@@ -175,6 +175,20 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, UnimplementedHandler::new(op));
                 }
             }
+            IpcOperationName::LocalDnsSuffixesGet => {
+                if let Some((store, context)) = deps.local_dns_suffixes.clone() {
+                    registry.register(op, LocalDnsSuffixesGetHandler::new(store, context));
+                } else {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            }
+            IpcOperationName::LocalDnsSuffixesSet => {
+                if let Some((store, context)) = deps.local_dns_suffixes.clone() {
+                    registry.register(op, LocalDnsSuffixesSetHandler::new(store, context));
+                } else {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            }
             IpcOperationName::SeedFromBrowserHistory => {
                 if let Some(seeder) = deps.browser_history_seeder.clone() {
                     registry.register(op, SeedFromBrowserHistoryHandler::new(seeder));
@@ -326,21 +340,21 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 }
             }
             IpcOperationName::ServiceStabilityConfigSet => {
-                match deps.service_stability_writer.clone() {
-                    Some(writer) => {
-                        let mut handler =
+                // A writer without its reader cannot tell a change from an
+                // echo, so it stays unregistered rather than ungated.
+                match (
+                    deps.service_stability_writer.clone(),
+                    deps.service_stability_provider.clone(),
+                ) {
+                    (Some(writer), Some(provider)) => {
+                        registry.register(
+                            op,
                             service_stability_handlers::ServiceStabilityConfigSetHandler::new(
-                                writer,
-                            );
-                        // The reader lets the handler tell a real change of the
-                        // administrative rules lock from a client echoing the
-                        // stored value back on an unrelated save.
-                        if let Some(provider) = deps.service_stability_provider.clone() {
-                            handler = handler.with_provider(provider);
-                        }
-                        registry.register(op, handler);
+                                writer, provider,
+                            ),
+                        );
                     }
-                    None => {
+                    _ => {
                         registry.register(op, UnimplementedHandler::new(op));
                     }
                 }

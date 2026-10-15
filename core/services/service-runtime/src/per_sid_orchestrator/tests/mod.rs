@@ -91,7 +91,6 @@ fn rules_with_n_primary_ips(n: u8) -> ActiveRulesSnapshot {
             primary: CanonicalRuleSet::from_rules(primary),
             secondary: CanonicalRuleSet::default(),
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     }
 }
 
@@ -128,6 +127,7 @@ fn snap_full(primary: &str, secondary: &str) -> PerSidPolicySnapshot {
         link_provider_exe_paths: Vec::new(),
         doh_lockdown_enabled: false,
         doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
+        doh_lockdown_auto: false,
         doh_resolver_ips: Vec::new(),
         auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
         primary_probe_auto: false,
@@ -137,6 +137,7 @@ fn snap_full(primary: &str, secondary: &str) -> PerSidPolicySnapshot {
         local_networks_auto_accept: false,
         zone_priority_over_ip: false,
         app_rules_take_all_addresses: false,
+        guard_forwarded_traffic: true,
     }
 }
 
@@ -163,6 +164,7 @@ fn snap_primary_only(primary: &str) -> PerSidPolicySnapshot {
         link_provider_exe_paths: Vec::new(),
         doh_lockdown_enabled: false,
         doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
+        doh_lockdown_auto: false,
         doh_resolver_ips: Vec::new(),
         auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
         primary_probe_auto: false,
@@ -172,6 +174,7 @@ fn snap_primary_only(primary: &str) -> PerSidPolicySnapshot {
         local_networks_auto_accept: false,
         zone_priority_over_ip: false,
         app_rules_take_all_addresses: false,
+        guard_forwarded_traffic: true,
     }
 }
 
@@ -245,7 +248,6 @@ fn rules_with_one_app(app_name: &str) -> ActiveRulesSnapshot {
             primary: CanonicalRuleSet::from_rules(vec![rule]),
             secondary: CanonicalRuleSet::default(),
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     }
 }
 
@@ -361,7 +363,6 @@ fn rules_with_secondary_host(host: &str) -> ActiveRulesSnapshot {
                 origin: None,
             }]),
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     }
 }
 
@@ -394,7 +395,6 @@ fn rules_with_secondary_ip(ip: Ipv4Addr) -> ActiveRulesSnapshot {
                 origin: None,
             }]),
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     }
 }
 
@@ -468,7 +468,6 @@ fn rules_with_secondary_ips(ips: &[Ipv4Addr]) -> ActiveRulesSnapshot {
             primary: CanonicalRuleSet::default(),
             secondary: CanonicalRuleSet::from_rules(rules),
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     }
 }
 
@@ -478,6 +477,7 @@ mod blocking_scope;
 mod cleanup;
 mod kill_switch;
 mod machine_reading;
+mod membership;
 mod network_holds;
 mod preview;
 mod route_before_block;

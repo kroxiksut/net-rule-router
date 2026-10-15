@@ -119,4 +119,14 @@ pub trait SystemDnsRedirectPort: Send + Sync {
         let _ = (claimed, extra);
         Ok(())
     }
+
+    /// Keep `names` — rule hosts inside an exempted namespace — pointed at
+    /// `listener`, replacing any previous set: a name under a rule follows the
+    /// rule, whatever its namespace was left to. Returns how many are in
+    /// force. Default: none, for a platform whose resolver already prefers the
+    /// longest matching namespace of the redirect's own link.
+    fn keep_names(&self, names: &[String], listener: SocketAddr) -> Result<usize, PlatformError> {
+        let _ = (names, listener);
+        Ok(0)
+    }
 }

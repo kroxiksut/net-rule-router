@@ -669,6 +669,8 @@ impl nrr_service_runtime::RoutePolicyWriter for EmptyRoutePolicyWriter {
                 secondary_link_provider_apps: Vec::new(),
                 doh_lockdown_enabled: request.doh_lockdown_enabled,
                 doh_lockdown_scope: request.doh_lockdown_scope.clone(),
+                doh_lockdown_auto: request.doh_lockdown_auto,
+                doh_lockdown_effective: false,
                 browser_history_auto_seed: request.browser_history_auto_seed,
                 kill_switch_strict_shared_ips: request.kill_switch_strict_shared_ips,
                 auto_rules_mode: request.auto_rules_mode.clone(),
@@ -682,6 +684,7 @@ impl nrr_service_runtime::RoutePolicyWriter for EmptyRoutePolicyWriter {
                 short_name_completion: false,
                 short_name_suffix: String::new(),
                 app_rules_take_all_addresses: false,
+                forwarded_outage: String::new(),
                 binding_source: request.binding_source,
             },
         )

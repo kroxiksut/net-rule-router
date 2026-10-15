@@ -212,7 +212,7 @@ mod tests {
     use nrr_domain::canonical::{
         CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
     };
-    use nrr_domain::{RouteBehaviorMode, RuleId};
+    use nrr_domain::RuleId;
     use nrr_platform_api::browser_history::MockBrowserHistoryRead;
     use nrr_platform_api::dns::{DnsResolverError, ResolvedRecord};
     use std::net::{IpAddr, Ipv4Addr};
@@ -227,7 +227,6 @@ mod tests {
                     primary: self.0.clone(),
                     secondary: CanonicalRuleSet::from_rules(vec![]),
                 },
-                behavior_mode: RouteBehaviorMode::PreferPrimary,
             })
         }
     }
@@ -348,7 +347,6 @@ mod tests {
                     primary: CanonicalRuleSet::from_rules(vec![zone_rule("r-zone", "example")]),
                     secondary: CanonicalRuleSet::from_rules(vec![]),
                 },
-                behavior_mode: RouteBehaviorMode::PreferPrimary,
             })
         }
     }

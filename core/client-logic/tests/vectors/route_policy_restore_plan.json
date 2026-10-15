@@ -23,21 +23,21 @@
       "name": "one switch",
       "input": {
         "intent": {
-          "kill-switch-enabled": true
+          "resolve-hosts-bypass": false
         },
         "service": {},
         "present": []
       },
       "expected": {
         "keys": [
-          "kill-switch-enabled"
+          "resolve-hosts-bypass"
         ],
         "missing": [],
         "values": {
-          "kill-switch-enabled": true
+          "resolve-hosts-bypass": false
         },
         "applyOnly": [
-          "kill-switch-enabled"
+          "resolve-hosts-bypass"
         ]
       }
     },
@@ -292,6 +292,51 @@
         "missing": [],
         "values": null,
         "applyOnly": null
+      }
+    },
+    {
+      "name": "protection the record holds on is not offered: it went back on its own",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": true,
+          "mode": "prefer-secondary-when-available"
+        },
+        "service": {},
+        "present": []
+      },
+      "expected": {
+        "keys": [
+          "mode"
+        ],
+        "missing": [],
+        "values": {
+          "mode": "prefer-secondary-when-available"
+        },
+        "applyOnly": [
+          "mode"
+        ]
+      }
+    },
+    {
+      "name": "protection the record holds off is offered, never sent on its own",
+      "input": {
+        "intent": {
+          "kill-switch-fail-closed": false
+        },
+        "service": {},
+        "present": []
+      },
+      "expected": {
+        "keys": [
+          "kill-switch-fail-closed"
+        ],
+        "missing": [],
+        "values": {
+          "kill-switch-fail-closed": false
+        },
+        "applyOnly": [
+          "kill-switch-fail-closed"
+        ]
       }
     }
   ]

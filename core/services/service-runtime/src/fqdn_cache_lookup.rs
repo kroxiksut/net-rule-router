@@ -611,6 +611,53 @@ impl FqdnCacheSnapshot {
     pub fn hostname_count(&self) -> usize {
         self.by_hostname.len()
     }
+
+    /// The snapshot as a plan about `wanted` alone needs it: each host keeps
+    /// only those of its addresses, a host with none drops out, the census
+    /// keeps only them. What a plan decides about an address rests on the
+    /// facts naming it, so it routes `wanted` as a plan over the whole cache
+    /// would — bar a host past a per-host or per-rule cap, which the next full
+    /// pass settles.
+    #[must_use]
+    pub fn scoped_to(&self, wanted: &[IpAddr]) -> Self {
+        let wanted: std::collections::HashSet<IpAddr> = wanted.iter().copied().collect();
+        let by_hostname: HashMap<String, Vec<IpAddr>> = self
+            .by_hostname
+            .iter()
+            .filter_map(|(host, ips)| {
+                let kept: Vec<IpAddr> = ips
+                    .iter()
+                    .copied()
+                    .filter(|ip| wanted.contains(ip))
+                    .collect();
+                (!kept.is_empty()).then(|| (host.clone(), kept))
+            })
+            .collect();
+        let hostnames_by_recency = self
+            .hostnames_by_recency
+            .iter()
+            .filter(|host| by_hostname.contains_key(host.as_str()))
+            .cloned()
+            .collect();
+        let kept = |ip: &Ipv4Addr| wanted.contains(&IpAddr::V4(*ip));
+        Self {
+            by_hostname,
+            hostnames_by_recency,
+            direct_host_counts: self
+                .direct_host_counts
+                .iter()
+                .filter(|(ip, _)| kept(ip))
+                .map(|(ip, count)| (*ip, *count))
+                .collect(),
+            shared_direct: self.shared_direct.iter().copied().filter(kept).collect(),
+            shared_direct_primary_ruled: self
+                .shared_direct_primary_ruled
+                .iter()
+                .copied()
+                .filter(kept)
+                .collect(),
+        }
+    }
 }
 
 impl FqdnCacheLookup for FqdnCacheSnapshot {
@@ -1223,4 +1270,71 @@ mod tests {
             cutoff
         ));
     }
+
+    /// A first contact plans over this view, so it must answer about the
+    /// wanted addresses exactly as the whole snapshot does, and know nothing
+    /// else.
+    #[test]
+    fn a_scoped_snapshot_keeps_only_the_wanted_addresses() {
+        use nrr_storage::dto::ResolutionEntry;
+        use nrr_storage::resolution_source::StorageResolutionSource;
+        let store = confirmation_store();
+        let wanted = Ipv4Addr::new(203, 0, 113, 1);
+        let other = Ipv4Addr::new(203, 0, 113, 2);
+        let elsewhere = Ipv4Addr::new(198, 51, 100, 3);
+        let now = SystemTime::now();
+        for (host, ips) in [
+            ("a.cdn.example", vec![wanted, other]),
+            ("b.cdn.example", vec![elsewhere]),
+            ("direct.example", vec![wanted]),
+        ] {
+            store
+                .upsert_resolution(ResolutionEntry {
+                    canonical_hostname: host.into(),
+                    raw_hostname_sample: None,
+                    resolved_ips: ips.into_iter().map(IpAddr::V4).collect(),
+                    ttl_seconds: Some(300),
+                    source: StorageResolutionSource::Dns,
+                    resolved_at: now,
+                    active_revision_id: None,
+                })
+                .expect("upsert");
+        }
+        store
+            .record_shared_ip_direct_host(wanted, "direct.example", 1, true)
+            .expect("census");
+        store
+            .record_shared_ip_direct_host(elsewhere, "direct.example", 1, false)
+            .expect("census");
+        let cache: Arc<Mutex<dyn CacheRepository + Send>> = Arc::new(Mutex::new(store));
+        let full = SqliteFqdnCacheLookup::new(cache, FreshnessThresholds::default_production())
+            .snapshot_for_compute()
+            .expect("sqlite adapter snapshots");
+
+        let scoped = full.scoped_to(&[IpAddr::V4(wanted)]);
+
+        assert_eq!(
+            scoped.ips_for_hostname("a.cdn.example"),
+            vec![IpAddr::V4(wanted)]
+        );
+        assert!(scoped.ips_for_hostname("b.cdn.example").is_empty());
+        assert_eq!(
+            scoped.hostnames_under_suffix("cdn.example", SUFFIX_LIMIT_FOR_TESTS),
+            vec!["a.cdn.example".to_string()]
+        );
+        assert_eq!(
+            scoped.direct_host_count_for_ip(wanted),
+            full.direct_host_count_for_ip(wanted)
+        );
+        assert_eq!(scoped.shared_direct_ips(), [wanted].into_iter().collect());
+        assert_eq!(
+            scoped.shared_direct_ips_primary_ruled(),
+            full.shared_direct_ips_primary_ruled()
+                .into_iter()
+                .filter(|ip| *ip == wanted)
+                .collect()
+        );
+    }
+
+    const SUFFIX_LIMIT_FOR_TESTS: usize = 64;
 }

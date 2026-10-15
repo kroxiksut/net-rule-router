@@ -318,6 +318,29 @@ fn facts_read_the_segments_by_the_addresses_on_them() {
     assert_eq!(facts.tunnel_servers, vec![addr("203.0.113.7")]);
 }
 
+/// The LAN the facts carry is the private part of what the non-tunnel links
+/// are attached to — a `/1` the access point handed out is no LAN. A name
+/// resolving onto it stays direct; a literal address is honoured.
+#[test]
+fn facts_keep_only_the_private_segments_off_the_tunnel_as_the_lan() {
+    let (mut routes, adapters) = machine();
+    routes.push(row("128.0.0.0", 1, "0.0.0.0", 12, 256));
+    let facts = NetworkRouteFacts::read(&routes, &adapters, Some(7), vec![addr("203.0.113.7")]);
+    assert_eq!(
+        facts.lan_segments,
+        vec![net("192.168.1.0/24")],
+        "the tunnel's interior, a public prefix and a half-internet segment are not the LAN"
+    );
+    let secondary = CanonicalRuleSet::from_rules(vec![rule(
+        "R-literal",
+        CanonicalAddressMatch::ExactIp(addr("192.168.1.6")),
+    )]);
+    assert!(facts.keeps_host_direct(&secondary, addr("192.168.1.5")));
+    assert!(!facts.keeps_host_direct(&secondary, addr("192.168.1.6")));
+    assert!(!facts.keeps_host_direct(&secondary, addr("203.0.113.9")));
+    assert!(!facts.keeps_host_direct(&secondary, addr("128.0.0.9")));
+}
+
 #[test]
 fn the_submission_check_names_what_a_network_would_take() {
     let (routes, adapters) = machine();

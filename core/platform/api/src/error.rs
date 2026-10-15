@@ -184,6 +184,18 @@ pub enum ErrorClass {
     PrivilegeRequired,
 }
 
+/// What the failed mutation was trying to do.
+///
+/// "Not found" is success for a removal and a failure for an addition: a route
+/// added onto an interface that has just vanished was never installed, and
+/// counting it as present leaves nothing to roll back and nothing for the next
+/// reconcile to add.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationIntent {
+    Add,
+    Remove,
+}
+
 impl PlatformError {
     /// True when this error means "the app rule's executable is not installed
     /// on this host" — `FwpmGetAppIdFromFileName0` returning
@@ -280,9 +292,20 @@ impl PlatformError {
         )
     }
 
-    /// Classify the error so the apply orchestrator knows how to react.
+    /// Classify the error for a removal, or where the intent does not matter
+    /// (a conflict, a privilege or a retry read the same either way). An
+    /// ADDITION asks [`Self::classify_for`] with [`MutationIntent::Add`].
     pub fn classify(&self) -> ErrorClass {
-        match self {
+        self.classify_for(MutationIntent::Remove)
+    }
+
+    /// Classify the error for what the mutation was trying to do.
+    ///
+    /// `Idempotent` only ever comes from a "not found" code, and nothing can be
+    /// already-added by being absent: on an add that code is the target — an
+    /// interface, a sub-layer — having gone, and the mutation failed.
+    pub fn classify_for(&self, intent: MutationIntent) -> ErrorClass {
+        let class = match self {
             Self::NotYetImplemented { .. } => ErrorClass::Fatal,
             Self::Win32 { code, .. } => classify_win32_error(*code),
             Self::AccessDenied { .. } => ErrorClass::PrivilegeRequired,
@@ -290,6 +313,10 @@ impl PlatformError {
             Self::StateCorrupted { .. } => ErrorClass::Fatal,
             Self::NotSupported { .. } => ErrorClass::Fatal,
             Self::Errno { code, .. } => classify_errno(*code),
+        };
+        match (intent, class) {
+            (MutationIntent::Add, ErrorClass::Idempotent) => ErrorClass::Fatal,
+            _ => class,
         }
     }
 }
@@ -303,8 +330,9 @@ impl PlatformError {
 #[cfg(unix)]
 fn classify_errno(code: i32) -> ErrorClass {
     match code {
-        // Already gone is success for an idempotent reconcile.
-        libc::ENOENT | libc::ESRCH => ErrorClass::Idempotent,
+        // Already gone is success for an idempotent reconcile; a route on an
+        // interface that no longer exists (`ENODEV`) is gone with it.
+        libc::ENOENT | libc::ESRCH | libc::ENODEV => ErrorClass::Idempotent,
         libc::EEXIST => ErrorClass::Conflict,
         libc::EPERM | libc::EACCES => ErrorClass::PrivilegeRequired,
         libc::EAGAIN | libc::EBUSY | libc::EINTR | libc::ENOBUFS => ErrorClass::Retryable,
@@ -454,6 +482,63 @@ mod tests {
         assert_eq!(
             win32("FwpmFilterDeleteByKey0", 0x8032_0003).classify(),
             ErrorClass::Idempotent
+        );
+    }
+
+    /// "Not found" on an ADD is the interface having gone, not a route already
+    /// in place: counted as success it left nothing to roll back and nothing
+    /// for the next pass to add, while the reconciler kept calling it owned.
+    #[test]
+    fn not_found_is_idempotent_on_remove_and_fatal_on_add() {
+        use win32_codes::{ERROR_NOT_FOUND, FWP_E_FILTER_NOT_FOUND};
+        for code in [
+            ERROR_NOT_FOUND,
+            FWP_E_FILTER_NOT_FOUND,
+            0x8007_0000 | ERROR_NOT_FOUND,
+        ] {
+            let add = win32("CreateIpForwardEntry2", code);
+            assert_eq!(
+                add.classify_for(MutationIntent::Remove),
+                ErrorClass::Idempotent
+            );
+            assert_eq!(add.classify_for(MutationIntent::Add), ErrorClass::Fatal);
+            assert_eq!(add.classify(), ErrorClass::Idempotent);
+        }
+        // Every other class reads the same on an add.
+        assert_eq!(
+            win32("CreateIpForwardEntry2", 0x1392).classify_for(MutationIntent::Add),
+            ErrorClass::Conflict
+        );
+        assert_eq!(
+            win32("CreateIpForwardEntry2", 0x5).classify_for(MutationIntent::Add),
+            ErrorClass::PrivilegeRequired
+        );
+    }
+
+    /// The Unix twin: `ENODEV` is a route whose interface vanished — already
+    /// gone on a delete, a failure on an add. Before, it was `Fatal` both ways
+    /// and one stale delete rolled back the whole batch.
+    #[cfg(unix)]
+    #[test]
+    fn enodev_is_idempotent_on_remove_and_fatal_on_add() {
+        let errno = |code: i32| PlatformError::Errno {
+            operation: "add an IPv4 route",
+            code,
+            message: String::new(),
+        };
+        for code in [libc::ENODEV, libc::ENOENT, libc::ESRCH] {
+            assert_eq!(
+                errno(code).classify_for(MutationIntent::Remove),
+                ErrorClass::Idempotent
+            );
+            assert_eq!(
+                errno(code).classify_for(MutationIntent::Add),
+                ErrorClass::Fatal
+            );
+        }
+        assert_eq!(
+            errno(libc::EEXIST).classify_for(MutationIntent::Add),
+            ErrorClass::Conflict
         );
     }
 

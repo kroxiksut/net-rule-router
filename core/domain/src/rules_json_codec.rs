@@ -428,6 +428,12 @@ pub(crate) fn wire_app_pattern(
         // is a mislabelled pattern.
         AppPatternDto::Exact { value } => (value, value.contains('*')),
         AppPatternDto::Glob { value } => (value, true),
+        AppPatternDto::Unrecognized(_) => {
+            return Err(ValidationError::AppNameInvalid {
+                rule_id: rule_id.clone(),
+                value: String::new(),
+            })
+        }
     };
     canonical_app_pattern(value, glob, naming, rule_id, &mut Vec::new())
 }
@@ -446,11 +452,7 @@ fn decode_app_match(
                 }
                 _ => RulesJsonCodecError::AppNameInvalid {
                     rule_id,
-                    raw: match &m.pattern {
-                        AppPatternDto::Exact { value } | AppPatternDto::Glob { value } => {
-                            value.clone()
-                        }
-                    },
+                    raw: m.pattern.value().to_owned(),
                 },
             }
         })?;
@@ -931,6 +933,28 @@ mod tests {
             .collect();
         assert_eq!(applied, ["r-1"]);
         assert_eq!(content.unrecognized.primary[0].id, "r-x");
+        let again = encode(&content);
+        assert_eq!(again.primary.len(), 2, "a rewrite keeps the unknown rule");
+    }
+
+    /// A book a newer build wrote: an application pattern of a kind this build
+    /// does not know, an origin it cannot read, a field it never heard of. The
+    /// book still reads, the known rules apply, nothing turns into "no rules".
+    #[test]
+    fn a_newer_builds_book_keeps_every_rule_it_can_apply() {
+        let wire = r#"{"schema-version":999,"primary":[{"app-match":{"include-child-processes":false,"pattern":{"kind":"signed-by","publisher":"Example"}},"enabled":true,"id":"r-app"},{"enabled":true,"id":"r-1","address-match":{"kind":"exact-fqdn","value":"x.test"},"origin":{"kind":"imported","list":"vendor"},"weight":3}],"secondary":[]}"#;
+        let dto = nrr_shared::rules_json::from_canonical_string(wire).expect("wire");
+        let content = decode(dto, HostPlatform::Windows).expect("a newer book is read");
+        let applied: Vec<&str> = content
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(applied, ["r-1"], "the known rule applies, as the user's");
+        assert_eq!(content.rule_book.primary.rules()[0].origin, None);
+        assert_eq!(content.unrecognized.primary[0].id, "r-app");
         let again = encode(&content);
         assert_eq!(again.primary.len(), 2, "a rewrite keeps the unknown rule");
     }

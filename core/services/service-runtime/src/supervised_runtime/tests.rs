@@ -71,6 +71,7 @@ fn fresh_deps() -> SupervisedRuntimeDeps {
         app_destination_memory: None,
         secondary_external_address: None,
         health: Arc::new(HealthAggregator::new()),
+        liveness: None,
         ipc_server: Arc::new(InertServer::default()),
         adapter_monitor: monitor,
         operation_results: Arc::new(OperationStatusStore::default()),
@@ -388,36 +389,185 @@ fn adapter_monitor_task_ticks_during_run() {
     );
 }
 
-/// Mapping from `TaskId` slug to `HealthComponent` is the same one
-/// that a fatal task retirement uses; lock it in so renaming a slug
-/// without coordinating breaks compilation here.
+fn component(
+    health: &HealthAggregator,
+    which: HealthComponent,
+) -> Option<crate::health::HealthComponentSnapshot> {
+    health
+        .snapshot()
+        .components
+        .into_iter()
+        .find(|c| c.component == which)
+}
+
+/// Every task the supervisor runs, retired: health moves exactly where the
+/// registry says, naming the task — or, for a task declared invisible, not at all.
 #[test]
-fn fatal_failure_routing_table_is_complete() {
-    assert_eq!(
-        component_for_task(TASK_ID_IPC_ACCEPT_LOOP),
-        Some(HealthComponent::Ipc)
+fn every_task_lands_where_the_registry_says_when_it_retires() {
+    for kind in ServiceTaskKind::ALL {
+        let health = Arc::new(HealthAggregator::new());
+        let sink = HealthFailureSink::new(Arc::clone(&health));
+        sink.task_terminated_fatal(&TaskId::new(kind.id()), "boom");
+        let recorded = health.snapshot().components;
+        match kind.health() {
+            TaskHealth::Reports {
+                component,
+                severity,
+            } => {
+                assert_eq!(recorded.len(), 1, "{}: {recorded:?}", kind.id());
+                assert_eq!(recorded[0].component, component, "{}", kind.id());
+                assert_eq!(recorded[0].severity, severity, "{}", kind.id());
+                assert!(
+                    recorded[0].message.contains(kind.id()),
+                    "the record must name the task: {}",
+                    recorded[0].message
+                );
+            }
+            TaskHealth::Invisible(_) => {
+                assert!(recorded.is_empty(), "{}: {recorded:?}", kind.id());
+            }
+        }
+    }
+}
+
+/// Invisible is a decision made in the registry; a task nobody registered
+/// must still show.
+#[test]
+fn an_unregistered_task_that_retires_still_shows() {
+    let health = Arc::new(HealthAggregator::new());
+    let sink = HealthFailureSink::new(Arc::clone(&health));
+    sink.task_terminated_fatal(&TaskId::new("unregistered-tick"), "boom");
+    let rec = background_tasks(&health).expect("component recorded");
+    assert_eq!(rec.severity, ServiceHealthSeverity::Degraded);
+    assert!(rec.message.contains("unregistered-tick"), "{}", rec.message);
+}
+
+/// A task that returns `Done` outside a stop is a loss health must show.
+#[test]
+fn a_task_that_ends_while_the_service_runs_changes_health() {
+    use crate::runtime_loop::{ServiceTask, TaskOutcome};
+
+    let health = Arc::new(HealthAggregator::new());
+    health.clear_lifecycle_override();
+    let stop = StopToken::new();
+    let supervisor = ServiceSupervisor::new(
+        stop.clone(),
+        Arc::new(HealthFailureSink::new(Arc::clone(&health))),
     );
-    assert_eq!(
-        component_for_task(TASK_ID_IPC_SHUTDOWN_WATCHER),
-        Some(HealthComponent::Ipc)
+    for (kind, class) in [
+        (
+            ServiceTaskKind::PrincipalEnforcement,
+            TaskClass::Recoverable,
+        ),
+        (ServiceTaskKind::DnsRefresh, TaskClass::Optional),
+    ] {
+        supervisor
+            .spawn(ServiceTask::periodic(
+                kind.id(),
+                class,
+                Duration::from_millis(5),
+                1,
+                |_stop| TaskOutcome::Done,
+            ))
+            .expect("spawn");
+    }
+    assert!(
+        wait_for(Duration::from_secs(2), || {
+            component(&health, HealthComponent::Apply)
+                .is_some_and(|c| c.severity == ServiceHealthSeverity::Degraded)
+                && background_tasks(&health).is_some_and(|c| {
+                    c.severity == ServiceHealthSeverity::Degraded
+                        && c.message.contains(ServiceTaskKind::DnsRefresh.id())
+                })
+        }),
+        "{:?}",
+        health.snapshot().components
     );
-    assert_eq!(
-        component_for_task(TASK_ID_ADAPTER_MONITOR),
-        Some(HealthComponent::Adapters)
+    assert_eq!(health.snapshot().state, ServiceRuntimeState::Degraded);
+    let _ = supervisor.shutdown();
+}
+
+/// Panics until the restart budget is spent: the enforcement task retires and
+/// `Apply` says so, rather than routing silently stopping.
+#[test]
+fn a_task_that_keeps_panicking_retires_into_its_component() {
+    use crate::runtime_loop::ServiceTask;
+
+    let health = Arc::new(HealthAggregator::new());
+    let stop = StopToken::new();
+    let supervisor = ServiceSupervisor::new(
+        stop.clone(),
+        Arc::new(HealthFailureSink::new(Arc::clone(&health))),
     );
-    assert_eq!(
-        component_for_task(TASK_ID_DIAGNOSTICS_CLEANUP),
-        Some(HealthComponent::Diagnostics)
+    supervisor
+        .spawn(ServiceTask::periodic(
+            ServiceTaskKind::PrincipalEnforcement.id(),
+            TaskClass::Recoverable,
+            Duration::from_millis(5),
+            1,
+            |_stop| panic!("enforcement pass blew up"),
+        ))
+        .expect("spawn");
+    assert!(wait_for(Duration::from_secs(3), || component(
+        &health,
+        HealthComponent::Apply
+    )
+    .is_some_and(|c| c.severity == ServiceHealthSeverity::Degraded)));
+    let apply = component(&health, HealthComponent::Apply).expect("apply recorded");
+    assert!(apply.message.contains("retired"), "{}", apply.message);
+    assert!(apply.message.contains("panicked"), "{}", apply.message);
+    let _ = supervisor.shutdown();
+}
+
+/// Gaps the contract test knows about. Each entry must still be a gap: when
+/// one closes, its check below fails and the entry has to go.
+const KNOWN_GAPS: &[(&str, &str)] = &[(
+    "hung-task",
+    "the supervisor gives a tick no deadline, so a tick blocked in a syscall or a lock keeps its task alive in name only and health stays as it was",
+)];
+
+fn gap_listed(name: &str) -> bool {
+    KNOWN_GAPS.iter().any(|(gap, _)| *gap == name)
+}
+
+/// A tick that never returns, for a hundred times its interval.
+#[test]
+fn a_hung_task_changes_health_or_is_a_listed_gap() {
+    use crate::runtime_loop::{ServiceTask, TaskOutcome};
+
+    let health = Arc::new(HealthAggregator::new());
+    health.clear_lifecycle_override();
+    health.record(HealthComponent::Ipc, ServiceHealthSeverity::Ok, "ok");
+    let stop = StopToken::new();
+    let supervisor = ServiceSupervisor::new(
+        stop.clone(),
+        Arc::new(HealthFailureSink::new(Arc::clone(&health))),
     );
-    // health-aggregator-tick and operation-results-gc intentionally
-    // do not have a routed component.
+    let entered = Arc::new(AtomicUsize::new(0));
+    let entered_in_task = Arc::clone(&entered);
+    supervisor
+        .spawn(ServiceTask::periodic(
+            ServiceTaskKind::PrincipalEnforcement.id(),
+            TaskClass::Recoverable,
+            Duration::from_millis(5),
+            1,
+            move |stop| {
+                entered_in_task.fetch_add(1, Ordering::SeqCst);
+                while !stop.wait_for(Duration::from_secs(5)) {}
+                TaskOutcome::Continue
+            },
+        ))
+        .expect("spawn");
+    assert!(wait_for(Duration::from_secs(2), || entered
+        .load(Ordering::SeqCst)
+        == 1));
+    std::thread::sleep(Duration::from_millis(500));
+    let noticed = health.snapshot().worst_severity > ServiceHealthSeverity::Ok;
+    let _ = supervisor.shutdown();
     assert_eq!(
-        component_for_task(crate::service_tasks::TASK_ID_HEALTH_AGGREGATOR),
-        None
-    );
-    assert_eq!(
-        component_for_task(crate::service_tasks::TASK_ID_OPERATION_RESULTS_GC),
-        None
+        !noticed,
+        gap_listed("hung-task"),
+        "hung task noticed by health: {noticed}; KNOWN_GAPS must list `hung-task` exactly while it is not"
     );
 }
 
@@ -440,8 +590,8 @@ fn wait_for(deadline: Duration, cond: impl Fn() -> bool) -> bool {
     cond()
 }
 
-/// An observer that panicked used to vanish with health still `Ok`. It must
-/// now show as degraded — by name — for exactly as long as it is down.
+/// A panicked observer shows as degraded, by name, for exactly as long as it
+/// is down.
 #[test]
 fn a_panicked_optional_task_is_degraded_in_health_until_its_restart_ticks() {
     use crate::runtime_loop::{RestartBackoff, ServiceTask, TaskOutcome};

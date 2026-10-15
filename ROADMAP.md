@@ -41,6 +41,30 @@ Today the rules follow the person at the keyboard.
 NetRuleRouter routes, by the same rules, the traffic of devices that cannot run
 it themselves: a phone, a TV, the clients of your own VPN server.
 
+**Protection from DNS rebinding.** A malicious web page can try to reach your
+router, printer or other devices at home through your browser by pointing its
+own name at a local address. NetRuleRouter will refuse such answers before your
+programs see them, while names that your company or your home network
+legitimately point at local addresses keep working. Anything it holds back is
+shown to you, with one click to allow it.
+
+**Know when the service stops.** If the NetRuleRouter background service stops
+or fails, the window, the tray and the terminal interface say so at once and
+offer two choices: start it again, or restore the network without it.
+
+**A warning when name answers are altered on the way.** If something between
+you and the internet, a public Wi-Fi network or a provider, replaces the
+answers about site names, NetRuleRouter notices and tells you which names were
+affected. It only reports: your routing does not change.
+
+**Let one program keep its own secure DNS.** When a program needs its own
+encrypted DNS, a corporate client or a game for example, you can allow just that
+program without turning the protection off for every other one, straight from
+the notice that it was blocked.
+
+**Traffic over time, per connection.** How much went through the additional
+connection and how much went directly, over a day, a week or a month.
+
 ## Once real-world usage data is in
 
 **Suggestions for programs, not only for sites.** Today NetRuleRouter suggests
@@ -55,9 +79,22 @@ it does. If it does not, you know the cause is elsewhere. It only reports:
 NetRuleRouter changes nothing in the VPN's settings. It comes as people ask
 for it.
 
+**Updates to the rule sets you imported.** When a new version of NetRuleRouter
+ships an updated version of a ready-made rule set you once imported, it offers
+the update and shows what changed. Nothing changes without your consent.
+
 ## Later
 
 **macOS**, after Linux.
 
+**Package repositories for Linux**, so that installation and updates come
+through the usual `apt upgrade` / `dnf upgrade`; later, the Astra Linux and
+RED OS application stores.
+
 **Traffic per user of the machine**, not only per connection: Linux first,
 Windows later.
+
+**Containers and virtual machines on a route of their own** (Linux first).
+Docker and Podman containers and local virtual machines get a route the way a
+program does: all of their traffic over the additional connection, or only the
+sites your rules name, with the same protection when that connection drops.

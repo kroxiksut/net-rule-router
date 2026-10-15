@@ -96,6 +96,9 @@ pub(crate) fn build_runtime_deps(
     // The policy layer arrives whole rather than field by field: every piece of
     // it is present or absent together, and splitting it into arguments invited
     // a caller to pass half of one.
+    if let Some(stack) = policy.as_ref() {
+        stack.rules_provider.set_health(Arc::clone(&health));
+    }
     let (
         enforcement,
         app_observations,
@@ -110,6 +113,8 @@ pub(crate) fn build_runtime_deps(
         dns_capture,
         service_resolver,
         drop_parts,
+        first_contact,
+        first_contact_v6,
     ) = match policy {
         Some(stack) => (
             Some(stack.cycle),
@@ -125,6 +130,8 @@ pub(crate) fn build_runtime_deps(
             stack.dns_capture,
             Some(stack.service_resolver),
             Some(stack.drop_observation),
+            Some(stack.first_contact),
+            Some(stack.first_contact_v6),
         ),
         None => (
             None,
@@ -138,6 +145,8 @@ pub(crate) fn build_runtime_deps(
             None,
             None,
             crate::dns_stack::DnsCapture::Unavailable,
+            None,
+            None,
             None,
             None,
         ),
@@ -173,17 +182,39 @@ pub(crate) fn build_runtime_deps(
     // Stopping must restore the machine: policy left in the kernel by an exited
     // daemon is policy nothing maintains, and its leak-guard `drop` would
     // outlive the service that could explain it.
+    // The plan is read at stop time: a machine shutdown keeps everything, a
+    // service stop removes routes first and filters last (`lifecycle_matrix`).
     let teardown_hook: Option<RouteRecomputeHook> = enforcement.as_ref().map(|cycle| {
         let cycle = Arc::clone(cycle);
+        let state_db_path = artifacts.topology.state_db_path.clone();
         Arc::new(move || {
-            if let Err(reason) = cycle.teardown() {
+            use nrr_service_runtime::lifecycle_matrix::{
+                leak_guard_armed_at, stop_plan, FilterTeardown, LifecycleInputs, RouteTeardown,
+            };
+            let reason = nrr_service_runtime::lifecycle::teardown_reason();
+            let plan = stop_plan(
+                reason,
+                LifecycleInputs {
+                    leak_guard_armed: leak_guard_armed_at(&state_db_path),
+                    keep_rule_routes_on_stop: keep_rule_routes_on_stop(&state_db_path),
+                },
+            );
+            if plan.routes == RouteTeardown::Keep && plan.filters == FilterTeardown::Keep {
+                tracing::info!(
+                    target: "nrr::enforcement",
+                    msg_key = "linux-svc-policy-kept-for-shutdown",
+                    reason = ?reason,
+                    "machine shutting down — filters and routes stay in force until the end",
+                );
+            }
+            if let Err(reason) = cycle.teardown_with(plan) {
                 tracing::error!(
                     target: "nrr::enforcement",
                     msg_key = "linux-svc-policy-teardown-failed",
                     reason = %reason,
                     "policy could NOT be removed on stop: the machine may still be enforcing rules no service is maintaining",
                 );
-            } else {
+            } else if plan.filters == FilterTeardown::RemoveAll {
                 tracing::info!(
                     target: "nrr::enforcement",
                     msg_key = "linux-svc-policy-teardown-ok",
@@ -206,6 +237,11 @@ pub(crate) fn build_runtime_deps(
                 LogindActivePrincipals,
             )),
         };
+    // Made before the resolver's threads exist, so each can hold a lease on it.
+    let task_liveness = Arc::new(
+        nrr_service_runtime::task_liveness::TaskLiveness::new(Arc::clone(&health))
+            .with_event_bus(Arc::clone(&event_bus)),
+    );
     let dns_resolver_controller = match (
         state_conn.as_ref(),
         cache_store.as_ref(),
@@ -231,13 +267,21 @@ pub(crate) fn build_runtime_deps(
                     Arc::new(move || principal().is_some())
                 }),
                 route_coordinator: None,
+                // The same hook the coordinator gives the other platform.
+                first_contact,
+                first_contact_v6,
                 outage_blocks: conn_trace
                     .as_ref()
                     .map(|tee| Arc::clone(tee.ring().outage_blocks())),
+                liveness: Some(Arc::clone(&task_liveness)),
             },
         ),
         _ => None,
     };
+    // A refused pass is a verdict on `Apply`, not only a log line.
+    if let Some(cycle) = enforcement.as_ref() {
+        cycle.set_health(Arc::clone(&health));
+    }
     // No logind session stream yet: the enforcement pass already asks logind
     // who is present every few seconds, so a resolver waiting for a sign-in
     // (and one whose serve thread died) is looked after from there.
@@ -260,6 +304,7 @@ pub(crate) fn build_runtime_deps(
 
     SupervisedRuntimeDeps {
         health,
+        liveness: Some(task_liveness),
         ipc_server: ipc.server,
         adapter_monitor,
         operation_results: Arc::default(),
@@ -295,7 +340,7 @@ pub(crate) fn build_runtime_deps(
             Arc::new(
                 nrr_service_runtime::dns_refresh::DnsRefreshOrchestrator::new(
                     Arc::new(nrr_platform_api::dns_budget::BudgetedDnsResolver::new(
-                        resolver as _,
+                        resolver,
                     )),
                     store,
                 ),
@@ -448,13 +493,14 @@ pub(crate) fn build_ipc_server(
                     Arc::clone(&stack.cache_store),
                     stack.conn_trace.ring(),
                     stack.app_enforcement.clone(),
+                    stack.shared_ip_exemptions.clone(),
                     stack.conn_trace_log.clone(),
                     verbosity,
                     // Beside the state database it signs, under the same `0700`.
                     Arc::new(nrr_platform_linux::key_store::FileKeyStore::in_state_dir(
                         &artifacts.topology.data_dir,
                     )),
-                    Arc::clone(&stack.service_resolver) as _,
+                    Arc::clone(&stack.service_resolver),
                     Arc::clone(&stack.block_notice_center),
                     Arc::clone(&stack.block_notice_journal),
                 );
@@ -790,6 +836,9 @@ pub(crate) struct PolicyStack {
     /// The per-principal rule book, shared with everything that needs to know
     /// which applications are routed where.
     pub rules: Arc<dyn RulesProvider>,
+    /// The same provider, concrete: a book that stops reading is reported to
+    /// health through it.
+    pub rules_provider: Arc<ProductionRulesProvider>,
     /// Companion-domain discovery: what the observed resolutions suggest the
     /// user might want a rule for. Suggests only — the mode decides whether
     /// anything is ever authored.
@@ -813,6 +862,9 @@ pub(crate) struct PolicyStack {
     /// Each principal's rule conflicts: the planner writes, the IPC surface
     /// reads.
     pub app_enforcement: nrr_service_runtime::app_enforcement_status::AppEnforcementStatus,
+    /// The addresses the smart leak-guard spared: the planner writes, the IPC
+    /// surface reads.
+    pub shared_ip_exemptions: nrr_service_runtime::app_enforcement_status::SharedIpExemptionStatus,
     /// The connection-trace panel: the app-destination tick writes it, the IPC
     /// surface reads it.
     pub conn_trace: Arc<nrr_service_runtime::conn_observation_consumer::ConnTraceTee>,
@@ -824,9 +876,9 @@ pub(crate) struct PolicyStack {
     pub traffic_sampler: Option<TrafficSamplerHandle>,
     /// Whether the local DNS resolver can take the machine's lookups.
     pub dns_capture: crate::dns_stack::DnsCapture,
-    /// The service's own lookups, shared by the seeder and the refresher so
-    /// both read one cached server list.
-    pub service_resolver: Arc<nrr_platform_linux::dns_resolver::LinuxDnsResolver>,
+    /// Rule-host lookups, shared by the seeder, the refresher and the history
+    /// import: one cached server list, behind the user's hosts-file posture.
+    pub service_resolver: Arc<dyn nrr_platform_api::dns::DnsResolverPort>,
     /// What the drop consumer needs, taken by the tick that starts it.
     pub drop_observation: drop_observation::DropObservationParts,
     /// The one notice centre: the drop consumer records into it, the mute
@@ -835,6 +887,10 @@ pub(crate) struct PolicyStack {
     /// The backlog the centre writes and the journal operations serve.
     pub block_notice_journal:
         Arc<dyn nrr_service_runtime::block_notice_journal_store::BlockNoticeJournalStore>,
+    /// Routes a rule host's never-seen addresses before the resolver answers.
+    pub first_contact: nrr_service_runtime::dns_resolver_ports::FirstContactFn,
+    /// The same for an AAAA answer's addresses.
+    pub first_contact_v6: nrr_service_runtime::dns_resolver_ports::FirstContactV6Fn,
 }
 
 /// Assemble the policy stack, or explain why the daemon cannot enforce.
@@ -842,6 +898,21 @@ pub(crate) struct PolicyStack {
 /// `None` is returned only when the state database is unreachable — without it
 /// there are no rules to apply, and a cycle over an empty store would flush the
 /// table on every tick, which is a policy decision nobody made.
+/// The stored stop setting, read fresh at stop time; a setting that cannot be
+/// read is the default.
+fn keep_rule_routes_on_stop(state_db_path: &std::path::Path) -> bool {
+    use nrr_storage::service_stability_config::{
+        RoutingStopPolicy, ServiceStabilityConfigRepository,
+    };
+    let Ok(conn) = nrr_storage::migration::open_connection(state_db_path) else {
+        return false;
+    };
+    ServiceStabilityConfigRepository::new(&conn)
+        .get_or_default()
+        .map(|r| r.routing_stop_policy == RoutingStopPolicy::Persist)
+        .unwrap_or(false)
+}
+
 pub(crate) fn build_policy_stack(
     artifacts: &BootstrapArtifacts,
     adapters: Arc<nrr_platform_linux::adapters::LinuxAdapterSource>,
@@ -855,7 +926,8 @@ pub(crate) fn build_policy_stack(
     let state_conn = Arc::clone(&conn);
     let conn_for_stability = Arc::clone(&conn);
 
-    let rules: Arc<dyn RulesProvider> = Arc::new(ProductionRulesProvider::new(Arc::clone(&conn)));
+    let production_rules = Arc::new(ProductionRulesProvider::new(Arc::clone(&conn)));
+    let rules: Arc<dyn RulesProvider> = Arc::clone(&production_rules) as Arc<dyn RulesProvider>;
     let rules_for_stack = Arc::clone(&rules);
 
     // No cache means domain rules resolve to nothing. Said out loud here,
@@ -905,11 +977,35 @@ pub(crate) fn build_policy_stack(
         let posture = fail_closed_posture.clone();
         Arc::new(move || posture.armed())
     };
-    let service_resolver = crate::dns_stack::service_dns_resolver(&dns_capture);
+    // Whose routes the service accounts follow, recorded by each pass before
+    // the enforcer runs; machine-scope filters follow the same user.
+    let route_owner = Arc::new(nrr_service_runtime::route_table_owner::RouteTableOwner::default());
+    // The hosts-file bypass follows the route-table owner's setting, as the
+    // active routing user's does on the other platform; nobody signed in, or an
+    // unreadable row, reads as the default (bypass on).
+    let hosts_bypass: Arc<dyn Fn() -> bool + Send + Sync> = {
+        let owner = Arc::clone(&route_owner);
+        let conn = Arc::clone(&state_conn);
+        Arc::new(move || {
+            let Some(principal) = owner.current() else {
+                return true;
+            };
+            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+            nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
+                .load_for_sid(principal.as_stored())
+                .map(|record| record.resolve_hosts_bypass)
+                .unwrap_or(true)
+        })
+    };
+    let service_resolver = crate::dns_stack::rule_host_resolver(
+        &dns_capture,
+        crate::dns_stack::service_dns_resolver(&dns_capture),
+        hosts_bypass,
+    );
     let rule_seeder = Arc::new(
         RuleHostnameSeeder::new(
             Arc::new(nrr_platform_api::dns_budget::BudgetedDnsResolver::new(
-                Arc::clone(&service_resolver) as _,
+                Arc::clone(&service_resolver),
             )),
             Arc::clone(&cache_store),
             Arc::clone(&fqdn_cache),
@@ -936,10 +1032,7 @@ pub(crate) fn build_policy_stack(
     // The saved setting is applied below, so an operator who never opted in
     // keeps the interface-state-only behaviour they had.
     let liveness = Arc::new(SecondaryLivenessTracker::new(0));
-    // Whose routes the service accounts follow, recorded by each pass before
-    // the enforcer runs; machine-scope filters follow the same user.
-    let route_owner = Arc::new(nrr_service_runtime::route_table_owner::RouteTableOwner::default());
-    let enforcer: Arc<dyn PolicyEnforcer> = Arc::new(
+    let nft_enforcer = Arc::new(
         NftPolicyEnforcer::new(Arc::clone(&bindings), Arc::clone(&adapter_port))
             .with_liveness({
                 let liveness = Arc::clone(&liveness);
@@ -960,6 +1053,7 @@ pub(crate) fn build_policy_stack(
                 })
             }),
     );
+    let enforcer: Arc<dyn PolicyEnforcer> = Arc::clone(&nft_enforcer) as Arc<dyn PolicyEnforcer>;
 
     // The consumer matches an observed name against a principal's rules, and asks
     // WHICH principal through a callback. With several users present the answer
@@ -1000,6 +1094,13 @@ pub(crate) fn build_policy_stack(
         .with_primary_behavior_source({
             let stalls = nrr_service_runtime::primary_stall_registry::global_primary_stalls();
             Arc::new(move |hostname: &str| stalls.behavior_of_subtree(hostname))
+        })
+        // The user's mode decides which offers change anything.
+        .with_behavior_mode_source({
+            let policy = Arc::clone(&policy);
+            Arc::new(move |sid: &str| {
+                nrr_service_runtime::per_sid_orchestrator::behavior_mode_of(policy.as_ref(), sid)
+            })
         })
         // The user's "this site refuses" mark: without it the mark is stored
         // and shown, yet the offers never hear it.
@@ -1065,11 +1166,6 @@ pub(crate) fn build_policy_stack(
         )
     };
 
-    // Tunnel servers the drop observer catches a client dialling through the
-    // guard: this session only, planned around from the next pass.
-    let learned_vpn_endpoints =
-        Arc::new(nrr_service_runtime::vpn_endpoint_learning::LearnedVpnEndpoints::new());
-
     // One store, two readers: the tick that learns destinations and the planner
     // that turns them into flows. Two would mean the planner reading a memory
     // nobody fills — which is what "app rules do nothing" looked like.
@@ -1077,7 +1173,9 @@ pub(crate) fn build_policy_stack(
     // The planner writes each principal's rule conflicts, the snapshot handler
     // reads them for the Overlaps screen.
     let app_enforcement = nrr_service_runtime::app_enforcement_status::AppEnforcementStatus::new();
-    let plans: Arc<dyn PrincipalPlanSource> = Arc::new(
+    let shared_ip_exemptions =
+        nrr_service_runtime::app_enforcement_status::SharedIpExemptionStatus::new();
+    let plan_source = Arc::new(
         ProductionPrincipalPlanSource::new(
             rules,
             Arc::clone(&policy),
@@ -1110,11 +1208,15 @@ pub(crate) fn build_policy_stack(
             )),
         )
         .with_rule_conflicts(app_enforcement.clone())
-        .with_learned_vpn_endpoints(Arc::clone(&learned_vpn_endpoints))
+        .with_shared_ip_exemption_status(shared_ip_exemptions.clone())
+        // A reported local segment too wide to be one reaches the user's screen.
+        .with_event_bus(Arc::clone(&events))
         .with_service_accounts(Arc::new(
             nrr_service_runtime::dns_stack::configured_dns_servers_now,
         )),
     );
+    let plans: Arc<dyn PrincipalPlanSource> =
+        Arc::clone(&plan_source) as Arc<dyn PrincipalPlanSource>;
 
     // The other half of enforcement: rtnetlink puts the /32s in the table so the
     // traffic the filters permit on the tunnel actually goes there. Without it a
@@ -1132,6 +1234,68 @@ pub(crate) fn build_policy_stack(
             nrr_platform_linux::policy_routing::LinuxPrincipalRouting::for_this_machine(),
         )),
     );
+
+    // A rule host's first contact with a new address: its route goes in
+    // before the answer leaves, so the first connect takes the link the rule
+    // names instead of the main one until the pass catches up. The route
+    // table owner is the one the resolver answers for.
+    let route_ahead = {
+        let owner = Arc::clone(&route_owner);
+        let plans = Arc::clone(&plan_source);
+        let routes = Arc::clone(&routes);
+        let enforcer = Arc::clone(&enforcer);
+        Arc::new(move |addresses: &[std::net::IpAddr]| {
+            let Some(principal) = owner.current() else {
+                return 0;
+            };
+            let intents = plans.first_contact_routes(
+                &principal,
+                enforcer.channel_availability(&principal),
+                addresses,
+            );
+            if intents.is_empty() {
+                return 0;
+            }
+            let plan = nrr_platform_api::enforcement::EnforcementPlan {
+                principal,
+                flows: Vec::new(),
+                routes: intents,
+                policy_rules: Vec::new(),
+            };
+            match routes.install_ahead(&plan, true) {
+                Ok(installed) => installed,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "nrr::routes",
+                        msg_key = "route-first-contact-install-failed",
+                        error = %error,
+                        "first-contact routes did not install — the next pass adds them",
+                    );
+                    0
+                }
+            }
+        })
+    };
+    let first_contact: nrr_service_runtime::dns_resolver_ports::FirstContactFn = {
+        let route_ahead = Arc::clone(&route_ahead);
+        Arc::new(move |addresses: &[std::net::Ipv4Addr]| {
+            let addresses: Vec<std::net::IpAddr> = addresses
+                .iter()
+                .copied()
+                .map(std::net::IpAddr::V4)
+                .collect();
+            route_ahead(addresses.as_slice())
+        })
+    };
+    let first_contact_v6: nrr_service_runtime::dns_resolver_ports::FirstContactV6Fn =
+        Arc::new(move |addresses: &[std::net::Ipv6Addr]| {
+            let addresses: Vec<std::net::IpAddr> = addresses
+                .iter()
+                .copied()
+                .map(std::net::IpAddr::V6)
+                .collect();
+            route_ahead(addresses.as_slice())
+        });
 
     // The persisted window, if the operator set one. Read once at build: a live
     // change reaches the tracker through the settings writer, exactly as on the
@@ -1155,7 +1319,6 @@ pub(crate) fn build_policy_stack(
         };
         let cache = Arc::clone(&cache_store);
         let observations = Arc::clone(&app_observations);
-        let learned = Arc::clone(&learned_vpn_endpoints);
         PassInputs::new()
             .with_source("applying", applying_revision())
             .with_source("verdicts", verify_verdicts())
@@ -1171,15 +1334,6 @@ pub(crate) fn build_policy_stack(
                 Arc::new(move || cache.lock().ok()?.change_generation()),
             )
             .with_source("apps", Arc::new(move || Some(observations.generation())))
-            // A learned server is planned around only by a pass that runs.
-            .with_source(
-                "vpn-learned",
-                hashed(move || {
-                    let mut servers = learned.current(std::time::SystemTime::now());
-                    servers.sort_unstable();
-                    Ok::<_, std::convert::Infallible>(servers)
-                }),
-            )
             .with_source(
                 "adapters",
                 hashed(move || adapter_port_for_inputs.enumerate_all()),
@@ -1195,6 +1349,30 @@ pub(crate) fn build_policy_stack(
                 "rules-in-front",
                 hashed(nrr_platform_linux::policy_routing::rules_in_front_of_ours),
             )
+            // What the kernel holds of ours: a `flush ruleset` or `ip rule
+            // flush` by another program moves nothing else a pass reads. Own
+            // writes, like the routes: the pass is what puts them there.
+            .with_own_writes_source("nft", {
+                let enforcer = Arc::clone(&nft_enforcer);
+                Arc::new(move || enforcer.installed_fingerprint())
+            })
+            .with_own_writes_source(
+                "selectors",
+                hashed(nrr_platform_linux::policy_routing::installed_selectors_fingerprint),
+            )
+    };
+
+    // Who paused their routing: the pass leaves them out, which is what takes
+    // their nft rules and routes down and, on resume, puts them back. A read
+    // that fails pauses nobody — the leak guard is not lifted by a failure.
+    let paused_principals: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+        let conn = Arc::clone(&state_conn);
+        Arc::new(move || {
+            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+            nrr_storage::pause_state::RoutingPauseStateRepository::new(&guard)
+                .list_paused()
+                .unwrap_or_default()
+        })
     };
 
     // Writing the trace to the log is a window that closes by itself, the
@@ -1264,12 +1442,6 @@ pub(crate) fn build_policy_stack(
             adapter_port_for_drops,
         ),
         notice_sink: drop_observation::notice_sink(Arc::clone(&block_notice_center)),
-        vpn_endpoint_learner: {
-            let learned = Arc::clone(&learned_vpn_endpoints);
-            Arc::new(move |ip| {
-                learned.register(ip, std::time::SystemTime::now());
-            })
-        },
         log_ndjson: conn_trace_log.flag(),
         // A socket older than the pin that caught it never reaches the tunnel.
         stale_flow_reset: Some(Arc::new(
@@ -1279,15 +1451,19 @@ pub(crate) fn build_policy_stack(
 
     Some(PolicyStack {
         app_enforcement,
+        shared_ip_exemptions,
         drop_observation,
         block_notice_center,
         block_notice_journal,
+        first_contact,
+        first_contact_v6,
         dns_capture,
         service_resolver,
         state_conn,
         cache_store,
         app_observations,
         rules: rules_for_stack,
+        rules_provider: production_rules,
         auto_rules,
         liveness,
         rule_seeder,
@@ -1310,7 +1486,8 @@ pub(crate) fn build_policy_stack(
                 .with_enforcement_status(enforcement_status)
                 .with_fail_closed_posture_status(fail_closed_posture)
                 .with_pass_inputs(pass_inputs)
-                .with_flow_reset(flow_reset),
+                .with_flow_reset(flow_reset)
+                .with_paused_principals(paused_principals),
         ),
         traffic_sampler: open_traffic_sampler(&artifacts.topology.traffic_db_path),
     })

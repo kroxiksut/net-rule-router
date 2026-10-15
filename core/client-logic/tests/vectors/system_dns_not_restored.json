@@ -1,0 +1,151 @@
+{
+  "description": "pure.js systemDnsNotRestored: whether a health answer says the system DNS was left redirected",
+  "cases": [
+    {
+      "name": "no answer",
+      "input": {
+        "health": null
+      },
+      "expected": false
+    },
+    {
+      "name": "healthy, no components",
+      "input": {
+        "health": {
+          "service-state": "running",
+          "components": []
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "missing components",
+      "input": {
+        "health": {
+          "service-state": "running"
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "the apply component says so",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "apply",
+              "severity": "degraded",
+              "message": "system DNS could not be restored: access denied"
+            }
+          ]
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "the same words on another component",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "background-tasks",
+              "severity": "degraded",
+              "message": "system DNS could not be restored"
+            }
+          ]
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "apply degraded for another reason",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "apply",
+              "severity": "degraded",
+              "message": "serve loop ended: closed"
+            }
+          ]
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "apply without a message",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "apply",
+              "severity": "degraded"
+            }
+          ]
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "apply with a null message",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "apply",
+              "severity": "degraded",
+              "message": null
+            }
+          ]
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "among other components",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "storage",
+              "severity": "ok"
+            },
+            null,
+            {
+              "component": "apply",
+              "severity": "degraded",
+              "message": "x system DNS could not be restored"
+            }
+          ]
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "components not a list",
+      "input": {
+        "health": {
+          "components": {
+            "component": "apply",
+            "message": "system DNS could not be restored"
+          }
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "component name differs in case",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "Apply",
+              "message": "system DNS could not be restored"
+            }
+          ]
+        }
+      },
+      "expected": false
+    }
+  ]
+}

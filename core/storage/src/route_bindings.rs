@@ -190,6 +190,9 @@ pub struct RoutePolicyRecord {
     /// other link's address rules name. Off by default: routes are per
     /// address, so a taken address goes that way for every program.
     pub app_rules_take_all_addresses: bool,
+    /// What WSL gets while the tunnel is down: "" (not answered yet; behaves
+    /// as the computer), "as-computer" or "unprotected".
+    pub forwarded_outage: String,
     /// "Treat a domain as `domain` + `*.domain`". When `true`, the
     /// enforcement layer expands every bare-domain (`ExactFqdn`) rule with a
     /// `SuffixDomain` sibling so it also covers subdomains (apex kept).
@@ -226,6 +229,10 @@ pub struct RoutePolicyRecord {
     /// [`DohLockdownScope::LeakProtectionOnly`] (default — only while the
     /// kill-switch / block-all is armed) or [`DohLockdownScope::Always`].
     pub doh_lockdown_scope: DohLockdownScope,
+    /// The lockdown decides itself: on while this user has rules for the
+    /// additional route, whatever the two fields above say. Default `true`;
+    /// a hand-set toggle turns it off.
+    pub doh_lockdown_auto: bool,
     /// Opt-in AUTOMATIC browser-history seed: when
     /// `true`, the service runs the (rule-gated) browser-history seed pass on
     /// its own at boot, without the manual button. Default `false` — browser
@@ -286,6 +293,7 @@ impl RoutePolicyRecord {
             short_name_completion: false,
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
+            forwarded_outage: String::new(),
             // Default ON: adding `site.example` and silently losing
             // `cdn.site.example` to the other route was the surprising outcome.
             // Widening only adds coverage towards the route the rule names, so
@@ -297,6 +305,7 @@ impl RoutePolicyRecord {
             resolve_hosts_bypass: true,
             doh_lockdown_enabled: false,
             doh_lockdown_scope: DohLockdownScope::default(),
+            doh_lockdown_auto: true,
             browser_history_auto_seed: false,
             kill_switch_strict_shared_ips: false,
             // Collect companion-domain findings and offer them; apply nothing
@@ -394,6 +403,7 @@ struct BlockPolicyRow {
     resolve_hosts_bypass: bool,
     doh_lockdown_enabled: bool,
     doh_lockdown_scope: DohLockdownScope,
+    doh_lockdown_auto: bool,
     browser_history_auto_seed: bool,
     kill_switch_strict_shared_ips: bool,
     auto_rules_mode: AutoRulesMode,
@@ -407,6 +417,7 @@ struct BlockPolicyRow {
     short_name_completion: bool,
     short_name_suffix: String,
     app_rules_take_all_addresses: bool,
+    forwarded_outage: String,
 }
 
 impl Default for BlockPolicyRow {
@@ -424,6 +435,7 @@ impl Default for BlockPolicyRow {
             resolve_hosts_bypass: true,
             doh_lockdown_enabled: false,
             doh_lockdown_scope: DohLockdownScope::default(),
+            doh_lockdown_auto: true,
             browser_history_auto_seed: false,
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: AutoRulesMode::default(),
@@ -437,6 +449,7 @@ impl Default for BlockPolicyRow {
             short_name_completion: false,
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
+            forwarded_outage: String::new(),
         }
     }
 }
@@ -547,9 +560,10 @@ impl<'c> RouteBindingsRepository<'c> {
                  primary_probe_timeout_ms, primary_probe_max_targets, \
                  primary_probe_repeat_secs, local_networks_auto_accept, \
                  zone_priority_over_ip, short_name_completion, short_name_suffix, \
-                 app_rules_take_all_addresses, updated_at)
+                 app_rules_take_all_addresses, updated_at, doh_lockdown_auto, \
+                 forwarded_outage)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
              ON CONFLICT(sid) DO UPDATE SET
                 block_secondary_when_unavailable = excluded.block_secondary_when_unavailable,
                 kill_switch_fail_closed = excluded.kill_switch_fail_closed,
@@ -576,7 +590,9 @@ impl<'c> RouteBindingsRepository<'c> {
                 short_name_completion = excluded.short_name_completion,
                 short_name_suffix = excluded.short_name_suffix,
                 app_rules_take_all_addresses = excluded.app_rules_take_all_addresses,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                doh_lockdown_auto = excluded.doh_lockdown_auto,
+                forwarded_outage = excluded.forwarded_outage",
             params![
                 sid,
                 record.block_secondary_when_unavailable as i64,
@@ -604,7 +620,9 @@ impl<'c> RouteBindingsRepository<'c> {
                 record.short_name_completion as i64,
                 record.short_name_suffix,
                 record.app_rules_take_all_addresses as i64,
-                now_epoch_secs
+                now_epoch_secs,
+                record.doh_lockdown_auto as i64,
+                forwarded_outage_slug(&record.forwarded_outage)
             ],
         )
         .map_err(|e| StorageError::Internal(format!("upsert block policy: {e}")))?;
@@ -766,6 +784,7 @@ impl<'c> RouteBindingsRepository<'c> {
             resolve_hosts_bypass: policy.resolve_hosts_bypass,
             doh_lockdown_enabled: policy.doh_lockdown_enabled,
             doh_lockdown_scope: policy.doh_lockdown_scope,
+            doh_lockdown_auto: policy.doh_lockdown_auto,
             browser_history_auto_seed: policy.browser_history_auto_seed,
             kill_switch_strict_shared_ips: policy.kill_switch_strict_shared_ips,
             auto_rules_mode: policy.auto_rules_mode,
@@ -779,6 +798,7 @@ impl<'c> RouteBindingsRepository<'c> {
             short_name_completion: policy.short_name_completion,
             short_name_suffix: policy.short_name_suffix,
             app_rules_take_all_addresses: policy.app_rules_take_all_addresses,
+            forwarded_outage: policy.forwarded_outage,
             binding_source,
         })
     }
@@ -880,7 +900,8 @@ impl<'c> RouteBindingsRepository<'c> {
                  primary_probe_timeout_ms, primary_probe_max_targets, \
                  primary_probe_repeat_secs, \
                  local_networks_auto_accept, zone_priority_over_ip, \
-                 short_name_completion, short_name_suffix, app_rules_take_all_addresses
+                 short_name_completion, short_name_suffix, app_rules_take_all_addresses, \
+                 doh_lockdown_auto, forwarded_outage
                  FROM secondary_block_policy WHERE sid = ?1",
                 params![sid],
                 |row| {
@@ -931,6 +952,8 @@ impl<'c> RouteBindingsRepository<'c> {
                         short_name_completion: row.get::<_, i64>(22)? != 0,
                         short_name_suffix: row.get(23)?,
                         app_rules_take_all_addresses: row.get::<_, i64>(24)? != 0,
+                        doh_lockdown_auto: row.get::<_, i64>(25)? != 0,
+                        forwarded_outage: row.get(26)?,
                     })
                 },
             )
@@ -1215,6 +1238,16 @@ fn merged_known_ids(
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+/// The stored spelling of the WSL outage answer: one of the three the column
+/// accepts, anything else the unanswered "".
+fn forwarded_outage_slug(value: &str) -> &'static str {
+    match value {
+        "as-computer" => "as-computer",
+        "unprotected" => "unprotected",
+        _ => "",
+    }
+}
 
 #[cfg(test)]
 mod tests;

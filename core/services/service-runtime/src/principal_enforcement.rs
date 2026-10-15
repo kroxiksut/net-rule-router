@@ -52,6 +52,16 @@ use nrr_platform_api::enforcement::{
 /// enabled rules. That is a legitimate answer, not a failure: a user who has not
 /// set up routing has no policy, and inventing an empty one would be a decision
 /// nobody made.
+/// What planning for one principal found. "Could not read" is kept apart from
+/// "nothing to plan": only the second may remove what is installed.
+pub enum PlanRead {
+    Planned(PlannedPolicy),
+    /// No policy or no rules: nothing is planned, so nothing stays installed.
+    NoPolicy,
+    /// The inputs could not be read. The pass keeps the principal's last plan.
+    Unreadable(String),
+}
+
 pub trait PrincipalPlanSource: Send + Sync {
     /// `availability` is what the platform can actually send over at this
     /// instant. It is an INPUT to the plan, not a detail of applying it: with
@@ -63,6 +73,19 @@ pub trait PrincipalPlanSource: Send + Sync {
         principal: &UserPrincipal,
         availability: ChannelAvailability,
     ) -> Option<PlannedPolicy>;
+
+    /// [`Self::plan_for`] that says why there is no plan. Fixtures never fail
+    /// to read their inputs.
+    fn plan_read_for(
+        &self,
+        principal: &UserPrincipal,
+        availability: ChannelAvailability,
+    ) -> PlanRead {
+        match self.plan_for(principal, availability) {
+            Some(planned) => PlanRead::Planned(planned),
+            None => PlanRead::NoPolicy,
+        }
+    }
 
     /// Called once before the pass's first `plan_for`.
     ///
@@ -184,6 +207,13 @@ pub struct PrincipalEnforcementCycle {
     /// Tells each present principal whether their channels carry their rules.
     /// `None` reports nothing.
     channel_status: Option<crate::channel_status::ChannelStatusPublisher>,
+    /// Who asked for their routing to be paused, as stored principals. A paused
+    /// principal is left out of the pass entirely, so the platform drops their
+    /// filters and routes on the pass that reads the flag. `None` = nobody.
+    paused: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
+    /// Where each pass's verdict lands on `HealthComponent::Apply`. Set once,
+    /// after construction, like the presence listener.
+    health: std::sync::OnceLock<Arc<crate::health::HealthAggregator>>,
 }
 
 /// One line counting what changed between two passes, per principal. Counts
@@ -295,7 +325,26 @@ impl PrincipalEnforcementCycle {
             someone_present: AtomicBool::new(false),
             route_owner: Arc::default(),
             channel_status: None,
+            paused: None,
+            health: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Report every pass on `HealthComponent::Apply`; a later call is ignored.
+    pub fn set_health(&self, health: Arc<crate::health::HealthAggregator>) {
+        let _ = self.health.set(health);
+    }
+
+    /// Read, once per pass, who paused their routing (stored principals). They
+    /// are planned for as if absent: the same pass that installs everyone else
+    /// removes their filters and routes, and the next resume puts them back.
+    #[must_use]
+    pub fn with_paused_principals(
+        mut self,
+        paused: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
+        self.paused = Some(paused);
+        self
     }
 
     /// Report each present principal's channel status on `board`, which the
@@ -398,6 +447,9 @@ impl PrincipalEnforcementCycle {
     fn pass(&self, skip_if_unchanged: bool) -> CycleOutcome {
         let outcome = self.run_pass(skip_if_unchanged);
         self.last_pass_at.store(epoch_secs(), Ordering::Relaxed);
+        if let Some(health) = self.health.get() {
+            crate::apply_health::report_cycle_outcome(health, &outcome);
+        }
         if self.someone_present.load(Ordering::Acquire) {
             if let Some(listener) = self.presence_listener.get() {
                 listener();
@@ -439,10 +491,19 @@ impl PrincipalEnforcementCycle {
             }
         };
 
+        // Presence is about the person, not their policy: a paused user is
+        // still signed in, and what listens here (the resolver) serves them.
+        self.someone_present
+            .store(!present.is_empty(), Ordering::Release);
+        // A paused principal is not planned for, not routed, not an owner: the
+        // pass treats them as signed out until they resume.
+        let paused = self.paused.as_ref().map(|read| read()).unwrap_or_default();
+        let present: Vec<_> = present
+            .into_iter()
+            .filter(|p| !paused.iter().any(|s| s == p.principal.as_stored()))
+            .collect();
         let owner = crate::route_table_owner::choose_route_table_owner(&present).cloned();
         let active: Vec<UserPrincipal> = present.into_iter().map(|p| p.principal).collect();
-        self.someone_present
-            .store(!active.is_empty(), Ordering::Release);
         let reports: Vec<ChannelReport> = active
             .iter()
             .map(|principal| self.enforcer.channel_report(principal))
@@ -476,9 +537,35 @@ impl PrincipalEnforcementCycle {
         let mut wants_machine_wide_cut: std::collections::BTreeMap<String, bool> =
             std::collections::BTreeMap::new();
         let mut guarded = 0usize;
+        // Principals whose inputs could not be read this pass. Their last plan
+        // is carried forward; with none to carry, the pass changes nothing.
+        let mut held_back: Vec<String> = Vec::new();
         for (principal, availability) in active.iter().zip(availability.iter().copied()) {
-            let Some(planned) = self.plans.plan_for(principal, availability) else {
-                continue;
+            let planned = match self.plans.plan_read_for(principal, availability) {
+                PlanRead::Planned(planned) => planned,
+                PlanRead::NoPolicy => continue,
+                PlanRead::Unreadable(reason) => {
+                    held_back.push(principal.as_stored().to_owned());
+                    let previous = last
+                        .as_deref()
+                        .and_then(|plans| plans.iter().find(|p| p.principal == *principal))
+                        .cloned();
+                    match previous {
+                        Some(plan) => plans.push(plan),
+                        None => {
+                            if let Some(inputs) = self.inputs.as_ref() {
+                                inputs.unsettle();
+                            }
+                            return CycleOutcome::EnforcementFailed {
+                                persistent: false,
+                                reason: format!(
+                                    "rule book unreadable for a present user and nothing applied yet to keep: {reason}"
+                                ),
+                            };
+                        }
+                    }
+                    continue;
+                }
             };
             if !planned.protection_complete {
                 unprotected.push(principal.as_stored().to_owned());
@@ -583,10 +670,11 @@ impl PrincipalEnforcementCycle {
                     }
                 }
                 // A failed route apply usually leaves the table as it was, so
-                // nothing in the inputs would move to bring the retry back.
+                // nothing in the inputs would move to bring the retry back;
+                // neither does a book that did not read.
                 if let Some(inputs) = self.inputs.as_ref() {
                     match fingerprint {
-                        Some(fp) if !routes_failed => inputs.settle(fp),
+                        Some(fp) if !routes_failed && held_back.is_empty() => inputs.settle(fp),
                         _ => inputs.unsettle(),
                     }
                 }
@@ -646,6 +734,62 @@ impl PrincipalEnforcementCycle {
         outcome
     }
 
+    /// Who a pass would plan for now, as stored principals; nobody when the
+    /// authority cannot answer.
+    pub fn present_stored(&self) -> Vec<String> {
+        self.principals
+            .present_principals()
+            .map(|present| {
+                present
+                    .into_iter()
+                    .map(|p| p.principal.as_stored().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Plan `stored`'s policy as a pass would now and ask the platform whether
+    /// it would take it, installing nothing — the pre-flight of a strict
+    /// activation, whose caller previews the candidate rules on this thread.
+    /// Only that principal is planned, so another user's rules can never
+    /// refuse this one's change. Absent, paused or without policy, a pass
+    /// would plan nothing for them either: nothing to check.
+    pub fn check_for(&self, stored: &str) -> Result<(), String> {
+        // Held like a pass: planning drops the machine reading a concurrent
+        // pass may be planning against.
+        let _pass = self.last_applied.lock().unwrap_or_else(|p| p.into_inner());
+        if self.stopped.load(Ordering::Acquire) || crate::teardown_in_progress() {
+            return Err("the service is stopping; the change was not checked".to_owned());
+        }
+        let present = self
+            .principals
+            .present_principals()
+            .map_err(|e| format!("could not determine who is logged in: {e}"))?;
+        let paused = self.paused.as_ref().map(|read| read()).unwrap_or_default();
+        if paused.iter().any(|s| s == stored) {
+            return Ok(());
+        }
+        let Some(principal) = present
+            .into_iter()
+            .map(|p| p.principal)
+            .find(|p| p.as_stored() == stored)
+        else {
+            return Ok(());
+        };
+        let availability = self.enforcer.channel_report(&principal).availability();
+        self.plans.begin_pass();
+        let plan = match self.plans.plan_read_for(&principal, availability) {
+            PlanRead::Planned(planned) => planned.plan,
+            PlanRead::NoPolicy => return Ok(()),
+            PlanRead::Unreadable(reason) => {
+                return Err(format!("the rules could not be read: {reason}"));
+            }
+        };
+        self.enforcer
+            .check(std::slice::from_ref(&plan))
+            .map_err(|failure| failure.reason)
+    }
+
     /// Tell the principals who need to know, and only them.
     ///
     /// Published on a CHANGE, never on the identical re-apply that follows every
@@ -689,21 +833,57 @@ impl PrincipalEnforcementCycle {
     /// Remove everything this product installed. Called on graceful stop: a
     /// daemon that exits leaving its policy in the kernel leaves the machine
     /// enforcing rules nothing is maintaining any more.
-    ///
-    /// Filters first, then routes — the opposite order to applying them. A
-    /// moment with routes but no filters still carries traffic over the link
-    /// the user chose; the reverse leaves the leak-guard `drop` in place with
-    /// nothing steering around it, which is a machine with no network.
     pub fn teardown(&self) -> Result<(), String> {
+        use crate::lifecycle_matrix::{FilterTeardown, RouteTeardown, StopPlan};
+        self.teardown_with(StopPlan {
+            routes: RouteTeardown::RemoveAll,
+            filters: FilterTeardown::RemoveAll,
+        })
+    }
+
+    /// [`Self::teardown`] following a stop plan, in [`TEARDOWN_ORDER`]: routes
+    /// go first and the filters last, under a deadline. Between the two a rule
+    /// host is blocked, never leaked; a plan that keeps everything (a machine
+    /// shutdown) only latches the cycle.
+    ///
+    /// [`TEARDOWN_ORDER`]: crate::lifecycle_matrix::TEARDOWN_ORDER
+    pub fn teardown_with(&self, plan: crate::lifecycle_matrix::StopPlan) -> Result<(), String> {
+        use crate::lifecycle_matrix::{
+            within_deadline, FilterTeardown, RouteTeardown, FILTER_TEARDOWN_DEADLINE,
+        };
         // Held for the whole teardown, and the latch is set inside it: a pass
         // already under way finishes, no later one starts, and the last word on
         // the kernel's contents is this one.
         let _pass = self.last_applied.lock().unwrap_or_else(|p| p.into_inner());
         self.stopped.store(true, Ordering::Release);
-        let filters = self.enforcer.teardown().map_err(|e| e.to_string());
-        let routes = match self.routes.as_ref() {
-            Some(applier) => applier.clear().map(|_| ()),
-            None => Ok(()),
+        let routes = match (plan.routes, self.routes.as_ref()) {
+            (RouteTeardown::Keep, _) | (_, None) => Ok(()),
+            (RouteTeardown::KeepRuleRoutes, Some(applier)) => {
+                applier.retain_rule_routes().map(|report| {
+                    tracing::info!(
+                        target: "nrr::enforcement",
+                        msg_key = "principal-stop-kept-rule-routes",
+                        removed_overlays = report.removed,
+                        "service stopping — kept the rule routes on the additional link; removed our overlays",
+                    );
+                })
+            }
+            (RouteTeardown::RemoveAll, Some(applier)) => applier.clear().map(|_| ()),
+        };
+        let filters = match plan.filters {
+            FilterTeardown::Keep => Ok(()),
+            FilterTeardown::RemoveAll => {
+                let enforcer = Arc::clone(&self.enforcer);
+                match within_deadline("filter-teardown", FILTER_TEARDOWN_DEADLINE, move || {
+                    enforcer.teardown()
+                }) {
+                    Some(outcome) => outcome.map_err(|e| e.to_string()),
+                    None => Err(format!(
+                        "filter removal did not finish within {} s",
+                        FILTER_TEARDOWN_DEADLINE.as_secs()
+                    )),
+                }
+            }
         };
         match (filters, routes) {
             (Ok(()), Ok(())) => Ok(()),
@@ -1079,6 +1259,144 @@ mod tests {
         UserPrincipal::from_linux_uid(n)
     }
 
+    /// Records what it was asked to check, refuses every check when told to,
+    /// and counts installs, which a check must never cause.
+    #[derive(Default)]
+    struct CheckingEnforcer {
+        refuse: bool,
+        times_out: bool,
+        checked: Mutex<Vec<Vec<String>>>,
+        enforced: AtomicUsize,
+    }
+    impl PolicyEnforcer for CheckingEnforcer {
+        fn enforce(&self, _plans: &[EnforcementPlan]) -> Result<ApplyReport, EnforcementFailure> {
+            self.enforced.fetch_add(1, Ordering::AcqRel);
+            Ok(ApplyReport {
+                applied: 0,
+                skipped: 0,
+                failed: 0,
+                notes: Vec::new(),
+            })
+        }
+        fn check(&self, plans: &[EnforcementPlan]) -> Result<(), EnforcementFailure> {
+            self.checked.lock().unwrap_or_else(|p| p.into_inner()).push(
+                plans
+                    .iter()
+                    .map(|p| p.principal.as_stored().to_owned())
+                    .collect(),
+            );
+            if self.refuse {
+                return Err(EnforcementFailure::persistent(
+                    "nft refused the ruleset: Invalid argument",
+                ));
+            }
+            if self.times_out {
+                return Err(EnforcementFailure::transient(
+                    "nft --check did not answer in time",
+                ));
+            }
+            Ok(())
+        }
+        fn channel_availability(&self, _principal: &UserPrincipal) -> ChannelAvailability {
+            ChannelAvailability {
+                primary: true,
+                secondary: true,
+            }
+        }
+        fn teardown(&self) -> Result<(), EnforcementFailure> {
+            Ok(())
+        }
+    }
+
+    fn checking_cycle(
+        answer: Option<Vec<UserPrincipal>>,
+        without_policy: Vec<String>,
+        enforcer: Arc<CheckingEnforcer>,
+    ) -> PrincipalEnforcementCycle {
+        PrincipalEnforcementCycle::new(
+            Arc::new(ScriptedPrincipals { answer }),
+            Arc::new(PlanEveryone { without_policy }),
+            enforcer,
+        )
+    }
+
+    /// Another user's rules can never refuse this one's change, and a check
+    /// installs nothing.
+    #[test]
+    fn a_check_plans_only_the_named_principal_and_installs_nothing() {
+        let enforcer = Arc::new(CheckingEnforcer::default());
+        let c = checking_cycle(
+            Some(vec![uid(1000), uid(1001)]),
+            Vec::new(),
+            Arc::clone(&enforcer),
+        );
+
+        c.check_for(uid(1001).as_stored()).expect("accepted");
+        assert_eq!(
+            *enforcer.checked.lock().expect("checked"),
+            vec![vec![uid(1001).as_stored().to_owned()]]
+        );
+        assert_eq!(enforcer.enforced.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_refused_check_carries_the_platform_s_reason_and_installs_nothing() {
+        let enforcer = Arc::new(CheckingEnforcer {
+            refuse: true,
+            ..CheckingEnforcer::default()
+        });
+        let c = checking_cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer));
+
+        let reason = c.check_for(uid(1000).as_stored()).expect_err("refused");
+        assert!(reason.contains("Invalid argument"), "{reason}");
+        assert_eq!(enforcer.enforced.load(Ordering::Acquire), 0);
+    }
+
+    /// A check that never answered is not one that passed: under the strict
+    /// policy the revision is refused rather than applied unchecked.
+    #[test]
+    fn a_check_that_times_out_refuses_the_change() {
+        let enforcer = Arc::new(CheckingEnforcer {
+            times_out: true,
+            ..CheckingEnforcer::default()
+        });
+        let c = checking_cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer));
+
+        let reason = c.check_for(uid(1000).as_stored()).expect_err("refused");
+        assert!(reason.contains("did not answer"), "{reason}");
+        assert_eq!(enforcer.enforced.load(Ordering::Acquire), 0);
+    }
+
+    /// A pass would plan nothing for them either.
+    #[test]
+    fn someone_absent_or_without_policy_has_nothing_to_check() {
+        let enforcer = Arc::new(CheckingEnforcer {
+            refuse: true,
+            ..CheckingEnforcer::default()
+        });
+        let c = checking_cycle(
+            Some(vec![uid(1000)]),
+            vec![uid(1000).as_stored().to_owned()],
+            Arc::clone(&enforcer),
+        );
+
+        c.check_for(uid(1000).as_stored()).expect("no policy");
+        c.check_for(uid(1001).as_stored()).expect("absent");
+        assert!(enforcer.checked.lock().expect("checked").is_empty());
+    }
+
+    /// An authority that cannot answer is not a check that passed.
+    #[test]
+    fn an_unreadable_authority_refuses_the_check_and_serves_nobody() {
+        let enforcer = Arc::new(CheckingEnforcer::default());
+        let c = checking_cycle(None, Vec::new(), Arc::clone(&enforcer));
+
+        assert!(c.check_for(uid(1000).as_stored()).is_err());
+        assert!(c.present_stored().is_empty());
+        let present = checking_cycle(Some(vec![uid(1000)]), Vec::new(), enforcer);
+        assert_eq!(present.present_stored(), vec![uid(1000).as_stored()]);
+    }
+
     /// The load-bearing distinction: a failed query is not "nobody". Applying an
     /// empty set here would strip every user's routing because the authority was
     /// unreachable for one tick.
@@ -1139,6 +1457,91 @@ mod tests {
 
         c.tick();
         assert_eq!(enforcer.calls(), vec![vec!["unix:uid:1001".to_owned()]]);
+    }
+
+    /// A pause removes one user's policy on the pass that reads the flag and
+    /// leaves the others alone; a resume brings it back on the next one.
+    #[test]
+    fn a_paused_principal_is_left_out_of_the_pass_until_resumed() {
+        let paused = Arc::new(Mutex::new(vec!["unix:uid:1000".to_owned()]));
+        let read = Arc::clone(&paused);
+        let enforcer = Arc::new(RecordingEnforcer::new(false));
+        let c = cycle(
+            Some(vec![uid(1000), uid(1001)]),
+            Vec::new(),
+            Arc::clone(&enforcer),
+        )
+        .with_paused_principals(Arc::new(move || {
+            read.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }));
+
+        assert!(matches!(
+            c.tick(),
+            CycleOutcome::Applied { ref principals, .. }
+                if principals == &["unix:uid:1001".to_owned()]
+        ));
+        paused.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        c.tick();
+        assert_eq!(
+            enforcer.calls(),
+            vec![
+                vec!["unix:uid:1001".to_owned()],
+                vec!["unix:uid:1000".to_owned(), "unix:uid:1001".to_owned()],
+            ],
+        );
+    }
+
+    /// Pausing is a change the skip-if-unchanged pass must see: the flag is
+    /// not one of the pass inputs, so the active set itself carries it.
+    #[test]
+    fn a_pause_is_a_change_for_the_pass_that_skips_when_nothing_moved() {
+        let paused = Arc::new(Mutex::new(Vec::<String>::new()));
+        let read = Arc::clone(&paused);
+        let enforcer = Arc::new(RecordingEnforcer::new(false));
+        let c = cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer))
+            .with_pass_inputs(
+                crate::pass_inputs::PassInputs::new().with_source("test", Arc::new(|| Some(1))),
+            )
+            .with_paused_principals(Arc::new(move || {
+                read.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            }));
+
+        assert!(matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::Applied { .. }
+        ));
+        assert!(matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::Unchanged
+        ));
+        paused
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push("unix:uid:1000".to_owned());
+        assert!(matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::Applied { ref principals, .. } if principals.is_empty()
+        ));
+        assert_eq!(enforcer.calls().len(), 2);
+    }
+
+    /// A paused user is still signed in: the resolver that listens for
+    /// presence keeps serving them while their routing is off.
+    #[test]
+    fn a_paused_principal_still_counts_as_present() {
+        use std::sync::atomic::AtomicUsize;
+        let heard = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&heard);
+        let enforcer = Arc::new(RecordingEnforcer::new(false));
+        let c = cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer))
+            .with_paused_principals(Arc::new(|| vec!["unix:uid:1000".to_owned()]));
+        c.set_presence_listener(Arc::new(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+        }));
+
+        c.tick();
+        assert_eq!(enforcer.calls(), vec![Vec::<String>::new()]);
+        assert_eq!(heard.load(Ordering::Acquire), 1);
     }
 
     /// Change detection drives the log, not the apply: the second tick still
@@ -1380,6 +1783,38 @@ mod tests {
         assert_eq!(enforcer.calls().len(), 2);
     }
 
+    /// A refused pass used to be a log line only; the service kept reporting
+    /// `Running` with nothing in force.
+    #[test]
+    fn a_refused_pass_degrades_apply_health_until_a_pass_succeeds() {
+        use crate::health::{HealthAggregator, HealthComponent};
+        use crate::state::{ServiceHealthSeverity, ServiceRuntimeState};
+
+        let enforcer = Arc::new(RecordingEnforcer::new(true));
+        let c = cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer));
+        let health = Arc::new(HealthAggregator::new());
+        health.clear_lifecycle_override();
+        health.record_initial(HealthComponent::Storage, ServiceHealthSeverity::Ok, "ok");
+        c.set_health(Arc::clone(&health));
+        let apply = |health: &HealthAggregator| {
+            health
+                .snapshot()
+                .components
+                .into_iter()
+                .find(|component| component.component == HealthComponent::Apply)
+                .map(|component| component.severity)
+        };
+
+        c.tick_if_changed_logged("timer");
+        assert_eq!(apply(&health), Some(ServiceHealthSeverity::Degraded));
+        assert_eq!(health.snapshot().state, ServiceRuntimeState::Degraded);
+
+        *enforcer.fail.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        c.tick_if_changed_logged("timer");
+        assert_eq!(apply(&health), None);
+        assert_eq!(health.snapshot().state, ServiceRuntimeState::Running);
+    }
+
     /// Handing the same plans to a platform that refused them for good only
     /// spawns the same refusal every tick.
     #[test]
@@ -1514,8 +1949,14 @@ mod tests {
 
         let mock = Arc::new(MockStaleFlowReset::new());
         let mine = EstablishedFlow {
-            local: std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 50_000),
-            remote: std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(203, 0, 113, 5), 443),
+            local: std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::new(192, 0, 2, 1),
+                50_000,
+            )),
+            remote: std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::new(203, 0, 113, 5),
+                443,
+            )),
             owner: Some(uid(1000).as_stored().to_owned()),
             pid: None,
             image: None,
@@ -1554,6 +1995,108 @@ mod tests {
 
         assert!(matches!(c.tick(), CycleOutcome::Stopped));
         assert_eq!(enforcer.calls().len(), 1);
+    }
+
+    /// A machine shutdown keeps the policy in the kernel to the end: the stop
+    /// latches the cycle and removes nothing.
+    #[test]
+    fn a_machine_shutdown_latches_the_cycle_and_removes_nothing() {
+        use crate::lifecycle_matrix::{stop_plan, LifecycleInputs, StopReason};
+        let enforcer = Arc::new(RecordingEnforcer::new(false));
+        let c = cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer));
+        c.tick();
+
+        c.teardown_with(stop_plan(
+            StopReason::MachineShutdown,
+            LifecycleInputs::default(),
+        ))
+        .expect("teardown");
+        assert_eq!(enforcer.teardowns.load(Ordering::Acquire), 0);
+        assert!(matches!(c.tick(), CycleOutcome::Stopped));
+
+        let plain = cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer));
+        plain
+            .teardown_with(stop_plan(
+                StopReason::ServiceStop,
+                LifecycleInputs::default(),
+            ))
+            .expect("teardown");
+        assert_eq!(enforcer.teardowns.load(Ordering::Acquire), 1);
+    }
+
+    /// A book that cannot be read keeps the principal's last plan in force
+    /// and leaves the pass unsettled, so the next tick asks again.
+    #[test]
+    fn an_unreadable_book_keeps_the_last_plan_and_never_settles() {
+        use std::sync::atomic::AtomicBool;
+        struct Flaky {
+            inner: Arc<dyn PrincipalPlanSource>,
+            unreadable: AtomicBool,
+        }
+        impl PrincipalPlanSource for Flaky {
+            fn plan_for(
+                &self,
+                principal: &UserPrincipal,
+                availability: ChannelAvailability,
+            ) -> Option<PlannedPolicy> {
+                self.inner.plan_for(principal, availability)
+            }
+            fn plan_read_for(
+                &self,
+                principal: &UserPrincipal,
+                availability: ChannelAvailability,
+            ) -> PlanRead {
+                if self.unreadable.load(Ordering::Acquire) {
+                    return PlanRead::Unreadable("damaged row".to_owned());
+                }
+                self.inner.plan_read_for(principal, availability)
+            }
+        }
+        let enforcer = Arc::new(RecordingEnforcer::new(false));
+        let readable = cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer));
+        let first = readable.tick();
+        assert!(matches!(first, CycleOutcome::Applied { .. }), "{first:?}");
+        let applied_once = enforcer.calls();
+        assert_eq!(applied_once.len(), 1);
+
+        // Nothing applied yet: the pass changes nothing at all.
+        let flaky = Arc::new(Flaky {
+            inner: Arc::new(PlanEveryone {
+                without_policy: Vec::new(),
+            }),
+            unreadable: AtomicBool::new(true),
+        });
+        let fresh = PrincipalEnforcementCycle::new(
+            Arc::new(ScriptedPrincipals {
+                answer: Some(vec![uid(1000)]),
+            }),
+            Arc::clone(&flaky) as Arc<dyn PrincipalPlanSource>,
+            Arc::clone(&enforcer) as Arc<dyn PolicyEnforcer>,
+        );
+        assert!(
+            matches!(
+                fresh.tick(),
+                CycleOutcome::EnforcementFailed {
+                    persistent: false,
+                    ..
+                }
+            ),
+            "no previous plan to keep: the pass must not apply an empty set"
+        );
+        assert_eq!(enforcer.calls().len(), 1, "nothing was applied");
+
+        // Once applied, the last plan is carried while the book is unreadable.
+        flaky.unreadable.store(false, Ordering::Release);
+        assert!(matches!(fresh.tick(), CycleOutcome::Applied { .. }));
+        let settled_calls = enforcer.calls().len();
+        flaky.unreadable.store(true, Ordering::Release);
+        let held = fresh.tick();
+        assert!(matches!(held, CycleOutcome::Applied { .. }), "{held:?}");
+        assert_eq!(
+            enforcer.calls().len(),
+            settled_calls + 1,
+            "the pass re-applies the plan it kept"
+        );
     }
 
     /// Without per-user routing one table serves everybody, so it carries the

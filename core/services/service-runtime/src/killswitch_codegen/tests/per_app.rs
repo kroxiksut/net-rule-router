@@ -148,70 +148,6 @@ fn default_vpn_exempt_patterns_present_and_each_emits_an_exempt_permit() {
         && f.remote_ip.is_none()));
 }
 
-/// The window is not the tunnel. A client that ships its transports as nested
-/// executables must have THOSE exempt, or fail-closed blocks the handshake and
-/// the outage never ends.
-#[test]
-fn a_recognised_client_lends_its_install_tree_to_the_exemption() {
-    use nrr_platform_api::app_path_resolver::MockAppPathResolver;
-    use std::path::PathBuf;
-
-    let client = r"C:\Program Files\vendor vpn\vendor vpn.exe";
-    // The nested directories are placeholders; only the file names matter —
-    // one must match the built-in `*vpn*` glob, the other deliberately must not.
-    let resolver = MockAppPathResolver::new().with_siblings(
-        client,
-        vec![
-            PathBuf::from(r"C:\Program Files\vendor vpn\dir-b\openvpn.exe"),
-            PathBuf::from(r"C:\Program Files\vendor vpn\dir-c\xray.exe"),
-            // Already named as the client — must not be added twice; filter ids
-            // are path-derived, so a duplicate is a duplicate filter.
-            PathBuf::from(client),
-        ],
-    );
-
-    let tree = tunnel_client_tree_exempt_paths(&resolver, &[client.to_string()]);
-
-    assert_eq!(
-        tree.len(),
-        2,
-        "the client's own path is not re-added: {tree:?}"
-    );
-    assert!(tree.iter().any(|p| p.ends_with("openvpn.exe")));
-    assert!(
-        tree.iter().any(|p| p.ends_with("xray.exe")),
-        "a transport matching NO vpn name pattern is exactly what the tree is for: {tree:?}",
-    );
-    // Positive control on the emitter: each added path becomes a real permit.
-    let filters = primary_app_exempt_filters("S", &tree);
-    assert_eq!(filters.len(), 2);
-    assert!(filters
-        .iter()
-        .all(|f| f.action == WfpAction::Permit && f.app_pattern.is_some()));
-}
-
-#[test]
-fn an_unrecognised_app_lends_nothing_and_the_tree_is_capped() {
-    use nrr_platform_api::app_path_resolver::MockAppPathResolver;
-    use std::path::PathBuf;
-
-    let client = r"C:\Program Files\vendor vpn\vendor vpn.exe";
-    let bundle: Vec<PathBuf> = (0..CLIENT_TREE_EXEMPT_CAP + 10)
-        .map(|i| PathBuf::from(format!(r"C:\Program Files\vendor vpn\tool{i}.exe")))
-        .collect();
-    let resolver = MockAppPathResolver::new().with_siblings(client, bundle);
-
-    assert_eq!(
-        tunnel_client_tree_exempt_paths(&resolver, &[client.to_string()]).len(),
-        CLIENT_TREE_EXEMPT_CAP,
-        "a client that ships a toolchain must not decide how many filters we hold",
-    );
-    assert!(
-        tunnel_client_tree_exempt_paths(&resolver, &[]).is_empty(),
-        "no recognised client, no tree",
-    );
-}
-
 #[test]
 fn app_kill_switch_never_touches_packet_layer() {
     // ALE_APP_ID is not available at the packet layer — a per-app ICMP gate
@@ -325,7 +261,9 @@ fn ale_filters_carry_sid_packet_filters_do_not() {
             }
             WfpLayerKey::OutboundIpPacketV4
             | WfpLayerKey::OutboundIpPacketV6
-            | WfpLayerKey::OutboundTransportV4 => {
+            | WfpLayerKey::OutboundTransportV4
+            | WfpLayerKey::IpForwardV4
+            | WfpLayerKey::IpForwardV6 => {
                 assert_eq!(f.user_sid, None, "no ALE_USER_ID below the ALE layers")
             }
         }

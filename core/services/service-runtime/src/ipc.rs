@@ -654,6 +654,27 @@ impl IpcRouter {
             );
         }
 
+        // 1b. A start parked in recovery answers reads, so the reason can be
+        //     shown, and refuses everything that would change state: nothing
+        //     behind the handlers has been brought up.
+        if crate::lifecycle::recovery_required()
+            && !matches!(
+                class,
+                IpcOperationClass::ReadSnapshot | IpcOperationClass::DiagnosticQuery
+            )
+        {
+            return IpcResponseEnvelope::err(
+                &request,
+                IpcError {
+                    code: IpcErrorCode::RecoveryRequired,
+                    message: "the service did not start: recovery is required; the health status \
+                              names the reason"
+                        .into(),
+                    diagnostics_id: None,
+                },
+            );
+        }
+
         // 2. Confirmation token presence (for classes that require it).
         if class.requires_confirmation_token()
             && request

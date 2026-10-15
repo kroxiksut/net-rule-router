@@ -70,22 +70,16 @@ impl ConnectionObservationConsumer {
         // (same hash the codegen used to mint it) — computed once per batch,
         // only when a notice or the trace will read it, so an idle observer
         // never pays for it. A wired classifier replaces it.
-        let default_block_id: Option<u64> = (self.not_covered_drop_check.is_none()
+        let default_block_ids: Option<[u64; 2]> = (self.not_covered_drop_check.is_none()
             && (self.block_notice_sink.is_some() || self.trace_ring.is_some()))
         .then(|| {
-            active_sid_now.as_deref().map(|sid| {
-                crate::wfp_codegen::filter_id_for(sid, "default", "", "default", "block-all").raw
-            })
+            active_sid_now
+                .as_deref()
+                .map(crate::wfp_codegen::default_block_ids)
         })
         .flatten();
 
-        // De-dup learned endpoints within the batch
-        // so a burst of drops to one server calls the learner once.
-        let mut learned_this_batch: std::collections::HashSet<std::net::Ipv4Addr> =
-            std::collections::HashSet::new();
-        // Separate per-batch dedup for the FCrDNS learner so it
-        // never couples with the VPN learner's dedup above (different concerns,
-        // same IP could matter to both).
+        // Per-batch dedup for the FCrDNS learner.
         let mut reverse_learned_this_batch: std::collections::HashSet<std::net::Ipv4Addr> =
             std::collections::HashSet::new();
         // Per-batch dedup for the client-app learner: one call per
@@ -100,7 +94,7 @@ impl ConnectionObservationConsumer {
         // Destinations whose pin caught a socket on the wrong link this batch.
         // Deduped (a stalled flow is re-observed every tick) and capped.
         let mut stale_flow_victims: std::collections::BTreeMap<
-            std::net::Ipv4Addr,
+            std::net::IpAddr,
             drop_reporter::PinDropVictims,
         > = std::collections::BTreeMap::new();
 
@@ -173,6 +167,11 @@ impl ConnectionObservationConsumer {
                     .nrr_drop_spec_id
                     .zip(self.service_account_drop_check.as_ref())
                     .is_some_and(|(spec_id, check)| check(spec_id));
+            // Whichever family's default block this drop hit, if either.
+            let default_block_id = default_block_ids
+                .zip(rec.nrr_drop_spec_id)
+                .filter(|(ids, id)| ids.contains(id))
+                .map(|(_, id)| id);
             let mut drop_reason = None;
             if rec.blocked_by_nrr == Some(true) {
                 let reason = self.reason_for_drop(&rec, killswitch_verified, default_block_id);
@@ -232,15 +231,14 @@ impl ConnectionObservationConsumer {
                     } else {
                         // Routed through the tunnel, yet this socket is on the
                         // other link — a teardown candidate.
-                        if let IpAddr::V4(rip) = rec.remote.ip() {
-                            if stale_flow_victims.len() < MAX_STALE_FLOW_RESETS_PER_BATCH
-                                || stale_flow_victims.contains_key(&rip)
-                            {
-                                stale_flow_victims
-                                    .entry(rip)
-                                    .or_default()
-                                    .note(rec.local, rec.user_sid.as_deref());
-                            }
+                        let rip = rec.remote.ip();
+                        if stale_flow_victims.len() < MAX_STALE_FLOW_RESETS_PER_BATCH
+                            || stale_flow_victims.contains_key(&rip)
+                        {
+                            stale_flow_victims
+                                .entry(rip)
+                                .or_default()
+                                .note(rec.local, rec.user_sid.as_deref());
                         }
                         if dest_scope_sample.is_none() {
                             dest_scope_sample = Some(DropSample {
@@ -254,49 +252,21 @@ impl ConnectionObservationConsumer {
                 }
                 self.log_drop_once(&rec, obs.drop_filter_id);
             }
-            // Reactive self-learning: a flow that OUR kill-switch/fail-closed
-            // Block dropped, from a process whose name matches a VPN-client
-            // pattern, teaches the exemption set the tunnel's server IP, so the
-            // client's own retry (VPN clients retry) is permitted and the
-            // tunnel comes up — no user action, no first-connect deadlock.
-            // Requires ALL of: our drop, a VPN-named process, a routable V4
-            // remote, AND the dropping filter's spec id passing the wired
-            // role-verification check — `blocked_by_nrr` alone cannot tell a
-            // leak-guard drop from the user's own Block rule, so without a
-            // verified spec id membership in the kill-switch registry the
-            // learner never fires.
-            // Shared gate for both VPN learners: OUR drop, whose filter's spec
-            // id passes the wired role-verification check, from a VPN-named
-            // process. Absence of a wired check keeps both learners inert.
+            // Gate for the client-app learner: OUR drop, by a filter whose spec
+            // id passes the wired role verification, from a VPN-named process.
+            // `blocked_by_nrr` alone cannot tell a leak-guard drop from the
+            // user's own Block rule.
             let role_verified_vpn_drop = rec.verdict == ConnectionVerdict::Block
                 && rec.blocked_by_nrr == Some(true)
                 && killswitch_verified
                 && process_name_matches_vpn(rec.process_path.as_deref());
-            if let Some(learner) = self.vpn_endpoint_learner.as_ref() {
-                if role_verified_vpn_drop {
-                    if let IpAddr::V4(rip) = rec.remote.ip() {
-                        if is_learnable_endpoint(rip) && learned_this_batch.insert(rip) {
-                            learner(rip);
-                            summary.vpn_endpoints_learned += 1;
-                            tracing::info!(
-                                target: "nrr::vpn-learn",
-                                msg_key = "connobs-vpn-endpoint-learned",
-                                server = %rip,
-                                process = rec.process_path.as_deref().unwrap_or("?"),
-                                "learned VPN bootstrap endpoint from a role-verified kill-switch drop — exempting so the tunnel can reconnect",
-                            );
-                        }
-                    }
-                }
-            }
             // Proactive VPN-client learning: the same role-verified
             // drop also identifies the CLIENT PROCESS itself. Register it for an
             // app-scoped exemption so the next block-all arming permits the
             // whole process up front — its egress IS the tunnel's transport —
-            // instead of chasing one rotated endpoint IP per drop (the
-            // examplevpn-over-rotating-CDN-IPs failure mode). Not gated on
-            // the remote IP being a learnable endpoint: the client's role is
-            // proven by the drop regardless of which address the check targeted.
+            // rather than any address it dialled: a CDN front a rule host
+            // shares would become a hole. The client's role is proven by the
+            // drop whichever address the check targeted.
             if let Some(learner) = self.vpn_client_app_learner.as_ref() {
                 if role_verified_vpn_drop {
                     if let Some(path) = rec.process_path.as_deref() {
@@ -502,7 +472,7 @@ impl ConnectionObservationConsumer {
             .as_ref()
             .filter(|_| !stale_flow_victims.is_empty())
         {
-            let addresses: Vec<std::net::Ipv4Addr> = stale_flow_victims.keys().copied().collect();
+            let addresses: Vec<std::net::IpAddr> = stale_flow_victims.keys().copied().collect();
             let flows = drop_reporter::stale_flows_behind_drops(
                 reset.established_flows_to(&addresses),
                 &stale_flow_victims,

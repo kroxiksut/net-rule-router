@@ -38,13 +38,49 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
     // The packed collectors hold one principal each, so the owner's flows and
     // the service-account twins are packed apart — merged, one scope's
     // addresses would be enforced under the other's condition.
-    let (service, own): (Vec<&FlowRule>, Vec<&FlowRule>) = plan
+    let scoped = |scope: &PrincipalScope| -> Vec<&FlowRule> {
+        plan.flows
+            .iter()
+            .filter(|f| f.principal == *scope)
+            .collect()
+    };
+    let own: Vec<&FlowRule> = plan
         .flows
         .iter()
-        .partition(|flow| flow.principal == PrincipalScope::ServiceAccounts);
+        .filter(|f| {
+            !matches!(
+                f.principal,
+                PrincipalScope::ServiceAccounts | PrincipalScope::Forwarded
+            )
+        })
+        .collect();
     let mut out = lower_kill_switch_flows(&own, secondary_luid);
-    out.extend(lower_kill_switch_flows(&service, secondary_luid));
+    out.extend(lower_kill_switch_flows(
+        &scoped(&PrincipalScope::ServiceAccounts),
+        secondary_luid,
+    ));
+    out.extend(forwarding_path(lower_kill_switch_flows(
+        &scoped(&PrincipalScope::Forwarded),
+        secondary_luid,
+    )));
     out
+}
+
+/// Forwarded packets are judged only on the forwarding layers, by destination
+/// and egress: the connect half of each filter, moved there.
+fn forwarding_path(mut specs: Vec<WfpFilterSpec>) -> Vec<WfpFilterSpec> {
+    specs.retain(|spec| spec.layer.supports_ale_scoping());
+    for spec in &mut specs {
+        spec.layer = if spec.layer.is_v6() {
+            WfpLayerKey::IpForwardV6
+        } else {
+            WfpLayerKey::IpForwardV4
+        };
+        spec.user_sid = None;
+        spec.ip_protocol = None;
+        spec.remote_port = None;
+    }
+    specs
 }
 
 fn lower_kill_switch_flows(flows: &[&FlowRule], secondary_luid: u64) -> Vec<WfpFilterSpec> {

@@ -13,8 +13,9 @@ fn a_first_contact_routes_only_what_the_planner_would() {
     let coord = coordinator(Arc::clone(&api), Arc::clone(&rules));
     let second = Ipv4Addr::new(203, 0, 113, 2);
     let unnamed = Ipv4Addr::new(198, 51, 100, 9);
+    let second_v4 = IpAddr::V4(second);
     assert_eq!(
-        coord.route_first_contact("S-IVANOV", &[second]),
+        coord.route_first_contact("S-IVANOV", &[second_v4]),
         0,
         "nothing recomputed yet, so no resolution to plan from"
     );
@@ -29,7 +30,10 @@ fn a_first_contact_routes_only_what_the_planner_would() {
             ip_rule("b", 203, 0, 113, 2),
         ]),
     );
-    assert_eq!(coord.route_first_contact("S-IVANOV", &[second, unnamed]), 1);
+    assert_eq!(
+        coord.route_first_contact("S-IVANOV", &[second_v4, IpAddr::V4(unnamed)]),
+        1
+    );
     let dests = table_dests(&api);
     assert!(dests.contains(&second), "{dests:?}");
     assert!(!dests.contains(&unnamed), "no rule names it: {dests:?}");
@@ -43,10 +47,188 @@ fn a_first_contact_routes_only_what_the_planner_would() {
         .recompute_for("S-IVANOV", &res(None))
         .expect("teardown");
     assert_eq!(
-        coord.route_first_contact("S-IVANOV", &[second]),
+        coord.route_first_contact("S-IVANOV", &[second_v4]),
         0,
         "no link, nothing to route"
     );
+}
+
+/// A rule host's IPv6 front is first contact like its IPv4 one: its `/128`
+/// goes in ahead of the full run through the link's v6 next hop — and only
+/// when the link has one, or the route would attract traffic into a black
+/// hole and the user would read the hang as a broken site.
+#[test]
+fn a_v6_first_contact_gets_its_slash_128_only_through_a_v6_capable_link() {
+    let api = Arc::new(MockWindowsApi::new());
+    let rules = Arc::new(FakeRules::new());
+    let v6: std::net::Ipv6Addr = "2001:db8::7".parse().expect("literal");
+    let rule = CanonicalRule {
+        id: RuleId("a6".into()),
+        enabled: true,
+        address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V6(v6))),
+        app_match: None,
+        comment: String::new(),
+        action: nrr_domain::RuleAction::Route,
+        origin: None,
+    };
+    rules.set_secondary("S-IVANOV", CanonicalRuleSet::from_rules(vec![rule]));
+    let coord = coordinator(Arc::clone(&api), Arc::clone(&rules));
+
+    coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .expect("recompute over a v4-only link");
+    assert_eq!(
+        coord.route_first_contact("S-IVANOV", &[IpAddr::V6(v6)]),
+        0,
+        "a link with no v6 next hop gets no /128"
+    );
+
+    let v6_link = SecondaryRouteTarget {
+        gateway_v6: Some("fe80::1".parse().expect("literal")),
+        ..target()
+    };
+    coord
+        .recompute_for("S-IVANOV", &res(Some(v6_link)))
+        .expect("recompute over a v6-capable link");
+    // The recompute already routed the rule's own address; a fresh one the
+    // book does not carry yet is what a first contact brings.
+    let fresh: std::net::Ipv6Addr = "2001:db8::8".parse().expect("literal");
+    let fresh_rule = CanonicalRule {
+        id: RuleId("b6".into()),
+        enabled: true,
+        address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V6(fresh))),
+        app_match: None,
+        comment: String::new(),
+        action: nrr_domain::RuleAction::Route,
+        origin: None,
+    };
+    rules.set_secondary("S-IVANOV", CanonicalRuleSet::from_rules(vec![fresh_rule]));
+    assert_eq!(
+        coord.route_first_contact("S-IVANOV", &[IpAddr::V6(fresh)]),
+        1,
+        "the v6 first contact is routed ahead of the full run"
+    );
+    let routed = api
+        .get_ip_forward_table()
+        .expect("table")
+        .into_iter()
+        .find(|r| r.destination == IpAddr::V6(fresh))
+        .expect("the /128 is in the table");
+    assert_eq!(routed.prefix_length, 128);
+    assert_eq!(
+        routed.next_hop,
+        IpAddr::V6("fe80::1".parse().expect("literal"))
+    );
+}
+
+/// A first contact plans over the cache cut down to its own addresses. The
+/// cut must not change a single decision about them: whatever the plan over
+/// the whole cache routes among those addresses is routed, a shared one it
+/// declines stays out, and nothing else comes along.
+#[test]
+fn a_first_contact_over_its_own_addresses_routes_what_the_full_plan_would() {
+    use crate::fqdn_cache_lookup::SqliteFqdnCacheLookup;
+    use nrr_domain::decision_lookup::FreshnessThresholds;
+    use nrr_storage::dto::ResolutionEntry;
+    use nrr_storage::migration::SqliteMigrationRunner;
+    use nrr_storage::repository::{CacheRepository, MigrationRunner};
+    use nrr_storage::resolution_source::StorageResolutionSource;
+    use nrr_storage::store::SqliteCacheStore;
+
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    let runner = SqliteMigrationRunner::for_cache_db(conn);
+    runner.run_pending_migrations().expect("migrate");
+    let thresholds = FreshnessThresholds::default_production();
+    let cache: Arc<Mutex<dyn CacheRepository + Send>> = Arc::new(Mutex::new(
+        SqliteCacheStore::new(runner.into_connection(), thresholds.clone()),
+    ));
+    let lookup = Arc::new(SqliteFqdnCacheLookup::new(Arc::clone(&cache), thresholds));
+
+    let api = Arc::new(MockWindowsApi::new());
+    let rules = Arc::new(FakeRules::new());
+    let suffix = CanonicalRule {
+        id: RuleId("cdn".into()),
+        enabled: true,
+        address_match: Some(CanonicalAddressMatch::SuffixDomain("cdn.example".into())),
+        app_match: None,
+        comment: String::new(),
+        action: nrr_domain::RuleAction::Route,
+        origin: None,
+    };
+    rules.set_secondary("S-IVANOV", CanonicalRuleSet::from_rules(vec![suffix]));
+    let coord = SecondaryRouteCoordinator::new(
+        Arc::clone(&api) as Arc<dyn RouteTablePort>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(FakePolicy::new()) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+        Arc::new(|| false) as RuleScopeProvider,
+    );
+    coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .expect("recompute over a cold cache");
+
+    let fresh = Ipv4Addr::new(203, 0, 113, 1);
+    let shared = Ipv4Addr::new(203, 0, 113, 2);
+    let not_asked = Ipv4Addr::new(203, 0, 113, 3);
+    let unnamed = Ipv4Addr::new(198, 51, 100, 9);
+    {
+        let guard = cache.lock().expect("cache");
+        for (host, ips) in [
+            ("a.cdn.example", vec![fresh, shared]),
+            ("b.cdn.example", vec![not_asked]),
+            ("direct.example", vec![shared]),
+        ] {
+            guard
+                .upsert_resolution(ResolutionEntry {
+                    canonical_hostname: host.into(),
+                    raw_hostname_sample: None,
+                    resolved_ips: ips.into_iter().map(IpAddr::V4).collect(),
+                    ttl_seconds: Some(300),
+                    source: StorageResolutionSource::Dns,
+                    resolved_at: std::time::SystemTime::now(),
+                    active_revision_id: None,
+                })
+                .expect("upsert");
+        }
+        guard
+            .record_shared_ip_direct_host(shared, "direct.example", 1, false)
+            .expect("census");
+    }
+    let asked = [IpAddr::V4(fresh), IpAddr::V4(shared), IpAddr::V4(unnamed)];
+    let rule_book = rules.active_rules_for("S-IVANOV").expect("rules").rule_book;
+    let full_plan: HashSet<Ipv4Addr> = coord
+        .planned_routes(
+            "S-IVANOV",
+            &res(Some(target())),
+            &target(),
+            &rule_book,
+            lookup.as_ref(),
+            &[],
+            &crate::route_codegen::network_routes::NetworkRouteFacts::default(),
+        )
+        .routes
+        .into_iter()
+        .filter(|r| r.prefix_length == 32 && asked.contains(&r.destination))
+        .filter_map(|r| match r.destination {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    assert!(
+        full_plan.contains(&fresh),
+        "the oracle routes the rule host: {full_plan:?}"
+    );
+
+    let before = table_dests(&api);
+    let routed = coord.route_first_contact("S-IVANOV", &asked);
+    let added: HashSet<Ipv4Addr> = table_dests(&api).difference(&before).copied().collect();
+
+    assert_eq!(
+        added, full_plan,
+        "the cut plan is the full plan for these addresses"
+    );
+    assert_eq!(routed, full_plan.len());
+    assert!(!added.contains(&not_asked), "only what the answer brought");
 }
 
 #[test]

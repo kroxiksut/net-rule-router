@@ -14,7 +14,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use nrr_platform_api::dns::{DnsResolverError, DnsResolverPort, ResolvedRecord};
 use nrr_storage::dto::ResolutionEntry;
@@ -333,10 +333,14 @@ impl DirectUdpUpstreamResolver {
     fn open_socket(
         egress: &crate::dns_egress::DnsEgress,
     ) -> Result<std::net::UdpSocket, ResolveError> {
+        let wildcard: std::net::SocketAddr = match egress.server {
+            std::net::SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+            std::net::SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+        };
         let sock = match egress.bind {
             Some(src) => std::net::UdpSocket::bind((src, 0))
                 .map_err(|e| ResolveError::Unavailable(format!("bind {src}: {e}")))?,
-            None => std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            None => std::net::UdpSocket::bind(wildcard)
                 .map_err(|e| ResolveError::Unavailable(format!("bind: {e}")))?,
         };
         nrr_platform_api::own_traffic::mark_own_socket(&sock);
@@ -362,12 +366,11 @@ impl DirectUdpUpstreamResolver {
         egress: &crate::dns_egress::DnsEgress,
         window: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
-        use crate::dns_wire::{parse_address_response, AddressResponseOutcome};
         let sock = Self::open_socket(egress)?;
         sock.send(query)
             .map_err(|e| ResolveError::Unavailable(format!("send: {e}")))?;
         let started = std::time::Instant::now();
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; 4096];
         loop {
             let remaining = window.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -399,29 +402,106 @@ impl DirectUdpUpstreamResolver {
                 }
                 Err(e) => return Err(ResolveError::Unavailable(format!("recv: {e}"))),
             };
-            match parse_address_response(id, hostname, qtype, &buf[..n]) {
-                AddressResponseOutcome::Answers { addresses, min_ttl } => {
-                    return Ok(ResolvedAddresses {
-                        addresses,
-                        // A 0-TTL record still needs a positive cache horizon;
-                        // 1 s keeps "do not cache" spirit without a special case.
-                        ttl_seconds: min_ttl.max(1),
-                    });
+            match Self::interpret(id, hostname, qtype, &buf[..n]) {
+                Some(Err(ResolveError::Unavailable(reason))) if reason == TRUNCATED => {
+                    // The answer did not fit a datagram: ask again over TCP,
+                    // on the same link, within what is left of the window.
+                    let left = window.saturating_sub(started.elapsed());
+                    return Self::attempt_tcp(query, id, hostname, qtype, egress, left);
                 }
-                AddressResponseOutcome::NoRecords => return Err(ResolveError::NoRecords),
-                AddressResponseOutcome::Truncated => {
-                    // No TCP fallback yet — surface as transient so the
-                    // listener fail-opens (forwards raw) instead of NXDOMAIN-ing.
-                    return Err(ResolveError::Unavailable("truncated (TC=1)".into()));
-                }
-                AddressResponseOutcome::Failed(rcode) => {
-                    return Err(ResolveError::Unavailable(format!("rcode {rcode}")));
-                }
-                AddressResponseOutcome::Mismatch => continue,
+                Some(outcome) => return outcome,
+                None => continue,
             }
         }
     }
+
+    /// What one reply means: `None` for a datagram that is not ours.
+    fn interpret(
+        id: u16,
+        hostname: &str,
+        qtype: u16,
+        reply: &[u8],
+    ) -> Option<Result<ResolvedAddresses, ResolveError>> {
+        use crate::dns_wire::{parse_address_response, AddressResponseOutcome};
+        Some(match parse_address_response(id, hostname, qtype, reply) {
+            AddressResponseOutcome::Answers { addresses, min_ttl } => Ok(ResolvedAddresses {
+                addresses,
+                // A 0-TTL record still needs a positive cache horizon; 1 s
+                // keeps the "do not cache" spirit without a special case.
+                ttl_seconds: min_ttl.max(1),
+            }),
+            AddressResponseOutcome::NoRecords => Err(ResolveError::NoRecords),
+            AddressResponseOutcome::Truncated => Err(ResolveError::Unavailable(TRUNCATED.into())),
+            AddressResponseOutcome::Failed(rcode) => {
+                Err(ResolveError::Unavailable(format!("rcode {rcode}")))
+            }
+            AddressResponseOutcome::Mismatch => return None,
+        })
+    }
+
+    /// The same question over TCP: one connection from the same source, one
+    /// framed exchange, all inside `window`. A reply over TCP cannot be
+    /// truncated, so a TC here is simply a failure.
+    fn attempt_tcp(
+        query: &[u8],
+        id: u16,
+        hostname: &str,
+        qtype: u16,
+        egress: &crate::dns_egress::DnsEgress,
+        window: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        use crate::dns_wire::{read_tcp_message, write_tcp_message, DNS_TCP_MAX_MESSAGE};
+        if window.is_zero() {
+            return Err(ResolveError::Unavailable("timeout".into()));
+        }
+        let started = std::time::Instant::now();
+        let unavailable =
+            |what: &str, e: std::io::Error| ResolveError::Unavailable(format!("tcp {what}: {e}"));
+        let mut stream = match egress.bind {
+            // `std` cannot bind before connecting; `socket2` can, and the bind
+            // is what keeps the query on the link the policy chose.
+            Some(src) => {
+                let domain = match egress.server {
+                    std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
+                    std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
+                };
+                let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)
+                    .map_err(|e| unavailable("socket", e))?;
+                socket
+                    .bind(&std::net::SocketAddr::from((src, 0)).into())
+                    .map_err(|e| unavailable("bind", e))?;
+                socket
+                    .connect_timeout(&egress.server.into(), window)
+                    .map_err(|e| unavailable("connect", e))?;
+                std::net::TcpStream::from(socket)
+            }
+            None => std::net::TcpStream::connect_timeout(&egress.server, window)
+                .map_err(|e| unavailable("connect", e))?,
+        };
+        nrr_platform_api::own_traffic::mark_own_socket(&stream);
+        let left = window.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(ResolveError::Unavailable("timeout".into()));
+        }
+        stream
+            .set_read_timeout(Some(left))
+            .and_then(|()| stream.set_write_timeout(Some(left)))
+            .map_err(|e| unavailable("timeout cfg", e))?;
+        write_tcp_message(&mut stream, query).map_err(|e| unavailable("send", e))?;
+        let reply = read_tcp_message(&mut stream, DNS_TCP_MAX_MESSAGE)
+            .map_err(|e| unavailable("recv", e))?
+            .ok_or_else(|| ResolveError::Unavailable("tcp: closed without a reply".into()))?;
+        match Self::interpret(id, hostname, qtype, &reply) {
+            Some(outcome) => outcome,
+            None => Err(ResolveError::Unavailable(
+                "tcp: reply to another question".into(),
+            )),
+        }
+    }
 }
+
+/// The `Unavailable` reason a truncated datagram carries.
+const TRUNCATED: &str = "truncated (TC=1)";
 
 impl DirectUdpUpstreamResolver {
     /// one PTR send + receive window for `ip`.
@@ -511,6 +591,29 @@ impl UpstreamResolver for DirectUdpUpstreamResolver {
         family: AddressFamily,
         budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
+        self.resolve_via(hostname, family, budget, false)
+    }
+
+    fn resolve_tunnel_only_within(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+        budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        self.resolve_via(hostname, family, budget, true)
+    }
+}
+
+impl DirectUdpUpstreamResolver {
+    /// The query loop. With `tunnel_only`, an attempt the egress policy would
+    /// send over the main link is not made at all: the name must not get there.
+    fn resolve_via(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+        budget: Duration,
+        tunnel_only: bool,
+    ) -> Result<ResolvedAddresses, ResolveError> {
         use crate::dns_wire::{build_address_query, QTYPE_A, QTYPE_AAAA};
         let qtype = match family {
             AddressFamily::Ipv4 => QTYPE_A,
@@ -532,6 +635,10 @@ impl UpstreamResolver for DirectUdpUpstreamResolver {
                 return Err(ResolveError::Unavailable("budget exhausted".into()));
             }
             let egress = self.egress_for(attempt);
+            if tunnel_only && !egress.via_secondary {
+                last = ResolveError::Unavailable("tunnel not available for the query".into());
+                continue;
+            }
             match self.attempt(&query, id, hostname, qtype, &egress, window) {
                 Ok(resolved) => {
                     tracing::debug!(
@@ -790,6 +897,16 @@ impl PoisonFallbackUpstreamResolver {
     }
 }
 
+/// What kept a confirmation round from confirming, as the log says it.
+fn unconfirmed_because(out_of_time: bool, failure: Option<&str>) -> String {
+    match (failure, out_of_time) {
+        (Some(why), true) => format!("{why}; then out of time"),
+        (Some(why), false) => why.to_string(),
+        (None, true) => "out of time".to_string(),
+        (None, false) => "no usable answer".to_string(),
+    }
+}
+
 /// An IPv6 address a route or a filter could name.
 fn usable_v6(ip: &IpAddr) -> bool {
     matches!(ip, IpAddr::V6(v6) if !crate::dns_address_sanity::is_unreachable_v6(v6))
@@ -819,6 +936,18 @@ fn same_address_set(a: &[IpAddr], b: &[IpAddr]) -> bool {
 }
 
 impl UpstreamResolver for PoisonFallbackUpstreamResolver {
+    /// No second opinion: the public resolvers' queries would be made by
+    /// resolvers of their own, and only the inner one is held to the tunnel.
+    fn resolve_tunnel_only_within(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+        budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        self.inner
+            .resolve_tunnel_only_within(hostname, family, budget)
+    }
+
     fn resolve_within(
         &self,
         hostname: &str,
@@ -864,13 +993,28 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
         // doubt, not failed to resolve it — and most rule hosts are zone
         // suffixes whose apex legitimately carries no A record.
         let mut second_source_saw_nothing_either = false;
+        // Why nothing confirmed, for the log: a round cut short and a source
+        // that failed call for different fixes.
+        let mut out_of_time = false;
+        let mut failure: Option<String> = None;
         for fallback in &self.fallbacks {
             let left = confirm_budget.saturating_sub(started.elapsed());
             if left.is_zero() {
+                out_of_time = true;
                 break;
             }
-            let Ok(candidate) = fallback.resolve_within(hostname, family, left) else {
-                continue;
+            let candidate = match fallback.resolve_within(hostname, family, left) {
+                Ok(candidate) => candidate,
+                // NXDOMAIN or an empty answer is the second source's answer,
+                // not its failure.
+                Err(ResolveError::NoRecords) => {
+                    second_source_saw_nothing_either = true;
+                    continue;
+                }
+                Err(ResolveError::Unavailable(why)) => {
+                    failure = Some(why);
+                    continue;
+                }
             };
             second_source_saw_nothing_either |= carries_nothing_to_pin(&candidate, family);
             match self.confirmation(
@@ -922,6 +1066,7 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
                 msg_key = "dns-resolver-unconfirmed-answer",
                 host = %hostname,
                 reason = %suspicion.as_str(),
+                second_source = %unconfirmed_because(out_of_time, failure.as_deref()),
                 "no second source could confirm this host's addresses — returning the upstream answer unconfirmed (it will not be pinned)",
             ),
             Suspicion::AlsoAnsweredFor(other) => tracing::warn!(
@@ -1225,11 +1370,96 @@ pub struct HookSyncReconciler {
     /// has finished. Read by [`SyncReconciler::typical_run`].
     last_run_ms: Arc<std::sync::atomic::AtomicU64>,
     first_contact: Option<FirstContactFn>,
+    first_contact_v6: Option<FirstContactV6Fn>,
+    /// What the first-contact routes cost the answers that waited on them.
+    first_contact_timing: FirstContactTiming,
+    /// Where the worker reports; a hook running past
+    /// [`RECONCILE_WORK_DEADLINE`] is a hang every waiter pays for.
+    liveness: Option<Arc<crate::task_liveness::TaskLiveness>>,
+}
+
+/// One reconcile run longer than this is stuck, not slow: waiters give up on
+/// it after a fraction of a second.
+const RECONCILE_WORK_DEADLINE: Duration = Duration::from_secs(60);
+
+/// A first contact above this held its DNS answer long enough to count.
+const FIRST_CONTACT_SLOW: Duration = Duration::from_millis(5);
+/// How often the cost of first contacts is written down, at most.
+const FIRST_CONTACT_REPORT_EVERY: Duration = Duration::from_secs(60);
+
+/// The time first-contact routes add to the DNS answers that wait on them,
+/// summed and written down once a minute: the answer path is where a slow
+/// route is paid, and one line per query would cost more than it tells.
+#[derive(Default)]
+struct FirstContactTiming {
+    acc: Mutex<FirstContactAcc>,
+}
+
+#[derive(Default)]
+struct FirstContactAcc {
+    calls: u64,
+    slow: u64,
+    total: Duration,
+    max: Duration,
+    since: Option<Instant>,
+}
+
+/// One minute of first contacts, as written down.
+#[derive(Debug, PartialEq, Eq)]
+struct FirstContactSummary {
+    calls: u64,
+    slow: u64,
+    avg_us: u64,
+    max_us: u64,
+}
+
+impl FirstContactTiming {
+    fn record(&self, elapsed: Duration, now: Instant) {
+        if let Some(summary) = self.add(elapsed, now) {
+            tracing::info!(
+                target: "nrr::dns-resolver",
+                msg_key = "dns-first-contact-timing",
+                calls = summary.calls,
+                slow = summary.slow,
+                avg_us = summary.avg_us,
+                max_us = summary.max_us,
+                "first-contact routes: time added to DNS answers over the last minute",
+            );
+        }
+    }
+
+    /// Add one call; the summary once a report is due, which starts the next.
+    fn add(&self, elapsed: Duration, now: Instant) -> Option<FirstContactSummary> {
+        let mut acc = self.acc.lock().unwrap_or_else(|p| p.into_inner());
+        let since = *acc.since.get_or_insert(now);
+        acc.calls += 1;
+        acc.total += elapsed;
+        acc.max = acc.max.max(elapsed);
+        if elapsed > FIRST_CONTACT_SLOW {
+            acc.slow += 1;
+        }
+        if now.saturating_duration_since(since) < FIRST_CONTACT_REPORT_EVERY {
+            return None;
+        }
+        let done = std::mem::take(&mut *acc);
+        let micros = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        Some(FirstContactSummary {
+            calls: done.calls,
+            slow: done.slow,
+            avg_us: micros(done.total) / done.calls.max(1),
+            max_us: micros(done.max),
+        })
+    }
 }
 
 /// Routes a first contact's addresses ahead of the full run; returns how many
 /// got their route. See [`SyncReconciler::install_first_contact`].
 pub type FirstContactFn = Arc<dyn Fn(&[std::net::Ipv4Addr]) -> usize + Send + Sync>;
+
+/// The same for an AAAA answer's addresses. A platform without a v6
+/// first-contact route leaves it unset and its AAAA answers wait for the
+/// full run, as before.
+pub type FirstContactV6Fn = Arc<dyn Fn(&[std::net::Ipv6Addr]) -> usize + Send + Sync>;
 
 #[derive(Default)]
 struct ReconcileWorkerState {
@@ -1256,12 +1486,31 @@ impl HookSyncReconciler {
             )),
             last_run_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             first_contact: None,
+            first_contact_v6: None,
+            first_contact_timing: FirstContactTiming::default(),
+            liveness: None,
         }
+    }
+
+    /// Report the worker to `liveness`.
+    #[must_use]
+    pub fn with_liveness(
+        mut self,
+        liveness: Option<Arc<crate::task_liveness::TaskLiveness>>,
+    ) -> Self {
+        self.liveness = liveness;
+        self
     }
 
     #[must_use]
     pub fn with_first_contact(mut self, route: FirstContactFn) -> Self {
         self.first_contact = Some(route);
+        self
+    }
+
+    #[must_use]
+    pub fn with_first_contact_v6(mut self, route: FirstContactV6Fn) -> Self {
+        self.first_contact_v6 = Some(route);
         self
     }
 
@@ -1271,13 +1520,26 @@ impl HookSyncReconciler {
         hook: RouteRecomputeHook,
         state: Arc<(Mutex<ReconcileWorkerState>, std::sync::Condvar)>,
         last_run: Arc<std::sync::atomic::AtomicU64>,
+        liveness: Option<Arc<crate::task_liveness::TaskLiveness>>,
     ) {
+        use crate::task_liveness::{ThreadExit, ThreadLease, Watch};
+        let lease = liveness.as_ref().map(|liveness| {
+            liveness.lease(
+                crate::service_tasks::ServiceTaskKind::DnsReconcileWorker,
+                None,
+                Watch::Work(RECONCILE_WORK_DEADLINE),
+            )
+        });
         let (lock, cv) = &*state;
         loop {
             let target = {
                 let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
                 loop {
                     if guard.shutdown {
+                        drop(guard);
+                        if let Some(lease) = lease {
+                            lease.finish(ThreadExit::Stopped);
+                        }
                         return;
                     }
                     if guard.requested > guard.completed.max(guard.failed) {
@@ -1290,10 +1552,13 @@ impl HookSyncReconciler {
             // it works; they will be covered by the NEXT run (their facts may
             // have landed mid-run, so this run cannot vouch for them).
             let started = std::time::Instant::now();
+            let run = lease.as_ref().map(ThreadLease::work);
             // A panic must not take the worker with it: the flag would still
             // say "spawned" and every later reconcile would wait out its
             // deadline, withholding every rule host until a restart.
-            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook())) {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()));
+            drop(run);
+            if let Err(panic) = outcome {
                 let detail = panic
                     .downcast_ref::<&str>()
                     .map(|s| (*s).to_string())
@@ -1357,7 +1622,8 @@ impl SyncReconciler for HookSyncReconciler {
                 let hook = Arc::clone(&self.hook);
                 let state = Arc::clone(&self.state);
                 let last_run = Arc::clone(&self.last_run_ms);
-                std::thread::spawn(move || Self::worker_loop(hook, state, last_run));
+                let liveness = self.liveness.clone();
+                std::thread::spawn(move || Self::worker_loop(hook, state, last_run, liveness));
             }
             cv.notify_all();
             guard.requested
@@ -1397,9 +1663,25 @@ impl SyncReconciler for HookSyncReconciler {
     }
 
     fn install_first_contact(&self, addresses: &[std::net::Ipv4Addr]) -> usize {
-        self.first_contact
-            .as_ref()
-            .map_or(0, |route| route(addresses))
+        let Some(route) = self.first_contact.as_ref() else {
+            return 0;
+        };
+        let started = Instant::now();
+        let routed = route(addresses);
+        self.first_contact_timing
+            .record(started.elapsed(), Instant::now());
+        routed
+    }
+
+    fn install_first_contact_v6(&self, addresses: &[std::net::Ipv6Addr]) -> usize {
+        let Some(route) = self.first_contact_v6.as_ref() else {
+            return 0;
+        };
+        let started = Instant::now();
+        let routed = route(addresses);
+        self.first_contact_timing
+            .record(started.elapsed(), Instant::now());
+        routed
     }
 }
 

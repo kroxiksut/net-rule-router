@@ -1,7 +1,7 @@
 use super::*;
 use crate::per_sid_orchestrator::ActiveRulesSnapshot;
 use nrr_domain::canonical::{CanonicalRule, CanonicalRuleBook};
-use nrr_domain::{RouteBehaviorMode, RuleId};
+use nrr_domain::RuleId;
 use nrr_platform_api::dns::{MockDnsResolver, ResolvedRecord};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,7 +60,6 @@ impl RulesProvider for FakeRules {
                 primary: self.primary.lock().unwrap().clone(),
                 secondary: self.secondary.lock().unwrap().clone(),
             },
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
         })
     }
 }

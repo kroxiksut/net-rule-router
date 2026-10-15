@@ -654,10 +654,16 @@ fn resubscribes_after_reconnect_without_caller_help() {
             >= 2),
         "client never replayed the subscription after reconnect"
     );
-    assert!(
-        pushes.recv_timeout(Duration::from_secs(2)).is_ok(),
-        "push after the replayed subscription never reached the subscriber"
-    );
+    // The replayed subscription starts at the service's head, so whatever was
+    // published meanwhile is gone: the subscriber is told before anything new.
+    let first = pushes
+        .recv_timeout(Duration::from_secs(2))
+        .expect("nothing reached the subscriber after the replayed subscription");
+    assert_eq!(first["event"]["type"], "push-gap", "{first}");
+    let second = pushes
+        .recv_timeout(Duration::from_secs(2))
+        .expect("push after the replayed subscription never reached the subscriber");
+    assert_eq!(second["event"]["type"], "stub-status-update", "{second}");
 
     stop.store(true, Ordering::SeqCst);
     client.shutdown();

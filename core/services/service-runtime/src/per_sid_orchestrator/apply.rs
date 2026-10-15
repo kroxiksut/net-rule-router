@@ -20,6 +20,16 @@ impl PerSidApplyOrchestrator {
 
     /// Number of WFP filter IDs installed for `sid`. Returns 0 if the
     /// SID has no entry.
+    /// The filter ids this orchestrator tracks for `sid`.
+    pub fn installed_filter_ids(&self, sid: &str) -> Vec<WfpFilterId> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(sid)
+            .map(|s| s.installed.clone())
+            .unwrap_or_default()
+    }
+
     pub fn filter_count_for(&self, sid: &str) -> usize {
         self.state
             .lock()
@@ -712,6 +722,25 @@ impl PerSidApplyOrchestrator {
     /// **non-dynamic** — filters persist until an explicit delete or reboot —
     /// so this explicit strip (not session close) is what removes them.
     pub fn cleanup_wfp(&self) -> Result<usize, OrchestratorError> {
+        // Every SID's apply lock first: a transaction still in flight commits
+        // before the sweep enumerates, so nothing lands behind it with its
+        // ledger line already erased. Nothing holds one of these and waits on
+        // another, so taking them in name order cannot deadlock.
+        let locks: Vec<Arc<Mutex<()>>> = {
+            let g = self.apply_locks.lock().unwrap_or_else(|p| p.into_inner());
+            let mut named: Vec<(&String, &Arc<Mutex<()>>)> = g.iter().collect();
+            named.sort_by(|a, b| a.0.cmp(b.0));
+            named.into_iter().map(|(_, l)| Arc::clone(l)).collect()
+        };
+        let _held: Vec<std::sync::MutexGuard<'_, ()>> = locks
+            .iter()
+            .map(|l| l.lock().unwrap_or_else(|p| p.into_inner()))
+            .collect();
+        // Nothing is left to adopt once everything is gone.
+        *self
+            .pending_orphans
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         // (1) Delete this session's known filters by id.
         let tracked: Vec<WfpFilterId> = {
             let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -836,6 +865,85 @@ impl PerSidApplyOrchestrator {
             .map_err(|e| OrchestratorError::WfpFailed(format!("cleanup_blocks_only: {e:?}")))
     }
 
+    /// Keep a dead instance's filters in force until the first pass has
+    /// re-derived every present user's set: with leak protection on, a strip
+    /// before that pass is a leak for the whole boot. The inherited ids leave
+    /// the ledger now so the pass records only its own;
+    /// [`Self::adopt_orphans_after_pass`] settles what the pass did not claim.
+    pub fn defer_orphans_to_first_pass(&self) {
+        let inherited = self.ledger.as_ref().map(|l| l.drain()).unwrap_or_default();
+        tracing::info!(
+            target: "nrr::per_sid_orchestrator",
+            msg_key = "persid-apply-orphans-deferred",
+            inherited = inherited.len() as u64,
+            "startup: a previous instance's filters stay in force until the first pass adopts them",
+        );
+        *self
+            .pending_orphans
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(inherited);
+    }
+
+    /// Delete every filter of ours the pass did not claim: the inherited ids
+    /// no SID tracks, and anything else under our provider no SID tracks (the
+    /// enumerate covers what the ledger missed, the ledger what the enumerate
+    /// under-reports). Returns `None` when nothing was deferred.
+    pub fn adopt_orphans_after_pass(&self) -> Option<usize> {
+        let inherited = self
+            .pending_orphans
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()?;
+        let tracked: std::collections::HashSet<u64> = {
+            let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            g.values()
+                .flat_map(|s| s.installed.iter().map(|id| id.raw))
+                .collect()
+        };
+        let mut doomed: Vec<u64> = inherited
+            .into_iter()
+            .filter(|raw| !tracked.contains(raw))
+            .collect();
+        match self.session.enumerate_our_filters() {
+            Ok(records) => {
+                for record in records {
+                    let raw = record.id.raw;
+                    if !tracked.contains(&raw) && !doomed.contains(&raw) {
+                        doomed.push(raw);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-orphans-enumerate-failed",
+                error = %e,
+                "adoption: enumerate failed; only the ledger's ids are settled",
+            ),
+        }
+        if doomed.is_empty() {
+            return Some(0);
+        }
+        let actions: Vec<WfpFilterAction> = doomed
+            .iter()
+            .map(|raw| WfpFilterAction::DeleteFilter(WfpFilterId { raw: *raw }))
+            .collect();
+        match self.session.execute_wfp_plan(&actions) {
+            Ok(_) => tracing::info!(
+                target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-orphans-adopted",
+                removed = doomed.len() as u64,
+                "first pass done: a previous instance's filters nobody claimed are gone",
+            ),
+            Err(e) => tracing::warn!(
+                target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-orphans-adopt-failed",
+                error = %e,
+                "adoption: delete of unclaimed filters best-effort failed",
+            ),
+        }
+        Some(doomed.len())
+    }
+
     /// Recompile the filter set for `sid` after a policy/rules change. Called
     /// when a user submits `RoutePolicyUpdate` so their new bindings take
     /// effect immediately.
@@ -852,9 +960,30 @@ impl PerSidApplyOrchestrator {
     /// policy/rules disappeared tears down via the full-replace path so the
     /// empty state and its audits stay exactly as before.
     pub fn recompile_for_sid(&self, sid: &str) -> Result<usize, OrchestratorError> {
+        self.settle_if_untracked(sid)?;
         let lock = self.apply_lock_for(sid);
         let _apply_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         self.recompile_for_sid_impl(sid, None)
+    }
+
+    /// Whether `sid` holds a filter set (an empty one counts).
+    fn is_tracked(&self, sid: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(sid)
+    }
+
+    /// A recompile of a user holding no set is an install, and whether that
+    /// user should hold one is the decider's call, not the recompile's: a
+    /// replan racing a tray exit used to put the departed user's set back.
+    /// With a decider wired, settle membership first; the recompile then
+    /// finds the set installed (or still rightly absent).
+    fn settle_if_untracked(&self, sid: &str) -> Result<(), OrchestratorError> {
+        if self.enforced_sids.is_none() || self.is_tracked(sid) {
+            return Ok(());
+        }
+        self.settle().map(|_| ())
     }
 
     /// Full recompile with the rules supplied by the caller instead of a
@@ -869,6 +998,7 @@ impl PerSidApplyOrchestrator {
         sid: &str,
         rules: &ActiveRulesSnapshot,
     ) -> Result<usize, OrchestratorError> {
+        self.settle_if_untracked(sid)?;
         let lock = self.apply_lock_for(sid);
         let _apply_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let outcome = self.recompile_for_sid_impl(sid, Some(rules));
@@ -920,7 +1050,18 @@ impl PerSidApplyOrchestrator {
             g.get(sid).map(|s| s.installed.clone())
         };
         // Never installed → nothing is up, so plain install opens no window.
+        // Under a decider the install is the decider's alone: the settle that
+        // ran before this lock did not name the user, or they left since.
         let Some(tracked) = tracked else {
+            if self.enforced_sids.is_some() {
+                tracing::info!(
+                    target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-apply-recompile-not-enforced",
+                    sid,
+                    "recompile asked for a user who holds no filter set and is not enforced right now — nothing installed",
+                );
+                return Ok(0);
+            }
             return self.install_for_sid_with(sid, rules_override);
         };
         match self.compute_filters_for_sid(sid, true, rules_override, ComputeIntent::Apply)? {
@@ -955,6 +1096,77 @@ impl PerSidApplyOrchestrator {
     /// for the remaining SIDs but already-applied changes are kept
     /// (consistent with the WFP transactions inside install/remove).
     pub fn reconcile(&self, snapshot: &[String]) -> Result<(), OrchestratorError> {
+        let _membership = self
+            .membership_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        self.reconcile_locked(snapshot)
+    }
+
+    /// Bring the set of enforced users to what the decider says right now.
+    ///
+    /// The one entry point for every writer that changes membership: the pass,
+    /// a tray connect or exit, a pause or resume. The decider is consulted
+    /// UNDER the membership lock, so two of them cannot act on two different
+    /// ideas of who is signed in — whichever runs second sees the newer state.
+    /// Returns the users decided on. An unknown answer touches nothing.
+    pub fn settle(&self) -> Result<Vec<String>, OrchestratorError> {
+        let _membership = self
+            .membership_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let want = self.decide_membership()?;
+        self.reconcile_locked(&want)?;
+        Ok(want)
+    }
+
+    /// [`Self::settle`], then recompile every set still held — for a change
+    /// that alters what each set contains (a fake-IP stack transition) and
+    /// must not, on its way, put back a set the decider has just withdrawn.
+    pub fn settle_and_recompile(&self) -> Result<(), OrchestratorError> {
+        let _membership = self
+            .membership_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let want = self.decide_membership()?;
+        self.reconcile_locked(&want)?;
+        let mut first_err = None;
+        for sid in self.installed_sids() {
+            let lock = self.apply_lock_for(&sid);
+            let _apply_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(e) = self.recompile_for_sid_impl(&sid, None) {
+                tracing::error!(
+                    target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-apply-settle-recompile-failed",
+                    sid = %sid,
+                    error = %e,
+                    "recompile after membership settle failed",
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
+    fn decide_membership(&self) -> Result<Vec<String>, OrchestratorError> {
+        let Some(decider) = self.enforced_sids.as_ref() else {
+            // Without a decider the installed set is the answer: nothing to do.
+            return Ok(self.installed_sids());
+        };
+        decider().map_err(|reason| {
+            tracing::error!(
+                target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-membership-unknown",
+                error = %reason,
+                "who holds a filter set could not be decided — leaving every set as it is",
+            );
+            OrchestratorError::MembershipUnknown(reason)
+        })
+    }
+
+    fn reconcile_locked(&self, snapshot: &[String]) -> Result<(), OrchestratorError> {
         let want: std::collections::BTreeSet<String> = snapshot.iter().cloned().collect();
         let have: std::collections::BTreeSet<String> = {
             let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -968,7 +1180,14 @@ impl PerSidApplyOrchestrator {
         for sid in have.difference(&want) {
             self.remove_for_sid(sid)?;
         }
-        self.follow_route_table_owner(&fresh)
+        let outcome = self.follow_route_table_owner(&fresh);
+        // The first pass over somebody present is what a deferred start waits
+        // for; a pass over nobody claims nothing and settles nothing, and a
+        // failed one leaves the inherited blocks standing for the next.
+        if !want.is_empty() && outcome.is_ok() {
+            self.adopt_orphans_after_pass();
+        }
+        outcome
     }
 
     /// Delete filters from `previous` that `kept` no longer contains. A
@@ -1085,21 +1304,17 @@ impl PerSidApplyOrchestrator {
     }
 
     /// What a filter set covers: the destinations it scopes to (deduplicated,
-    /// in emission order) and whether the leak guard had a resolved tunnel when
-    /// it was built. Both are read off the filters, so the install and the
-    /// reconcile path cannot derive them differently.
+    /// in emission order, both families) and whether the leak guard had a
+    /// resolved tunnel when it was built. Both are read off the filters, so
+    /// the install and the reconcile path cannot derive them differently.
     ///
     /// Only host-scoped filters contribute here; a rule's network is read by
     /// [`Self::rule_networks_of`], since a subnet filter is mostly an exemption.
-    fn coverage_of(filters: &[WfpFilterSpec]) -> (Vec<std::net::Ipv4Addr>, bool) {
+    pub(super) fn coverage_of(filters: &[WfpFilterSpec]) -> (Vec<std::net::IpAddr>, bool) {
         let mut seen = std::collections::HashSet::new();
         let destinations = filters
             .iter()
-            .flat_map(|spec| {
-                spec.remote_ip
-                    .into_iter()
-                    .chain(spec.remote_ip_set.iter().copied())
-            })
+            .flat_map(Self::hosts_of)
             .filter(|ip| seen.insert(*ip))
             .collect();
         // The leak-guard emits an egress-via-secondary permit only when it has a
@@ -1109,11 +1324,25 @@ impl PerSidApplyOrchestrator {
         (destinations, secondary_resolved)
     }
 
+    /// Every single host a filter names, v4 then v6.
+    fn hosts_of(spec: &WfpFilterSpec) -> impl Iterator<Item = std::net::IpAddr> + '_ {
+        spec.remote_ip
+            .into_iter()
+            .chain(spec.remote_ip_set.iter().copied())
+            .map(std::net::IpAddr::V4)
+            .chain(
+                spec.remote_ip_set_v6
+                    .iter()
+                    .copied()
+                    .map(std::net::IpAddr::V6),
+            )
+    }
+
     pub(super) fn upsert_state_with_destinations(
         &self,
         sid: &str,
         installed: Vec<WfpFilterId>,
-        destinations: Vec<std::net::Ipv4Addr>,
+        destinations: Vec<std::net::IpAddr>,
         networks: Vec<nrr_shared::ip_block::IpBlock>,
         secondary_resolved: bool,
     ) {
@@ -1190,18 +1419,23 @@ impl PerSidApplyOrchestrator {
                 }
             }
         }
-        let mut hosts: std::collections::HashMap<std::net::Ipv4Addr, Seen> =
+        let mut hosts: std::collections::HashMap<std::net::IpAddr, Seen> =
             std::collections::HashMap::new();
         let mut networks: std::collections::HashMap<nrr_shared::ip_block::IpBlock, Seen> =
             std::collections::HashMap::new();
         for spec in filters {
-            for ip in spec.remote_ip.iter().chain(&spec.remote_ip_set) {
-                hosts.entry(*ip).or_default().mark(spec);
+            for ip in Self::hosts_of(spec) {
+                hosts.entry(ip).or_default().mark(spec);
             }
             let named = spec
                 .remote_subnet
                 .and_then(|(net, prefix)| {
                     nrr_shared::ip_block::IpBlock::new(std::net::IpAddr::V4(net), prefix)
+                })
+                .or_else(|| {
+                    spec.remote_subnet_v6.and_then(|(net, prefix)| {
+                        nrr_shared::ip_block::IpBlock::new(std::net::IpAddr::V6(net), prefix)
+                    })
                 })
                 .filter(|block| rule_networks.contains(block));
             if let Some(block) = named {
@@ -1246,7 +1480,7 @@ impl PerSidApplyOrchestrator {
         &self,
         sid: &str,
         filters: &[WfpFilterSpec],
-        destinations: &[std::net::Ipv4Addr],
+        destinations: &[std::net::IpAddr],
         networks: &[nrr_shared::ip_block::IpBlock],
         secondary_resolved: bool,
     ) {
@@ -1273,7 +1507,7 @@ impl PerSidApplyOrchestrator {
         // Walked only on the edge or once something is connected: this runs on
         // every reconcile, and the courses read every filter.
         let mut courses = tunnel_came_up.then(|| Self::courses_of(filters, networks));
-        let (hosts, nets): (Vec<std::net::Ipv4Addr>, Vec<nrr_shared::ip_block::IpBlock>) =
+        let (hosts, nets): (Vec<std::net::IpAddr>, Vec<nrr_shared::ip_block::IpBlock>) =
             match courses.as_ref() {
                 Some(courses) => (
                     destinations

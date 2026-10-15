@@ -1061,6 +1061,9 @@ pub enum CrashRecoveryOutcome {
     Clean,
     /// Recovery decision was executed; service may proceed normally.
     Recovered { detail: String },
+    /// The last activation was committed; only its marker could not be
+    /// removed. The service starts and the health card carries a warning.
+    RecoveredMarkerStale { detail: String },
     /// Recovery requires manual action — service should NOT transition
     /// to `Running`. The supervisor can route this to the bootstrap
     /// blocker path.
@@ -1098,7 +1101,37 @@ pub fn run_crash_recovery_on_startup(
     let coordinator = StartupRecoveryCoordinator::new(marker_store, sink);
     let state = coordinator.assess();
     let decision = decide_recovery(&state, true);
-    match coordinator.execute(decision) {
+    outcome_of(coordinator.execute(decision))
+}
+
+impl CrashRecoveryOutcome {
+    /// Put the outcome where the supervisor and the health card read it: a
+    /// blocking phase for what stops the start, a warning for a stale marker.
+    pub fn record_in(&self, report: &mut crate::managers::BootstrapReport) {
+        use crate::bootstrap::phases::CRASH_RECOVERY;
+        match self {
+            Self::ManualActionRequired { reason } | Self::Aborted { reason } => {
+                report.block(CRASH_RECOVERY, reason.clone());
+            }
+            Self::RecoveredMarkerStale { detail } => {
+                tracing::warn!(
+                    target: "nrr::recovery",
+                    msg_key = "svc-boot-crash-recovery-marker-stale",
+                    detail = %detail,
+                    "the last activation was applied but its marker could not be removed",
+                );
+                report.warn(
+                    CRASH_RECOVERY,
+                    format!("apply marker could not be removed: {detail}"),
+                );
+            }
+            Self::Clean | Self::Recovered { .. } | Self::SkippedNoAudit => {}
+        }
+    }
+}
+
+fn outcome_of(result: RecoveryExecutionResult) -> CrashRecoveryOutcome {
+    match result {
         RecoveryExecutionResult::Recovered => CrashRecoveryOutcome::Clean,
         RecoveryExecutionResult::VerifiedAndCleared => CrashRecoveryOutcome::Recovered {
             detail: "verified and marker cleared".into(),
@@ -1120,6 +1153,9 @@ pub fn run_crash_recovery_on_startup(
         RecoveryExecutionResult::MarkerClearFailed { detail } => CrashRecoveryOutcome::Aborted {
             reason: format!("marker clear failed: {detail}"),
         },
+        RecoveryExecutionResult::AppliedMarkerClearFailed { detail } => {
+            CrashRecoveryOutcome::RecoveredMarkerStale { detail }
+        }
     }
 }
 
@@ -1691,5 +1727,37 @@ mod tests {
         assert_eq!(outcome, CrashRecoveryOutcome::SkippedNoAudit);
         // Marker stays in place — recovery did not run.
         assert!(store.read().is_some());
+    }
+
+    #[test]
+    fn a_stale_applied_marker_warns_and_does_not_block_the_start() {
+        let outcome = outcome_of(RecoveryExecutionResult::AppliedMarkerClearFailed {
+            detail: "access denied".into(),
+        });
+        assert!(matches!(
+            outcome,
+            CrashRecoveryOutcome::RecoveredMarkerStale { .. }
+        ));
+        let mut report = crate::managers::BootstrapReport::default();
+        outcome.record_in(&mut report);
+        assert!(
+            !report.blocking,
+            "the activation is committed: nothing to hold the start for"
+        );
+        assert_eq!(
+            report.worst_severity,
+            crate::state::ServiceHealthSeverity::Warning
+        );
+        assert_eq!(report.phases.len(), 1);
+    }
+
+    #[test]
+    fn a_marker_that_could_not_be_cleared_mid_recovery_still_blocks() {
+        let outcome = outcome_of(RecoveryExecutionResult::MarkerClearFailed {
+            detail: "access denied".into(),
+        });
+        let mut report = crate::managers::BootstrapReport::default();
+        outcome.record_in(&mut report);
+        assert!(report.blocking);
     }
 }

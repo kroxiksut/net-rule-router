@@ -14,10 +14,11 @@
 //! The crate has no `windows-service` / `windows-sys` dependency: the
 //! Windows adapters live in `nrr-windows-service` and implement the trait.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::lifecycle_matrix::StopReason;
 use crate::state::ServiceRuntimeState;
 
 // ── Service identity / install metadata ──────────────────────────────────────
@@ -68,10 +69,32 @@ pub struct StopToken {
 #[derive(Debug, Default)]
 struct StopSignal {
     flag: AtomicBool,
+    /// The first reason given; a stop followed by a shutdown is still the
+    /// stop that began the teardown.
+    reason: AtomicU8,
     /// Wakes the sleepers in [`StopToken::wait_for`]. A sleeper that polled the
     /// flag instead woke twenty times a second per thread, on every idle task.
     lock: Mutex<()>,
     wake: Condvar,
+}
+
+const REASON_NONE: u8 = 0;
+const REASON_SERVICE_STOP: u8 = 1;
+const REASON_MACHINE_SHUTDOWN: u8 = 2;
+
+fn encode_reason(reason: StopReason) -> u8 {
+    match reason {
+        StopReason::ServiceStop => REASON_SERVICE_STOP,
+        StopReason::MachineShutdown => REASON_MACHINE_SHUTDOWN,
+    }
+}
+
+fn decode_reason(code: u8) -> Option<StopReason> {
+    match code {
+        REASON_SERVICE_STOP => Some(StopReason::ServiceStop),
+        REASON_MACHINE_SHUTDOWN => Some(StopReason::MachineShutdown),
+        _ => None,
+    }
 }
 
 impl StopToken {
@@ -82,8 +105,19 @@ impl StopToken {
     }
 
     /// Signal every clone of this token to stop, waking every sleeper.
-    /// Idempotent.
+    /// Idempotent. A plain stop: the machine keeps running.
     pub fn request_stop(&self) {
+        self.request_stop_for(StopReason::ServiceStop);
+    }
+
+    /// [`Self::request_stop`] with the reason the teardown reads.
+    pub fn request_stop_for(&self, reason: StopReason) {
+        let _ = self.inner.reason.compare_exchange(
+            REASON_NONE,
+            encode_reason(reason),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
         self.inner.flag.store(true, Ordering::SeqCst);
         // Taken so a sleeper between its flag check and its wait cannot miss
         // the notification.
@@ -94,6 +128,11 @@ impl StopToken {
     /// Whether `request_stop()` has been called on any clone.
     pub fn is_stop_requested(&self) -> bool {
         self.inner.flag.load(Ordering::SeqCst)
+    }
+
+    /// Why the stop was requested; `None` while no stop is requested.
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        decode_reason(self.inner.reason.load(Ordering::SeqCst))
     }
 
     /// Sleep up to `total`, returning early — at once — when a stop is
@@ -135,9 +174,21 @@ impl Default for StopToken {
 /// stripped them — and those survive the process, because the WFP session is
 /// non-dynamic. Anything that enforces must check this before it applies.
 static TEARDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+static TEARDOWN_REASON: AtomicU8 = AtomicU8::new(REASON_NONE);
+
+/// A start that cannot reach `Running`. Read by the IPC router: reads are
+/// answered so the reason can be shown, everything that changes state is
+/// refused.
+static RECOVERY_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 /// Latch the teardown. Called once, right after the stop token flips.
 pub fn begin_teardown() {
+    begin_teardown_for(StopReason::ServiceStop);
+}
+
+/// [`begin_teardown`] with the reason the teardown hooks plan by.
+pub fn begin_teardown_for(reason: StopReason) {
+    TEARDOWN_REASON.store(encode_reason(reason), Ordering::SeqCst);
     TEARDOWN_STARTED.store(true, Ordering::SeqCst);
 }
 
@@ -146,10 +197,32 @@ pub fn teardown_in_progress() -> bool {
     TEARDOWN_STARTED.load(Ordering::SeqCst)
 }
 
+/// Why the teardown runs. A service stop until a teardown says otherwise.
+pub fn teardown_reason() -> StopReason {
+    decode_reason(TEARDOWN_REASON.load(Ordering::SeqCst)).unwrap_or(StopReason::ServiceStop)
+}
+
 /// Clear the latch at runtime start so a second runtime in the same process
 /// (tests, console-mode restart) is not born already tearing down.
 pub fn clear_teardown() {
     TEARDOWN_STARTED.store(false, Ordering::SeqCst);
+    TEARDOWN_REASON.store(REASON_NONE, Ordering::SeqCst);
+    RECOVERY_REQUIRED.store(false, Ordering::SeqCst);
+}
+
+/// Mark this run as one that never reached `Running`.
+pub fn mark_recovery_required() {
+    RECOVERY_REQUIRED.store(true, Ordering::SeqCst);
+}
+
+/// Whether this run is parked in recovery.
+pub fn recovery_required() -> bool {
+    RECOVERY_REQUIRED.load(Ordering::SeqCst)
+}
+
+/// The run is over; a later runtime in this process starts clean.
+pub fn clear_recovery_required() {
+    RECOVERY_REQUIRED.store(false, Ordering::SeqCst);
 }
 
 // ── Service controller trait ─────────────────────────────────────────────────
@@ -210,5 +283,18 @@ mod tests {
         assert!(!clone.is_stop_requested());
         token.request_stop();
         assert!(clone.is_stop_requested());
+    }
+
+    #[test]
+    fn the_first_stop_reason_is_the_one_the_teardown_reads() {
+        let token = StopToken::new();
+        assert_eq!(token.stop_reason(), None);
+        token.request_stop_for(StopReason::MachineShutdown);
+        token.request_stop();
+        assert_eq!(token.stop_reason(), Some(StopReason::MachineShutdown));
+        assert_eq!(StopToken::new().stop_reason(), None);
+        let plain = StopToken::new();
+        plain.request_stop();
+        assert_eq!(plain.stop_reason(), Some(StopReason::ServiceStop));
     }
 }

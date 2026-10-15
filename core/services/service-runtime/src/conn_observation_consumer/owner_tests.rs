@@ -41,7 +41,6 @@ struct Fixture {
     consumer: ConnectionObservationConsumer,
     ring: Arc<ConnectionTraceRing>,
     notices: Notices,
-    learned: Arc<Mutex<Vec<Ipv4Addr>>>,
 }
 
 /// Alice's additional route is down, Bob's is up; nobody is "the active user".
@@ -58,9 +57,7 @@ fn fixture() -> Fixture {
     });
     let ring = Arc::new(ConnectionTraceRing::new(64));
     let notices: Notices = Arc::new(Mutex::new(Vec::new()));
-    let learned = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&notices);
-    let learn = Arc::clone(&learned);
     let consumer =
         ConnectionObservationConsumer::with_egress(Arc::new(api), egress, Arc::new(|| None), false)
             .with_owner_scoped_egress()
@@ -68,12 +65,7 @@ fn fixture() -> Fixture {
             .with_trace_ring(Arc::clone(&ring))
             .with_not_covered_drop_check(Arc::new(|id: u64| id == DEFAULT))
             .with_service_account_drop_check(Arc::new(|id: u64| id == SYSTEM_PIN))
-            .with_vpn_endpoint_learner(
-                Arc::new(move |ip: Ipv4Addr| {
-                    learn.lock().unwrap_or_else(|p| p.into_inner()).push(ip)
-                }),
-                Arc::new(|id: u64| id == PIN || id == SYSTEM_PIN),
-            )
+            .with_killswitch_drop_check(Arc::new(|id: u64| id == PIN || id == SYSTEM_PIN))
             .with_block_notice(
                 Arc::new(|_: Ipv4Addr| -> Option<String> { None }),
                 Arc::new(
@@ -88,7 +80,6 @@ fn fixture() -> Fixture {
         consumer,
         ring,
         notices,
-        learned,
     }
 }
 
@@ -184,19 +175,14 @@ fn an_outage_is_announced_once_per_episode_and_per_owner() {
 }
 
 #[test]
-fn a_system_drop_teaches_a_tunnel_server_and_nothing_else() {
+fn a_system_drop_reaches_nobodys_notice_or_outage_list() {
     let f = fixture();
     let mut client = drop_by(SYSTEM, SYSTEM_PIN, 9, 1_000);
     client.process_path = Some("/usr/sbin/openvpn".into());
-    let summary = f.consumer.consume(&[client], at(1_500));
+    f.consumer.consume(&[client], at(1_500));
 
     assert!(notices(&f).is_empty(), "nobody's notice");
     assert!(f.ring.outage_blocks().snapshot(SYSTEM).entries.is_empty());
-    assert_eq!(summary.vpn_endpoints_learned, 1);
-    assert_eq!(
-        *f.learned.lock().unwrap_or_else(|p| p.into_inner()),
-        vec![Ipv4Addr::new(198, 51, 100, 9)]
-    );
     let (rows, _) = f.ring.snapshot(0, 8);
     assert_eq!(rows.len(), 1, "the trace still shows it");
 }

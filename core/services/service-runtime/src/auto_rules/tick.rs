@@ -150,7 +150,7 @@ impl AutoRulesEngine {
         // nothing: the host is uncovered (the exclusions guarantee it), so it
         // goes there anyway. Dropping these is not a matter of taste — offering
         // them asks the user to approve a rule with no effect.
-        let default_role = snapshot.behavior_mode.default_route_role();
+        let default_role = self.default_route_role(sid);
         let suppressed = self.suppressed_ids(sid);
         let mut inert = 0_usize;
         // One address, one offer. A CDN host pulled by two routed sites yields

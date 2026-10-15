@@ -7,6 +7,8 @@
 // would then drift.
 use super::*;
 
+use nrr_service_runtime::lifecycle_matrix::{orphaned_blocks_at_start, OrphanedBlocks};
+
 /// What the stack needs from the boot bundle.
 ///
 /// Owned clones (every field is an `Arc` or a `Copy`) rather than borrows, so
@@ -39,7 +41,6 @@ pub(super) struct PerSidApplyStack {
     pub app_enforcement: nrr_service_runtime::app_enforcement_status::AppEnforcementStatus,
     pub shared_ip_exemptions: nrr_service_runtime::app_enforcement_status::SharedIpExemptionStatus,
     pub block_all_posture: nrr_service_runtime::app_enforcement_status::BlockAllPostureStatus,
-    pub learned_vpn_endpoints: Arc<nrr_service_runtime::vpn_endpoint_learning::LearnedVpnEndpoints>,
     pub learned_vpn_client_apps:
         Arc<nrr_service_runtime::vpn_client_registry::LearnedVpnClientApps>,
     pub killswitch_drop_registry:
@@ -109,15 +110,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
         let posture = fail_closed_posture.clone();
         Arc::new(move || posture.armed())
     };
-    // Reactive VPN-endpoint learning — bounded, session-scoped, role-verified
-    // server IPs (see `nrr_service_runtime::vpn_endpoint_learning`) plus the
-    // kill-switch/fail-closed Block-id registry that role-verifies a drop
-    // before the learner trusts it (see `nrr_service_runtime::killswitch_drop_registry`).
-    // Shared: the route coordinator merges the learned set into its exemption
-    // bands, the per-SID orchestrator publishes into the registry on every
-    // compute, and the conn-trace consumer (built later) reads/writes both.
-    let learned_vpn_endpoints =
-        Arc::new(nrr_service_runtime::vpn_endpoint_learning::LearnedVpnEndpoints::new());
     // Proactive VPN-client exemption — registry of client exe
     // paths whose VPN role was verified by a kill-switch drop. Shared: the
     // per-SID orchestrator folds it into the block-all app-exemption set on
@@ -232,8 +224,10 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     ProductionRoutePolicySource::new(Arc::clone(state_conn))
                         .with_fqdn_cache(Arc::clone(&fqdn_cache)),
                 );
-                let rules_provider: Arc<dyn RulesProvider> =
-                    Arc::new(ProductionRulesProvider::new(Arc::clone(state_conn)));
+                let production_rules = ProductionRulesProvider::new(Arc::clone(state_conn));
+                // A book that stops reading is a health verdict, not a log line.
+                production_rules.set_health(Arc::clone(&health_agg));
+                let rules_provider: Arc<dyn RulesProvider> = Arc::new(production_rules);
                 // Swap Noop → Production audit
                 // sink when the audit writer is available. Without
                 // an audit writer (boot before audit init or
@@ -246,6 +240,13 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     )),
                     None => Arc::new(NoopPerSidApplyAudit),
                 };
+                // A refused install is a verdict on `Apply`, not only an
+                // audit line.
+                let audit: Arc<dyn PerSidApplyAudit> =
+                    Arc::new(nrr_service_runtime::apply_health::ApplyHealthAudit::new(
+                        audit,
+                        Arc::clone(&health_agg),
+                    ));
                 // Build the route coordinator with cloned providers BEFORE
                 // the orchestrator moves them.
                 // Live routing-scope read for the
@@ -339,6 +340,12 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                                         .push((rule.adapter.clone(), rule.allow));
                                 }
                                 let Some(network) = Ipv4Network::parse(&rule.cidr) else {
+                                    // A public IPv6 prefix, answered by itself.
+                                    if let Some(block) = nrr_shared::ip_block::IpBlock::parse(&rule.cidr)
+                                        .filter(|b| !b.is_ipv4())
+                                    {
+                                        policy.answers_v6.push((block, rule.allow));
+                                    }
                                     continue;
                                 };
                                 if rule.allow {
@@ -437,10 +444,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     .with_dns_via_secondary(
                         nrr_service_runtime::dns_egress::global_dns_via_secondary(),
                     )
-                    // Reactive VPN-endpoint learning — fold role-verified
-                    // learned server IPs into the kill-switch/fail-closed
-                    // exemption bands alongside the route-observed set.
-                    .with_learned_vpn_endpoints(Arc::clone(&learned_vpn_endpoints))
                     // So "your rules are not in force, and here is why" reaches
                     // the GUI banner and the tray instead of only the log.
                     .with_event_bus(Arc::clone(&event_bus)),
@@ -604,6 +607,16 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                                 .load_for_sid(sid)
                                 .map(|record| record.auto_rules_eager_delivery_names)
                                 .unwrap_or(false)
+                        })
+                    })
+                    // The user's mode decides which offers change anything.
+                    .with_behavior_mode_source({
+                        let policy = Arc::clone(&route_source);
+                        Arc::new(move |sid: &str| {
+                            nrr_service_runtime::per_sid_orchestrator::behavior_mode_of(
+                                policy.as_ref(),
+                                sid,
+                            )
                         })
                     })
                     .with_event_bus(Arc::clone(&event_bus))
@@ -828,6 +841,31 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 // through a slot filled once that construction lands.
                 let dns_resolve_slot = Arc::clone(&dns_resolve_now_slot);
                 let dns_resolve_busy = Arc::clone(&dns_resolve_now_busy);
+                // The one answer to "who holds a filter set": every served
+                // user (tray or no tray — see `served_sids`) minus whoever
+                // paused, read fresh under the orchestrator's membership lock
+                // by the pass, the registry listener, the pause dispatcher and
+                // the fake-IP replan alike. Same settings DB the pause writes
+                // to, so a flag written before the call is seen by it. A flag
+                // read that fails is an unknown answer, never an empty one.
+                let enforced_sids: nrr_service_runtime::per_sid_orchestrator::EnforcedSidsSource = {
+                    let coord = Arc::clone(&route_coord);
+                    let registry = Arc::clone(&sid_registry);
+                    let conn = Arc::clone(state_conn);
+                    Arc::new(move || -> Result<Vec<String>, String> {
+                        let paused = {
+                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                            nrr_storage::pause_state::RoutingPauseStateRepository::new(&guard)
+                                .list_paused()
+                                .map_err(|e| format!("pause-state read failed: {e}"))?
+                        };
+                        Ok(coord
+                            .effective_enforcement_sids(&registry.active_sids())
+                            .into_iter()
+                            .filter(|sid| !paused.iter().any(|p| p == sid))
+                            .collect())
+                    })
+                };
                 let orch = Arc::new(
                         PerSidApplyOrchestrator::new(
                             Arc::new(session),
@@ -837,6 +875,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             audit,
                         )
                         .with_failure_mode_source(failure_mode_source)
+                        .with_enforced_sids(enforced_sids)
                         .with_machine_reader(machine_reader)
                         .with_kill_switch_resolver(kill_switch_resolver)
                         .with_ipv6_guard_resolver(ipv6_guard_resolver)
@@ -1067,34 +1106,34 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 // the first recompute reconciles them. Runs before any
                 // listener can fire (no active SID yet at construction).
                 route_coord.adopt_orphans_from_table();
-                // Persist-on-stop (startup guarantee) — ALWAYS strip any
-                // orphaned block/fail-closed/kill-switch WFP filter a dead
-                // prior instance left behind, in BOTH stop modes. A
-                // non-dynamic WFP session's block filters survive
-                // taskkill/F until reboot, so a hard-killed kill-switch with
-                // no service to lift it would lock the user out. Runs before
-                // any active-SID listener fires (registry empty at
-                // construction), so it never races per-SID reconcile.
-                //
-                // Reap the prior instance's filters by PERSISTED ID first
-                // (robust even when enumerate under-reports), then the
-                // enumerate-based block strip as defence in depth.
-                orch.cleanup_persisted_orphans();
-                match orch.cleanup_wfp_blocks_only() {
-                    Ok(0) => {}
-                    Ok(n) => tracing::warn!(
-                        target: "nrr::runtime",
-                        msg_key = "svc-persid-startup-blocks-stripped",
-                        stripped_blocks = n as u64,
-                        "startup reconciliation: stripped orphaned block/kill-switch \
-                         WFP filter(s) left by a prior instance",
-                    ),
-                    Err(e) => tracing::warn!(
-                        target: "nrr::runtime",
-                        msg_key = "svc-persid-startup-block-strip-failed",
-                        error = %e,
-                        "startup block-filter reconciliation failed",
-                    ),
+                // A dead instance's filters (a non-dynamic session's survive
+                // `taskkill /F` until reboot): stripped now when nobody has
+                // leak protection on, else kept until the first pass over a
+                // present user adopts them. Runs before any active-SID
+                // listener fires (registry empty at construction).
+                match orphaned_blocks_at_start(super::offline_reset::leak_guard_armed_anywhere()) {
+                    OrphanedBlocks::AdoptOnFirstPass => orch.defer_orphans_to_first_pass(),
+                    OrphanedBlocks::StripNow => {
+                        // By persisted id first (robust when enumerate
+                        // under-reports), then the enumerate-based block strip.
+                        orch.cleanup_persisted_orphans();
+                        match orch.cleanup_wfp_blocks_only() {
+                            Ok(0) => {}
+                            Ok(n) => tracing::warn!(
+                                target: "nrr::runtime",
+                                msg_key = "svc-persid-startup-blocks-stripped",
+                                stripped_blocks = n as u64,
+                                "startup reconciliation: stripped orphaned block/kill-switch \
+                                 WFP filter(s) left by a prior instance",
+                            ),
+                            Err(e) => tracing::warn!(
+                                target: "nrr::runtime",
+                                msg_key = "svc-persid-startup-block-strip-failed",
+                                error = %e,
+                                "startup block-filter reconciliation failed",
+                            ),
+                        }
+                    }
                 }
                 // Recompute the route table on every active-user transition
                 // (login/logout/switch). Every served user's routes share the
@@ -1176,119 +1215,47 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
         Arc::new(coord)
     });
 
-    // Register the orchestrator's install listener as a PAUSE-AWARE reconcile:
-    // persisted-paused SIDs are subtracted from the active snapshot before
-    // `reconcile`, so a paused SID's filters are removed and NOT reinstalled on
-    // an active-user transition or reboot (durable pause / safe-disable).
-    // Replaces the old `wire_orchestrator_to_registry` direct wiring.
-    match (per_sid_orchestrator.as_ref(), pause_coordinator.as_ref()) {
-        (Some(orch), Some(coord)) => {
-            let orch = Arc::clone(orch);
-            let coord = Arc::clone(coord);
-            let routing = route_coordinator.clone();
-            sid_registry.add_listener(Arc::new(move |snapshot: &[String]| {
-                // Fail-CLOSED on a pause-state read error: do NOT touch the
-                // platform, so a transient DB error can never reinstall a paused
-                // SID's filters (mirrors
-                // `RoutingPauseCoordinator::make_pause_aware_listener`).
-                let paused = match coord.paused_sids() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(
-                            target: "nrr::per_sid_orchestrator",
-                            msg_key = "svc-persid-pause-read-failed-reconcile",
-                            error = %e,
-                            "pause-state read failed; skipping reconcile",
-                        );
-                        return;
-                    }
-                };
-                // With NO tray connected, the console-
-                // session user (service-driven scope) is still the routing
-                // user: a tray disconnect must not strip their enforcement,
-                // and a tray-less boot must still install it. Connected trays
-                // pass through unchanged.
-                let effective: Vec<String> = match routing.as_ref() {
-                    Some(rc) => rc.effective_enforcement_sids(snapshot),
-                    None => snapshot.to_vec(),
-                };
-                let active_unpaused: Vec<String> = effective
-                    .iter()
-                    .filter(|s| !paused.iter().any(|p| p == *s))
-                    .cloned()
-                    .collect();
-                if let Err(e) = orch.reconcile(&active_unpaused) {
-                    tracing::error!(
-                        target: "nrr::per_sid_orchestrator",
-                        msg_key = "svc-persid-pause-aware-reconcile-failed",
-                        error = %e,
-                        "pause-aware reconcile failed",
-                    );
-                }
-            }));
-        }
-        // No pause state (no settings DB) but WFP is up → plain reconcile wiring
-        // so enforcement still installs on tray connect.
-        (Some(orch), None) => {
-            wire_orchestrator_to_registry(Arc::clone(orch), sid_registry.as_ref())
-        }
-        // No orchestrator (WFP unavailable) → nothing to install.
-        (None, _) => {}
+    // A tray connect or exit settles membership through the orchestrator's one
+    // decider (served minus paused, read under its membership lock), the same
+    // call the pass and the pause dispatcher make — so an exit during a pass
+    // can no longer be overtaken by the pass's older view. A decider that
+    // cannot answer (pause-flag read error) touches nothing.
+    if let Some(orch) = per_sid_orchestrator.as_ref() {
+        let orch = Arc::clone(orch);
+        sid_registry.add_listener(Arc::new(move |_snapshot: &[String]| {
+            if let Err(e) = orch.settle() {
+                tracing::error!(
+                    target: "nrr::per_sid_orchestrator",
+                    msg_key = "svc-persid-pause-aware-reconcile-failed",
+                    error = %e,
+                    "membership settle on active-user change failed",
+                );
+            }
+        }));
     }
 
-    // Recompile the active SIDs' filter sets right after a
-    // fake-IP stack transition. The per-SID codegen reads the fake-IP context
-    // LIVE (see `with_fake_ip_context_provider`), but nothing else would
-    // recompute at the moment of a toggle — the pool permit (or its removal)
-    // would otherwise wait for the next unrelated recompute. Pause-aware and
-    // fail-closed on a pause-state read error, mirroring the listener above.
+    // Recompile the held filter sets right after a fake-IP stack transition.
+    // The per-SID codegen reads the fake-IP context LIVE (see
+    // `with_fake_ip_context_provider`), but nothing else would recompute at the
+    // moment of a toggle — the pool permit (or its removal) would otherwise
+    // wait for the next unrelated recompute. Membership is settled first,
+    // under the same lock, so the replan recompiles exactly the sets the
+    // decider keeps and never installs one for a user who just left. A
+    // window-free recompile, not an add-only install: a transition also
+    // REMOVES filters, and the MAKE-then-BREAK diff deletes them in one pass.
     let fake_ip_replan: Arc<dyn Fn() + Send + Sync> = {
         let orch = per_sid_orchestrator.clone();
-        let pause = pause_coordinator.clone();
-        let routing = route_coordinator.clone();
-        let registry = Arc::clone(&sid_registry);
         Arc::new(move || {
             let Some(orch) = orch.as_ref() else {
                 return;
             };
-            let paused = match pause.as_ref() {
-                Some(coord) => match coord.paused_sids() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(
-                            target: "nrr::fake-ip",
-                            msg_key = "svc-persid-pause-read-failed-fakeip-replan",
-                            error = %e,
-                            "pause-state read failed; skipping fake-IP replan",
-                        );
-                        return;
-                    }
-                },
-                None => Vec::new(),
-            };
-            let snapshot = registry.active_sids();
-            let effective: Vec<String> = match routing.as_ref() {
-                Some(rc) => rc.effective_enforcement_sids(&snapshot),
-                None => snapshot,
-            };
-            for sid in effective.iter().filter(|s| !paused.iter().any(|p| p == *s)) {
-                // Window-free RECOMPILE, not the add-only install:
-                // a fake-IP transition also REMOVES filters (pool permit /
-                // real-IP blocks on toggle-off; the shared-IP exemption permits
-                // when the datapath drops and the strict subtraction re-arms).
-                // `install_for_sid` only adds and re-tracks, so the superseded
-                // filters would stay live in WFP yet untracked — invisible to
-                // every later diff until a service restart. The MAKE-then-BREAK
-                // diff deletes them in the same pass.
-                if let Err(e) = orch.recompile_for_sid(sid) {
-                    tracing::error!(
-                        target: "nrr::fake-ip",
-                        msg_key = "svc-persid-fakeip-recompile-failed",
-                        sid = %sid,
-                        error = %e,
-                        "fake-IP replan: per-SID recompile failed",
-                    );
-                }
+            if let Err(e) = orch.settle_and_recompile() {
+                tracing::error!(
+                    target: "nrr::fake-ip",
+                    msg_key = "svc-persid-fakeip-recompile-failed",
+                    error = %e,
+                    "fake-IP replan: recompile of the held filter sets failed",
+                );
             }
         })
     };
@@ -1298,7 +1265,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
         app_enforcement,
         shared_ip_exemptions,
         block_all_posture,
-        learned_vpn_endpoints,
         learned_vpn_client_apps,
         killswitch_drop_registry,
         main_route_verdicts,

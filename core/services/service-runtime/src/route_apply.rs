@@ -224,6 +224,42 @@ impl PlannedRouteApplier {
         Ok(report)
     }
 
+    /// Install `plan`'s routes now, ahead of the pass that will plan them, in
+    /// the tables that pass would use: the user's own, and the service
+    /// accounts' when `owner`. Without per-user routing only the owner's
+    /// routes have a table. Returns how many landed; the pass finds them in
+    /// place and keeps or drops them as it would any route of ours.
+    pub fn install_ahead(&self, plan: &EnforcementPlan, owner: bool) -> Result<usize, String> {
+        let adapters = self.read_adapters()?;
+        self.adopt_leftovers();
+        let mut unresolved = Vec::new();
+        let routes = self.lowered(plan, &adapters, &mut unresolved);
+        let port = self
+            .principal_routing
+            .as_deref()
+            .filter(|_| !self.principal_routing_refused.load(Ordering::Acquire));
+        let desired: Vec<RouteEntry> = match port {
+            None if owner => routes,
+            None => Vec::new(),
+            Some(port) => {
+                let mut desired: Vec<RouteEntry> = port
+                    .table_for(&plan.principal)
+                    .map(|table| in_table(&routes, &table).collect())
+                    .unwrap_or_default();
+                if owner {
+                    desired.extend(in_table(&routes, &port.system_table()));
+                }
+                desired
+            }
+        };
+        if desired.is_empty() {
+            return Ok(0);
+        }
+        self.reconciler
+            .install_additional(&desired)
+            .map_err(|e| format!("routes could not be installed ahead of the pass: {e}"))
+    }
+
     fn read_adapters(&self) -> Result<Vec<AdapterInfo>, String> {
         self.adapters
             .enumerate_all()
@@ -291,6 +327,26 @@ impl PlannedRouteApplier {
             .clear()
             .map_err(|e| format!("owned routes could not be removed: {e}"))?;
         selectors?;
+        Ok(RouteApplyReport {
+            added: delta.added,
+            removed: delta.removed,
+            unresolved: Vec::new(),
+            failure: None,
+        })
+    }
+}
+
+impl PlannedRouteApplier {
+    /// The stop that keeps the rule routes on the additional link (the stored
+    /// `routing_stop_policy`): only our overlays go, so the rest of the traffic
+    /// returns to the machine's own routing. The per-user selectors stay —
+    /// without them the routes left in those tables would be inert.
+    pub fn retain_rule_routes(&self) -> Result<RouteApplyReport, String> {
+        self.adopt_leftovers();
+        let delta = self
+            .reconciler
+            .retain_rule_routes()
+            .map_err(|e| format!("our overlay routes could not be removed: {e}"))?;
         Ok(RouteApplyReport {
             added: delta.added,
             removed: delta.removed,
@@ -796,6 +852,34 @@ mod tests {
             assert!(tables.rows().is_empty(), "{:?}", tables.rows());
         }
 
+        /// A stop that keeps the rule routes leaves them, and the selectors
+        /// that make their tables count, in place; only overlays go.
+        #[test]
+        fn a_stop_that_keeps_rule_routes_keeps_them_and_their_selectors() {
+            let (applier, tables, selectors) = rig(false);
+            let plans = [plan(1000), plan(1001)];
+            let present = users(&[1000, 1001]);
+            applier.apply_pass(pass(&plans, &present, 0)).expect("pass");
+            let before = tables.rows();
+            assert!(!before.is_empty());
+
+            applier.retain_rule_routes().expect("keep");
+
+            assert_eq!(*selectors.cleared.lock().expect("lock"), 0);
+            let after = tables.rows();
+            assert!(
+                after
+                    .iter()
+                    .all(|r| !crate::route_codegen::is_overlay_route(r)),
+                "{after:?}"
+            );
+            let rules_before = before
+                .iter()
+                .filter(|r| !crate::route_codegen::is_overlay_route(r))
+                .count();
+            assert_eq!(after.len(), rules_before, "{after:?}");
+        }
+
         #[test]
         fn nobody_present_selects_nobody() {
             let (applier, tables, selectors) = rig(false);
@@ -804,6 +888,52 @@ mod tests {
             assert!(selected.users.is_empty());
             assert!(selected.system.is_none());
             assert!(tables.rows().is_empty());
+        }
+
+        /// A rule host's first contact gets its route before the pass that
+        /// plans it: in the user's table and, for the owner, the service
+        /// accounts' too. The pass then finds it in place and redoes nothing.
+        #[test]
+        fn a_route_installed_ahead_lands_where_the_pass_would_put_it() {
+            let (applier, tables, _) = rig(false);
+            let plans = [plan(1000), plan(1001)];
+            let present = users(&[1000, 1001]);
+
+            assert_eq!(applier.install_ahead(&plans[0], true).expect("ahead"), 2);
+            assert_eq!(tables.links_of(table_of(1000)), vec![TUN]);
+            assert_eq!(tables.links_of(RouteTableRef::Tagged(SYSTEM)), vec![TUN]);
+            assert!(tables.links_of(table_of(1001)).is_empty());
+            assert_eq!(applier.install_ahead(&plans[1], false).expect("ahead"), 1);
+            assert_eq!(tables.links_of(table_of(1001)), vec![ETH]);
+            assert!(tables.links_of(RouteTableRef::Main).is_empty());
+
+            let report = applier.apply_pass(pass(&plans, &present, 0)).expect("pass");
+            assert_eq!(
+                (report.added, report.removed),
+                (0, 0),
+                "the pass redid what was already in place"
+            );
+            assert_eq!(tables.links_of(table_of(1000)), vec![TUN]);
+        }
+
+        /// Without per-user routing only the owner has a table to be early in.
+        #[test]
+        fn ahead_of_the_pass_an_old_kernel_routes_the_owner_alone() {
+            let (applier, tables, _) = rig(true);
+            let plans = [plan(1000), plan(1001)];
+            let present = users(&[1000, 1001]);
+            applier.apply_pass(pass(&plans, &present, 1)).expect("pass");
+
+            let other = Ipv4Addr::new(198, 51, 100, 8);
+            let mut owner = plan(1001);
+            owner.routes = vec![intent(DstMatch::HostV4(other), EgressRef::Secondary)];
+            assert_eq!(applier.install_ahead(&plans[0], false).expect("ahead"), 0);
+            assert_eq!(applier.install_ahead(&owner, true).expect("ahead"), 1);
+            let rows = tables.rows();
+            assert!(rows.iter().any(|r| r.table == RouteTableRef::Main
+                && r.destination == IpAddr::V4(other)
+                && r.interface_index == TUN));
+            assert!(rows.iter().all(|r| r.table == RouteTableRef::Main));
         }
     }
 }

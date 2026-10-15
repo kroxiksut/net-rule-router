@@ -33,6 +33,7 @@
 //! - **`ExactIp`**, subnets and ranges name addresses: no DNS, nothing seeded.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -170,6 +171,9 @@ pub struct RuleHostnameSeeder {
     /// concurrently, multiplying query load and racing the retry backoff; a
     /// pass that finds another in flight returns at once.
     pass_gate: Mutex<()>,
+    /// A [`Self::seed_within`] worker is running. Separate from `pass_gate`,
+    /// whose guard cannot cross into the worker's thread.
+    worker_busy: Arc<AtomicBool>,
 }
 
 /// How long a recompute waits for the rule-host seed before going ahead with
@@ -209,6 +213,7 @@ impl RuleHostnameSeeder {
             apex_negatives: Mutex::new(HashMap::new()),
             previous_hostnames: Mutex::new(HashMap::new()),
             pass_gate: Mutex::new(()),
+            worker_busy: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -426,16 +431,26 @@ impl RuleHostnameSeeder {
         if principals.is_empty() {
             return SeedWait::Finished;
         }
-        // Whoever holds the gate recomputes on its own progress; a second
-        // worker would only return empty.
-        if self.pass_gate.try_lock().is_err() {
+        // Whoever runs the worker recomputes on its own progress; a second
+        // worker would only return empty, and its caller would take that for a
+        // finished seed.
+        if self.worker_busy.swap(true, AtomicOrdering::SeqCst) {
             return SeedWait::Detached;
         }
+        /// Clears the busy flag however the worker ends, a panic included.
+        struct WorkerDone(Arc<AtomicBool>);
+        impl Drop for WorkerDone {
+            fn drop(&mut self) {
+                self.0.store(false, AtomicOrdering::SeqCst);
+            }
+        }
+        let busy = Arc::clone(&self.worker_busy);
         let handoff = Arc::new((Mutex::new(Handoff::Waiting), Condvar::new()));
         let worker = {
             let seeder = Arc::clone(self);
             let handoff = Arc::clone(&handoff);
             move || {
+                let _done = WorkerDone(busy);
                 let mut progressed = false;
                 for sid in &principals {
                     let summary = seeder.seed_for_principal(sid, SystemTime::now());
@@ -465,6 +480,7 @@ impl RuleHostnameSeeder {
             .name("nrr-rule-seed".into())
             .spawn(worker)
         {
+            self.worker_busy.store(false, AtomicOrdering::SeqCst);
             tracing::warn!(
                 target: "nrr::rule-seed",
                 msg_key = "hostseed-seed-worker-spawn-failed",

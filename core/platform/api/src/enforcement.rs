@@ -218,6 +218,9 @@ pub enum PrincipalScope {
     /// Linux the system uid range and `nobody`, minus the uids of present
     /// users. Each lowering resolves the set; the plan only names it.
     ServiceAccounts,
+    /// Packets the machine forwards for others — WSL, containers, virtual
+    /// machines. No user owns them; only a destination can be matched.
+    Forwarded,
 }
 
 impl PrincipalScope {
@@ -232,7 +235,7 @@ impl PrincipalScope {
     pub fn user(&self) -> Option<&UserPrincipal> {
         match self {
             Self::User(user) => Some(user),
-            Self::Machine | Self::ServiceAccounts => None,
+            Self::Machine | Self::ServiceAccounts | Self::Forwarded => None,
         }
     }
 }
@@ -568,6 +571,13 @@ pub trait PolicyEnforcer: Send + Sync {
     /// set in force — anything absent from it stops being enforced, which is how
     /// a user logging out drops their policy.
     fn enforce(&self, plans: &[EnforcementPlan]) -> Result<ApplyReport, EnforcementFailure>;
+
+    /// Whether the platform would take these plans, installing nothing: the
+    /// pre-flight of a strict activation. The default has no dry run and
+    /// accepts, which leaves the decision to the apply itself.
+    fn check(&self, _plans: &[EnforcementPlan]) -> Result<(), EnforcementFailure> {
+        Ok(())
+    }
 
     /// Which of the principal's bound channels are usable RIGHT NOW.
     ///

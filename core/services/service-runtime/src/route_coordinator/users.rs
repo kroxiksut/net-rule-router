@@ -92,6 +92,7 @@ impl SecondaryRouteCoordinator {
             resolution,
             &secondary,
             &snapshot.rule_book,
+            self.fqdn_cache.as_ref(),
             &tunnel_catch_alls,
             &networks,
         );

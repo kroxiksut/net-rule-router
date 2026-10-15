@@ -118,6 +118,9 @@ struct TrayContextPayload {
     /// Per-kind mute for the "connection blocked" notice — the tray is the
     /// surface that raises it, so it honours this like `show_notifications`.
     notify_block_notices: bool,
+    /// Per-kind mute for the "a rule is set on both routes" notice, which the
+    /// tray raises while no window is on screen.
+    notify_rule_duplicates: bool,
     /// Whether that notice may name the destination. Off-screen leaks are the
     /// point: a shared screen must not show what the user browses.
     hide_block_notice_addresses: bool,
@@ -197,6 +200,7 @@ pub fn write_qt_tray_context_file(
         show_notifications: preferences.show_notifications,
         notify_suggestion_changes: preferences.notify_suggestion_changes,
         notify_block_notices: preferences.notify_block_notices,
+        notify_rule_duplicates: preferences.notify_rule_duplicates,
         hide_block_notice_addresses: preferences.hide_block_notice_addresses,
         tray_notice_opacity_percent: preferences.tray_notice_opacity_percent,
         routing_detailed_mode: preferences.routing_detailed_mode,

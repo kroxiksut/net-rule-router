@@ -777,7 +777,14 @@ pub fn generate_filters_with_shapes(
         input.behavior_mode,
         RouteBehaviorMode::StrictSecondaryFailClosed
     ) {
-        out.filters.push(default_block_spec(input.sid));
+        out.filters
+            .push(default_block_spec(input.sid, WfpLayerKey::AleAuthConnectV4));
+        // Strict means "nothing a rule did not name leaves": a v4-only
+        // default let every IPv6 flow to an unnamed host out the main link.
+        if input.families == crate::enforcement_planner::FamilyScope::Both {
+            out.filters
+                .push(default_block_spec(input.sid, WfpLayerKey::AleAuthConnectV6));
+        }
         out.diagnostics
             .push(CodegenDiagnostic::FailClosedDefaultEmitted);
     }
@@ -1524,10 +1531,12 @@ fn push_packed_packet_block_mirror(
     ));
 }
 
-fn default_block_spec(sid: &str) -> WfpFilterSpec {
-    let id = filter_id_for(sid, "default", "", "default", "block-all");
+/// The Strict default block at one ALE layer. The v4 id is the one installed
+/// machines already carry; the v6 twin needs its own or the add swallows it.
+fn default_block_spec(sid: &str, layer: WfpLayerKey) -> WfpFilterSpec {
+    let id = filter_id_for(sid, "default", "", "default", default_block_target(layer));
     WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
+        layer,
         action: WfpAction::Block,
         remote_ip: None,
         remote_ip_set: Vec::new(),
@@ -1542,6 +1551,21 @@ fn default_block_spec(sid: &str) -> WfpFilterSpec {
         remote_subnet_v6: None,
         ip_protocol: None,
     }
+}
+
+/// The id target of the Strict default block at `layer`, shared with the
+/// drop classifier so a v6 drop by the twin reads as "not covered by rules".
+pub fn default_block_target(layer: WfpLayerKey) -> &'static str {
+    match layer {
+        WfpLayerKey::AleAuthConnectV6 => "block-all-v6",
+        _ => "block-all",
+    }
+}
+
+/// The ids of the Strict default block at both ALE layers.
+pub fn default_block_ids(sid: &str) -> [u64; 2] {
+    [WfpLayerKey::AleAuthConnectV4, WfpLayerKey::AleAuthConnectV6]
+        .map(|layer| filter_id_for(sid, "default", "", "default", default_block_target(layer)).raw)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

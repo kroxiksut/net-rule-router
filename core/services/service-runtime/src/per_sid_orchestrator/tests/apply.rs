@@ -283,15 +283,19 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
 
     // Positive control: once the window has passed, changed input is compared
     // again. Without this the test would pass on a compare that never reruns.
+    // A machine up for less than one window has no such moment to stand on.
+    let Some(a_window_ago) =
+        std::time::Instant::now().checked_sub(super::super::shadow_compare::SHADOW_COMPARE_EVERY)
+    else {
+        return;
+    };
     {
         let mut seen = orch
             .shadow_compare_seen
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let entry = seen.get_mut(sid).expect("the first compare was recorded");
-        entry.1 = std::time::Instant::now()
-            .checked_sub(super::super::shadow_compare::SHADOW_COMPARE_EVERY)
-            .expect("the clock is past one window");
+        entry.1 = a_window_ago;
     }
     assert!(
         orch.shadow_compare_neutral_plan(
@@ -520,7 +524,7 @@ fn a_coverage_reconcile_records_and_sweeps_what_it_starts_covering() {
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
     let after_install = reset.queried();
-    assert!(after_install.contains(&first_ip));
+    assert!(after_install.contains(&IpAddr::V4(first_ip)));
 
     // A rule appears between passes; the coverage reconcile is what installs
     // its filters, so it is also what must break the flows already running
@@ -529,7 +533,7 @@ fn a_coverage_reconcile_records_and_sweeps_what_it_starts_covering() {
     orch.reconcile_secondary_coverage("S-1-5-21-A").unwrap();
     let swept = reset.queried();
     assert!(
-        swept.contains(&second_ip),
+        swept.contains(&IpAddr::V4(second_ip)),
         "the address this pass started enforcing must be swept by it"
     );
 
@@ -553,7 +557,7 @@ fn a_coverage_reconcile_records_and_sweeps_what_it_starts_covering() {
 #[test]
 fn the_additional_link_coming_up_sweeps_what_is_steered_onto_it_and_nothing_else() {
     use nrr_platform_api::fake_ip::stale_flows::{EstablishedFlow, FlowLinks};
-    use std::net::SocketAddrV4;
+    use std::net::{SocketAddr, SocketAddrV4};
     let tunnel_ip = Ipv4Addr::new(203, 0, 113, 9);
     let direct_ip = Ipv4Addr::new(203, 0, 113, 20);
     let api = Arc::new(MockWindowsApi::new());
@@ -607,8 +611,8 @@ fn the_additional_link_coming_up_sweeps_what_is_steered_onto_it_and_nothing_else
     let after_first = reset.queried().len();
 
     let flow = |local: Ipv4Addr, remote: Ipv4Addr, port: u16| EstablishedFlow {
-        local: SocketAddrV4::new(local, port),
-        remote: SocketAddrV4::new(remote, 443),
+        local: SocketAddr::V4(SocketAddrV4::new(local, port)),
+        remote: SocketAddr::V4(SocketAddrV4::new(remote, 443)),
         owner: Some("S-1-5-21-A".to_owned()),
         pid: None,
         image: None,
@@ -622,13 +626,13 @@ fn the_additional_link_coming_up_sweeps_what_is_steered_onto_it_and_nothing_else
     *live.lock().unwrap_or_else(|p| p.into_inner()) = Some(full_ks_resolution());
     orch.install_for_sid("S-1-5-21-A").unwrap();
 
-    let swept: Vec<Ipv4Addr> = reset.queried().into_iter().skip(after_first).collect();
+    let swept: Vec<IpAddr> = reset.queried().into_iter().skip(after_first).collect();
     assert!(
-        swept.contains(&tunnel_ip),
+        swept.contains(&IpAddr::V4(tunnel_ip)),
         "the destination was pinned before and after, so only the up-edge can explain sweeping it: {swept:?}"
     );
     assert!(
-        !swept.contains(&direct_ip),
+        !swept.contains(&IpAddr::V4(direct_ip)),
         "the main link's destination has nowhere new to go: {swept:?}"
     );
     assert_eq!(reset.reset_flows(), vec![stranded]);
@@ -653,15 +657,15 @@ fn a_new_destination_spares_connections_on_another_link_and_on_course() {
     use nrr_platform_api::fake_ip::stale_flows::{
         EstablishedFlow, FlowLinks, MockStaleFlowReset, StaleFlowReset,
     };
-    use std::net::SocketAddrV4;
+    use std::net::{SocketAddr, SocketAddrV4};
     const OWNER: &str = "S-1-5-21-A";
     let gateway = Ipv4Addr::new(203, 0, 113, 25);
     let main_link = Ipv4Addr::new(192, 0, 2, 7);
     let tunnel_link = Ipv4Addr::new(198, 51, 100, 41);
     let corporate_link = Ipv4Addr::new(172, 16, 0, 150);
     let flow = |local: Ipv4Addr, port: u16| EstablishedFlow {
-        local: SocketAddrV4::new(local, port),
-        remote: SocketAddrV4::new(gateway, 443),
+        local: SocketAddr::V4(SocketAddrV4::new(local, port)),
+        remote: SocketAddr::V4(SocketAddrV4::new(gateway, 443)),
         owner: Some(OWNER.to_owned()),
         pid: None,
         image: None,
@@ -701,14 +705,13 @@ fn a_new_destination_spares_connections_on_another_link_and_on_course() {
             primary: CanonicalRuleSet::from_rules(vec![primary_ip_rule("r-pri", gateway)]),
             secondary: CanonicalRuleSet::default(),
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     });
     src.set(OWNER, snap_full("Wi-Fi", "TAP"));
 
     orch.install_for_sid(OWNER).unwrap();
 
     assert!(
-        reset.queried().contains(&gateway),
+        reset.queried().contains(&IpAddr::V4(gateway)),
         "the address is newly enforced"
     );
     assert_eq!(reset.reset_flows(), vec![off_course]);
@@ -739,7 +742,7 @@ fn activation_tears_down_only_the_owners_connections_off_shared_addresses() {
     use nrr_platform_api::fake_ip::stale_flows::{
         EstablishedFlow, MockStaleFlowReset, StaleFlowReset,
     };
-    use std::net::SocketAddrV4;
+    use std::net::{SocketAddr, SocketAddrV4};
     const OWNER: &str = "S-1-5-21-A";
     let routed = Ipv4Addr::new(203, 0, 113, 9);
     let shared = Ipv4Addr::new(203, 0, 113, 10);
@@ -750,8 +753,8 @@ fn activation_tears_down_only_the_owners_connections_off_shared_addresses() {
     let cache: Arc<dyn FqdnCacheLookup> = Arc::new(SharedCensus([shared].into_iter().collect()));
     let reset = Arc::new(MockStaleFlowReset::new());
     let flow = |remote: Ipv4Addr, port: u16, owner: Option<&str>| EstablishedFlow {
-        local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), port),
-        remote: SocketAddrV4::new(remote, 443),
+        local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), port)),
+        remote: SocketAddr::V4(SocketAddrV4::new(remote, 443)),
         owner: owner.map(str::to_owned),
         pid: None,
         image: None,
@@ -778,7 +781,7 @@ fn activation_tears_down_only_the_owners_connections_off_shared_addresses() {
 
     let queried = reset.queried();
     assert!(
-        queried.contains(&routed) && queried.contains(&shared),
+        queried.contains(&IpAddr::V4(routed)) && queried.contains(&IpAddr::V4(shared)),
         "both addresses are new destinations, so both are candidates: {queried:?}"
     );
     assert_eq!(reset.reset_flows(), vec![owners]);
@@ -805,12 +808,12 @@ fn a_new_rule_network_tears_down_only_the_owners_connections_inside_it() {
         EstablishedFlow, MockStaleFlowReset, StaleFlowReset,
     };
     use nrr_shared::ip_block::IpBlock;
-    use std::net::SocketAddrV4;
+    use std::net::{SocketAddr, SocketAddrV4};
     const OWNER: &str = "S-1-5-21-A";
     let net = IpBlock::parse("198.51.100.0/24").unwrap();
     let flow = |remote: Ipv4Addr, port: u16, owner: &str| EstablishedFlow {
-        local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), port),
-        remote: SocketAddrV4::new(remote, 443),
+        local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), port)),
+        remote: SocketAddr::V4(SocketAddrV4::new(remote, 443)),
         owner: Some(owner.to_owned()),
         pid: None,
         image: None,
@@ -846,4 +849,65 @@ fn a_new_rule_network_tears_down_only_the_owners_connections_inside_it() {
         vec![net],
         "a network already enforced is not swept again"
     );
+}
+
+/// The v6 hosts a filter set names are part of what it covers: the sweep
+/// that follows an install lists them, and a stranded v6 connection of the
+/// owner is torn down like a v4 one — another user's is not.
+#[test]
+fn coverage_names_v6_hosts_and_the_sweep_tears_down_the_owners_v6_connection() {
+    use nrr_platform_api::fake_ip::stale_flows::{
+        EstablishedFlow, MockStaleFlowReset, StaleFlowReset,
+    };
+    use nrr_platform_api::types::{WfpAction, WfpFilterSpec, WfpLayerKey};
+    use std::net::{Ipv6Addr, SocketAddr};
+    const OWNER: &str = "S-1-5-21-A";
+    let v6: Ipv6Addr = "2001:db8::7".parse().unwrap();
+    let v4 = Ipv4Addr::new(203, 0, 113, 9);
+    let spec = |layer: WfpLayerKey, ip: Option<Ipv4Addr>, set_v6: Vec<Ipv6Addr>| WfpFilterSpec {
+        layer,
+        action: WfpAction::Permit,
+        remote_ip: ip,
+        remote_ip_set: Vec::new(),
+        remote_ip_set_v6: set_v6,
+        remote_port: None,
+        weight: 0,
+        id: WfpFilterId { raw: 1 },
+        user_sid: None,
+        app_pattern: None,
+        local_interface_luid: None,
+        remote_subnet: None,
+        remote_subnet_v6: None,
+        ip_protocol: None,
+    };
+    let spec6 = spec(WfpLayerKey::AleAuthConnectV6, None, vec![v6]);
+    let spec4 = spec(WfpLayerKey::AleAuthConnectV4, Some(v4), Vec::new());
+    let (destinations, _) = PerSidApplyOrchestrator::coverage_of(&[spec4, spec6.clone()]);
+    assert_eq!(destinations, vec![IpAddr::V4(v4), IpAddr::V6(v6)]);
+
+    let flow = |port: u16, owner: &str| EstablishedFlow {
+        local: SocketAddr::new(IpAddr::V6("2001:db8::2".parse().unwrap()), port),
+        remote: SocketAddr::new(IpAddr::V6(v6), 443),
+        owner: Some(owner.to_owned()),
+        pid: None,
+        image: None,
+    };
+    let owners = flow(50_001, OWNER);
+    let reset = Arc::new(MockStaleFlowReset::new());
+    reset.set_flows(vec![owners.clone(), flow(50_002, "S-1-5-21-B")]);
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::new(ScriptedSource::default()) as Arc<dyn RoutePolicySource>,
+        Arc::new(ScriptedRules::default()) as Arc<dyn RulesProvider>,
+        Arc::new(SharedCensus(Default::default())) as Arc<dyn FqdnCacheLookup>,
+        Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_stale_flow_reset(Arc::clone(&reset) as Arc<dyn StaleFlowReset>);
+
+    orch.tear_down_flows_to_new_destinations(OWNER, &[spec6], &[IpAddr::V6(v6)], &[], false);
+
+    assert_eq!(reset.queried(), vec![IpAddr::V6(v6)]);
+    assert_eq!(reset.reset_flows(), vec![owners]);
 }

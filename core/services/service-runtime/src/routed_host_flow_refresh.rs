@@ -39,7 +39,7 @@
 //! rule over a warm cache cannot turn into an unbounded sweep.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use nrr_platform_api::conn_observe::egress::EgressRole;
@@ -114,12 +114,12 @@ pub enum Course {
 /// are reset wherever they run.
 #[derive(Debug, Clone, Default)]
 pub struct Courses {
-    hosts: HashMap<Ipv4Addr, Course>,
+    hosts: HashMap<IpAddr, Course>,
     networks: Vec<(IpBlock, Course)>,
 }
 
 impl Courses {
-    pub fn insert_host(&mut self, host: Ipv4Addr, course: Course) {
+    pub fn insert_host(&mut self, host: IpAddr, course: Course) {
         self.hosts.insert(host, course);
     }
 
@@ -144,13 +144,13 @@ impl Courses {
     /// A host's own course outranks a network's, and a longer prefix a shorter
     /// one — the narrower rule wins, as in enforcement.
     #[must_use]
-    pub fn of(&self, remote: Ipv4Addr) -> Option<Course> {
+    pub fn of(&self, remote: IpAddr) -> Option<Course> {
         if let Some(course) = self.hosts.get(&remote) {
             return Some(*course);
         }
         self.networks
             .iter()
-            .filter(|(net, _)| net.contains(std::net::IpAddr::V4(remote)))
+            .filter(|(net, _)| net.contains(remote))
             .max_by_key(|(net, _)| net.prefix_len())
             .map(|(_, course)| *course)
     }
@@ -166,19 +166,25 @@ pub struct FlowPaths {
 
 /// Which `candidates` a rule change by `rule_owner` may tear down: the owner's
 /// own connections, to addresses no direct host shares unless they are in
-/// `anchors`, that are off course on one of the owner's links.
+/// `anchors`, that are off course on one of the owner's links. The census is
+/// of IPv4 fronts, so a v6 connection is never spared as shared.
 #[must_use]
 pub fn flows_to_reset(
     candidates: Vec<EstablishedFlow>,
     rule_owner: &str,
     shared_direct: &HashSet<Ipv4Addr>,
-    anchors: &HashSet<Ipv4Addr>,
+    anchors: &HashSet<IpAddr>,
     paths: &FlowPaths,
 ) -> FlowRefreshDecision {
     let mut decision = FlowRefreshDecision::default();
     for flow in candidates {
-        let anchor = anchors.contains(flow.remote.ip());
-        if !anchor && shared_direct.contains(flow.remote.ip()) {
+        let remote = flow.remote.ip();
+        let anchor = anchors.contains(&remote);
+        let shared = match remote {
+            IpAddr::V4(v4) => shared_direct.contains(&v4),
+            IpAddr::V6(_) => false,
+        };
+        if !anchor && shared {
             decision.kept_shared += 1;
             continue;
         }
@@ -187,8 +193,8 @@ pub fn flows_to_reset(
             // SID strings compare case-insensitively.
             Some(owner) if owner.eq_ignore_ascii_case(rule_owner) => {
                 let on_course = match (
-                    paths.links.role_of(*flow.local.ip()),
-                    paths.courses.of(*flow.remote.ip()),
+                    paths.links.role_of(flow.local.ip()),
+                    paths.courses.of(remote),
                 ) {
                     (EgressRole::Other, _) => {
                         decision.kept_other_link += 1;
@@ -258,10 +264,10 @@ pub fn reset_owner_flows(
 
 /// The addresses one pass looks at, and which of them are the anchors'.
 struct RefreshTargets {
-    addresses: Vec<Ipv4Addr>,
-    anchors: HashSet<Ipv4Addr>,
+    addresses: Vec<IpAddr>,
+    anchors: HashSet<IpAddr>,
     /// The hostname each address was reached through, for the per-connection log.
-    hosts: HashMap<Ipv4Addr, String>,
+    hosts: HashMap<IpAddr, String>,
 }
 
 /// A principal's links, read when a pass has connections to decide on.
@@ -423,9 +429,9 @@ impl RoutedHostFlowRefresh {
                 break;
             }
         }
-        let mut names: HashMap<Ipv4Addr, String> = addresses.clone().into_iter().collect();
+        let mut names: HashMap<IpAddr, String> = addresses.clone().into_iter().collect();
         names.extend(anchors.clone());
-        let anchors: Vec<Ipv4Addr> = anchors.into_keys().take(MAX_ADDRESSES_PER_PASS).collect();
+        let anchors: Vec<IpAddr> = anchors.into_keys().take(MAX_ADDRESSES_PER_PASS).collect();
         let rest = addresses.into_keys().filter(|a| !anchors.contains(a));
         RefreshTargets {
             addresses: anchors
@@ -439,9 +445,8 @@ impl RoutedHostFlowRefresh {
         }
     }
 
-    fn collect_into(&self, addresses: &mut BTreeMap<Ipv4Addr, String>, hostname: &str) {
-        // Routed-host flow refresh acts on the v4 flows the relay tracks.
-        for address in crate::dns_wire::only_v4(&self.cache.ips_for_hostname(hostname)) {
+    fn collect_into(&self, addresses: &mut BTreeMap<IpAddr, String>, hostname: &str) {
+        for address in self.cache.ips_for_hostname(hostname) {
             addresses
                 .entry(address)
                 .or_insert_with(|| hostname.to_owned());
@@ -452,7 +457,7 @@ impl RoutedHostFlowRefresh {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::net::{IpAddr, SocketAddrV4};
+    use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 
     use nrr_platform_api::fake_ip::MockStaleFlowReset;
 
@@ -500,17 +505,21 @@ mod tests {
         s.parse().expect("test address")
     }
 
+    fn addr(s: &str) -> IpAddr {
+        s.parse().expect("test address")
+    }
+
     fn flow(remote: &str, local_port: u16, owner: Option<&str>) -> EstablishedFlow {
         EstablishedFlow {
-            local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), local_port),
-            remote: SocketAddrV4::new(ip(remote), 443),
+            local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), local_port)),
+            remote: SocketAddr::new(addr(remote), 443),
             owner: owner.map(str::to_string),
             pid: None,
             image: None,
         }
     }
 
-    fn addresses_of(cache: FakeCache, hosts: &[RoutedHost]) -> Vec<Ipv4Addr> {
+    fn addresses_of(cache: FakeCache, hosts: &[RoutedHost]) -> Vec<IpAddr> {
         RoutedHostFlowRefresh::new(Arc::new(cache), Arc::new(MockStaleFlowReset::new()))
             .addresses_behind(hosts)
             .addresses
@@ -622,7 +631,7 @@ mod tests {
 
     fn via(local: Ipv4Addr, remote: &str, local_port: u16) -> EstablishedFlow {
         EstablishedFlow {
-            local: SocketAddrV4::new(local, local_port),
+            local: SocketAddr::V4(SocketAddrV4::new(local, local_port)),
             ..flow(remote, local_port, Some(OWNER))
         }
     }
@@ -630,7 +639,7 @@ mod tests {
     fn paths(courses: &[(&str, Course)]) -> FlowPaths {
         let mut known = Courses::default();
         for (host, course) in courses {
-            known.insert_host(ip(host), *course);
+            known.insert_host(addr(host), *course);
         }
         FlowPaths {
             links: links(),
@@ -706,7 +715,7 @@ mod tests {
             vec![anchor.clone()],
             OWNER,
             &HashSet::new(),
-            &HashSet::from([ip("203.0.113.10")]),
+            &HashSet::from([addr("203.0.113.10")]),
             &paths(&[("203.0.113.10", Course::Primary)]),
         );
         assert_eq!(decision.reset, vec![anchor]);
@@ -717,11 +726,17 @@ mod tests {
         let mut courses = Courses::default();
         courses.insert_network(network("203.0.113.0/24"), Course::Secondary);
         courses.insert_network(network("203.0.113.0/28"), Course::Primary);
-        courses.insert_host(ip("203.0.113.5"), Course::Secondary);
-        assert_eq!(courses.of(ip("203.0.113.5")), Some(Course::Secondary));
-        assert_eq!(courses.of(ip("203.0.113.6")), Some(Course::Primary));
-        assert_eq!(courses.of(ip("203.0.113.200")), Some(Course::Secondary));
-        assert_eq!(courses.of(ip("198.51.100.1")), None);
+        courses.insert_host(ip("203.0.113.5").into(), Course::Secondary);
+        assert_eq!(
+            courses.of(ip("203.0.113.5").into()),
+            Some(Course::Secondary)
+        );
+        assert_eq!(courses.of(ip("203.0.113.6").into()), Some(Course::Primary));
+        assert_eq!(
+            courses.of(ip("203.0.113.200").into()),
+            Some(Course::Secondary)
+        );
+        assert_eq!(courses.of(ip("198.51.100.1").into()), None);
     }
 
     #[test]
@@ -806,7 +821,7 @@ mod tests {
             vec![anchor.clone()],
             OWNER,
             &shared,
-            &shared,
+            &HashSet::from([addr("203.0.113.10")]),
             &FlowPaths::default(),
         );
         assert_eq!(decision.reset, vec![anchor]);
@@ -817,7 +832,7 @@ mod tests {
     #[test]
     fn a_non_anchor_connection_on_a_shared_address_is_still_kept() {
         let shared = HashSet::from([ip("203.0.113.10"), ip("203.0.113.11")]);
-        let anchors = HashSet::from([ip("203.0.113.11")]);
+        let anchors = HashSet::from([addr("203.0.113.11")]);
         let decision = flows_to_reset(
             vec![flow("203.0.113.10", 50_000, Some(OWNER))],
             OWNER,
@@ -831,14 +846,14 @@ mod tests {
 
     #[test]
     fn another_users_or_an_unattributed_anchor_connection_is_kept() {
-        let anchors = HashSet::from([ip("203.0.113.10")]);
+        let anchors = HashSet::from([addr("203.0.113.10")]);
         let decision = flows_to_reset(
             vec![
                 flow("203.0.113.10", 50_000, Some(OTHER_USER)),
                 flow("203.0.113.10", 50_001, None),
             ],
             OWNER,
-            &anchors,
+            &HashSet::from([ip("203.0.113.10")]),
             &anchors,
             &FlowPaths::default(),
         );
@@ -928,7 +943,7 @@ mod tests {
             ],
         );
         assert_eq!(listed.len(), MAX_ADDRESSES_PER_PASS);
-        assert!(listed.contains(&ip("203.0.113.200")));
+        assert!(listed.contains(&addr("203.0.113.200")));
     }
 
     // ── a network target ──────────────────────────────────────────────────
@@ -1027,8 +1042,41 @@ mod tests {
         );
         assert_eq!(
             listed,
-            vec![ip("203.0.113.10"), ip("203.0.113.11"), ip("203.0.113.20")]
+            vec![
+                addr("203.0.113.10"),
+                addr("203.0.113.11"),
+                addr("203.0.113.20")
+            ]
         );
+    }
+
+    /// A rule host's IPv6 front is torn down like its IPv4 one — the owner's
+    /// own connection only — and the v4 census never spares a v6 connection.
+    #[test]
+    fn a_hosts_v6_front_is_listed_and_the_owners_v6_connection_is_reset() {
+        let mut cache = cache_with(&[
+            ("site.example", "203.0.113.10"),
+            ("site.example", "2001:db8::10"),
+        ]);
+        cache.shared_direct.insert(ip("203.0.113.10"));
+        let reset = Arc::new(MockStaleFlowReset::new());
+        let mine6 = flow("2001:db8::10", 50_000, Some(OWNER));
+        reset.set_flows(vec![
+            mine6.clone(),
+            flow("2001:db8::10", 50_001, Some(OTHER_USER)),
+            flow("203.0.113.10", 50_002, Some(OWNER)),
+        ]);
+        let refresher = RoutedHostFlowRefresh::new(Arc::new(cache), Arc::clone(&reset) as _);
+
+        let outcome = refresher.refresh(OWNER, &[RoutedHost::Exact("site.example".into())]);
+
+        assert_eq!(
+            reset.queried(),
+            vec![addr("203.0.113.10"), addr("2001:db8::10")],
+            "both fronts of the host are candidates"
+        );
+        assert_eq!(reset.reset_flows(), vec![mine6]);
+        assert_eq!(outcome.sweep.torn_down, 1);
     }
 
     #[test]
@@ -1044,6 +1092,6 @@ mod tests {
         );
         let listed = addresses_of(cache, &[RoutedHost::Suffix("site.example".into())]);
         assert_eq!(listed.len(), 2);
-        assert!(!listed.contains(&ip("203.0.113.99")));
+        assert!(!listed.contains(&addr("203.0.113.99")));
     }
 }

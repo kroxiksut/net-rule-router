@@ -125,10 +125,6 @@ pub struct RelayCore {
     resolve_at_dial: bool,
 }
 
-// The allocator mutex is shared with the resolver thread; poisoning it would
-// mean a panic mid-update, and the relay must fail closed rather than keep
-// routing on a half-written map — hence `expect` on the lock.
-#[allow(clippy::expect_used)]
 impl RelayCore {
     pub fn new(
         allocator: Arc<Mutex<FakeIpAllocator>>,
@@ -248,20 +244,22 @@ impl RelayCore {
             };
         }
 
-        let cached = self
+        // Keep the address family the application used: an app that opened an
+        // IPv4 socket cannot be handed an IPv6 upstream.
+        let mut cached = self
             .resolver
             .addresses_for(&hostname)
             .into_iter()
-            .find(|ip| {
-                // Keep the address family the application used: an app that opened
-                // an IPv4 socket cannot be handed an IPv6 upstream.
-                ip.is_ipv4() == destination.is_ipv4()
-            });
+            .filter(|ip| ip.is_ipv4() == destination.is_ipv4())
+            .take(super::dialer::MAX_DIAL_ADDRESSES)
+            .map(|ip| SocketAddr::new(ip, destination.port()));
+        let address = cached.next();
+        let fallbacks: Vec<SocketAddr> = cached.collect();
         // Nothing cached is not the same as nowhere to go: the name is the
         // durable fact, the address is a lookup nobody has performed yet. With
         // dial-time resolution the flow proceeds and the dialer finds out; the
         // poll loop must not, which is why the lookup is not attempted here.
-        if cached.is_none() && !self.resolve_at_dial {
+        if address.is_none() && !self.resolve_at_dial {
             return RelayDecision::NoUpstreamAddress { hostname };
         }
 
@@ -284,7 +282,8 @@ impl RelayCore {
         RelayDecision::Relay {
             target: UpstreamTarget {
                 hostname: hostname.clone(),
-                address: cached.map(|ip| SocketAddr::new(ip, destination.port())),
+                address,
+                fallbacks,
                 port: destination.port(),
                 route,
             },
@@ -453,6 +452,38 @@ mod tests {
                 assert_eq!(hostname, "assistant.example");
                 assert_eq!(target.address, "203.0.113.140:443".parse().ok());
                 assert_eq!(target.route, RouteRole::Secondary);
+            }
+            other => panic!("expected a relay decision, got {other:?}"),
+        }
+    }
+
+    /// The application holds one virtual address, so the host's other
+    /// addresses reach the dial only through the target.
+    #[test]
+    fn the_hosts_other_addresses_of_the_same_family_ride_along_as_fallbacks() {
+        let (allocator, fake) = allocator_with("assistant.example");
+        let resolver = StaticUpstreamResolver::new().with(
+            "assistant.example",
+            &[
+                ip("203.0.113.1"),
+                ip("2001:db8::1"),
+                ip("203.0.113.2"),
+                ip("203.0.113.3"),
+                ip("203.0.113.4"),
+                ip("203.0.113.5"),
+            ],
+        );
+        let relay = core(allocator, resolver, RouteRole::Primary);
+
+        match relay.decide(&packet(SocketAddr::new(fake, 443), true)) {
+            RelayDecision::Relay { target, .. } => {
+                assert_eq!(target.address, "203.0.113.1:443".parse().ok());
+                let fallbacks: Vec<SocketAddr> =
+                    ["203.0.113.2:443", "203.0.113.3:443", "203.0.113.4:443"]
+                        .iter()
+                        .map(|a| a.parse().expect("address"))
+                        .collect();
+                assert_eq!(target.fallbacks, fallbacks, "same family, bounded");
             }
             other => panic!("expected a relay decision, got {other:?}"),
         }

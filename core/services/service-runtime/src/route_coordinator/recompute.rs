@@ -18,6 +18,7 @@ impl SecondaryRouteCoordinator {
         &self,
         active_sids: &[String],
     ) -> Result<RouteReconcileDelta, PlatformError> {
+        let _pass = self.pass_lock.lock().unwrap_or_else(|p| p.into_inner());
         let served = self.served_sids_fresh(active_sids);
         let sid = match served.as_slice() {
             [] => {
@@ -67,7 +68,7 @@ impl SecondaryRouteCoordinator {
                         sid = %sid,
                         "routing paused for this user (persist policy) — keeping /32 rule-routes, dropping overlays only",
                     );
-                    return self.teardown_keep_rule_routes();
+                    return self.reconciler.retain_rule_routes();
                 }
             }
         }
@@ -107,6 +108,7 @@ impl SecondaryRouteCoordinator {
     /// falls back to the console user under service-driven scope: stopping the
     /// service must restore pristine networking in BOTH scopes.
     pub fn teardown(&self) -> Result<RouteReconcileDelta, PlatformError> {
+        let _pass = self.pass_lock.lock().unwrap_or_else(|p| p.into_inner());
         self.reconciler.clear()
     }
 
@@ -114,6 +116,7 @@ impl SecondaryRouteCoordinator {
     /// routes the rest to the primary or the VPN's own default. See
     /// [`SecondaryRouteReconciler::retain_rule_routes`].
     pub fn teardown_keep_rule_routes(&self) -> Result<RouteReconcileDelta, PlatformError> {
+        let _pass = self.pass_lock.lock().unwrap_or_else(|p| p.into_inner());
         self.reconciler.retain_rule_routes()
     }
 }

@@ -45,6 +45,10 @@ const NRPT_MARKER: &str = "NetRuleRouter-ModeB-DnsRedirect";
 /// under a different key, and these are supposed to sit beside it.
 const NRPT_EXEMPT_MARKER: &str = "NetRuleRouter-DnsScopeExemption";
 
+/// Marker on the rules that keep a rule host with our listener inside a
+/// namespace left to another resolver. Its own marker for the same reason.
+const NRPT_KEEP_MARKER: &str = "NetRuleRouter-RuleNameKeep";
+
 // The neutral system-DNS-redirect PORT + its handle/state types live
 // in `nrr-platform-api`; re-export so `nrr_platform_windows::dns_redirect::*`
 // paths keep resolving unchanged. The Windows NRPT MECHANISM below impls it via
@@ -126,6 +130,17 @@ fn multi_sz(name: &'static str, text: &str) -> RegistryValue {
     }
 }
 
+/// A `REG_MULTI_SZ` of several strings: each NUL-terminated, the list too.
+fn multi_sz_list(name: &'static str, texts: &[String]) -> RegistryValue {
+    let mut data: Vec<u8> = texts.iter().flat_map(|text| utf16_bytes(text, 1)).collect();
+    data.extend(0u16.to_le_bytes());
+    RegistryValue {
+        name,
+        kind: RegistryValueKind::MultiSz,
+        data,
+    }
+}
+
 fn dword(name: &'static str, value: u32) -> RegistryValue {
     RegistryValue {
         name,
@@ -168,6 +183,27 @@ pub fn nrpt_namespace_rule_values(suffix: &str, servers: &str) -> Vec<RegistryVa
     ]
 }
 
+/// The rule that keeps one rule host with our listener: the name itself and
+/// everything under it, so a rule widened to subdomains keeps those too. The
+/// DNS client prefers the longest matching namespace, so this outranks the
+/// exemption it sits inside.
+pub fn nrpt_keep_rule_values(name: &str, listener_ip: &str) -> Vec<RegistryValue> {
+    vec![
+        sz("Comment", NRPT_KEEP_MARKER),
+        sz("DisplayName", ""),
+        sz("IPSECCARestriction", ""),
+        multi_sz_list("Name", &[name.to_string(), format!(".{name}")]),
+        sz("GenericDNSServers", listener_ip),
+        dword("ConfigOptions", NRPT_CONFIG_GENERIC_DNS_SERVERS),
+        dword("Version", NRPT_RULE_VERSION),
+    ]
+}
+
+/// Registry key for one kept name, stable per name like the exemption keys.
+pub fn nrpt_keep_key(name: &str) -> String {
+    format!("{{NRR-KEEP-{:016X}}}", fnv1a(name))
+}
+
 /// Registry key for one namespace exemption.
 ///
 /// Derived from the namespace so the same claim always lands on the same key:
@@ -175,14 +211,18 @@ pub fn nrpt_namespace_rule_values(suffix: &str, servers: &str) -> Vec<RegistryVa
 /// per session. Hex of a stable hash, because a key name may not carry the
 /// characters a domain can.
 pub fn nrpt_exemption_key(suffix: &str) -> String {
-    // FNV-1a: no dependency, and the only property needed is that the same
-    // string maps to the same key.
+    format!("{{NRR-EXEMPT-{:016X}}}", fnv1a(suffix))
+}
+
+/// FNV-1a: no dependency, and the only property needed is that the same
+/// string maps to the same key.
+fn fnv1a(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in suffix.as_bytes() {
+    for byte in text.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{{NRR-EXEMPT-{hash:016X}}}")
+    hash
 }
 
 /// What a scan of the rule table found.
@@ -372,6 +412,81 @@ impl nrr_platform_api::dns::SystemDnsServersPort for WindowsSystemDnsServers {
     fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
         capture_upstream_dns_candidates_v4(&PowerShellRunner)
     }
+
+    fn upstream_candidates_v6(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        capture_upstream_dns_candidates_v6(&PowerShellRunner)
+    }
+}
+
+/// The IPv6 twin of [`upstream_dns_script`]: the connected v6 interfaces by
+/// metric, default-route interface first, each with its v6 servers.
+fn upstream_dns_script_v6() -> &'static str {
+    "$ErrorActionPreference='SilentlyContinue'; \
+     $live = @(Get-NetIPInterface -AddressFamily IPv6 | \
+       Where-Object { $_.ConnectionState -eq 'Connected' } | \
+       Sort-Object -Property InterfaceMetric | \
+       Select-Object -ExpandProperty ifIndex); \
+     $idx = Get-NetRoute -DestinationPrefix '::/0' | \
+       Sort-Object -Property RouteMetric | \
+       Select-Object -First 1 -ExpandProperty ifIndex; \
+     $order = @(); \
+     if ($idx -and ($live -contains $idx)) { $order += $idx }; \
+     $order += $live; \
+     foreach ($i in $order) { \
+       $a = Get-NetAdapter -InterfaceIndex $i -IncludeHidden | Select-Object -First 1; \
+       Get-DnsClientServerAddress -InterfaceIndex $i -AddressFamily IPv6 | \
+       Select-Object -ExpandProperty ServerAddresses | \
+       Where-Object { $_ } | \
+       ForEach-Object { \"$i`t$_`t$($a.InterfaceDescription)`t$($a.Name)\" } \
+     }"
+}
+
+/// Every routable IPv6 upstream the v6 script emits, best first, deduplicated.
+/// Link-local servers are left out: the address alone does not say which
+/// link, and a wrong guess is a probe timeout on every re-selection.
+pub fn capture_upstream_dns_candidates_v6<R: CommandRunner>(
+    runner: &R,
+) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+    let Ok(out) = runner.run_powershell(upstream_dns_script_v6()) else {
+        return Vec::new();
+    };
+    if !out.success {
+        return Vec::new();
+    }
+    let mut seen: Vec<nrr_platform_api::dns::UpstreamDnsServer> = Vec::new();
+    for line in out.stdout.lines() {
+        let mut columns = line.trim_end().split('\t');
+        let Some(head) = columns.next() else {
+            continue;
+        };
+        let (index, addr) = match columns.next() {
+            Some(addr) => (head.trim().parse::<u32>().ok(), addr.trim()),
+            None => (None, head.trim()),
+        };
+        // A scope suffix (`fe80::1%12`) marks a link-local server.
+        let Ok(server) = addr.parse::<std::net::Ipv6Addr>() else {
+            continue;
+        };
+        if server.is_loopback() || server.is_unspecified() || server.is_unicast_link_local() {
+            continue;
+        }
+        if FakeIpPoolConfig::is_default_pool_addr(IpAddr::V6(server)) {
+            continue;
+        }
+        let description = columns.next().unwrap_or_default().trim();
+        let friendly_name = columns.next().unwrap_or_default().trim();
+        if names_indicate_virtual_machine_network(description, friendly_name) {
+            continue;
+        }
+        let server = IpAddr::V6(server);
+        if !seen.iter().any(|c| c.server == server) {
+            seen.push(nrr_platform_api::dns::UpstreamDnsServer {
+                interface_index: index,
+                server,
+            });
+        }
+    }
+    seen
 }
 
 /// Remove any orphaned NetRuleRouter Mode-B NRPT rule left by a prior crashed
@@ -384,7 +499,8 @@ impl nrr_platform_api::dns::SystemDnsServersPort for WindowsSystemDnsServers {
 pub fn clear_orphan_redirect<S: NrptRuleStore>(store: &S) -> Result<usize, PlatformError> {
     let own = usize::from(store.delete_rule(NRPT_RULE_KEY)?);
     let exemptions = store.sweep_orphans(NRPT_EXEMPT_MARKER, "")?;
-    Ok(own + exemptions + store.sweep_orphans(NRPT_MARKER, "")?)
+    let kept = store.sweep_orphans(NRPT_KEEP_MARKER, "")?;
+    Ok(own + exemptions + kept + store.sweep_orphans(NRPT_MARKER, "")?)
 }
 
 /// What [`sweep_orphan_dns_state`] took back from a dead instance.
@@ -532,7 +648,10 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
     /// they would keep steering names at servers we no longer watch, which
     /// is a change to the machine outliving the thing that asked for it.
     fn restore(&self, _handle: &RedirectHandle) -> Result<(), PlatformError> {
-        let swept = self.store.sweep_orphans(NRPT_EXEMPT_MARKER, "");
+        let swept = self
+            .store
+            .sweep_orphans(NRPT_EXEMPT_MARKER, "")
+            .and_then(|n| Ok(n + self.store.sweep_orphans(NRPT_KEEP_MARKER, "")?));
         let deleted = self.store.delete_rule(NRPT_RULE_KEY);
         // The catch-all is what actually points the OS at us, so its removal
         // decides the outcome; a stuck exemption is reported and not fatal.
@@ -634,6 +753,38 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
                 removed,
                 written,
                 "namespaces left to the connections that claim them",
+            );
+        }
+        Ok(written)
+    }
+
+    /// Same shape as the exemptions: sweep first, then write what holds now.
+    fn keep_names(&self, names: &[String], listener: SocketAddr) -> Result<usize, PlatformError> {
+        let removed = self.store.sweep_orphans(NRPT_KEEP_MARKER, "")?;
+        let ip = listener.ip().to_string();
+        let mut written = 0usize;
+        for name in names {
+            match self
+                .store
+                .write_rule(&nrpt_keep_key(name), &nrpt_keep_rule_values(name, &ip))
+            {
+                Ok(()) => written += 1,
+                Err(error) => tracing::warn!(
+                    target: "nrr::dns-redirect",
+                    msg_key = "win-dns-redirect-keep-write-failed",
+                    name = %name,
+                    error = %error,
+                    "could not keep this rule host with the resolver",
+                ),
+            }
+        }
+        if removed > 0 || written > 0 {
+            tracing::info!(
+                target: "nrr::dns-redirect",
+                msg_key = "win-dns-redirect-keeps-applied",
+                removed,
+                written,
+                "rule hosts inside left namespaces kept with the resolver",
             );
         }
         Ok(written)

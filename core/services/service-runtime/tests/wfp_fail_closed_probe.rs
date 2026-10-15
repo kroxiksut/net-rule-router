@@ -62,6 +62,7 @@ fn probe_exemptions() -> FailClosedExemptions {
         foreign_tunnel_luids: Vec::new(),
         primary_dest_ips: Vec::new(),
         allow_dns_over_primary: false,
+        dns_servers: Vec::new(),
         known_direct_ips: Vec::new(),
         // Liveness-probe target (tunnel next-hop) — private-range like the
         // real derived next-hop it stands in for.
@@ -205,6 +206,7 @@ fn probe_leak_proof_pair_and_dns_exempt_filters_materialize_on_windows() {
     );
     let dns_exemptions = FailClosedExemptions {
         allow_dns_over_primary: true,
+        dns_servers: vec![Ipv4Addr::new(192, 0, 2, 53)],
         ..probe_exemptions()
     };
     specs.extend(fail_closed_block_all_filters(

@@ -39,6 +39,16 @@ pub(crate) fn build_supervised_runtime_deps(
     // supervisor transitions to `Running`, because it would be reading a
     // different aggregator than the one the supervisor seeds.
     let health_agg = Arc::new(HealthAggregator::new());
+    // ── Event bus ────────────────────────────────────────────────────
+    // Shared across all settings writers so push events surface on the
+    // existing `StatusUpdatesSubscribe` channel. The
+    // `SnapshotInitialResponse` carries the initial snapshot that primes
+    // the GUI; subsequent state changes ride this bus.
+    let event_bus = Arc::new(EventBus::new());
+    // Made before the threads below exist, so every one of them can hold a
+    // lease on it.
+    let task_liveness =
+        Arc::new(TaskLiveness::new(Arc::clone(&health_agg)).with_event_bus(Arc::clone(&event_bus)));
 
     // Drained by the resume watchdog; filled by whoever notices a binding worth
     // re-resolving (today the fail-closed posture heartbeat).
@@ -85,13 +95,6 @@ pub(crate) fn build_supervised_runtime_deps(
     // that cannot be true for the interactive user. The launcher owns autostart
     // (it runs as that user) and answers `autostart.*` before the pipe hop; an
     // absent row states "the service does not know", which is the truth.
-
-    // ── Event bus ────────────────────────────────────────────────────
-    // Shared across all settings writers so push events surface on the
-    // existing `StatusUpdatesSubscribe` channel. The
-    // `SnapshotInitialResponse` carries the initial snapshot that primes
-    // the GUI; subsequent state changes ride this bus.
-    let event_bus = Arc::new(EventBus::new());
 
     // ── Routing-pause coordinator ───────────────────────────────────
     // Built LATER, after the per-SID orchestrator exists, so it can use
@@ -141,6 +144,7 @@ pub(crate) fn build_supervised_runtime_deps(
     // resolver controller above. Its Wintun-backed factory is installed later,
     // once the cache / rules / routing-SID inputs exist.
     let fake_ip_controller = Arc::new(nrr_service_runtime::fake_ip::FakeIpController::new());
+    fake_ip_controller.set_liveness(Arc::clone(&task_liveness));
 
     // The shared allocator the DNS answerer, the direct-host answerer and the
     // packet relay all draw from, so a hostname's virtual address means the
@@ -256,7 +260,6 @@ pub(crate) fn build_supervised_runtime_deps(
         app_enforcement,
         shared_ip_exemptions,
         block_all_posture,
-        learned_vpn_endpoints,
         learned_vpn_client_apps,
         killswitch_drop_registry,
         main_route_verdicts,
@@ -475,7 +478,6 @@ pub(crate) fn build_supervised_runtime_deps(
         let adapters = WindowsApiAdapterSource::new(Arc::clone(&api));
         let liveness = Arc::clone(&liveness_tracker);
         let known_direct = known_direct_registry.clone();
-        let vpn_endpoints = Arc::clone(&learned_vpn_endpoints);
         let vpn_clients = Arc::clone(&learned_vpn_client_apps);
         let fake_ip = Arc::clone(&fake_ip_controller);
         Arc::new(
@@ -486,14 +488,6 @@ pub(crate) fn build_supervised_runtime_deps(
                 .with_source(
                     "known-direct",
                     Arc::new(move || Some(known_direct.as_ref().map_or(0, |r| r.generation()))),
-                )
-                .with_source(
-                    "vpn-endpoints",
-                    hashed(move || {
-                        let mut ips = vpn_endpoints.current(std::time::SystemTime::now());
-                        ips.sort_unstable();
-                        Ok::<_, std::convert::Infallible>(ips)
-                    }),
                 )
                 .with_source(
                     "vpn-clients",
@@ -576,10 +570,6 @@ pub(crate) fn build_supervised_runtime_deps(
             // periodic hook: if the resolver is enabled but its serve thread exited
             // unexpectedly, re-arm it.
             let dns_ctl = Arc::clone(&dns_resolver_controller);
-            // Pause state for the boot self-apply
-            // reconcile below (a paused SID's filters must never reinstall
-            // from a periodic tick).
-            let pause = pause_coordinator.clone();
             // The IPv6 route table, written to the log whenever it CHANGES.
             // This hook already fires on every adapter/network change, so it is
             // the cheapest honest place to notice one; the logger itself stays
@@ -637,62 +627,32 @@ pub(crate) fn build_supervised_runtime_deps(
                 }
                 timings.mark("routes");
                 if let Some(orch) = orch.as_ref() {
-                    // NEVER reconcile the
-                    // orchestrator to an EMPTY effective set from a periodic
-                    // tick. `effective_enforcement_sids` returns empty both for
-                    // "genuinely nobody" AND for a transient console-SID lookup
-                    // failure (fast-user-switch, RDP console grab, a momentary
-                    // `WTSQueryUserToken` `ERROR_NO_TOKEN`). Reconciling to `[]`
-                    // there would STRIP every installed fail-closed / kill-switch
-                    // filter for one tick — a leak window on the primary link.
-                    // A genuine user departure is handled by the registry
-                    // `on_disconnect` reconcile listener and by stop-teardown, so
-                    // the periodic hook has no reason to strip on empty; leaving
-                    // the filters in place fails SAFE (they block, never leak).
-                    if active.is_empty() {
-                        dns_ctl.tick();
-                        report_recompute_cost(&timings, &moved);
-                        return;
-                    }
-                    // Boot self-apply: reconcile the
-                    // orchestrator against the effective set FIRST, so a SID
-                    // that became routing-active without a registry transition
-                    // (service boot, console user, dead tray) gets its full
-                    // per-SID filter set installed from persisted state. This
-                    // very tick fires immediately at task spawn, on every
-                    // adapter/network change, and every 30 s. Fail-CLOSED on a
-                    // pause-state read error: touch nothing (an empty want-set
-                    // would strip a healthy SID's filters).
-                    let paused = match pause.as_ref().map(|c| c.paused_sids()).transpose() {
-                        Ok(p) => p.unwrap_or_default(),
+                    // Membership is the orchestrator's one decider (served minus
+                    // paused), read under its membership lock, so the pass, a
+                    // tray exit and a pause cannot act on different views. A
+                    // user gone from every session past the departure grace
+                    // leaves with their routes AND their filters: with nobody
+                    // served there is no route-table owner, so the service
+                    // accounts' pins have no routes to pin to, and a block
+                    // without its route is a dead end for system traffic, not
+                    // protection. This tick fires at task spawn, on every
+                    // adapter/network change, and every 30 s; a decider that
+                    // cannot answer (pause-flag read error) touches nothing.
+                    let settled = match orch.settle() {
+                        Ok(sids) => sids,
                         Err(e) => {
+                            clean = false;
                             tracing::error!(
                                 target: "nrr::per_sid_orchestrator",
-                                msg_key = "svc-boot-pause-state-read-failed",
+                                msg_key = "svc-boot-enforcement-reconcile-failed",
                                 error = %e,
-                                "pause-state read failed; skipping enforcement reconcile",
+                                "periodic enforcement reconcile failed",
                             );
-                            dns_ctl.tick();
-                            report_recompute_cost(&timings, &moved);
-                            return;
+                            orch.installed_sids()
                         }
                     };
-                    let unpaused: Vec<String> = active
-                        .iter()
-                        .filter(|s| !paused.iter().any(|p| p == *s))
-                        .cloned()
-                        .collect();
-                    if let Err(e) = orch.reconcile(&unpaused) {
-                        clean = false;
-                        tracing::error!(
-                            target: "nrr::per_sid_orchestrator",
-                            msg_key = "svc-boot-enforcement-reconcile-failed",
-                            error = %e,
-                            "periodic enforcement reconcile failed",
-                        );
-                    }
                     timings.mark("filters");
-                    for sid in &unpaused {
+                    for sid in &settled {
                         match orch.reconcile_secondary_coverage(sid) {
                             Ok(0) => {}
                             Ok(n) => {
@@ -816,22 +776,14 @@ pub(crate) fn build_supervised_runtime_deps(
         nrr_service_runtime::secondary_external_address::ExternalAddressWiring { announcer, links }
     });
 
-    // Persist-on-stop — graceful-stop hook, gated by the fresh
-    // `routing_stop_policy` setting (read at stop time, NOT a boot snapshot,
-    // so a mid-session change takes effect). Built only when the full route
-    // path is available (coordinator + orchestrator come as a bundle, so both
-    // are Some together, and `settings_conn` is Some whenever the bundle is).
+    // The stop plan is read at stop time, never a boot snapshot: the reason
+    // (service stop or machine shutdown) and the `routing_stop_policy` setting
+    // both decide it. Built only when the full route path is available
+    // (coordinator + orchestrator come as a bundle, so both are Some together,
+    // and `settings_conn` is Some whenever the bundle is).
     //
-    // - **persist** (the default — VPN-type-aware "keep VPN"): KEEP the
-    //   secondary /32 rule-routes but remove NRR's overlays (the mode-A /2
-    //   counter-overlay / mode-B /1 split-default), so rule-matched hosts keep
-    //   egressing the VPN after stop while general traffic returns to whatever
-    //   the OS/VPN provides — the primary for a gateway-less VPN, the VPN's own
-    //   default for a full-tunnel one (no fabricated default → a split / corp
-    //   VPN is not forced to carry its non-org traffic).
-    // - **teardown**: full restore-pristine — remove EVERY NRR route.
-    // Both strip ALL WFP filters (routing is route-table-based; a lingering
-    // block with no service to lift it would be a lockout).
+    // Routes go first, filters last under a deadline: between the two a rule
+    // host is blocked, never leaked. On a machine shutdown nothing is removed.
     let route_teardown_hook: Option<nrr_service_runtime::supervised_runtime::RouteRecomputeHook> =
         match (
             route_coordinator.as_ref(),
@@ -844,6 +796,29 @@ pub(crate) fn build_supervised_runtime_deps(
                 let conn = Arc::clone(conn);
                 Some(
                     Arc::new(move || {
+                        use nrr_service_runtime::lifecycle_matrix::{
+                            stop_plan, within_deadline, FilterTeardown, LifecycleInputs,
+                            RouteTeardown, FILTER_TEARDOWN_DEADLINE,
+                        };
+                        let reason = nrr_service_runtime::lifecycle::teardown_reason();
+                        let plan = stop_plan(
+                            reason,
+                            LifecycleInputs {
+                                leak_guard_armed: super::offline_reset::leak_guard_armed_anywhere(),
+                                keep_rule_routes_on_stop: read_routing_stop_persist(&conn),
+                            },
+                        );
+                        if plan.routes == RouteTeardown::Keep
+                            && plan.filters == FilterTeardown::Keep
+                        {
+                            tracing::info!(
+                                target: "nrr::lifecycle",
+                                msg_key = "svc-boot-teardown-kept-for-shutdown",
+                                reason = ?reason,
+                                "machine shutting down — filters and routes stay in force until the end; nothing of ours survives the power-off",
+                            );
+                            return;
+                        }
                         // Who was connected at the moment the paths go away.
                         // Removing our routes changes the outgoing path for
                         // live sessions, and TCP does not survive that — so
@@ -867,26 +842,27 @@ pub(crate) fn build_supervised_runtime_deps(
                                 "connections live at teardown — removing our routes changes their path, and an established session does not survive that",
                             );
                         }
-                        if read_routing_stop_persist(&conn) {
-                            // persist (default): keep the /32 rule-routes on the
-                            // VPN, remove NRR's overlays.
-                            match coord.teardown_keep_rule_routes() {
-                                Ok(delta) => tracing::info!(
-                                    target: "nrr::route-coordinator",
-                                    msg_key = "svc-boot-teardown-persist-routes",
-                                    removed_overlays = delta.removed as u64,
-                                    "service stopping — kept secondary rule-routes on the VPN; removed NRR overlays (general traffic returns to the OS/VPN default)",
-                                ),
-                                Err(e) => tracing::warn!(
-                                    target: "nrr::route-coordinator",
-                                    msg_key = "svc-boot-teardown-keep-secondary-failed",
-                                    error = %e,
-                                    "route keep-secondary teardown on shutdown failed",
-                                ),
+                        match plan.routes {
+                            RouteTeardown::Keep => {}
+                            // Keep the /32 rule-routes on the VPN, remove NRR's
+                            // overlays.
+                            RouteTeardown::KeepRuleRoutes => {
+                                match coord.teardown_keep_rule_routes() {
+                                    Ok(delta) => tracing::info!(
+                                        target: "nrr::route-coordinator",
+                                        msg_key = "svc-boot-teardown-persist-routes",
+                                        removed_overlays = delta.removed as u64,
+                                        "service stopping — kept secondary rule-routes on the VPN; removed NRR overlays (general traffic returns to the OS/VPN default)",
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        target: "nrr::route-coordinator",
+                                        msg_key = "svc-boot-teardown-keep-secondary-failed",
+                                        error = %e,
+                                        "route keep-secondary teardown on shutdown failed",
+                                    ),
+                                }
                             }
-                        } else {
-                            // teardown: full restore-pristine — remove every route.
-                            match coord.teardown() {
+                            RouteTeardown::RemoveAll => match coord.teardown() {
                                 Ok(_) => tracing::info!(
                                     target: "nrr::route-coordinator",
                                     msg_key = "svc-boot-teardown-full-restore",
@@ -898,22 +874,37 @@ pub(crate) fn build_supervised_runtime_deps(
                                     error = %e,
                                     "route teardown on shutdown failed",
                                 ),
-                            }
+                            },
                         }
-                        // Both policies strip ALL WFP filters — a lingering block
-                        // with no service to lift it would be a lockout.
-                        match orch.cleanup_wfp() {
-                            Ok(n) => tracing::info!(
+                        if plan.filters != FilterTeardown::RemoveAll {
+                            return;
+                        }
+                        // A lingering block with no service to lift it would be
+                        // a lockout; a wedged engine that never answers would
+                        // be a stop that never ends, so the wait is bounded.
+                        let sweep = Arc::clone(&orch);
+                        match within_deadline(
+                            "wfp-filter-teardown",
+                            FILTER_TEARDOWN_DEADLINE,
+                            move || sweep.cleanup_wfp(),
+                        ) {
+                            Some(Ok(n)) => tracing::info!(
                                 target: "nrr::route-coordinator",
                                 msg_key = "svc-boot-wfp-filters-stripped",
                                 stripped_filters = n as u64,
                                 "service stopping — all NRR WFP filters stripped",
                             ),
-                            Err(e) => tracing::warn!(
+                            Some(Err(e)) => tracing::warn!(
                                 target: "nrr::route-coordinator",
                                 msg_key = "svc-boot-wfp-strip-failed",
                                 error = %e,
                                 "WFP filter strip on shutdown failed",
+                            ),
+                            None => tracing::warn!(
+                                target: "nrr::route-coordinator",
+                                msg_key = "svc-boot-wfp-strip-deadline",
+                                deadline_secs = FILTER_TEARDOWN_DEADLINE.as_secs(),
+                                "WFP filter strip did not finish before the deadline — the stop goes on; the next start adopts or strips what is left",
                             ),
                         }
                     })
@@ -1130,7 +1121,6 @@ pub(crate) fn build_supervised_runtime_deps(
             },
         },
         VpnLearningDeps {
-            learned_vpn_endpoints: &learned_vpn_endpoints,
             killswitch_drop_registry: &killswitch_drop_registry,
             learned_vpn_client_apps: &learned_vpn_client_apps,
             vpn_client_app_persist,
@@ -1147,7 +1137,12 @@ pub(crate) fn build_supervised_runtime_deps(
             }
             _ => None,
         };
-        spawn_fcrdns_learner_worker(fcrdns_rx, Arc::clone(dns_consumer), companion);
+        spawn_fcrdns_learner_worker(
+            fcrdns_rx,
+            Arc::clone(dns_consumer),
+            companion,
+            Arc::clone(&task_liveness),
+        );
     }
 
     // Clear any orphaned NRPT redirect a prior crashed Resolver session may
@@ -1325,6 +1320,7 @@ pub(crate) fn build_supervised_runtime_deps(
         active_routing_sid.as_ref(),
         route_coordinator.as_ref(),
         auto_rules_engine.as_ref(),
+        Arc::clone(&task_liveness),
     ) {
         fake_ip_controller.set_factory(stack_factory);
         true
@@ -1348,17 +1344,30 @@ pub(crate) fn build_supervised_runtime_deps(
     if fake_ip_armed {
         let controller = Arc::clone(&fake_ip_controller);
         let replan = Arc::clone(&fake_ip_replan);
+        let liveness = Arc::clone(&task_liveness);
         let spawned = std::thread::Builder::new()
             .name("nrr-fakeip-watchdog".into())
             .spawn(move || {
                 use nrr_platform_api::DnsCacheControlPort;
+                use nrr_service_runtime::service_tasks::ServiceTaskKind;
+                use nrr_service_runtime::task_liveness::{ThreadExit, Watch};
+                // A tick is a mutex lock and a replan; a minute without one
+                // means the loop is stuck behind a wedged stop.
+                let lease = liveness.lease(
+                    ServiceTaskKind::FakeIpWatchdog,
+                    None,
+                    Watch::Beats(std::time::Duration::from_secs(60)),
+                );
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(5));
+                    lease.beat();
                     // `replan()` reinstalls filters, so a tick during teardown
                     // would undo the strip.
                     if controller.is_shut_down() || nrr_service_runtime::teardown_in_progress() {
+                        lease.finish(ThreadExit::Stopped);
                         break;
                     }
+                    let _tick = lease.work();
                     if controller.watchdog_tick() {
                         replan();
                         if let Err(e) = nrr_platform_windows::WindowsDnsCacheControl::new()
@@ -1420,6 +1429,7 @@ pub(crate) fn build_supervised_runtime_deps(
         conn_trace_ring
             .as_ref()
             .map(|ring| Arc::clone(ring.outage_blocks())),
+        Arc::clone(&task_liveness),
     ) {
         dns_resolver_controller.set_factory(factory);
         dns_resolver_controller.set_sign_in_probe(Arc::clone(&signed_in));
@@ -1586,6 +1596,7 @@ pub(crate) fn build_supervised_runtime_deps(
         nrr_service_runtime::dns_stack::persisted_enforcement_mode(settings_conn.clone());
     SupervisedRuntimeDeps {
         health: Arc::clone(&health_agg),
+        liveness: Some(task_liveness),
         ipc_server,
         adapter_monitor,
         operation_results,

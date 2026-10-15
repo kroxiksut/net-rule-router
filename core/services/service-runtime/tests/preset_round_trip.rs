@@ -290,6 +290,7 @@ fn settings_export_full_yaml_conforms_to_formats_md_2_4() {
             resolve_hosts_bypass: true,
             doh_lockdown_enabled: false,
             doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
+            doh_lockdown_auto: true,
             browser_history_auto_seed: false,
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
@@ -303,6 +304,7 @@ fn settings_export_full_yaml_conforms_to_formats_md_2_4() {
             short_name_completion: false,
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
+            forwarded_outage: String::new(),
             binding_source: BindingSource::UserAssigned,
         };
         repo.update_for_sid("S-1-5-21-test", &record, 1)

@@ -11,7 +11,8 @@
 //! ## Error handling
 //!
 //! - `Idempotent` (e.g. ERROR_NOT_FOUND on delete) → treat as success,
-//!   push no compensating action (nothing to undo).
+//!   push no compensating action (nothing to undo). On an ADD the same code
+//!   is the interface having gone (`MutationIntent::Add` → `Fatal`).
 //! - `Conflict` (e.g. route already exists on add) → treat as success for
 //!   AddRoute; for UpdateRoute a conflict means the current state may be
 //!   stale — surface as `Fatal` so the orchestrator re-snapshots.
@@ -27,7 +28,7 @@
 use std::sync::Arc;
 
 use crate::{
-    error::{ErrorClass, PlatformError},
+    error::{ErrorClass, MutationIntent, PlatformError},
     route_table::RouteTablePort,
     types::{RouteEntry, RoutingAction},
 };
@@ -98,16 +99,14 @@ impl RoutingTransaction {
     fn execute_one(&mut self, action: &RoutingAction) -> Result<(), PlatformError> {
         match action {
             RoutingAction::AddRoute(entry) => {
+                // Classified as an ADD: "not found" here is the interface having
+                // gone, so the route was never installed and the add fails.
                 match self.api.create_ip_forward_entry(entry) {
                     Ok(()) => {
                         self.compensating
                             .push(CompensatingAction::DeleteRoute(entry.clone()));
                     }
-                    Err(e) if e.classify() == ErrorClass::Idempotent => {
-                        // Route already exists in the exact desired state —
-                        // no-op, no undo needed.
-                    }
-                    Err(e) if e.classify() == ErrorClass::Conflict => {
+                    Err(e) if e.classify_for(MutationIntent::Add) == ErrorClass::Conflict => {
                         // A route with this key already exists with a different
                         // config — e.g. a redirect-gateway VPN's own `/1`
                         // overlay (its metric ≠ ours). Per the module doc,
@@ -163,7 +162,7 @@ impl RoutingTransaction {
                     // "somebody else's overlay" case `AddRoute` treats as
                     // success, and for the same reason: we neither own nor undo
                     // it, and a more specific prefix still wins.
-                    Err(e) if e.classify() == ErrorClass::Conflict => {}
+                    Err(e) if e.classify_for(MutationIntent::Add) == ErrorClass::Conflict => {}
                     Err(e) => {
                         // The add failed, so there is no new route to delete on
                         // the way back — only the old one to restore. Narrow the
@@ -234,9 +233,12 @@ impl RoutingTransaction {
         }
     }
 
+    /// A restore that finds the route already back is done; one whose
+    /// interface has gone is not, and is reported so the caller's ownership
+    /// stays honest.
     fn create_tolerant(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
         match self.api.create_ip_forward_entry(entry) {
-            Err(e) if e.classify() == ErrorClass::Idempotent => Ok(()),
+            Err(e) if e.classify_for(MutationIntent::Add) == ErrorClass::Conflict => Ok(()),
             other => other,
         }
     }
@@ -496,6 +498,76 @@ mod tests {
         );
         // No compensating action pushed (nothing was changed).
         assert_eq!(tx.pending_undo_count(), 0);
+    }
+
+    /// An add answered "not found" is a route onto an interface that vanished:
+    /// the apply fails, nothing is journalled as added, and the rollback has
+    /// nothing to undo — instead of a phantom route the reconciler owns.
+    #[test]
+    fn an_add_onto_a_vanished_interface_fails_instead_of_counting_as_done() {
+        let api = api();
+        let first = route([10, 0, 0, 0], [192, 168, 1, 1], 5, true);
+        let vanished = route([10, 0, 1, 0], [192, 168, 1, 1], 99, true);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        tx.execute(&[RoutingAction::AddRoute(first)]).unwrap();
+
+        api.set_route_create_error(Some(PlatformError::Win32 {
+            operation: "CreateIpForwardEntry2",
+            code: 0x490, // ERROR_NOT_FOUND
+            message: "interface gone".into(),
+        }));
+        assert!(
+            tx.execute(&[RoutingAction::AddRoute(vanished)]).is_err(),
+            "not found on an add is the interface being gone, not success"
+        );
+        assert_eq!(
+            tx.pending_undo_count(),
+            1,
+            "only the first add is journalled"
+        );
+        assert!(tx.added_routes().iter().all(|r| r.interface_index == 5));
+
+        api.set_route_create_error(None);
+        let residue = tx.rollback_with_residue();
+        assert!(residue.errors.is_empty());
+        assert!(api.get_ip_forward_table().unwrap().is_empty());
+    }
+
+    /// The same answer on the way back: a restore whose interface is gone is
+    /// reported as still missing, and one that finds the route already there
+    /// is done.
+    #[test]
+    fn a_rollback_restore_onto_a_vanished_interface_is_reported_not_swallowed() {
+        let api = api();
+        let dropped = route([10, 0, 1, 0], [192, 168, 1, 1], 5, true);
+        api.create_ip_forward_entry(&dropped).unwrap();
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        tx.execute(&[RoutingAction::DeleteRoute(dropped.clone())])
+            .unwrap();
+
+        api.set_route_create_error(Some(PlatformError::Win32 {
+            operation: "CreateIpForwardEntry2",
+            code: 0x490,
+            message: "interface gone".into(),
+        }));
+        let residue = tx.rollback_with_residue();
+        assert_eq!(residue.still_removed, vec![dropped.clone()]);
+        assert_eq!(residue.errors.len(), 1);
+
+        // Already back (somebody re-added it) is the state the restore wanted.
+        api.set_route_create_error(None);
+        api.create_ip_forward_entry(&dropped).unwrap();
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        tx.execute(&[RoutingAction::DeleteRoute(dropped.clone())])
+            .unwrap();
+        api.set_route_create_error(Some(PlatformError::Win32 {
+            operation: "CreateIpForwardEntry2",
+            code: 0x1392,
+            message: "already exists".into(),
+        }));
+        let residue = tx.rollback_with_residue();
+        assert!(residue.errors.is_empty(), "{:?}", residue.errors);
+        assert!(residue.still_removed.is_empty());
     }
 
     #[test]

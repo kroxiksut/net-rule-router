@@ -46,6 +46,10 @@ pub const SYSTEM_TABLE: u32 = PRINCIPAL_TABLE_BASE - 1;
 pub const USER_PRIORITY: u32 = 30_100;
 /// The service accounts' selectors, after every user's.
 pub const SYSTEM_PRIORITY: u32 = 30_110;
+/// What the machine forwards follows the service accounts' table too, after
+/// them: at the tunnel's outage the forward hook blocks what the owner's guard
+/// blocks, and while it is up the same routes carry it as the machine's own.
+pub const FORWARDED_PRIORITY: u32 = 30_115;
 /// Every rule at these priorities that selects by uid alone is ours.
 pub const PRIORITY_BAND: RangeInclusive<u32> = 30_100..=30_119;
 
@@ -124,6 +128,22 @@ pub fn rules_in_front_of_ours() -> Result<Vec<(bool, u32, Vec<u8>)>, PlatformErr
         .collect())
 }
 
+/// Our selectors as installed, hashed. A pass input: `ip rule flush` or a
+/// network manager rewriting the rules moves nothing else a pass reads, and
+/// the pass that reinstalls them is the same one that writes them.
+#[cfg(target_os = "linux")]
+pub fn installed_selectors_fingerprint() -> Result<u64, PlatformError> {
+    use std::hash::{Hash, Hasher};
+    let mut ours: Vec<FibRule> = crate::route_table::get_fib_rules()?
+        .into_iter()
+        .filter(is_our_rule)
+        .collect();
+    ours.sort_unstable();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ours.hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
 /// Move what [`displaced_rules`] finds. One refused move does not hold back
 /// the others; the first refusal is returned after all were tried.
 #[cfg(target_os = "linux")]
@@ -168,19 +188,23 @@ pub(crate) fn is_our_rule(rule: &FibRule) -> bool {
 fn push_selectors(
     out: &mut Vec<FibRule>,
     table: u32,
-    ranges: &[(u32, u32)],
+    ranges: &[Option<(u32, u32)>],
     selector: TableSelector,
     priority: u32,
     with_ipv6: bool,
 ) {
     for &range in ranges {
+        // `iif lo` on a uid selector: a forwarded packet is looked up as uid 0
+        // and takes only the selector made for it (`range` = `None`).
         let rule = |ipv6, priority, table, suppress_prefixlen| FibRule {
             ipv6,
             priority,
             table,
-            uid_range: Some(range),
+            uid_range: range,
             suppress_prefixlen,
+            iif_lo: range.is_some(),
             narrowed: false,
+            forwarded: range.is_none(),
         };
         match selector.overlay_prefix_v4.filter(|p| *p > 0) {
             Some(p) => {
@@ -215,7 +239,7 @@ pub(crate) fn selector_rules(
             push_selectors(
                 &mut out,
                 table,
-                &[(uid, uid)],
+                &[Some((uid, uid))],
                 *selector,
                 USER_PRIORITY,
                 with_ipv6,
@@ -223,13 +247,25 @@ pub(crate) fn selector_rules(
         }
     }
     if let Some(selector) = plan.system {
-        let ranges = crate::service_account_uids::service_account_uids(sys_uid_max, &present);
+        let ranges: Vec<_> =
+            crate::service_account_uids::service_account_uids(sys_uid_max, &present)
+                .into_iter()
+                .map(Some)
+                .collect();
         push_selectors(
             &mut out,
             SYSTEM_TABLE,
             &ranges,
             selector,
             SYSTEM_PRIORITY,
+            with_ipv6,
+        );
+        push_selectors(
+            &mut out,
+            SYSTEM_TABLE,
+            &[None],
+            selector,
+            FORWARDED_PRIORITY,
             with_ipv6,
         );
     }
@@ -263,7 +299,7 @@ pub(crate) fn selector_changes(
 pub(crate) fn uid_range_ignored(installed: &[FibRule]) -> bool {
     installed
         .iter()
-        .any(|r| is_our_rule(r) && r.uid_range.is_none())
+        .any(|r| is_our_rule(r) && r.uid_range.is_none() && !r.forwarded)
 }
 
 /// Whether a kernel release (`/proc/sys/kernel/osrelease`) selects by uid. An
@@ -496,7 +532,8 @@ mod tests {
         assert!(a.iter().all(in_own_table));
         assert!(b.iter().all(|r| r.table == 0x8000_03E9));
         let ours_by_uid = |r: &FibRule| r.uid_range.is_some() && is_our_rule(r);
-        assert!(rules.iter().all(ours_by_uid));
+        assert!(rules.iter().filter(|r| !r.forwarded).all(ours_by_uid));
+        assert!(rules.iter().all(is_our_rule));
     }
 
     /// An overlay table yields to `main`'s more specific routes: table without
@@ -527,7 +564,10 @@ mod tests {
             SYS_UID_MAX,
             false,
         );
-        let system: Vec<_> = rules.iter().filter(|r| r.table == SYSTEM_TABLE).collect();
+        let system: Vec<_> = rules
+            .iter()
+            .filter(|r| r.table == SYSTEM_TABLE && !r.forwarded)
+            .collect();
         assert_eq!(
             system.iter().map(|r| r.uid_range).collect::<Vec<_>>(),
             vec![Some((1, 999)), Some((65_534, 65_534))]
@@ -577,7 +617,9 @@ mod tests {
                 table: 51_820,
                 uid_range: None,
                 suppress_prefixlen: None,
+                iif_lo: false,
                 narrowed: true,
+                forwarded: false,
             },
             FibRule {
                 ipv6: false,
@@ -585,7 +627,9 @@ mod tests {
                 table: 100,
                 uid_range: Some((1000, 1000)),
                 suppress_prefixlen: None,
+                iif_lo: true,
                 narrowed: false,
+                forwarded: false,
             },
             FibRule {
                 ipv6: false,
@@ -593,16 +637,21 @@ mod tests {
                 table: 0x8000_03E8,
                 uid_range: Some((1000, 1000)),
                 suppress_prefixlen: None,
+                iif_lo: true,
                 narrowed: true,
+                forwarded: false,
             },
         ];
+        // A selector of ours from before `iif lo`: still ours to delete.
         let stale = FibRule {
             ipv6: false,
             priority: USER_PRIORITY,
             table: 0x8000_07D0,
             uid_range: Some((2000, 2000)),
             suppress_prefixlen: None,
+            iif_lo: false,
             narrowed: false,
+            forwarded: false,
         };
         let mut installed = foreign.to_vec();
         installed.push(stale);
@@ -621,6 +670,65 @@ mod tests {
         );
         let (add, delete) = selector_changes(&desired, &desired);
         assert!(add.is_empty() && delete.is_empty());
+    }
+
+    /// What the kernel does with one of our rules: a locally originated
+    /// packet of `uid` matches a uid selector, a forwarded one (ingress is the
+    /// bridge, uid 0) only the selector made for it.
+    fn selects(rule: &FibRule, uid: u32, forwarded: bool) -> bool {
+        if rule.forwarded {
+            return forwarded;
+        }
+        let uid_ok = rule
+            .uid_range
+            .is_none_or(|(lo, hi)| (lo..=hi).contains(&uid));
+        uid_ok && !(rule.iif_lo && forwarded)
+    }
+
+    /// Docker, libvirt and LXC traffic is forwarded as uid 0: it skips every
+    /// uid selector and takes the service accounts' table by its own selector,
+    /// after theirs.
+    #[test]
+    fn forwarded_traffic_takes_only_its_own_selector() {
+        let rules = selector_rules(
+            &plan(vec![user(1000, Some(2))], Some(Some(2))),
+            SYS_UID_MAX,
+            true,
+        );
+        assert!(rules.iter().any(|r| selects(r, 1000, false)));
+        assert!(
+            rules.iter().any(|r| selects(r, 0, false)),
+            "service accounts"
+        );
+        let forwarded: Vec<_> = rules.iter().filter(|r| selects(r, 0, true)).collect();
+        assert!(!forwarded.is_empty());
+        assert!(forwarded.iter().all(|r| r.forwarded
+            && r.uid_range.is_none()
+            && r.priority >= FORWARDED_PRIORITY
+            && (r.table == SYSTEM_TABLE || r.table == RT_TABLE_MAIN)));
+        assert!(rules.iter().filter(|r| !r.forwarded).all(|r| r.iif_lo));
+        assert!(
+            !uid_range_ignored(&rules),
+            "the forwarded selector is not a lost uid range"
+        );
+        // None without the service accounts' table to send it to.
+        let users_only = selector_rules(&plan(vec![user(1000, None)], None), SYS_UID_MAX, true);
+        assert!(users_only.iter().all(|r| !r.forwarded));
+    }
+
+    /// A selector installed by a previous version carries no `iif lo`; the
+    /// reconcile replaces it rather than keeping it.
+    #[test]
+    fn a_selector_without_the_lo_ingress_is_replaced() {
+        let desired = selector_rules(&plan(vec![user(1000, None)], None), SYS_UID_MAX, false);
+        let old = FibRule {
+            iif_lo: false,
+            ..desired[0]
+        };
+        assert!(is_our_rule(&old));
+        let (add, delete) = selector_changes(&[old], &desired);
+        assert_eq!(add, desired);
+        assert_eq!(delete, vec![old]);
     }
 
     /// A rule of ours with no uid range steers everybody: the sign of a kernel

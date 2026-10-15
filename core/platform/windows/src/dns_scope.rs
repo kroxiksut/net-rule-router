@@ -18,7 +18,8 @@
 use std::net::Ipv4Addr;
 
 use nrr_platform_api::dns_scope::{
-    is_actionable_scope, normalize_suffix, InterfaceDnsScope, InterfaceDnsScopePort,
+    classify_claims, is_actionable_scope, normalize_suffix, ClaimedNamespace, InterfaceDnsScope,
+    InterfaceDnsScopePort,
 };
 use nrr_platform_api::{AdapterInfo, IfOperStatus, InterfaceType};
 use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
@@ -56,6 +57,30 @@ pub fn live_actionable_dns_scopes() -> Vec<InterfaceDnsScope> {
         .get_adapter_infos()
         .unwrap_or_default();
     claims_of_live_adapters(WindowsInterfaceDnsScopes.dns_scopes(), &live)
+}
+
+/// Every claim of a connection the OS is using right now, told apart by the
+/// kind of link behind it. Not narrowed to actionable claims: a single-label
+/// lease on the main link is still worth offering.
+pub fn live_claims() -> Vec<ClaimedNamespace> {
+    use nrr_platform_api::route_table::RouteTablePort;
+
+    let api = crate::windows_api::ProductionWindowsApi;
+    let live = api.get_adapter_infos().unwrap_or_default();
+    let routes = api.get_ip_forward_table().unwrap_or_default();
+    let scopes = WindowsInterfaceDnsScopes
+        .dns_scopes()
+        .into_iter()
+        .filter_map(|mut scope| {
+            let adapter = live.iter().find(|a| {
+                a.adapter_name.eq_ignore_ascii_case(&scope.adapter_id) && carries_live_claim(a)
+            })?;
+            scope.display_name =
+                nrr_platform_api::adapters::preferred_display_name(adapter).to_string();
+            Some(scope)
+        })
+        .collect();
+    classify_claims(scopes, &live, &routes)
 }
 
 fn claims_of_live_adapters(

@@ -154,6 +154,10 @@ struct HealthAggregatorInner {
     /// Per-component status, keyed by slug-ordered component id for
     /// stable iteration.
     components: BTreeMap<HealthComponent, HealthComponentSnapshot>,
+    /// What a named writer says about a component, beside the unnamed slot
+    /// above. The snapshot shows the worst voice per component, so a writer
+    /// that clears its own verdict cannot erase somebody else's.
+    sourced: BTreeMap<(HealthComponent, &'static str), HealthComponentSnapshot>,
     /// Optional SCM-lifecycle override (Starting / Stopping / Disabled).
     /// When `Some`, takes precedence over the component-derived state.
     lifecycle_override: Option<ServiceRuntimeState>,
@@ -174,6 +178,7 @@ impl HealthAggregator {
         Self {
             inner: Mutex::new(HealthAggregatorInner {
                 components: BTreeMap::new(),
+                sourced: BTreeMap::new(),
                 lifecycle_override: Some(ServiceRuntimeState::Starting),
                 policy_state: ServicePolicyState::NoState,
                 current_revision: None,
@@ -236,6 +241,37 @@ impl HealthAggregator {
         }
     }
 
+    /// What `source` says about `component`, kept apart from every other
+    /// writer. Use it where a verdict comes and goes (a task down, then back)
+    /// and another writer may hold its own verdict on the same component.
+    pub fn record_as(
+        &self,
+        source: &'static str,
+        component: HealthComponent,
+        severity: ServiceHealthSeverity,
+        message: impl Into<String>,
+    ) {
+        let now = epoch_secs();
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.sourced.insert(
+                (component, source),
+                HealthComponentSnapshot {
+                    component,
+                    severity,
+                    message: message.into(),
+                    updated_at_epoch_secs: now,
+                },
+            );
+        }
+    }
+
+    /// `source` has nothing to say about `component` any more.
+    pub fn clear_as(&self, source: &'static str, component: HealthComponent) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.sourced.remove(&(component, source));
+        }
+    }
+
     /// Seed a component that has not reported yet. The seed exists to move a
     /// component off `Unknown` (which the derived state maps to `Starting`), so
     /// it must never overwrite something already said — a `Blocking` recorded
@@ -279,7 +315,7 @@ impl HealthAggregator {
                 "diagnostics-init-audit" | "diagnostics-init-logs" => {
                     (&mut diagnostics, &mut diagnostics_msg)
                 }
-                "integrity-verify" => (&mut policy, &mut policy_msg),
+                "integrity-verify" | "crash-recovery" => (&mut policy, &mut policy_msg),
                 _ => continue,
             };
             if phase.severity > *bucket {
@@ -357,9 +393,19 @@ impl HealthAggregator {
             Ok(g) => g,
             Err(_) => return self.poisoned_snapshot(now),
         };
-        let mut components: Vec<HealthComponentSnapshot> =
-            inner.components.values().cloned().collect();
-        components.sort_by_key(|c| c.component);
+        let mut by_component: BTreeMap<HealthComponent, HealthComponentSnapshot> =
+            inner.components.clone();
+        // A named voice shows only when it is worse than what is already said:
+        // on a tie the unnamed slot keeps its message and timestamp.
+        for ((component, _), voice) in &inner.sourced {
+            match by_component.get(component) {
+                Some(current) if current.severity >= voice.severity => {}
+                _ => {
+                    by_component.insert(*component, voice.clone());
+                }
+            }
+        }
+        let components: Vec<HealthComponentSnapshot> = by_component.into_values().collect();
         let worst = components
             .iter()
             .map(|c| c.severity)
@@ -687,5 +733,75 @@ mod tests {
         assert_eq!(s1.components, s2.components);
         assert_eq!(s1.policy_state, s2.policy_state);
         assert_eq!(s1.worst_severity, s2.worst_severity);
+    }
+
+    fn severity_of(agg: &HealthAggregator, component: HealthComponent) -> ServiceHealthSeverity {
+        agg.snapshot()
+            .components
+            .into_iter()
+            .find(|c| c.component == component)
+            .map(|c| c.severity)
+            .expect("component present")
+    }
+
+    #[test]
+    fn a_named_voice_degrades_a_component_and_clearing_it_restores_the_unnamed_verdict() {
+        let agg = HealthAggregator::new();
+        agg.record(HealthComponent::Apply, ServiceHealthSeverity::Ok, "applied");
+        agg.record_as(
+            "liveness",
+            HealthComponent::Apply,
+            ServiceHealthSeverity::Degraded,
+            "resolver gone",
+        );
+        assert_eq!(
+            severity_of(&agg, HealthComponent::Apply),
+            ServiceHealthSeverity::Degraded
+        );
+        agg.clear_as("liveness", HealthComponent::Apply);
+        assert_eq!(
+            severity_of(&agg, HealthComponent::Apply),
+            ServiceHealthSeverity::Ok
+        );
+    }
+
+    #[test]
+    fn a_named_voice_clearing_itself_cannot_erase_another_writers_verdict() {
+        let agg = HealthAggregator::new();
+        agg.record(
+            HealthComponent::Apply,
+            ServiceHealthSeverity::Degraded,
+            "no filtering session",
+        );
+        agg.record_as(
+            "apply-pass",
+            HealthComponent::Apply,
+            ServiceHealthSeverity::Degraded,
+            "pass failed",
+        );
+        agg.clear_as("apply-pass", HealthComponent::Apply);
+        let apply = agg
+            .snapshot()
+            .components
+            .into_iter()
+            .find(|c| c.component == HealthComponent::Apply)
+            .expect("apply present");
+        assert_eq!(apply.severity, ServiceHealthSeverity::Degraded);
+        assert_eq!(apply.message, "no filtering session");
+    }
+
+    #[test]
+    fn a_named_voice_alone_creates_the_component() {
+        let agg = HealthAggregator::new();
+        agg.clear_lifecycle_override();
+        agg.record_as(
+            "liveness",
+            HealthComponent::BackgroundTasks,
+            ServiceHealthSeverity::Degraded,
+            "fcrdns gone",
+        );
+        let snap = agg.snapshot();
+        assert_eq!(snap.worst_severity, ServiceHealthSeverity::Degraded);
+        assert_eq!(snap.state, ServiceRuntimeState::Degraded);
     }
 }

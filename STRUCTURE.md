@@ -81,7 +81,10 @@ Per-platform files the build stamps into binaries or the delivery installs:
 - **`packaging/linux`** — the two XDG desktop entries (`netrulerouter.desktop`, `netrulerouter-tray.desktop`). Their basenames are the Wayland `app_id` the Qt host declares via `setDesktopFileName`, which is how a compositor finds the window's name and icon. `maintainer/` holds the service steps the `.deb` scripts and `.rpm` scriptlets share, `tarball/` the archive's `install.sh` / `uninstall.sh`; `scripts/package-linux.sh` assembles all three formats from them.
 
 ### scripts/
-Developer automation, PowerShell and shell side by side: bootstrap, build, run, check, service install/uninstall/status, desktop-entry install/uninstall, full data purge, network reset, smoke and speed probes, packaging, WSL gate. `scripts/lib/` holds path constants and helpers the shell and PowerShell scripts source (never execute); `scripts/dev/` holds one-off maintenance utilities.
+Developer automation, PowerShell and shell side by side: bootstrap, build, run, check, service install/uninstall/status, desktop-entry install/uninstall, full data purge, network reset, smoke and speed probes, packaging, WSL gate, fuzzing. `scripts/lib/` holds path constants and helpers the shell and PowerShell scripts source (never execute); `scripts/dev/` holds one-off maintenance utilities.
+
+### fuzz/
+A cargo workspace of its own (nightly, libFuzzer), excluded from the product workspace: one target per parser of bytes another party can shape, with synthetic seed inputs under `corpus/`. Run by `scripts/fuzz.sh`.
 
 ### .github/
 CI/CD workflow definitions (Windows and Linux quality gates)
@@ -155,7 +158,7 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - `build` — Compile binaries (dev or release profile)
 - `run` — Launch individual components (GUI, tray, service)
 - `check` — Canonical quality gate (fmt, clippy, test, cargo-deny)
-- `clean-sync-duplicates` — Remove file-sync conflict copies
+- `clean-sync-duplicates` — Remove file-sync conflict copies identical to their original; stop on one that differs
 - `install-service` / `uninstall-service` / `service-status` / `service-smoke` — Service lifecycle for development. `install-service.ps1` stages the built binaries into an administrators-only directory and registers the service from there; the SCM never points at `target\`
 - `speed-probe` — Read-only per-adapter reachability and download-speed probe (`curl` pinned to each adapter's source address)
 - `install-desktop` / `uninstall-desktop` — Linux only: desktop entries and hicolor icons, per user or machine-wide

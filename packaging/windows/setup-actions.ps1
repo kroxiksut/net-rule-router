@@ -54,13 +54,27 @@ if ($LogPath) {
     try { Start-Transcript -Path $LogPath -Append | Out-Null } catch { }
 }
 
-function Stop-NrrService {
+# $true once no service process is left: stopped, or never registered.
+function Test-NrrServiceStopped {
     $service = Get-Service -Name $NrrServiceName -ErrorAction SilentlyContinue
-    if (-not $service -or $service.Status -eq 'Stopped') { return $true }
+    return (-not $service -or $service.Status -eq 'Stopped')
+}
+
+function Stop-NrrService {
+    if (Test-NrrServiceStopped) { return $true }
     Write-Host "==> stopping $NrrServiceName"
     $null = Invoke-NativeCommand -FilePath (Get-SystemTool 'sc.exe') -ArgumentList @('stop', $NrrServiceName)
     # Teardown restores DNS and unwinds filters; give it more than SCM's usual wait.
-    return (Wait-ServiceStatus -Name $NrrServiceName -Status Stopped -Seconds 60)
+    if (Wait-ServiceStatus -Name $NrrServiceName -Status Stopped -Seconds 60) { return $true }
+    # A process stuck in its stop keeps the registration and would put back
+    # what the reset removes; the files it runs from are about to go anyway.
+    $servicePid = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$NrrServiceName'" -ErrorAction SilentlyContinue).ProcessId
+    if ($servicePid) {
+        Write-Host "    $NrrServiceName did not stop; ending its process $servicePid"
+        Stop-Process -Id $servicePid -Force -ErrorAction SilentlyContinue
+        $null = Wait-ServiceStatus -Name $NrrServiceName -Status Stopped -Seconds 15
+    }
+    return (Test-NrrServiceStopped)
 }
 
 # A registration pointing elsewhere belongs to another copy (a portable folder,
@@ -91,13 +105,19 @@ function Invoke-UserScript {
 
 # Unregistering already sweeps filters and the DNS redirect when the service
 # stopped cleanly; the offline reset catches whatever a crashed instance left.
+# The DNS redirect is then swept once more without the binary: it lives in the
+# registry, and nothing removed with the package could lift it after a reboot.
 function Restore-Network {
-    if (-not (Test-Path -LiteralPath $console)) {
-        Write-Host "    $console is missing; network state was not checked"
-        return 1
+    $code = 1
+    if (Test-Path -LiteralPath $console) {
+        Write-Host '==> nrr-cli reset-network --confirm'
+        $code = Invoke-NativeCommand -FilePath $console -ArgumentList @('reset-network', '--confirm')
     }
-    Write-Host '==> nrr-cli reset-network --confirm'
-    return (Invoke-NativeCommand -FilePath $console -ArgumentList @('reset-network', '--confirm'))
+    else {
+        Write-Host "    $console is missing; only the DNS redirect is swept"
+    }
+    if (-not (Remove-NrrDnsRedirect) -and $code -eq 0) { $code = 1 }
+    return $code
 }
 
 # 'gone' once no registration is left, 'foreign' when another copy owns it,
@@ -160,10 +180,14 @@ switch ($Action) {
         $exitCode = Invoke-NativeCommand -FilePath $console -ArgumentList @('reinstall')
     }
     'Unregister' {
+        # Stopped here first, so a process stuck in its stop is ended rather
+        # than left to keep the registration and the DNS redirect past a reboot.
+        if ((Test-RegisteredFromHere) -and -not (Stop-NrrService)) { $exitCode = 1 }
         $service = Remove-OwnService
         if ($service -ne 'gone') { $exitCode = 1 }
-        # A service still running would put back what the reset removes.
-        if ($service -eq 'gone' -and (Restore-Network) -ne 0) { $exitCode = 1 }
+        # A service still running would put back what the reset removes; a
+        # registration merely marked for deletion is not one.
+        if ($service -ne 'foreign' -and (Test-NrrServiceStopped) -and (Restore-Network) -ne 0) { $exitCode = 1 }
         if ($service -eq 'gone' -and -not (Remove-ServiceCopy)) { $exitCode = 1 }
         if ($RemoveData) {
             if ($service -eq 'foreign') {
@@ -186,7 +210,8 @@ switch ($Action) {
     'Rollback' {
         $null = Stop-NrrService
         if (-not $Upgrade) {
-            if ((Remove-OwnService) -eq 'gone' -and (Restore-Network) -ne 0) { $exitCode = 1 }
+            $service = Remove-OwnService
+            if ($service -ne 'foreign' -and (Test-NrrServiceStopped) -and (Restore-Network) -ne 0) { $exitCode = 1 }
         }
     }
 }

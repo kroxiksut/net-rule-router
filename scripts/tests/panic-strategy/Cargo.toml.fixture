@@ -1,0 +1,12 @@
+# Gate fixture, not a manifest: the panic-strategy scan must find exactly the
+# two `abort` settings below and stay silent on everything else.
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "unwind"
+# panic = "abort"
+opt-level = 1 # panic = "abort" in a trailing comment
+
+[profile.bench]
+panic='abort'

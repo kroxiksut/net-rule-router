@@ -88,12 +88,33 @@ impl LogonSessionRearm {
         window: Duration,
         routes: Option<LogonRoutePass>,
     ) -> Result<Self, PlatformError> {
-        let trigger = DebouncedTrigger::new(rearm, window);
+        Self::start_with_routes_observed(observer, rearm, window, routes, None)
+    }
+
+    /// [`Self::start_with_routes`], with every debounce worker reporting to
+    /// `liveness`.
+    pub fn start_with_routes_observed(
+        observer: &dyn LogonSessionObserver,
+        rearm: Arc<dyn Fn() + Send + Sync>,
+        window: Duration,
+        routes: Option<LogonRoutePass>,
+        liveness: Option<Arc<crate::task_liveness::TaskLiveness>>,
+    ) -> Result<Self, PlatformError> {
+        let observed = |label: &'static str| liveness.as_ref().map(|l| (Arc::clone(l), label));
+        let trigger = DebouncedTrigger::new_observed(rearm, window, observed("logon"));
         let poke = trigger.poker();
         let route_triggers = routes.map(|r| {
             (
-                DebouncedTrigger::new(Arc::clone(&r.hook), r.arrival_window),
-                DebouncedTrigger::new(r.hook, r.departure_window),
+                DebouncedTrigger::new_observed(
+                    Arc::clone(&r.hook),
+                    r.arrival_window,
+                    observed("logon-arrival"),
+                ),
+                DebouncedTrigger::new_observed(
+                    r.hook,
+                    r.departure_window,
+                    observed("logon-departure"),
+                ),
             )
         });
         let route_pokes = route_triggers
@@ -147,15 +168,17 @@ impl SignInGate {
 
     /// Run `action` now if a user is signed in, else hold it for `fire`.
     pub fn defer(&self, name: &'static str, action: Arc<dyn Fn() + Send + Sync>) {
+        // Asked under the lock `fire` takes: a sign-in landing between the
+        // question and the push would otherwise fire an empty list and leave
+        // this step waiting for the next sign-in.
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         if (self.signed_in)() {
+            drop(pending);
             action();
             return;
         }
         tracing::info!(target: "nrr::logon", msg_key = "logon-step-waiting", step = name, "waiting for a signed-in user");
-        self.pending
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push((name, action));
+        pending.push((name, action));
     }
 
     /// A user signed in: run everything held, once.

@@ -20,6 +20,10 @@ fn fixture_with_resolution_and_vpn_clients(
     let rules = Arc::new(ScriptedRules::default());
     let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
     let audit = Arc::new(CollectAudit::default());
+    // A learned client is trusted by place like a resolved one: the fixture
+    // installs it where only an administrator writes.
+    let resolver = nrr_platform_api::MockAppPathResolver::new();
+    let resolver = resolver.with_protected_root(r"C:\Apps");
     let orch = Arc::new(
         PerSidApplyOrchestrator::new(
             session,
@@ -28,6 +32,7 @@ fn fixture_with_resolution_and_vpn_clients(
             cache,
             Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
         )
+        .with_app_resolver(Arc::new(resolver))
         .with_kill_switch_resolver(Arc::new(move |_, _| resolution.clone()))
         .with_vpn_client_apps_provider(Arc::new(move || client_paths.clone())),
     );
@@ -35,6 +40,159 @@ fn fixture_with_resolution_and_vpn_clients(
 }
 
 const VPN_CLIENT_PATH: &str = r"C:\Apps\examplevpn 3.0.exe";
+
+/// A client learned from its own dropped connections is exempted as a
+/// process and nothing else: the address it was dropped on may be a CDN
+/// front the user's rule hosts share, so no destination the client reached
+/// is ever carved out of the block for every other program.
+#[test]
+fn a_learned_client_is_exempt_by_process_never_by_the_address_it_was_dropped_on() {
+    let rule_host = Ipv4Addr::new(198, 51, 100, 8);
+    let (api, orch, src, rules) = fixture_with_resolution_and_vpn_clients(
+        None, // tunnel down: the posture that learns from drops
+        vec![VPN_CLIENT_PATH.to_string()],
+    );
+    rules.set(rules_with_secondary_ip(rule_host));
+    src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
+
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    let filters = api.wfp_filters.lock().unwrap();
+    let exempt = find_client_exempt(&filters).expect("the client itself is exempt");
+    assert!(exempt.weight >= 0x0060_0000);
+    assert!(
+        filters
+            .iter()
+            .any(|f| f.action == WfpAction::Block && f.covers_v4(rule_host)),
+        "the rule host stays blocked while the tunnel is down",
+    );
+    // The rule's own route permit is process-less and link-less as well (WFP
+    // rule permits never name a link; the route table steers). It is harmless
+    // only because it sits in the rule band, under the guard's blocks; a
+    // carve-out for the dropped address would sit above them and win.
+    let heaviest_block = filters
+        .iter()
+        .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV4 && f.action == WfpAction::Block)
+        .filter(|f| f.app_pattern.is_none() && f.covers_v4(rule_host))
+        .map(|f| f.weight)
+        .max()
+        .expect("an ALE block names the rule host");
+    assert!(
+        !filters.iter().any(|f| f.action == WfpAction::Permit
+            && f.app_pattern.is_none()
+            && f.local_interface_luid.is_none()
+            && f.covers_v4(rule_host)
+            && f.weight > heaviest_block),
+        "no process-less, link-less permit may open a rule host to every program",
+    );
+    let main_link = KS_LUID + 1;
+    let browser = Some(r"C:\Apps\browser.exe");
+    assert_eq!(
+        ale_v4_verdict(&filters, "S-1-5-21-A", browser, rule_host, main_link),
+        WfpAction::Block,
+        "no program but the client may reach a rule host while the tunnel is down",
+    );
+    assert_eq!(
+        ale_v4_verdict(
+            &filters,
+            "S-1-5-21-A",
+            Some(VPN_CLIENT_PATH),
+            rule_host,
+            main_link
+        ),
+        WfpAction::Permit,
+        "the client is exempt by process, wherever it dials",
+    );
+}
+
+/// WFP's verdict for one TCP/443 connect from `sid`'s `app` to `remote` over
+/// the link `luid`: of the ALE v4 filters whose every condition matches, the
+/// heaviest decides; none leaves the connect permitted.
+fn ale_v4_verdict(
+    filters: &[nrr_platform_api::WfpFilterRecord],
+    sid: &str,
+    app: Option<&str>,
+    remote: Ipv4Addr,
+    luid: u64,
+) -> WfpAction {
+    let in_subnet = |(net, len): (Ipv4Addr, u8)| {
+        let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+        u32::from(net) & mask == u32::from(remote) & mask
+    };
+    filters
+        .iter()
+        .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV4)
+        .filter(|f| f.user_sid.as_deref().is_none_or(|s| s == sid))
+        .filter(|f| f.app_pattern.is_none() || f.app_pattern.as_deref() == app)
+        .filter(|f| f.local_interface_luid.is_none_or(|l| l == luid))
+        .filter(|f| f.ip_protocol.is_none_or(|p| p == 6))
+        .filter(|f| f.remote_port.is_none_or(|p| p == 443))
+        .filter(|f| {
+            let named =
+                f.remote_ip.is_some() || !f.remote_ip_set.is_empty() || f.remote_subnet.is_some();
+            !named || f.covers_v4(remote) || f.remote_subnet.is_some_and(in_subnet)
+        })
+        .max_by_key(|f| f.weight)
+        .map_or(WfpAction::Permit, |f| f.action)
+}
+
+/// A client learned from drops but sitting where the user could have put it
+/// is not a client yet — it is a question for the user.
+#[test]
+fn a_learned_client_outside_the_program_folders_is_not_exempt() {
+    const PLANTED: &str = r"C:\Users\someone\Downloads\x-vpn.exe";
+    let (api, orch, src, rules) =
+        fixture_with_resolution_and_vpn_clients(None, vec![PLANTED.to_string()]);
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
+    src.set("S-1-5-21-K5B", snap_block_mode_b("Wi-Fi", "TAP"));
+
+    orch.install_for_sid("S-1-5-21-K5B").unwrap();
+    let filters = api.wfp_filters.lock().unwrap();
+    assert!(
+        !filters
+            .iter()
+            .any(|f| f.action == WfpAction::Permit && f.app_pattern.as_deref() == Some(PLANTED)),
+        "a drop proves the file dials out, not that an administrator installed it",
+    );
+    assert!(crate::vpn_client_trust::global_pending_vpn_clients()
+        .for_sid("S-1-5-21-K5B")
+        .contains(&PLANTED.to_string()));
+}
+
+/// Strict means nothing a rule did not name leaves. The default block used to
+/// be IPv4 only, so every IPv6 flow to an unnamed host left over the main
+/// link; now the family has its own block, with the link's own upkeep spared.
+#[test]
+fn the_strict_default_block_closes_ipv6_too_and_spares_loopback() {
+    let (api, orch, src, rules) = fixture_with_ipv6(
+        Some(KS_LUID),
+        "example.test",
+        vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))],
+    );
+    rules.set(rules_with_secondary_host("example.test"));
+    src.set("S-1-5-21-A", snap_strict_guard_off("Wi-Fi", "TAP"));
+
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    let filters = api.wfp_filters.lock().unwrap();
+    let default_v6 = filters
+        .iter()
+        .find(|f| {
+            f.layer == WfpLayerKey::AleAuthConnectV6
+                && f.action == WfpAction::Block
+                && f.remote_ip_set_v6.is_empty()
+                && f.remote_subnet_v6.is_none()
+        })
+        .expect("the v6 twin of the Strict default block");
+    assert_eq!(default_v6.user_sid.as_deref(), Some("S-1-5-21-A"));
+    let v6_loopback = filters
+        .iter()
+        .find(|f| {
+            f.layer == WfpLayerKey::AleAuthConnectV6
+                && f.action == WfpAction::Permit
+                && f.remote_subnet_v6 == Some((std::net::Ipv6Addr::LOCALHOST, 128))
+        })
+        .expect("loopback survives the v6 default block");
+    assert!(v6_loopback.weight > default_v6.weight);
+}
 
 /// Find the app-exempt permit for [`VPN_CLIENT_PATH`], if any installed.
 fn find_client_exempt(
@@ -158,7 +316,6 @@ fn fail_closed_block_all_permits_what_the_main_link_names_and_nothing_else() {
                 primary_ip_rule("r-sec-only", secondary_only),
             ]),
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     });
     let mut snap = snap_block("Wi-Fi", "TAP");
     snap.mode_a_coverage_strategy = ModeACoverageStrategy::FailClosedUnknown;
@@ -295,7 +452,6 @@ fn a_main_route_named_ip_is_spared_by_the_block_all_in_both_modes() {
                     origin: None,
                 }]),
             },
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
         });
         let mut snap = snap_block("Wi-Fi", "TAP");
         snap.mode_a_coverage_strategy = ModeACoverageStrategy::FailClosedUnknown;
@@ -345,7 +501,6 @@ fn known_direct_exemption_keeps_census_shared_ip_under_mode_b_block_all() {
                 primary_ip_rule("r-sec-2", pinned),
             ]),
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     });
     let mut snap = snap_block_mode_b("Wi-Fi", "TAP");
     snap.kill_switch_strict_shared_ips = false;
@@ -389,7 +544,6 @@ fn shared_ip_rule_book(shared: Ipv4Addr) -> ActiveRulesSnapshot {
             primary: CanonicalRuleSet::default(),
             secondary: CanonicalRuleSet::from_rules(vec![primary_ip_rule("r-sec", shared)]),
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     }
 }
 
@@ -452,7 +606,6 @@ fn known_direct_exemption_denied_for_shared_ip_when_fake_ip_not_effective() {
             primary: CanonicalRuleSet::default(),
             secondary: CanonicalRuleSet::from_rules(vec![primary_ip_rule("r-sec", shared)]),
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     });
     let mut snap = snap_block_mode_b("Wi-Fi", "TAP");
     snap.kill_switch_strict_shared_ips = false;
@@ -1184,7 +1337,6 @@ fn kill_switch_protects_only_secondary_not_primary_destinations() {
                 origin: None,
             }]),
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     });
     src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
 

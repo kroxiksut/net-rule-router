@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use nrr_platform_windows::constants::MAX_FILTERS_PER_TRANSACTION;
 use nrr_platform_windows::{ErrorClass, PlatformError, WfpAction};
+use nrr_service_runtime::lifecycle_matrix::{
+    after_crash_plan, orphaned_blocks_at_start, FilterTeardown, LifecycleInputs, OrphanedBlocks,
+};
 
 /// Set once the runtime holds its own engine session. From then on a block
 /// under our provider may be a live kill-switch, and the runtime strips its
@@ -95,6 +98,17 @@ pub(crate) fn strip_orphaned_block_filters_standalone() {
 }
 
 fn strip_orphaned_block_filters_blocking() {
+    // With leak protection on for anyone, a dead instance's blocks hold until
+    // the first pass adopts them; stripping them here is a leak for the whole
+    // boot, endless under a crash loop.
+    if orphaned_blocks_at_start(leak_guard_armed_anywhere()) == OrphanedBlocks::AdoptOnFirstPass {
+        tracing::info!(
+            target: "nrr::runtime",
+            msg_key = "svc-offline-orphan-strip-deferred",
+            "startup: leak protection is on — a previous instance's blocks stay until the first pass adopts them",
+        );
+        return;
+    }
     tracing::debug!(target: "nrr::runtime", "startup: opening WFP to strip orphaned block filters");
     let api: Arc<dyn WindowsApiPort> = Arc::new(ProductionWindowsApi);
     match WfpSession::open(Arc::clone(&api)) {
@@ -148,6 +162,100 @@ fn strip_orphaned_block_filters_blocking() {
 /// non-elevated caller ([`ErrorClass::PrivilegeRequired`]), turned into a
 /// "re-run elevated" message.
 pub(crate) fn run_offline_reset() -> std::process::ExitCode {
+    // A live service would put every piece straight back, and its blocks are a
+    // protection the user asked for: that is the stopping variant's call.
+    if let Some(state) = live_service_state() {
+        eprintln!(
+            "cleanup: the service is {}; it keeps this state in place and would put back \
+             anything removed now.",
+            state.slug()
+        );
+        eprintln!(
+            "To stop it and restore the network, run `{} reset-network --confirm --stop-service`.",
+            nrr_shared::product_identity::BinaryRole::Console.host_file_name()
+        );
+        return std::process::ExitCode::from(
+            nrr_platform_api::service_control::EXIT_SERVICE_RUNNING,
+        );
+    }
+    finish_offline_reset()
+}
+
+/// "Stop the service and restore the network": a clean stop, the process ended
+/// when it hangs past the budget, then the same sweep as `cleanup`.
+///
+/// The SCM restarts a process that was ended, so its recovery actions are off
+/// from the stop until the sweep is done; without that hold the service is not
+/// ended at all, only asked to stop.
+pub(crate) fn run_stop_and_cleanup() -> std::process::ExitCode {
+    use nrr_platform_api::service_control::{
+        ServiceControlError, ServiceControlPort, STOP_FOR_RESET_BUDGET,
+    };
+    use nrr_platform_windows::service_control::{hold_recovery, WindowsServiceControl};
+    let control = WindowsServiceControl::new();
+    let hold = match hold_recovery() {
+        Ok(hold) => Some(hold),
+        Err(ServiceControlError::NotInstalled) => None,
+        Err(ServiceControlError::AccessDenied) => return std::process::ExitCode::from(3),
+        Err(e) => {
+            eprintln!(
+                "stop-and-cleanup: the service's restart-on-failure could not be paused ({e}); \
+                 it will be asked to stop, not ended."
+            );
+            None
+        }
+    };
+    let stopped = if hold.is_some() {
+        control.stop_or_kill(STOP_FOR_RESET_BUDGET)
+    } else {
+        control.stop(STOP_FOR_RESET_BUDGET)
+    };
+    match stopped {
+        Ok(()) | Err(ServiceControlError::NotInstalled) => {}
+        Err(ServiceControlError::AccessDenied) => return std::process::ExitCode::from(3),
+        Err(e) => {
+            eprintln!(
+                "stop-and-cleanup: the service could not be stopped ({e}); nothing was reset."
+            );
+            return std::process::ExitCode::from(1);
+        }
+    }
+    let code = finish_offline_reset();
+    if let Some(hold) = hold {
+        if let Err(e) = hold.release() {
+            eprintln!(
+                "stop-and-cleanup: the service's restart-on-failure could not be put back ({e}); \
+                 reinstalling the service restores it."
+            );
+        }
+    }
+    if let Some(state) = live_service_state() {
+        eprintln!(
+            "stop-and-cleanup: the service is {} again; it puts back what was removed.",
+            state.slug()
+        );
+        return std::process::ExitCode::from(1);
+    }
+    code
+}
+
+/// The service's state when it is anything but stopped or absent. A question
+/// the SCM cannot answer is no reason to leave a machine cut off: it is said,
+/// and read as stopped.
+fn live_service_state() -> Option<nrr_platform_api::service_control::ServiceRunState> {
+    use nrr_platform_api::service_control::{ServiceControlPort, ServiceRunState};
+    match nrr_platform_windows::service_control::WindowsServiceControl::new().query() {
+        Ok(report) => report
+            .map(|report| report.run_state)
+            .filter(|state| *state != ServiceRunState::Stopped),
+        Err(e) => {
+            eprintln!("cleanup: the service manager could not say whether the service runs ({e}).");
+            None
+        }
+    }
+}
+
+fn finish_offline_reset() -> std::process::ExitCode {
     match sweep_orphaned_machine_state() {
         SweepOutcome::Done => std::process::ExitCode::SUCCESS,
         // The console relays this verbatim as its own "needs privilege" code,
@@ -165,8 +273,12 @@ pub(crate) fn run_offline_reset() -> std::process::ExitCode {
 /// settings; filters and routes go too unless someone's leak protection asked
 /// for blocking over leaking.
 pub(crate) fn run_after_crash() -> std::process::ExitCode {
-    if !leak_guard_armed_anywhere() {
-        return run_offline_reset();
+    let plan = after_crash_plan(LifecycleInputs {
+        leak_guard_armed: leak_guard_armed_anywhere(),
+        keep_rule_routes_on_stop: false,
+    });
+    if plan.filters == FilterTeardown::RemoveAll {
+        return finish_offline_reset();
     }
     let dns_sweep = nrr_platform_windows::dns_redirect::sweep_orphan_dns_state(
         &nrr_platform_windows::dns_redirect::TransactedNrptStore,
@@ -187,21 +299,13 @@ pub(crate) fn run_after_crash() -> std::process::ExitCode {
 
 /// Unknown counts as armed: lifting a block the user asked for is the one
 /// mistake this question exists to avoid.
-fn leak_guard_armed_anywhere() -> bool {
+pub(super) fn leak_guard_armed_anywhere() -> bool {
     let Ok(topology) =
         nrr_storage::resolve_storage_topology(&nrr_storage::StorageProfile::ProductionService)
     else {
         return true;
     };
-    if !topology.state_db_path.exists() {
-        return false;
-    }
-    let Ok(conn) = nrr_storage::migration::open_connection(&topology.state_db_path) else {
-        return true;
-    };
-    nrr_storage::route_bindings::RouteBindingsRepository::new(&conn)
-        .any_leak_guard_armed()
-        .unwrap_or(true)
+    nrr_service_runtime::lifecycle_matrix::leak_guard_armed_at(&topology.state_db_path)
 }
 
 /// Why an offline sweep stopped.

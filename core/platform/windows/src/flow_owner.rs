@@ -22,9 +22,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+    GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID,
+    MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
 };
-use windows::Win32::Networking::WinSock::AF_INET;
+use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
 use nrr_platform_api::FlowOwnerLookup;
 
@@ -95,15 +96,39 @@ const TABLE_READ_ATTEMPTS: usize = 4;
 /// that answer and the next read.
 const TABLE_HEADROOM_ROWS: usize = 64;
 
-/// `GetExtendedTcpTable` into a buffer grown until the table fits. Returns the
-/// raw table buffer, or `None` on a real error, which is logged.
+/// `GetExtendedTcpTable` for IPv4 into a buffer grown until the table fits.
+/// Returns the raw table buffer, or `None` on a real error, which is logged.
 ///
 /// `pub(crate)`: `stale_flows` reuses this to walk the same table for a
 /// different purpose (range membership, not endpoint matching).
 pub(crate) fn read_tcp_owner_pid_table() -> Option<Vec<u8>> {
-    let read = read_growing(
+    read_owner_pid_table(
+        AF_INET.0 as u32,
         std::mem::size_of::<MIB_TCPTABLE_OWNER_PID>(),
-        TABLE_HEADROOM_ROWS * std::mem::size_of::<MIB_TCPROW_OWNER_PID>(),
+        std::mem::size_of::<MIB_TCPROW_OWNER_PID>(),
+        "IPv4",
+    )
+}
+
+/// The IPv6 twin of [`read_tcp_owner_pid_table`]: a `MIB_TCP6TABLE_OWNER_PID`.
+pub(crate) fn read_tcp6_owner_pid_table() -> Option<Vec<u8>> {
+    read_owner_pid_table(
+        AF_INET6.0 as u32,
+        std::mem::size_of::<MIB_TCP6TABLE_OWNER_PID>(),
+        std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>(),
+        "IPv6",
+    )
+}
+
+fn read_owner_pid_table(
+    family: u32,
+    table_size: usize,
+    row_size: usize,
+    family_name: &'static str,
+) -> Option<Vec<u8>> {
+    let read = read_growing(
+        table_size,
+        TABLE_HEADROOM_ROWS * row_size,
         |buffer, size| {
             // SAFETY: `buffer` is writable for `*size` bytes, which is its full
             // length; the API writes at most that much, or only updates `size`.
@@ -112,7 +137,7 @@ pub(crate) fn read_tcp_owner_pid_table() -> Option<Vec<u8>> {
                     Some(buffer.as_mut_ptr().cast::<c_void>()),
                     size,
                     false,
-                    AF_INET.0 as u32,
+                    family,
                     TCP_TABLE_OWNER_PID_ALL,
                     0,
                 )
@@ -125,6 +150,7 @@ pub(crate) fn read_tcp_owner_pid_table() -> Option<Vec<u8>> {
             tracing::warn!(
                 target: "nrr::conn-observe",
                 code,
+                family = family_name,
                 "reading the TCP connection table failed",
             );
             None
@@ -133,6 +159,7 @@ pub(crate) fn read_tcp_owner_pid_table() -> Option<Vec<u8>> {
             tracing::warn!(
                 target: "nrr::conn-observe",
                 last_size,
+                family = family_name,
                 attempts = TABLE_READ_ATTEMPTS,
                 "the TCP connection table kept outgrowing the read buffer",
             );

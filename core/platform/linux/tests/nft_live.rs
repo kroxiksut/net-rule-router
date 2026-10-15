@@ -65,6 +65,7 @@ fn live_ruleset(table: &str) -> NftRuleset {
         family: NftFamily::Inet,
         table: table.to_owned(),
         chain: "output".to_owned(),
+        forward: Vec::new(),
         rules: vec![
             // A host pinned to an interface — the shape an egress pin lowers to.
             NftRule {

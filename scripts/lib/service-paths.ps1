@@ -199,3 +199,63 @@ function Get-SystemTool {
     param([string] $Name)
     return (Join-Path ([Environment]::SystemDirectory) $Name)
 }
+
+# The Mode-B DNS redirect as the service writes it into the NRPT table. Must
+# match `dns_redirect.rs::NRPT_MARKER`, `NRPT_EXEMPT_MARKER` and `NRPT_RULE_KEY`:
+# the sweep below reproduces the binary's own, and a drifted value would either
+# miss our rule or delete somebody else's.
+$NrrNrptMarker = 'NetRuleRouter-ModeB-DnsRedirect'
+$NrrNrptExemptMarker = 'NetRuleRouter-DnsScopeExemption'
+$NrrNrptKeepMarker = 'NetRuleRouter-RuleNameKeep'
+$NrrNrptRuleKey = '{5E0C2A17-8B3D-4F61-9C4A-2D7E6F1B0A93}'
+$NrrNrptTable = 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig'
+
+# Remove our DNS redirect without the binary: the rules carrying our markers,
+# then the registry table itself, since the cmdlet reads the whole table and
+# one half-written key (the service died between creating it and writing its
+# values) fails it for every rule. Scoped to our fixed key, our markers and
+# keys without `Version`, which no DNS client can use; an admin's or a VPN's
+# own rules are untouched. Idempotent. $true when nothing failed.
+function Remove-NrrDnsRedirect {
+    $ok = $true
+    Write-Host "--> removing our NRPT rules (DNS redirect)"
+    try {
+        $rules = @(Get-DnsClientNrptRule -ErrorAction Stop | Where-Object {
+                $_.Comment -eq $NrrNrptMarker -or $_.Comment -eq $NrrNrptExemptMarker -or
+                    $_.Comment -eq $NrrNrptKeepMarker
+            })
+        foreach ($rule in $rules) {
+            Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop
+        }
+        Write-Host "    NRPT rules removed: $($rules.Count)"
+    }
+    catch {
+        Write-Warning "NRPT sweep failed: $($_.Exception.Message)"
+        $ok = $false
+    }
+    Write-Host "--> sweeping the NRPT table in the registry"
+    try {
+        $swept = 0
+        if (Test-Path -LiteralPath $NrrNrptTable) {
+            foreach ($key in @(Get-ChildItem -LiteralPath $NrrNrptTable -ErrorAction Stop)) {
+                $values = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+                $ours = $key.PSChildName -eq $NrrNrptRuleKey -or
+                    ($values -and ($values.Comment -eq $NrrNrptMarker -or
+                        $values.Comment -eq $NrrNrptExemptMarker -or
+                        $values.Comment -eq $NrrNrptKeepMarker))
+                $halfWritten = -not ($values -and $null -ne $values.Version)
+                if ($ours -or $halfWritten) {
+                    Remove-Item -LiteralPath $key.PSPath -Recurse -Force -ErrorAction Stop
+                    $swept += 1
+                }
+            }
+        }
+        Write-Host "    NRPT keys removed: $swept"
+    }
+    catch {
+        Write-Warning "NRPT registry sweep failed: $($_.Exception.Message)"
+        $ok = $false
+    }
+    Clear-DnsClientCache -ErrorAction SilentlyContinue
+    return $ok
+}

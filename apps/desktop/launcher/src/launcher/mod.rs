@@ -118,7 +118,9 @@ pub fn run(config: LauncherConfig) -> ExitCode {
     // Main GUI only (the tray rides the same cache). Never blocks launch; the
     // result surfaces on the next start, since the context is built before
     // the fetch can finish.
-    if config.surface == LauncherSurface::MainGui {
+    if config.surface == LauncherSurface::MainGui
+        && nrr_desktop_gui::update_check::UPDATE_CHECK_AVAILABLE
+    {
         crate::update_check_fetch::spawn_scheduled_release_check(
             preferences.update_check_enabled,
             preferences.update_check_interval_days,

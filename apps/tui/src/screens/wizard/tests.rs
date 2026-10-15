@@ -169,6 +169,7 @@ fn the_walk_binds_the_main_connection_sends_protection_once_and_hands_over() {
     let protection = &fake.sent(IpcOperationName::RoutePolicyUpdate)[1];
     assert_eq!(protection["kill-switch-enabled"], json!(true));
     assert_eq!(protection["doh-lockdown-enabled"], json!(false));
+    assert_eq!(protection["doh-lockdown-auto"], json!(false));
 
     take(&mut app, &Action::StartEmpty);
     run_jobs(&mut app, &fake);

@@ -47,6 +47,7 @@ pub fn contract_fingerprint() -> String {
 
 pub mod app_identity;
 pub mod auto_rule;
+pub mod client_error_codes;
 pub mod diagnostics_dto;
 pub mod dns_name;
 pub mod eula;
@@ -58,6 +59,7 @@ pub mod ipc_payloads;
 pub mod ipc_transport;
 pub mod ipc_wire;
 pub mod launcher_rpc;
+pub mod local_dns_suffixes;
 pub mod localization;
 pub mod merge_dto;
 pub mod pagination;

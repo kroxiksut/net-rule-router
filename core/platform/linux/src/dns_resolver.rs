@@ -20,13 +20,15 @@
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nrr_platform_api::dns::{
     DnsResolverError, DnsResolverPort, ResolvedRecord, SystemDnsServersPort, UpstreamDnsCandidate,
 };
+use nrr_platform_api::hosts_file::{HostsFileReader, OsHostsFileReader};
 
 use crate::dns_message::{
     canonical_name, decode_response, encode_query, AddressFamily, DnsAnswer, DnsDecodeError,
@@ -411,9 +413,117 @@ impl DnsResolverPort for LinuxDnsResolver {
     }
 }
 
+/// `/etc/hosts` first, the servers second — what the C library does. The stub
+/// resolver above never reads the file, so a user who turns the hosts-file
+/// bypass OFF to have a pin honoured needs this in front of it.
+pub struct HostsFileFirstResolver {
+    hosts: Arc<dyn HostsFileReader>,
+    servers: Arc<dyn DnsResolverPort>,
+}
+
+impl HostsFileFirstResolver {
+    #[must_use]
+    pub fn new(servers: Arc<dyn DnsResolverPort>) -> Self {
+        Self::with_hosts(Arc::new(OsHostsFileReader::new()), servers)
+    }
+
+    #[must_use]
+    pub fn with_hosts(hosts: Arc<dyn HostsFileReader>, servers: Arc<dyn DnsResolverPort>) -> Self {
+        Self { hosts, servers }
+    }
+}
+
+impl DnsResolverPort for HostsFileFirstResolver {
+    fn resolve(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+    ) -> Result<ResolvedRecord, DnsResolverError> {
+        let canonical = canonical_name(hostname);
+        if canonical.is_empty() || canonical.contains('\0') {
+            return Err(DnsResolverError::InvalidName { name: canonical });
+        }
+        // The file is read for IPv4 only; an AAAA question goes past it.
+        if family == AddressFamily::Ipv4 {
+            if let Some(pin) = self.hosts.lookup(&canonical) {
+                return Ok(ResolvedRecord {
+                    canonical_hostname: canonical,
+                    addresses: vec![IpAddr::V4(pin.ip)],
+                    ttl_seconds: None,
+                });
+            }
+        }
+        self.servers.resolve(hostname, family)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hosts-file pin answers before any server is asked, loopback pins
+    /// included (the downstream filter is what drops those), and a name the
+    /// file does not carry goes to the servers unchanged.
+    #[test]
+    fn the_hosts_file_answers_first_and_only_for_names_it_carries() {
+        use nrr_platform_api::dns::MockDnsResolver;
+        use nrr_platform_api::hosts_file::StaticHostsFileReader;
+
+        let servers = Arc::new(MockDnsResolver::new());
+        servers.set_response(
+            "pinned.example",
+            ResolvedRecord {
+                canonical_hostname: "pinned.example".to_owned(),
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))],
+                ttl_seconds: Some(60),
+            },
+        );
+        servers.set_response(
+            "free.example",
+            ResolvedRecord {
+                canonical_hostname: "free.example".to_owned(),
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20))],
+                ttl_seconds: Some(60),
+            },
+        );
+        let resolver = HostsFileFirstResolver::with_hosts(
+            Arc::new(StaticHostsFileReader::from_pairs([
+                ("pinned.example", Ipv4Addr::new(127, 0, 0, 1)),
+                ("Redirected.Example", Ipv4Addr::new(192, 0, 2, 7)),
+            ])),
+            Arc::clone(&servers) as Arc<dyn DnsResolverPort>,
+        );
+
+        let pinned = resolver
+            .resolve("PINNED.example.", AddressFamily::Ipv4)
+            .expect("the pin answers");
+        assert_eq!(pinned.addresses, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        assert_eq!(pinned.canonical_hostname, "pinned.example");
+        let redirected = resolver
+            .resolve("redirected.example", AddressFamily::Ipv4)
+            .expect("the redirect answers");
+        assert_eq!(
+            redirected.addresses,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))]
+        );
+        let free = resolver
+            .resolve("free.example", AddressFamily::Ipv4)
+            .expect("the servers answer");
+        assert_eq!(free.ttl_seconds, Some(60));
+        // Only the unpinned name reached the servers; an AAAA question for a
+        // pinned name does too, since the file maps IPv4 only.
+        assert!(resolver
+            .resolve("pinned.example", AddressFamily::Ipv6)
+            .is_err());
+        assert_eq!(
+            servers.observed_queries(),
+            vec!["free.example".to_owned(), "pinned.example".to_owned()]
+        );
+        assert!(matches!(
+            resolver.resolve("", AddressFamily::Ipv4),
+            Err(DnsResolverError::InvalidName { .. })
+        ));
+    }
 
     #[test]
     fn nameservers_are_read_in_file_order_without_duplicates() {

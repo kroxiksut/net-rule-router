@@ -50,6 +50,8 @@ ColumnLayout {
     // and every sub-setting below is hidden. The sub-settings become visible only
     // when this is true. Read from the live per-SID policy on mount.
     property bool killSwitchEnabled: false
+    // Default route for unmatched traffic, as the service holds it.
+    property string routeMode: ""
     // OPT-IN "allow name resolution over the primary link while
     // The kill-switch block-all is engaged". (P1b): Default flipped to
     // true — with DNS cut too, an armed block-all is a total blackout. Only
@@ -85,6 +87,13 @@ ColumnLayout {
     // Application rules take every address their program uses. Per-SID
     // service setting; the snapshot is the SSOT.
     property bool appRulesTakeAllAddresses: false
+    /// What forwarded traffic gets while the tunnel is down; "" until answered.
+    property string forwardedOutage: ""
+    // A clicked radio no longer follows its `checked:` binding.
+    onForwardedOutageChanged: {
+        forwardedAsComputerRadio.checked = forwardedOutage === "as-computer"
+        forwardedUnprotectedRadio.checked = forwardedOutage === "unprotected"
+    }
     function _shortNamesApplied(enabled, domain) {
         panel.shortNameCompletion = enabled
         panel.shortNameSuffix = domain
@@ -167,6 +176,15 @@ ColumnLayout {
     // When the lockdown applies: "leak-protection-only" (default,
     // recommended — only while a block-all leak-guard is armed) | "always".
     property string dohLockdownScope: "leak-protection-only"
+    // The lockdown decides itself (on while the user has rules for the
+    // additional route); the service reports what it decided.
+    property bool dohLockdownAuto: true
+    property bool dohLockdownEffective: false
+    // Hand-set controls show only when the user took the decision over.
+    readonly property bool dohLockdownManual: !panel.dohLockdownAuto && panel.dohLockdownEnabled
+    // Details and the resolver list follow whether the lockdown applies.
+    readonly property bool dohLockdownShown: panel.dohLockdownAuto
+        ? panel.dohLockdownEffective : panel.dohLockdownEnabled
     // Track 1 Chunk 4 — secondary tunnel liveness window (SECONDS). An
     // active ICMP-probe window: how long the tunnel next-hop must be
     // continuously unreachable before the kill-switch fail-closes. `0` =
@@ -310,6 +328,19 @@ ColumnLayout {
     }
 
     /// Row subtitle: whose network this is, in the user's terms.
+    /// Why a listed network stays closed whatever is answered; "" when the
+    /// answer decides.
+    function localNetworkReasonText(entry) {
+        var reason = String((entry || {}).reason || "")
+        if (reason === "too-wide")
+            return root.tr("settings.routing.local-networks.reason.too-wide",
+                "too wide to be a local network, stays blocked")
+        if (reason === "contains-rule-address")
+            return root.tr("settings.routing.local-networks.reason.contains-rule-address",
+                "holds an address your rules name, stays blocked")
+        return ""
+    }
+
     function localNetworkSubtitle(entry) {
         var kind = String((entry || {}).kind || "")
         var adapter = String((entry || {}).adapter || "")
@@ -394,7 +425,8 @@ ColumnLayout {
         "primary-probe-repeat-secs",
         "local-networks-auto-accept",
         "short-name-completion", "short-name-suffix",
-        "app-rules-take-all-addresses"
+        "app-rules-take-all-addresses",
+        "forwarded-outage"
     ]
 
     /// Copy the subset of `cur` this panel mirrors into the display mirror.
@@ -499,6 +531,8 @@ ColumnLayout {
             _mirroredBool("kill-switch-block-all", root.prefs.routeKillSwitchBlockAll))
         panel.killSwitchEnabled = _offlineRoutePolicyPick(parked, mirror, "kill-switch-enabled",
             _mirroredBool("kill-switch-enabled", root.prefs.routeKillSwitchEnabled))
+        panel.routeMode = _offlineRoutePolicyPick(parked, mirror, "mode",
+            _mirroredString("mode", root.prefs.routeBehaviorMode))
         panel.allowDnsOverPrimary = _offlineRoutePolicyPick(parked, mirror,
             "allow-dns-over-primary",
             _mirroredBool("allow-dns-over-primary", root.prefs.routeAllowDnsOverPrimary))
@@ -514,6 +548,10 @@ ColumnLayout {
             "doh-lockdown-enabled", root.routePolicyDefault("doh-lockdown-enabled"))
         panel.dohLockdownScope = _offlineRoutePolicyPick(parked, mirror,
             "doh-lockdown-scope", root.routePolicyDefault("doh-lockdown-scope"))
+        panel.dohLockdownAuto = _offlineRoutePolicyPick(parked, mirror,
+            "doh-lockdown-auto", root.routePolicyDefault("doh-lockdown-auto"))
+        // Only the service knows what it decided; nothing is claimed offline.
+        panel.dohLockdownEffective = false
         panel.ksStrictSharedIps = _offlineRoutePolicyPick(parked, mirror,
             "kill-switch-strict-shared-ips",
             root.routePolicyDefault("kill-switch-strict-shared-ips"))
@@ -550,6 +588,8 @@ ColumnLayout {
         panel.appRulesTakeAllAddresses = _offlineRoutePolicyPick(parked, mirror,
             "app-rules-take-all-addresses",
             root.routePolicyDefault("app-rules-take-all-addresses"))
+        panel.forwardedOutage = _offlineRoutePolicyPick(parked, mirror,
+            "forwarded-outage", root.routePolicyDefault("forwarded-outage"))
     }
 
     function _loadKillSwitchPosture() {
@@ -587,6 +627,8 @@ ColumnLayout {
             panel.resolveHostsBypass = root._routePolicyEffective(cur, "resolve-hosts-bypass")
             panel.dohLockdownEnabled = root._routePolicyEffective(cur, "doh-lockdown-enabled")
             panel.dohLockdownScope = root._routePolicyEffective(cur, "doh-lockdown-scope")
+            panel.dohLockdownAuto = root._routePolicyEffective(cur, "doh-lockdown-auto")
+            panel.dohLockdownEffective = cur["doh-lockdown-effective"] === true
             panel.ksStrictSharedIps =
                 root._routePolicyEffective(cur, "kill-switch-strict-shared-ips")
             panel.autoRulesMode = root._routePolicyEffective(cur, "auto-rules-mode")
@@ -605,11 +647,12 @@ ColumnLayout {
             panel.shortNameSuffix = root._routePolicyEffective(cur, "short-name-suffix")
             panel.appRulesTakeAllAddresses =
                 root._routePolicyEffective(cur, "app-rules-take-all-addresses")
+            panel.forwardedOutage = root._routePolicyEffective(cur, "forwarded-outage")
+            panel.routeMode = root._routePolicyEffective(cur, "mode")
             // A live read always wins — and refreshes the display mirror the
-            // service-stopped seed reads back.
+            // service-stopped seed reads back. Nothing is sent back: a service
+            // that lost the user's settings is offered the restore card.
             panel._rememberRoutePolicy(cur)
-            // Restore remembered toggle intent after a service-DB wipe.
-            panel._reseedTogglesFromPrefs()
         })
     }
 
@@ -624,129 +667,43 @@ ColumnLayout {
     function _mirroredString(key, raw) {
         return String(raw || root.routePolicyDefault(key))
     }
-    /// The re-seed rule, once instead of per key: the service is still at the
-    /// declared default but the local mirror remembers a different choice →
-    /// restore the remembered one; anything else is a deliberate service value
-    /// and is left alone.
-    function _reseedWant(key, svc, mem) {
-        var def = root.routePolicyDefault(key)
-        return (svc === def && mem !== def) ? mem : svc
-    }
-
-    // The three routing-policy toggles live in the
-    // per-SID service DB, which is wiped on a schema bump. UiPrefs mirrors the
-    // user's intent (survives the wipe); when the service reports the DEFAULT for
-    // a toggle but the mirror remembers a non-default choice, re-push it in ONE
-    // atomic update so it is restored without the user re-entering it. Only
-    // overrides at-default values → never clobbers a deliberate service choice.
-    function _reseedTogglesFromPrefs() {
-        if (!root.prefs || !root.routePolicyController) return
-        // Decided against the row the write is built on, not the one the panel
-        // loaded: another write may land in between.
-        var req = null
-        var killSwitchReArmed = false
-        root.routePolicyController.mutateRoutePolicy(function(cur) {
-            // What the service currently holds, read through the shared defaults.
-            var svcSub = root._routePolicyEffective(cur, "include-subdomains")
-            var svcShared = root._routePolicyEffective(cur, "shared-ip-policy")
-            var svcBlockAll = root._routePolicyEffective(cur, "kill-switch-block-all")
-            var svcEnabled = root._routePolicyEffective(cur, "kill-switch-enabled")
-            var svcAllowDns = root._routePolicyEffective(cur, "allow-dns-over-primary")
-            var svcFailClosed = root._routePolicyEffective(cur, "kill-switch-fail-closed")
-            var svcProtocols = root._routePolicyEffective(cur, "kill-switch-protocols")
-            var svcCoverage = root._routePolicyEffective(cur, "mode-a-coverage-strategy")
-            var svcBypass = root._routePolicyEffective(cur, "resolve-hosts-bypass")
-            // What the local UiPrefs mirror remembers (same defaults again).
-            var memSub = _mirroredBool("include-subdomains", root.prefs.routeIncludeSubdomains)
-            var memShared = _mirroredString("shared-ip-policy", root.prefs.routeSharedIpPolicy)
-            var memBlockAll = _mirroredBool("kill-switch-block-all",
-                root.prefs.routeKillSwitchBlockAll)
-            var memEnabled = _mirroredBool("kill-switch-enabled", root.prefs.routeKillSwitchEnabled)
-            var memAllowDns = _mirroredBool("allow-dns-over-primary",
-                root.prefs.routeAllowDnsOverPrimary)
-            var memFailClosed = _mirroredBool("kill-switch-fail-closed",
-                root.prefs.routeKillSwitchFailClosed)
-            var memProtocols =
-                Pure.routePolicyCoerce("kill-switch-protocols", root.prefs.routeKillSwitchProtocols)
-            var memCoverage = _mirroredString("mode-a-coverage-strategy",
-                root.prefs.routeModeACoverageStrategy)
-            var memBypass = _mirroredBool("resolve-hosts-bypass", root.prefs.routeResolveHostsBypass)
-            var wantSub = _reseedWant("include-subdomains", svcSub, memSub)
-            var wantShared = _reseedWant("shared-ip-policy", svcShared, memShared)
-            var wantBlockAll = _reseedWant("kill-switch-block-all", svcBlockAll, memBlockAll)
-            var wantEnabled = _reseedWant("kill-switch-enabled", svcEnabled, memEnabled)
-            var wantAllowDns = _reseedWant("allow-dns-over-primary", svcAllowDns, memAllowDns)
-            var wantFailClosed = _reseedWant("kill-switch-fail-closed", svcFailClosed, memFailClosed)
-            var wantProtocols = _reseedWant("kill-switch-protocols", svcProtocols, memProtocols)
-            var wantCoverage = _reseedWant("mode-a-coverage-strategy", svcCoverage, memCoverage)
-            var wantBypass = _reseedWant("resolve-hosts-bypass", svcBypass, memBypass)
-            // Any key the user parked while the service was
-            // stopped is owned by the offline pending-changes dialog now. Do NOT
-            // auto-re-push it here (that would race the dialog and could clobber the
-            // parked intent). Reset each such key to the service's current value so the
-            // "all equal → return" guard below leaves it untouched.
-            var pendingRp = (typeof root._readPendingOffline === "function")
-                ? (root._readPendingOffline()["route-policy"] || {}) : {}
-            if (pendingRp.hasOwnProperty("include-subdomains")) wantSub = svcSub
-            if (pendingRp.hasOwnProperty("shared-ip-policy")) wantShared = svcShared
-            if (pendingRp.hasOwnProperty("kill-switch-block-all")) wantBlockAll = svcBlockAll
-            if (pendingRp.hasOwnProperty("kill-switch-enabled")) wantEnabled = svcEnabled
-            if (pendingRp.hasOwnProperty("allow-dns-over-primary")) wantAllowDns = svcAllowDns
-            if (pendingRp.hasOwnProperty("kill-switch-fail-closed")) wantFailClosed = svcFailClosed
-            if (pendingRp.hasOwnProperty("kill-switch-protocols")) wantProtocols = svcProtocols
-            if (pendingRp.hasOwnProperty("mode-a-coverage-strategy")) wantCoverage = svcCoverage
-            if (pendingRp.hasOwnProperty("resolve-hosts-bypass")) wantBypass = svcBypass
-            if (wantSub === svcSub && wantShared === svcShared && wantBlockAll === svcBlockAll
-                    && wantEnabled === svcEnabled && wantAllowDns === svcAllowDns
-                    && wantFailClosed === svcFailClosed && wantProtocols === svcProtocols
-                    && wantCoverage === svcCoverage && wantBypass === svcBypass)
-                return null
-            // Reflect the restored values in the panel immediately (push is async).
-            panel.includeSubdomains = wantSub
-            panel.sharedIpPolicy = wantShared
-            panel.ksBlockAll = wantBlockAll
-            panel.killSwitchEnabled = wantEnabled
-            panel.allowDnsOverPrimary = wantAllowDns
-            panel.ksFailClosed = wantFailClosed
-            panel.ksProtocols = wantProtocols
-            panel.modeACoverage = wantCoverage
-            panel.resolveHostsBypass = wantBypass
-            // route.policy.update is a full-replacement request: any field left out
-            // falls back to its serde default on the server, silently resetting it.
-            // Build from the shared SSOT (`root._buildFullRoutePolicyReq`, which
-            // carries every current field forward from `cur`) and overlay only the
-            // keys this re-seed is actually restoring — this is what keeps a future
-            // policy field from being forgotten here the way
-            // `kill-switch-strict-shared-ips` / `browser-history-auto-seed` were.
-            req = root._buildFullRoutePolicyReq(cur)
-            req["kill-switch-fail-closed"] = wantFailClosed
-            req["kill-switch-protocols"] = wantProtocols
-            req["include-subdomains"] = wantSub
-            req["shared-ip-policy"] = wantShared
-            req["kill-switch-block-all"] = wantBlockAll
-            req["kill-switch-enabled"] = wantEnabled
-            req["allow-dns-over-primary"] = wantAllowDns
-            req["mode-a-coverage-strategy"] = wantCoverage
-            req["resolve-hosts-bypass"] = wantBypass
-            // Did we RE-ARM the kill-switch from the saved
-            // mirror because the service had lost it (e.g. a state-DB wipe)? If so,
-            // surface a visible notice so a restored kill-switch is never a surprise.
-            killSwitchReArmed = (wantEnabled === true && svcEnabled === false)
-            return req
-        }, function(ok, code, stage) {
-            if (!ok || stage !== "write") return
-            // The service now holds the re-seeded values; keep the display
-            // mirror in step so a later offline launch shows them.
-            panel._rememberRoutePolicy(req)
-            if (killSwitchReArmed) {
-                root.notificationsController.killSwitchRestoredNoticeActive = true
-                root.statusLine = root.tr("status.kill-switch-restored-from-prefs",
-                    "Leak protection was restored from your saved settings.")
-            } else {
-                root.statusLine = root.tr("status.policy-toggles-restored",
-                    "Your saved routing preferences were restored.")
-            }
-        }, "reseed")
+    /// The service refused a write: every control the write named goes back
+    /// to the value the service still holds. A checkbox the user clicked no
+    /// longer follows its `checked:` binding, so it is set by hand as well;
+    /// the combo boxes follow their panel property.
+    function _showConfirmedPolicy(confirmed) {
+        var fields = {
+            "mode": ["routeMode", null],
+            "kill-switch-enabled": ["killSwitchEnabled", killSwitchEnableCheck],
+            "kill-switch-fail-closed": ["ksFailClosed", null],
+            "kill-switch-protocols": ["ksProtocols", null],
+            "kill-switch-block-all": ["ksBlockAll", ksBlockAllCheck],
+            "allow-dns-over-primary": ["allowDnsOverPrimary", allowDnsOverPrimaryCheck],
+            "include-subdomains": ["includeSubdomains", includeSubdomainsCheck],
+            "shared-ip-policy": ["sharedIpPolicy", null],
+            "mode-a-coverage-strategy": ["modeACoverage", null],
+            "resolve-hosts-bypass": ["resolveHostsBypass", hostsBypassCheck],
+            "doh-lockdown-enabled": ["dohLockdownEnabled", dohEnableCheck],
+            "doh-lockdown-scope": ["dohLockdownScope", null],
+            "kill-switch-strict-shared-ips": ["ksStrictSharedIps", ksStrictSharedCheck],
+            "auto-rules-mode": ["autoRulesMode", null],
+            "auto-rules-eager-delivery-names": ["autoRulesEagerDeliveryNames", autoRulesEagerCheck],
+            "primary-probe-auto": ["primaryProbeAuto", primaryProbeAutoCheck],
+            "primary-probe-timeout-ms": ["primaryProbeTimeoutMs", null],
+            "primary-probe-max-targets": ["primaryProbeMaxTargets", null],
+            "primary-probe-repeat-secs": ["primaryProbeRepeatSecs", null],
+            "local-networks-auto-accept": ["localNetworksAutoAccept", localNetworksAutoAcceptCheck],
+            "short-name-completion": ["shortNameCompletion", shortNameCheck],
+            "short-name-suffix": ["shortNameSuffix", null],
+            "app-rules-take-all-addresses": ["appRulesTakeAllAddresses", appRulesTakeAllCheck],
+            "forwarded-outage": ["forwardedOutage", null]
+        }
+        for (var key in (confirmed || {})) {
+            var field = fields[key]
+            if (!field) continue
+            panel[field[0]] = confirmed[key]
+            if (field[1]) field[1].checked = confirmed[key] === true
+        }
     }
 
     // Read the persisted enforcement mode from the
@@ -1427,11 +1384,13 @@ ColumnLayout {
     function _focusTarget(id) {
         if (id === "doh-lockdown") return dohEnableCheck
         if (id === "leak-protection") return killSwitchEnableCheck
+        if (id === "forwarded-traffic") return forwardedAsComputerRadio
         return null
     }
     function _focusBanner(id) {
         if (id === "doh-lockdown") return dohFocusBanner
         if (id === "leak-protection") return leakFocusBanner
+        if (id === "forwarded-traffic") return forwardedGroup
         return null
     }
 
@@ -1548,6 +1507,12 @@ ColumnLayout {
     // panel never keeps showing a value the dialog just changed. The same
     // reload runs on every disconnected→connected edge (cold start on the mock
     // backend, service reinstall mid-session).
+    // A refused write (a declined prompt, most often) puts the controls back
+    // to what the service kept; the status line says why.
+    Connections {
+        target: root ? root.routePolicyController : null
+        function onPolicyWriteRefused(confirmed) { panel._showConfirmedPolicy(confirmed) }
+    }
     Connections {
         target: root
         function onOfflinePendingApplied() {
@@ -1682,8 +1647,8 @@ ColumnLayout {
                 }
                 popup.width: root.comboPopupWidth(defaultRouteCombo, root.behaviorModeModel,
                     "id", function(item) { return root.behaviorModeLabel(item.id) })
-                Component.onCompleted: {
-                    var want = String(root.prefs.routeBehaviorMode || "prefer-primary")
+                function _syncFromState() {
+                    var want = String(panel.routeMode || root.prefs.routeBehaviorMode || "prefer-primary")
                     var idx = 0
                     for (var i = 0; i < root.behaviorModeModel.count; i += 1) {
                         if (String(root.behaviorModeModel.get(i).id) === want) { idx = i; break }
@@ -1692,10 +1657,14 @@ ColumnLayout {
                     if (currentIndex >= 0 && currentIndex < root.behaviorModeModel.count)
                         displayText = root.behaviorModeLabel(root.behaviorModeModel.get(currentIndex).id)
                 }
+                Component.onCompleted: _syncFromState()
+                Connections {
+                    target: panel
+                    function onRouteModeChanged() { defaultRouteCombo._syncFromState() }
+                }
                 onActivated: {
                     var id = root.behaviorModeModel.get(currentIndex).id
-                    root.updatePrefs({ routeBehaviorMode: id })
-                    root.emitPrefs()
+                    panel.routeMode = String(id)
                     if (typeof root.routePolicyController.applyRouteBehaviorMode === "function") {
                         root.routePolicyController.applyRouteBehaviorMode(id)
                     }
@@ -2097,13 +2066,6 @@ ColumnLayout {
                 visible: panel.stabilitySupported && panel.killSwitchEnabled
                 Layout.fillWidth: true
                 Layout.preferredHeight: root.uiTheme.spacingSm
-            }
-            ServiceIntentDivergenceNote {
-                root: panel.root
-                keys: ["enforcement-mode", "fake-ip-enabled", "fake-ip-udp-relay",
-                    "fake-ip-instant-rst", "dns-via-secondary", "dns-fast-answers",
-                    "secondary-liveness-window-secs"]
-                visible: panel.stabilitySupported && panel.killSwitchEnabled && lines.length > 0
             }
             Label {
                 Layout.fillWidth: true
@@ -2748,7 +2710,7 @@ ColumnLayout {
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
                         text: root.tr("settings.routing.kill-switch.shared-strict-note",
-                            "Off (smart, recommended): an address that a routed site shares with an ordinary site is not blocked, so the ordinary site keeps working — at the cost of the routed site's traffic to that shared address not being protected while the additional adapter is down. On (strict): every routed address is blocked, including shared ones — no leak, but co-hosted ordinary sites (for example search.example sharing addresses with routed Google services) stop opening while the block is active.")
+                            "Off (recommended): more convenient. Ordinary sites keep opening while the additional adapter is down, but some traffic of routed sites may go out through the main connection. On (strict): safer. No traffic of routed sites goes out through the main connection, but some ordinary sites may stop opening until the additional adapter is back.")
                     }
                     Label {
                         Layout.fillWidth: true
@@ -3190,8 +3152,17 @@ ColumnLayout {
                                     modelData.slug === "icmp"
                                         ? "ICMP (ping)"
                                         : modelData.slug.toUpperCase())
+                                id: protocolBox
                                 checked: (panel.ksProtocols & modelData.bit) !== 0
                                 enabled: !lastOne
+                                // A click drops the `checked:` binding; a refused
+                                // write still has to show the mask the service kept.
+                                Connections {
+                                    target: panel
+                                    function onKsProtocolsChanged() {
+                                        protocolBox.checked = (panel.ksProtocols & modelData.bit) !== 0
+                                    }
+                                }
                                 onToggled: {
                                     var m = checked
                                         ? (panel.ksProtocols | modelData.bit)
@@ -3383,6 +3354,108 @@ ColumnLayout {
         }
     }
 
+    // WSL, containers and VMs reach the internet as traffic this computer
+    // forwards, which the user's own guard does not see; the answer says whether
+    // it gets that guard's blocks. Shown wherever the platform guards it: a
+    // guest on a bridge is forwarded too, whatever its adapter is called.
+    GroupBox {
+        id: forwardedGroup
+        title: root.uiRevision >= 0
+            ? root.tr("settings.routing.forwarded-traffic.title", "WSL, containers and virtual machines") : ""
+        Layout.fillWidth: true
+        visible: root.supports("forwardedTrafficGuard")
+
+        function _answer(slug) {
+            var previous = panel.forwardedOutage
+            if (previous === slug) return
+            panel.forwardedOutage = slug
+            root.routePolicyController.applyForwardedOutage(slug, function() {
+                panel.forwardedOutage = previous
+            })
+        }
+
+        ColumnLayout {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: root.uiTheme.spacingSm
+
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.routing.forwarded-traffic.description",
+                        "Programs in WSL, containers and virtual machines reach the internet through this computer, yet leak protection does not see them on its own. Choose what they get while the additional route is down.")
+                    : ""
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                visible: panel.forwardedOutage === ""
+                color: root.textColor
+                wrapMode: Text.WordWrap
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.routing.forwarded-traffic.unanswered",
+                        "Not chosen yet: they are protected like this computer.")
+                    : ""
+            }
+            ThemedRadioButton {
+                id: forwardedAsComputerRadio
+                SettingFocusHighlight {
+                    theme: root.uiTheme
+                    shown: panel._focusHighlightId === "forwarded-traffic"
+                }
+                theme: root.uiTheme
+                Layout.fillWidth: true
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.routing.forwarded-traffic.as-computer.label",
+                        "Same as this computer (recommended)")
+                    : ""
+                Accessible.description: forwardedAsComputerNote.text
+                checked: panel.forwardedOutage === "as-computer"
+                onToggled: if (checked) forwardedGroup._answer("as-computer")
+            }
+            Label {
+                id: forwardedAsComputerNote
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.leftMargin: root.uiTheme.spacingLg
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.routing.forwarded-traffic.as-computer.note",
+                        "Addresses your rules send through the additional route reach them only through it, as they do your programs; while that route is down those stay closed, and when this computer blocks everything, so is their traffic. Works while leak protection is on.")
+                    : ""
+            }
+            ThemedRadioButton {
+                id: forwardedUnprotectedRadio
+                theme: root.uiTheme
+                Layout.fillWidth: true
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.routing.forwarded-traffic.unprotected.label", "Do not protect")
+                    : ""
+                Accessible.description: forwardedUnprotectedNote.text
+                checked: panel.forwardedOutage === "unprotected"
+                onToggled: if (checked) forwardedGroup._answer("unprotected")
+            }
+            Label {
+                id: forwardedUnprotectedNote
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.leftMargin: root.uiTheme.spacingLg
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.routing.forwarded-traffic.unprotected.note",
+                        "While the additional route is down, they reach everything over the main route, including addresses your rules send through the additional one.")
+                    : ""
+            }
+        }
+    }
+
     // Local networks. Leak protection blocks everything that is not the tunnel,
     // and a virtual machine's own segment is caught in that net even though its
     // traffic never leaves this computer. The service exempts what it can
@@ -3421,6 +3494,7 @@ ColumnLayout {
             // The banner's "Stop asking" lives here too, so it can be undone
             // from the same place the networks are listed.
             CheckBox {
+                id: localNetworksAutoAcceptCheck
                 Layout.fillWidth: true
                 visible: panel.localNetworksSupported
                 checked: panel.localNetworksAutoAccept
@@ -3446,21 +3520,27 @@ ColumnLayout {
                     Layout.fillWidth: true
                     spacing: root.uiTheme.spacingSm
 
+                    readonly property string reasonText: panel.localNetworkReasonText(modelData)
+
                     CheckBox {
                         checked: modelData.allowed === true
+                        enabled: parent.reasonText === ""
                         onToggled: panel.setLocalNetworkAllowed(
                             String(modelData.cidr), checked)
                         Accessible.name: String(modelData.cidr)
+                        Accessible.description: parent.reasonText
                     }
                     Label {
                         text: String(modelData.cidr)
-                        color: root.textColor
+                        color: parent.reasonText === "" ? root.textColor : root.mutedTextColor
                     }
                     Label {
                         Layout.fillWidth: true
                         elide: Text.ElideRight
                         color: root.mutedTextColor
-                        text: panel.localNetworkSubtitle(modelData)
+                        text: parent.reasonText === ""
+                            ? panel.localNetworkSubtitle(modelData)
+                            : panel.localNetworkSubtitle(modelData) + " — " + parent.reasonText
                     }
                     Label {
                         visible: modelData["decided-by-user"] !== true
@@ -3542,6 +3622,196 @@ ColumnLayout {
                 color: root.uiTheme.colorWarning
                 wrapMode: Text.WordWrap
                 text: panel.localNetworkError
+            }
+        }
+    }
+
+    // Home and local network names. One list for the machine, pre-filled;
+    // names under a listed suffix are left to the network's own resolver. A
+    // change is an administrator's (dns.local-suffixes.set; the launcher
+    // relays the refusal through the broker); the main link's own suffix is
+    // offered here, never applied by itself.
+    GroupBox {
+        id: localSuffixesGroup
+        title: root.tr("settings.routing.local-suffixes.title", "Home and local network names")
+        Layout.fillWidth: true
+
+        property var _suffixes: []
+        property var _offered: []
+        property bool _loading: false
+        property bool _loaded: false
+
+        function _load() {
+            if (localSuffixesGroup._loading) return
+            if (typeof root.rpc.rpcLocalDnsSuffixesGet !== "function") return
+            localSuffixesGroup._loading = true
+            var corr = root.rpc.rpcLocalDnsSuffixesGet()
+            if (!corr) { localSuffixesGroup._loading = false; return }
+            root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
+                localSuffixesGroup._loading = false
+                if (!ok) {
+                    root.statusLine = root.tr("settings.routing.local-suffixes.load-failed",
+                        "Could not load the network name list: ")
+                        + ((typeof root.ipcErrorLabel === "function") ? root.ipcErrorLabel(String(code || "")) : String(code || ""))
+                    return
+                }
+                localSuffixesGroup._take(p)
+            })
+        }
+        function _take(p) {
+            localSuffixesGroup._suffixes = (p && p.suffixes) || []
+            localSuffixesGroup._offered = (p && p.offered) || []
+            localSuffixesGroup._loaded = true
+        }
+        function _names() {
+            var out = []
+            for (var i = 0; i < localSuffixesGroup._suffixes.length; i += 1)
+                out.push(String(localSuffixesGroup._suffixes[i].suffix || ""))
+            return out
+        }
+        /// The whole list is sent; the service replaces it and answers with
+        /// what it stored.
+        function _save(names) {
+            if (typeof root.rpc.rpcLocalDnsSuffixesSet !== "function") return
+            var corr = root.rpc.rpcLocalDnsSuffixesSet({ "suffixes": names })
+            if (!corr) return
+            root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
+                if (ok) {
+                    localSuffixesGroup._take(p)
+                    root.statusLine = root.tr("settings.routing.local-suffixes.saved",
+                        "Network name list saved.")
+                    return
+                }
+                var c = String(code || "")
+                root.statusLine = (c === "uac-declined")
+                    ? root.tr("settings.routing.local-suffixes.uac-declined",
+                        "Administrator approval was declined; the network name list was not saved.")
+                    : root.tr("settings.routing.local-suffixes.save-failed",
+                        "Could not save the network name list: ")
+                        + ((typeof root.ipcErrorLabel === "function") ? root.ipcErrorLabel(c) : c)
+            })
+        }
+        function _add(name) {
+            var names = localSuffixesGroup._names()
+            names.push(String(name || "").trim())
+            localSuffixesGroup._save(names)
+        }
+        function _remove(index) {
+            var names = localSuffixesGroup._names()
+            if (index < 0 || index >= names.length) return
+            names.splice(index, 1)
+            localSuffixesGroup._save(names)
+        }
+        Component.onCompleted: localSuffixesGroup._load()
+
+        ColumnLayout {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: root.uiTheme.spacingSm
+
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.tr("settings.routing.local-suffixes.description",
+                    "Names under these suffixes belong to the network you are on (a printer, a router, a NAS) and are resolved by that network, never sent down a route. One list for every user of this computer; changing it needs an administrator.")
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                visible: localSuffixesGroup._loaded && localSuffixesGroup._suffixes.length === 0
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.tr("settings.routing.local-suffixes.empty", "The list is empty.")
+            }
+            Repeater {
+                model: localSuffixesGroup._suffixes
+                delegate: RowLayout {
+                    id: suffixRow
+                    required property int index
+                    required property var modelData
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+                        Label {
+                            Layout.fillWidth: true
+                            color: root.textColor
+                            elide: Text.ElideRight
+                            text: String(suffixRow.modelData.suffix || "")
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            visible: (suffixRow.modelData["covers-rule-hosts"] || []).length > 0
+                            color: root.mutedTextColor
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: root.uiTheme.baseFontSizePx - 2
+                            text: root.uiRevision >= 0
+                                ? root.tr("settings.routing.local-suffixes.covers-rules",
+                                    "covers your rules for {hosts}; those names keep following their rules")
+                                    .replace("{hosts}", (suffixRow.modelData["covers-rule-hosts"] || []).join(", "))
+                                : ""
+                        }
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        flat: true
+                        text: root.tr("action.delete", "Delete")
+                        Accessible.name: text + " " + String(suffixRow.modelData.suffix || "")
+                        onClicked: localSuffixesGroup._remove(suffixRow.index)
+                    }
+                }
+            }
+            Repeater {
+                model: localSuffixesGroup._offered
+                delegate: RowLayout {
+                    id: offerRow
+                    required property int index
+                    required property var modelData
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+                    Label {
+                        Layout.fillWidth: true
+                        color: root.textColor
+                        wrapMode: Text.WordWrap
+                        text: root.uiRevision >= 0
+                            ? root.tr("settings.routing.local-suffixes.offered",
+                                "Add {suffix}, offered by {link}")
+                                .replace("{suffix}", String(offerRow.modelData.suffix || ""))
+                                .replace("{link}", String(offerRow.modelData.link || ""))
+                            : ""
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: root.tr("action.add", "Add")
+                        icon.source: root.uiIconSource("add")
+                        onClicked: localSuffixesGroup._add(offerRow.modelData.suffix)
+                    }
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingSm
+                ThemedTextField {
+                    id: suffixAddField
+                    theme: root.uiTheme
+                    Layout.fillWidth: true
+                    placeholderText: root.tr("settings.routing.local-suffixes.add-field", "New suffix")
+                }
+                ThemedButton {
+                    theme: root.uiTheme
+                    enabled: suffixAddField.text.trim() !== ""
+                    text: root.tr("action.add", "Add")
+                    icon.source: root.uiIconSource("add")
+                    onClicked: {
+                        var t = suffixAddField.text.trim()
+                        if (t === "") return
+                        suffixAddField.text = ""
+                        localSuffixesGroup._add(t)
+                    }
+                }
             }
         }
     }
@@ -4061,9 +4331,59 @@ ColumnLayout {
                 onDismissed: panel._focusId = ""
             }
 
-            // ── Part A: per-SID master toggle ──
+            // ── Part A: automatic by default ──
+            CheckBox {
+                id: dohAutoCheck
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                checked: panel.dohLockdownAuto
+                text: root.tr("settings.routing.doh-lockdown.auto-label",
+                    "Decide automatically (recommended)")
+                contentItem: Label {
+                    text: dohAutoCheck.text
+                    leftPadding: dohAutoCheck.indicator.width + dohAutoCheck.spacing
+                    color: root.textColor
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignVCenter
+                    font.bold: true
+                }
+                onToggled: {
+                    // Taking the decision over keeps what applies right now.
+                    var enabled = checked ? panel.dohLockdownEnabled : panel.dohLockdownEffective
+                    panel.dohLockdownAuto = checked
+                    panel.dohLockdownEnabled = enabled
+                    if (typeof root.routePolicyController.applyDohLockdownChoice === "function")
+                        root.routePolicyController.applyDohLockdownChoice(checked, enabled)
+                }
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.leftMargin: root.uiTheme.spacingSm
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                text: root.tr("settings.routing.doh-lockdown.auto-note",
+                    "Blocks encrypted DNS in browsers while you have rules for the additional route, so the sites you route are seen and routed. Turn this off to set the blocking by hand.")
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.leftMargin: root.uiTheme.spacingSm
+                visible: panel.dohLockdownAuto
+                color: root.textColor
+                wrapMode: Text.WordWrap
+                text: (root.uiRevision >= 0 && panel.dohLockdownEffective)
+                    ? root.tr("settings.routing.doh-lockdown.auto-on",
+                        "On: you have rules for the additional route.")
+                    : root.tr("settings.routing.doh-lockdown.auto-off",
+                        "Off: no rules for the additional route yet.")
+            }
+
+            // ── Part A: per-SID master toggle (hand-set) ──
             CheckBox {
                 id: dohEnableCheck
+                visible: !panel.dohLockdownAuto
                 SettingFocusHighlight {
                     theme: root.uiTheme
                     shown: panel._focusHighlightId === "doh-lockdown"
@@ -4082,14 +4402,15 @@ ColumnLayout {
                 }
                 onToggled: {
                     panel.dohLockdownEnabled = checked
-                    if (typeof root.routePolicyController.applyDohLockdownEnabled === "function")
-                        root.routePolicyController.applyDohLockdownEnabled(checked)
+                    if (typeof root.routePolicyController.applyDohLockdownChoice === "function")
+                        root.routePolicyController.applyDohLockdownChoice(false, checked)
                 }
             }
             Label {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
+                visible: !panel.dohLockdownAuto
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -4101,7 +4422,7 @@ ColumnLayout {
             Label {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.dohLockdownEnabled
+                visible: panel.dohLockdownManual
                 color: root.textColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.doh-lockdown.scope-label", "When to apply")
@@ -4109,7 +4430,7 @@ ColumnLayout {
             ThemedComboBox {
                 id: dohScopeCombo
                 theme: root.uiTheme
-                visible: panel.dohLockdownEnabled
+                visible: panel.dohLockdownManual
                 Layout.fillWidth: true
                 Layout.maximumWidth: 460
                 model: ListModel {
@@ -4160,7 +4481,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.dohLockdownEnabled
+                visible: panel.dohLockdownManual
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -4175,7 +4496,7 @@ ColumnLayout {
             ThemedButton {
                 theme: root.uiTheme
                 flat: true
-                visible: panel.dohLockdownEnabled
+                visible: panel.dohLockdownShown
                 Layout.leftMargin: root.uiTheme.spacingSm
                 text: root.routingDohLockdownDetailsExpanded
                     ? root.tr("action.hide-details", "Hide details")
@@ -4186,7 +4507,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.dohLockdownEnabled && root.routingDohLockdownDetailsExpanded
+                visible: panel.dohLockdownShown && root.routingDohLockdownDetailsExpanded
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -4198,7 +4519,7 @@ ColumnLayout {
             ThemedButton {
                 theme: root.uiTheme
                 flat: true
-                visible: panel.dohLockdownEnabled
+                visible: panel.dohLockdownShown
                 Layout.leftMargin: root.uiTheme.spacingSm
                 text: root.routingDohEditorExpanded
                     ? root.tr("settings.routing.doh-lockdown.resolvers.hide", "Hide resolver list")
@@ -4212,7 +4533,7 @@ ColumnLayout {
 
             ColumnLayout {
                 Layout.fillWidth: true
-                visible: panel.dohLockdownEnabled && root.routingDohEditorExpanded
+                visible: panel.dohLockdownShown && root.routingDohEditorExpanded
                 spacing: root.uiTheme.spacingSm
 
                 Label {
@@ -4404,11 +4725,6 @@ ColumnLayout {
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 text: root.platformUnsupportedText
-            }
-            ServiceIntentDivergenceNote {
-                root: panel.root
-                keys: ["rule-scope-service-driven", "routing-stop-policy"]
-                visible: panel.stabilitySupported && lines.length > 0
             }
 
             // ── Who may change the rules at all (rule-edit lock) ──

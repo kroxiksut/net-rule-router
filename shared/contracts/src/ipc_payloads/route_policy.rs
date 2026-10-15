@@ -131,6 +131,15 @@ pub struct RoutePolicyDto {
     /// `nrr_storage::doh_lockdown::DohLockdownScope::as_slug`).
     #[serde(default = "doh_lockdown_scope_default")]
     pub doh_lockdown_scope: String,
+    /// The lockdown decides itself: on while this user has rules for the
+    /// additional route, whatever the two fields above say. Default `true`.
+    #[serde(default = "default_true")]
+    pub doh_lockdown_auto: bool,
+    /// Whether the lockdown applies right now, as the service decided it —
+    /// read-only, so a client can show "on automatically" without knowing the
+    /// rules. Absent from the update request.
+    #[serde(default)]
+    pub doh_lockdown_effective: bool,
     /// Opt-in AUTOMATIC browser-history seed for this SID:
     /// when `true` the service runs the rule-gated history seed on its own at
     /// boot. `false` (default) = manual button only (privacy-sensitive read —
@@ -199,6 +208,10 @@ pub struct RoutePolicyDto {
     /// that omits it reads as off.
     #[serde(default)]
     pub app_rules_take_all_addresses: bool,
+    /// What WSL gets while the tunnel is down: `""` (not answered yet;
+    /// treated as `as-computer`), `as-computer` or `unprotected`.
+    #[serde(default)]
+    pub forwarded_outage: String,
 }
 
 /// Additive default for [`RoutePolicyDto::auto_rules_mode`] /
@@ -224,6 +237,20 @@ pub struct LinkProviderAppDto {
     /// Display name shown in the GUI. May be empty.
     #[serde(default)]
     pub display_name: String,
+}
+
+/// A program named like a VPN client that sits where the user could have put
+/// it, so the built-in exemption does not trust it by name: the user is asked
+/// to confirm it as the link provider (`route.link-provider.set`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PendingVpnClientDto {
+    /// User-facing Win32 path of the executable.
+    pub exe_path: String,
+    /// Other executables of the same product that sit in a protected install
+    /// tree and may be confirmed together with it. Empty when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundled_exe_paths: Vec<String>,
 }
 
 /// `route.link-provider.set` request — replace the caller's link-provider app
@@ -431,6 +458,10 @@ pub struct RoutePolicyUpdateRequest {
     /// Defaults to `leak-protection-only` when an older GUI omits it.
     #[serde(default = "doh_lockdown_scope_default")]
     pub doh_lockdown_scope: String,
+    /// Let the lockdown decide itself (see [`RoutePolicyDto`]). Defaults to
+    /// `true` when an older GUI omits it: the automatic posture is the safe one.
+    #[serde(default = "default_true")]
+    pub doh_lockdown_auto: bool,
     /// Opt-in automatic browser-history seed (see
     /// [`RoutePolicyDto`]). Defaults to `false` (off) when an older GUI omits it.
     #[serde(default)]
@@ -482,6 +513,9 @@ pub struct RoutePolicyUpdateRequest {
     /// Application rules take all their addresses (see [`RoutePolicyDto`]).
     #[serde(default)]
     pub app_rules_take_all_addresses: bool,
+    /// WSL while the tunnel is down (see [`RoutePolicyDto`]).
+    #[serde(default)]
+    pub forwarded_outage: String,
     /// When not empty, only these fields (wire names) are taken from this
     /// request; the rest stay as stored. Two clients each writing the row they
     /// read lose each other's change; naming what changed keeps both.
@@ -528,6 +562,7 @@ impl RoutePolicyUpdateRequest {
             resolve_hosts_bypass,
             doh_lockdown_enabled,
             doh_lockdown_scope,
+            doh_lockdown_auto,
             browser_history_auto_seed,
             kill_switch_strict_shared_ips,
             auto_rules_mode,
@@ -541,6 +576,7 @@ impl RoutePolicyUpdateRequest {
             short_name_completion,
             short_name_suffix,
             app_rules_take_all_addresses,
+            forwarded_outage,
             binding_source: _,
             apply_only: _,
         } = self;
@@ -561,6 +597,9 @@ impl RoutePolicyUpdateRequest {
             secondary_link_provider_apps: _,
             doh_lockdown_enabled: stored_doh_enabled,
             doh_lockdown_scope: stored_doh_scope,
+            doh_lockdown_auto: stored_doh_auto,
+            // What the service decided, never what the user asked for.
+            doh_lockdown_effective: _,
             browser_history_auto_seed: stored_history_seed,
             kill_switch_strict_shared_ips: stored_strict_shared_ips,
             auto_rules_mode: stored_auto_rules_mode,
@@ -574,6 +613,7 @@ impl RoutePolicyUpdateRequest {
             short_name_completion: stored_short_name_completion,
             short_name_suffix: stored_short_name_suffix,
             app_rules_take_all_addresses: stored_app_takeover,
+            forwarded_outage: stored_wsl_outage,
             binding_source: _,
         } = current;
 
@@ -592,6 +632,7 @@ impl RoutePolicyUpdateRequest {
             || resolve_hosts_bypass != stored_hosts_bypass
             || doh_lockdown_enabled != stored_doh_enabled
             || doh_lockdown_scope != stored_doh_scope
+            || doh_lockdown_auto != stored_doh_auto
             || browser_history_auto_seed != stored_history_seed
             || kill_switch_strict_shared_ips != stored_strict_shared_ips
             || auto_rules_mode != stored_auto_rules_mode
@@ -608,6 +649,7 @@ impl RoutePolicyUpdateRequest {
             || short_name_completion != stored_short_name_completion
             || short_name_suffix != stored_short_name_suffix
             || app_rules_take_all_addresses != stored_app_takeover
+            || forwarded_outage != stored_wsl_outage
     }
 }
 

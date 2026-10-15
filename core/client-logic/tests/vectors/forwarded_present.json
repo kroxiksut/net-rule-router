@@ -1,0 +1,195 @@
+{
+  "description": "pure.js forwardingPresent: any live interface row that is WSL or a Linux container/VM bridge",
+  "cases": [
+    {
+      "name": "no rows",
+      "input": {
+        "rows": []
+      },
+      "expected": false
+    },
+    {
+      "name": "null rows",
+      "input": {
+        "rows": null
+      },
+      "expected": false
+    },
+    {
+      "name": "plain uplink only",
+      "input": {
+        "rows": [
+          {
+            "name": "Ethernet"
+          }
+        ]
+      },
+      "expected": false
+    },
+    {
+      "name": "classic name",
+      "input": {
+        "rows": [
+          {
+            "name": "Ethernet"
+          },
+          {
+            "name": "vEthernet (WSL)"
+          }
+        ]
+      },
+      "expected": true
+    },
+    {
+      "name": "firewall-era name",
+      "input": {
+        "rows": [
+          {
+            "name": "vEthernet (WSL (Hyper-V firewall))"
+          }
+        ]
+      },
+      "expected": true
+    },
+    {
+      "name": "case does not matter",
+      "input": {
+        "rows": [
+          {
+            "name": "VETHERNET (wsl)"
+          }
+        ]
+      },
+      "expected": true
+    },
+    {
+      "name": "default switch is not WSL",
+      "input": {
+        "rows": [
+          {
+            "name": "vEthernet (Default Switch)"
+          }
+        ]
+      },
+      "expected": false
+    },
+    {
+      "name": "prefix alone is not WSL",
+      "input": {
+        "rows": [
+          {
+            "name": "vEthernet"
+          }
+        ]
+      },
+      "expected": false
+    },
+    {
+      "name": "WSL inside the name is not WSL",
+      "input": {
+        "rows": [
+          {
+            "name": "Docker vEthernet (WSL)"
+          }
+        ]
+      },
+      "expected": false
+    },
+    {
+      "name": "name that is not text",
+      "input": {
+        "rows": [
+          {
+            "name": 7
+          },
+          {
+            "name": null
+          },
+          {}
+        ]
+      },
+      "expected": false
+    },
+    {
+      "name": "null row skipped",
+      "input": {
+        "rows": [
+          null,
+          {
+            "name": "vEthernet (WSL)"
+          }
+        ]
+      },
+      "expected": true
+    },
+    {
+      "name": "non-ASCII before the prefix",
+      "input": {
+        "rows": [
+          {
+            "name": "évEthernet (WSL)"
+          }
+        ]
+      },
+      "expected": false
+    },
+    {
+      "name": "docker bridge",
+      "input": {
+        "rows": [
+          {
+            "name": "wlp3s0"
+          },
+          {
+            "name": "docker0"
+          }
+        ]
+      },
+      "expected": true
+    },
+    {
+      "name": "docker user network",
+      "input": {
+        "rows": [
+          {
+            "name": "br-3f2a9c1d0e7b"
+          }
+        ]
+      },
+      "expected": true
+    },
+    {
+      "name": "libvirt bridge",
+      "input": {
+        "rows": [
+          {
+            "name": "virbr0"
+          }
+        ]
+      },
+      "expected": true
+    },
+    {
+      "name": "container veth alone is not a network",
+      "input": {
+        "rows": [
+          {
+            "name": "veth1a2b3c"
+          }
+        ]
+      },
+      "expected": false
+    },
+    {
+      "name": "Linux names are exact",
+      "input": {
+        "rows": [
+          {
+            "name": "Docker0"
+          }
+        ]
+      },
+      "expected": false
+    }
+  ]
+}

@@ -45,6 +45,19 @@ pub trait AppPathResolver: Send + Sync {
     fn sibling_executables(&self, _exe: &std::path::Path) -> Vec<PathBuf> {
         Vec::new()
     }
+
+    /// Whether only the machine's administrators could have put `exe` where
+    /// it is: a system program folder, or a file an administrative account
+    /// owns.
+    ///
+    /// A built-in exemption keyed on a file NAME is only as trustworthy as the
+    /// place the file sits: anything-vpn.exe in a download folder would
+    /// otherwise walk around the leak guard with no rule and no confirmation.
+    /// The default is `false` — an OS that cannot answer trusts nothing by
+    /// name, and the user's own confirmation is the way in.
+    fn is_protected_install(&self, _exe: &std::path::Path) -> bool {
+        false
+    }
 }
 
 /// Default / off-platform resolver: resolves nothing. Compiles on every OS so the
@@ -157,6 +170,9 @@ pub struct MockAppPathResolver {
     map: HashMap<String, Vec<PathBuf>>,
     /// `exe path (lowercased) -> what else ships in its install tree`.
     siblings: HashMap<String, Vec<PathBuf>>,
+    /// Lowercased directory prefixes standing in for the machine's protected
+    /// program folders.
+    protected_roots: Vec<String>,
 }
 
 impl MockAppPathResolver {
@@ -181,6 +197,7 @@ impl MockAppPathResolver {
         Self {
             map,
             siblings: HashMap::new(),
+            protected_roots: Vec::new(),
         }
     }
 
@@ -188,6 +205,19 @@ impl MockAppPathResolver {
     #[must_use]
     pub fn with_siblings(mut self, exe: &str, paths: Vec<PathBuf>) -> Self {
         self.siblings.insert(exe.trim().to_ascii_lowercase(), paths);
+        self
+    }
+
+    /// Declare a directory whose contents count as administrator-installed
+    /// (chainable). Everything outside every declared root is untrusted, which
+    /// is also the answer of a mock with no roots at all.
+    #[must_use]
+    pub fn with_protected_root(mut self, root: &str) -> Self {
+        let mut root = root.trim().to_ascii_lowercase();
+        if !root.ends_with(['\\', '/']) {
+            root.push('\\');
+        }
+        self.protected_roots.push(root);
         self
     }
 }
@@ -212,6 +242,13 @@ impl AppPathResolver for MockAppPathResolver {
             .get(&exe.to_string_lossy().to_ascii_lowercase())
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn is_protected_install(&self, exe: &std::path::Path) -> bool {
+        let path = exe.to_string_lossy().to_ascii_lowercase();
+        self.protected_roots
+            .iter()
+            .any(|root| path.starts_with(root.as_str()))
     }
 }
 
@@ -389,6 +426,30 @@ mod tests {
             p(r"C:\A\ab.exe"), // exact dup
         ]);
         assert_eq!(out, vec![p(r"C:\A\ab.exe"), p(r"C:\B\ab.exe")]);
+    }
+
+    /// A mock with no declared root trusts nothing, like the port's default:
+    /// a test that forgets to declare one fails closed instead of passing an
+    /// exemption it never meant to grant.
+    #[test]
+    fn mock_trusts_only_what_sits_under_a_declared_root() {
+        let installed = p(r"C:\Program Files\vendor\vendor.exe");
+        let installed_recased = p(r"c:\program files\VENDOR\vendor.exe");
+        let lookalike = p(r"C:\Program Filesx\vendor.exe");
+        let planted = p(r"C:\Users\someone\Downloads\x-vpn.exe");
+
+        let bare = MockAppPathResolver::new();
+        assert!(!bare.is_protected_install(&installed));
+
+        let r = MockAppPathResolver::new();
+        let r = r.with_protected_root(r"C:\Program Files");
+        assert!(r.is_protected_install(&installed));
+        assert!(r.is_protected_install(&installed_recased));
+        assert!(
+            !r.is_protected_install(&lookalike),
+            "a prefix match must stop at the directory boundary",
+        );
+        assert!(!r.is_protected_install(&planted));
     }
 
     #[test]

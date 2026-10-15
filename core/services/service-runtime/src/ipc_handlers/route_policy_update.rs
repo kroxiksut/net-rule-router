@@ -249,6 +249,8 @@ mod tests {
             secondary_link_provider_apps: Vec::new(),
             doh_lockdown_enabled: false,
             doh_lockdown_scope: "leak-protection-only".into(),
+            doh_lockdown_auto: true,
+            doh_lockdown_effective: false,
             browser_history_auto_seed: false,
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
@@ -262,6 +264,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
+            forwarded_outage: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
         }
     }
@@ -289,6 +292,7 @@ mod tests {
             resolve_hosts_bypass: true,
             doh_lockdown_enabled: false,
             doh_lockdown_scope: "leak-protection-only".into(),
+            doh_lockdown_auto: true,
             browser_history_auto_seed: false,
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
@@ -302,6 +306,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
+            forwarded_outage: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
             apply_only: Vec::new(),
         })
@@ -422,6 +427,7 @@ mod tests {
             resolve_hosts_bypass: true,
             doh_lockdown_enabled: false,
             doh_lockdown_scope: "leak-protection-only".into(),
+            doh_lockdown_auto: true,
             browser_history_auto_seed: false,
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
@@ -435,6 +441,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
+            forwarded_outage: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
             apply_only: Vec::new(),
         })
@@ -467,6 +474,7 @@ mod tests {
             resolve_hosts_bypass: true,
             doh_lockdown_enabled: false,
             doh_lockdown_scope: "leak-protection-only".into(),
+            doh_lockdown_auto: true,
             browser_history_auto_seed: false,
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
@@ -480,6 +488,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
+            forwarded_outage: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
             apply_only: Vec::new(),
         })
@@ -511,6 +520,7 @@ mod tests {
             resolve_hosts_bypass: true,
             doh_lockdown_enabled: false,
             doh_lockdown_scope: "leak-protection-only".into(),
+            doh_lockdown_auto: true,
             browser_history_auto_seed: false,
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
@@ -524,6 +534,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
+            forwarded_outage: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
             apply_only: Vec::new(),
         })
@@ -558,6 +569,7 @@ mod tests {
             resolve_hosts_bypass: dto.resolve_hosts_bypass,
             doh_lockdown_enabled: dto.doh_lockdown_enabled,
             doh_lockdown_scope: dto.doh_lockdown_scope.clone(),
+            doh_lockdown_auto: dto.doh_lockdown_auto,
             browser_history_auto_seed: dto.browser_history_auto_seed,
             kill_switch_strict_shared_ips: dto.kill_switch_strict_shared_ips,
             auto_rules_mode: dto.auto_rules_mode.clone(),
@@ -571,6 +583,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
+            forwarded_outage: String::new(),
             binding_source: dto.binding_source,
             apply_only: Vec::new(),
         })
@@ -625,6 +638,7 @@ mod tests {
             resolve_hosts_bypass: dto.resolve_hosts_bypass,
             doh_lockdown_enabled: dto.doh_lockdown_enabled,
             doh_lockdown_scope: dto.doh_lockdown_scope.clone(),
+            doh_lockdown_auto: dto.doh_lockdown_auto,
             browser_history_auto_seed: dto.browser_history_auto_seed,
             kill_switch_strict_shared_ips: dto.kill_switch_strict_shared_ips,
             auto_rules_mode: dto.auto_rules_mode.clone(),
@@ -638,6 +652,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
+            forwarded_outage: String::new(),
             binding_source: dto.binding_source,
             apply_only: Vec::new(),
         })
@@ -679,6 +694,7 @@ mod tests {
             resolve_hosts_bypass: true,
             doh_lockdown_enabled: false,
             doh_lockdown_scope: "leak-protection-only".into(),
+            doh_lockdown_auto: true,
             browser_history_auto_seed: false,
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
@@ -692,6 +708,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
+            forwarded_outage: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
             apply_only: Vec::new(),
         })

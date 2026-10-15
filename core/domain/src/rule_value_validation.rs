@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use nrr_shared::rules_json::{AddressMatchDto, AppPatternDto, CanonicalRulesJsonV1, RuleDto};
+use nrr_shared::rules_json::{AddressMatchDto, CanonicalRulesJsonV1, RuleDto};
 
 use crate::address_class::AddressClass;
 use crate::ip_network_policy::IpValueKind;
@@ -395,11 +395,11 @@ pub fn wire_rule_values(rule: &RuleDto) -> impl Iterator<Item = (&'static str, S
         AddressMatchDto::Unrecognized(_) => ("", String::new()),
     });
     let address = address.filter(|(kind, _)| !kind.is_empty());
-    let app = rule.app_match.as_ref().map(|m| match &m.pattern {
-        AppPatternDto::Exact { value } | AppPatternDto::Glob { value } => {
-            ("application", value.clone())
-        }
-    });
+    let app = rule
+        .app_match
+        .as_ref()
+        .map(|m| ("application", m.pattern.value().to_owned()))
+        .filter(|(_, value)| !value.is_empty());
     address.into_iter().chain(app)
 }
 
@@ -503,9 +503,7 @@ fn refused_outright(rule: &RuleDto) -> Option<String> {
         &no_rule,
     )
     .is_err()
-    .then(|| match &app.pattern {
-        AppPatternDto::Exact { value } | AppPatternDto::Glob { value } => value.clone(),
-    })
+    .then(|| app.pattern.value().to_owned())
 }
 
 // ── network domain ────────────────────────────────────────────────────────────

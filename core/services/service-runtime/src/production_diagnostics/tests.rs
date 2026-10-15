@@ -1632,3 +1632,92 @@ fn every_explain_reason_is_translated() {
         assert!(missing.is_empty(), "locale '{locale}' lacks {missing:?}");
     }
 }
+
+/// Between installing a revision and committing its pointer, enforcement
+/// already runs the new rules. The routing check reads them through the rules
+/// provider, so in that window it answers for what is enforced, not for the
+/// revision being replaced.
+#[test]
+fn the_routing_check_reads_a_revision_mid_activation() {
+    use nrr_shared::rules_json::{
+        to_canonical_string, AddressMatchDto, CanonicalRulesJsonV1, RuleDto,
+        RULES_JSON_SCHEMA_VERSION,
+    };
+    use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+    use nrr_storage::repository::MigrationRunner;
+
+    let book = |host: &str| {
+        to_canonical_string(&CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![],
+            secondary: vec![RuleDto {
+                id: "R-0001".into(),
+                enabled: true,
+                address_match: Some(AddressMatchDto::ExactFqdn { value: host.into() }),
+                app_match: None,
+                comment: String::new(),
+                action: nrr_shared::rules_json::RuleAction::Route,
+                origin: None,
+            }],
+        })
+        .expect("serialise")
+    };
+    // The overlay is keyed by the database file, so the store must be a file.
+    let dir = TempDir::new().expect("tmp");
+    let conn = open_connection(&dir.path().join("state.db")).expect("open");
+    let runner = SqliteMigrationRunner::for_state_db(conn);
+    runner.run_pending_migrations().expect("migrate");
+    let conn = Arc::new(std::sync::Mutex::new(runner.into_connection()));
+    conn.lock()
+        .expect("lock")
+        .execute(
+            "INSERT INTO revisions (
+                principal, revision_id, content_hash, rules_json, status, source,
+                correlation_id, created_at, activated_at
+             ) VALUES (?1, 'rev-1', 'h', ?2, 'active', 'gui-rules-edit', 'c', 1, 1)",
+            rusqlite::params![nrr_storage::BASELINE_PRINCIPAL, book("old.example")],
+        )
+        .expect("seed active revision");
+    let alerts: Arc<dyn SecurityAlertsRepository> =
+        Arc::new(InMemorySecurityAlertsRepository::new());
+    let facade = ProductionDiagnosticsFacade::new(
+        dir.path(),
+        dir.path(),
+        None,
+        alerts,
+        Some(Arc::clone(&conn)),
+    );
+    let route_of = |host: &str| {
+        let q = ExplainQuery::Synthetic {
+            input_sample: nrr_diagnostics::explain::RuntimeInputSample::new().with_hostname(host),
+        };
+        facade
+            .get_explain(&q, ExplainDetailLevel::Diagnostics, "")
+            .expect("explain")
+            .final_action_section
+            .expect("final action")
+            .route_role
+    };
+
+    // Positive control: the stored revision is what answers outside the window.
+    assert_eq!(route_of("old.example").as_deref(), Some("secondary"));
+    assert_eq!(route_of("new.example").as_deref(), Some("primary"));
+
+    let applying = {
+        let guard = conn.lock().expect("lock");
+        crate::applying_revision_overlay::publish(
+            &guard,
+            nrr_storage::BASELINE_PRINCIPAL,
+            &book("new.example"),
+        )
+    };
+    assert_eq!(
+        route_of("new.example").as_deref(),
+        Some("secondary"),
+        "mid-activation the check must answer for the revision being installed"
+    );
+    assert_eq!(route_of("old.example").as_deref(), Some("primary"));
+
+    drop(applying);
+    assert_eq!(route_of("old.example").as_deref(), Some("secondary"));
+}

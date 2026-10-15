@@ -331,6 +331,9 @@ pub enum RecoveryExecutionResult {
     AuditWriteFailed { detail: String },
     /// Marker clear failed; recovery is incomplete.
     MarkerClearFailed { detail: String },
+    /// The activation was applied and committed; only its marker could not be
+    /// removed. Nothing is left to recover, so the start is not held back.
+    AppliedMarkerClearFailed { detail: String },
 }
 
 // ── Startup recovery coordinator ──────────────────────────────────────────────
@@ -404,6 +407,9 @@ where
                             attempt_id: marker.attempt_id,
                         });
                         RecoveryExecutionResult::VerifiedAndCleared
+                    }
+                    Err(detail) if marker.phase == ApplyPhase::Applied => {
+                        RecoveryExecutionResult::AppliedMarkerClearFailed { detail }
                     }
                     Err(e) => RecoveryExecutionResult::MarkerClearFailed { detail: e },
                 }
@@ -613,6 +619,21 @@ mod tests {
     #[allow(dead_code)]
     struct FailingMarkerStore;
 
+    /// A marker that is there to read and cannot be removed.
+    struct StuckMarkerStore(ApplyAttemptMarker);
+
+    impl ApplyMarkerStore for StuckMarkerStore {
+        fn read(&self) -> Option<ApplyAttemptMarker> {
+            Some(self.0.clone())
+        }
+        fn write(&self, _: &ApplyAttemptMarker) -> Result<(), String> {
+            Err("read-only".into())
+        }
+        fn clear(&self) -> Result<(), String> {
+            Err("access denied".into())
+        }
+    }
+
     impl ApplyMarkerStore for FailingMarkerStore {
         fn read(&self) -> Option<ApplyAttemptMarker> {
             None
@@ -673,10 +694,10 @@ mod tests {
         }
     }
 
-    fn coord(
-        store: FakeMarkerStore,
+    fn coord<S: ApplyMarkerStore>(
+        store: S,
         audit: RecordingAuditSink,
-    ) -> StartupRecoveryCoordinator<FakeMarkerStore, RecordingAuditSink> {
+    ) -> StartupRecoveryCoordinator<S, RecordingAuditSink> {
         StartupRecoveryCoordinator::new(store, audit)
     }
 
@@ -769,6 +790,32 @@ mod tests {
         let result = c.execute(decision);
         assert_eq!(result, RecoveryExecutionResult::VerifiedAndCleared);
         assert!(c.marker_store.read().is_none());
+    }
+
+    #[test]
+    fn an_applied_marker_that_will_not_clear_is_not_an_aborted_recovery() {
+        let c = coord(
+            StuckMarkerStore(marker(ApplyPhase::Applied)),
+            RecordingAuditSink::ok(),
+        );
+        let decision = decide_recovery(&c.assess(), true);
+        assert!(matches!(
+            c.execute(decision),
+            RecoveryExecutionResult::AppliedMarkerClearFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unfinished_marker_that_will_not_clear_still_fails_recovery() {
+        let c = coord(
+            StuckMarkerStore(marker(ApplyPhase::Verifying)),
+            RecordingAuditSink::ok(),
+        );
+        let decision = decide_recovery(&c.assess(), true);
+        assert!(matches!(
+            c.execute(decision),
+            RecoveryExecutionResult::MarkerClearFailed { .. }
+        ));
     }
 
     #[test]

@@ -8,8 +8,8 @@ import "../lib/pure.js" as Pure
 //
 // Nothing is written unasked. On connect the record is compared with the
 // service; a difference raises one card, and only its action sends the one
-// write that brings the settings back. The stability settings keep their own
-// per-key flow (`ServiceIntentController`).
+// write that brings the settings back. The service's own settings are the
+// machine's and come back only from the service's backup.
 QtObject {
     id: settingsRestoreController
 
@@ -133,10 +133,15 @@ QtObject {
         })
     }
 
-    /// What the service lacks: route-policy keys, and the mutes to bring back.
+    /// What the service lacks and the user is asked about: route-policy keys
+    /// other than the protection that goes back on its own, and the mutes.
     function _missing(state) {
+        var intentPolicy = state.intent["route-policy"] || {}
+        var automatic = Pure.routePolicyProtectionToRestore(intentPolicy, state.policy)
         return {
-            keys: Pure.routePolicyIntentDivergence(state.intent["route-policy"] || {}, state.policy),
+            keys: Pure.routePolicyIntentDivergence(intentPolicy, state.policy).filter(function(k) {
+                return automatic.indexOf(k) < 0
+            }),
             mutes: Pure.noticeMutesToRestore(state.intent["notice-mutes"], state.mutes, Date.now())
         }
     }
@@ -153,6 +158,7 @@ QtObject {
                 console.log("settings-restore: not compared, a read failed")
                 return
             }
+            _restoreProtection(state)
             var missing = _missing(state)
             _dropCard()
             console.log("settings-restore: compared, missing keys=" + missing.keys.join(",")
@@ -160,6 +166,34 @@ QtObject {
             if (missing.keys.length === 0 && missing.mutes.length === 0) return
             _raiseCard(missing)
         })
+    }
+
+    /// Protection the record holds on and the service lost goes back on at
+    /// once, unasked, and the user is told. Only ever switched ON this way.
+    function _restoreProtection(state) {
+        var intentPolicy = state.intent["route-policy"] || {}
+        var keys = Pure.routePolicyProtectionToRestore(intentPolicy, state.policy)
+        if (keys.length === 0) return
+        console.log("settings-restore: protection switched back on, keys=" + keys.join(","))
+        root.routePolicyController.mutateRoutePolicy(function(cur) {
+            return Pure.routePolicyProtectionRestore(intentPolicy, cur)
+        }, function(ok, code) {
+            if (!ok) {
+                console.log("settings-restore: protection not restored:", code)
+                return
+            }
+            root.notificationsController._addPushNotice({
+                "id": "protection-restored:" + String(Date.now()),
+                "kind": "protection-restored",
+                "severity": "info",
+                "dismissible": true,
+                "title": root.tr("notifications.protection-restored.title",
+                    "Protection restored after a service failure"),
+                "body": root.tr("notifications.protection-restored.body",
+                        "The service had lost these settings and they were switched back on: {settings}.")
+                    .replace("{settings}", _names({ keys: keys, mutes: [] }))
+            })
+        }, "auto:restore-protection")
     }
 
     /// The name a setting is listed under on the card.

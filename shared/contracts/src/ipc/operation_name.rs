@@ -42,6 +42,12 @@ pub enum IpcOperationName {
     /// by value in the handler, because a settings page saves the whole list
     /// back whether or not the user touched it.
     DohResolversSet,
+    /// Read the machine-wide list of home and local network suffixes, with
+    /// what the current network offers. Query, GUI+tray readable.
+    LocalDnsSuffixesGet,
+    /// Replace that list. Machine-wide, so a CHANGE needs an administrator —
+    /// checked by value in the handler, like the DoH resolver list.
+    LocalDnsSuffixesSet,
     /// OPT-IN — read the caller's browser history, resolve the
     /// rule-matching hostnames, and cache them (closes the "visited before the
     /// service started" blind spot). Runs asynchronously and returns immediately;
@@ -329,7 +335,7 @@ pub enum IpcOperationName {
 }
 
 impl IpcOperationName {
-    pub const ALL: [Self; 74] = [
+    pub const ALL: [Self; 76] = [
         Self::ContractNegotiate,
         Self::ServiceHealthGet,
         Self::SnapshotInitialGet,
@@ -350,6 +356,8 @@ impl IpcOperationName {
         Self::RouteLinkProviderSet,
         Self::DohResolversGet,
         Self::DohResolversSet,
+        Self::LocalDnsSuffixesGet,
+        Self::LocalDnsSuffixesSet,
         Self::SeedFromBrowserHistory,
         Self::MigrationStatusGet,
         Self::MigrationMarkComplete,
@@ -428,6 +436,8 @@ impl IpcOperationName {
             Self::RouteLinkProviderSet => "route.link-provider.set",
             Self::DohResolversGet => "doh.resolvers.get",
             Self::DohResolversSet => "doh.resolvers.set",
+            Self::LocalDnsSuffixesGet => "dns.local-suffixes.get",
+            Self::LocalDnsSuffixesSet => "dns.local-suffixes.set",
             Self::SeedFromBrowserHistory => "diagnostics.seed-from-browser-history",
             Self::MigrationStatusGet => "migration.status.get",
             Self::MigrationMarkComplete => "migration.mark.complete",

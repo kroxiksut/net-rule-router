@@ -1481,3 +1481,31 @@ pub const STATE_DB_V69_DDL: &[&str] = &[
 pub const STATE_DB_V70_DDL: &[&str] = &[
     "ALTER TABLE secondary_block_policy ADD COLUMN app_rules_take_all_addresses      INTEGER NOT NULL DEFAULT 0 CHECK(app_rules_take_all_addresses IN (0, 1))",
 ];
+
+/// The DoH/DoT lockdown decides itself by default: on while the user has rules
+/// for the additional route. A user who had switched it on by hand keeps that
+/// choice. DEV schema; wiped freely.
+pub const STATE_DB_V71_DDL: &[&str] = &[
+    "ALTER TABLE secondary_block_policy ADD COLUMN doh_lockdown_auto INTEGER NOT NULL \
+     DEFAULT 1 CHECK(doh_lockdown_auto IN (0, 1))",
+    "UPDATE secondary_block_policy SET doh_lockdown_auto = 0 WHERE doh_lockdown_enabled = 1",
+];
+
+/// Machine-wide suffixes of home and local networks: names under them are
+/// left to the network's own resolver. Pre-filled; an administrator edits the
+/// list. DEV schema; wiped freely.
+pub const STATE_DB_V72_DDL: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS local_dns_suffixes (
+    suffix     TEXT    PRIMARY KEY CHECK(length(suffix) BETWEEN 1 AND 253),
+    updated_at INTEGER NOT NULL
+) WITHOUT ROWID",
+    "INSERT OR IGNORE INTO local_dns_suffixes (suffix, updated_at) VALUES \
+     ('home.arpa', 0), ('lan', 0), ('local', 0), ('fritz.box', 0)",
+];
+
+/// What WSL (and Docker Desktop on it) gets while the tunnel is down: '' (not
+/// answered yet, behaves as the computer), 'as-computer' or 'unprotected'.
+pub const STATE_DB_V73_DDL: &[&str] = &[
+    "ALTER TABLE secondary_block_policy ADD COLUMN forwarded_outage TEXT NOT NULL DEFAULT '' \
+     CHECK(forwarded_outage IN ('', 'as-computer', 'unprotected'))",
+];

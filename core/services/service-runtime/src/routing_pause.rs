@@ -22,18 +22,27 @@
 //! - Concurrent `pause` and `resume` for the same SID serialise via the
 //!   IPC `MutationQueue` — this coordinator does not add a second lock.
 //!
-//! ## M-1 awareness
+//! ## Whose filters move
 //!
-//! `resume` only triggers the dispatcher's `install_for_sid` if the SID
-//! is currently routing-active in [`ActiveSidRegistry`] (i.e. has a
-//! tray connection). Otherwise the pause flag is cleared in storage and
-//! the next tray connect will install via the standard listener flow.
+//! The dispatcher is called for a SID whose policy is live: one with a tray
+//! connection in [`ActiveSidRegistry`], one the route table serves, or one the
+//! platform's presence authority names (logind on Linux, where no tray feeds
+//! the registry). For anybody else only the flag moves, and the next
+//! connect or pass reads it.
+//!
+//! ## The flag follows the platform
+//!
+//! The flag is written first — on Linux the pass reads it to know whom to
+//! leave out — and put back if the dispatcher refuses. A stored pause the
+//! platform did not carry out would report "paused" over live routing, the
+//! one state a pause exists to rule out.
 
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
-use nrr_storage::pause_state::RoutingPauseStateRepository;
+use nrr_platform_api::active_principals::ActivePrincipalSource;
+use nrr_storage::pause_state::{RoutingPauseRecord, RoutingPauseStateRepository};
 
 use crate::activation_coordinator::Clock;
 use crate::active_sid_registry::{ActiveSidRegistry, ActiveSidsListener};
@@ -112,13 +121,13 @@ impl RoutingPauseAudit for NoopRoutingPauseAudit {
 /// Production impl wraps `PerSidApplyOrchestrator`; tests use a
 /// scriptable mock.
 pub trait PauseDispatcher: Send + Sync {
-    /// Apply the SID's current per-user policy to the platform layer
-    /// (install WFP filters). Idempotent — calling install on an
-    /// already-installed SID succeeds.
+    /// Apply the SID's current per-user policy to the platform layer (WFP
+    /// filters on Windows; a pass that reads the cleared flag on Linux).
+    /// Idempotent — calling install on an already-installed SID succeeds.
     fn install_for_sid(&self, sid: &str) -> Result<(), String>;
 
-    /// Withdraw the SID's WFP filters. Idempotent — calling remove on
-    /// an already-removed SID succeeds.
+    /// Withdraw the SID's policy from the platform layer. Idempotent —
+    /// calling remove on an already-removed SID succeeds.
     fn remove_for_sid(&self, sid: &str) -> Result<(), String>;
 }
 
@@ -137,6 +146,10 @@ pub struct RoutingPauseCoordinator {
     /// pre-ROUTE-half behaviour: WFP-only. Held one-directionally — the route
     /// coordinator reads the pause flag from storage, so there is no Arc cycle.
     route_coord: Option<Arc<crate::route_coordinator::SecondaryRouteCoordinator>>,
+    /// The platform's own answer to "whose policy is live" where no tray feeds
+    /// the registry: logind on Linux. `None` leaves presence to the registry
+    /// and the route coordinator.
+    presence: Option<Arc<dyn ActivePrincipalSource>>,
 }
 
 // State is `Mutex`-guarded; `lock().expect(...)` propagates poisoning (a prior
@@ -157,6 +170,61 @@ impl RoutingPauseCoordinator {
             audit,
             clock,
             route_coord: None,
+            presence: None,
+        }
+    }
+
+    /// Count a principal the platform authority names as live, so a pause
+    /// reaches the dispatcher for a signed-in user who has no tray connection
+    /// and no route-table share, and a safe-disable pauses every one of them.
+    #[must_use]
+    pub fn with_presence_source(mut self, presence: Arc<dyn ActivePrincipalSource>) -> Self {
+        self.presence = Some(presence);
+        self
+    }
+
+    /// Stored principals the presence authority names right now. An authority
+    /// that cannot answer names nobody: a pause then only stores its flag,
+    /// which the next pass reads, rather than failing outright.
+    fn present_sids(&self) -> Vec<String> {
+        self.presence
+            .as_ref()
+            .and_then(|source| source.active_principals().ok())
+            .map(|principals| {
+                principals
+                    .iter()
+                    .map(|p| p.as_stored().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The stored row before a write, so a refused dispatch can put it back.
+    fn record(&self, sid: &str) -> Option<RoutingPauseRecord> {
+        let conn = self.conn.lock().expect("record connection mutex poisoned");
+        RoutingPauseStateRepository::new(&conn)
+            .get(sid)
+            .ok()
+            .flatten()
+    }
+
+    /// Put the flag back to what it was before a dispatch the platform refused.
+    /// Best-effort: the refusal is what the caller reports, and a second
+    /// storage failure on top of it cannot be acted on.
+    fn restore(&self, sid: &str, previous: Option<&RoutingPauseRecord>, now: i64) {
+        let conn = self.conn.lock().expect("restore connection mutex poisoned");
+        let repo = RoutingPauseStateRepository::new(&conn);
+        let result = match previous {
+            Some(rec) => repo.set_paused(sid, rec.paused, rec.pause_reason.as_deref(), now),
+            None => repo.forget(sid),
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                target: "nrr::routing-pause",
+                msg_key = "routingpause-flag-restore-failed",
+                error = %e,
+                "the pause flag could not be put back after the platform refused",
+            );
         }
     }
 
@@ -173,15 +241,16 @@ impl RoutingPauseCoordinator {
         self
     }
 
-    /// `true` when the route table serves `sid` — a connected tray, or a
-    /// signed-in user under service-driven scope with no tray. Always `false`
-    /// without a route coordinator. This — not `registry.is_active` alone — is
-    /// what makes a no-tray safe-disable tear down that user's routes and
+    /// `true` when `sid`'s policy is live without a tray: the route table
+    /// serves them (a signed-in user under service-driven scope), or the
+    /// platform authority names them. This — not `registry.is_active` alone —
+    /// is what makes a no-tray safe-disable tear down that user's routes and
     /// filters.
     fn is_effective(&self, sid: &str) -> bool {
         self.route_coord
             .as_ref()
             .is_some_and(|c| c.is_served(sid, &self.registry.active_sids()))
+            || self.present_sids().iter().any(|s| s == sid)
     }
 
     /// Take a paused user's routes out of the table. Alone in it, the table is
@@ -265,7 +334,9 @@ impl RoutingPauseCoordinator {
             return Err(PauseError::EmptySid);
         }
         let now = self.clock.now_secs();
-        // Storage write first (durable record before platform mutation).
+        let previous = self.record(sid);
+        // Storage write first: a platform whose pass reads the flag learns the
+        // pause from here, and the write is undone below if it refuses.
         {
             let conn = self.conn.lock().expect("pause connection mutex poisoned");
             RoutingPauseStateRepository::new(&conn)
@@ -282,13 +353,14 @@ impl RoutingPauseCoordinator {
         // widened guard is safe even when no filters are installed.
         let effective = self.is_effective(sid);
         if self.registry.is_active(sid) || effective {
-            self.dispatcher
-                .remove_for_sid(sid)
-                .map_err(|e| PauseError::Dispatch {
+            if let Err(e) = self.dispatcher.remove_for_sid(sid) {
+                self.restore(sid, previous.as_ref(), now);
+                return Err(PauseError::Dispatch {
                     operation: "remove_for_sid",
                     sid: sid.to_string(),
                     message: e,
-                })?;
+                });
+            }
         }
         // ROUTE-half — the WFP-only removal above left the `/32` host routes and
         // `/2` counter-overlays installed, so matched traffic kept egressing the
@@ -313,6 +385,7 @@ impl RoutingPauseCoordinator {
             return Err(PauseError::EmptySid);
         }
         let now = self.clock.now_secs();
+        let previous = self.record(sid);
         {
             let conn = self.conn.lock().expect("resume connection mutex poisoned");
             RoutingPauseStateRepository::new(&conn)
@@ -324,13 +397,16 @@ impl RoutingPauseCoordinator {
         }
         let effective = self.is_effective(sid);
         if self.registry.is_active(sid) || effective {
-            self.dispatcher
-                .install_for_sid(sid)
-                .map_err(|e| PauseError::Dispatch {
+            // Routing that did not come back is still paused, and the flag
+            // says so rather than reporting a resume the platform refused.
+            if let Err(e) = self.dispatcher.install_for_sid(sid) {
+                self.restore(sid, previous.as_ref(), now);
+                return Err(PauseError::Dispatch {
                     operation: "install_for_sid",
                     sid: sid.to_string(),
                     message: e,
-                })?;
+                });
+            }
         }
         // ROUTE-half — the pause flag is already cleared in storage above, so a
         // recompute now RE-ADDS the effective user's routes (the recompute gate
@@ -368,6 +444,12 @@ impl RoutingPauseCoordinator {
                 if !sids.contains(&served) {
                     sids.push(served);
                 }
+            }
+        }
+        // Where the platform names who is signed in, every one of them.
+        for present in self.present_sids() {
+            if !sids.contains(&present) {
+                sids.push(present);
             }
         }
         let mut paused = Vec::new();
@@ -538,6 +620,15 @@ impl ScriptedPauseDispatcher {
 
     pub fn queue_install(&self, sid: &str, outcome: Result<(), String>) {
         self.install_outcomes
+            .lock()
+            .expect("dispatcher mutex")
+            .entry(sid.to_string())
+            .or_default()
+            .push(outcome);
+    }
+
+    pub fn queue_remove(&self, sid: &str, outcome: Result<(), String>) {
+        self.remove_outcomes
             .lock()
             .expect("dispatcher mutex")
             .entry(sid.to_string())
@@ -736,6 +827,96 @@ mod tests {
         ));
         assert!(matches!(fx.coord.resume(""), Err(PauseError::EmptySid)));
         assert!(matches!(fx.coord.is_paused(""), Err(PauseError::EmptySid)));
+    }
+
+    /// A pause the platform refused used to stay on file: "paused" reported
+    /// over routing that never stopped.
+    #[test]
+    fn a_refused_pause_leaves_no_flag_behind() {
+        let fx = build_fx();
+        fx.registry
+            .on_connect("S-A", IpcClientProfile::TrayLightweight);
+        fx.dispatcher
+            .queue_remove("S-A", Err("nft refused the ruleset".to_owned()));
+
+        assert!(matches!(
+            fx.coord.pause("S-A", Some("travel")),
+            Err(PauseError::Dispatch { .. })
+        ));
+        assert!(!fx.coord.is_paused("S-A").expect("is_paused"));
+        assert!(fx.coord.paused_sids().expect("list").is_empty());
+        assert!(
+            fx.audit.snapshot().is_empty(),
+            "nothing to audit: nothing happened"
+        );
+    }
+
+    /// The mirror image: a resume the platform refused leaves the user paused,
+    /// because their routing did not come back.
+    #[test]
+    fn a_refused_resume_keeps_the_user_paused() {
+        let fx = build_fx();
+        fx.registry
+            .on_connect("S-A", IpcClientProfile::TrayLightweight);
+        fx.coord.pause("S-A", Some("travel")).expect("pause");
+        fx.dispatcher
+            .queue_install("S-A", Err("nft refused the ruleset".to_owned()));
+
+        assert!(matches!(
+            fx.coord.resume("S-A"),
+            Err(PauseError::Dispatch { .. })
+        ));
+        assert!(fx.coord.is_paused("S-A").expect("is_paused"));
+        let conn = fx.coord.conn.lock().expect("conn");
+        let record = RoutingPauseStateRepository::new(&conn)
+            .get("S-A")
+            .expect("get")
+            .expect("row");
+        assert_eq!(record.pause_reason.as_deref(), Some("travel"));
+    }
+
+    /// Where the platform itself says who is signed in (logind), a user with
+    /// no tray and no route-table share still reaches the dispatcher, and a
+    /// safe-disable pauses every one of them.
+    #[test]
+    fn a_present_principal_without_a_tray_reaches_the_dispatcher() {
+        use nrr_platform_api::active_principals::FixedActivePrincipals;
+        use nrr_platform_api::enforcement::UserPrincipal;
+
+        let fx = build_fx();
+        let coord = Arc::new(
+            RoutingPauseCoordinator::new(
+                Arc::clone(&fx.coord.conn),
+                Arc::clone(&fx.registry),
+                Arc::clone(&fx.dispatcher) as Arc<dyn PauseDispatcher>,
+                Arc::clone(&fx.audit) as Arc<dyn RoutingPauseAudit>,
+                FixedClock::new(1_700_000_000) as Arc<dyn Clock>,
+            )
+            .with_presence_source(Arc::new(FixedActivePrincipals(vec![
+                UserPrincipal::from_linux_uid(1000),
+                UserPrincipal::from_linux_uid(1001),
+            ]))),
+        );
+
+        coord.pause("unix:uid:1000", None).expect("pause");
+        assert_eq!(fx.dispatcher.remove_log(), vec!["unix:uid:1000".to_owned()]);
+        coord.resume("unix:uid:1000").expect("resume");
+        assert_eq!(
+            fx.dispatcher.install_log(),
+            vec!["unix:uid:1000".to_owned()]
+        );
+        // Somebody the authority does not name only gets the flag.
+        coord.pause("unix:uid:1002", None).expect("pause");
+        assert_eq!(fx.dispatcher.remove_log(), vec!["unix:uid:1000".to_owned()]);
+
+        let mut paused = coord
+            .pause_all_active(Some("safe-disable"))
+            .expect("pause_all_active");
+        paused.sort();
+        assert_eq!(
+            paused,
+            vec!["unix:uid:1000".to_owned(), "unix:uid:1001".to_owned()]
+        );
     }
 
     // ── Pause-aware listener ──────────────────────────────────────────────────

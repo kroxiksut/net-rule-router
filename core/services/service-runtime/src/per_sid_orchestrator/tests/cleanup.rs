@@ -108,6 +108,129 @@ fn cleanup_wfp_blocks_only_strips_blocks_and_keeps_permits() {
     assert_eq!(remaining[0].action, WfpAction::Permit);
 }
 
+/// Leak protection on: a dead instance's blocks hold through the start, and
+/// the first pass over a present user deletes only what it did not claim.
+#[test]
+fn deferred_orphans_hold_until_the_first_pass_then_the_unclaimed_go() {
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let orch = orch_sharing_session(Arc::clone(&session));
+    seeded_block_permit_block(&session, &api);
+
+    orch.defer_orphans_to_first_pass();
+    assert_eq!(
+        api.wfp_filters.lock().unwrap().len(),
+        3,
+        "nothing comes off before the first pass"
+    );
+    assert_eq!(
+        orch.adopt_orphans_after_pass(),
+        Some(3),
+        "a pass that claimed nothing settles all three"
+    );
+    assert!(api.wfp_filters.lock().unwrap().is_empty());
+    assert_eq!(
+        orch.adopt_orphans_after_pass(),
+        None,
+        "adoption happens once per start"
+    );
+}
+
+/// The pass that adopts: a user whose set re-adds an inherited id keeps it;
+/// what the set does not name is deleted after the pass, never before it.
+#[test]
+fn the_first_reconcile_keeps_what_it_re_adds_and_drops_the_rest() {
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let source = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
+    let audit = Arc::new(CollectAudit::default());
+    let orch = Arc::new(PerSidApplyOrchestrator::new(
+        Arc::clone(&session),
+        Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        cache,
+        Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
+    ));
+    // The dead instance's leftovers: an orphan block nobody will claim.
+    seeded_block_permit_block(&session, &api);
+    orch.defer_orphans_to_first_pass();
+
+    // A present user with two pinned hosts: their ids are deterministic, so
+    // the pass re-adds over whatever the dead instance left under them.
+    source.set("S-A", snap_full("primary-1", "secondary-1"));
+    rules.set(rules_with_n_primary_ips(2));
+    orch.reconcile(&["S-A".to_string()]).unwrap();
+
+    let remaining: Vec<u64> = api
+        .wfp_filters
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|f| f.id.raw)
+        .collect();
+    let tracked: Vec<u64> = orch
+        .installed_filter_ids("S-A")
+        .into_iter()
+        .map(|id| id.raw)
+        .collect();
+    assert!(!tracked.is_empty(), "the pass installed the user's set");
+    for raw in &remaining {
+        assert!(
+            tracked.contains(raw),
+            "filter {raw} survived the pass unclaimed"
+        );
+    }
+}
+
+/// Without a deferral the start strips at once and the pass adopts nothing.
+#[test]
+fn a_start_that_stripped_at_once_has_nothing_to_adopt() {
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let orch = orch_sharing_session(Arc::clone(&session));
+    seeded_block_permit_block(&session, &api);
+
+    assert_eq!(orch.cleanup_wfp_blocks_only().unwrap(), 2);
+    assert_eq!(orch.adopt_orphans_after_pass(), None);
+    assert_eq!(api.wfp_filters.lock().unwrap().len(), 1, "the permit stays");
+}
+
+/// The stop sweep waits for a transaction in flight under a user's apply
+/// lock, so nothing lands behind the sweep with its ledger line erased.
+#[test]
+fn cleanup_wfp_waits_for_an_apply_in_flight() {
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let orch = orch_sharing_session(Arc::clone(&session));
+    seeded_block_permit_block(&session, &api);
+
+    let lock = orch.apply_lock_for("S-A");
+    let guard = lock.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sweeper = {
+        let orch = Arc::clone(&orch);
+        std::thread::spawn(move || {
+            let n = orch.cleanup_wfp().unwrap();
+            let _ = tx.send(n);
+        })
+    };
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(200))
+            .is_err(),
+        "the sweep ran while the apply lock was held"
+    );
+    assert_eq!(api.wfp_filters.lock().unwrap().len(), 3);
+    drop(guard);
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+        3
+    );
+    sweeper.join().unwrap();
+    assert!(api.wfp_filters.lock().unwrap().is_empty());
+}
+
 #[test]
 fn cleanup_wfp_strips_all_filters_and_clears_state() {
     let api = Arc::new(MockWindowsApi::new());

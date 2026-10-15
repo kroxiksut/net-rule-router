@@ -85,6 +85,10 @@ impl AppPathResolver for ConfirmedClientAppPathResolver {
     fn sibling_executables(&self, exe: &Path) -> Vec<PathBuf> {
         self.inner.sibling_executables(exe)
     }
+
+    fn is_protected_install(&self, exe: &Path) -> bool {
+        self.inner.is_protected_install(exe)
+    }
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@
 //! teardown, cache flush — is unit-testable with a fake redirect + an ephemeral
 //! socket, independent of a live Windows DNS client or a privileged `:53` bind.
 
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -19,6 +19,8 @@ use nrr_platform_api::dns_redirect::{
 };
 
 use crate::dns_listener::DnsInterceptListener;
+use crate::service_tasks::ServiceTaskKind;
+use crate::task_liveness::{TaskLiveness, ThreadExit, ThreadLease, Watch};
 
 /// How often the serve loop wakes to check the stop flag (the socket read
 /// timeout). Small enough that stop is honoured promptly on shutdown.
@@ -203,7 +205,13 @@ pub struct DnsResolverService {
     guard_interval: Duration,
     claims: NamespaceClaims,
     short_names: ShortNameUpkeep,
+    /// Where the serve loop and its guard report their liveness.
+    liveness: Option<Arc<TaskLiveness>>,
 }
+
+/// The serve loop touches its pulse at least once per socket timeout; this
+/// much silence means the thread is stuck, not idle.
+const SERVE_LOOP_SILENCE: Duration = Duration::from_secs(60);
 
 impl DnsResolverService {
     pub fn new(
@@ -218,7 +226,15 @@ impl DnsResolverService {
             guard_interval: REDIRECT_GUARD_INTERVAL,
             claims: NamespaceClaims::default(),
             short_names: ShortNameUpkeep::default(),
+            liveness: None,
         }
+    }
+
+    /// Report the serve loop and the redirect guard to `liveness`.
+    #[must_use]
+    pub fn with_liveness(mut self, liveness: Option<Arc<TaskLiveness>>) -> Self {
+        self.liveness = liveness;
+        self
     }
 
     /// Wire the user's own short-name suffixes. The machine's suffixes are the
@@ -324,7 +340,11 @@ impl DnsResolverService {
     }
 
     /// Re-installs the redirect whenever `inspect` finds it missing or the
-    /// table damaged, until `stop`. Runs beside the serve loop.
+    /// table damaged, until `stop`. Runs beside the serve loop. While no
+    /// upstream answers at all it lifts the redirect instead: a listener that
+    /// can forward nowhere is worse than the system's own resolver, and it is
+    /// put back the moment a server answers a probe.
+    #[allow(clippy::too_many_arguments)]
     fn guard(
         redirect: Arc<dyn SystemDnsRedirectPort>,
         handle: RedirectHandle,
@@ -333,6 +353,8 @@ impl DnsResolverService {
         claims: NamespaceClaims,
         mut applied: Vec<DnsNamespaceExemption>,
         mut short_names: ShortNameUpkeep,
+        lease: Option<ThreadLease>,
+        links: GuardLinks,
     ) {
         // The arm has just read the claims.
         let mut last_read = Instant::now();
@@ -340,11 +362,21 @@ impl DnsResolverService {
         // every tick; a check that finds it in place ends the streak.
         let mut missing_streak = false;
         let mut last_reinstall_error: Option<String> = None;
+        let mut lifted = false;
         loop {
-            let raised = Self::wait_tick(&claims, interval, &stop);
+            let tick = if lifted {
+                interval.min(LIFTED_RECHECK)
+            } else {
+                interval
+            };
+            let raised = Self::wait_tick(&claims, tick, &stop);
             if stop.load(Ordering::SeqCst) {
+                if let Some(lease) = lease {
+                    lease.finish(ThreadExit::Stopped);
+                }
                 return;
             }
+            let _tick = lease.as_ref().map(ThreadLease::work);
             // A connection that appeared may claim a namespace of its own, and
             // one that went away stops claiming it. Checked before the redirect
             // itself: re-installing the catch-all without the exemptions beside
@@ -356,11 +388,75 @@ impl DnsResolverService {
             } else {
                 claims.published.current()
             };
+            // Lifted: nothing is written to the table until an upstream
+            // answers; then the redirect comes back with everything beside it.
+            if lifted {
+                let Some(pool) = links.pool.as_ref() else {
+                    continue;
+                };
+                if pool.reprobe().is_none() {
+                    continue;
+                }
+                let _held = links.latch.hold();
+                if links.latch.is_restored() {
+                    continue;
+                }
+                match redirect.redirect_to(handle.listener) {
+                    Ok(_) => {
+                        lifted = false;
+                        Self::apply_exemptions(&redirect, &claims, &current, &mut applied);
+                        short_names.keep(&redirect, &current);
+                        let _ = redirect.flush_cache();
+                        tracing::info!(
+                            target: "nrr::dns-resolver",
+                            msg_key = "dns-resolver-redirect-back-upstream-answers",
+                            "Mode B: an upstream DNS server answers again — system DNS redirected to the resolver",
+                        );
+                    }
+                    Err(error) => tracing::warn!(
+                        target: "nrr::dns-resolver",
+                        msg_key = "dns-resolver-reinstall-failed",
+                        error = %error,
+                        "Mode B: re-installing the system-DNS redirect failed; \
+                         names resolve past the resolver until the next check",
+                    ),
+                }
+                continue;
+            }
             // Unchanged claims cost a comparison; a write that failed is
             // retried with what was read, without reading again.
             Self::apply_exemptions(&redirect, &claims, &current, &mut applied);
             if due || short_names.failing() {
                 short_names.keep(&redirect, &current);
+            }
+            // Nothing answers: lift, under the latch, so it cannot undo the
+            // restore at stop.
+            if let Some(pool) = links.pool.as_ref() {
+                if pool.upstream_dark() {
+                    let _held = links.latch.hold();
+                    if links.latch.is_restored() {
+                        continue;
+                    }
+                    match redirect.restore(&handle) {
+                        Ok(()) => {
+                            let _ = redirect.flush_cache();
+                            lifted = true;
+                            applied.clear();
+                            tracing::warn!(
+                                target: "nrr::dns-resolver",
+                                msg_key = "dns-resolver-redirect-lifted-no-upstream",
+                                "Mode B: no upstream DNS server answers — the system's DNS is handed back to the OS until one does",
+                            );
+                        }
+                        Err(error) => tracing::warn!(
+                            target: "nrr::dns-resolver",
+                            msg_key = "dns-resolver-restore-failed",
+                            error = %error,
+                            "Mode B: no upstream answers and the redirect could not be lifted; names fail until one answers",
+                        ),
+                    }
+                    continue;
+                }
             }
             match redirect.inspect(&handle) {
                 Ok(RedirectState::Active) => {
@@ -381,6 +477,12 @@ impl DnsResolverService {
                             "Mode B: the system-DNS redirect is no longer configured as written — \
                              re-installing it",
                         );
+                    }
+                    // Never past the restore: a re-install after it would
+                    // leave the OS pointed at a listener that is gone.
+                    let _held = links.latch.hold();
+                    if links.latch.is_restored() {
+                        continue;
                     }
                     match redirect.redirect_to(handle.listener) {
                         Ok(_) => {
@@ -431,9 +533,30 @@ impl DnsResolverService {
     /// - The redirect is installed only AFTER the socket is bound, so the OS is
     ///   never pointed at a listener that does not exist.
     /// - Once installed, the redirect is ALWAYS restored before returning —
-    ///   including when the serve loop errors — so a dead `:53` never outlives
-    ///   this call.
+    ///   the restore is a drop guard, so a panic anywhere after the install,
+    ///   the serve loop included, still runs it — and at a stop it runs before
+    ///   the queued datagrams are dealt with, so a burst cannot delay it.
     pub fn run(&self, stop: &AtomicBool) -> DnsResolverRunOutcome {
+        let lease = self.liveness.as_ref().map(|liveness| {
+            liveness.lease(
+                ServiceTaskKind::DnsResolver,
+                None,
+                Watch::Beats(SERVE_LOOP_SILENCE),
+            )
+        });
+        let (outcome, exit) = self.run_leased(stop, lease.as_ref());
+        if let Some(lease) = lease {
+            lease.finish(exit);
+        }
+        outcome
+    }
+
+    /// [`Self::run`] with the lease to beat on; says how the run ended.
+    fn run_leased(
+        &self,
+        stop: &AtomicBool,
+        lease: Option<&ThreadLease>,
+    ) -> (DnsResolverRunOutcome, ThreadExit) {
         let socket = match UdpSocket::bind(self.listen_addr) {
             Ok(socket) => socket,
             Err(error) => {
@@ -445,11 +568,29 @@ impl DnsResolverService {
                     "Mode B: could not bind the DNS listener; resolver disabled, \
                      system DNS untouched",
                 );
-                return DnsResolverRunOutcome::BindFailed;
+                return (
+                    DnsResolverRunOutcome::BindFailed,
+                    ThreadExit::Ended(format!("could not bind the DNS listener: {error}")),
+                );
             }
         };
         // Read timeout so the serve loop polls `stop` even with no DNS traffic.
         let _ = socket.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
+        // The OS retries a truncated answer over TCP on the same address.
+        // Without it the UDP side still serves; the large answers are lost.
+        let tcp = match socket.local_addr().and_then(TcpListener::bind) {
+            Ok(tcp) => Some(tcp),
+            Err(error) => {
+                tracing::warn!(
+                    target: "nrr::dns-resolver",
+                    msg_key = "dns-resolver-tcp-bind-failed",
+                    addr = %self.listen_addr,
+                    error = %error,
+                    "Mode B: could not bind the DNS listener for TCP; answers too large for a datagram will not resolve",
+                );
+                None
+            }
+        };
 
         // cancel BEFORE touching system DNS if a disarm
         // already fired during the bind. Arming holds no lock across the
@@ -465,7 +606,10 @@ impl DnsResolverService {
                 "Mode B: arm cancelled during bind (mode switched back before redirect); \
                  system DNS untouched",
             );
-            return DnsResolverRunOutcome::CancelledBeforeRedirect;
+            return (
+                DnsResolverRunOutcome::CancelledBeforeRedirect,
+                ThreadExit::Stopped,
+            );
         }
 
         let handle = match self.redirect.redirect_to(self.listen_addr) {
@@ -497,8 +641,19 @@ impl DnsResolverService {
                          Remove-DnsClientNrptRule)",
                     ),
                 }
-                return DnsResolverRunOutcome::RedirectFailed;
+                return (
+                    DnsResolverRunOutcome::RedirectFailed,
+                    ThreadExit::Ended("the system-DNS redirect could not be installed".to_owned()),
+                );
             }
+        };
+        // From here on the restore is owed, whatever happens.
+        let latch = Arc::new(RedirectLatch::default());
+        let restore = RestoreGuard {
+            redirect: Arc::clone(&self.redirect),
+            handle: handle.clone(),
+            latch: Arc::clone(&latch),
+            outcome: Mutex::new(None),
         };
         // Before the flush, so a name inside a claimed namespace is never
         // answered by us even once: the flush is what sends every cached name
@@ -541,6 +696,17 @@ impl DnsResolverService {
                 // The set arm time installed: the guard starts from it so an
                 // unchanged machine writes nothing on its first tick.
                 let applied = applied.clone();
+                let lease = self.liveness.as_ref().map(|liveness| {
+                    liveness.lease(
+                        ServiceTaskKind::DnsRedirectGuard,
+                        None,
+                        Watch::Work(self.guard_interval.saturating_mul(4)),
+                    )
+                });
+                let links = GuardLinks {
+                    latch: Arc::clone(&latch),
+                    pool: Some(Arc::clone(self.listener.upstream_pool())),
+                };
                 move || {
                     Self::guard(
                         redirect,
@@ -550,39 +716,58 @@ impl DnsResolverService {
                         claims,
                         applied,
                         short_names,
+                        lease,
+                        links,
                     )
                 }
             })
             .ok();
 
-        let serve_result = self.listener.serve_udp(&socket, stop);
+        // A panic in the serve loop must still reach the restore: the
+        // alternative is the machine's DNS pointed at a listener that is gone,
+        // with the guard re-installing that redirect every interval. The drop
+        // guard covers it; catching here only keeps the outcome readable.
+        let beat = || {
+            if let Some(lease) = lease {
+                lease.beat();
+            }
+        };
+        // At stop the restore runs first, from the receive thread, before the
+        // queued datagrams are even looked at.
+        let on_stop = || {
+            let _ = restore.restore_now();
+        };
+        let serve_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.listener
+                .serve_observed(&socket, tcp.as_ref(), stop, &beat, &on_stop)
+        })) {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_) => Err("the serve loop panicked".to_owned()),
+        };
 
-        // The guard must be gone before the restore, or it re-installs what
-        // the restore just removed.
+        // Fail-safe teardown: restore no matter how the serve loop ended. The
+        // latch keeps the guard from re-installing what this removes.
+        let restored = restore.restore_now();
         guard_stop.store(true, Ordering::SeqCst);
         if let Some(guard) = guard {
             let _ = guard.join();
         }
-
-        // Fail-safe teardown: restore no matter how the serve loop ended.
-        if let Err(error) = self.redirect.restore(&handle) {
-            tracing::error!(
+        match &restored {
+            Err(error) => tracing::error!(
                 target: "nrr::dns-resolver",
                 msg_key = "dns-resolver-restore-failed",
                 error = %error,
                 "Mode B: FAILED to restore system DNS; if name resolution is \
                  broken, remove the NetRuleRouter NRPT rule manually \
                  (Get-DnsClientNrptRule / Remove-DnsClientNrptRule)",
-            );
-        } else {
-            let _ = self.redirect.flush_cache();
-            tracing::info!(
+            ),
+            Ok(()) => tracing::info!(
                 target: "nrr::dns-resolver",
                 msg_key = "dns-resolver-stopped-restored",
                 "Mode B: DNS resolver stopped — system DNS restored",
-            );
+            ),
         }
-        if let Err(error) = serve_result {
+        if let Err(error) = &serve_result {
             tracing::warn!(
                 target: "nrr::dns-resolver",
                 msg_key = "dns-resolver-serve-loop-error",
@@ -590,7 +775,87 @@ impl DnsResolverService {
                 "Mode B: DNS serve loop ended with an error",
             );
         }
-        DnsResolverRunOutcome::ServedAndRestored
+        // The one exit that leaves the machine worse than before the arm is
+        // reported at least Degraded, with the text the clients key their hint on.
+        let exit = match (restored, serve_result, stop.load(Ordering::SeqCst)) {
+            (Err(error), _, _) => ThreadExit::Broken(format!(
+                "{}: {error}",
+                nrr_shared::ipc_payloads::SYSTEM_DNS_NOT_RESTORED
+            )),
+            (Ok(()), Err(error), _) => ThreadExit::Ended(format!("serve loop ended: {error}")),
+            (Ok(()), Ok(()), true) => ThreadExit::Stopped,
+            (Ok(()), Ok(()), false) => {
+                ThreadExit::Ended("serve loop returned without a stop".to_owned())
+            }
+        };
+        (DnsResolverRunOutcome::ServedAndRestored, exit)
+    }
+}
+
+/// How often the guard asks whether an upstream answers while the redirect is
+/// lifted for want of one. Each ask is a probe sweep, floored by the pool.
+const LIFTED_RECHECK: Duration = Duration::from_secs(5);
+
+/// Who may touch the redirect: the guard's re-installs and the restore take
+/// turns, and once the restore has run nothing re-installs.
+#[derive(Default)]
+struct RedirectLatch {
+    turn: Mutex<()>,
+    restored: AtomicBool,
+}
+
+impl RedirectLatch {
+    fn hold(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.turn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn is_restored(&self) -> bool {
+        self.restored.load(Ordering::SeqCst)
+    }
+}
+
+/// What the guard shares with the rest of the run. The default is a guard on
+/// its own: no pool to watch, a latch nobody else holds.
+#[derive(Default)]
+struct GuardLinks {
+    latch: Arc<RedirectLatch>,
+    pool: Option<Arc<crate::dns_upstream::UpstreamDnsPool>>,
+}
+
+/// Restores the system's DNS exactly once, on the first call or on drop —
+/// whichever comes first — so no exit path from an installed redirect, a
+/// panic included, leaves the OS pointed at a listener that is gone.
+struct RestoreGuard {
+    redirect: Arc<dyn SystemDnsRedirectPort>,
+    handle: RedirectHandle,
+    latch: Arc<RedirectLatch>,
+    outcome: Mutex<Option<Result<(), String>>>,
+}
+
+impl RestoreGuard {
+    /// Restore now; a later call (or the drop) answers with the first result.
+    fn restore_now(&self) -> Result<(), String> {
+        let _turn = self.latch.hold();
+        let mut outcome = self.outcome.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(done) = outcome.as_ref() {
+            return done.clone();
+        }
+        self.latch.restored.store(true, Ordering::SeqCst);
+        let result = match self.redirect.restore(&self.handle) {
+            Ok(()) => {
+                let _ = self.redirect.flush_cache();
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        *outcome = Some(result.clone());
+        result
+    }
+}
+
+impl Drop for RestoreGuard {
+    fn drop(&mut self) {
+        let _ = self.restore_now();
     }
 }
 
@@ -1024,6 +1289,10 @@ mod tests {
     struct RecordingRedirect {
         calls: Mutex<Vec<&'static str>>,
         flip_stop: Option<Arc<AtomicBool>>,
+        /// Where the listener was bound, as `redirect_to` was told.
+        bound: Mutex<Option<SocketAddr>>,
+        /// When the first restore ran.
+        restored_at: Mutex<Option<Instant>>,
         /// How many self-checks answer "gone" before the redirect reads as
         /// intact again — the guard's re-install is what the count buys.
         damaged_checks: std::sync::atomic::AtomicUsize,
@@ -1045,6 +1314,7 @@ mod tests {
     }
     impl SystemDnsRedirectPort for RecordingRedirect {
         fn redirect_to(&self, listener: SocketAddr) -> Result<RedirectHandle, PlatformError> {
+            *self.bound.lock().unwrap() = Some(listener);
             let mut calls = self.calls.lock().unwrap();
             calls.push("redirect_to");
             if calls.iter().filter(|c| **c == "redirect_to").count() > 1 {
@@ -1071,6 +1341,10 @@ mod tests {
             Ok(RedirectState::Active)
         }
         fn restore(&self, _handle: &RedirectHandle) -> Result<(), PlatformError> {
+            self.restored_at
+                .lock()
+                .unwrap()
+                .get_or_insert_with(Instant::now);
             self.calls.lock().unwrap().push("restore");
             Ok(())
         }
@@ -1294,6 +1568,8 @@ mod tests {
                         claims,
                         Vec::new(),
                         short_names,
+                        None,
+                        GuardLinks::default(),
                     );
                 }
             });
@@ -1664,6 +1940,8 @@ mod tests {
                     claims,
                     Vec::new(),
                     ShortNameUpkeep::default(),
+                    None,
+                    GuardLinks::default(),
                 );
             }
         });
@@ -1738,6 +2016,8 @@ mod tests {
                     },
                     std::mem::take(&mut applied),
                     ShortNameUpkeep::default(),
+                    None,
+                    GuardLinks::default(),
                 );
             }
         });
@@ -2142,5 +2422,194 @@ mod tests {
         signed.store(true, Ordering::SeqCst);
         controller.try_tick();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "the watchdog never armed");
+    }
+
+    // ── Restore first, whatever the queue holds ──────────────────────────────
+
+    struct AnyHost;
+    impl RuleHostOracle for AnyHost {
+        fn is_rule_host(&self, _hostname: &str) -> bool {
+            true
+        }
+    }
+
+    /// Takes `0` per answer: the shape of a slow upstream under a burst.
+    struct SlowUpstream(Duration);
+    impl UpstreamResolver for SlowUpstream {
+        fn resolve_within(
+            &self,
+            _hostname: &str,
+            _family: AddressFamily,
+            _budget: Duration,
+        ) -> Result<ResolvedAddresses, ResolveError> {
+            std::thread::sleep(self.0);
+            Ok(ResolvedAddresses {
+                addresses: vec!["100.64.0.9".parse().expect("ip")],
+                ttl_seconds: 60,
+            })
+        }
+    }
+
+    fn wait_for(what: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A stop that arrives under a burst of slow queries restores the system's
+    /// DNS at once; the queued datagrams are thrown away, not worked through.
+    #[test]
+    fn a_stop_under_a_burst_restores_dns_before_the_queue_is_drained() {
+        let listener = DnsInterceptListener::new(
+            Arc::new(AnyHost),
+            Arc::new(SlowUpstream(Duration::from_millis(300))),
+            Arc::new(NoopSink),
+            Arc::new(OkReconciler),
+            "127.0.0.1:5353".parse().expect("addr"),
+            Duration::from_millis(150),
+            Duration::from_millis(500),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirect = Arc::new(RecordingRedirect::default());
+        let service =
+            DnsResolverService::new(listener, redirect.clone(), "127.0.0.1:0".parse().unwrap());
+        let run = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || service.run(&stop)
+        });
+        wait_for("the listener to bind", || {
+            redirect.bound.lock().unwrap().is_some()
+        });
+        let addr = redirect.bound.lock().unwrap().expect("bound");
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client");
+        let query =
+            crate::dns_wire::build_address_query(7, "slow.example", crate::dns_wire::QTYPE_A)
+                .expect("query");
+        // Far more than the workers clear in the time the stop is given.
+        for _ in 0..200 {
+            let _ = client.send_to(&query, addr);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let stopped_at = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(
+            run.join().expect("run"),
+            DnsResolverRunOutcome::ServedAndRestored
+        );
+        let restored_at = redirect.restored_at.lock().unwrap().expect("restored");
+        assert!(
+            restored_at.duration_since(stopped_at) < Duration::from_secs(1),
+            "the restore waited on the queue: {:?}",
+            restored_at.duration_since(stopped_at)
+        );
+        assert!(
+            stopped_at.elapsed() < Duration::from_secs(2),
+            "the run drained the queue instead of discarding it: {:?}",
+            stopped_at.elapsed()
+        );
+    }
+
+    /// The restore is owed from the moment the redirect is installed, and a
+    /// panic anywhere after that still pays it.
+    #[test]
+    fn a_panic_after_the_redirect_still_restores_through_the_drop_guard() {
+        let redirect = Arc::new(RecordingRedirect::default());
+        let latch = Arc::new(RedirectLatch::default());
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = RestoreGuard {
+                redirect: redirect.clone(),
+                handle: RedirectHandle {
+                    marker: "test".to_string(),
+                    listener: "127.0.0.1:0".parse().expect("addr"),
+                },
+                latch: Arc::clone(&latch),
+                outcome: Mutex::new(None),
+            };
+            panic!("somewhere inside the serve loop");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(
+            redirect.calls.lock().unwrap().as_slice(),
+            ["restore", "flush"]
+        );
+        assert!(
+            latch.is_restored(),
+            "and the guard thread may re-install nothing"
+        );
+    }
+
+    // ── No upstream answers: hand DNS back until one does ────────────────────
+
+    struct SwitchProbe(Mutex<bool>);
+    impl crate::dns_upstream::UpstreamProbe for SwitchProbe {
+        fn responds(&self, _server: SocketAddr) -> bool {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// A resolver whose every upstream has stopped answering is worse than no
+    /// resolver: the redirect is lifted while that lasts and put back, with
+    /// its exemptions, once a server answers a probe again.
+    #[test]
+    fn a_pool_with_no_answering_upstream_lifts_the_redirect_until_one_answers() {
+        let probe = Arc::new(SwitchProbe(Mutex::new(false)));
+        let pool = Arc::new(crate::dns_upstream::UpstreamDnsPool::new(
+            Arc::new(nrr_platform_api::dns::StaticDnsServers::new(vec![
+                "192.0.2.53".parse().expect("ip"),
+            ])),
+            Arc::clone(&probe) as Arc<dyn crate::dns_upstream::UpstreamProbe>,
+        ));
+        assert_eq!(pool.refresh(), None, "nothing answers at arm time");
+        assert!(pool.upstream_dark());
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirect = Arc::new(RecordingRedirect::default());
+        let service = DnsResolverService::new(
+            listener().with_upstream_pool(pool),
+            redirect.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .with_guard_interval(Duration::from_millis(20))
+        .with_namespace_exemptions(Arc::new(|| vec![exemption("branch.corp.example")]));
+        let run = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || service.run(&stop)
+        });
+        let count = |name: &str| {
+            redirect
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| **c == name)
+                .count()
+        };
+        wait_for("the redirect to be lifted", || count("restore") == 1);
+        assert_eq!(count("redirect_to"), 1);
+        *probe.0.lock().unwrap() = true;
+        wait_for("the redirect to come back", || count("redirect_to") == 2);
+        assert_eq!(
+            count("exempt"),
+            2,
+            "the exemptions are written again beside the re-installed catch-all"
+        );
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(
+            run.join().expect("run"),
+            DnsResolverRunOutcome::ServedAndRestored
+        );
+        let calls = redirect.calls.lock().unwrap().clone();
+        let positions: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c == "restore" || **c == "redirect_to")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            positions.len(),
+            4,
+            "install, lift, re-install, stop: {calls:?}"
+        );
     }
 }

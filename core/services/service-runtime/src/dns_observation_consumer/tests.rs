@@ -1,6 +1,6 @@
 use super::*;
 use nrr_domain::canonical::{CanonicalRule, CanonicalRuleBook};
-use nrr_domain::{RouteBehaviorMode, RuleId};
+use nrr_domain::RuleId;
 use std::net::Ipv4Addr;
 
 use crate::fqdn_cache_lookup::{FqdnCacheLookup, MockFqdnCacheLookup, SqliteFqdnCacheLookup};
@@ -40,7 +40,6 @@ impl RulesProvider for FakeRules {
                 primary: self.primary.clone(),
                 secondary: self.secondary.clone(),
             },
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
         })
     }
 }
@@ -1020,7 +1019,6 @@ impl RulesProvider for RulesPerSid {
                 primary: CanonicalRuleSet::default(),
                 secondary: self.0.get(principal)?.clone(),
             },
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
         })
     }
 }

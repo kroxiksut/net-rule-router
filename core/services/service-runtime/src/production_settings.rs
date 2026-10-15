@@ -71,12 +71,14 @@ impl crate::routing_pause::PauseDispatcher for NoopPauseDispatcher {
     }
 }
 
-/// production `PauseDispatcher` wrapping
-/// [`crate::per_sid_orchestrator::PerSidApplyOrchestrator`]. The
-/// adapter forwards `install_for_sid` / `remove_for_sid` directly. The
-/// orchestrator's idempotency (re-install on already-installed SID
-/// succeeds) carries through, so the `PauseDispatcher` contract is
-/// preserved without extra bookkeeping.
+/// Production `PauseDispatcher` over
+/// [`crate::per_sid_orchestrator::PerSidApplyOrchestrator`].
+///
+/// A pause is the pass without that user, as on Linux: the flag is already
+/// stored when this is called, so one membership settle — the same decision
+/// the pass and the registry listener make, under the same lock — withdraws
+/// the paused user's set and a resume puts it back. Installing or removing
+/// here directly would be a second writer racing the pass with an older view.
 pub struct OrchestratorPauseDispatcher {
     orchestrator: Arc<crate::per_sid_orchestrator::PerSidApplyOrchestrator>,
 }
@@ -88,18 +90,24 @@ impl OrchestratorPauseDispatcher {
 }
 
 impl crate::routing_pause::PauseDispatcher for OrchestratorPauseDispatcher {
-    fn install_for_sid(&self, sid: &str) -> Result<(), String> {
+    fn install_for_sid(&self, _sid: &str) -> Result<(), String> {
         self.orchestrator
-            .install_for_sid(sid)
-            .map(|_count| ())
-            .map_err(|e| format!("install_for_sid failed: {e}"))
+            .settle()
+            .map(|_decided| ())
+            .map_err(|e| format!("membership settle after resume failed: {e}"))
     }
 
     fn remove_for_sid(&self, sid: &str) -> Result<(), String> {
-        self.orchestrator
-            .remove_for_sid(sid)
-            .map(|_count| ())
-            .map_err(|e| format!("remove_for_sid failed: {e}"))
+        let decided = self
+            .orchestrator
+            .settle()
+            .map_err(|e| format!("membership settle after pause failed: {e}"))?;
+        // The flag is stored before this call, so a decider that still names
+        // the user did not read it: report it rather than claim a pause.
+        if decided.iter().any(|s| s == sid) {
+            return Err(format!("{sid} is still enforced after the pause settle"));
+        }
+        Ok(())
     }
 }
 

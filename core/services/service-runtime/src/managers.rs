@@ -39,6 +39,45 @@ pub struct BootstrapReport {
     pub blocking: bool,
 }
 
+impl BootstrapReport {
+    /// Record a phase that stops the start, with the reason a person will
+    /// read in the health card.
+    pub fn block(&mut self, phase: &'static str, reason: impl Into<String>) {
+        self.phases.push(BootstrapPhaseStatus {
+            phase,
+            severity: ServiceHealthSeverity::Blocking,
+            message: reason.into(),
+        });
+        self.worst_severity = ServiceHealthSeverity::Blocking;
+        self.blocking = true;
+    }
+
+    /// Record a phase that finished with a non-blocking anomaly the health
+    /// card should show.
+    pub fn warn(&mut self, phase: &'static str, message: impl Into<String>) {
+        self.phases.push(BootstrapPhaseStatus {
+            phase,
+            severity: ServiceHealthSeverity::Warning,
+            message: message.into(),
+        });
+        // `Unknown` sorts above `Blocking`, so `max` cannot keep the worse of two.
+        if matches!(
+            self.worst_severity,
+            ServiceHealthSeverity::Ok | ServiceHealthSeverity::Unknown
+        ) {
+            self.worst_severity = ServiceHealthSeverity::Warning;
+        }
+    }
+
+    /// The first blocking phase and its reason.
+    pub fn blocking_reason(&self) -> Option<String> {
+        self.phases
+            .iter()
+            .find(|p| p.severity == ServiceHealthSeverity::Blocking)
+            .map(|p| format!("{}: {}", p.phase, p.message))
+    }
+}
+
 /// Storage subsystem (`nrr-storage`). The trait wraps the
 /// service-state DB and the FQDN/IP cache so the runtime never touches
 /// `rusqlite::Connection` directly. The production
@@ -315,11 +354,6 @@ pub trait HealthReporter: Send + Sync {
     /// whoever is diagnosing. Defaulted to empty so a reporter that genuinely
     /// tracks nothing (test doubles, the degraded-boot stub) stays valid.
     fn components(&self) -> Vec<(&'static str, ServiceHealthSeverity, String)> {
-        Vec::new()
-    }
-
-    /// Slugs of the degraded modes currently in force, sorted.
-    fn degraded_modes(&self) -> Vec<String> {
         Vec::new()
     }
 }

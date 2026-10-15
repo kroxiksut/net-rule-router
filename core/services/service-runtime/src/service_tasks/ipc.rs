@@ -182,6 +182,8 @@ pub fn build_ipc_accept_task_bundle(
         interval: None,
         max_restarts,
         backoff: accept_backoff,
+        // Waiting for a client is the tick; it has no deadline.
+        tick_deadline: None,
         tick: Box::new(accept_tick),
         // Draining on the way out, not inside a tick: whichever way the loop
         // ended, the workers get their signal and are joined once.

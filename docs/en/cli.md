@@ -97,6 +97,7 @@ Flags:
 | `--start-mode=<auto\|on-demand>` | `install` | Start with the operating system (default), or when the application is launched |
 | `--purge` | `uninstall` | Also delete the service-owned data directory. Your rule files are kept either way |
 | `--confirm` | `reset-network` | Required. Without it the command explains what it would drop and refuses |
+| `--stop-service` | `reset-network` | Stop a running service first (ending it if it hangs), then reset |
 | `--tail=<N>` | `diag logs` | How many of the newest lines to print. Default 50, maximum 2000 |
 | `--elevate` | every *administrator* verb | If the command turns out to need administrator rights, ask the system for them and run it again instead of asking you |
 
@@ -133,9 +134,11 @@ is the way back to the log without administrator rights.
 `reset-network` is for the machine that lost the network because the service
 died without cleaning up after itself. It does not undo anything by itself: it
 runs the service binary's own reset, because the program that applied the state
-is the only one that knows every piece of it. Nor does it stop the service: a
-running service would put the state straight back, so stop it first — on Linux
-the reset refuses until you have. Because open connections can drop
+is the only one that knows every piece of it. A running service would put the
+state straight back, so while it runs the reset refuses and names the variant
+that stops it first: `--stop-service` stops the service, ends it if it does not
+stop in time, then resets — the same on Windows and Linux, and the same as the
+"Stop service and restore network" button in the window. Because open connections can drop
 when the state goes, the command refuses without `--confirm` and explains what
 it would remove. Where the service applies no network state yet, it says so and
 exits with code 6 rather than pretending to have cleaned something.

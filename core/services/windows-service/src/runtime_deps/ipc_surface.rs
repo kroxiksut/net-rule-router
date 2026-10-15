@@ -652,6 +652,18 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
             ),
         )
             as Arc<dyn nrr_service_runtime::ipc_handlers::doh_resolvers::DohResolverListStore>);
+        // The home-network suffix list the DNS guard leaves to the main link.
+        {
+            use nrr_service_runtime::production_local_dns_suffixes::{
+                ProductionLocalDnsSuffixContext, ProductionLocalDnsSuffixStore,
+            };
+            deps = deps.with_local_dns_suffixes(
+                Arc::new(ProductionLocalDnsSuffixStore::new(Arc::clone(conn))),
+                Arc::new(ProductionLocalDnsSuffixContext::new(Arc::new(
+                    ProductionRulesProvider::new(Arc::clone(conn)),
+                ))),
+            );
+        }
         // Wire the FQDN/IP cache repository so the
         // `cache.clear` IPC op can clear it. Only when the cache DB opened.
         if let Some(cache) = cache_store.clone() {

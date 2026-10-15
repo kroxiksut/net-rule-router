@@ -52,7 +52,6 @@ impl RulesProvider for FakeRules {
                 primary: CanonicalRuleSet::from_rules(vec![]),
                 secondary,
             },
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
         })
     }
 }
@@ -193,6 +192,7 @@ impl RoutePolicySource for FakePolicy {
             link_provider_exe_paths: Vec::new(),
             doh_lockdown_enabled: false,
             doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
+            doh_lockdown_auto: false,
             doh_resolver_ips: Vec::new(),
             auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
             primary_probe_auto: false,
@@ -202,6 +202,7 @@ impl RoutePolicySource for FakePolicy {
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
             app_rules_take_all_addresses: false,
+            guard_forwarded_traffic: true,
         })
     }
 }

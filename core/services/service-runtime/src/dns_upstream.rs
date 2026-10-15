@@ -8,14 +8,14 @@
 //! committing, rotate when the active one stops answering, re-enumerate when the
 //! network changes.
 
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use nrr_platform_api::dns::{SystemDnsServersPort, UpstreamDnsCandidate};
+use nrr_platform_api::dns::{SystemDnsServersPort, UpstreamDnsServer};
 
 /// Standard DNS port; the OS never reports a port with its server list.
 const DNS_PORT: u16 = 53;
@@ -88,7 +88,11 @@ impl UpstreamProbe for UdpUpstreamProbe {
         else {
             return false;
         };
-        let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        let wildcard: SocketAddr = match server {
+            SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+            SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+        };
+        let Ok(sock) = UdpSocket::bind(wildcard) else {
             return false;
         };
         nrr_platform_api::own_traffic::mark_own_socket(&sock);
@@ -129,9 +133,9 @@ pub type PreferredInterfaceFn = Arc<dyn Fn() -> Option<u32> + Send + Sync>;
 
 struct PoolState {
     /// Candidates in preference order, as last enumerated.
-    candidates: Vec<UpstreamDnsCandidate>,
+    candidates: Vec<UpstreamDnsServer>,
     /// The server currently being forwarded to.
-    active: Option<Ipv4Addr>,
+    active: Option<IpAddr>,
     /// Consecutive failures reported against `active`.
     failures: u32,
     last_refresh: Option<Instant>,
@@ -148,6 +152,9 @@ struct PoolState {
 pub struct UpstreamDnsPool {
     servers: Arc<dyn SystemDnsServersPort>,
     probe: Arc<dyn UpstreamProbe>,
+    /// What every candidate is reached on; only an explicitly dictated
+    /// address ([`Self::fixed`]) differs from the standard port.
+    port: u16,
     preferred_interface: OnceLock<PreferredInterfaceFn>,
     /// Held for the duration of one sweep. Probing is slow and the answer is
     /// shared, so a second caller takes the current choice rather than running
@@ -157,6 +164,10 @@ pub struct UpstreamDnsPool {
     /// A background re-selection is under way; see
     /// [`Self::note_network_change_in_background`].
     background_refresh: AtomicBool,
+    /// The last sweep found no server answering and nothing has answered
+    /// since. Read by the resolver service, which lifts the redirect while it
+    /// holds: every forward would wait out its timeout and fail.
+    dark: AtomicBool,
 }
 
 impl UpstreamDnsPool {
@@ -164,6 +175,7 @@ impl UpstreamDnsPool {
         Self {
             servers,
             probe,
+            port: DNS_PORT,
             preferred_interface: OnceLock::new(),
             sweep: Mutex::new(()),
             state: Mutex::new(PoolState {
@@ -174,7 +186,13 @@ impl UpstreamDnsPool {
                 last_empty_sweep: None,
             }),
             background_refresh: AtomicBool::new(false),
+            dark: AtomicBool::new(false),
         }
+    }
+
+    /// Whether no upstream is known to answer right now — see [`Self::dark`].
+    pub fn upstream_dark(&self) -> bool {
+        self.dark.load(Ordering::Relaxed)
     }
 
     /// Prefer the resolver of the interface this returns.
@@ -200,23 +218,31 @@ impl UpstreamDnsPool {
     /// shape callers use when the upstream is dictated rather than discovered
     /// (tests, and any caller handed an explicit address).
     pub fn fixed(server: SocketAddr) -> Self {
-        let ip = match server {
-            SocketAddr::V4(v4) => *v4.ip(),
-            SocketAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+        let ip = server.ip();
+        let servers = match ip {
+            IpAddr::V4(v4) => nrr_platform_api::dns::StaticDnsServers::new(vec![v4]),
+            IpAddr::V6(v6) => {
+                nrr_platform_api::dns::StaticDnsServers::new(Vec::new()).with_v6(vec![v6])
+            }
         };
         Self {
-            servers: Arc::new(nrr_platform_api::dns::StaticDnsServers::new(vec![ip])),
+            servers: Arc::new(servers),
             probe: Arc::new(AcceptingProbe),
+            port: server.port(),
             preferred_interface: OnceLock::new(),
             sweep: Mutex::new(()),
             state: Mutex::new(PoolState {
-                candidates: vec![UpstreamDnsCandidate::new(None, ip)],
+                candidates: vec![UpstreamDnsServer {
+                    interface_index: None,
+                    server: ip,
+                }],
                 active: Some(ip),
                 failures: 0,
                 last_refresh: Some(Instant::now()),
                 last_empty_sweep: None,
             }),
             background_refresh: AtomicBool::new(false),
+            dark: AtomicBool::new(false),
         }
     }
 
@@ -230,12 +256,13 @@ impl UpstreamDnsPool {
     pub fn current(&self) -> Option<SocketAddr> {
         self.lock()
             .active
-            .map(|ip| SocketAddr::from((ip, DNS_PORT)))
+            .map(|ip| SocketAddr::from((ip, self.port)))
     }
 
     /// A forward succeeded — the active server is good.
     pub fn note_success(&self) {
         self.lock().failures = 0;
+        self.dark.store(false, Ordering::Relaxed);
     }
 
     /// A forward failed. Returns the replacement once the failure streak retires
@@ -262,7 +289,7 @@ impl UpstreamDnsPool {
         }
         replacement
             .filter(|ip| Some(*ip) != retired)
-            .map(|ip| SocketAddr::from((ip, DNS_PORT)))
+            .map(|ip| SocketAddr::from((ip, self.port)))
     }
 
     /// Re-enumerate and re-probe now, regardless of the failure streak. Called
@@ -288,7 +315,15 @@ impl UpstreamDnsPool {
                 "upstream DNS re-selected after a network change",
             );
         }
-        selected.map(|ip| SocketAddr::from((ip, DNS_PORT)))
+        selected.map(|ip| SocketAddr::from((ip, self.port)))
+    }
+
+    /// Probe the known candidates again (re-enumerating only when the list is
+    /// stale), for a caller waiting for ANY server to answer. Honours the
+    /// pool's floors, so calling it every few seconds costs one sweep each.
+    pub fn reprobe(&self) -> Option<SocketAddr> {
+        self.reselect(None)
+            .map(|ip| SocketAddr::from((ip, self.port)))
     }
 
     /// The OS reported a network change. Re-selects at most once per
@@ -319,12 +354,21 @@ impl UpstreamDnsPool {
         if self.background_refresh.swap(true, Ordering::SeqCst) {
             return;
         }
+        /// Clears the busy flag however the worker ends, a panic included:
+        /// left set, it would drop every later re-selection for good.
+        struct RefreshDone(Arc<UpstreamDnsPool>);
+        impl Drop for RefreshDone {
+            fn drop(&mut self) {
+                self.0.background_refresh.store(false, Ordering::SeqCst);
+            }
+        }
         let pool = Arc::clone(self);
         let spawned = std::thread::Builder::new()
             .name("nrr-dns-upstream-refresh".into())
             .spawn(move || {
-                let selected = pool.note_network_change();
-                pool.background_refresh.store(false, Ordering::SeqCst);
+                let done = RefreshDone(pool);
+                let selected = done.0.note_network_change();
+                drop(done);
                 then(selected);
             });
         if let Err(e) = spawned {
@@ -340,7 +384,7 @@ impl UpstreamDnsPool {
 
     /// Pick the first candidate that answers, preferring anything over `avoid`.
     /// Re-enumerates from the OS when the candidate list is stale.
-    fn reselect(&self, avoid: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    fn reselect(&self, avoid: Option<IpAddr>) -> Option<IpAddr> {
         let swept_recently = {
             let state = self.lock();
             state
@@ -362,7 +406,7 @@ impl UpstreamDnsPool {
                 .is_none_or(|at| at.elapsed() >= MIN_REFRESH_GAP)
         };
         if stale {
-            let fresh = self.servers.upstream_candidates_v4();
+            let fresh = self.servers.upstream_candidates();
             let mut state = self.lock();
             state.last_refresh = Some(Instant::now());
             if !fresh.is_empty() {
@@ -374,8 +418,8 @@ impl UpstreamDnsPool {
         // trying to move off of last.
         let preferred = self.preferred_interface.get().and_then(|resolve| resolve());
         let on_preferred =
-            |c: &UpstreamDnsCandidate| preferred.is_some() && c.interface_index == preferred;
-        let mut ordered: Vec<&UpstreamDnsCandidate> = Vec::with_capacity(candidates.len());
+            |c: &UpstreamDnsServer| preferred.is_some() && c.interface_index == preferred;
+        let mut ordered: Vec<&UpstreamDnsServer> = Vec::with_capacity(candidates.len());
         ordered.extend(
             candidates
                 .iter()
@@ -388,17 +432,20 @@ impl UpstreamDnsPool {
         );
         ordered.extend(candidates.iter().filter(|c| Some(c.server) == avoid));
         for ip in ordered.into_iter().map(|c| c.server) {
-            if self.probe.responds(SocketAddr::from((ip, DNS_PORT))) {
+            if self.probe.responds(SocketAddr::from((ip, self.port))) {
                 let mut state = self.lock();
                 state.active = Some(ip);
                 state.failures = 0;
                 state.last_empty_sweep = None;
+                self.dark.store(false, Ordering::Relaxed);
                 return Some(ip);
             }
         }
         // Nothing answered. Keep the previous choice rather than blanking it:
         // a machine that is briefly offline has no better server to offer, and
-        // dropping the redirect mid-session would be the louder failure.
+        // dropping the redirect mid-session would be the louder failure. The
+        // `dark` flag says so for whoever must act on it.
+        self.dark.store(true, Ordering::Relaxed);
         let mut state = self.lock();
         state.last_empty_sweep = Some(Instant::now());
         // The rotation this streak asked for has been attempted and there was
@@ -414,6 +461,46 @@ mod tests {
     use super::*;
     use nrr_platform_api::dns::{StaticDnsServers, UpstreamDnsCandidate};
     use std::sync::atomic::AtomicUsize;
+
+    /// A network with DNS only over IPv6: the pool must be able to pick a v6
+    /// server at all, or such a network has no upstream.
+    #[test]
+    fn an_ipv6_only_server_list_yields_a_v6_upstream() {
+        struct AnyProbe;
+        impl UpstreamProbe for AnyProbe {
+            fn responds(&self, _server: SocketAddr) -> bool {
+                true
+            }
+        }
+        let v6: Ipv6Addr = "2001:db8::53".parse().expect("v6");
+        let pool = UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::new(Vec::new()).with_v6(vec![v6])),
+            Arc::new(AnyProbe),
+        );
+        assert_eq!(pool.refresh(), Some(SocketAddr::from((v6, 53))));
+    }
+
+    /// "Nothing answers" is a state the resolver service acts on; it must be
+    /// raised by an empty sweep and cleared by the first server that answers.
+    #[test]
+    fn an_empty_sweep_marks_the_pool_dark_until_a_server_answers() {
+        let probe = ScriptedProbe::new(vec![]);
+        let pool = pool(vec![ip(0)], Arc::clone(&probe));
+        assert!(!pool.upstream_dark());
+        pool.refresh();
+        assert!(pool.upstream_dark(), "no candidate answered");
+        probe.set_alive(vec![ip(0)]);
+        pool.refresh();
+        assert!(!pool.upstream_dark(), "a probe that answers clears it");
+        probe.set_alive(vec![]);
+        pool.refresh();
+        assert!(pool.upstream_dark());
+        pool.note_success();
+        assert!(
+            !pool.upstream_dark(),
+            "a forward that succeeded clears it too"
+        );
+    }
 
     /// Probe answering only for an allow-list, counting calls.
     struct ScriptedProbe {

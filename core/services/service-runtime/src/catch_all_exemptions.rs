@@ -15,14 +15,21 @@
 //! [`RouteEntry`][nrr_platform_api::types::RouteEntry] — what was missing was a
 //! caller that reads the facts on a platform where the route table is a port.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use nrr_platform_api::adapters::AdapterInfo;
 use nrr_platform_api::types::RouteEntry;
+use nrr_shared::ip_block::IpBlock;
+use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+use crate::ipc_handlers::event_bus::EventBus;
 
 use crate::route_reconciler::{
-    bootstrap_server_ips, bootstrap_server_ips_v6, primary_gateway_v6, primary_local_subnets,
-    primary_local_subnets_v6, virtual_machine_local_subnets,
+    bootstrap_server_ips, bootstrap_server_ips_v6, exemptible_local_subnets, primary_gateway_v6,
+    virtual_machine_local_subnets,
 };
 
 /// The escapes a blanket block grants, for one principal's bindings.
@@ -30,15 +37,22 @@ use crate::route_reconciler::{
 pub struct CatchAllExemptions {
     /// Tunnel-server endpoints, from the bootstrap host routes.
     pub server_ips: Vec<Ipv4Addr>,
-    /// Subnets this machine is directly attached to over the primary link, plus
-    /// the private segments of its own virtual-machine adapters.
+    /// The private part of the subnets this machine is directly attached to
+    /// over the primary link, plus the private segments of its own
+    /// virtual-machine adapters.
     pub local_subnets: Vec<(Ipv4Addr, u8)>,
     /// Tunnel-server endpoints reached over IPv6, from the `/128` bootstrap
     /// routes. Empty on a machine with no v6 — which is not a reason to refuse
     /// to arm, because the tunnel then bootstraps over v4.
     pub server_ips_v6: Vec<Ipv6Addr>,
-    /// The prefixes the primary link is directly attached to over IPv6.
+    /// The private part of the prefixes the primary link is directly attached
+    /// to over IPv6.
     pub local_subnets_v6: Vec<(Ipv6Addr, u8)>,
+    /// Segments the primary link reported that are too wide to be a local
+    /// network. Nothing of them is exempt; the caller tells the user
+    /// (`StatusUpdateEvent::LocalNetworkTooWide`), named by the primary's
+    /// display name.
+    pub too_wide: Vec<IpBlock>,
 }
 
 impl CatchAllExemptions {
@@ -73,7 +87,8 @@ pub fn collect_exemptions(
         return CatchAllExemptions::default();
     };
 
-    let mut local_subnets = primary_local_subnets(routes, primary.index);
+    let attached = exemptible_local_subnets(routes, primary.index);
+    let mut local_subnets = attached.v4;
     for subnet in virtual_machine_local_subnets(routes, adapters, secondary.map(|s| s.index)) {
         if !local_subnets.contains(&subnet) {
             local_subnets.push(subnet);
@@ -91,7 +106,68 @@ pub fn collect_exemptions(
             tunnel,
             primary_gateway_v6(routes, primary.index),
         ),
-        local_subnets_v6: primary_local_subnets_v6(routes, primary.index),
+        local_subnets_v6: attached.v6,
+        too_wide: attached.too_wide,
+    }
+}
+
+/// How often one user hears about one too-wide segment: the passes run at
+/// reconcile cadence, and the network does not change its mind between them.
+pub const TOO_WIDE_NOTICE_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Tells a user that the main link reports a segment too wide to be a local
+/// network — half the internet, on a hostile access point — and that leak
+/// protection keeps blocking it. One latch per `sid|adapter|network`, shared
+/// by both backends' publishers so the user hears it once either way.
+#[derive(Default)]
+pub struct TooWideLocalNetworkNotices {
+    notified: Mutex<HashMap<String, Instant>>,
+}
+
+impl TooWideLocalNetworkNotices {
+    /// Log and push every segment of `too_wide` whose latch is open at `now`;
+    /// returns how many were published.
+    pub fn publish(
+        &self,
+        bus: &EventBus,
+        sid: &str,
+        adapter_name: &str,
+        too_wide: &[IpBlock],
+        now: Instant,
+    ) -> usize {
+        let mut published = 0;
+        for segment in too_wide {
+            let network = segment.to_string();
+            let key = format!("{sid}|{adapter_name}|{network}");
+            {
+                let mut seen = self.notified.lock().unwrap_or_else(|p| p.into_inner());
+                if seen
+                    .get(&key)
+                    .is_some_and(|last| now.duration_since(*last) < TOO_WIDE_NOTICE_WINDOW)
+                {
+                    continue;
+                }
+                seen.insert(key, now);
+            }
+            tracing::warn!(
+                target: "nrr::route-coordinator",
+                msg_key = "route-local-network-too-wide",
+                sid = %sid,
+                adapter = %adapter_name,
+                network = %network,
+                "the main link reports a connected network too wide to be local; it is not exempted from leak protection",
+            );
+            bus.publish_for(
+                sid,
+                StatusUpdateEvent::LocalNetworkTooWide {
+                    sid: sid.to_string(),
+                    adapter_name: adapter_name.to_string(),
+                    network,
+                },
+            );
+            published += 1;
+        }
+        published
     }
 }
 
@@ -230,6 +306,33 @@ mod tests {
         assert_eq!(ex.local_subnets, vec![(Ipv4Addr::new(192, 168, 1, 0), 24)]);
         assert!(links_resolve(&adapters, Some("eth0"), Some("tun0")));
         assert!(!links_resolve(&adapters, None, Some("tun0")));
+    }
+
+    /// The café access point hands the main link a `/1`. The blanket block
+    /// keeps it blocked — only the real private segment is let through — and
+    /// the refused segment is reported for the user to hear about.
+    #[test]
+    fn a_half_internet_segment_is_not_exempted_and_is_reported() {
+        let (mut routes, adapters) = machine();
+        routes.push(route(Ipv4Addr::UNSPECIFIED, 1, Ipv4Addr::UNSPECIFIED, 2));
+        routes.push(route(
+            Ipv4Addr::new(128, 0, 0, 0),
+            1,
+            Ipv4Addr::UNSPECIFIED,
+            2,
+        ));
+
+        let ex = collect_exemptions(&routes, &adapters, Some("eth0"), Some("tun0"));
+
+        assert_eq!(ex.local_subnets, vec![(Ipv4Addr::new(192, 168, 1, 0), 24)]);
+        assert_eq!(
+            ex.too_wide,
+            vec![
+                IpBlock::parse("0.0.0.0/1").expect("block"),
+                IpBlock::parse("128.0.0.0/1").expect("block"),
+            ]
+        );
+        assert!(ex.can_arm());
     }
 
     /// A primary with no gateway cannot produce a bootstrap route, and calling

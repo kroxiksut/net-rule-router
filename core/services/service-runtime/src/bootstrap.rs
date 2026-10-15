@@ -70,6 +70,8 @@ pub mod phases {
     pub const DIAGNOSTICS_LOGS: &str = "diagnostics-init-logs";
     pub const IPC_START: &str = "ipc-start";
     pub const RUNTIME_LOOP_START: &str = "runtime-loop-start";
+    /// The apply-marker assessment the platform entrypoint runs after bootstrap.
+    pub const CRASH_RECOVERY: &str = "crash-recovery";
 }
 
 // ── Phase tracking ───────────────────────────────────────────────────────────
@@ -194,12 +196,10 @@ impl BootstrapArtifacts {
 /// only the `.db` leaves `-wal` and `-shm` behind, and the fresh database
 /// created next opens beside a write-ahead log written for the file that no
 /// longer exists — the corruption we were recovering from, carried forward.
-fn remove_sqlite_triplet(db_path: &std::path::Path) {
+fn remove_sqlite_triplet(db_path: &Path) {
     let _ = std::fs::remove_file(db_path);
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar = db_path.as_os_str().to_owned();
-        sidecar.push(suffix);
-        let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+    for suffix in SQLITE_SIDECARS {
+        let _ = std::fs::remove_file(with_suffix(db_path, suffix));
     }
 }
 
@@ -359,19 +359,61 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
 
     // Phase 3a — open + migrate state DB. Service-critical.
     if !report.blocking {
-        match open_and_migrate_state(&topology.state_db_path, &config.retry) {
+        let opened = open_and_migrate_state(&topology.state_db_path, &config.retry);
+        // A database that will not open or migrate blocks the start, and a
+        // blocked start protects nobody. The last snapshot is worth more than
+        // that; the damaged file is kept beside it for whoever investigates.
+        let opened = opened.or_else(|failure| {
+            // A newer build's database is not damaged: replacing it with an
+            // older snapshot would quietly undo every change made since.
+            if matches!(failure, StateOpenFailure::NewerSchema(_)) {
+                return Err(failure);
+            }
+            match restore_state_db_from_backup(&topology, &config.retry) {
+                Ok((store, restored)) => {
+                    tracing::error!(
+                        target: "nrr::bootstrap",
+                        msg_key = "svc-boot-state-db-restored-from-backup",
+                        failure = %failure.message(),
+                        backup = %restored.backup.display(),
+                        damaged = %restored.damaged.display(),
+                        "the state database could not be used and was restored from its newest backup — changes made after that backup are gone; the damaged file is kept",
+                    );
+                    push(
+                        &mut report,
+                        phases::STORAGE_STATE,
+                        BootstrapStepStatus::Degraded,
+                        format!(
+                            "state DB restored from backup {} after: {}; damaged copy kept at {}",
+                            restored.backup.display(),
+                            failure.message(),
+                            restored.damaged.display()
+                        ),
+                    );
+                    Ok(store)
+                }
+                Err(restore) => Err(failure.with_restore_attempt(&restore)),
+            }
+        });
+        match opened {
             Ok(store) => {
                 // The state store is single-writer (RefCell<Connection>), shared
                 // only via `Arc` for refcount/ownership — never sent across threads.
                 #[allow(clippy::arc_with_non_send_sync)]
                 let store = Arc::new(store);
                 state_store = Some(store);
-                push(
-                    &mut report,
-                    phases::STORAGE_STATE,
-                    BootstrapStepStatus::Ok,
-                    "ok",
-                );
+                if !report
+                    .phases
+                    .iter()
+                    .any(|p| p.phase == phases::STORAGE_STATE)
+                {
+                    push(
+                        &mut report,
+                        phases::STORAGE_STATE,
+                        BootstrapStepStatus::Ok,
+                        "ok",
+                    );
+                }
                 push(
                     &mut report,
                     phases::MIGRATIONS_STATE,
@@ -393,7 +435,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
                     "state DB unavailable",
                 );
             }
-            Err(StateOpenFailure::Migrate(msg)) => {
+            Err(StateOpenFailure::Migrate(msg) | StateOpenFailure::NewerSchema(msg)) => {
                 push(
                     &mut report,
                     phases::STORAGE_STATE,
@@ -680,6 +722,178 @@ fn push(
 enum StateOpenFailure {
     Open(String),
     Migrate(String),
+    /// Written by a newer build; nothing to repair.
+    NewerSchema(String),
+}
+
+impl StateOpenFailure {
+    fn message(&self) -> &str {
+        match self {
+            Self::Open(m) | Self::Migrate(m) | Self::NewerSchema(m) => m,
+        }
+    }
+
+    /// The same failure, saying why no backup replaced the database either.
+    fn with_restore_attempt(self, restore: &str) -> Self {
+        match self {
+            Self::Open(m) => Self::Open(format!("{m}; backup restore: {restore}")),
+            Self::Migrate(m) => Self::Migrate(format!("{m}; backup restore: {restore}")),
+            Self::NewerSchema(m) => Self::NewerSchema(m),
+        }
+    }
+}
+
+/// What a backup restore left behind.
+struct RestoredStateDb {
+    /// The snapshot now in place.
+    backup: PathBuf,
+    /// Where the unusable database was moved.
+    damaged: PathBuf,
+}
+
+/// Replace an unusable state database with its newest backup that opens and
+/// migrates. Snapshots the migration runner and the update verb made are the
+/// candidates, newest first; the damaged file is moved into the backup
+/// directory, never deleted.
+fn restore_state_db_from_backup(
+    topology: &StorageTopology,
+    retry: &RetryPolicy,
+) -> Result<(SqliteStateStore, RestoredStateDb), String> {
+    let candidates = state_db_backups_newest_first(topology);
+    if candidates.is_empty() {
+        return Err("no backup of the state database exists".to_string());
+    }
+    let damaged = park_damaged_state_db(topology)?;
+    let mut last_error = String::new();
+    for backup in candidates {
+        if let Err(e) = std::fs::copy(&backup, &topology.state_db_path) {
+            last_error = format!("copy {}: {e}", backup.display());
+            continue;
+        }
+        match open_and_migrate_state(&topology.state_db_path, retry) {
+            Ok(store) => return Ok((store, RestoredStateDb { backup, damaged })),
+            Err(e) => {
+                last_error = format!("{}: {}", backup.display(), e.message());
+                remove_sqlite_triplet(&topology.state_db_path);
+            }
+        }
+    }
+    let put_back = put_damaged_state_db_back(topology, &damaged);
+    Err(format!(
+        "no backup could be used; last: {last_error}; the original {}",
+        match put_back {
+            Ok(()) => "is back in place".to_string(),
+            Err(e) => format!("could not be put back: {e}"),
+        }
+    ))
+}
+
+/// Every snapshot of the state database on disk, newest first. Bounded to
+/// what the backup retention keeps, so a directory somebody filled by hand
+/// cannot turn the start into a tour of it.
+fn state_db_backups_newest_first(topology: &StorageTopology) -> Vec<PathBuf> {
+    let Some(stem) = topology
+        .state_db_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned)
+    else {
+        return Vec::new();
+    };
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for dir in [&topology.backup_dir, &topology.migration_backup_dir] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let is_snapshot =
+                name.starts_with(&stem) && name.ends_with(".db") && !name.contains(".damaged-");
+            if !is_snapshot {
+                continue;
+            }
+            if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                found.push((modified, path));
+            }
+        }
+    }
+    // The update verb's copy sits beside the database itself.
+    let update_copy = topology.state_db_path.with_extension("db.bak");
+    if let Ok(modified) = std::fs::metadata(&update_copy).and_then(|m| m.modified()) {
+        found.push((modified, update_copy));
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found
+        .into_iter()
+        .map(|(_, path)| path)
+        .take(nrr_storage::backup::BACKUP_RETENTION_PER_DATABASE)
+        .collect()
+}
+
+/// Move the unusable database into the backup directory and drop its
+/// write-ahead sidecars: left beside the restored file they would be applied
+/// to it.
+fn park_damaged_state_db(topology: &StorageTopology) -> Result<PathBuf, String> {
+    let stem = topology
+        .state_db_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "state DB path has no file stem".to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    std::fs::create_dir_all(&topology.backup_dir)
+        .map_err(|e| format!("create {}: {e}", topology.backup_dir.display()))?;
+    let parked = topology
+        .backup_dir
+        .join(format!("{stem}.damaged-{stamp}.db"));
+    match std::fs::rename(&topology.state_db_path, &parked) {
+        Ok(()) => {}
+        // A database that never came into being leaves nothing to keep.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("move damaged state DB aside: {e}")),
+    }
+    // The journal may hold the last changes; it travels with its database.
+    for suffix in SQLITE_SIDECARS {
+        let _ = std::fs::rename(
+            with_suffix(&topology.state_db_path, suffix),
+            with_suffix(&parked, suffix),
+        );
+    }
+    remove_sqlite_triplet(&topology.state_db_path);
+    Ok(parked)
+}
+
+/// Undo [`park_damaged_state_db`] when no backup could replace the database:
+/// with nothing in place, the next start would create an empty one and run
+/// with no rules and none of the protection the user had set.
+fn put_damaged_state_db_back(topology: &StorageTopology, parked: &Path) -> Result<(), String> {
+    if !parked.exists() {
+        return Ok(());
+    }
+    remove_sqlite_triplet(&topology.state_db_path);
+    std::fs::rename(parked, &topology.state_db_path)
+        .map_err(|e| format!("move {} back: {e}", parked.display()))?;
+    for suffix in SQLITE_SIDECARS {
+        let _ = std::fs::rename(
+            with_suffix(parked, suffix),
+            with_suffix(&topology.state_db_path, suffix),
+        );
+    }
+    Ok(())
+}
+
+const SQLITE_SIDECARS: [&str; 2] = ["-wal", "-shm"];
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 fn open_and_migrate_state(
@@ -691,9 +905,12 @@ fn open_and_migrate_state(
     let conn = retry_io(retry, || open_connection(path))
         .map_err(|e| StateOpenFailure::Open(e.to_string()))?;
     let runner = SqliteMigrationRunner::for_state_db(conn);
-    runner
-        .run_pending_migrations()
-        .map_err(|e| StateOpenFailure::Migrate(e.to_string()))?;
+    runner.run_pending_migrations().map_err(|e| match e {
+        nrr_storage::StorageError::UnsupportedSchemaVersion { .. } => {
+            StateOpenFailure::NewerSchema(e.to_string())
+        }
+        other => StateOpenFailure::Migrate(other.to_string()),
+    })?;
     let verification = runner
         .verify_schema()
         .map_err(|e| StateOpenFailure::Migrate(format!("verify_schema: {e}")))?;
@@ -1014,6 +1231,157 @@ mod tests {
                 sidecar.display()
             );
         }
+    }
+
+    /// A state database that no longer opens is replaced by its newest backup
+    /// and the start goes on; the damaged file is kept for whoever looks.
+    #[test]
+    fn an_unusable_state_db_is_restored_from_its_newest_backup() {
+        let (_dir, cfg) = temp_profile();
+        let first = bootstrap(&cfg);
+        assert!(first.is_ready_to_run(), "report = {:?}", first.report);
+        let topology = first.topology.clone();
+        drop(first);
+
+        std::fs::create_dir_all(&topology.backup_dir).expect("backup dir");
+        let backup = nrr_storage::backup_database(
+            &topology.state_db_path,
+            &topology.backup_dir,
+            &nrr_storage::BackupReason::ManualExport,
+        )
+        .expect("backup");
+        std::fs::write(&topology.state_db_path, b"not a sqlite database at all")
+            .expect("damage the state DB");
+
+        let second = bootstrap(&cfg);
+        assert!(second.is_ready_to_run(), "report = {:?}", second.report);
+        assert!(second.state_store.is_some());
+        let storage = second
+            .report
+            .phases
+            .iter()
+            .find(|p| p.phase == phases::STORAGE_STATE)
+            .expect("storage phase");
+        assert_eq!(storage.severity, ServiceHealthSeverity::Degraded);
+        assert!(
+            storage.message.contains(&backup.display().to_string()),
+            "{}",
+            storage.message
+        );
+        let parked: Vec<_> = std::fs::read_dir(&topology.backup_dir)
+            .expect("read backups")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".damaged-"))
+            .collect();
+        assert_eq!(parked.len(), 1, "the damaged file is kept, once");
+        assert_eq!(
+            std::fs::read(parked[0].path()).expect("damaged copy"),
+            b"not a sqlite database at all"
+        );
+    }
+
+    /// Without a backup the damaged database is left where it is and the
+    /// start stays blocked, with the restore attempt in the reason.
+    #[test]
+    fn an_unusable_state_db_with_no_backup_still_blocks() {
+        let (_dir, cfg) = temp_profile();
+        let first = bootstrap(&cfg);
+        let topology = first.topology.clone();
+        drop(first);
+        std::fs::write(&topology.state_db_path, b"not a sqlite database at all")
+            .expect("damage the state DB");
+
+        let second = bootstrap(&cfg);
+        assert!(!second.is_ready_to_run());
+        let storage = second
+            .report
+            .phases
+            .iter()
+            .find(|p| p.phase == phases::STORAGE_STATE)
+            .expect("storage phase");
+        assert_eq!(storage.severity, ServiceHealthSeverity::Blocking);
+        assert!(storage.message.contains("no backup"), "{}", storage.message);
+        assert_eq!(
+            std::fs::read(&topology.state_db_path).expect("state DB"),
+            b"not a sqlite database at all",
+            "nothing is moved when nothing replaces it"
+        );
+    }
+
+    /// Backups exist but none of them takes: the original goes back where it
+    /// was. Left missing, the next start would create an empty database and run
+    /// with no rules and none of the protection the user had set.
+    #[test]
+    fn an_unusable_state_db_whose_backups_all_fail_is_put_back() {
+        let (_dir, cfg) = temp_profile();
+        let first = bootstrap(&cfg);
+        let topology = first.topology.clone();
+        drop(first);
+        let stem = topology
+            .state_db_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("stem")
+            .to_owned();
+        std::fs::create_dir_all(&topology.backup_dir).expect("backup dir");
+        std::fs::write(
+            topology.backup_dir.join(format!("{stem}-broken.db")),
+            b"a broken backup",
+        )
+        .expect("broken backup");
+        std::fs::write(&topology.state_db_path, b"not a sqlite database at all")
+            .expect("damage the state DB");
+
+        let second = bootstrap(&cfg);
+        assert!(!second.is_ready_to_run());
+        drop(second);
+        assert_eq!(
+            std::fs::read(&topology.state_db_path).expect("state DB"),
+            b"not a sqlite database at all",
+            "the original is back in place, not an empty database"
+        );
+        let parked = std::fs::read_dir(&topology.backup_dir)
+            .expect("read backups")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".damaged-"))
+            .count();
+        assert_eq!(parked, 0, "nothing is left parked once it is put back");
+    }
+
+    /// A database a newer build wrote is not damaged: no backup replaces it,
+    /// or a rollback to an older build would quietly undo every later change.
+    #[test]
+    fn a_state_db_from_a_newer_build_is_not_replaced_by_a_backup() {
+        let (_dir, cfg) = temp_profile();
+        let first = bootstrap(&cfg);
+        let topology = first.topology.clone();
+        drop(first);
+        std::fs::create_dir_all(&topology.backup_dir).expect("backup dir");
+        nrr_storage::backup_database(
+            &topology.state_db_path,
+            &topology.backup_dir,
+            &nrr_storage::BackupReason::ManualExport,
+        )
+        .expect("backup");
+        {
+            let conn = rusqlite::Connection::open(&topology.state_db_path).expect("open");
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at, checksum, app_version) VALUES (999999, 'from-the-future', 0, 'x', '9.9.9')",
+                [],
+            )
+            .expect("a newer build's step");
+        }
+
+        let second = bootstrap(&cfg);
+        assert!(!second.is_ready_to_run());
+        drop(second);
+        let conn = rusqlite::Connection::open(&topology.state_db_path).expect("reopen");
+        let newest: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .expect("version");
+        assert_eq!(newest, 999_999, "the newer database is left as it was");
     }
 
     #[test]

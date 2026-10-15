@@ -48,6 +48,7 @@ pub mod dto;
 pub mod error;
 pub mod explain;
 pub mod explain_snapshots;
+pub mod local_dns_suffixes;
 pub mod local_network_rules;
 pub mod log_retention_config;
 pub mod migration;

@@ -21,6 +21,10 @@ impl AutoRulesEngine {
                 .eager_delivery_for
                 .as_ref()
                 .is_some_and(|read| read(sid)),
+            behavior_mode: self
+                .behavior_mode_for
+                .as_ref()
+                .map_or(RouteBehaviorMode::PreferPrimary, |read| read(sid)),
         };
         memo.insert(sid.to_string(), (settings, Instant::now()));
         settings
@@ -28,6 +32,11 @@ impl AutoRulesEngine {
 
     pub(super) fn mode(&self, sid: &str) -> AutoRulesMode {
         self.settings(sid).mode
+    }
+
+    /// The route `sid`'s unmatched traffic takes, from the user's policy.
+    pub(super) fn default_route_role(&self, sid: &str) -> RouteRole {
+        self.settings(sid).behavior_mode.default_route_role()
     }
 
     /// Forces the next settings read to hit the source. Production refreshes on

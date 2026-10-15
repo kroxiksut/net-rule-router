@@ -146,6 +146,25 @@ denied, the full test suite, then `cargo deny`. Enforcement tests that need root
 If you develop on Windows and build Linux through WSL, run this gate before
 pushing: code that compiles on one platform is not evidence about the other.
 
+## Fuzzing
+
+Every parser that reads bytes another party can shape (DNS, STUN and TLS
+replies, dropped-packet reports, packets entering the user-space stack, IPC
+frames and payloads, rules and preset files, the per-user settings file) has a
+fuzz target under `fuzz/`. The run is Linux-only and opt-in, since it needs the
+nightly toolchain:
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz
+bash scripts/fuzz.sh --seconds 60          # every target, one minute each
+bash scripts/check.sh --fuzz 60            # the same, after the regular gate
+```
+
+A crash, hang or memory blow-up fails the run and leaves the input under
+`fuzz/artifacts/<target>/`. Run it before a release; a minute per target is the
+floor, not the ceiling.
+
 ## Removing everything
 
 ```bash

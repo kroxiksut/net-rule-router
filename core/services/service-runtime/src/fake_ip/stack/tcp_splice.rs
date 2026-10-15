@@ -66,7 +66,8 @@ impl FakeIpStack {
         self.health.record_tcp_relay_flow_opened();
         let shared =
             FlowShared::for_flow(Arc::clone(&self.waker), Arc::clone(&self.ready), packet.key);
-        spawn_dial_worker(
+        let submitted = submit_tcp_dial(
+            &self.dial_pool,
             Arc::clone(&shared),
             Arc::clone(&self.dialer),
             target,
@@ -74,6 +75,13 @@ impl FakeIpStack {
             Arc::clone(&self.health),
             Arc::clone(&self.instant_rst),
         );
+        // No worker for the dial is a failed dial: the flow is kept so the
+        // next step resets the client instead of leaving its SYN hanging.
+        if let Err(refusal) = submitted {
+            self.warn_dial_refused(&refusal);
+            self.health.record_tcp_dial_failed();
+            shared.signal_dial_failed();
+        }
         self.ready.mark(packet.key);
         self.flows.insert(
             packet.key,

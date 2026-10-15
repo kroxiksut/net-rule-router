@@ -397,6 +397,11 @@ GroupBox {
         // elevated broker the console uses — one implementation of "undo".
         ColumnLayout {
             id: recoveryBlock
+            // A live service would put the state back: the action stops it first.
+            readonly property bool serviceLive: {
+                var slug = group._statusSlug(nrrServiceController.status)
+                return slug === "running" || slug === "start-pending" || slug === "stop-pending"
+            }
             Layout.fillWidth: true
             Layout.topMargin: root.uiTheme.spacingSm
             spacing: root.uiTheme.spacingXxs
@@ -417,7 +422,10 @@ GroupBox {
                 spacing: root.uiTheme.spacingSm
                 ThemedButton {
                     theme: root.uiTheme
-                    text: root.tr("settings.service.recovery.action", "Restore network")
+                    text: recoveryBlock.serviceLive
+                        ? root.tr("settings.service.recovery.action-stop",
+                            "Stop service and restore network")
+                        : root.tr("settings.service.recovery.action", "Restore network")
                     icon.source: root.uiIconSource("refresh")
                     enabled: !group._busy()
                     onClicked: recoveryConfirm.open()
@@ -433,7 +441,10 @@ GroupBox {
         NetworkRecoveryConfirmDialog {
             id: recoveryConfirm
             ownerRoot: root
-            onConfirmed: nrrServiceController.resetNetwork()
+            stopsService: recoveryBlock.serviceLive
+            onConfirmed: recoveryBlock.serviceLive
+                ? nrrServiceController.stopServiceAndResetNetwork()
+                : nrrServiceController.resetNetwork()
         }
 
         // ── #7 — service start mode (admin-opt-in) ──

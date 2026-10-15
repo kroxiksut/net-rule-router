@@ -115,12 +115,14 @@ impl SecondaryRouteCoordinator {
     /// The routes `sid`'s rule book asks for under `resolution` — the one
     /// lowering a full recompute and a first-contact install share, so the two
     /// cannot disagree about an address.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn planned_routes(
         &self,
         sid: &str,
         resolution: &RouteResolution,
         secondary: &SecondaryRouteTarget,
         rule_book: &nrr_domain::canonical::CanonicalRuleBook,
+        cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
         tunnel_catch_alls: &[(Ipv4Addr, u8)],
         networks: &crate::route_codegen::network_routes::NetworkRouteFacts,
     ) -> crate::route_codegen::RouteCodegenOutput {
@@ -144,7 +146,7 @@ impl SecondaryRouteCoordinator {
         );
         let denied = crate::secondary_ip_policy::secondary_ip_denylist(
             &rule_book.secondary,
-            self.fqdn_cache.as_ref(),
+            cache,
             shared_ip_policy,
         );
         crate::route_codegen::generate_routes_with(
@@ -152,7 +154,7 @@ impl SecondaryRouteCoordinator {
             rule_book,
             resolution.primary.as_ref(),
             secondary,
-            self.fqdn_cache.as_ref(),
+            cache,
             self.app_observations.as_ref(),
             &denied,
             ownership_settings,
@@ -181,8 +183,14 @@ impl SecondaryRouteCoordinator {
     /// DNS path — and installs only the `/32`s the planner asks for these
     /// addresses: one it declines (a shared address, a main-link claim) stays
     /// unrouted, and so does one another signed-in user already routes through
-    /// a different link. Returns how many of `addresses` now have their route.
-    pub fn route_first_contact(&self, sid: &str, addresses: &[Ipv4Addr]) -> usize {
+    /// a different link. An IPv6 address gets its `/128` the same way, or
+    /// nothing when the link has no v6 next hop — the planner's call, not
+    /// this one's. Returns how many of `addresses` now have their route.
+    ///
+    /// Cost: one cache snapshot and a plan over the hosts on `addresses` per
+    /// DNS answer that introduces an address, never per packet or connection;
+    /// the plan of the whole cache is the full recompute's.
+    pub fn route_first_contact(&self, sid: &str, addresses: &[std::net::IpAddr]) -> usize {
         if addresses.is_empty() {
             return 0;
         }
@@ -201,21 +209,31 @@ impl SecondaryRouteCoordinator {
         let Some(snapshot) = self.rules_provider.active_rules_for(sid) else {
             return 0;
         };
+        let scoped = self
+            .fqdn_cache
+            .snapshot_for_compute()
+            .map(|full| full.scoped_to(addresses));
+        let cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup = match scoped.as_ref() {
+            Some(scoped) => scoped,
+            None => self.fqdn_cache.as_ref(),
+        };
         let wanted: Vec<RouteEntry> = self
             .planned_routes(
                 sid,
                 &resolution,
                 &secondary,
                 &snapshot.rule_book,
+                cache,
                 &[],
                 &crate::route_codegen::network_routes::NetworkRouteFacts::default(),
             )
             .routes
             .into_iter()
             .filter(|r| {
-                r.prefix_length == 32
-                    && matches!(r.destination, std::net::IpAddr::V4(d) if addresses.contains(&d))
-                    && !nrr_shared::ip_block::IpBlock::new(r.destination, 32)
+                let host_prefix = if r.destination.is_ipv4() { 32 } else { 128 };
+                r.prefix_length == host_prefix
+                    && addresses.contains(&r.destination)
+                    && !nrr_shared::ip_block::IpBlock::new(r.destination, host_prefix)
                         .is_some_and(|block| self.routed_for_another_user(sid, block))
             })
             .collect();

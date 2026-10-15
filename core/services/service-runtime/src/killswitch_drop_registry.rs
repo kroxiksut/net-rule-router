@@ -156,8 +156,8 @@ impl KillswitchBlockFilterRegistry {
     }
 
     /// Whether `id` guards the machine's service accounts. Such a drop is
-    /// system traffic, not the user's: it may teach a tunnel endpoint, and
-    /// nothing else may read it.
+    /// system traffic, not the user's: it may teach a VPN client, and nothing
+    /// else may read it.
     pub fn is_service_account(&self, id: u64) -> bool {
         self.blocks
             .read()

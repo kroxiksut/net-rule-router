@@ -140,6 +140,30 @@ pub fn catch_all_v6_filters(
     out
 }
 
+/// The v6 twin of `default_block_exemptions`: what the Strict default block's
+/// IPv6 half must let through. ALE only — that block has no packet half.
+pub fn default_block_exemptions_v6(
+    sid: &str,
+    server_ips: &[Ipv6Addr],
+    local_subnets: &[(Ipv6Addr, u8)],
+) -> Vec<WfpFilterSpec> {
+    const ALE: WfpLayerKey = WfpLayerKey::AleAuthConnectV6;
+    let link_scope = [
+        (V6_LOOPBACK, 128u8),
+        (V6_LINK_LOCAL, 10),
+        (V6_LINK_LOCAL_MULTICAST, 16),
+    ];
+    link_scope
+        .into_iter()
+        .chain(server_ips.iter().map(|ip| (*ip, 128u8)))
+        .chain(local_subnets.iter().copied())
+        .enumerate()
+        .map(|(e, (net, prefix))| {
+            exempt_subnet_v6(sid, ALE, net, prefix, CATCHALL_EXEMPT_BASE + e as u64)
+        })
+        .collect()
+}
+
 /// Permit for traffic egressing the tunnel, on a v6 layer.
 fn egress_permit_v6(sid: &str, layer: WfpLayerKey, secondary_luid: u64) -> WfpFilterSpec {
     let is_packet = matches!(layer, WfpLayerKey::OutboundIpPacketV6);

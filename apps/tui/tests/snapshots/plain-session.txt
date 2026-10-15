@@ -21,6 +21,7 @@ Notifications:
   No notifications.
 Commands on this screen:
   r: restore your settings to a service that lost them
+  t: confirm the listed programs as your VPN, so leak protection keeps them working
 Type a screen number, h for help or q to quit, then press Enter.
 Service: OK
 Routing state: Routing active

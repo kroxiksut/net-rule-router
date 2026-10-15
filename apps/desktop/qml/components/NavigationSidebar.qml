@@ -260,7 +260,7 @@ Pane {
                             spacing: root.uiTheme.spacingXxs
 
                             Repeater {
-                                model: Pure.settingsCategories()
+                                model: Pure.settingsCategories(root.updateCheckAvailable)
                                 delegate: SidebarSubNavButton {
                                     shell: navigationSidebar.root
                                     iconName: modelData.icon || ""

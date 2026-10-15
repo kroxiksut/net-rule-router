@@ -70,6 +70,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::lifecycle::{StopToken, STOP_TIMEOUT};
+use crate::task_liveness::{TaskLiveness, DEFAULT_TICK_DEADLINE};
 
 // ── Task taxonomy ────────────────────────────────────────────────────────────
 
@@ -98,8 +99,8 @@ pub enum OperationPriority {
 pub enum TaskOutcome {
     /// Task did its work and is happy to be ticked again.
     Continue,
-    /// Task wants to be torn down (no error). The supervisor
-    /// removes it without flipping health.
+    /// Task wants to be torn down (no error). Outside a stop the sink still
+    /// hears of it: a task that quietly ends is a feature that quietly stops.
     Done,
     /// Task crashed. Supervisor restarts according to `TaskClass`.
     Failed(String),
@@ -218,6 +219,9 @@ pub struct ServiceTask {
     /// `build_ipc_accept_task_bundle` — other task builders may opt in
     /// over time.
     pub backoff: BackoffSchedule,
+    /// A tick still running past this is reported as a hang. `None` only for
+    /// a tick that blocks by design (the IPC accept loop waits for a client).
+    pub tick_deadline: Option<Duration>,
     pub tick: TickFn,
     /// Run exactly once when the task's loop ends, however it ends.
     ///
@@ -243,9 +247,24 @@ impl ServiceTask {
             interval: Some(interval),
             max_restarts,
             backoff: BackoffSchedule::default(),
+            tick_deadline: Some(DEFAULT_TICK_DEADLINE),
             tick: Box::new(tick),
             on_stop: None,
         }
+    }
+
+    /// Chainable override for how long one tick may run before it is a hang.
+    #[must_use]
+    pub fn with_tick_deadline(mut self, deadline: Duration) -> Self {
+        self.tick_deadline = Some(deadline);
+        self
+    }
+
+    /// For a tick that blocks until something happens: no deadline at all.
+    #[must_use]
+    pub fn without_tick_deadline(mut self) -> Self {
+        self.tick_deadline = None;
+        self
     }
 
     /// Chainable override for the failure back-off schedule. Returns
@@ -286,6 +305,9 @@ pub trait TaskFailureSink: Send + Sync {
     }
     /// A restarted task completed a tick again.
     fn task_recovered(&self, _id: &TaskId, _class: TaskClass) {}
+    /// The task returned `Done` while the service was not stopping; it will
+    /// not run again.
+    fn task_exited(&self, _id: &TaskId, _class: TaskClass) {}
 }
 
 #[derive(Default)]
@@ -294,6 +316,7 @@ pub struct CountingFailureSink {
     pub fatal: AtomicU64,
     pub restarts: AtomicU64,
     pub recovered: AtomicU64,
+    pub exited: AtomicU64,
     /// Every scheduled restart delay, in order.
     pub delays: Mutex<Vec<Duration>>,
 }
@@ -322,6 +345,9 @@ impl TaskFailureSink for CountingFailureSink {
     fn task_recovered(&self, _id: &TaskId, _class: TaskClass) {
         self.recovered.fetch_add(1, Ordering::SeqCst);
     }
+    fn task_exited(&self, _id: &TaskId, _class: TaskClass) {
+        self.exited.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// What a caught panic said, as far as it can be recovered.
@@ -347,6 +373,8 @@ pub struct ServiceSupervisor {
     /// Maximum total wait time during shutdown. Defaults to `STOP_TIMEOUT`.
     stop_timeout: Duration,
     optional_restart: RestartBackoff,
+    /// Where each tick's start and end are marked, so a hang is visible.
+    liveness: Option<Arc<TaskLiveness>>,
 }
 
 impl ServiceSupervisor {
@@ -358,7 +386,15 @@ impl ServiceSupervisor {
             sink,
             stop_timeout: STOP_TIMEOUT,
             optional_restart: RestartBackoff::default(),
+            liveness: None,
         }
+    }
+
+    /// Report tick deadlines to `liveness`.
+    #[must_use]
+    pub fn with_liveness(mut self, liveness: Arc<TaskLiveness>) -> Self {
+        self.liveness = Some(liveness);
+        self
     }
 
     pub fn with_stop_timeout(mut self, d: Duration) -> Self {
@@ -388,6 +424,10 @@ impl ServiceSupervisor {
         let interval = task.interval;
         let backoff = task.backoff;
         let optional_restart = self.optional_restart;
+        let liveness = self.liveness.clone();
+        let pulse = liveness
+            .as_ref()
+            .and_then(|l| l.supervised(&id.0, task.tick_deadline));
         let handle = thread::Builder::new()
             .name(format!("nrr-task-{}", id.0))
             .spawn(move || {
@@ -404,6 +444,10 @@ impl ServiceSupervisor {
                     // may be inconsistent after a panic, which is exactly why
                     // the outcome is `Failed` and the class decides whether it
                     // restarts.
+                    let in_flight = liveness
+                        .as_ref()
+                        .zip(pulse.as_ref())
+                        .map(|(l, p)| l.tick_begins(p));
                     let outcome =
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             (task.tick)(&stop)
@@ -411,6 +455,7 @@ impl ServiceSupervisor {
                             Ok(outcome) => outcome,
                             Err(payload) => TaskOutcome::Failed(panic_message(payload.as_ref())),
                         };
+                    drop(in_flight);
                     match outcome {
                         TaskOutcome::Continue => {
                             if down {
@@ -437,7 +482,12 @@ impl ServiceSupervisor {
                                 sleep_observing_stop(&stop, Duration::from_millis(50));
                             }
                         }
-                        TaskOutcome::Done => break,
+                        TaskOutcome::Done => {
+                            if !stop.is_stop_requested() {
+                                sink.task_exited(&id, class);
+                            }
+                            break;
+                        }
                         TaskOutcome::Failed(msg) => {
                             attempt = attempt.saturating_add(1);
                             sink.task_failed(&id, class, attempt, &msg);
@@ -468,6 +518,9 @@ impl ServiceSupervisor {
                             }
                         }
                     }
+                }
+                if let Some(l) = liveness.as_ref() {
+                    l.supervised_ended(&id.0);
                 }
                 // Teardown runs on every exit path, including the one that
                 // skips the tick entirely (stop observed while asleep).
@@ -964,7 +1017,44 @@ mod tests {
         let _ = supervisor.shutdown();
         assert_eq!(sink.failures.load(Ordering::SeqCst), 0);
         assert_eq!(sink.fatal.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sink.exited.load(Ordering::SeqCst),
+            1,
+            "ending while the service runs is reported"
+        );
         assert!(done_after.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[test]
+    fn done_during_a_stop_is_an_ordinary_teardown_not_an_exit() {
+        let stop = StopToken::new();
+        let sink = counting_sink();
+        let supervisor =
+            ServiceSupervisor::new(stop.clone(), sink.clone() as Arc<dyn TaskFailureSink>);
+        let ticked = Arc::new(AtomicUsize::new(0));
+        let ticked_in_task = Arc::clone(&ticked);
+        supervisor
+            .spawn(ServiceTask::periodic(
+                "ends-on-stop",
+                TaskClass::Recoverable,
+                Duration::from_millis(5),
+                1,
+                move |stop| {
+                    ticked_in_task.fetch_add(1, Ordering::SeqCst);
+                    // Returns only once the stop has arrived, so `Done` is
+                    // observed with the token already set.
+                    while !stop.wait_for(Duration::from_secs(5)) {}
+                    TaskOutcome::Done
+                },
+            ))
+            .expect("spawn");
+        assert!(wait_until(Duration::from_secs(2), || ticked
+            .load(Ordering::SeqCst)
+            == 1));
+        let report = supervisor.shutdown();
+        assert!(!report.timed_out(), "{report:?}");
+        assert_eq!(sink.exited.load(Ordering::SeqCst), 0);
+        assert_eq!(sink.failures.load(Ordering::SeqCst), 0);
     }
 
     // ── Per-task backoff ─────────────────────────────────────────────────

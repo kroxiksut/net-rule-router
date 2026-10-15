@@ -177,10 +177,8 @@ pub fn fold_observations(wiring: &AppObservationWiring) -> usize {
         }
         let summary = consumer.consume(&batch, now);
         // Each of these changes what the next pass plans.
-        return (summary.app_ips_added
-            + summary.app_ips_retracted
-            + summary.vpn_endpoints_learned
-            + summary.vpn_client_apps_learned) as usize;
+        return (summary.app_ips_added + summary.app_ips_retracted + summary.vpn_client_apps_learned)
+            as usize;
     }
     if let Some(trace) = wiring.trace.as_ref() {
         trace.record(&batch, crate::conn_observation_consumer::now_unix_ms());
@@ -344,7 +342,6 @@ pub fn build_conn_observe_task(
                         unknown = summary.unknown,
                         app_ips_added = summary.app_ips_added,
                         app_ips_retracted = summary.app_ips_retracted,
-                        vpn_endpoints_learned = summary.vpn_endpoints_learned,
                         vpn_client_apps_learned = summary.vpn_client_apps_learned,
                         blocked_nrr = summary.blocked_nrr,
                         blocked_foreign = summary.blocked_foreign,
@@ -362,18 +359,14 @@ pub fn build_conn_observe_task(
                 }
                 // New app→IP pairs may give an `Application` rule new
                 // destinations; recompute now so they route promptly instead
-                // of waiting for the next apply. A newly-learned VPN
-                // bootstrap endpoint must likewise arm its exemption before
-                // the client's retry, so recompute on that too (not just the
-                // 30 s safety tick) — same for a newly-learned VPN client app
-                // arming its app-scoped exemption before the client's next
-                // check.
+                // of waiting for the next apply. A newly-learned VPN client
+                // app must likewise arm its app-scoped exemption before the
+                // client's next check, not at the 30 s safety tick.
                 if summary.app_ips_added > 0
                     // A withdrawal has to reach the route table as promptly as
                     // an addition: until the recompute runs, the `/32` is still
                     // moving the process the withdrawal was for.
                     || summary.app_ips_retracted > 0
-                    || summary.vpn_endpoints_learned > 0
                     || summary.vpn_client_apps_learned > 0
                 {
                     if let Some(hook) = on_progress.as_ref() {

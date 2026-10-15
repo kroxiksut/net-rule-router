@@ -1,0 +1,93 @@
+{
+  "description": "pure.js systemDnsNoticeStep: raise the DNS notice when the state appears, keep a dismissed one down while it lasts",
+  "cases": [
+    {
+      "name": "appears",
+      "input": {
+        "wasRaised": false,
+        "notRestored": true
+      },
+      "expected": {
+        "raise": true,
+        "raised": true
+      }
+    },
+    {
+      "name": "still there after the notice",
+      "input": {
+        "wasRaised": true,
+        "notRestored": true
+      },
+      "expected": {
+        "raise": false,
+        "raised": true
+      }
+    },
+    {
+      "name": "clears",
+      "input": {
+        "wasRaised": true,
+        "notRestored": false
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "never there",
+      "input": {
+        "wasRaised": false,
+        "notRestored": false
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "unknown earlier reading counts as not raised",
+      "input": {
+        "wasRaised": null,
+        "notRestored": true
+      },
+      "expected": {
+        "raise": true,
+        "raised": true
+      }
+    },
+    {
+      "name": "a truthy non-true earlier reading is not raised",
+      "input": {
+        "wasRaised": "yes",
+        "notRestored": true
+      },
+      "expected": {
+        "raise": true,
+        "raised": true
+      }
+    },
+    {
+      "name": "a non-true reading is not the state",
+      "input": {
+        "wasRaised": false,
+        "notRestored": "yes"
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "a missing reading is not the state",
+      "input": {
+        "wasRaised": true,
+        "notRestored": null
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    }
+  ]
+}

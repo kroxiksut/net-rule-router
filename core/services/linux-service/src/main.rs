@@ -39,6 +39,11 @@ use std::process::ExitCode;
 
 use cli::Command;
 
+// A panic on foreign bytes is contained by unwinding; under abort one bad
+// packet would stop the daemon and lift its protection.
+#[cfg(panic = "abort")]
+compile_error!("the service must be built with panic = \"unwind\"");
+
 /// This daemon's own executable name, derived from the product identity so the
 /// usage text can never disagree with what `install` writes into `ExecStart`.
 const DAEMON_NAME: &str = nrr_shared::product_identity::BinaryRole::Service.unix_file_name();
@@ -70,7 +75,11 @@ fn main() -> ExitCode {
         #[cfg(target_os = "linux")]
         Command::RestoreDns => restore_dns(),
         #[cfg(target_os = "linux")]
-        Command::Cleanup => run_cleanup(),
+        Command::Cleanup => run_cleanup(false),
+        #[cfg(target_os = "linux")]
+        Command::StopAndCleanup => run_cleanup(true),
+        #[cfg(target_os = "linux")]
+        Command::AfterCrash => run_after_crash(),
         #[cfg(target_os = "linux")]
         Command::PackageFiles => install::write_package_files(args.get(1).map(String::as_str)),
         #[cfg(not(target_os = "linux"))]
@@ -79,6 +88,8 @@ fn main() -> ExitCode {
         | Command::Uninstall
         | Command::RestoreDns
         | Command::Cleanup
+        | Command::StopAndCleanup
+        | Command::AfterCrash
         | Command::PackageFiles => {
             eprintln!(
                 "the `run`, `install`, `uninstall` and `cleanup` verbs run only on Linux \
@@ -112,12 +123,51 @@ fn restore_dns() -> ExitCode {
     }
 }
 
+/// systemd's `OnFailure=` hook, run once the restarts are spent. Name
+/// resolution is handed back whatever the settings; the policy goes too unless
+/// someone's leak protection asked for blocking over leaking.
+#[cfg(target_os = "linux")]
+fn run_after_crash() -> ExitCode {
+    use nrr_service_runtime::lifecycle_matrix::{
+        after_crash_plan, leak_guard_armed_at, FilterTeardown, LifecycleInputs,
+    };
+    let Some(data_dir) = nrr_platform_api::paths::production_data_root() else {
+        return ExitCode::SUCCESS;
+    };
+    let state_db =
+        nrr_storage::resolve_storage_topology(&nrr_storage::StorageProfile::ProductionService)
+            .map(|t| t.state_db_path)
+            .unwrap_or_else(|_| data_dir.join("nrr_service_state.db"));
+    let plan = after_crash_plan(LifecycleInputs {
+        leak_guard_armed: leak_guard_armed_at(&state_db),
+        keep_rule_routes_on_stop: false,
+    });
+    if plan.filters == FilterTeardown::RemoveAll {
+        return run_cleanup(false);
+    }
+    let dns = dns_stack::clear_dns_redirect(&data_dir);
+    println!("NetRuleRouter: the service stopped for good; name resolution handed back.");
+    println!(
+        "  Leak protection is on, so its filters and routes stay until the service runs again."
+    );
+    match dns {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(reason) => {
+            eprintln!("after-crash: could not give the machine's DNS back: {reason}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Undo what a dead daemon left behind; [`cleanup`] owns the exit codes.
 #[cfg(target_os = "linux")]
-fn run_cleanup() -> ExitCode {
-    let outcome = cleanup::cleanup(&cleanup::SystemHost {
-        data_dir: nrr_platform_api::paths::production_data_root(),
-    });
+fn run_cleanup(stop_first: bool) -> ExitCode {
+    let outcome = cleanup::cleanup(
+        &cleanup::SystemHost {
+            data_dir: nrr_platform_api::paths::production_data_root(),
+        },
+        stop_first,
+    );
     let (out, err) = cleanup::render(&outcome);
     print!("{out}");
     eprint!("{err}");

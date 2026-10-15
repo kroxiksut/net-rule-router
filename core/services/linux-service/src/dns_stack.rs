@@ -8,12 +8,13 @@
 
 #![cfg(target_os = "linux")]
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
-use nrr_platform_api::dns::{SystemDnsServersPort, UpstreamDnsCandidate};
+use nrr_platform_api::dns::{DnsResolverPort, SystemDnsServersPort, UpstreamDnsCandidate};
 use nrr_platform_api::network_change::{
     NetworkChangeCallback, NetworkChangeObserver, NetworkChangeSubscription,
 };
@@ -173,6 +174,10 @@ impl SystemDnsServersPort for FollowingServers {
         self.current().upstream_candidates_v4_within(budget)
     }
 
+    fn upstream_candidates_v6(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        self.current().upstream_candidates_v6()
+    }
+
     fn report_all_unreachable(&self, servers: &[UpstreamDnsCandidate]) {
         self.current().report_all_unreachable(servers);
     }
@@ -314,19 +319,14 @@ fn armed_through(
         upstream_pool: Arc::clone(pool),
         redirect: parts.redirect,
         listen_addr: parts.listener,
+        // Every claim with the kind of link behind it; the neutral stack
+        // decides which ones the redirect honours.
         claimed_namespaces: Arc::new(move || {
-            use nrr_platform_api::dns_scope::is_actionable_scope;
-            scopes
-                .dns_scopes()
-                .into_iter()
-                .filter(is_actionable_scope)
-                .map(
-                    |scope| nrr_platform_api::dns_redirect::DnsNamespaceExemption {
-                        suffix: scope.suffix,
-                        servers: scope.servers,
-                    },
-                )
-                .collect()
+            use nrr_platform_api::route_table::RouteTablePort;
+            let api = nrr_platform_linux::LinuxApi;
+            let adapters = api.get_adapter_infos().unwrap_or_default();
+            let routes = api.get_ip_forward_table().unwrap_or_default();
+            nrr_platform_api::dns_scope::classify_claims(scopes.dns_scopes(), &adapters, &routes)
         }),
         network_changes: Arc::new(nrr_platform_linux::network_change::LinuxNetworkChangeObserver),
         // A VPN's domain reaches the DNS manager after its link is up.
@@ -368,6 +368,41 @@ pub(crate) fn service_dns_resolver(
         &nrr_platform_linux::dns_config_change::LinuxDnsConfigChangeObserver::default(),
     );
     Arc::new(LinuxDnsResolver::with_servers(Box::new(servers)))
+}
+
+/// How long one direct query to the chosen upstream may take before the
+/// hosts-honouring path answers instead. Matches the other platform.
+const HOSTS_BYPASS_QUERY_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// The resolver behind the per-user `resolve_hosts_bypass` setting, for rule
+/// hosts: the seeder, the refresh and the history import.
+///
+/// Bypass on: the host is asked of the upstream the pool chose, over a raw
+/// socket, so a hosts-file pin never costs a rule its routable address. Bypass
+/// off: `/etc/hosts` answers first, as the C library would. With no mechanism
+/// there is no chosen upstream, and both postures read the file first.
+pub(crate) fn rule_host_resolver(
+    capture: &DnsCapture,
+    servers: Arc<nrr_platform_linux::dns_resolver::LinuxDnsResolver>,
+    bypass_enabled: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Arc<dyn DnsResolverPort> {
+    use nrr_platform_linux::dns_resolver::HostsFileFirstResolver;
+    use nrr_service_runtime::dns_resolver_ports::HostsBypassDnsResolver;
+
+    let system: Arc<dyn DnsResolverPort> = Arc::new(HostsFileFirstResolver::new(servers as _));
+    let upstream: Arc<dyn Fn() -> Option<SocketAddr> + Send + Sync> = match capture {
+        DnsCapture::Via(mechanism) => {
+            let pool = upstream_dns_pool(Arc::clone(&mechanism.servers) as _);
+            Arc::new(move || pool.current().or_else(|| pool.note_network_change()))
+        }
+        DnsCapture::Unavailable => Arc::new(|| None),
+    };
+    Arc::new(HostsBypassDnsResolver::new(
+        system,
+        bypass_enabled,
+        upstream,
+        HOSTS_BYPASS_QUERY_TIMEOUT,
+    ))
 }
 
 /// Same helper and same two feeds as the listener's own `system_dns` cache

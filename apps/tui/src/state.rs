@@ -12,10 +12,39 @@ use crate::backend::{BackendEvent, Outbox, PushEvent};
 use crate::i18n::{Key, Texts};
 use crate::keys;
 use crate::link::Link;
+use crate::screens::settings::Category as SettingsCategory;
 use crate::screens::ScreenId;
 
 /// How many notices the feed keeps; the oldest go first.
 const FEED_CAPACITY: usize = 200;
+
+/// The sentence for a block reason the service names, as the window shows it;
+/// a slug outside the known shape reads as the generic one.
+fn block_reason_text(reason: &str, texts: &Texts) -> String {
+    let unknown = texts.get(keys::BLOCK_NOTICE_REASON_UNKNOWN);
+    let well_formed = !reason.is_empty()
+        && reason.len() <= 64
+        && reason
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !well_formed {
+        return unknown;
+    }
+    texts.dynamic(
+        &[keys::BLOCK_NOTICE_REASON_PREFIX, reason].concat(),
+        &unknown,
+    )
+}
+
+/// The text behind a protection-coverage reason; `None` for one this build
+/// does not know.
+fn protection_text(reason: &str) -> Option<Key> {
+    match reason {
+        "blanket-block-not-armed" => Some(keys::PROTECTION_BLANKET_BLOCK_NOT_ARMED),
+        "machine-wide-cut-by-another-user" => Some(keys::PROTECTION_MACHINE_WIDE_CUT),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeLevel {
@@ -74,6 +103,8 @@ pub struct AppState {
     pub enforcement_down: BTreeMap<String, EnforcementDown>,
     /// This user's destinations another signed-in user's routing holds.
     pub routes_held: Option<RoutesHeldDto>,
+    /// The system-DNS notice is up for the state as it stands.
+    pub system_dns_notice_raised: bool,
     /// The newest notices, at most [`FEED_CAPACITY`].
     pub notices: Vec<Notice>,
     /// Notices ever received, the dropped ones included.
@@ -105,6 +136,13 @@ pub struct AppState {
     /// The Settings screen's sections, what they read and the terminal's own
     /// saved options.
     pub settings: crate::screens::settings::SettingsState,
+    /// VPN-named programs leak protection does not trust by place, awaiting
+    /// the user's word.
+    pub vpn_trust: crate::vpn_trust::VpnTrustState,
+    /// Blocks kept while no surface was open, read on connect.
+    pub block_backlog: crate::block_backlog::BlockBacklogState,
+    pub local_network_offer: crate::local_network_offer::LocalNetworkOfferState,
+    pub forwarded_traffic: crate::forwarded_traffic::ForwardedTrafficState,
 }
 
 impl AppState {
@@ -115,6 +153,7 @@ impl AppState {
             fetch_error: None,
             enforcement_down: BTreeMap::new(),
             routes_held: None,
+            system_dns_notice_raised: false,
             notices: Vec::new(),
             notice_count: 0,
             last_notice_at: None,
@@ -134,6 +173,10 @@ impl AppState {
             language_change: None,
             restore: crate::restore::RestoreState::default(),
             settings: crate::screens::settings::SettingsState::default(),
+            vpn_trust: crate::vpn_trust::VpnTrustState::default(),
+            block_backlog: Default::default(),
+            local_network_offer: Default::default(),
+            forwarded_traffic: Default::default(),
         }
     }
 
@@ -185,6 +228,8 @@ impl AppState {
                 if reconnected {
                     crate::restore::on_connected(self);
                     crate::screens::rules::verdicts::load(self);
+                    crate::block_backlog::drain(self);
+                    crate::local_network_offer::check(self);
                     crate::screens::screen(self.screen).on_show(self);
                 }
                 Vec::new()
@@ -192,7 +237,12 @@ impl AppState {
             BackendEvent::Reply(reply) => {
                 (reply.0)(self);
                 let mut effects = crate::restore::announce(self, texts, now);
-                for effect in crate::screens::rules::verdicts::announce(self, texts, now) {
+                let later = crate::screens::rules::verdicts::announce(self, texts, now)
+                    .into_iter()
+                    .chain(crate::vpn_trust::announce(self, texts, now))
+                    .chain(crate::block_backlog::announce(self, texts, now))
+                    .chain(crate::local_network_offer::announce(self, texts, now));
+                for effect in later {
                     if !effects.contains(&effect) {
                         effects.push(effect);
                     }
@@ -202,12 +252,23 @@ impl AppState {
             BackendEvent::Snapshot(snapshot) => {
                 let reports = snapshot.enforcement_status.clone();
                 let held = snapshot.routes_held_by_another_user.clone();
+                self.vpn_trust.pending = snapshot.pending_vpn_clients.clone();
                 self.snapshot = Some(*snapshot);
                 self.fetch_error = None;
                 crate::screens::wizard::snapshot_arrived(self);
                 crate::restore::on_snapshot(self);
+                let dns_not_restored = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| serde_json::to_value(&s.health).ok())
+                    .is_some_and(|health| nrr_client_logic::system_dns::not_restored(&health));
                 let mut effects = self.apply_standing_enforcement(reports, texts, now);
-                for effect in self.routes_held_changed(held, texts, now) {
+                for effect in self
+                    .routes_held_changed(held, texts, now)
+                    .into_iter()
+                    .chain(self.system_dns_reading(dns_not_restored, texts, now))
+                    .chain(crate::forwarded_traffic::reading(self, texts, now))
+                {
                     if !effects.contains(&effect) {
                         effects.push(effect);
                     }
@@ -254,6 +315,7 @@ impl AppState {
                 let held = (count > 0).then_some(RoutesHeldDto { count, sample });
                 self.routes_held_changed(held, texts, now)
             }
+            StatusUpdateEvent::SystemDnsNotRestored => self.system_dns_reading(true, texts, now),
             StatusUpdateEvent::HostUnreachableOnBothRoutes { host, .. } => self.notify(
                 NoticeLevel::Info,
                 texts.get(keys::HOST_UNREACHABLE_TITLE),
@@ -282,9 +344,9 @@ impl AppState {
                     now,
                 )
             }
-            StatusUpdateEvent::AdaptersChanged { .. }
-            | StatusUpdateEvent::HealthChanged { .. }
-            | StatusUpdateEvent::Overflow { .. } => vec![Effect::Refresh],
+            StatusUpdateEvent::AdaptersChanged { .. } | StatusUpdateEvent::HealthChanged { .. } => {
+                vec![Effect::Refresh]
+            }
             StatusUpdateEvent::AutoRuleCandidatesChanged {
                 pending_count,
                 top_anchor,
@@ -316,6 +378,139 @@ impl AppState {
                 crate::screens::rules::on_revision_changed(self);
                 Vec::new()
             }
+            StatusUpdateEvent::BlockNoticeRaised {
+                destination,
+                app,
+                reason,
+                attempts,
+                ..
+            } => {
+                let app = if app.is_empty() {
+                    texts.get(keys::BLOCK_NOTICE_APP_UNKNOWN)
+                } else {
+                    app
+                };
+                let body = texts.fill(
+                    keys::BLOCK_NOTICE_BODY,
+                    &[
+                        ("reason", block_reason_text(&reason, texts).as_str()),
+                        ("destination", destination.as_str()),
+                        ("app", app.as_str()),
+                        ("attempts", attempts.to_string().as_str()),
+                    ],
+                );
+                self.notify(
+                    NoticeLevel::Warning,
+                    texts.get(keys::BLOCK_NOTICE_TITLE),
+                    body,
+                    now,
+                )
+            }
+            StatusUpdateEvent::UnassignedTunnelDetected { adapter_name, .. } => {
+                if adapter_name.is_empty() {
+                    return Vec::new();
+                }
+                let body = texts.fill(
+                    keys::UNASSIGNED_TUNNEL_BODY,
+                    &[("adapter", adapter_name.as_str())],
+                );
+                self.notify(
+                    NoticeLevel::Warning,
+                    texts.get(keys::UNASSIGNED_TUNNEL_TITLE),
+                    body,
+                    now,
+                )
+            }
+            StatusUpdateEvent::LocalNetworkTooWide {
+                adapter_name,
+                network,
+                ..
+            } => {
+                if network.is_empty() {
+                    return Vec::new();
+                }
+                let body = texts.fill(
+                    keys::LOCAL_NETWORK_TOO_WIDE_BODY,
+                    &[
+                        ("adapter", adapter_name.as_str()),
+                        ("network", network.as_str()),
+                    ],
+                );
+                self.notify(
+                    NoticeLevel::Warning,
+                    texts.get(keys::LOCAL_NETWORK_TOO_WIDE_TITLE),
+                    body,
+                    now,
+                )
+            }
+            StatusUpdateEvent::RuleDuplicatesDetected { count, sample, .. } => self.notify(
+                NoticeLevel::Warning,
+                texts.get(keys::RULE_DUPLICATES_TITLE),
+                texts.fill(
+                    keys::RULE_DUPLICATES_BODY,
+                    &[
+                        ("count", count.to_string().as_str()),
+                        ("sample", sample.as_str()),
+                    ],
+                ),
+                now,
+            ),
+            StatusUpdateEvent::AppRuleLearningDestinations { apps, .. } => self.notify(
+                NoticeLevel::Info,
+                texts.get(keys::APP_RULE_LEARNING_TITLE),
+                texts.fill(
+                    keys::APP_RULE_LEARNING_BODY,
+                    &[("apps", apps.join(", ").as_str())],
+                ),
+                now,
+            ),
+            // The whole list each time; an empty one is a question withdrawn,
+            // which the Status screen shows by no longer listing it.
+            StatusUpdateEvent::VpnClientAwaitingConfirmation { clients, .. } => {
+                let names = crate::vpn_trust::names(&clients);
+                self.vpn_trust.pending = clients;
+                if names.is_empty() {
+                    vec![Effect::Refresh]
+                } else {
+                    self.notify(
+                        NoticeLevel::Warning,
+                        texts.get(keys::VPN_TRUST_TITLE),
+                        texts.fill(keys::VPN_TRUST_BODY, &[("apps", names.join(", "))]),
+                        now,
+                    )
+                }
+            }
+            // A reason this build does not know has no sentence to show; the
+            // slug itself is never put on screen.
+            StatusUpdateEvent::ProtectionCoverageChanged { reason } => {
+                match protection_text(&reason) {
+                    Some(body) => self.notify(
+                        NoticeLevel::Warning,
+                        texts.get(keys::PROTECTION_COVERAGE_TITLE),
+                        texts.get(body),
+                        now,
+                    ),
+                    None => Vec::new(),
+                }
+            }
+            // What another surface changed is re-read where it is on screen.
+            StatusUpdateEvent::SecurityAlertsChanged => {
+                crate::screens::inspect::diagnostics::reload_alerts(self);
+                Vec::new()
+            }
+            StatusUpdateEvent::ApplyFailurePolicyChanged { .. } => {
+                crate::screens::settings::reload_if_open(self, SettingsCategory::FailurePolicy);
+                Vec::new()
+            }
+            StatusUpdateEvent::RetentionSettingsChanged => {
+                crate::screens::settings::reload_if_open(self, SettingsCategory::Logs);
+                Vec::new()
+            }
+            StatusUpdateEvent::BlockNoticeMutesChanged { .. } => {
+                crate::screens::settings::reload_if_open(self, SettingsCategory::Notifications);
+                Vec::new()
+            }
+            // Autostart starts the desktop app at sign-in; nothing here shows it.
             _ => Vec::new(),
         }
     }
@@ -358,6 +553,28 @@ impl AppState {
     /// Another user's routing holds some of this user's destinations, or
     /// stopped holding them. The snapshot repeats the standing report on every
     /// refresh, so one equal to the state held is not news.
+    /// The system DNS left redirected: said when it appears, with the way out;
+    /// not repeated while it lasts.
+    fn system_dns_reading(
+        &mut self,
+        not_restored: bool,
+        texts: &Texts,
+        now: Instant,
+    ) -> Vec<Effect> {
+        let step =
+            nrr_client_logic::system_dns::notice_step(self.system_dns_notice_raised, not_restored);
+        self.system_dns_notice_raised = step.raised;
+        if !step.raise {
+            return Vec::new();
+        }
+        self.notify(
+            NoticeLevel::Warning,
+            texts.get(keys::SYSTEM_DNS_TITLE),
+            texts.get(crate::screens::inspect::keys::DNS_NOT_RESTORED),
+            now,
+        )
+    }
+
     fn routes_held_changed(
         &mut self,
         held: Option<RoutesHeldDto>,
@@ -586,6 +803,252 @@ mod tests {
         assert_eq!(connected(&paused).routing_state(), RoutingState::Paused);
     }
 
+    fn push(event: StatusUpdateEvent) -> BackendEvent {
+        BackendEvent::Push(PushEvent::Status(Box::new(event)))
+    }
+
+    #[test]
+    fn a_blocked_connection_is_reported_with_its_reason() {
+        let t = texts();
+        let mut app = connected(&Fixture::healthy());
+        app.apply(
+            push(StatusUpdateEvent::BlockNoticeRaised {
+                sid: "S".into(),
+                destination: "cdn.example".into(),
+                app: "messenger.exe".into(),
+                reason: "blocked-by-rule".into(),
+                attempts: 3,
+                launched_by: Vec::new(),
+            }),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.notices[0].level, NoticeLevel::Warning);
+        assert_eq!(app.notices[0].title, "Connection blocked");
+        assert_eq!(
+            app.notices[0].body,
+            "A rule blocks this connection. Destination: cdn.example. Application: messenger.exe. Attempts: 3."
+        );
+
+        // A reason this build does not know, and no application named.
+        app.apply(
+            push(StatusUpdateEvent::BlockNoticeRaised {
+                sid: "S".into(),
+                destination: "cdn.example".into(),
+                app: String::new(),
+                reason: "Zz/../not-a-slug".into(),
+                attempts: 1,
+                launched_by: Vec::new(),
+            }),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(
+            app.notices[1].body,
+            "This connection was blocked. Destination: cdn.example. Application: unknown application. Attempts: 1."
+        );
+    }
+
+    #[test]
+    fn tunnel_and_rule_news_reach_the_feed() {
+        let t = texts();
+        let mut app = connected(&Fixture::healthy());
+        app.apply(
+            push(StatusUpdateEvent::UnassignedTunnelDetected {
+                sid: "S".into(),
+                adapter_name: "Tunnel".into(),
+            }),
+            &t,
+            Instant::now(),
+        );
+        app.apply(
+            push(StatusUpdateEvent::RuleDuplicatesDetected {
+                sid: "S".into(),
+                count: 2,
+                sample: "both.example".into(),
+            }),
+            &t,
+            Instant::now(),
+        );
+        app.apply(
+            push(StatusUpdateEvent::AppRuleLearningDestinations {
+                sid: "S".into(),
+                apps: vec!["messenger.exe".into(), "game.exe".into()],
+            }),
+            &t,
+            Instant::now(),
+        );
+        app.apply(
+            push(StatusUpdateEvent::VpnClientAwaitingConfirmation {
+                sid: "S".into(),
+                clients: vec![nrr_shared::ipc_payloads::PendingVpnClientDto {
+                    exe_path: r"C:\Users\someone\Downloads\x-vpn.exe".into(),
+                    bundled_exe_paths: Vec::new(),
+                }],
+            }),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 4, "{:?}", app.notices);
+        assert_eq!(app.notices[3].level, NoticeLevel::Warning);
+        assert_eq!(app.notices[3].title, "Is this your VPN?");
+        assert!(
+            app.notices[3].body.starts_with("x-vpn.exe: "),
+            "{:?}",
+            app.notices[3]
+        );
+        assert_eq!(
+            app.vpn_trust.pending.len(),
+            1,
+            "the question stands until answered"
+        );
+        // The whole list each time: an empty one withdraws the question.
+        app.apply(
+            push(StatusUpdateEvent::VpnClientAwaitingConfirmation {
+                sid: "S".into(),
+                clients: Vec::new(),
+            }),
+            &t,
+            Instant::now(),
+        );
+        assert!(app.vpn_trust.pending.is_empty());
+        assert_eq!(app.notices.len(), 4, "a withdrawn question is not news");
+        assert_eq!(app.notices[0].level, NoticeLevel::Warning);
+        assert_eq!(app.notices[0].title, "The additional route is not assigned");
+        assert!(
+            app.notices[0].body.starts_with("Tunnel is up"),
+            "{:?}",
+            app.notices[0]
+        );
+        assert_eq!(app.notices[1].title, "A rule is set on both routes");
+        assert!(
+            app.notices[1].body.starts_with(
+                "2 of your rules are enabled on both routes, starting with both.example."
+            ),
+            "{:?}",
+            app.notices[1]
+        );
+        assert_eq!(app.notices[2].level, NoticeLevel::Info);
+        assert!(
+            app.notices[2].body.starts_with("messenger.exe, game.exe: "),
+            "{:?}",
+            app.notices[2]
+        );
+
+        app.apply(
+            push(StatusUpdateEvent::UnassignedTunnelDetected {
+                sid: "S".into(),
+                adapter_name: String::new(),
+            }),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 4, "a tunnel without a name is not news");
+    }
+
+    /// A segment too wide to be local is said with the link and the number,
+    /// so the user can tell the café's access point from their own router.
+    #[test]
+    fn a_too_wide_local_network_reaches_the_feed() {
+        let t = texts();
+        let mut app = connected(&Fixture::healthy());
+        app.apply(
+            push(StatusUpdateEvent::LocalNetworkTooWide {
+                sid: "S".into(),
+                adapter_name: "Wi-Fi".into(),
+                network: "0.0.0.0/1".into(),
+            }),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 1, "{:?}", app.notices);
+        assert_eq!(app.notices[0].level, NoticeLevel::Warning);
+        assert_eq!(app.notices[0].title, "This network looks suspicious");
+        assert!(
+            app.notices[0]
+                .body
+                .starts_with("Wi-Fi reports 0.0.0.0/1 as its local network"),
+            "{:?}",
+            app.notices[0]
+        );
+    }
+
+    #[test]
+    fn protection_coverage_is_told_for_the_reasons_this_build_knows() {
+        let t = texts();
+        let mut app = connected(&Fixture::healthy());
+        app.apply(
+            push(StatusUpdateEvent::ProtectionCoverageChanged {
+                reason: "machine-wide-cut-by-another-user".into(),
+            }),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.notices[0].level, NoticeLevel::Warning);
+        assert_eq!(app.notices[0].title, "Leak protection coverage changed");
+        assert!(
+            app.notices[0]
+                .body
+                .starts_with("Another user of this computer"),
+            "{:?}",
+            app.notices[0]
+        );
+        app.apply(
+            push(StatusUpdateEvent::ProtectionCoverageChanged {
+                reason: "zz-unknown".into(),
+            }),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 1, "an unknown reason has nothing to say");
+    }
+
+    /// A setting another surface changed is re-read while its section is on
+    /// screen, and left alone while the user is typing into it.
+    #[test]
+    fn a_settings_change_elsewhere_reloads_the_open_section() {
+        let t = texts();
+        let mut app = connected(&Fixture::healthy());
+        app.open(ScreenId::Settings);
+        crate::screens::settings::open_category(&mut app, SettingsCategory::FailurePolicy);
+        app.outbox.take();
+
+        app.apply(
+            push(StatusUpdateEvent::RetentionSettingsChanged),
+            &t,
+            Instant::now(),
+        );
+        assert!(
+            app.outbox.take().is_empty(),
+            "retention lives in another section"
+        );
+        app.apply(
+            push(StatusUpdateEvent::ApplyFailurePolicyChanged {
+                policy: "best-effort".into(),
+            }),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.outbox.take().len(), 1, "the open section is re-read");
+
+        app.settings.mode = crate::screens::settings::Mode::Editing {
+            buffer: String::new(),
+        };
+        app.apply(
+            push(StatusUpdateEvent::ApplyFailurePolicyChanged {
+                policy: "best-effort".into(),
+            }),
+            &t,
+            Instant::now(),
+        );
+        assert!(
+            app.outbox.take().is_empty(),
+            "a read must not land under the user's edit"
+        );
+    }
+
     fn held(count: u64, sample: &[&str]) -> BackendEvent {
         BackendEvent::Push(PushEvent::Status(Box::new(
             StatusUpdateEvent::RoutesHeldByAnotherUser {
@@ -646,6 +1109,49 @@ mod tests {
             "Addresses from your rules follow your own route again."
         );
         assert!(app.routes_held.is_none());
+    }
+
+    /// The system DNS left redirected is said once while it lasts, whether the
+    /// push or a snapshot brings it, and again once it clears and comes back.
+    #[test]
+    fn the_system_dns_notice_is_raised_once_per_occurrence() {
+        let t = texts();
+        let mut app = AppState::new(ScreenId::Status, false);
+        app.apply(BackendEvent::Link(Link::Connected), &t, Instant::now());
+        let not_restored = || {
+            let mut snapshot = Fixture::healthy().snapshot();
+            snapshot.health.components = vec![nrr_shared::ipc_payloads::HealthComponentResponse {
+                component: "apply".into(),
+                severity: "degraded".into(),
+                message: Some(format!(
+                    "{}: access denied",
+                    nrr_shared::ipc_payloads::SYSTEM_DNS_NOT_RESTORED
+                )),
+            }];
+            BackendEvent::Snapshot(Box::new(snapshot))
+        };
+
+        app.apply(
+            push(StatusUpdateEvent::SystemDnsNotRestored),
+            &t,
+            Instant::now(),
+        );
+        app.apply(not_restored(), &t, Instant::now());
+        app.apply(
+            push(StatusUpdateEvent::SystemDnsNotRestored),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.notices[0].level, NoticeLevel::Warning);
+
+        app.apply(
+            BackendEvent::Snapshot(Box::new(Fixture::healthy().snapshot())),
+            &t,
+            Instant::now(),
+        );
+        app.apply(not_restored(), &t, Instant::now());
+        assert_eq!(app.notices.len(), 2, "cleared, then back: news again");
     }
 
     /// A terminal opened after the conflict began learns it from the snapshot.

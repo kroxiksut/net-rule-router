@@ -36,6 +36,7 @@ use nrr_platform_api::service_control::{ServiceControlError, ServiceControlPort}
 use nrr_platform_windows::event_log::WindowsEventLog;
 use nrr_platform_windows::service_control::WindowsServiceControl;
 use nrr_service_runtime::lifecycle_journal::LifecycleJournal;
+use nrr_service_runtime::lifecycle_matrix::StopReason;
 use nrr_service_runtime::{
     run_bootstrap, run_supervised_runtime, BootstrapConfig, InstallConfig, InstallOutcome,
     ServiceController, ServiceRuntimeState, StopToken, UninstallConfig, UninstallOutcome,
@@ -163,6 +164,10 @@ fn capture_stderr() {
     }
 }
 
+/// The service-specific exit code of a stop that followed the filtering engine
+/// down. Non-zero, so SCM's recovery actions run.
+const STOPPED_WITH_FILTERING_ENGINE: u32 = 2;
+
 /// Controls advertised while Running. Each entry is load-bearing, and an
 /// omission is silent: SCM simply never delivers that control. `SESSION_CHANGE`
 /// carries the sign-in the DNS resolver arms on; `PRESHUTDOWN` buys teardown
@@ -176,8 +181,15 @@ fn running_controls() -> ServiceControlAccept {
 }
 
 fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmError> {
+    // Left by a stop that never arrived; it must not speak for a later one.
+    let _ = nrr_platform_windows::service_control::take_deliberate_stop_marker();
     let stop = StopToken::new();
     let stop_for_handler = stop.clone();
+    // A stop that comes because the filtering engine is going down is no
+    // user's stop: ending with an error code lets SCM's recovery start us again
+    // once it is back, instead of leaving the machine unprotected until a reboot.
+    let engine_went_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let engine_went_down_for_handler = std::sync::Arc::clone(&engine_went_down);
 
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
@@ -185,21 +197,38 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
             // is indistinguishable from a process that died on its own.
             ServiceControl::Stop => {
                 tracing::info!(target: "nrr::lifecycle", msg_key = "svc-scm-control-received", control = "stop", "SCM control received");
+                // Our own verbs stop us on purpose, the filtering engine down
+                // being the very reason a network reset is run.
+                let deliberate =
+                    nrr_platform_windows::service_control::take_deliberate_stop_marker();
+                if !deliberate
+                    && nrr_platform_windows::service_control::filtering_engine_running()
+                        == Some(false)
+                {
+                    engine_went_down_for_handler.store(true, std::sync::atomic::Ordering::SeqCst);
+                    tracing::warn!(
+                        target: "nrr::lifecycle",
+                        msg_key = "svc-scm-stop-with-filtering-engine",
+                        "stopping because the Windows Base Filtering Engine is going down; the service reports a failure so it is started again once the engine is back",
+                    );
+                }
                 stop_for_handler.request_stop();
                 ServiceControlHandlerResult::NoError
             }
+            // The machine is going down: the teardown hands DNS back and keeps
+            // every filter and route (`lifecycle_matrix::stop_plan`).
             ServiceControl::Shutdown => {
                 tracing::info!(target: "nrr::lifecycle", msg_key = "svc-scm-control-received", control = "shutdown", "SCM control received");
-                stop_for_handler.request_stop();
+                stop_for_handler.request_stop_for(StopReason::MachineShutdown);
                 ServiceControlHandlerResult::NoError
             }
             // Arrives before `Shutdown` and is waited on for minutes, against the
             // five seconds `WaitToKillServiceTimeout` allows a shutdown handler.
-            // Teardown restores system DNS and unwinds packet filters; cut off
-            // halfway it leaves the OS resolving through a listener that is gone.
+            // Teardown restores system DNS; cut off halfway it leaves the OS
+            // resolving through a listener that is gone.
             ServiceControl::Preshutdown => {
                 tracing::info!(target: "nrr::lifecycle", msg_key = "svc-scm-control-received", control = "preshutdown", "SCM control received");
-                stop_for_handler.request_stop();
+                stop_for_handler.request_stop_for(StopReason::MachineShutdown);
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -222,14 +251,15 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
         .map_err(|e| ScmError::Handler(e.to_string()))?;
 
-    // Stopped with a service-specific code, so SCM records a failed start
-    // rather than a process that vanished.
+    // Reported stopped rather than vanished, and with no error code: recovery
+    // runs on one, and a start refused for the data tree would only be refused
+    // again. The reason is in the log.
     if let Some(reason) = refused {
         let _ = status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: ServiceState::Stopped,
             controls_accepted: ServiceControlAccept::empty(),
-            exit_code: ServiceExitCode::ServiceSpecific(1),
+            exit_code: ServiceExitCode::Win32(0),
             checkpoint: 0,
             wait_hint: Duration::from_secs(0),
             process_id: None,
@@ -250,6 +280,8 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
         /// or came up unable to enforce. SCM state alone cannot say the last one:
         /// `RecoveryRequired` reports as `Running`.
         journal: LifecycleJournal,
+        /// Set when the stop followed the filtering engine down.
+        engine_went_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
     impl ServiceController for ScmController {
         fn report(&self, state: ServiceRuntimeState) {
@@ -284,7 +316,15 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: scm_state,
                 controls_accepted,
-                exit_code: ServiceExitCode::Win32(0),
+                exit_code: if scm_state == ServiceState::Stopped
+                    && self
+                        .engine_went_down
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    ServiceExitCode::ServiceSpecific(STOPPED_WITH_FILTERING_ENGINE)
+                } else {
+                    ServiceExitCode::Win32(0)
+                },
                 checkpoint,
                 // A pending state with no hint tells SCM to expect an immediate
                 // answer, which is how a slow boot reads as a hung one.
@@ -302,6 +342,7 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
         handle: status_handle,
         checkpoint: std::sync::atomic::AtomicU32::new(0),
         journal: LifecycleJournal::new(std::sync::Arc::new(WindowsEventLog::new())),
+        engine_went_down,
     };
     // Production bootstrap profile (`%ProgramData%`-rooted service-owned
     // topology). The topology resolver itself is profile-agnostic.
@@ -365,18 +406,14 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
         "crash recovery probe complete",
     );
     let mut artifacts = artifacts;
-    if let nrr_service_runtime::CrashRecoveryOutcome::ManualActionRequired { .. }
-    | nrr_service_runtime::CrashRecoveryOutcome::Aborted { .. } = recovery_outcome
-    {
-        artifacts.report.blocking = true;
-    }
+    // A blocking outcome walks the runtime straight to `RecoveryRequired`;
+    // a stale marker only adds a warning to the health card.
+    recovery_outcome.record_in(&mut artifacts.report);
 
-    // Defensive standalone strip of any orphaned block/fail-closed/kill-switch
-    // filter a hard-killed prior instance left behind, run before deps are
-    // built so it happens even on a recovery-BLOCKED boot (where the
-    // orchestrator and its own startup strip are never constructed).
-    // Idempotent on a healthy boot; stages announce themselves so a stall
-    // here isn't a silent gap before the dependency build's own logging.
+    // The blocks a hard-killed prior instance left behind: stripped before
+    // deps are built only when nobody has leak protection on; otherwise they
+    // hold until the first pass adopts them (`lifecycle_matrix`). Runs on a
+    // recovery-blocked boot too, where the orchestrator is never built.
     //
     // Everything this product enforces goes through the filtering engine, so
     // a stopped one explains an otherwise baffling boot before it happens.

@@ -129,10 +129,16 @@ pub fn canonical_argv(command: &Command) -> Vec<String> {
         Command::DiagDoctor => vec![word("diag"), word("doctor")],
         Command::DiagLogs { tail } => vec![word("diag"), word("logs"), format!("--tail={tail}")],
         Command::DiagExport => vec![word("diag"), word("export")],
-        Command::ResetNetwork { confirmed } => {
+        Command::ResetNetwork {
+            confirmed,
+            stop_service,
+        } => {
             let mut argv = vec![word("reset-network")];
             if *confirmed {
                 argv.push(word("--confirm"));
+            }
+            if *stop_service {
+                argv.push(word("--stop-service"));
             }
             argv
         }
@@ -529,8 +535,18 @@ mod tests {
             Command::DiagDoctor,
             Command::DiagLogs { tail: 17 },
             Command::DiagExport,
-            Command::ResetNetwork { confirmed: false },
-            Command::ResetNetwork { confirmed: true },
+            Command::ResetNetwork {
+                confirmed: false,
+                stop_service: false,
+            },
+            Command::ResetNetwork {
+                confirmed: true,
+                stop_service: false,
+            },
+            Command::ResetNetwork {
+                confirmed: true,
+                stop_service: true,
+            },
             Command::Version,
             Command::Help,
         ];

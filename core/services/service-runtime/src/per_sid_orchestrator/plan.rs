@@ -43,6 +43,7 @@ impl PerSidApplyOrchestrator {
                     // app rules are unenforced; clear any stale unresolved-app set so
                     // the GUI banner does not keep listing a now-phantom app.
                     self.clear_app_enforcement_status(sid);
+                    self.clear_pending_vpn_clients(sid);
                     // policy gone ⇒ any block-all is disarming.
                     self.note_block_all_state(sid, false);
                     self.note_fail_closed_state(sid, false);
@@ -75,12 +76,17 @@ impl PerSidApplyOrchestrator {
         timings.mark("cache");
         let rules = match rules_override
             .cloned()
-            .or_else(|| self.rules_provider.active_rules_for(sid))
+            .map_or_else(|| self.rules_provider.rules_read_for(sid), RulesRead::Rules)
         {
-            Some(r) => r,
-            None => {
+            RulesRead::Rules(r) => r,
+            // Not "no rules": whatever is installed stays until the book reads.
+            RulesRead::Unreadable(reason) => {
+                return Err(OrchestratorError::RulesUnreadable(reason));
+            }
+            RulesRead::NoPolicy => {
                 if intent.publishes() {
                     self.clear_app_enforcement_status(sid);
+                    self.clear_pending_vpn_clients(sid);
                     // rules gone ⇒ any block-all is disarming.
                     self.note_block_all_state(sid, false);
                     self.note_fail_closed_state(sid, false);
@@ -131,8 +137,7 @@ impl PerSidApplyOrchestrator {
         }
 
         timings.mark("rules");
-        // swap: route the policy's behaviour-mode through the codegen.
-        let behavior_mode = behavior_mode_for_codegen(&policy, rules.behavior_mode);
+        let behavior_mode = behavior_mode_for_codegen(&policy);
         // shared-IP denylist from the SAME enforcement rule
         // book + live cache the codegen reads, so the WFP set and the route
         // table decline the same shared IPs coherently.
@@ -471,94 +476,72 @@ impl PerSidApplyOrchestrator {
                     "mode-A coverage strategy 'zone-widening' selected but not yet enforced — falling back to per-IP pinning",
                 );
             }
-            // apps the user explicitly routed to the PRIMARY adapter
-            // are EXEMPT from the kill-switch: an always-permit by app-id so a VPN
-            // client placed on primary can always reach its server and the tunnel
-            // comes up instead of being blocked (the bootstrap deadlock fix). The
-            // built-in common-VPN-client exemptions are merged in so this works out
-            // of the box; the user's own primary-app rules augment the set. Deduped
-            // so a path named by both sources emits a single filter (ids are
-            // path-derived).
+            // The tunnel clients are exempt from the kill-switch by app id, so
+            // the handshake that brings the tunnel back is never what the
+            // guard drops. Concrete on-disk paths only: the built-in globs are
+            // resolved in the codegen (`vpn_default_exempt_paths`), because a
+            // glob stamped into `ALE_APP_ID` installs nothing. Emitted only in
+            // the blocking branches below — a permit over nothing blocked is
+            // standing volume for nothing.
             //
-            // the built-in exemptions are the RESOLVED
-            // on-disk exe paths (`codegen_out.vpn_default_exempt_paths`), NOT the
-            // raw `DEFAULT_VPN_EXEMPT_PATTERNS` globs. The WFP `ALE_APP_ID` condition
-            // keys on a real file path, so a glob stamped verbatim into `app_pattern`
-            // never installed a permit (the apply layer silently skipped it) — the
-            // chicken-and-egg that trapped the VPN under the kill-switch. Both
-            // sources here are now concrete paths, so no `app_pattern` carrying a
-            // glob (`*`) can ever leave the fail-closed set.
-            //
-            // fix — these permits are emitted ONLY inside the BLOCKING
-            // branches below (`None` = secondary unresolved, the empty Some
-            // path, and — since  — the armed mode-B catch-all), NOT
-            // unconditionally. A permit-only exemption is pointless where
-            // nothing is blocked (fail-open, or mode A with the secondary UP
-            // and routing normally). Computed once here; each blocking branch
-            // below folds them in with
-            // `primary_app_exempt_filters(sid, &exempt_patterns)`.
-            // the user-confirmed link-provider apps join the
-            // exemption set: concrete paths from `route_link_provider_apps`,
-            // strictly more precise than the built-in glob resolutions.
-            //  — VERIFIED VPN clients join too: exe paths learned
-            // from role-verified kill-switch drops (see
-            // `crate::vpn_client_registry`), covering clients the glob
-            // resolver never finds on disk. Deduped case-insensitively —
-            // Windows paths; filter ids are path-derived, so two casings of
-            // one path would otherwise emit two filters.
+            // Three sources say "this is a tunnel client": a built-in VPN
+            // pattern resolved to it, the user confirmed it as their link
+            // provider, or our own kill-switch drop verified its role. A name
+            // is something anyone can give a file, so the first and the third
+            // are trusted only from a place the user could not have written
+            // to; the rest wait for the user's word. An app the user merely
+            // routes to the main link is NOT a client: its own rule permit
+            // sits below the kill-switch block band, so a host the tunnel
+            // owns stays blocked for it while the tunnel is down.
             let learned_vpn_client_paths: Vec<String> = self
                 .vpn_client_apps_provider
                 .as_ref()
                 .map(|provider| provider())
                 .unwrap_or_default();
-            // The three sources that mean "this IS a tunnel client": a built-in
-            // VPN pattern resolved to it, the user confirmed it as their link
-            // provider, or our own kill-switch drop verified its role. Their
-            // install trees join the exemption — see
-            // `tunnel_client_tree_exempt_paths` for why one binary is not the
-            // client. `primary_app_patterns` is deliberately NOT among them:
-            // an app the user routes to the main link is not a tunnel client.
-            let recognised_clients: Vec<String> = {
-                let mut seen = std::collections::HashSet::new();
+            let trust = crate::vpn_client_trust::split_by_trust(
+                self.app_resolver.as_ref(),
+                &policy.link_provider_exe_paths,
                 codegen_out
                     .vpn_default_exempt_paths
                     .iter()
                     .cloned()
                     .chain(policy.link_provider_exe_paths.iter().cloned())
-                    .chain(learned_vpn_client_paths.iter().cloned())
-                    .filter(|p| seen.insert(p.to_ascii_lowercase()))
-                    .collect()
-            };
-            let client_tree_paths = crate::killswitch_codegen::tunnel_client_tree_exempt_paths(
-                self.app_resolver.as_ref(),
-                &recognised_clients,
+                    .chain(learned_vpn_client_paths),
             );
-            if !client_tree_paths.is_empty() {
-                tracing::debug!(
-                    target: "nrr::per_sid_orchestrator",
-                    sid,
-                    clients = recognised_clients.len(),
-                    tree_paths = client_tree_paths.len(),
-                    "tunnel clients' install trees joined the fail-closed exemption — the transport process is not the binary we resolved",
+            if intent.publishes() {
+                let pending = crate::vpn_client_trust::pending_with_bundles(
+                    self.app_resolver.as_ref(),
+                    &trust.pending,
                 );
+                let changed =
+                    crate::vpn_client_trust::global_pending_vpn_clients().publish(sid, &pending);
+                if changed {
+                    if !pending.is_empty() {
+                        tracing::info!(
+                            target: "nrr::per_sid_orchestrator",
+                            msg_key = "persid-plan-vpn-client-awaiting-confirmation",
+                            sid,
+                            count = pending.len(),
+                            apps = %trust.pending.join(", "),
+                            "programs named like VPN clients sit outside the protected program folders — not exempted from leak protection until confirmed as the link provider",
+                        );
+                    }
+                    // The whole list, an empty one included: the window
+                    // withdraws its question when the last client is confirmed.
+                    if let Some(bus) = self.events.as_ref() {
+                        bus.publish_for(
+                            sid,
+                            nrr_shared::ipc_payloads::StatusUpdateEvent::VpnClientAwaitingConfirmation {
+                                sid: sid.to_string(),
+                                clients: pending,
+                            },
+                        );
+                    }
+                }
             }
-            // What the service accounts' set exempts: the clients themselves,
-            // never the user's own main-link apps.
-            let tunnel_clients: Vec<String> = recognised_clients
-                .iter()
-                .chain(&client_tree_paths)
-                .cloned()
-                .collect();
-            let exempt_patterns: Vec<String> = {
-                let mut seen = std::collections::HashSet::new();
-                recognised_clients
-                    .iter()
-                    .cloned()
-                    .chain(client_tree_paths)
-                    .chain(codegen_out.primary_app_patterns.iter().cloned())
-                    .filter(|p| seen.insert(p.to_ascii_lowercase()))
-                    .collect()
-            };
+            // What every exemption below spares, the service accounts' set
+            // included: the clients themselves and nothing else.
+            let tunnel_clients: Vec<String> = trust.accepted;
             // "smart" kill-switch shared-IP
             // handling (the default). An IP the shared-IP census has ALSO seen
             // on a direct (non-rule) hostname is removed from the kill-switch
@@ -837,6 +820,7 @@ impl PerSidApplyOrchestrator {
                         // A block-all-only relaxation: while the tunnel is up, name
                         // resolution belongs in it.
                         allow_dns_over_primary: false,
+                        dns_servers: Vec::new(),
                         // The catch-all never blocks the tunnel next-hop, so the
                         // liveness probe needs no hole through it.
                         probe_target_ips: Vec::new(),
@@ -908,7 +892,7 @@ impl PerSidApplyOrchestrator {
                     // guard holds anything — the address pairs, never the
                     // blanket the tunnel-default modes give the owner.
                     if !ks.is_empty() || fail_closed {
-                        let service = self.service_account_filters(
+                        let shares = self.owner_shares(
                             sid,
                             intent,
                             OwnerGuard {
@@ -925,11 +909,17 @@ impl PerSidApplyOrchestrator {
                                 ),
                                 secondary_luid: resolution.secondary_luid,
                                 protocols,
+                                guard_forwarded: policy.guard_forwarded_traffic,
+                                block_all: None,
                             },
                             &tunnel_clients,
                         );
-                        collect_service_account_block_ids(&service, &mut killswitch_block_ids);
-                        filters.extend(service);
+                        collect_service_account_block_ids(
+                            &shares.service,
+                            &mut killswitch_block_ids,
+                        );
+                        filters.extend(shares.service);
+                        filters.extend(shares.forwarded);
                     }
                     // A blanket block covers every network, so only a
                     // per-destination posture leaves any of them open.
@@ -962,6 +952,7 @@ impl PerSidApplyOrchestrator {
                                 // block_all=false below) — DNS-over-primary is a
                                 // block-all-only relaxation, so never set here.
                                 allow_dns_over_primary: false,
+                                dns_servers: Vec::new(),
                                 // per-IP path never blocks direct hosts,
                                 // so there is nothing to exempt.
                                 known_direct_ips: Vec::new(),
@@ -1027,15 +1018,11 @@ impl PerSidApplyOrchestrator {
                             }
                             collect_block_ids(&fc, &mut killswitch_block_ids);
                             filters.extend(fc);
-                            //  — this branch blocks too (per-IP in
-                            // mode A, catch-all in mode B), so the VPN-client /
-                            // primary-app exemptions must ride along, exactly
-                            // as in the `None` (secondary-unresolved) branch
-                            // below. Previously promised by the comment above
-                            // `exempt_patterns` but never emitted here.
+                            // This branch blocks too, so the clients ride
+                            // along exactly as in the unresolved branch below.
                             filters.extend(crate::killswitch_codegen::primary_app_exempt_filters(
                                 sid,
-                                &exempt_patterns,
+                                &tunnel_clients,
                             ));
                         } else if self.posture_changed_for(intent, sid, "pair-empty-fail-open") {
                             tracing::warn!(
@@ -1091,7 +1078,7 @@ impl PerSidApplyOrchestrator {
                         if behavior_mode != RouteBehaviorMode::PreferPrimary {
                             filters.extend(crate::killswitch_codegen::primary_app_exempt_filters(
                                 sid,
-                                &exempt_patterns,
+                                &tunnel_clients,
                             ));
                         }
                     }
@@ -1109,6 +1096,8 @@ impl PerSidApplyOrchestrator {
                         // the primary link while the block-all is engaged (adds a
                         // port-scoped UDP/TCP-53 permit). Strict default = blocks DNS too.
                         exemptions.allow_dns_over_primary = policy.allow_dns_over_primary;
+                        // Port 53 reaches the machine's own resolvers and no other host.
+                        exemptions.dns_servers = self.primary_dns_v4();
                         // known-primary hosts get a
                         // packet-layer permit so ping/ICMP to them survives the block-all
                         // (TCP/UDP already escapes at the ALE rule permit).
@@ -1150,15 +1139,21 @@ impl PerSidApplyOrchestrator {
                         let effective_block_all = effective_block_all
                             || behavior_mode != RouteBehaviorMode::PreferPrimary;
                         block_all_armed = effective_block_all;
-                        // The block-all covers every network itself.
+                        // The networks the tunnel's rules name are pinned
+                        // whatever the posture: the blanket sits below the
+                        // main-link rule band, the holds above it, and only
+                        // the holds keep a main-link program off a network the
+                        // tunnel owns. The log still reads "blanket" — nothing
+                        // is too wide or spared under a block-all.
+                        let pinned_holds = crate::enforcement_planner::NetworkHolds::for_pass(
+                            &ownership,
+                            &ks_dest_ips,
+                            || exemptions.never_blocked_networks(),
+                        );
                         let holds = if effective_block_all {
                             crate::enforcement_planner::NetworkHolds::default()
                         } else {
-                            crate::enforcement_planner::NetworkHolds::for_pass(
-                                &ownership,
-                                &ks_dest_ips,
-                                || exemptions.never_blocked_networks(),
-                            )
+                            pinned_holds.clone()
                         };
                         if intent.publishes() {
                             self.network_hold_log.note(sid, &holds);
@@ -1172,7 +1167,7 @@ impl PerSidApplyOrchestrator {
                             sid,
                             behavior_mode,
                             &ks_dest_ips,
-                            &holds,
+                            &pinned_holds,
                             &exemptions,
                             protocols,
                             FailClosedPosture {
@@ -1193,23 +1188,15 @@ impl PerSidApplyOrchestrator {
                         app_block_emitted |= !app_blocks.is_empty();
                         fc.extend(app_blocks);
                         // Address blocks only for the service accounts, even
-                        // when the owner's posture escalated to a blanket one.
-                        let service_holds = if effective_block_all {
-                            crate::enforcement_planner::NetworkHolds::for_pass(
-                                &ownership,
-                                &ks_dest_ips,
-                                || exemptions.never_blocked_networks(),
-                            )
-                        } else {
-                            holds.clone()
-                        };
-                        let service = self.service_account_filters(
+                        // when the owner's posture escalated to a blanket one;
+                        // forwarded traffic takes the blanket with it.
+                        let shares = self.owner_shares(
                             sid,
                             intent,
                             OwnerGuard {
                                 posture: ServiceAccountPosture::Block,
                                 destinations: &ks_dest_ips,
-                                holds: &service_holds,
+                                holds: &pinned_holds,
                                 tunnel_servers: OwnerGuard::servers_of(
                                     &exemptions.bootstrap_server_ips,
                                     &exemptions.bootstrap_server_ips_v6,
@@ -1220,11 +1207,17 @@ impl PerSidApplyOrchestrator {
                                 ),
                                 secondary_luid: 0,
                                 protocols,
+                                guard_forwarded: policy.guard_forwarded_traffic,
+                                block_all: effective_block_all.then_some(&exemptions),
                             },
                             &tunnel_clients,
                         );
-                        collect_service_account_block_ids(&service, &mut killswitch_block_ids);
-                        filters.extend(service);
+                        collect_service_account_block_ids(
+                            &shares.service,
+                            &mut killswitch_block_ids,
+                        );
+                        filters.extend(shares.service);
+                        filters.extend(shares.forwarded);
                         // Full-level only on a posture change or a heartbeat (the
                         // block-all/per-IP split is part of the posture, so a
                         // coverage escalation still re-logs immediately); steady
@@ -1300,12 +1293,12 @@ impl PerSidApplyOrchestrator {
                         }
                         collect_block_ids(&fc, &mut killswitch_block_ids);
                         filters.extend(fc);
-                        // C4 — the secondary (VPN) is DOWN here, so a VPN client is
+                        // The secondary (VPN) is DOWN here, so a VPN client is
                         // bootstrapping over the primary; permit it through the block
                         // so the tunnel can establish (else fail-closed deadlocks it).
                         filters.extend(crate::killswitch_codegen::primary_app_exempt_filters(
                             sid,
-                            &exempt_patterns,
+                            &tunnel_clients,
                         ));
                     } else if self.posture_changed_for(intent, sid, "unresolved-fail-open") {
                         tracing::warn!(
@@ -1329,10 +1322,13 @@ impl PerSidApplyOrchestrator {
         if app_block_emitted
             || (leak_guard_armed && behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed)
         {
-            let floor =
-                self.destination_less_block_floor(sid, &filters, kill_switch().as_ref(), &|| {
-                    fail_closed_base().clone()
-                });
+            let floor = self.destination_less_block_floor(
+                sid,
+                &filters,
+                kill_switch().as_ref(),
+                &|| fail_closed_base().clone(),
+                ipv6.families() == crate::enforcement_planner::FamilyScope::Both,
+            );
             filters.extend(floor);
         }
         timings.mark("kill-switch");
@@ -1351,6 +1347,7 @@ impl PerSidApplyOrchestrator {
                         local_subnets_v6: resolution.local_subnets_v6.clone(),
                         primary_dest_ips: Vec::new(),
                         allow_dns_over_primary: false,
+                        dns_servers: Vec::new(),
                         known_direct_ips: Vec::new(),
                         probe_target_ips: Vec::new(),
                         secondary_luid: resolution.secondary_luid,
@@ -1359,6 +1356,13 @@ impl PerSidApplyOrchestrator {
                         sid,
                         &exemptions,
                     ));
+                    if ipv6.families() == crate::enforcement_planner::FamilyScope::Both {
+                        filters.extend(crate::killswitch_codegen::default_block_exemptions_v6(
+                            sid,
+                            &exemptions.bootstrap_server_ips_v6,
+                            &exemptions.local_subnets_v6,
+                        ));
+                    }
                 }
             }
             let _ = self.posture_changed_for(intent, sid, "off");
@@ -1381,12 +1385,13 @@ impl PerSidApplyOrchestrator {
         // rule permits but below the exemptions, so they never break the tunnel or
         // a primary-routed app. The resolver IPs are already resolved by the
         // composition root (host entries via the FQDN cache).
-        if policy.doh_lockdown_enabled
-            && (matches!(
-                policy.doh_lockdown_scope,
-                nrr_storage::doh_lockdown::DohLockdownScope::Always
-            ) || policy.kill_switch_enabled)
-        {
+        if crate::doh_lockdown_policy::doh_lockdown_active(
+            policy.doh_lockdown_auto,
+            policy.doh_lockdown_enabled,
+            policy.doh_lockdown_scope,
+            policy.kill_switch_enabled,
+            crate::rule_book_facts::has_secondary_rules(&rules.rule_book),
+        ) {
             let doh = crate::killswitch_codegen::doh_dot_block_filters(
                 sid,
                 &policy.doh_resolver_ips,
@@ -1522,18 +1527,29 @@ impl PerSidApplyOrchestrator {
         emitted: &[WfpFilterSpec],
         kill_switch: Option<&KillSwitchResolution>,
         fail_closed: &dyn Fn() -> FailClosedExemptions,
+        ipv6: bool,
     ) -> Vec<WfpFilterSpec> {
         let exemptions = match kill_switch {
             Some(resolution) => FailClosedExemptions {
                 bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
+                bootstrap_server_ips_v6: resolution.bootstrap_server_ips_v6.clone(),
                 local_subnets: resolution.local_subnets.clone(),
+                local_subnets_v6: resolution.local_subnets_v6.clone(),
                 ..FailClosedExemptions::default()
             },
             None => fail_closed(),
         };
         let present: std::collections::HashSet<nrr_platform_api::types::WfpFilterId> =
             emitted.iter().map(|f| f.id).collect();
-        crate::killswitch_codegen::default_block_exemptions(sid, &exemptions)
+        let mut floor = crate::killswitch_codegen::default_block_exemptions(sid, &exemptions);
+        if ipv6 {
+            floor.extend(crate::killswitch_codegen::default_block_exemptions_v6(
+                sid,
+                &exemptions.bootstrap_server_ips_v6,
+                &exemptions.local_subnets_v6,
+            ));
+        }
+        floor
             .into_iter()
             .filter(|f| !present.contains(&f.id))
             .collect()

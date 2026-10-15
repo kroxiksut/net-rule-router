@@ -574,7 +574,19 @@ impl ActivationCoordinator {
 
         // Phase 2a — pre-flight (only PreFlightThenAllOrNothing).
         if matches!(policy, ApplyFailurePolicy::PreFlightThenAllOrNothing) {
+            // A dispatcher that plans through the rules provider (Linux) must
+            // plan with this revision; only this thread sees it, so nothing
+            // enforces it before the check passes.
+            let preview = {
+                let conn = self.conn.lock().expect("connection mutex poisoned");
+                crate::applying_revision_overlay::preview_on_this_thread(
+                    &conn,
+                    &principal,
+                    &record.rules_json,
+                )
+            };
             let pre = self.run_pre_flight(&principal, &phase1.sids, &record.rules_json);
+            drop(preview);
             if !pre.failures.is_empty() {
                 self.audit.emit(ActivationAuditEvent::PreFlightFailed {
                     revision_id: revision_id.as_str().to_string(),

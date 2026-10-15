@@ -4,8 +4,9 @@
 //! would have removed them is gone. `nrr-cli reset-network` and
 //! `scripts/reset-network.sh` both run this, so there is one undo, not three.
 //!
-//! Stops nothing: a live service would put the state straight back, so it is
-//! refused instead, and stopping stays the operator's decision.
+//! A live service would put the state straight back, so plain `cleanup`
+//! refuses it; `stop-and-cleanup` stops it first — and ends it when it hangs —
+//! which is the operator's explicit choice.
 
 #![cfg(target_os = "linux")]
 
@@ -21,7 +22,7 @@ use nrr_shared::product_identity::{BinaryRole, PRODUCT_NAME};
 pub(crate) const EXIT_NEEDS_ROOT: u8 = 3;
 /// The service is live. Distinct from a failure so a wrapper can tell "stop it
 /// first" from "the undo did not work".
-pub(crate) const EXIT_SERVICE_RUNNING: u8 = 4;
+pub(crate) const EXIT_SERVICE_RUNNING: u8 = nrr_platform_api::service_control::EXIT_SERVICE_RUNNING;
 const EXIT_FAILED: u8 = 1;
 
 /// The machine, as far as cleanup touches it. Every undo is idempotent: with
@@ -37,11 +38,17 @@ pub(crate) trait CleanupHost {
     fn sweep_rules(&self) -> Result<usize, String>;
     /// How many routes went.
     fn sweep_routes(&self) -> Result<usize, String>;
+    /// Stop the service, ending it when it hangs past the budget.
+    fn stop_service(&self) -> Result<(), String> {
+        Err("stopping the service is not available here".to_string())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     ServiceLive(ServiceRunState),
+    /// Asked to stop it first, and it would not go: nothing was touched.
+    StopFailed(String),
     NeedsRoot,
     Ran(Report),
 }
@@ -62,10 +69,19 @@ impl Report {
     }
 }
 
-pub(crate) fn cleanup(host: &dyn CleanupHost) -> Outcome {
+pub(crate) fn cleanup(host: &dyn CleanupHost, stop_first: bool) -> Outcome {
     let unit_unknown = match host.service_run_state() {
         Ok(None | Some(ServiceRunState::Stopped)) => None,
-        Ok(Some(live)) => return Outcome::ServiceLive(live),
+        Ok(Some(live)) if !stop_first => return Outcome::ServiceLive(live),
+        Ok(Some(_)) => {
+            if !host.is_root() {
+                return Outcome::NeedsRoot;
+            }
+            if let Err(reason) = host.stop_service() {
+                return Outcome::StopFailed(reason);
+            }
+            None
+        }
         // A broken systemd is no reason to leave a machine cut off.
         Err(reason) => Some(reason),
     };
@@ -93,6 +109,7 @@ pub(crate) fn cleanup(host: &dyn CleanupHost) -> Outcome {
 pub(crate) fn exit_code(outcome: &Outcome) -> u8 {
     match outcome {
         Outcome::ServiceLive(_) => EXIT_SERVICE_RUNNING,
+        Outcome::StopFailed(_) => EXIT_FAILED,
         Outcome::NeedsRoot => EXIT_NEEDS_ROOT,
         Outcome::Ran(report) if report.complete() => 0,
         Outcome::Ran(_) => EXIT_FAILED,
@@ -113,9 +130,14 @@ pub(crate) fn render(outcome: &Outcome) -> (String, String) {
             );
             let _ = writeln!(
                 err,
-                "Stop it first (`{} stop`, or `systemctl stop {}`), then run this again.",
+                "To stop it and restore the network, run `{} reset-network --confirm --stop-service`.",
                 BinaryRole::Console.unix_file_name(),
-                nrr_platform_linux::systemd::SYSTEMD_UNIT_NAME
+            );
+        }
+        Outcome::StopFailed(reason) => {
+            let _ = writeln!(
+                err,
+                "cleanup: the {PRODUCT_NAME} service could not be stopped ({reason}); nothing was reset."
             );
         }
         Outcome::NeedsRoot => {
@@ -231,6 +253,13 @@ impl CleanupHost for SystemHost {
 
     /// The main table's rows by our signature, and every row of a per-user
     /// table: only we write those.
+    fn stop_service(&self) -> Result<(), String> {
+        use nrr_platform_api::service_control::{ServiceControlPort, STOP_FOR_RESET_BUDGET};
+        nrr_platform_linux::service_control::LinuxServiceControl::new()
+            .stop_or_kill(STOP_FOR_RESET_BUDGET)
+            .map_err(|e| e.to_string())
+    }
+
     fn sweep_routes(&self) -> Result<usize, String> {
         use nrr_platform_api::{RouteEntry, RouteTableRef};
         use nrr_platform_linux::policy_routing::is_our_table;
@@ -324,6 +353,8 @@ mod tests {
         rules: Cell<usize>,
         routes: Cell<usize>,
         calls: RefCell<Vec<&'static str>>,
+        /// What a stop request answers.
+        stop: Result<(), String>,
     }
 
     impl FakeHost {
@@ -336,6 +367,7 @@ mod tests {
                 rules: Cell::new(0),
                 routes: Cell::new(0),
                 calls: RefCell::new(Vec::new()),
+                stop: Ok(()),
             }
         }
     }
@@ -356,6 +388,10 @@ mod tests {
             self.table_present.set(false);
             Ok(true)
         }
+        fn stop_service(&self) -> Result<(), String> {
+            self.calls.borrow_mut().push("stop");
+            self.stop.clone()
+        }
         fn sweep_rules(&self) -> Result<usize, String> {
             self.calls.borrow_mut().push("rules");
             Ok(self.rules.replace(0))
@@ -375,7 +411,7 @@ mod tests {
         std::fs::write(&files.resolv_conf, SYSTEM_RESOLV_CONF).unwrap();
         let host = FakeHost::new(files.clone());
 
-        let outcome = cleanup(&host);
+        let outcome = cleanup(&host, false);
 
         assert_eq!(exit_code(&outcome), 0);
         assert_eq!(
@@ -383,7 +419,7 @@ mod tests {
             SYSTEM_RESOLV_CONF
         );
         // Twice is the same as once.
-        assert_eq!(exit_code(&cleanup(&host)), 0);
+        assert_eq!(exit_code(&cleanup(&host, false)), 0);
     }
 
     #[test]
@@ -405,7 +441,7 @@ mod tests {
         host.rules.set(3);
         host.routes.set(2);
 
-        let outcome = cleanup(&host);
+        let outcome = cleanup(&host, false);
 
         assert_eq!(
             *host.calls.borrow(),
@@ -436,14 +472,49 @@ mod tests {
             let mut host = FakeHost::new(scratch_files(&dir.0));
             host.state = Ok(Some(live));
 
-            let outcome = cleanup(&host);
+            let outcome = cleanup(&host, false);
 
             assert_eq!(outcome, Outcome::ServiceLive(live));
             assert_eq!(exit_code(&outcome), EXIT_SERVICE_RUNNING);
             assert!(host.calls.borrow().is_empty());
             let (_, err) = render(&outcome);
-            assert!(err.contains("stop"), "names how to stop it: {err}");
+            assert!(
+                err.contains("--stop-service"),
+                "names how to stop it: {err}"
+            );
         }
+    }
+
+    /// Asked to stop first: the service goes, then the same undo runs.
+    #[test]
+    fn stop_and_cleanup_stops_a_live_service_then_undoes_everything() {
+        let dir = TempDir::new("stop-first");
+        let mut host = FakeHost::new(scratch_files(&dir.0));
+        host.state = Ok(Some(ServiceRunState::Running));
+
+        let outcome = cleanup(&host, true);
+
+        assert_eq!(
+            *host.calls.borrow(),
+            vec!["stop", "dns", "table", "rules", "routes"]
+        );
+        assert_eq!(exit_code(&outcome), 0);
+    }
+
+    /// A service that will not stop keeps its state: an undo it would put back
+    /// is no undo.
+    #[test]
+    fn a_service_that_will_not_stop_is_left_untouched() {
+        let dir = TempDir::new("stop-fails");
+        let mut host = FakeHost::new(scratch_files(&dir.0));
+        host.state = Ok(Some(ServiceRunState::Running));
+        host.stop = Err("still running after the kill".to_string());
+
+        let outcome = cleanup(&host, true);
+
+        assert_eq!(*host.calls.borrow(), vec!["stop"]);
+        assert_eq!(exit_code(&outcome), EXIT_FAILED);
+        assert!(render(&outcome).1.contains("still running after the kill"));
     }
 
     #[test]
@@ -451,9 +522,9 @@ mod tests {
         let dir = TempDir::new("absent");
         let mut host = FakeHost::new(scratch_files(&dir.0));
         host.state = Ok(None);
-        assert_eq!(exit_code(&cleanup(&host)), 0);
+        assert_eq!(exit_code(&cleanup(&host, false)), 0);
         host.state = Err("no system bus".to_string());
-        let outcome = cleanup(&host);
+        let outcome = cleanup(&host, false);
         assert_eq!(exit_code(&outcome), 0);
         assert!(render(&outcome).1.contains("no system bus"));
     }
@@ -464,7 +535,7 @@ mod tests {
         let mut host = FakeHost::new(scratch_files(&dir.0));
         host.root = false;
 
-        let outcome = cleanup(&host);
+        let outcome = cleanup(&host, false);
 
         assert_eq!(outcome, Outcome::NeedsRoot);
         assert_eq!(exit_code(&outcome), 3);
@@ -498,7 +569,7 @@ mod tests {
         let dir = TempDir::new("partial");
         let host = TableRefuses(FakeHost::new(scratch_files(&dir.0)));
 
-        let outcome = cleanup(&host);
+        let outcome = cleanup(&host, false);
 
         assert_eq!(
             *host.0.calls.borrow(),

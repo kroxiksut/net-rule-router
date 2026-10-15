@@ -16,6 +16,11 @@ use serde::{Deserialize, Serialize};
 /// Public GitHub repository the releases are published under.
 pub const RELEASES_REPO: &str = "kroxiksut/net-rule-router";
 
+/// Whether the release check exists in this build. Off until a first release
+/// is published: before that the check could only fail, so neither the
+/// settings, the Help menu nor the network sees it.
+pub const UPDATE_CHECK_AVAILABLE: bool = false;
+
 const DAY_MS: u128 = 24 * 60 * 60 * 1000;
 
 /// Cache payload written by the launcher's fetch thread and read at context

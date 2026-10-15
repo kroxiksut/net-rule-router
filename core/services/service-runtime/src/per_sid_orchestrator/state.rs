@@ -119,6 +119,14 @@ pub type UnresolvedHostsSink = Arc<dyn Fn(Vec<String>) + Send + Sync>;
 pub type FakeIpContextProvider =
     Arc<dyn Fn() -> Option<crate::fake_ip::FakeIpEnforcementContext> + Send + Sync>;
 
+/// The one answer to "who holds a filter set right now": every served user
+/// minus those who paused. Read under the membership lock by every writer
+/// that changes the set of users enforced (the pass, a tray connect or exit,
+/// a pause or resume, a fake-IP replan), so the last writer to run acts on the
+/// newest state instead of on the snapshot it was started with. `Err` means
+/// the answer is not known (a pause-flag read failed): nothing is touched.
+pub type EnforcedSidsSource = Arc<dyn Fn() -> Result<Vec<String>, String> + Send + Sync>;
+
 /// "Route before block" ordering hook. Cheap and idempotent: the
 /// production impl recomputes the active user's secondary route table. Called
 /// from the filter reconcile just before a NEW destination-scoped block is
@@ -138,6 +146,17 @@ pub struct PerSidApplyOrchestrator {
     /// for. The per-SID state mutex is not enough: it is taken pointwise, so
     /// two computes interleave between its acquisitions.
     pub(super) apply_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
+    /// Held while the SET OF USERS holding filters is decided and changed.
+    /// The per-SID locks keep two computes for one user apart; this keeps two
+    /// writers with different ideas of who is enforced apart — a tray exit
+    /// during a pass used to leave the departed user's full set in the engine
+    /// because the pass, started on the older view, installed last. Taken
+    /// before any per-SID lock, never inside one.
+    pub(super) membership_lock: Mutex<()>,
+    /// The decider the membership writers consult under that lock. `None`
+    /// (tests, a degraded boot) leaves `reconcile(snapshot)` as the only way
+    /// to change membership.
+    pub(super) enforced_sids: Option<EnforcedSidsSource>,
     /// "Has the stop teardown begun?" A filter added behind it outlives the
     /// process — the WFP session is non-dynamic, so nothing takes it down when
     /// we exit. Injected rather than read from the static directly so a test
@@ -215,6 +234,10 @@ pub struct PerSidApplyOrchestrator {
     /// next start (robust against an unreliable WFP enumerate). `None` disables
     /// persistence (tests / degraded boot).
     pub(super) ledger: Option<Arc<crate::wfp_filter_ledger::WfpFilterLedger>>,
+    /// A dead instance's filter ids kept in force until the first pass. `Some`
+    /// while adoption is pending; the pass re-adds what the rule book wants
+    /// (same deterministic ids) and the rest is deleted afterwards.
+    pub(super) pending_orphans: Mutex<Option<Vec<u64>>>,
     /// shared status the codegen's `AppUnresolved`
     /// diagnostics are published into on every filter compute, so the
     /// `SnapshotInitial` handler can surface a GUI banner listing app rules

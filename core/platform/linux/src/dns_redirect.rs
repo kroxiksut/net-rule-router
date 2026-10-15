@@ -484,6 +484,7 @@ impl<C: DnsCommands> ResolvedDnsRedirect<C> {
             &["dns", REDIRECT_LINK, &listener_ip],
             "point the DNS link at the listener",
         )?;
+        self.plain_dns_to_listener();
         self.set_domains(REDIRECT_LINK, &[CATCH_ALL.to_string()])?;
         self.checked(
             "resolvectl",
@@ -498,6 +499,31 @@ impl<C: DnsCommands> ResolvedDnsRedirect<C> {
             self.set_domains(&link.name, &kept)?;
         }
         Ok(())
+    }
+}
+
+impl<C: DnsCommands> ResolvedDnsRedirect<C> {
+    /// The listener speaks plain DNS and answers unsigned: a machine-wide
+    /// strict DNS-over-TLS or DNSSEC would refuse every name it gives. Our link
+    /// says so for itself; a resolved too old to know the setting has no strict
+    /// mode to override, so a refusal is only reported.
+    fn plain_dns_to_listener(&self) {
+        for (setting, what) in [("dnsovertls", "DNS-over-TLS"), ("dnssec", "DNSSEC")] {
+            let refused = match self
+                .commands
+                .run("resolvectl", &[setting, REDIRECT_LINK, "no"])
+            {
+                Ok(reply) if reply.success => continue,
+                Ok(reply) => reply.stderr.trim().to_string(),
+                Err(e) => e.to_string(),
+            };
+            tracing::warn!(
+                target: "nrr::dns-redirect",
+                setting = what,
+                error = %refused,
+                "could not turn this off for our DNS link; with it enforced machine-wide, names may not resolve",
+            );
+        }
     }
 }
 

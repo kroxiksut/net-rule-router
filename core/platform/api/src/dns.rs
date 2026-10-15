@@ -348,6 +348,24 @@ impl UpstreamDnsCandidate {
     }
 }
 
+/// One configured upstream server of either family. The forwarding pool works
+/// on this shape; [`UpstreamDnsCandidate`] is the IPv4 list the mechanisms
+/// have always produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpstreamDnsServer {
+    pub interface_index: Option<u32>,
+    pub server: IpAddr,
+}
+
+impl From<UpstreamDnsCandidate> for UpstreamDnsServer {
+    fn from(c: UpstreamDnsCandidate) -> Self {
+        Self {
+            interface_index: c.interface_index,
+            server: IpAddr::V4(c.server),
+        }
+    }
+}
+
 /// Enumerates the IPv4 DNS servers the OS is configured with, best first.
 ///
 /// The loopback resolver forwards everything it does not intercept to one of
@@ -374,6 +392,24 @@ pub trait SystemDnsServersPort: Send + Sync {
         self.upstream_candidates_v4()
     }
 
+    /// The IPv6 servers, same rules as the IPv4 list. Empty by default: a
+    /// mechanism that has not learned to read them offers none, and a network
+    /// with DNS only over IPv6 is then one the caller cannot forward on.
+    fn upstream_candidates_v6(&self) -> Vec<UpstreamDnsServer> {
+        Vec::new()
+    }
+
+    /// Both families, IPv4 first: the caller probes, so order is a first guess.
+    fn upstream_candidates(&self) -> Vec<UpstreamDnsServer> {
+        let mut all: Vec<UpstreamDnsServer> = self
+            .upstream_candidates_v4()
+            .into_iter()
+            .map(UpstreamDnsServer::from)
+            .collect();
+        all.extend(self.upstream_candidates_v6());
+        all
+    }
+
     /// A lookup reached none of `servers` — every one ended in a network error
     /// or a timeout. An implementation that keeps a list may take this as the
     /// sign that its list is stale; a server that answered, even with an
@@ -392,6 +428,10 @@ impl<T: SystemDnsServersPort + ?Sized> SystemDnsServersPort for std::sync::Arc<T
         (**self).upstream_candidates_v4_within(budget)
     }
 
+    fn upstream_candidates_v6(&self) -> Vec<UpstreamDnsServer> {
+        (**self).upstream_candidates_v6()
+    }
+
     fn report_all_unreachable(&self, servers: &[UpstreamDnsCandidate]) {
         (**self).report_all_unreachable(servers);
     }
@@ -403,6 +443,7 @@ impl<T: SystemDnsServersPort + ?Sized> SystemDnsServersPort for std::sync::Arc<T
 #[derive(Debug, Default, Clone)]
 pub struct StaticDnsServers {
     servers: Vec<UpstreamDnsCandidate>,
+    servers_v6: Vec<UpstreamDnsServer>,
 }
 
 impl StaticDnsServers {
@@ -414,17 +455,37 @@ impl StaticDnsServers {
                 .into_iter()
                 .map(|ip| UpstreamDnsCandidate::new(None, ip))
                 .collect(),
+            servers_v6: Vec::new(),
         }
     }
 
     pub fn with_interfaces(servers: Vec<UpstreamDnsCandidate>) -> Self {
-        Self { servers }
+        Self {
+            servers,
+            servers_v6: Vec::new(),
+        }
+    }
+
+    /// Add IPv6 servers with no interface attribution.
+    pub fn with_v6(mut self, servers: Vec<std::net::Ipv6Addr>) -> Self {
+        self.servers_v6 = servers
+            .into_iter()
+            .map(|ip| UpstreamDnsServer {
+                interface_index: None,
+                server: IpAddr::V6(ip),
+            })
+            .collect();
+        self
     }
 }
 
 impl SystemDnsServersPort for StaticDnsServers {
     fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
         self.servers.clone()
+    }
+
+    fn upstream_candidates_v6(&self) -> Vec<UpstreamDnsServer> {
+        self.servers_v6.clone()
     }
 }
 

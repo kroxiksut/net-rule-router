@@ -9,7 +9,6 @@ fn service_health_response_fake_ip_datapath_round_trips_as_kebab_case() {
         worst_severity: "ok".to_string(),
         active_revision_id: None,
         components: Vec::new(),
-        degraded_modes: Vec::new(),
         fake_ip_datapath: Some(FakeIpDatapathDto {
             desired: true,
             running: false,
@@ -32,7 +31,6 @@ fn service_health_response_without_fake_ip_datapath_stays_compatible() {
         "service-state": "running",
         "worst-severity": "ok",
         "components": [],
-        "degraded-modes": [],
     });
     let parsed: ServiceHealthResponse =
         serde_json::from_value(old_wire).expect("deserialise old payload");
@@ -112,6 +110,7 @@ fn route_policy_update_request_sample(auto_rules_mode: &str) -> RoutePolicyUpdat
         resolve_hosts_bypass: true,
         doh_lockdown_enabled: false,
         doh_lockdown_scope: doh_lockdown_scope_default(),
+        doh_lockdown_auto: true,
         browser_history_auto_seed: false,
         kill_switch_strict_shared_ips: false,
         auto_rules_mode: auto_rules_mode.to_string(),
@@ -125,6 +124,7 @@ fn route_policy_update_request_sample(auto_rules_mode: &str) -> RoutePolicyUpdat
         short_name_completion: false,
         short_name_suffix: String::new(),
         app_rules_take_all_addresses: false,
+        forwarded_outage: String::new(),
         binding_source: BindingSourceDto::UserAssigned,
         apply_only: Vec::new(),
     }
@@ -196,19 +196,22 @@ fn app_rules_take_all_addresses_travels_as_kebab_case_and_defaults_off() {
     assert!(!parsed.app_rules_take_all_addresses);
 }
 
-/// Every push event a client can receive. Kept here rather than built ad
-/// hoc so the shape test below covers new variants by construction.
+/// Every push event a client can receive, one sample per variant.
+/// `every_variant_is_sampled` holds this list to the enum, so the shape tests
+/// below cover a new variant the moment it is declared.
 fn every_status_update_event() -> Vec<StatusUpdateEvent> {
     vec![
         StatusUpdateEvent::HealthChanged {
             service_state: "running".into(),
             worst_severity: "info".into(),
         },
+        StatusUpdateEvent::ProtectionCoverageChanged {
+            reason: "blanket-block-not-armed".into(),
+        },
         StatusUpdateEvent::AdaptersChanged {
             data_source: "os".into(),
         },
         StatusUpdateEvent::SecurityAlertsChanged,
-        StatusUpdateEvent::Overflow { dropped_count: 3 },
         StatusUpdateEvent::RevisionStatusChanged {
             revision_id: "rev-1".into(),
             status: "active".into(),
@@ -227,6 +230,7 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             last_known_state: "enabled".into(),
         },
         StatusUpdateEvent::RetentionSettingsChanged,
+        StatusUpdateEvent::SystemDnsNotRestored,
         StatusUpdateEvent::MutationProgress {
             correlation_id: "corr-1".into(),
             mutation_kind: "rules-update".into(),
@@ -269,7 +273,91 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             count: 2,
             sample: vec!["198.51.100.1".into(), "203.0.113.0/24".into()],
         },
+        StatusUpdateEvent::RuleDuplicatesDetected {
+            sid: "S-1-5-21".into(),
+            count: 2,
+            sample: "both.example".into(),
+        },
+        StatusUpdateEvent::AppRuleLearningDestinations {
+            sid: "S-1-5-21".into(),
+            apps: vec!["messenger.exe".into()],
+        },
+        StatusUpdateEvent::VpnClientAwaitingConfirmation {
+            sid: "S-1-5-21".into(),
+            clients: vec![PendingVpnClientDto {
+                exe_path: r"C:\Users\someone\Downloads\x-vpn.exe".into(),
+                bundled_exe_paths: Vec::new(),
+            }],
+        },
+        StatusUpdateEvent::UnassignedTunnelDetected {
+            sid: "S-1-5-21".into(),
+            adapter_name: "Tunnel".into(),
+        },
+        StatusUpdateEvent::LocalNetworkTooWide {
+            sid: "S-1-5-21".into(),
+            adapter_name: "Wi-Fi".into(),
+            network: "0.0.0.0/1".into(),
+        },
+        StatusUpdateEvent::EnforcementStatusChanged {
+            sid: "S-1-5-21".into(),
+            status: "secondary-down".into(),
+            role: "secondary".into(),
+            candidates: vec!["Tunnel".into()],
+            since_unix_ms: Some(1),
+        },
     ]
+}
+
+/// The wire tags serde knows, read out of its own "unknown variant" error:
+/// the one list of variants that cannot fall behind the enum.
+fn declared_event_tags() -> Vec<String> {
+    let probe = serde_json::json!({ "type": "zz-not-an-event" });
+    let message = match serde_json::from_value::<StatusUpdateEvent>(probe) {
+        Ok(event) => panic!("the probe tag parsed as {event:?}"),
+        Err(e) => e.to_string(),
+    };
+    let (_, listed) = message
+        .split_once("expected")
+        .unwrap_or_else(|| panic!("serde no longer lists the variants: {message}"));
+    listed
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A variant missing from the sample list is a variant the shape tests never
+/// see; this is what makes the list exhaustive rather than well-meant.
+#[test]
+fn every_variant_is_sampled() {
+    let declared = declared_event_tags();
+    assert!(
+        declared.len() > 2 && declared.iter().any(|t| t == "mutation-progress"),
+        "could not read the variant list out of serde's error: {declared:?}"
+    );
+    let sampled: Vec<String> = every_status_update_event()
+        .iter()
+        .map(|event| {
+            let json = serde_json::to_value(event).expect("serialise event");
+            json["type"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no wire tag on {json}"))
+                .to_owned()
+        })
+        .collect();
+    for tag in &declared {
+        assert!(
+            sampled.contains(tag),
+            "StatusUpdateEvent `{tag}` has no sample in every_status_update_event()"
+        );
+    }
+    for tag in &sampled {
+        assert!(
+            declared.contains(tag),
+            "sample `{tag}` is not a declared variant"
+        );
+    }
 }
 
 /// `rename_all` renames variants, NOT their fields. Without

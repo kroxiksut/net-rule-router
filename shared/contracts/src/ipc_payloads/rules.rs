@@ -786,6 +786,10 @@ pub struct MutationConfirmResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct VerifyVerdictDto {
+    /// The verdict's handle, echoed back by accept and dismiss: the set the
+    /// rule is written in and its value (`primary:*.mail.example.net`), not
+    /// the rule's number, which restarts in each set and shifts under an
+    /// inserted line. Opaque to clients.
     pub rule_id: String,
     /// The value as the rule shows it: `accounts.example.com`,
     /// `*.mail.example.net`, `203.0.113.7`.

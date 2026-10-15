@@ -16,13 +16,13 @@
 //! on the written link, ticks apart, AND an answer over the other link — a
 //! destination down on both proves nothing about either.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 
-use nrr_domain::canonical::{CanonicalRule, CanonicalRuleSet};
+use nrr_domain::canonical::{CanonicalRule, CanonicalRuleSet, VerifyKey};
 use nrr_domain::decision_matching::match_suffix_domain;
-use nrr_domain::{RuleAction, RuleId};
+use nrr_domain::RuleAction;
 use nrr_shared::ipc_payloads::{StatusUpdateEvent, VerifyVerdictDto};
 
 use super::*;
@@ -69,18 +69,10 @@ const MAX_PENDING: usize = 32;
 /// added a moment ago must not miss the query that made the user add it.
 const MAX_RECENT: usize = 64;
 
-/// One enabled `?` rule as stored.
-#[derive(Clone)]
-struct VerifyRule {
-    id: RuleId,
-    matcher: CanonicalAddressMatch,
-    written: RouteRole,
-}
-
 /// A destination waiting for its check.
 #[derive(Clone)]
 struct Candidate {
-    rule: RuleId,
+    key: VerifyKey,
     addresses: Vec<Ipv4Addr>,
     /// `Some` for an address rule: the port the program connected to. `None`
     /// checks the name over TLS.
@@ -89,20 +81,21 @@ struct Candidate {
 
 /// "Does not open where it is written, opens on the other link".
 struct Verdict {
-    written: RouteRole,
-    matcher: CanonicalAddressMatch,
     host: String,
     since_ms: i64,
     dismissed: bool,
 }
 
 /// One principal's `?` rules and what is known about their destinations.
+/// A rule is its set and address ([`VerifyKey`]): a number is route-local
+/// and moves under an inserted line.
 #[derive(Default)]
 pub(super) struct VerifyState {
-    rules: Vec<VerifyRule>,
+    /// The enabled `?` rules as stored.
+    rules: Vec<VerifyKey>,
     /// The address rules among `rules`, by address: what a connection is
     /// looked up in.
-    ips: HashMap<Ipv4Addr, RuleId>,
+    ips: HashMap<Ipv4Addr, VerifyKey>,
     /// Whether an exact rule covers its subdomains, read with the rules.
     subdomains: bool,
     rules_read_at: Option<Instant>,
@@ -117,7 +110,7 @@ pub(super) struct VerifyState {
     inconclusive: HashMap<String, (SystemTime, Duration)>,
     /// Recent queries the `?` rules as last read did not cover, oldest first.
     recent: VecDeque<(String, Vec<Ipv4Addr>)>,
-    verdicts: BTreeMap<RuleId, Verdict>,
+    verdicts: HashMap<VerifyKey, Verdict>,
 }
 
 impl VerifyState {
@@ -127,15 +120,11 @@ impl VerifyState {
     }
 
     /// The `?` rule that decides `host`: the narrowest one covering it.
-    fn rule_for_host(&self, host: &str) -> Option<&VerifyRule> {
+    fn rule_for_host(&self, host: &str) -> Option<&VerifyKey> {
         self.rules
             .iter()
-            .filter(|r| covers(&r.matcher, host, self.subdomains))
-            .max_by_key(|r| specificity(&r.matcher))
-    }
-
-    fn written_of(&self, rule: &RuleId) -> Option<RouteRole> {
-        self.rules.iter().find(|r| r.id == *rule).map(|r| r.written)
+            .filter(|r| covers(&r.address, host, self.subdomains))
+            .max_by_key(|r| specificity(&r.address))
     }
 
     /// `host`'s check settled nothing at `now`: it waits before the next.
@@ -189,20 +178,20 @@ fn other_route(role: RouteRole) -> RouteRole {
 /// just dropped. `None` when none of them is in the book any more.
 fn moved_for_good(
     book: &CanonicalRuleBook,
-    rules: &BTreeMap<RuleId, RouteRole>,
+    rules: &HashSet<VerifyKey>,
 ) -> Option<(CanonicalRuleBook, u32)> {
     let mut primary = book.primary.rules().to_vec();
     let mut secondary = book.secondary.rules().to_vec();
     let mut moved = 0;
-    for (id, written) in rules {
-        let (from, to) = match written {
+    for key in rules {
+        let (from, to) = match key.written {
             RouteRole::Primary => (&mut primary, &mut secondary),
             RouteRole::Secondary => (&mut secondary, &mut primary),
         };
-        let Some(at) = from
-            .iter()
-            .position(|r| r.id == *id && r.action == RuleAction::Verify)
-        else {
+        let names = |r: &CanonicalRule| {
+            r.action == RuleAction::Verify && r.address_match.as_ref() == Some(&key.address)
+        };
+        let Some(at) = from.iter().position(names) else {
             continue;
         };
         let plain = CanonicalRule {
@@ -249,13 +238,13 @@ impl AutoRulesEngine {
             return;
         }
         let state = states.entry(sid.to_owned()).or_default();
-        if let Some(rule) = state.rule_for_host(host).map(|r| r.id.clone()) {
+        if let Some(key) = state.rule_for_host(host).cloned() {
             // A live verdict already answered for this rule.
-            if !state.verdicts.contains_key(&rule) && state.pending.len() < MAX_PENDING {
+            if !state.verdicts.contains_key(&key) && state.pending.len() < MAX_PENDING {
                 state.pending.insert(
                     host.to_owned(),
                     Candidate {
-                        rule,
+                        key,
                         addresses: addresses.to_vec(),
                         port: None,
                     },
@@ -286,18 +275,18 @@ impl AutoRulesEngine {
         let Some(state) = states.get_mut(sid) else {
             return;
         };
-        let Some(rule) = state.ips.get(&ip) else {
+        let Some(key) = state.ips.get(&ip) else {
             return;
         };
-        if state.verdicts.contains_key(rule) || state.pending.len() >= MAX_PENDING {
+        if state.verdicts.contains_key(key) || state.pending.len() >= MAX_PENDING {
             return;
         }
-        let rule = rule.clone();
+        let key = key.clone();
         state
             .pending
             .entry(ip.to_string())
             .or_insert_with(|| Candidate {
-                rule,
+                key,
                 addresses: vec![ip],
                 port: Some(remote.port()),
             });
@@ -320,7 +309,7 @@ impl AutoRulesEngine {
             let waits = &state.inconclusive;
             let verdicts = &state.verdicts;
             state.pending.retain(|h, c| {
-                !verdicts.contains_key(&c.rule)
+                !verdicts.contains_key(&c.key)
                     && !waits
                         .get(h)
                         .is_some_and(|&(since, wait)| still_waiting(since, wait, now))
@@ -355,22 +344,23 @@ impl AutoRulesEngine {
             let rules = &state.rules;
             let reached = &state.reached;
             state.pending.retain(|h, c| {
-                rules.iter().find(|r| r.id == c.rule).is_some_and(|r| {
-                    reached
+                rules.contains(&c.key)
+                    && reached
                         .get(h)
-                        .is_none_or(|(from, _)| *from != link(r.written))
-                })
+                        .is_none_or(|(from, _)| *from != link(c.key.written))
             });
-            let first = state
+            state
                 .pending
                 .iter()
                 .next()
-                .map(|(h, c)| (h.clone(), c.clone()));
-            first.and_then(|(h, c)| state.written_of(&c.rule).map(|written| (h, c, written)))
+                .map(|(h, c)| (h.clone(), c.clone()))
         };
-        let Some((host, candidate, written)) = next else {
+        let Some((host, candidate)) = next else {
             return;
         };
+        // The link the rule is written for, never the other set's rule of the
+        // same number: a tunnel host must not send its name over the primary.
+        let written = candidate.key.written;
         let Some(&target) = candidate.addresses.first() else {
             return;
         };
@@ -433,7 +423,7 @@ impl AutoRulesEngine {
                 let control = check(link(other_route(written)));
                 let proven = control == PathVerdict::Answered;
                 if proven {
-                    self.reach_verdict(sid, &host, &candidate.rule, now);
+                    self.reach_verdict(sid, &host, &candidate.key, now);
                 } else {
                     tracing::info!(
                         target: "nrr::auto-rules",
@@ -457,30 +447,25 @@ impl AutoRulesEngine {
         }
     }
 
-    /// Record the verdict for `rule`, proven by `host`, and act on it.
-    fn reach_verdict(&self, sid: &str, host: &str, rule: &RuleId, now: SystemTime) {
+    /// Record the verdict for `key`, proven by `host`, and act on it.
+    fn reach_verdict(&self, sid: &str, host: &str, key: &VerifyKey, now: SystemTime) {
         let written = {
             let mut states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = states.get_mut(sid) else {
                 return;
             };
-            let Some(found) = state.rules.iter().find(|r| r.id == *rule).cloned() else {
-                return;
-            };
-            if state.verdicts.contains_key(rule) {
+            if !state.rules.contains(key) || state.verdicts.contains_key(key) {
                 return;
             }
             state.verdicts.insert(
-                rule.clone(),
+                key.clone(),
                 Verdict {
-                    written: found.written,
-                    matcher: found.matcher,
                     host: host.to_owned(),
                     since_ms: unix_ms(now),
                     dismissed: false,
                 },
             );
-            found.written
+            key.written
         };
         tracing::info!(
             target: "nrr::auto-rules",
@@ -499,9 +484,9 @@ impl AutoRulesEngine {
     fn verdicts_changed(&self, sid: &str, reapply: bool) {
         let (moved, pending) = {
             let states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
-            states.get(sid).map_or((BTreeSet::new(), 0), |state| {
+            states.get(sid).map_or((HashSet::new(), 0), |state| {
                 (
-                    state.verdicts.keys().cloned().collect::<BTreeSet<_>>(),
+                    state.verdicts.keys().cloned().collect::<HashSet<_>>(),
                     state.pending_count(),
                 )
             })
@@ -532,17 +517,17 @@ impl AutoRulesEngine {
         let mut out: Vec<VerifyVerdictDto> = state
             .verdicts
             .iter()
-            .map(|(id, v)| VerifyVerdictDto {
-                rule_id: id.0.clone(),
-                value: v.matcher.to_display_string(),
-                kind: if matches!(v.matcher, CanonicalAddressMatch::ExactIp(_)) {
+            .map(|(key, v)| VerifyVerdictDto {
+                rule_id: key.to_string(),
+                value: key.address.to_display_string(),
+                kind: if matches!(key.address, CanonicalAddressMatch::ExactIp(_)) {
                     "ip"
                 } else {
                     "domain"
                 }
                 .to_owned(),
-                from_route: v.written.slug().to_owned(),
-                to_route: other_route(v.written).slug().to_owned(),
+                from_route: key.written.slug().to_owned(),
+                to_route: other_route(key.written).slug().to_owned(),
                 host: v.host.clone(),
                 since_unix_ms: v.since_ms,
                 dismissed: v.dismissed,
@@ -557,20 +542,21 @@ impl AutoRulesEngine {
     }
 
     /// "Not now": the move holds until restart, the notice goes. Returns how
-    /// many verdicts this changed.
+    /// many verdicts this changed. `rule_ids` are the handles the list gave
+    /// out; one that names no live verdict is ignored.
     pub fn dismiss_verify_verdicts(&self, sid: &str, rule_ids: &[String]) -> u32 {
         let dismissed = {
             let mut states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = states.get_mut(sid) else {
                 return 0;
             };
+            // One pass over the verdicts, whatever the caller sent.
+            let asked: HashSet<&str> = rule_ids.iter().map(String::as_str).collect();
             let mut n = 0;
-            for id in rule_ids {
-                if let Some(v) = state.verdicts.get_mut(&RuleId(id.clone())) {
-                    if !v.dismissed {
-                        v.dismissed = true;
-                        n += 1;
-                    }
+            for (key, v) in state.verdicts.iter_mut() {
+                if !v.dismissed && asked.contains(key.to_string().as_str()) {
+                    v.dismissed = true;
+                    n += 1;
                 }
             }
             n
@@ -589,18 +575,17 @@ impl AutoRulesEngine {
         rule_ids: &[String],
         now: SystemTime,
     ) -> Result<u32, AuthorError> {
-        let wanted: BTreeMap<RuleId, RouteRole> = {
+        let wanted: HashSet<VerifyKey> = {
             let states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = states.get(sid) else {
                 return Ok(0);
             };
-            rule_ids
-                .iter()
-                .filter_map(|id| {
-                    let id = RuleId(id.clone());
-                    let written = state.verdicts.get(&id)?.written;
-                    Some((id, written))
-                })
+            let asked: HashSet<&str> = rule_ids.iter().map(String::as_str).collect();
+            state
+                .verdicts
+                .keys()
+                .filter(|key| asked.contains(key.to_string().as_str()))
+                .cloned()
                 .collect()
         };
         if wanted.is_empty() {
@@ -626,7 +611,7 @@ impl AutoRulesEngine {
             if let Some(state) = states.get_mut(sid) {
                 // Rewritten, or no longer in the book: either way nothing is
                 // left to offer for them.
-                state.verdicts.retain(|id, _| !wanted.contains_key(id));
+                state.verdicts.retain(|key, _| !wanted.contains(key));
                 state.rules_read_at = None;
             }
         }
@@ -671,24 +656,16 @@ impl AutoRulesEngine {
         if !due {
             return;
         }
-        let mut rules: Vec<VerifyRule> = Vec::new();
+        let mut rules: Vec<VerifyKey> = Vec::new();
         if let Some(stored) = self.rules.stored_rules_for(sid) {
             let book = &stored.rule_book;
-            for (written, set) in [
-                (RouteRole::Primary, &book.primary),
-                (RouteRole::Secondary, &book.secondary),
-            ] {
+            for written in [RouteRole::Primary, RouteRole::Secondary] {
                 rules.extend(
-                    set.rules()
+                    book.set_for(written)
+                        .rules()
                         .iter()
                         .filter(|r| r.enabled && r.action == RuleAction::Verify)
-                        .filter_map(|r| {
-                            Some(VerifyRule {
-                                id: r.id.clone(),
-                                matcher: r.address_match.clone()?,
-                                written,
-                            })
-                        }),
+                        .filter_map(|r| VerifyKey::of(written, r)),
                 );
             }
         }
@@ -700,17 +677,15 @@ impl AutoRulesEngine {
                 // A new book is a new question: earlier waits do not carry over.
                 state.inconclusive.clear();
             }
+            // A verdict outlives a renumbering: the rule it names is still
+            // there, under whatever line number the edit left it.
             let before = state.verdicts.len();
-            state.verdicts.retain(|id, v| {
-                rules
-                    .iter()
-                    .any(|r| r.id == *id && r.written == v.written && r.matcher == v.matcher)
-            });
+            state.verdicts.retain(|key, _| rules.contains(key));
             let dropped = state.verdicts.len() != before;
             state.ips = rules
                 .iter()
-                .filter_map(|r| match r.matcher {
-                    CanonicalAddressMatch::ExactIp(IpAddr::V4(ip)) => Some((ip, r.id.clone())),
+                .filter_map(|r| match r.address {
+                    CanonicalAddressMatch::ExactIp(IpAddr::V4(ip)) => Some((ip, r.clone())),
                     _ => None,
                 })
                 .collect();
@@ -723,26 +698,25 @@ impl AutoRulesEngine {
                 ..
             } = &mut *state;
             pending.retain(|host, c| {
-                rules.iter().any(|r| {
-                    r.id == c.rule && (c.port.is_some() || covers(&r.matcher, host, subdomains))
-                })
+                rules.contains(&c.key)
+                    && (c.port.is_some() || covers(&c.key.address, host, subdomains))
             });
             // Queries that came before a rule was read now count for it. With
             // no `?` rule at all they are dropped: such a principal keeps no
             // buffer.
             let earlier = std::mem::take(recent);
             for (host, addresses) in earlier {
-                let rule = rules
+                let key = rules
                     .iter()
-                    .filter(|r| covers(&r.matcher, &host, subdomains))
-                    .max_by_key(|r| specificity(&r.matcher))
-                    .map(|r| r.id.clone());
-                match rule {
-                    Some(rule) if pending.len() < MAX_PENDING => {
+                    .filter(|r| covers(&r.address, &host, subdomains))
+                    .max_by_key(|r| specificity(&r.address))
+                    .cloned();
+                match key {
+                    Some(key) if pending.len() < MAX_PENDING => {
                         pending.insert(
                             host,
                             Candidate {
-                                rule,
+                                key,
                                 addresses,
                                 port: None,
                             },

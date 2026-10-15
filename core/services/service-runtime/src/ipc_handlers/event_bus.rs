@@ -12,10 +12,10 @@
 //! - Detect *gap* situations on resubscribe — when the client's
 //!   `last_seen_event_id` is older than the oldest buffered event —
 //!   and signal the client to do a fresh `SnapshotInitialGet`.
-//! - Track per-subscriber `dropped_count` for slow consumers (the
-//!   transport bumps this when a pipe write fails); the next
-//!   successful push ahead of fresh events is an
-//!   [`StatusUpdateEvent::Overflow`] frame so the GUI can resync.
+//!
+//! A subscriber whose connection cannot take a frame is not counted or
+//! signalled here: the transport closes that connection, and the client's
+//! own reconnect and `push-gap` are the recovery path.
 //!
 //! ## What this module *does not* own
 //!
@@ -76,10 +76,6 @@ pub struct SubscriberState {
     /// Lowest `event_id` we still owe this subscriber. Each successful
     /// transport push advances this past the pushed event.
     pub cursor_event_id: u64,
-    /// Bumped by the transport when a pipe write fails. The subscriber
-    /// receives an `Overflow { dropped_count }` frame on its next
-    /// successful push (and the counter resets to zero).
-    pub dropped_count: u64,
     /// Last time the transport read or acknowledged anything for this
     /// subscription. What separates a quiet client from a dead one.
     pub last_activity: Instant,
@@ -142,8 +138,11 @@ impl EventBus {
     }
 
     fn publish_to(&self, audience: Option<String>, event: StatusUpdateEvent) -> u64 {
-        let id = self.next_event_id.fetch_add(1, Ordering::SeqCst);
+        // Numbered under the buffer's lock: numbered outside it, a smaller id
+        // could land behind a larger one and a reader that saw the larger would
+        // never be pushed the smaller.
         let mut buf = self.buffer.lock().expect("event bus buffer poisoned");
+        let id = self.next_event_id.fetch_add(1, Ordering::SeqCst);
         buf.push_back(EventEntry {
             event_id: id,
             event,
@@ -242,7 +241,6 @@ impl EventBus {
                 client_id,
                 principal,
                 cursor_event_id: cursor,
-                dropped_count: 0,
                 last_activity: now,
             },
         );
@@ -307,30 +305,6 @@ impl EventBus {
         if let Some(sub) = subs.get_mut(subscription_id) {
             sub.cursor_event_id = sub.cursor_event_id.max(event_id + 1);
             sub.last_activity = Instant::now();
-        }
-    }
-
-    /// Increment the per-subscriber dropped counter (called by the
-    /// transport when a pipe write fails). The next successful push
-    /// will be preceded by an `Overflow { dropped_count }` frame.
-    pub fn record_drop(&self, subscription_id: &str, count: u64) {
-        let mut subs = self.subscribers.lock().expect("subscribers poisoned");
-        if let Some(sub) = subs.get_mut(subscription_id) {
-            sub.dropped_count = sub.dropped_count.saturating_add(count);
-        }
-    }
-
-    /// Take and reset the dropped counter for `subscription_id`. The
-    /// transport calls this right before a successful flush so it
-    /// knows to emit an `Overflow` frame first.
-    pub fn take_dropped_count(&self, subscription_id: &str) -> u64 {
-        let mut subs = self.subscribers.lock().expect("subscribers poisoned");
-        if let Some(sub) = subs.get_mut(subscription_id) {
-            let dropped = sub.dropped_count;
-            sub.dropped_count = 0;
-            dropped
-        } else {
-            0
         }
     }
 
@@ -545,16 +519,6 @@ mod tests {
         assert_eq!(pending.len(), 2);
         bus.advance_cursor(&s.subscription_id, 2);
         assert!(bus.peek_pending_for(&s.subscription_id, 16).is_empty());
-    }
-
-    #[test]
-    fn dropped_counter_round_trips_through_record_and_take() {
-        let bus = EventBus::new();
-        let s = bus.subscribe("client-1".into(), None);
-        bus.record_drop(&s.subscription_id, 3);
-        bus.record_drop(&s.subscription_id, 2);
-        assert_eq!(bus.take_dropped_count(&s.subscription_id), 5);
-        assert_eq!(bus.take_dropped_count(&s.subscription_id), 0);
     }
 
     #[test]

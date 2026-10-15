@@ -23,7 +23,7 @@ use nrr_service_runtime::app_observation_lookup::AppObservationStore;
 use nrr_service_runtime::block_notice_center::BlockNoticeCenter;
 use nrr_service_runtime::conn_observation_consumer::{
     BlockNoticeSinkFn, ConnTraceTee, ConnectionObservationConsumer, ConnectionTraceRing,
-    EgressIfindexesFn, KillswitchDropCheckFn, VpnEndpointLearnFn,
+    EgressIfindexesFn, KillswitchDropCheckFn,
 };
 use nrr_service_runtime::service_tasks::AppObservationWiring;
 
@@ -32,7 +32,6 @@ pub(crate) struct DropObservationParts {
     pub api: Arc<dyn RouteTablePort>,
     pub egress_of: EgressIfindexesFn,
     pub notice_sink: BlockNoticeSinkFn,
-    pub vpn_endpoint_learner: VpnEndpointLearnFn,
     /// The trace's "write to the log" switch, shared with the settings writer.
     pub log_ndjson: Arc<AtomicBool>,
     pub stale_flow_reset: Option<Arc<dyn StaleFlowReset>>,
@@ -104,11 +103,7 @@ pub(crate) fn drop_consumer(
     .with_drop_pairing()
     .with_app_observations(store)
     .with_trace_ring(ring)
-    // System drops may teach a tunnel server, as on the other platform.
-    .with_vpn_endpoint_learner(
-        parts.vpn_endpoint_learner,
-        tag_check(|tag| tag.kind.verifies_kill_switch()),
-    )
+    .with_killswitch_drop_check(tag_check(|tag| tag.kind.verifies_kill_switch()))
     .with_ipv6_cut_drop_check(tag_check(|tag| tag.kind == DropKind::Ipv6Cut))
     .with_dns_lockdown_drop_check(tag_check(|tag| tag.kind == DropKind::DnsLockdown))
     .with_service_account_drop_check(tag_check(|tag| tag.system))

@@ -176,13 +176,15 @@ impl FakeIpStack {
         };
         self.health.record_udp_relay_flow_opened();
         let outcome = Arc::new(Mutex::new(None));
-        let spawned = spawn_udp_dial_worker(
+        let submitted = submit_udp_dial(
+            &self.dial_pool,
             Arc::clone(&self.dialer),
             target,
             Arc::clone(&outcome),
             Arc::clone(&self.waker),
         );
-        if spawned.is_err() {
+        if let Err(refusal) = submitted {
+            self.warn_dial_refused(&refusal);
             self.health.record_udp_dial_failed();
             self.send_port_unreachable(*key, client, payload.len());
             return;
@@ -244,8 +246,17 @@ impl FakeIpStack {
                 }
             };
             let upstream: Arc<dyn RelayDatagram> = Arc::from(datagram);
-            let replies = UdpReplies::new(Arc::clone(&self.waker));
-            let worker = spawn_udp_reader(Arc::clone(&upstream), Arc::clone(&replies));
+            let replies = UdpReplies::new(Arc::clone(&self.waker), Arc::clone(&self.health));
+            // No reader, no replies: the flow fails here, like a dial that
+            // never landed. The upstream socket closes with `upstream`.
+            let worker = match spawn_udp_reader(Arc::clone(&upstream), Arc::clone(&replies)) {
+                Ok(worker) => worker,
+                Err(_) => {
+                    self.health.record_worker_spawn_failed();
+                    self.send_port_unreachable(*key, client, pending.first_payload_len);
+                    continue;
+                }
+            };
             let Some(bind) = self.udp_binds.get_mut(key) else {
                 return;
             };

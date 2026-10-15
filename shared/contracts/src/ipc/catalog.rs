@@ -53,7 +53,7 @@ const CLIENTS_POLICY_SURFACES: [IpcClientProfile; 3] = [
     IpcClientProfile::Tui,
 ];
 
-const IPC_OPERATION_CATALOG: [IpcOperationSpec; 74] = [
+const IPC_OPERATION_CATALOG: [IpcOperationSpec; 76] = [
     IpcOperationSpec {
         name: IpcOperationName::ContractNegotiate,
         class: IpcInteractionClass::HealthCheck,
@@ -202,6 +202,22 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 74] = [
         name: IpcOperationName::DohResolversSet,
         // Machine-wide baseline edit → privileged (elevation), unlike the
         // per-SID route-policy writes.
+        class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
+        requires_service_mutation_privilege: true,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::LocalDnsSuffixesGet,
+        // Read the shared suffix list and the network's offer — a plain query.
+        class: IpcInteractionClass::Query,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::LocalDnsSuffixesSet,
+        // Machine-wide list edit: an administrator's change, like the DoH list.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_POLICY_SURFACES,
@@ -566,8 +582,8 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 74] = [
     // ── Block-notice mutes + notice-driven routing ──────────────────
     IpcOperationSpec {
         name: IpcOperationName::BlockNoticeJournalList,
-        // Read of the caller's own undelivered notices. GUI + TRAY: whichever
-        // surface comes up first is the one that shows them.
+        // Read of the caller's own undelivered notices. Whichever surface
+        // comes up first is the one that shows them.
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_POLICY_SURFACES,

@@ -2,10 +2,10 @@
 //!
 //! Read / replace the SHARED DoH/DoT resolver baseline list (the machine-wide
 //! `doh_resolver_entries` table). The list is NOT per-SID: it is a machine fact
-//! seeded with public resolvers by country and edited rarely. The set op is
-//! privileged (elevation) at the catalog level; a successful replace fires the
-//! recompile hook for the active caller so the new resolver set takes effect at
-//! once (the resolved IPs feed the DoH-lockdown blocks).
+//! seeded with public resolvers by country and edited rarely. A change needs an
+//! administrator, checked by value (`machine_scoped`); a successful replace
+//! fires the recompile hook for the active caller so the new resolver set takes
+//! effect at once (the resolved IPs feed the DoH-lockdown blocks).
 
 use std::sync::Arc;
 
@@ -102,7 +102,7 @@ impl IpcHandler for DohResolversSetHandler {
             ctx.caller_is_elevated,
         ) {
             return Err(crate::machine_scoped::machine_scoped_refusal(
-                "The DoH/DoT resolver list",
+                crate::machine_scoped::MachineScopedSetting::DohResolvers,
             ));
         }
         match self.store.replace_all(&req.resolvers) {

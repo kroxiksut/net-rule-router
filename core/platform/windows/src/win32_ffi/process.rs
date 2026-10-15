@@ -8,13 +8,36 @@ use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, FALSE, HANDLE};
 use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
 /// The longest path Win32 can name, in UTF-16 units with the terminator.
 const MAX_PATH_UNITS: usize = 32_768;
 /// Past `MAX_PATH` with room to spare, so an ordinary path takes one call.
 const FIRST_TRY_UNITS: usize = 512;
+
+/// End process `pid` at once. `false` when it cannot be opened for that or
+/// refuses; pid 0 is never touched.
+pub fn terminate(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: terminate rights on a pid; the handle is closed below.
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_TERMINATE, FALSE, pid) }) else {
+        return false;
+    };
+    if handle.is_invalid() {
+        return false;
+    }
+    // SAFETY: a handle opened above with terminate rights.
+    let ended = unsafe { TerminateProcess(handle, 1) }.is_ok();
+    // SAFETY: opened above and not used after this call.
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    ended
+}
 
 /// Every running process id; empty on failure.
 pub fn enum_process_ids() -> Vec<u32> {

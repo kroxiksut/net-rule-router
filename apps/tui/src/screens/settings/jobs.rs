@@ -12,7 +12,8 @@ use nrr_platform_api::service_control::ServiceControlError;
 use nrr_shared::ipc::IpcOperationName as Op;
 use nrr_shared::ipc_payloads::{
     ApplyFailurePolicyDto, BlockNoticeMuteDto, BlockNoticeMuteScopeDto,
-    BlockNoticeMutesListResponse, LogRetentionConfigDto, LogRetentionConfigSetRequest,
+    BlockNoticeMutesListResponse, LocalDnsSuffixesGetResponse, LocalNetworksGetResponse,
+    LocalNetworksSetResponse, LogRetentionConfigDto, LogRetentionConfigSetRequest,
     LogsClearResponse, RetentionSettingsDto, RetentionSettingsSetRequest,
     SettingsExportFullResponse, StorageUsageDto, TrafficStatsGetResponse, TrafficStatsSettingsDto,
 };
@@ -93,6 +94,82 @@ pub fn load_policy() -> Job {
     job(|client| {
         let result = loaded(policy_of(client));
         Reply::new(move |app| app.settings.data.policy = result)
+    })
+}
+
+pub fn load_local_suffixes() -> Job {
+    job(|client| {
+        let result = loaded(read::<LocalDnsSuffixesGetResponse>(
+            client,
+            Op::LocalDnsSuffixesGet,
+            json!({}),
+        ));
+        Reply::new(move |app| app.settings.data.local_suffixes = result)
+    })
+}
+
+/// The whole list, replaced; the answer is the list as stored.
+pub fn write_local_suffixes(suffixes: Vec<String>) -> Job {
+    job(move |client| {
+        let result = read::<LocalDnsSuffixesGetResponse>(
+            client,
+            Op::LocalDnsSuffixesSet,
+            json!({ "suffixes": suffixes }),
+        );
+        written(result, Words::Key(text::SAVED), |app, list| {
+            app.settings.data.local_suffixes = Loadable::Ready(list);
+            app.settings.local_suffix_new.clear();
+        })
+    })
+}
+
+pub fn load_local_networks() -> Job {
+    job(|client| {
+        let result = loaded(read::<LocalNetworksGetResponse>(
+            client,
+            Op::LocalNetworksGet,
+            json!({}),
+        ));
+        Reply::new(move |app| app.settings.data.local_networks = result)
+    })
+}
+
+/// Answers about listed networks (`decisions`: network, keep reachable) and
+/// networks to forget. A refusal is said by the network it names.
+pub fn write_local_networks(decisions: Vec<(String, bool)>, forget: Vec<String>) -> Job {
+    job(move |client| {
+        let decisions: Vec<Value> = decisions
+            .into_iter()
+            .map(|(cidr, allowed)| json!({ "cidr": cidr, "allowed": allowed }))
+            .collect();
+        let result = read::<LocalNetworksSetResponse>(
+            client,
+            Op::LocalNetworksSet,
+            json!({ "decisions": decisions, "forget": forget }),
+        );
+        Reply::new(move |app| match result {
+            Ok(answer) => {
+                app.settings.data.local_networks = Loadable::Ready(LocalNetworksGetResponse {
+                    networks: answer.networks,
+                });
+                match answer.rejected.first() {
+                    Some(refused) => {
+                        let key = if refused.reason == "not-private" {
+                            text::LOCAL_NOT_PRIVATE
+                        } else {
+                            text::LOCAL_MALFORMED
+                        };
+                        app.settings
+                            .refuse(Words::Fill(key, vec![("cidr", refused.cidr.clone())]));
+                    }
+                    None => {
+                        app.settings.local_network_new.clear();
+                        app.settings.done(Words::Key(text::SAVED));
+                    }
+                }
+            }
+            Err(failure) => app.settings.failed(text::NOT_SAVED, failure),
+        })
     })
 }
 

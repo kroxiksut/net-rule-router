@@ -7,10 +7,8 @@
 //! [`super::providers`].
 //!
 //! `caller_sid.is_empty()` is treated as a transport error (`Internal`)
-//! for per-SID writers (routing pause, autostart). The two singleton
-//! mutators (retention, apply failure policy) are gated upstream by the
-//! envelope class and the handler-side value check; the handlers here do not
-//! re-check elevation.
+//! for per-SID writers (routing pause, autostart). The machine-wide writers
+//! gate a change by value (`machine_scoped`); their class needs no elevation.
 
 use std::sync::Arc;
 
@@ -108,7 +106,7 @@ impl IpcHandler for RetentionSettingsSetHandler {
             ctx.caller_is_elevated,
         ) {
             return Err(crate::machine_scoped::machine_scoped_refusal(
-                "The retention policy",
+                crate::machine_scoped::MachineScopedSetting::Retention,
             ));
         }
         match self.writer.set(&req) {
@@ -219,7 +217,7 @@ impl IpcHandler for LogRetentionConfigSetHandler {
             ctx.caller_is_elevated,
         ) {
             return Err(crate::machine_scoped::machine_scoped_refusal(
-                "The log and audit retention policy",
+                crate::machine_scoped::MachineScopedSetting::LogRetention,
             ));
         }
         match self.writer.set(&req) {
@@ -275,7 +273,7 @@ impl IpcHandler for ApplyFailurePolicySetHandler {
             ctx.caller_is_elevated,
         ) {
             return Err(crate::machine_scoped::machine_scoped_refusal(
-                "The apply-failure policy",
+                crate::machine_scoped::MachineScopedSetting::ApplyFailurePolicy,
             ));
         }
         let sid = if ctx.caller_stored().is_empty() {
@@ -478,7 +476,7 @@ impl IpcHandler for TrafficStatsSetHandler {
             ctx.caller_is_elevated,
         ) {
             return Err(crate::machine_scoped::machine_scoped_refusal(
-                "Traffic statistics",
+                crate::machine_scoped::MachineScopedSetting::TrafficStats,
             ));
         }
         match self.writer.set(&req.settings) {

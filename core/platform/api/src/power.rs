@@ -65,6 +65,25 @@ pub trait PowerEventObserver: Send + Sync {
     ) -> Result<PowerEventSubscription, PlatformError>;
 }
 
+/// Whether the machine itself is going down, asked when a stop arrives. The
+/// teardown keeps every filter and route on a shutdown: nothing of ours
+/// survives the power-off, and removing it only opens a window while system
+/// services still run. On Windows the SCM control code carries the answer;
+/// on Linux systemd is asked.
+pub trait MachineShutdownProbe: Send + Sync {
+    fn machine_is_shutting_down(&self) -> bool;
+}
+
+/// A probe that never sees a shutdown: every stop reads as a service stop.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopMachineShutdownProbe;
+
+impl MachineShutdownProbe for NoopMachineShutdownProbe {
+    fn machine_is_shutting_down(&self) -> bool {
+        false
+    }
+}
+
 /// No-op observer for platforms without an impl and for tests. Subscribing
 /// succeeds and nothing ever fires, so the caller falls back entirely to the
 /// neutral gap detector.

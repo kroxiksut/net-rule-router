@@ -5,16 +5,18 @@
 //! reads it, and nothing stored or hashed does. Process-wide and keyed by
 //! principal, so no wiring can hand one reader a different set than another;
 //! a service restart forgets it, which is what makes the check repeat.
+//!
+//! A rule is named by its set and address ([`VerifyKey`]), never by its
+//! number: numbers restart in each set and shift under an inserted line.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
-use nrr_domain::canonical::CanonicalRuleBook;
-use nrr_domain::RuleId;
+use nrr_domain::canonical::{CanonicalRuleBook, VerifyKey};
 
 struct Entry {
-    moved: Arc<BTreeSet<RuleId>>,
+    moved: Arc<HashSet<VerifyKey>>,
     generation: u64,
 }
 
@@ -26,8 +28,8 @@ fn registry() -> &'static RwLock<HashMap<String, Entry>> {
     REGISTRY.get_or_init(Default::default)
 }
 
-fn empty() -> Arc<BTreeSet<RuleId>> {
-    static EMPTY: OnceLock<Arc<BTreeSet<RuleId>>> = OnceLock::new();
+fn empty() -> Arc<HashSet<VerifyKey>> {
+    static EMPTY: OnceLock<Arc<HashSet<VerifyKey>>> = OnceLock::new();
     Arc::clone(EMPTY.get_or_init(Default::default))
 }
 
@@ -37,8 +39,8 @@ pub(crate) fn changes() -> u64 {
     CHANGES.load(Ordering::Acquire)
 }
 
-/// `principal`'s moved rule ids and the generation they carry (0 when none).
-pub(crate) fn moved_for(principal: &str) -> (u64, Arc<BTreeSet<RuleId>>) {
+/// `principal`'s moved rules and the generation they carry (0 when none).
+pub(crate) fn moved_for(principal: &str) -> (u64, Arc<HashSet<VerifyKey>>) {
     let map = registry().read().unwrap_or_else(PoisonError::into_inner);
     match map.get(principal) {
         Some(e) => (e.generation, Arc::clone(&e.moved)),
@@ -47,7 +49,7 @@ pub(crate) fn moved_for(principal: &str) -> (u64, Arc<BTreeSet<RuleId>>) {
 }
 
 /// Replace `principal`'s set; `false` when it was already this one.
-pub(crate) fn set(principal: &str, moved: BTreeSet<RuleId>) -> bool {
+pub(crate) fn set(principal: &str, moved: HashSet<VerifyKey>) -> bool {
     let mut map = registry().write().unwrap_or_else(PoisonError::into_inner);
     let current = map.get(principal).map(|e| e.moved.as_ref());
     if current.map_or(moved.is_empty(), |c| *c == moved) {
@@ -77,27 +79,35 @@ pub(crate) fn effective(book: &CanonicalRuleBook, principal: &str) -> CanonicalR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nrr_domain::canonical::CanonicalAddressMatch;
+    use nrr_shared::RouteRole;
 
-    fn ids(names: &[&str]) -> BTreeSet<RuleId> {
-        names.iter().map(|n| RuleId((*n).to_string())).collect()
+    fn keys(hosts: &[&str]) -> HashSet<VerifyKey> {
+        hosts
+            .iter()
+            .map(|h| VerifyKey {
+                written: RouteRole::Primary,
+                address: CanonicalAddressMatch::ExactFqdn((*h).to_string()),
+            })
+            .collect()
     }
 
     #[test]
     fn a_set_is_served_to_its_principal_only_and_moves_the_change_number() {
         let before = changes();
-        assert!(set("S-overlay-1", ids(&["r-1"])));
+        assert!(set("S-overlay-1", keys(&["a.example"])));
         assert!(changes() > before);
         let (generation, moved) = moved_for("S-overlay-1");
         assert_ne!(generation, 0);
-        assert_eq!(*moved, ids(&["r-1"]));
+        assert_eq!(*moved, keys(&["a.example"]));
         assert!(moved_for("S-overlay-2").1.is_empty());
 
         assert!(
-            !set("S-overlay-1", ids(&["r-1"])),
+            !set("S-overlay-1", keys(&["a.example"])),
             "the same set is no change"
         );
-        assert!(set("S-overlay-1", BTreeSet::new()));
+        assert!(set("S-overlay-1", HashSet::new()));
         assert_eq!(moved_for("S-overlay-1").0, 0);
-        assert!(!set("S-overlay-1", BTreeSet::new()));
+        assert!(!set("S-overlay-1", HashSet::new()));
     }
 }

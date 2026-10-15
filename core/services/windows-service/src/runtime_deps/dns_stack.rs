@@ -30,6 +30,7 @@ pub(super) fn build_dns_resolver_factory(
         Arc<nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator>,
     >,
     outage_blocks: Option<Arc<nrr_service_runtime::outage_blocks::OutageBlocks>>,
+    liveness: Arc<TaskLiveness>,
 ) -> Option<nrr_service_runtime::dns_resolver_service::DnsResolverFactory> {
     use nrr_platform_windows::dns_redirect::{
         NrptDnsRedirect, PowerShellRunner, TransactedNrptStore, WindowsSearchList,
@@ -52,7 +53,10 @@ pub(super) fn build_dns_resolver_factory(
         auto_rules,
         signed_in,
         route_coordinator,
+        first_contact: None,
+        first_contact_v6: None,
         outage_blocks,
+        liveness: Some(liveness),
     };
     let platform = DnsStackPlatform {
         // One enumeration costs a PowerShell run; built once here, so every
@@ -208,6 +212,7 @@ pub(super) fn build_fake_ip_stack_factory(
         &Arc<nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator>,
     >,
     auto_rules_engine: Option<&Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>>,
+    liveness: Arc<TaskLiveness>,
 ) -> Option<nrr_service_runtime::fake_ip::FakeIpStackFactory> {
     use nrr_platform_api::fake_ip::tun::{TunAdapterConfig, TunAdapterPort};
     use nrr_platform_windows::fake_ip::WintunTunAdapter;
@@ -355,6 +360,7 @@ pub(super) fn build_fake_ip_stack_factory(
                 }
             }),
             Some(heal_persist),
+            Some(Arc::clone(&liveness)),
         ));
         let flow_observer: Arc<dyn nrr_service_runtime::fake_ip::FlowObserver> =
             match auto_rules_engine.as_ref() {
@@ -364,6 +370,7 @@ pub(super) fn build_fake_ip_stack_factory(
                         Arc::new(nrr_service_runtime::fake_ip::FlowActivityObserver::new(
                             Arc::clone(engine),
                             Arc::clone(&active_sid),
+                            Some(Arc::clone(&liveness)),
                         )),
                     ],
                 )),
@@ -478,16 +485,9 @@ pub(super) fn upstream_dns_pool() -> Arc<nrr_service_runtime::dns_upstream::Upst
     }))
 }
 
-/// The namespaces the product must not answer for, read fresh on every call:
-/// actionable claims of the connections in use, our own tunnel aside.
-fn claimed_namespaces() -> Vec<nrr_platform_api::dns_redirect::DnsNamespaceExemption> {
-    nrr_platform_windows::dns_scope::live_actionable_dns_scopes()
-        .into_iter()
-        .map(
-            |scope| nrr_platform_api::dns_redirect::DnsNamespaceExemption {
-                suffix: scope.suffix,
-                servers: scope.servers,
-            },
-        )
-        .collect()
+/// The namespaces the connections in use claim, read fresh on every call, with
+/// the kind of link behind each; our own tunnel aside. The neutral stack
+/// decides which ones the redirect honours.
+fn claimed_namespaces() -> Vec<nrr_platform_api::dns_scope::ClaimedNamespace> {
+    nrr_platform_windows::dns_scope::live_claims()
 }

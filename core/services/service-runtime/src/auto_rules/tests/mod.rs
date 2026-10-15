@@ -56,13 +56,19 @@ impl FixedRules {
     fn set_behavior_mode(&self, mode: RouteBehaviorMode) {
         *self.behavior_mode.lock().unwrap_or_else(|p| p.into_inner()) = mode;
     }
+
+    /// What the engine's behaviour-mode source answers: the user's policy,
+    /// which the snapshot below never carries.
+    fn behavior_mode(&self) -> RouteBehaviorMode {
+        *self.behavior_mode.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 impl RulesProvider for FixedRules {
     fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
         Some(ActiveRulesSnapshot {
             rule_book: self.book.lock().unwrap_or_else(|p| p.into_inner()).clone(),
-            behavior_mode: *self.behavior_mode.lock().unwrap_or_else(|p| p.into_inner()),
+            // The placeholder the production provider ships.
         })
     }
 }
@@ -225,6 +231,15 @@ struct Fixture {
     dismissals: Arc<InMemoryDismissalStore>,
 }
 
+impl Fixture {
+    /// Change the user's mode; the engine memoises its settings, so the memo
+    /// is dropped as a settings write would in production.
+    fn set_behavior_mode(&self, mode: RouteBehaviorMode) {
+        self.rules.set_behavior_mode(mode);
+        self.engine.expire_settings_memo();
+    }
+}
+
 fn fixture(mode: AutoRulesMode) -> Fixture {
     fixture_with_store(mode, Arc::new(InMemoryDismissalStore::new()))
 }
@@ -293,6 +308,10 @@ fn build_fixture(
         Arc::clone(&pending_store) as Arc<dyn PendingSuggestionStore>,
         SystemTime::UNIX_EPOCH,
     )
+    .with_behavior_mode_source({
+        let rules = Arc::clone(&rules);
+        Arc::new(move |_sid: &str| rules.behavior_mode())
+    })
     .with_author(Arc::clone(&author) as Arc<dyn AutoRuleAuthor>);
     if let Some(source) = eager_delivery {
         engine = engine.with_eager_delivery_names(source);

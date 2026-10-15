@@ -142,6 +142,10 @@ pub fn ipc_operation_timeout(op: IpcOperationName) -> Duration {
         IpcOperationName::DohResolversGet | IpcOperationName::DohResolversSet => {
             Duration::from_secs(2)
         }
+        // A list of a few dozen suffixes plus one registry walk for the offer.
+        IpcOperationName::LocalDnsSuffixesGet | IpcOperationName::LocalDnsSuffixesSet => {
+            Duration::from_secs(2)
+        }
         // Traffic-stats read is a couple of indexed SQLite reads plus
         // in-memory session totals; the write is one singleton-row upsert. 2 s.
         IpcOperationName::TrafficStatsGet

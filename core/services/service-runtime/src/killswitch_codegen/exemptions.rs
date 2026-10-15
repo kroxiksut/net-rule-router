@@ -267,28 +267,41 @@ pub(super) fn exempt_probe_target(sid: &str, ip: Ipv4Addr, weight: u64) -> WfpFi
     }
 }
 
-/// port-scoped exemption permits for outbound DNS (remote port
-/// 53, UDP + TCP) at the ALE connect layer, so name resolution keeps working over
-/// the PRIMARY link while the catch-all block-all is engaged. Opt-in only (see
-/// [`FailClosedExemptions::allow_dns_over_primary`]); narrowed to port 53 so it is
-/// not a full-host tunnel. Returns two specs (UDP then TCP).
-/// `pub(super)` because the emitters moved out of `killswitch_codegen` and it
-/// is now the caller.
-pub(super) fn exempt_dns_over_primary(sid: &str, base_weight: u64) -> Vec<WfpFilterSpec> {
+/// Most resolvers the DNS permit names; the OS lists two or three.
+pub const MAX_DNS_SERVER_PERMITS: usize = 8;
+
+/// Port-scoped permits for outbound DNS (remote port 53, UDP + TCP) at the ALE
+/// connect layer, one pair per system resolver, so name resolution keeps
+/// working over the PRIMARY link while the catch-all block-all is engaged.
+/// Opt-in only (see [`FailClosedExemptions::allow_dns_over_primary`]) and
+/// pinned to the machine's own resolvers: port 53 to any host is a tunnel for
+/// every program that runs its own DNS. No servers, no permits.
+pub(super) fn exempt_dns_over_primary(
+    sid: &str,
+    servers: &[Ipv4Addr],
+    base_weight: u64,
+) -> Vec<WfpFilterSpec> {
     const IP_PROTO_UDP: u8 = 17;
     const IP_PROTO_TCP: u8 = 6;
-    [(IP_PROTO_UDP, "udp53"), (IP_PROTO_TCP, "tcp53")]
-        .into_iter()
+    servers
+        .iter()
+        .filter(|ip| !is_exempt_from_blocking(**ip))
+        .take(MAX_DNS_SERVER_PERMITS)
+        .flat_map(|ip| {
+            [(IP_PROTO_UDP, "udp53"), (IP_PROTO_TCP, "tcp53")]
+                .into_iter()
+                .map(move |(proto, tag)| (*ip, proto, tag))
+        })
         .enumerate()
-        .map(|(i, (proto, tag))| WfpFilterSpec {
+        .map(|(i, (ip, proto, tag))| WfpFilterSpec {
             layer: WfpLayerKey::AleAuthConnectV4,
             action: WfpAction::Permit,
-            remote_ip: None,
+            remote_ip: Some(ip),
             remote_ip_set: Vec::new(),
             remote_ip_set_v6: Vec::new(),
             remote_port: Some(53),
             weight: base_weight + i as u64,
-            id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-ca-dns", tag),
+            id: filter_id_for(sid, KILLSWITCH_ROLE, &ip.to_string(), "ks-ca-dns", tag),
             user_sid: Some(sid.to_string()),
             app_pattern: None,
             local_interface_luid: None,

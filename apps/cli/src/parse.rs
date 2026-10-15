@@ -53,7 +53,7 @@ pub enum Command {
     /// Remove network state a crashed service left behind. `confirmed` carries
     /// the mandatory flag rather than gating the parse, so "you meant this but
     /// did not confirm" stays a distinct answer from a usage error.
-    ResetNetwork { confirmed: bool },
+    ResetNetwork { confirmed: bool, stop_service: bool },
     /// Print the console version.
     Version,
     /// Print usage.
@@ -349,6 +349,7 @@ fn build(
         "diag export" => Ok(Command::DiagExport),
         "reset-network" => Ok(Command::ResetNetwork {
             confirmed: flag(flags, "confirm").is_some(),
+            stop_service: flag(flags, "stop-service").is_some(),
         }),
         "version" => Ok(Command::Version),
         "help" => Ok(Command::Help),
@@ -487,11 +488,24 @@ mod tests {
         // answer with its own exit code, not a usage error.
         assert_eq!(
             p(&["reset-network"]),
-            Ok(Command::ResetNetwork { confirmed: false })
+            Ok(Command::ResetNetwork {
+                confirmed: false,
+                stop_service: false
+            })
         );
         assert_eq!(
             p(&["reset-network", "--confirm"]),
-            Ok(Command::ResetNetwork { confirmed: true })
+            Ok(Command::ResetNetwork {
+                confirmed: true,
+                stop_service: false
+            })
+        );
+        assert_eq!(
+            p(&["reset-network", "--confirm", "--stop-service"]),
+            Ok(Command::ResetNetwork {
+                confirmed: true,
+                stop_service: true
+            })
         );
     }
 

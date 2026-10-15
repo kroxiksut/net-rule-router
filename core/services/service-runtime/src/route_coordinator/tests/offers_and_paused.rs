@@ -900,3 +900,186 @@ fn principal_with_no_rules_clears_routes_via_read_through_miss() {
     assert!(delta.is_noop());
     assert!(table_dests(&api).is_empty());
 }
+
+/// A public IPv6 prefix on the main link is a home network only the user can
+/// vouch for: closed until they say yes, and never opened while a rule names
+/// an address inside it — that rule's traffic would leave past the guard.
+#[test]
+fn a_public_v6_prefix_opens_only_on_a_yes_and_never_over_a_rule_address() {
+    let api = Arc::new(MockWindowsApi::new());
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
+    let vpn_id = vpn.stable_id();
+    let eth_id = eth.stable_id();
+    api.set_adapter_infos(vec![vpn, eth]);
+    let home: std::net::Ipv6Addr = "2001:db8:5:7::".parse().expect("prefix");
+    let mut routes = vec![
+        route_entry([192, 168, 1, 0], 24, [0, 0, 0, 0], 12, 5),
+        route_entry([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, 1),
+    ];
+    routes.push(RouteEntry {
+        destination: IpAddr::V6(home),
+        prefix_length: 64,
+        next_hop: IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        interface_index: 12,
+        metric: 5,
+        is_ours: false,
+        table: nrr_platform_api::RouteTableRef::Main,
+    });
+    api.set_route_table(routes.clone());
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_primary("S-IVANOV", &eth_id);
+    policy.bind_secondary("S-IVANOV", &vpn_id);
+    let block = nrr_shared::ip_block::IpBlock::new(IpAddr::V6(home), 64).expect("block");
+
+    let rules = Arc::new(FakeRules::new());
+    rules.set_secondary("S-IVANOV", CanonicalRuleSet::from_rules(vec![]));
+    let unanswered =
+        coordinator_with_policy(Arc::clone(&api), Arc::clone(&rules), Arc::clone(&policy));
+    let listed = unanswered.public_v6_local_networks("S-IVANOV", &routes, 12, true);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(!listed[0].allowed && !listed[0].decided, "{listed:?}");
+    let exempt = unanswered.fail_closed_exemptions("S-IVANOV", &unanswered.read_machine());
+    assert!(
+        !exempt.local_subnets_v6.contains(&(home, 64)),
+        "closed until answered: {:?}",
+        exempt.local_subnets_v6
+    );
+
+    let answered = |rules: Arc<FakeRules>| {
+        coordinator_with_policy(Arc::clone(&api), rules, Arc::clone(&policy))
+            .with_local_network_policy(Arc::new(move |_sid: &str| LocalNetworkPolicy {
+                answers_v6: vec![(block, true)],
+                ..LocalNetworkPolicy::default()
+            }))
+    };
+    let yes = answered(Arc::clone(&rules));
+    let exempt = yes.fail_closed_exemptions("S-IVANOV", &yes.read_machine());
+    assert!(
+        exempt.local_subnets_v6.contains(&(home, 64)),
+        "{:?}",
+        exempt.local_subnets_v6
+    );
+
+    let named = Arc::new(FakeRules::new());
+    named.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![CanonicalRule {
+            id: RuleId("nas".into()),
+            enabled: true,
+            address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V6(
+                "2001:db8:5:7::10".parse().expect("address"),
+            ))),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_domain::RuleAction::Route,
+            origin: None,
+        }]),
+    );
+    let over_rule = answered(named);
+    let listed = over_rule.public_v6_local_networks("S-IVANOV", &routes, 12, true);
+    assert!(listed[0].names_rule && !listed[0].allowed, "{listed:?}");
+    let exempt = over_rule.fail_closed_exemptions("S-IVANOV", &over_rule.read_machine());
+    assert!(
+        !exempt.local_subnets_v6.contains(&(home, 64)),
+        "a rule's address is never local: {:?}",
+        exempt.local_subnets_v6
+    );
+}
+
+/// The settings list shows the home prefix as a question, and an answer is
+/// taken only about a public prefix the main link carries right now: a typed
+/// public range is refused, and the stored answer names no adapter, so it
+/// never carries over to the link's private segments.
+#[test]
+fn a_public_v6_answer_is_stored_only_for_a_prefix_the_main_link_carries() {
+    use crate::ipc_handlers::providers::LocalNetworksProvider;
+    use nrr_shared::ipc_payloads::{LocalNetworkDecisionDto, LocalNetworksSetRequest};
+    let api = Arc::new(MockWindowsApi::new());
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
+    let vpn_id = vpn.stable_id();
+    let eth_id = eth.stable_id();
+    api.set_adapter_infos(vec![vpn, eth]);
+    let home: std::net::Ipv6Addr = "2001:db8:5:7::".parse().expect("prefix");
+    api.set_route_table(vec![
+        route_entry([192, 168, 1, 0], 24, [0, 0, 0, 0], 12, 5),
+        RouteEntry {
+            destination: IpAddr::V6(home),
+            prefix_length: 64,
+            next_hop: IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            interface_index: 12,
+            metric: 5,
+            is_ours: false,
+            table: nrr_platform_api::RouteTableRef::Main,
+        },
+    ]);
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_primary("S-IVANOV", &eth_id);
+    policy.bind_secondary("S-IVANOV", &vpn_id);
+    let coord = Arc::new(coordinator_with_policy(
+        Arc::clone(&api),
+        Arc::new(FakeRules::new()),
+        policy,
+    ));
+    let state = {
+        use nrr_storage::migration::SqliteMigrationRunner;
+        use nrr_storage::repository::MigrationRunner;
+        let runner = SqliteMigrationRunner::for_state_db(
+            rusqlite::Connection::open_in_memory().expect("in-memory"),
+        );
+        runner.run_pending_migrations().expect("migrate");
+        Arc::new(Mutex::new(runner.into_connection()))
+    };
+    let networks =
+        crate::production_local_networks::ProductionLocalNetworks::new(coord, Arc::clone(&state));
+
+    let listed = networks.list("S-IVANOV").networks;
+    let row = listed
+        .iter()
+        .find(|n| n.cidr == "2001:db8:5:7::/64")
+        .expect("the home prefix is listed");
+    assert!(
+        !row.allowed && !row.decided_by_user && row.reason.is_empty(),
+        "{row:?}"
+    );
+
+    let answer = |cidr: &str| LocalNetworkDecisionDto {
+        cidr: cidr.to_string(),
+        allowed: true,
+    };
+    let reply = networks.set(
+        "S-IVANOV",
+        &LocalNetworksSetRequest {
+            decisions: vec![
+                answer("2001:db8:5:7::/64"),
+                answer("2001:db8:9::/48"),
+                answer("not-a-network"),
+            ],
+            forget: Vec::new(),
+        },
+    );
+    let refused: Vec<(&str, &str)> = reply
+        .rejected
+        .iter()
+        .map(|r| (r.cidr.as_str(), r.reason.as_str()))
+        .collect();
+    assert_eq!(
+        refused,
+        vec![
+            ("2001:db8:9::/48", "not-private"),
+            ("not-a-network", "malformed-cidr")
+        ]
+    );
+    let guard = state.lock().expect("state");
+    let stored = nrr_storage::local_network_rules::LocalNetworkRulesRepository::new(&guard)
+        .list_for_sid("S-IVANOV")
+        .expect("rules");
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(stored[0].cidr, "2001:db8:5:7::/64");
+    assert!(
+        stored[0].allow && stored[0].adapter.is_empty(),
+        "{:?}",
+        stored[0]
+    );
+}

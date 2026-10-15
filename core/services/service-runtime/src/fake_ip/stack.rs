@@ -24,9 +24,14 @@
 //! two worker threads that own the two halves of its upstream socket
 //! ([`RelayStream::into_split`]); a UDP flow gets one (only the receive side
 //! blocks — sends are non-blocking and go out inline). Dials of either kind run
-//! on a worker of their own, since one may resolve a name first. Workers
-//! exchange bytes with the poll loop through per-flow buffers; the poll loop
-//! never blocks on the network, and the workers never touch a `smoltcp` socket.
+//! on a bounded worker pool (`stack::dial_pool`), since one may resolve a name
+//! first. Workers exchange bytes with the poll loop through per-flow buffers;
+//! the poll loop never blocks on the network, and the workers never touch a
+//! `smoltcp` socket.
+//!
+//! The poll thread is the data path for every flow on the machine, so nothing
+//! on it may panic its way out: a thread the OS refuses is a failed flow, and
+//! a step that panics is contained by [`FakeIpStack::run`].
 //!
 //! ## Test vs. production wiring
 //!
@@ -119,11 +124,32 @@ fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // `stack::tcp_splice`, datagrams in `stack::datagrams`. NOT `udp` —
 // `smoltcp::socket::udp` is already imported here under that name.
 mod datagrams;
+mod dial_pool;
 mod echo;
 mod phy;
 mod tcp_splice;
 
 pub use phy::{TunPhyDevice, TunRxToken, TunTxToken};
+
+use dial_pool::{DialPool, DialRefusal};
+
+/// Dial workers alive at once. A dial to a dead host holds one for the whole
+/// connect timeout, so this is how many such hosts a burst may probe in
+/// parallel before further dials queue.
+const MAX_DIAL_WORKERS: usize = 128;
+
+/// Dials waiting for a worker. Matches the TCP flow cap: every live flow may
+/// have exactly one dial outstanding, so a deeper backlog could only hold
+/// dials for flows that are already gone.
+const DIAL_QUEUE_CAP: usize = MAX_ACTIVE_TCP_FLOWS;
+
+/// How long an idle dial worker lingers before exiting.
+const DIAL_WORKER_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Consecutive poll steps that may panic before the run loop gives the stack
+/// back to the watchdog. One contained panic costs a step; a streak means the
+/// stack's own state is broken and only a rebuild clears it.
+const MAX_CONSECUTIVE_STEP_PANICS: u32 = 8;
 
 // ── Poll-loop wake ───────────────────────────────────────────────────────────
 
@@ -418,28 +444,73 @@ struct FlowConn {
 // non-blocking, so the poll loop forwards datagrams upstream inline. This
 // carries QUIC/HTTP-3 (443/udp) unchanged — the relay never inspects payloads.
 
+/// Datagrams one UDP flow's reply queue holds before the newest is dropped.
+/// One poll step can emit no more than the socket's metadata ring holds, so
+/// a deeper queue would only delay the same drop.
+const UDP_REPLY_QUEUE_MAX_DATAGRAMS: usize = UDP_META_SLOTS;
+
+/// Bytes one UDP flow's reply queue holds before the newest is dropped — the
+/// datagram twin of [`FLOW_QUEUE_HIGH_WATER_BYTES`]. TCP closes its window
+/// instead; UDP has no window, so the excess is dropped and counted, as a
+/// kernel socket buffer would.
+const UDP_REPLY_QUEUE_MAX_BYTES: usize = FLOW_QUEUE_HIGH_WATER_BYTES;
+
 /// Datagrams coming back from one UDP flow's upstream, filled by its reader
-/// worker and drained by the poll loop back to the client.
+/// worker and drained by the poll loop back to the client. Bounded by count
+/// and bytes: the reader is paced by the peer, the drain by the poll loop, and
+/// a peer that answers faster than the loop drains must not grow the service.
 struct UdpReplies {
-    queue: Mutex<VecDeque<Vec<u8>>>,
+    queue: Mutex<UdpReplyQueue>,
     dead: AtomicBool,
     waker: Arc<StackWaker>,
+    health: Arc<super::health::FakeIpHealth>,
+}
+
+struct UdpReplyQueue {
+    datagrams: VecDeque<Vec<u8>>,
+    bytes: usize,
 }
 
 impl UdpReplies {
-    fn new(waker: Arc<StackWaker>) -> Arc<Self> {
+    fn new(waker: Arc<StackWaker>, health: Arc<super::health::FakeIpHealth>) -> Arc<Self> {
         Arc::new(Self {
-            queue: Mutex::new(VecDeque::new()),
+            queue: Mutex::new(UdpReplyQueue {
+                datagrams: VecDeque::with_capacity(UDP_REPLY_QUEUE_MAX_DATAGRAMS),
+                bytes: 0,
+            }),
             dead: AtomicBool::new(false),
             waker,
+            health,
         })
     }
-    fn push(&self, datagram: Vec<u8>) {
-        guard(&self.queue).push_back(datagram);
+    /// Queue a reply for the client; `false` when it was dropped at the bound.
+    /// The copy is made only once admitted, so a flood past the bound costs no
+    /// allocation at all.
+    fn push(&self, datagram: &[u8]) -> bool {
+        {
+            let mut queue = guard(&self.queue);
+            let over = queue.datagrams.len() >= UDP_REPLY_QUEUE_MAX_DATAGRAMS
+                || queue.bytes.saturating_add(datagram.len()) > UDP_REPLY_QUEUE_MAX_BYTES;
+            if over {
+                drop(queue);
+                self.health.record_udp_reply_dropped();
+                return false;
+            }
+            queue.bytes += datagram.len();
+            queue.datagrams.push_back(datagram.to_vec());
+        }
         self.waker.wake();
+        true
     }
     fn drain(&self) -> Vec<Vec<u8>> {
-        guard(&self.queue).drain(..).collect()
+        let mut queue = guard(&self.queue);
+        queue.bytes = 0;
+        queue.datagrams.drain(..).collect()
+    }
+    #[cfg(test)]
+    fn queued(&self) -> (usize, usize) {
+        let queue = guard(&self.queue);
+        (queue.datagrams.len(), queue.bytes)
     }
     fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst)
@@ -579,9 +650,12 @@ pub struct FakeIpStack {
     /// running to tens of minutes of "answers without ingress" ending in a
     /// detached zombie stack thread).
     worker_graveyard: Vec<JoinHandle<()>>,
+    /// Runs every upstream dial, TCP and UDP, on a capped number of threads.
+    dial_pool: Arc<DialPool>,
     /// Rate limit for the lingering-worker warning below.
     last_graveyard_warn: Option<std::time::Instant>,
     last_capacity_warn: Option<std::time::Instant>,
+    last_dial_refused_warn: Option<std::time::Instant>,
     /// Flows with work pending, and when every flow was last visited anyway.
     ready: Arc<ReadyFlows>,
     last_flow_sweep_ms: u64,
@@ -641,6 +715,7 @@ impl FakeIpStack {
             let _ = iface.routes_mut().add_default_ipv6_route(v6);
         }
 
+        let health = Arc::new(super::health::FakeIpHealth::new());
         Self {
             iface,
             device,
@@ -656,11 +731,18 @@ impl FakeIpStack {
             waker,
             log_gate: DialLogGate::new(),
             flow_observer: Arc::new(NoopFlowObserver),
-            health: Arc::new(super::health::FakeIpHealth::new()),
+            dial_pool: DialPool::new(
+                MAX_DIAL_WORKERS,
+                DIAL_QUEUE_CAP,
+                DIAL_WORKER_IDLE,
+                Arc::clone(&health),
+            ),
+            health,
             instant_rst: Arc::new(AtomicBool::new(true)),
             worker_graveyard: Vec::new(),
             last_graveyard_warn: None,
             last_capacity_warn: None,
+            last_dial_refused_warn: None,
             ready: Arc::new(ReadyFlows::default()),
             last_flow_sweep_ms: 0,
             read_buffer: Vec::new(),
@@ -673,7 +755,27 @@ impl FakeIpStack {
     /// default is a private counter nobody reads.
     #[must_use]
     pub fn with_health(mut self, health: Arc<super::health::FakeIpHealth>) -> Self {
+        // No dial has run yet, so the pool is rebuilt over the shared counters
+        // rather than left reporting into the private ones.
+        self.dial_pool = DialPool::new(
+            MAX_DIAL_WORKERS,
+            DIAL_QUEUE_CAP,
+            DIAL_WORKER_IDLE,
+            Arc::clone(&health),
+        );
         self.health = health;
+        self
+    }
+
+    /// Shrink the dial pool so a test can fill it in a few dials.
+    #[cfg(test)]
+    fn with_dial_pool_limits(mut self, max_workers: usize, queue_cap: usize) -> Self {
+        self.dial_pool = DialPool::new(
+            max_workers,
+            queue_cap,
+            DIAL_WORKER_IDLE,
+            Arc::clone(&self.health),
+        );
         self
     }
 
@@ -748,18 +850,61 @@ impl FakeIpStack {
     /// `Err` and ends the loop, which the controller reaps.
     pub fn run(&mut self, stop: &AtomicBool) -> Result<(), PlatformError> {
         let start = std::time::Instant::now();
+        let mut consecutive_panics = 0u32;
         while !stop.load(Ordering::Relaxed) {
             let now_ms = start.elapsed().as_millis();
             let now_ms = u64::try_from(now_ms).unwrap_or(u64::MAX);
             // Drain fast: if this step processed a packet, loop immediately to
             // clear the rest of the burst before parking; only park when idle, so
             // a run of inbound packets is not throttled to one per wait interval.
-            let progressed = self.step(now_ms)?;
+            let progressed = match self.contained_step(now_ms) {
+                Ok(progressed) => {
+                    consecutive_panics = 0;
+                    progressed?
+                }
+                Err(()) => {
+                    consecutive_panics += 1;
+                    if consecutive_panics >= MAX_CONSECUTIVE_STEP_PANICS {
+                        return Err(PlatformError::Transient {
+                            operation: "fake-ip poll step",
+                            detail: format!("{consecutive_panics} consecutive poll steps panicked"),
+                        });
+                    }
+                    false
+                }
+            };
             if !progressed {
                 self.waker.wait(IDLE_POLL_INTERVAL);
             }
         }
         Ok(())
+    }
+
+    /// One [`step`](Self::step) with a panic contained to that step. A panic
+    /// anywhere under the poll thread — a packet shape the stack mishandles, a
+    /// poisoned worker lock — would otherwise unwind the one thread every flow
+    /// on the machine runs through, and under an armed block-all that is the
+    /// whole machine offline until the watchdog notices. `Err(())` is the
+    /// contained panic; the device error stays inside `Ok`.
+    fn contained_step(&mut self, now_ms: u64) -> Result<Result<bool, PlatformError>, ()> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.step(now_ms))) {
+            Ok(outcome) => Ok(outcome),
+            Err(payload) => {
+                self.health.record_poll_step_panic();
+                let reason = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_owned());
+                tracing::error!(
+                    target: "nrr::fake-ip",
+                    msg_key = "fakeip-poll-step-panicked",
+                    reason = %reason,
+                    "fake-IP poll step panicked — contained, the relay keeps running",
+                );
+                Err(())
+            }
+        }
     }
 
     /// One iteration: ingest a packet (if any), advance the TCP/UDP state
@@ -855,6 +1000,26 @@ impl FakeIpStack {
             "fake-IP is carrying its maximum number of TCP flows — new connections are being reset until some finish",
         );
     }
+
+    /// Counted per refusal, logged once a minute: a full dial pool refuses as
+    /// fast as clients retry.
+    fn warn_dial_refused(&mut self, refusal: &DialRefusal) {
+        self.health.record_dial_pool_refused();
+        if self
+            .last_dial_refused_warn
+            .is_some_and(|at| at.elapsed() < GRAVEYARD_WARN_INTERVAL)
+        {
+            return;
+        }
+        self.last_dial_refused_warn = Some(std::time::Instant::now());
+        tracing::warn!(
+            target: "nrr::fake-ip",
+            msg_key = "fakeip-dial-pool-refused",
+            reason = %refusal,
+            refused = self.health.dial_pool_refused(),
+            "fake-IP cannot start another upstream dial — the connection is reset",
+        );
+    }
 }
 
 impl Drop for FakeIpStack {
@@ -862,6 +1027,7 @@ impl Drop for FakeIpStack {
     /// observe the flag and return; we do not join here (a blocked upstream read
     /// is paced by its own timeout), so drop stays prompt.
     fn drop(&mut self) {
+        self.dial_pool.close();
         for flow in self.flows.values() {
             flow.shared.mark_dead();
         }
@@ -986,47 +1152,85 @@ fn socketaddr_to_endpoint(addr: SocketAddr) -> IpEndpoint {
 /// The reader worker for one UDP flow: block on the upstream socket, push each
 /// reply to the poll loop. A read timeout surfaces as `WouldBlock`, which is a
 /// poll tick — the loop re-checks teardown rather than treating it as an error.
-fn spawn_udp_reader(upstream: Arc<dyn RelayDatagram>, replies: Arc<UdpReplies>) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut buf = vec![0u8; 65536];
-        loop {
-            if replies.is_dead() {
-                return;
-            }
-            match upstream.receive(&mut buf) {
-                Ok(n) => replies.push(buf[..n].to_vec()),
-                Err(RelayError::WouldBlock) => {} // poll tick — re-check teardown
-                // The upstream socket is finished (on Windows a connected UDP
-                // socket reports WSAECONNRESET once an ICMP port-unreachable
-                // comes back). Say so: a reader that just returns leaves the
-                // client bound to a flow nothing reads, and its `send` keeps
-                // succeeding, so the idle reap never comes for it either.
-                Err(_) => {
-                    replies.mark_dead();
+/// A thread the OS refuses is the caller's flow error, never a panic on the
+/// poll thread.
+fn spawn_udp_reader(
+    upstream: Arc<dyn RelayDatagram>,
+    replies: Arc<UdpReplies>,
+) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("nrr-fakeip-udp-read".to_string())
+        .spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                if replies.is_dead() {
                     return;
                 }
+                match upstream.receive(&mut buf) {
+                    // Past the queue bound the reply is dropped and counted;
+                    // UDP has no window to close.
+                    Ok(n) => {
+                        let _ = replies.push(&buf[..n]);
+                    }
+                    Err(RelayError::WouldBlock) => {} // poll tick — re-check teardown
+                    // The upstream socket is finished (on Windows a connected UDP
+                    // socket reports WSAECONNRESET once an ICMP port-unreachable
+                    // comes back). Say so: a reader that just returns leaves the
+                    // client bound to a flow nothing reads, and its `send` keeps
+                    // succeeding, so the idle reap never comes for it either.
+                    Err(_) => {
+                        replies.mark_dead();
+                        return;
+                    }
+                }
             }
-        }
-    })
+        })
 }
 
-/// Dial one UDP upstream off the poll thread and wake the loop with the
-/// outcome. Detached like the TCP dial worker: it owns only `Arc`s, and a
-/// result nobody collects any more is simply dropped.
-fn spawn_udp_dial_worker(
+/// Lands the UDP dial outcome exactly once, whatever ends the job: a return,
+/// a panic in the dialer, or the pool dropping the job unrun. Without it a
+/// client whose dial never reported would sit in `pending` until the idle
+/// reap, its datagrams held the whole time.
+struct UdpDialReport {
+    outcome: Arc<Mutex<Option<UdpDialOutcome>>>,
+    waker: Arc<StackWaker>,
+}
+
+impl UdpDialReport {
+    fn land(&self, dialed: UdpDialOutcome) {
+        *guard(&self.outcome) = Some(dialed);
+        self.waker.wake();
+    }
+}
+
+impl Drop for UdpDialReport {
+    fn drop(&mut self) {
+        let mut outcome = guard(&self.outcome);
+        if outcome.is_some() {
+            return;
+        }
+        *outcome = Some(Err(RelayError::Upstream {
+            detail: "dial worker did not complete".to_owned(),
+        }));
+        drop(outcome);
+        self.waker.wake();
+    }
+}
+
+/// Queue one UDP dial on the pool; the loop is woken with the outcome. The
+/// job owns only `Arc`s, and a result nobody collects any more is dropped.
+fn submit_udp_dial(
+    pool: &Arc<DialPool>,
     dialer: Arc<dyn RelayDialer>,
     target: super::dialer::UpstreamTarget,
     outcome: Arc<Mutex<Option<UdpDialOutcome>>>,
     waker: Arc<StackWaker>,
-) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("nrr-fakeip-udp-dial".to_string())
-        .spawn(move || {
-            let dialed = dialer.connect_udp(&target);
-            *guard(&outcome) = Some(dialed);
-            waker.wake();
-        })
-        .map(drop)
+) -> Result<(), DialRefusal> {
+    let report = UdpDialReport { outcome, waker };
+    pool.submit(Box::new(move || {
+        let dialed = dialer.connect_udp(&target);
+        report.land(dialed);
+    }))
 }
 
 /// Convert a std [`std::net::IpAddr`] to the `smoltcp` wire type.
@@ -1178,11 +1382,11 @@ fn client_fin_may_propagate(dial_is_done: bool, state: tcp::State) -> bool {
 /// those would mask a real outage as a slow connect instead of letting the
 /// application retry or fail over on its own.
 ///
-/// Runs on the dial-worker thread spawned by [`spawn_dial_worker`], which is
-/// never joined by the poll loop OR by
+/// Runs on a dial-pool worker (see [`submit_tcp_dial`]), which is never
+/// joined by the poll loop OR by
 /// [`FakeIpController::stop`](super::lifecycle::FakeIpController::stop) —
 /// `stop` only joins the poll-loop thread (`RunningStack.join`), never a
-/// per-flow dial worker. Holding here for up to `HOLD_RETRY_WINDOW` therefore
+/// dial worker. Holding here for up to `HOLD_RETRY_WINDOW` therefore
 /// cannot delay a clean stack shutdown; the bounded window (rather than an
 /// explicit cancel signal) is what keeps a held dial from outliving the flow
 /// indefinitely. `shared.is_dead()` is also checked every iteration so a
@@ -1191,7 +1395,7 @@ fn client_fin_may_propagate(dial_is_done: bool, state: tcp::State) -> bool {
 ///
 /// Returns the dial result, which mode applied (`"instant"` / `"held"`), and
 /// how many attempts were made — all three feed the dial-outcome telemetry in
-/// [`spawn_dial_worker`].
+/// [`run_tcp_dial`].
 ///
 /// `retry_interval`/`retry_window` are parameters (not the
 /// [`HOLD_RETRY_INTERVAL`]/[`HOLD_RETRY_WINDOW`] constants directly) purely so
@@ -1231,168 +1435,236 @@ fn dial_tcp_with_hold(
     (result, "held", attempts)
 }
 
-/// Dial the upstream off the poll thread, then hand the flow its workers.
+/// Settles a TCP dial that ended without a verdict — a panic in the dialer or
+/// the pool dropping the job unrun — as a failure, so the flow is reset
+/// instead of waiting out its idle timer with the client's bytes held.
+struct TcpDialVerdict(Arc<FlowShared>);
+
+impl Drop for TcpDialVerdict {
+    fn drop(&mut self) {
+        if !self.0.dial_is_done() && !self.0.dial_has_failed() {
+            self.0.signal_dial_failed();
+        }
+    }
+}
+
+/// Queue the upstream dial on the pool; the job hands the flow its workers.
 ///
 /// Never joined by the poll loop: a dial can sit in `connect` for the full
 /// timeout — or, with `fake_ip_instant_rst` off, in the hold-and-retry window
 /// (see [`dial_tcp_with_hold`]) — and joining it would recreate the very
-/// stall this thread exists to prevent. It owns nothing but `Arc`s and exits
-/// on its own — when the flow died while dialing, the fresh upstream is
-/// simply dropped.
-fn spawn_dial_worker(
+/// stall the pool exists to prevent. The job owns nothing but `Arc`s; when
+/// the flow died while it waited or dialed, it does nothing or drops the
+/// fresh upstream.
+fn submit_tcp_dial(
+    pool: &Arc<DialPool>,
     shared: Arc<FlowShared>,
     dialer: Arc<dyn RelayDialer>,
     target: super::dialer::UpstreamTarget,
     log_gate: Arc<DialLogGate>,
     health: Arc<super::health::FakeIpHealth>,
     instant_rst: Arc<AtomicBool>,
-) {
-    std::thread::spawn(move || {
-        let started = std::time::Instant::now();
-        let (split, mode, attempts) = dial_tcp_with_hold(
-            shared.as_ref(),
+) -> Result<(), DialRefusal> {
+    let verdict = TcpDialVerdict(Arc::clone(&shared));
+    pool.submit(Box::new(move || {
+        let _verdict = verdict;
+        // Queued behind other dials and the client gave up: nothing to dial.
+        if shared.is_dead() {
+            return;
+        }
+        run_tcp_dial(
+            &shared,
             dialer.as_ref(),
             &target,
+            &log_gate,
+            &health,
             instant_rst.as_ref(),
-            HOLD_RETRY_INTERVAL,
-            HOLD_RETRY_WINDOW,
         );
-        let elapsed_ms = started.elapsed().as_millis();
-        let was_held = mode == "held";
-        match split {
-            Ok(split) => {
-                health.record_tcp_dial_ok();
-                if shared.is_dead() {
-                    return; // client already gone; drop the upstream
-                }
-                log_gate.log_dial_ok(&target, elapsed_ms);
-                if was_held {
-                    // Hold/relay behaviour is otherwise invisible without
-                    // per-connection events; log every held resolution
-                    // explicitly rather than relying on the deduped
-                    // per-destination gate above.
-                    tracing::info!(
-                        target: "nrr::fake-ip",
-                        msg_key = "fakeip-dial-held-succeeded",
-                        hostname = %target.hostname,
-                        route = ?target.route,
-                        elapsed_ms = %elapsed_ms,
-                        mode,
-                        attempts,
-                        "fake-IP dial succeeded after holding for the secondary to resolve",
-                    );
-                }
-                let workers = spawn_upstream_workers(Arc::clone(&shared), split);
-                shared.complete_dial(workers);
+    }))
+}
+
+/// The body of a TCP dial job.
+fn run_tcp_dial(
+    shared: &Arc<FlowShared>,
+    dialer: &dyn RelayDialer,
+    target: &super::dialer::UpstreamTarget,
+    log_gate: &DialLogGate,
+    health: &super::health::FakeIpHealth,
+    instant_rst: &AtomicBool,
+) {
+    let started = std::time::Instant::now();
+    let (split, mode, attempts) = dial_tcp_with_hold(
+        shared.as_ref(),
+        dialer,
+        target,
+        instant_rst,
+        HOLD_RETRY_INTERVAL,
+        HOLD_RETRY_WINDOW,
+    );
+    let elapsed_ms = started.elapsed().as_millis();
+    let was_held = mode == "held";
+    match split {
+        Ok(split) => {
+            health.record_tcp_dial_ok();
+            if shared.is_dead() {
+                return; // client already gone; drop the upstream
             }
-            Err(error) => {
-                let is_policy_refusal = matches!(error, RelayError::SourcePolicyRefused { .. });
-                if is_policy_refusal {
-                    health.record_tcp_dial_refused();
-                } else {
+            log_gate.log_dial_ok(target, elapsed_ms);
+            if was_held {
+                // Hold/relay behaviour is otherwise invisible without
+                // per-connection events; log every held resolution
+                // explicitly rather than relying on the deduped
+                // per-destination gate above.
+                tracing::info!(
+                    target: "nrr::fake-ip",
+                    msg_key = "fakeip-dial-held-succeeded",
+                    hostname = %target.hostname,
+                    route = ?target.route,
+                    elapsed_ms = %elapsed_ms,
+                    mode,
+                    attempts,
+                    "fake-IP dial succeeded after holding for the secondary to resolve",
+                );
+            }
+            match spawn_upstream_workers(Arc::clone(shared), split) {
+                Ok(workers) => shared.complete_dial(workers),
+                // The upstream is open but nothing can pump it: a flow error,
+                // reported like a failed dial. The verdict guard resets it.
+                Err(error) => {
+                    health.record_worker_spawn_failed();
                     health.record_tcp_dial_failed();
+                    let error = RelayError::Upstream {
+                        detail: format!("splice workers could not be started: {error}"),
+                    };
+                    log_gate.log_dial_failed(target, elapsed_ms, &error);
                 }
-                log_gate.log_dial_failed(&target, elapsed_ms, &error);
-                if is_policy_refusal {
-                    tracing::warn!(
-                        target: "nrr::fake-ip",
-                        msg_key = "fakeip-dial-policy-refused",
-                        hostname = %target.hostname,
-                        route = ?target.route,
-                        elapsed_ms = %elapsed_ms,
-                        mode,
-                        attempts,
-                        error = %error,
-                        "fake-IP dial refused by source policy — client gets a reset",
-                    );
-                }
-                shared.signal_dial_failed();
             }
         }
-    });
+        Err(error) => {
+            let is_policy_refusal = matches!(error, RelayError::SourcePolicyRefused { .. });
+            if is_policy_refusal {
+                health.record_tcp_dial_refused();
+            } else {
+                health.record_tcp_dial_failed();
+            }
+            log_gate.log_dial_failed(target, elapsed_ms, &error);
+            if is_policy_refusal {
+                tracing::warn!(
+                    target: "nrr::fake-ip",
+                    msg_key = "fakeip-dial-policy-refused",
+                    hostname = %target.hostname,
+                    route = ?target.route,
+                    elapsed_ms = %elapsed_ms,
+                    mode,
+                    attempts,
+                    error = %error,
+                    "fake-IP dial refused by source policy — client gets a reset",
+                );
+            }
+            shared.signal_dial_failed();
+        }
+    }
 }
 
 /// Spawn the reader and writer threads that own the two halves of a flow's
-/// upstream socket and exchange bytes with the poll loop.
-fn spawn_upstream_workers(shared: Arc<FlowShared>, split: RelaySplit) -> Vec<JoinHandle<()>> {
+/// upstream socket and exchange bytes with the poll loop. A thread the OS
+/// refuses fails the flow: a half-pumped splice would stall the client, so
+/// the reader already started is told to exit.
+fn spawn_upstream_workers(
+    shared: Arc<FlowShared>,
+    split: RelaySplit,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
     let RelaySplit {
         mut reader,
         mut writer,
     } = split;
 
     let reader_shared = Arc::clone(&shared);
-    let reader_thread = std::thread::spawn(move || {
-        let mut buf = [0u8; PUMP_CHUNK_BYTES];
-        loop {
-            if reader_shared.is_dead() {
-                return;
-            }
-            // The client is not keeping up: stop reading so the upstream's own
-            // window closes, instead of buffering the difference here.
-            reader_shared.await_upstream_queue_room();
-            if reader_shared.is_dead() {
-                return;
-            }
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    reader_shared.signal_upstream_eof();
+    let reader_thread = std::thread::Builder::new()
+        .name("nrr-fakeip-up-read".to_string())
+        .spawn(move || {
+            let mut buf = [0u8; PUMP_CHUNK_BYTES];
+            loop {
+                if reader_shared.is_dead() {
                     return;
                 }
-                Ok(n) => reader_shared.push_from_upstream(&buf[..n]),
-                // The upstream socket carries a read timeout (see
-                // `connect_tcp`) precisely so a silent peer becomes this
-                // periodic teardown check instead of an unjoinable thread.
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    continue;
-                }
-                // Not an EOF: the peer went away mid-answer. Distinguished
-                // from `Ok(0)` so the poll loop mirrors a reset rather than a
-                // clean close.
-                Err(_) => {
-                    reader_shared.signal_upstream_reset();
+                // The client is not keeping up: stop reading so the upstream's
+                // own window closes, instead of buffering the difference here.
+                reader_shared.await_upstream_queue_room();
+                if reader_shared.is_dead() {
                     return;
                 }
+                match reader.read(&mut buf) {
+                    Ok(0) => {
+                        reader_shared.signal_upstream_eof();
+                        return;
+                    }
+                    Ok(n) => reader_shared.push_from_upstream(&buf[..n]),
+                    // The upstream socket carries a read timeout (see
+                    // `connect_tcp`) precisely so a silent peer becomes this
+                    // periodic teardown check instead of an unjoinable thread.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        continue;
+                    }
+                    // Not an EOF: the peer went away mid-answer. Distinguished
+                    // from `Ok(0)` so the poll loop mirrors a reset rather than
+                    // a clean close.
+                    Err(_) => {
+                        reader_shared.signal_upstream_reset();
+                        return;
+                    }
+                }
             }
-        }
-    });
+        })?;
 
     let writer_shared = Arc::clone(&shared);
-    let writer_thread = std::thread::spawn(move || loop {
-        let pending: Vec<u8> = {
-            let mut buffer = guard(&writer_shared.to_upstream);
-            loop {
-                if writer_shared.is_dead() {
-                    return;
+    let writer_spawned = std::thread::Builder::new()
+        .name("nrr-fakeip-up-write".to_string())
+        .spawn(move || loop {
+            let pending: Vec<u8> = {
+                let mut buffer = guard(&writer_shared.to_upstream);
+                loop {
+                    if writer_shared.is_dead() {
+                        return;
+                    }
+                    if !buffer.is_empty() {
+                        break buffer.drain(..).collect();
+                    }
+                    if writer_shared.client_fin.load(Ordering::SeqCst) {
+                        drop(buffer);
+                        let _ = writer.shutdown_write();
+                        return;
+                    }
+                    // Park ON the `to_upstream` mutex, releasing it while waiting
+                    // so the poll loop can enqueue more client bytes.
+                    let (next, _timeout) = writer_shared
+                        .writer_cv
+                        .wait_timeout(buffer, std::time::Duration::from_millis(200))
+                        .unwrap_or_else(PoisonError::into_inner);
+                    buffer = next;
                 }
-                if !buffer.is_empty() {
-                    break buffer.drain(..).collect();
-                }
-                if writer_shared.client_fin.load(Ordering::SeqCst) {
-                    drop(buffer);
-                    let _ = writer.shutdown_write();
-                    return;
-                }
-                // Park ON the `to_upstream` mutex, releasing it while waiting so
-                // the poll loop can enqueue more client bytes.
-                let (next, _timeout) = writer_shared
-                    .writer_cv
-                    .wait_timeout(buffer, std::time::Duration::from_millis(200))
-                    .unwrap_or_else(PoisonError::into_inner);
-                buffer = next;
+            };
+            if writer.write_all(&pending).is_err() {
+                writer_shared.mark_dead();
+                return;
             }
-        };
-        if writer.write_all(&pending).is_err() {
-            writer_shared.mark_dead();
-            return;
+        });
+    let writer_thread = match writer_spawned {
+        Ok(thread) => thread,
+        Err(error) => {
+            // The reader exits on the flag; its handle is detached, not kept.
+            shared.mark_dead();
+            drop(reader_thread);
+            return Err(error);
         }
-    });
+    };
 
-    vec![reader_thread, writer_thread]
+    Ok(vec![reader_thread, writer_thread])
 }
 
 #[cfg(test)]

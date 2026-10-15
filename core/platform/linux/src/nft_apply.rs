@@ -34,6 +34,7 @@ use crate::drop_tag::{
 };
 use crate::nft_ir::{
     reported_drop_tags, NftMatch, NftRule, NftRuleset, NftVerdict, NRR_CHAIN_PRIORITY,
+    NRR_FORWARD_CHAIN,
 };
 
 const FAMILY: NfFamily = NfFamily::INet;
@@ -82,27 +83,48 @@ pub fn render_batch_with(ruleset: &NftRuleset, reporting: DropReporting) -> Nfta
     // changed is EEXIST, so an upgrade moving either would fail every apply
     // until the table was deleted by hand. The hookless `add` first makes the
     // `delete` valid on a fresh table too.
-    batch.add(NfListObject::Chain(chain_object(
+    recreate_chain(
+        &mut batch,
         table.clone(),
         chain.clone(),
-        false,
-    )));
-    batch.delete(NfListObject::Chain(chain_object(
-        table.clone(),
-        chain.clone(),
-        false,
-    )));
-    batch.add(NfListObject::Chain(chain_object(
-        table.clone(),
-        chain.clone(),
-        true,
-    )));
+        Some(NfHook::Output),
+    );
     add_drop_chains(&mut batch, table.clone(), &ruleset.rules, reporting);
 
     for rule in &ruleset.rules {
         batch.add(rule_object(&table, &chain, rule, reporting));
     }
+    // Recreated, or removed when nothing is forwarded under guard any more.
+    let forward: Cow<'_, str> = Cow::Borrowed(NRR_FORWARD_CHAIN);
+    let hook = (!ruleset.forward.is_empty()).then_some(NfHook::Forward);
+    recreate_chain(&mut batch, table.clone(), forward.clone(), hook);
+    for rule in &ruleset.forward {
+        batch.add(rule_object(&table, &forward, rule, DropReporting::Silent));
+    }
     batch.to_nftables()
+}
+
+/// A hookless `add` first makes the `delete` valid on a fresh table; with no
+/// `hook` the chain stays deleted.
+fn recreate_chain<'a>(
+    batch: &mut Batch<'a>,
+    table: Cow<'a, str>,
+    chain: Cow<'a, str>,
+    hook: Option<NfHook>,
+) {
+    batch.add(NfListObject::Chain(chain_object(
+        table.clone(),
+        chain.clone(),
+        None,
+    )));
+    batch.delete(NfListObject::Chain(chain_object(
+        table.clone(),
+        chain.clone(),
+        None,
+    )));
+    if hook.is_some() {
+        batch.add(NfListObject::Chain(chain_object(table, chain, hook)));
+    }
 }
 
 /// One chain per tag the rules jump to: a rate-limited log, then the drop.
@@ -122,7 +144,7 @@ fn add_drop_chains<'a, 'r>(
         batch.add(NfListObject::Chain(chain_object(
             table.clone(),
             chain.clone(),
-            false,
+            None,
         )));
         for expr in [drop_report_statements(tag), vec![Statement::Drop(None)]] {
             batch.add(NfListObject::Rule(Rule {
@@ -180,7 +202,7 @@ fn render_probe_batch<'a>(ruleset: &'a NftRuleset, indices: &[usize]) -> Nftable
     batch.add(NfListObject::Chain(chain_object(
         table.clone(),
         chain.clone(),
-        true,
+        Some(NfHook::Output),
     )));
     batch.add(NfListObject::Rule(Rule {
         family: FAMILY,
@@ -221,9 +243,10 @@ fn table_object(name: Cow<'_, str>) -> Table<'_> {
     }
 }
 
-/// `hooked` = our output base chain; otherwise a bare declaration, which an
+/// With `hook`, one of our base chains; otherwise a bare declaration, which an
 /// existing base chain accepts whatever its hook.
-fn chain_object<'a>(table: Cow<'a, str>, name: Cow<'a, str>, hooked: bool) -> Chain<'a> {
+fn chain_object<'a>(table: Cow<'a, str>, name: Cow<'a, str>, hook: Option<NfHook>) -> Chain<'a> {
+    let hooked = hook.is_some();
     Chain {
         family: FAMILY,
         table,
@@ -231,7 +254,7 @@ fn chain_object<'a>(table: Cow<'a, str>, name: Cow<'a, str>, hooked: bool) -> Ch
         newname: None,
         handle: None,
         _type: hooked.then_some(NfChainType::Filter),
-        hook: hooked.then_some(NfHook::Output),
+        hook,
         prio: hooked.then_some(NRR_CHAIN_PRIORITY),
         dev: None,
         // Accept: this product routes traffic, it does not firewall the host.
@@ -544,6 +567,30 @@ impl NftCliEnforcement {
             .map_err(classify)
     }
 
+    /// Whether `nft` takes the ruleset, committing nothing: the same batch as
+    /// [`Self::apply`] under `--check`, so the live table is never touched.
+    /// A refused drop log is retried silent, as the apply does.
+    #[cfg(target_os = "linux")]
+    pub fn check(&self, ruleset: &NftRuleset) -> Result<(), NftApplyError> {
+        const CHECK: &[&str] = &["--check"];
+        let reporting = self.drop_reporting();
+        let refusal = match self.run_batch(&render_batch_with(ruleset, reporting), CHECK) {
+            Ok(()) => return Ok(()),
+            Err(failure) => failure,
+        };
+        let silent_may_pass = kernel_answered(&refusal)
+            && reporting == DropReporting::Logged
+            && !reported_drop_tags(&ruleset.rules).is_empty();
+        if silent_may_pass
+            && self
+                .run_batch(&render_batch_with(ruleset, DropReporting::Silent), CHECK)
+                .is_ok()
+        {
+            return Ok(());
+        }
+        Err(classify(refusal))
+    }
+
     /// Apply, and if the kernel refuses the batch, apply everything it does
     /// accept — naming what it would not.
     ///
@@ -752,6 +799,11 @@ impl NftCliEnforcement {
     }
 
     #[cfg(not(target_os = "linux"))]
+    pub fn check(&self, _ruleset: &NftRuleset) -> Result<(), NftApplyError> {
+        Err(Self::not_linux())
+    }
+
+    #[cfg(not(target_os = "linux"))]
     pub fn teardown(&self, _table: &str) -> Result<(), NftApplyError> {
         Err(Self::not_linux())
     }
@@ -955,6 +1007,7 @@ fn without_rules(ruleset: &NftRuleset, offenders: &[usize]) -> (NftRuleset, Vec<
             .filter(|(i, _)| !offenders.contains(i))
             .map(|(_, rule)| rule.clone())
             .collect(),
+        forward: ruleset.forward.clone(),
     };
     (kept, skipped)
 }
@@ -1006,6 +1059,7 @@ mod tests {
             family: NftFamily::Inet,
             table: "nrr".into(),
             chain: "output".into(),
+            forward: Vec::new(),
             rules,
         }
     }
@@ -1066,6 +1120,35 @@ mod tests {
         assert!(json.contains(r#""type":"filter""#), "{json}");
         assert!(json.contains(r#""policy":"accept""#), "{json}");
         assert!(json.contains(r#""prio":-10"#), "{json}");
+    }
+
+    /// Forwarded drops get a chain on the forward hook; without any, the chain
+    /// is deleted rather than left behind.
+    #[test]
+    fn forwarded_drops_get_a_forward_hook_chain_that_goes_when_empty() {
+        let mut set = ruleset(vec![plain("a")]);
+        let without = commands(&render_batch(&set));
+        assert!(
+            without.iter().any(|c| c == "delete chain nrr/forward"),
+            "{without:?}"
+        );
+        assert!(!without.iter().any(|c| c == "add chain nrr/forward hooked"));
+        set.forward = vec![NftRule {
+            matches: vec![NftMatch::DstV4 {
+                net: std::net::Ipv4Addr::new(203, 0, 113, 5),
+                prefix: 32,
+            }],
+            verdict: NftVerdict::Drop,
+            comment: "fwd".to_owned(),
+        }];
+        let with = commands(&render_batch(&set));
+        assert!(
+            with.iter().any(|c| c == "add chain nrr/forward hooked"),
+            "{with:?}"
+        );
+        assert!(with.iter().any(|c| c == "add rule nrr/forward"), "{with:?}");
+        assert!(json_of(&set).contains(r#""hook":"forward""#));
+        assert!(set.to_nft_script().contains("hook forward"));
     }
 
     /// Each command as `verb kind table[/chain][ hooked]`, in batch order.
@@ -1137,6 +1220,8 @@ mod tests {
                 "delete chain nrr/output",
                 "add chain nrr/output hooked",
                 "add rule nrr/output",
+                "add chain nrr/forward",
+                "delete chain nrr/forward",
             ]
         );
     }
@@ -1288,6 +1373,8 @@ mod tests {
                 "add rule nrr/output",
                 "add rule nrr/output",
                 "add rule nrr/output",
+                "add chain nrr/forward",
+                "delete chain nrr/forward",
             ]
         );
         let json = serde_json::to_string(&batch).expect("the batch must serialise");
@@ -1550,6 +1637,7 @@ mod tests {
             family: crate::nft_ir::NftFamily::Inet,
             table: "t".into(),
             chain: "c".into(),
+            forward: Vec::new(),
             rules: vec![rule("a"), rule("b"), rule("c"), rule("d")],
         };
         let (kept, skipped) = without_rules(&ruleset, &[1, 3]);
@@ -1641,6 +1729,7 @@ mod cli_tests {
             family: crate::nft_ir::NftFamily::Inet,
             table: "nrr".into(),
             chain: "output".into(),
+            forward: Vec::new(),
             rules: Vec::new(),
         };
         assert!(matches!(
@@ -1662,6 +1751,7 @@ mod cli_tests {
             family: crate::nft_ir::NftFamily::Inet,
             table: "nrr".into(),
             chain: "output".into(),
+            forward: Vec::new(),
             rules: comments
                 .iter()
                 .map(|c| NftRule {
@@ -1843,6 +1933,7 @@ mod cli_tests {
             family: crate::nft_ir::NftFamily::Inet,
             table: table.to_owned(),
             chain: "output".into(),
+            forward: Vec::new(),
             rules: vec![
                 NftRule {
                     matches: vec![
@@ -1935,6 +2026,7 @@ mod cli_tests {
             family: crate::nft_ir::NftFamily::Inet,
             table: table.to_owned(),
             chain: "output".into(),
+            forward: Vec::new(),
             rules: vec![host(1, "kept-1"), host(99, "refused"), host(3, "kept-3")],
         };
         let outcome = cli

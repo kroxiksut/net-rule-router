@@ -121,6 +121,54 @@ pub const DAEMON_RESTORE_DNS_VERB: &str = "restore-dns";
 /// console's `reset-network` runs it; internal, like the other two.
 pub const DAEMON_CLEANUP_VERB: &str = "cleanup";
 
+/// The argument the failure unit passes once the restarts are spent.
+pub const DAEMON_AFTER_CRASH_VERB: &str = "after-crash";
+
+/// How long systemd waits for an orderly stop. The filter removal alone may
+/// take up to a minute on a filtering backend that stopped answering; the
+/// other steps are bounded by a few seconds each.
+pub const STOP_TIMEOUT_SEC: u32 = 120;
+
+/// The oneshot unit `OnFailure=` starts: `<product>-after-crash.service`.
+pub fn after_crash_unit_name() -> String {
+    format!(
+        "{}-after-crash.service",
+        nrr_shared::product_identity::PRODUCT_NAME_UNIX
+    )
+}
+
+/// Render the failure unit. One command, no sandboxing of its own: it runs the
+/// same binary as the service with the verb that undoes what the service left.
+pub fn render_after_crash_unit(cfg: &SystemdServiceConfig) -> String {
+    let executable = exec_word(&cfg.binary_path);
+    format!(
+        "[Unit]\nDescription={} — after the service stopped for good\n\n\
+         [Service]\nType=oneshot\nExecStart={executable} {DAEMON_AFTER_CRASH_VERB}\n",
+        cfg.description
+    )
+}
+
+/// Whether the machine is going down right now, asked of systemd with a short
+/// budget: a stop signal that arrives during a shutdown is one the teardown
+/// must not act on.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemdShutdownProbe;
+
+impl nrr_platform_api::power::MachineShutdownProbe for SystemdShutdownProbe {
+    fn machine_is_shutting_down(&self) -> bool {
+        // `is-system-running` answers "stopping" on the way down; its exit
+        // code is non-zero for every state but "running", so only stdout
+        // counts. No answer within the budget reads as a plain stop.
+        crate::command::output_with_timeout(
+            "systemctl",
+            &["is-system-running"],
+            std::time::Duration::from_secs(2),
+        )
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "stopping")
+        .unwrap_or(false)
+    }
+}
+
 /// The `RuntimeDirectory=` / `StateDirectory=` leaf. Kept next to the paths in
 /// the IPC address (`/run/netrulerouter/…`) and the secrets store
 /// (`/var/lib/netrulerouter/…`) so all three agree on one directory name.
@@ -150,6 +198,10 @@ pub fn render_service_unit(cfg: &SystemdServiceConfig) -> String {
         cfg.start_limit_interval_sec
     ));
     s.push_str(&format!("StartLimitBurst={}\n", cfg.start_limit_burst));
+    // Fires once the restarts above are spent: the Windows "after-crash"
+    // failure action, so a dead daemon hands DNS back and keeps or clears its
+    // policy by the same rule on both OSes.
+    s.push_str(&format!("OnFailure={}\n", after_crash_unit_name()));
     s.push('\n');
 
     s.push_str("[Service]\n");
@@ -166,6 +218,9 @@ pub fn render_service_unit(cfg: &SystemdServiceConfig) -> String {
     ));
     s.push_str("Restart=on-failure\n");
     s.push_str(&format!("RestartSec={}\n", cfg.restart_sec));
+    // Past this systemd kills the daemon with its policy still in the kernel;
+    // every teardown step has a deadline that fits well inside it.
+    s.push_str(&format!("TimeoutStopSec={STOP_TIMEOUT_SEC}\n"));
     if let Some(sec) = cfg.watchdog_sec {
         s.push_str(&format!("WatchdogSec={sec}\n"));
     }
@@ -443,6 +498,13 @@ pub fn plan_install(cfg: &SystemdServiceConfig, activation: UnitActivation) -> S
                 contents: crate::polkit_policy::render_actions_file(),
                 mode: 0o644,
             },
+            // The unit `OnFailure=` names; without it systemd logs an unknown
+            // unit once the restarts are spent and nothing hands DNS back.
+            InstallFile {
+                path: Path::new(SYSTEMD_UNIT_DIR).join(after_crash_unit_name()),
+                contents: render_after_crash_unit(cfg),
+                mode: 0o644,
+            },
         ],
         symlinks: alias_link(&cfg.binary_path).into_iter().collect(),
         post_write_commands,
@@ -527,6 +589,7 @@ pub fn plan_uninstall(binary_path: Option<&Path>) -> SystemdUninstallPlan {
     let mut files_to_remove = vec![
         crate::logrotate::config_file(),
         crate::polkit_policy::actions_file(),
+        Path::new(SYSTEMD_UNIT_DIR).join(after_crash_unit_name()),
     ];
     if let Some(alias) = binary_path.and_then(alias_link) {
         files_to_remove.push(alias.link_path);
@@ -833,6 +896,34 @@ mod tests {
         // The bounds belong to [Unit]; without them `Restart=` is unbounded.
         assert!(unit.contains("StartLimitBurst=3"), "{unit}");
         assert!(unit.contains("StartLimitIntervalSec=600"), "{unit}");
+        // Past the bounds the failure unit runs, and a stop that hangs is
+        // killed rather than waited on forever.
+        assert!(
+            unit.contains("OnFailure=netrulerouter-after-crash.service\n"),
+            "{unit}"
+        );
+        assert!(unit.contains("TimeoutStopSec=120\n"), "{unit}");
+    }
+
+    #[test]
+    fn the_failure_unit_runs_the_after_crash_verb_once() {
+        let unit = render_after_crash_unit(&sample_config());
+        assert!(unit.contains("Type=oneshot\n"), "{unit}");
+        assert!(
+            unit.contains(r#"ExecStart="/usr/libexec/netrulerouter/nrr-serviced" after-crash"#),
+            "{unit}"
+        );
+        let plan = plan_install(&sample_config(), UnitActivation::EnableNow);
+        let staged = plan
+            .additional_files
+            .iter()
+            .find(|f| f.path.ends_with("netrulerouter-after-crash.service"))
+            .expect("install writes the failure unit");
+        assert_eq!(staged.contents, unit);
+        assert_eq!(
+            staged.path,
+            PathBuf::from("/etc/systemd/system/netrulerouter-after-crash.service")
+        );
     }
 
     #[test]
@@ -989,8 +1080,8 @@ mod tests {
     #[test]
     fn install_plan_writes_the_logrotate_backstop_dropin() {
         let plan = plan_install(&sample_config(), UnitActivation::EnableNow);
-        // Two additional files: the logrotate drop-in and the polkit actions.
-        assert_eq!(plan.additional_files.len(), 2);
+        // The logrotate drop-in, the polkit actions and the failure unit.
+        assert_eq!(plan.additional_files.len(), 3);
         let dropin = &plan.additional_files[0];
         assert_eq!(dropin.path, PathBuf::from("/etc/logrotate.d/netrulerouter"));
         // World-readable /etc config.
@@ -1050,7 +1141,8 @@ mod tests {
             plan.additional_files_to_remove,
             vec![
                 crate::logrotate::config_file(),
-                crate::polkit_policy::actions_file()
+                crate::polkit_policy::actions_file(),
+                PathBuf::from("/etc/systemd/system/netrulerouter-after-crash.service"),
             ]
         );
         assert_eq!(

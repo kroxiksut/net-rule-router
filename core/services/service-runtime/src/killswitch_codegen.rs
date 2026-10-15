@@ -699,7 +699,7 @@ pub const DEFAULT_VPN_EXEMPT_PATTERNS: &[&str] = &[
     "continent*",
 ];
 
-/// Kill-switch EXEMPTION for apps the user routed to the **primary** adapter.
+/// Kill-switch EXEMPTION for the tunnel clients themselves.
 ///
 /// Emits one unconditional ALE `Permit` per app pattern at the exempt weight
 /// band ([`APP_EXEMPT_BASE`]), so it OUTRANKS every kill-switch / fail-closed /
@@ -707,67 +707,19 @@ pub const DEFAULT_VPN_EXEMPT_PATTERNS: &[&str] = &[
 /// so the app's TCP/UDP egress is allowed over ANY link — crucially the primary —
 /// even while the secondary adapter is down and the block is engaged.
 ///
-/// Rationale: fail-closed exists to stop LEAKS over the unprotected path; an app
-/// the user *deliberately* routes to the primary adapter is not a leak, so the
-/// kill-switch must never cut it. This is the VPN-bootstrap fix — put the VPN
-/// client on the primary adapter and its handshake to its server is never
-/// blocked, so the tunnel can come up (no fail-closed deadlock).
+/// Rationale: the client's egress IS the tunnel's transport. Blocking its
+/// handshake while the tunnel is down is how an outage becomes permanent.
 ///
 /// ALE connect layer only: `ALE_APP_ID` is not exposed at the packet layer, so a
 /// per-app ICMP exemption is not possible (VPN bootstrap is TCP/UDP, so this is
 /// sufficient). There is no `Block` half — this is a pure exemption.
-/// How many install-tree binaries the exemption is willing to admit in total,
-/// across every recognised client. A ceiling, not a target: one product ships a
-/// handful of executables, and a number this size only ever binds if something
-/// unexpected resolved as a client.
-pub const CLIENT_TREE_EXEMPT_CAP: usize = 24;
-
-/// The OTHER executables of each recognised tunnel client, so the exemption
-/// covers the process that actually performs the handshake.
 ///
-/// A client is not one binary. `examplevpn 3.0.exe` is a window: its
-/// transports are `OpenVPN\openvpn.exe` and `XRay\ExternalBinaries\xray.exe`,
-/// each a separate process, and one of them — never the window — is what talks
-/// to the server. Exempting only the resolved binary is why one observed outage
-/// held: the user switched protocols for over an hour while every attempt ran
-/// from a process no permit named. The bounded Program-Files walk had not found
-/// the nested `openvpn.exe` either, and `xray.exe` matches no VPN pattern at
-/// all, so neither the resolver nor the drop-driven learner could ever have
-/// covered them.
-///
-/// `client_paths` must hold ONLY recognised clients — resolved built-in VPN
-/// patterns, the user-confirmed link provider, drop-verified clients. An
-/// ordinary primary-routed application must not reach here: the user routing
-/// their mail client to the main link is not a reason to exempt everything
-/// shipped beside it.
-///
-/// The residual hole is one product directory: a binary planted next to a
-/// confirmed client is exempt too. That is narrower than it looks — writing
-/// there already means being able to replace the client itself — but it is the
-/// reason this takes recognised clients rather than any resolved app.
-pub fn tunnel_client_tree_exempt_paths(
-    resolver: &dyn nrr_platform_api::AppPathResolver,
-    client_paths: &[String],
-) -> Vec<String> {
-    let mut seen: std::collections::HashSet<String> = client_paths
-        .iter()
-        .map(|p| p.to_ascii_lowercase())
-        .collect();
-    let mut out = Vec::new();
-    for client in client_paths {
-        for sibling in resolver.sibling_executables(std::path::Path::new(client)) {
-            if out.len() >= CLIENT_TREE_EXEMPT_CAP {
-                return out;
-            }
-            let path = sibling.to_string_lossy().into_owned();
-            if seen.insert(path.to_ascii_lowercase()) {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
-
+/// `app_patterns` must hold ONLY recognised tunnel clients: a resolved
+/// built-in pattern from a protected install, the user-confirmed link
+/// provider, a drop-verified client the trust pass accepted. An application
+/// the user merely routes to the main link is not one — its own rule permit
+/// sits below the kill-switch block band, which is what keeps a rule host on
+/// the tunnel even for that application.
 pub fn primary_app_exempt_filters(sid: &str, app_patterns: &[String]) -> Vec<WfpFilterSpec> {
     app_patterns
         .iter()
@@ -1105,15 +1057,15 @@ const V4_LOCAL_NETWORK_CONTROL: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 0);
 // `killswitch_codegen::exemptions`.
 mod exemptions;
 
-pub use exemptions::default_block_exemptions;
 use exemptions::{
     base_ale_exemptions, base_packet_exemptions, exempt_direct_host, exempt_dns_over_primary,
     exempt_egress, exempt_probe_target, exempt_subnet,
 };
+pub use exemptions::{default_block_exemptions, MAX_DNS_SERVER_PERMITS};
 
 mod v6;
 
-pub use v6::catch_all_v6_filters;
+pub use v6::{catch_all_v6_filters, default_block_exemptions_v6};
 
 mod fail_closed;
 pub use fail_closed::*;

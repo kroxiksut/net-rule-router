@@ -80,9 +80,13 @@ fn only_a_confirmed_user_write_is_recorded() {
     // The internal writers name an origin that is not the user's.
     let resync = function_body(&controller, "_resyncRouteBindingWith");
     assert!(resync.contains("}, \"binding-resync\")"), "{resync}");
+    // The panel never re-sends what its preferences remember: a service that
+    // lost the user's settings gets the restore card, and only its action writes.
     let routing = repo_file("apps/desktop/qml/sections/settings/RoutingSettings.qml");
-    let reseed = function_body(&routing, "_reseedTogglesFromPrefs");
-    assert!(reseed.contains("}, \"reseed\")"), "{reseed}");
+    assert!(
+        !routing.contains("mutateRoutePolicy(") && !routing.contains("_applyRoutePolicyKey"),
+        "RoutingSettings writes the policy on its own"
+    );
     // A binding push records only when its caller says it is the user's.
     let push = function_body(&controller, "pushRouteBindingToService");
     assert!(push.contains("}, origin)"), "{push}");
@@ -102,38 +106,6 @@ fn only_a_confirmed_user_write_is_recorded() {
         assert_eq!(out, json!([true, true, false, false, false, false]));
     } else {
         eprintln!("node not available — skipping the origin check");
-    }
-}
-
-#[test]
-fn the_stability_record_keeps_the_other_namespaces() {
-    let controller = repo_file("apps/desktop/qml/flows/ServiceIntentController.qml");
-    assert!(
-        !controller.contains("JSON.stringify({ \"stability\""),
-        "a record rebuilt from stability alone erases the route policy and the mutes"
-    );
-    let write = function_body(&controller, "_writeStabilityIntent");
-    assert!(write.contains("Pure.intentWithNamespace("), "{write}");
-
-    let body = r#"
-        console.log(JSON.stringify({
-            kept: intentWithNamespace(
-                JSON.stringify({ "stability": { "a": 1 }, "route-policy": { "mode": "x" } }),
-                "stability", { "a": 2 }),
-            dropped: intentWithNamespace(JSON.stringify({ "stability": {}, "notice-mutes": [] }),
-                "stability", null),
-            broken: intentWithNamespace("{not json", "stability", { "a": 1 })
-        }));
-    "#;
-    if let Some(out) = run_pure(body) {
-        assert_eq!(
-            out["kept"],
-            json!({ "stability": { "a": 2 }, "route-policy": { "mode": "x" } })
-        );
-        assert_eq!(out["dropped"], json!({ "notice-mutes": [] }));
-        assert_eq!(out["broken"], json!({ "stability": { "a": 1 } }));
-    } else {
-        eprintln!("node not available — skipping the namespace check");
     }
 }
 

@@ -18,6 +18,12 @@ use std::time::{Duration, Instant};
 use nrr_platform_api::error::PlatformError;
 use nrr_platform_api::network_change::{NetworkChangeObserver, NetworkChangeSubscription};
 
+use crate::service_tasks::ServiceTaskKind;
+use crate::task_liveness::{TaskLiveness, ThreadExit, ThreadLease, Watch};
+
+/// A fire still running past this is a hang of the pass behind it.
+const FIRE_DEADLINE: Duration = Duration::from_secs(120);
+
 /// Coalescing window: bursts of OS change callbacks within this window collapse
 /// into a single re-arm. 500 ms matches the adapter-monitor debounce and smooths
 /// Wi-Fi-roam / VPN-reconnect flaps without adding perceptible re-arm latency.
@@ -54,6 +60,15 @@ impl DebouncedTrigger {
     /// Spawn the coalescing worker. `target` is invoked (off the poking thread)
     /// at most once per `window` after a burst of pokes.
     pub fn new(target: Arc<dyn Fn() + Send + Sync>, window: Duration) -> Self {
+        Self::new_observed(target, window, None)
+    }
+
+    /// [`Self::new`], with the worker holding a liveness lease under `label`.
+    pub fn new_observed(
+        target: Arc<dyn Fn() + Send + Sync>,
+        window: Duration,
+        observed: Option<(Arc<TaskLiveness>, &'static str)>,
+    ) -> Self {
         let inner = Arc::new(DebounceInner {
             state: Mutex::new(DebounceState {
                 pending: false,
@@ -66,12 +81,24 @@ impl DebouncedTrigger {
         let worker = Arc::clone(&inner);
         let join = std::thread::Builder::new()
             .name("nrr-net-change-debounce".to_string())
-            .spawn(move || Self::run(worker))
+            .spawn(move || {
+                let lease = observed.map(|(liveness, label)| {
+                    liveness.lease(
+                        ServiceTaskKind::NetChangeDebounce,
+                        Some(label),
+                        Watch::Work(FIRE_DEADLINE),
+                    )
+                });
+                Self::run(worker, lease.as_ref());
+                if let Some(lease) = lease {
+                    lease.finish(ThreadExit::Stopped);
+                }
+            })
             .ok();
         Self { inner, join }
     }
 
-    fn run(inner: Arc<DebounceInner>) {
+    fn run(inner: Arc<DebounceInner>, lease: Option<&ThreadLease>) {
         loop {
             // Wait for the first poke of a burst (or stop).
             {
@@ -110,6 +137,7 @@ impl DebouncedTrigger {
                     st = guard;
                 }
             }
+            let _fire = lease.map(ThreadLease::work);
             (inner.target)();
         }
     }
@@ -162,7 +190,21 @@ impl NetworkChangeRearm {
         recompute_hook: Arc<dyn Fn() + Send + Sync>,
         window: Duration,
     ) -> Result<Self, PlatformError> {
-        let trigger = DebouncedTrigger::new(recompute_hook, window);
+        Self::start_observed(observer, recompute_hook, window, None)
+    }
+
+    /// [`Self::start`], with the debounce worker reporting to `liveness`.
+    pub fn start_observed(
+        observer: &dyn NetworkChangeObserver,
+        recompute_hook: Arc<dyn Fn() + Send + Sync>,
+        window: Duration,
+        liveness: Option<Arc<TaskLiveness>>,
+    ) -> Result<Self, PlatformError> {
+        let trigger = DebouncedTrigger::new_observed(
+            recompute_hook,
+            window,
+            liveness.map(|liveness| (liveness, "network")),
+        );
         let subscription = observer.subscribe(trigger.poker())?;
         Ok(Self {
             _subscription: subscription,

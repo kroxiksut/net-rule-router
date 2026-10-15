@@ -75,6 +75,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
 
 It wraps `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`,
 `cargo test --workspace` and `cargo deny check`. All four have to be green.
+It also runs `qmllint` over every QML file and fails on a syntax error, since a
+file with one does not load; without Qt installed that step is skipped with a
+warning, and CI requires it.
 
 Two practical notes. Run the crate's tests in full — `cargo test -p <crate>`,
 not `--lib`: integration tests live in `tests/` and have caught regressions the

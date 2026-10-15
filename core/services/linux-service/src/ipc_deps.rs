@@ -30,9 +30,10 @@ use std::sync::{Arc, Mutex};
 
 use nrr_diagnostics::audit::alert::SecurityAlertsRepository;
 use nrr_platform_api::key_store::KeyStore;
+use nrr_platform_linux::logind::LogindActivePrincipals;
 use nrr_service_runtime::activation_coordinator::{
-    ActivationCoordinator, DispatchFailure, PreFlightWarning, RulesApplyDispatcher,
-    SidActionPlanSummary,
+    ActivationCoordinator, ApplyFailurePolicy, DispatchFailure, PreFlightWarning,
+    RulesApplyDispatcher, SidActionPlanSummary,
 };
 use nrr_service_runtime::boot_integrity::AuditTrail;
 use nrr_service_runtime::browser_history_seeder::BrowserHistorySeeder;
@@ -48,6 +49,9 @@ use nrr_service_runtime::production_handlers_misc::{
     ProductionMigrationCompletionWriter, ProductionMigrationStatusProvider,
     ProductionPrincipalDataPurger, ProductionRoutePolicyProvider, ProductionRoutePolicyWriter,
     ProductionRulesSnapshotProvider,
+};
+use nrr_service_runtime::production_local_dns_suffixes::{
+    ProductionLocalDnsSuffixContext, ProductionLocalDnsSuffixStore,
 };
 use nrr_service_runtime::production_merge_preview::{
     MergePreviewSource, ProductionMergePreviewSource,
@@ -133,12 +137,34 @@ impl RulesApplyDispatcher for CycleApplyDispatcher {
         })
     }
 
+    /// The ruleset this user's pass would install, under `nft --check`. The
+    /// coordinator previews the candidate on this thread, so the plan is the
+    /// revision's while every other reader keeps the one in force.
     fn pre_flight_for_sid(
         &self,
-        _sid: &str,
+        sid: &str,
         _rules_json: &str,
     ) -> Result<Vec<PreFlightWarning>, DispatchFailure> {
-        Ok(Vec::new())
+        self.cycle
+            .check_for(sid)
+            .map(|()| Vec::new())
+            .map_err(|message| DispatchFailure {
+                sid: sid.to_string(),
+                message,
+            })
+    }
+
+    /// A review never runs the check: it would plan the stored revision, not
+    /// the one under review, and hold the client's request for an `nft` run.
+    fn plan_with_pre_flight_for_sid(
+        &self,
+        sid: &str,
+        rules_json: &str,
+    ) -> (
+        Result<SidActionPlanSummary, DispatchFailure>,
+        Vec<PreFlightWarning>,
+    ) {
+        (self.dry_run_for_sid(sid, rules_json), Vec::new())
     }
 
     fn apply_for_sid(&self, sid: &str, _rules_json: &str) -> Result<(), DispatchFailure> {
@@ -154,45 +180,70 @@ impl RulesApplyDispatcher for CycleApplyDispatcher {
 
 impl CycleApplyDispatcher {
     fn run_pass(&self, sid: &str) -> Result<(), DispatchFailure> {
-        // An apply the user asked for is attempted even with plans refused
-        // before: the fix may be one the plans do not show.
-        self.cycle.request_retry();
-        match self.cycle.tick_logged("apply") {
-            CycleOutcome::Applied { .. } | CycleOutcome::Unchanged => Ok(()),
-            // Every other outcome means the machine does NOT match the
-            // revision that was just approved. Reporting success here would
-            // leave the user believing rules are in force that are not.
-            CycleOutcome::EnforcementFailed { reason, .. }
-            | CycleOutcome::RefusalStands { reason } => Err(DispatchFailure {
-                sid: sid.to_string(),
-                message: reason,
-            }),
-            CycleOutcome::AuthorityUnavailable { reason } => Err(DispatchFailure {
-                sid: sid.to_string(),
-                message: format!("could not determine who is logged in: {reason}"),
-            }),
-            CycleOutcome::Stopped => Err(DispatchFailure {
-                sid: sid.to_string(),
-                message: "the service is stopping; the rules were saved but not applied".to_owned(),
-            }),
+        pass_now(&self.cycle, "apply").map_err(|message| DispatchFailure {
+            sid: sid.to_string(),
+            message,
+        })
+    }
+}
+
+/// One pass, now, for a change the user just asked for. Attempted even with
+/// plans refused before: the fix may be one the plans do not show.
+///
+/// Every outcome but an applied pass means the machine does NOT match what was
+/// just approved; reporting success there would leave the user believing a
+/// policy is in force that is not.
+fn pass_now(cycle: &PrincipalEnforcementCycle, trigger: &'static str) -> Result<(), String> {
+    cycle.request_retry();
+    match cycle.tick_logged(trigger) {
+        CycleOutcome::Applied { .. } | CycleOutcome::Unchanged => Ok(()),
+        CycleOutcome::EnforcementFailed { reason, .. } | CycleOutcome::RefusalStands { reason } => {
+            Err(reason)
+        }
+        CycleOutcome::AuthorityUnavailable { reason } => {
+            Err(format!("could not determine who is logged in: {reason}"))
+        }
+        CycleOutcome::Stopped => {
+            Err("the service is stopping; the change was saved but not applied".to_owned())
         }
     }
 }
 
-/// Routing pause on this platform is not wired to a mechanism yet.
+/// Routing pause on this platform: the pass is the whole mechanism.
 ///
-/// It refuses instead of pretending: a pause that reports success while traffic
-/// keeps following the rules is the exact failure a pause exists to prevent.
-struct UnsupportedPauseDispatcher;
+/// The coordinator stores the flag before calling here and the pass reads it,
+/// so "remove" is a pass that leaves the paused user out — their nft rules and
+/// routes go with everyone else's re-apply — and "install" is a pass that plans
+/// for them again. A pass that did not land is reported, and the coordinator
+/// puts the flag back.
+struct CyclePauseDispatcher {
+    cycle: Arc<PrincipalEnforcementCycle>,
+}
 
-impl PauseDispatcher for UnsupportedPauseDispatcher {
+impl PauseDispatcher for CyclePauseDispatcher {
     fn install_for_sid(&self, _sid: &str) -> Result<(), String> {
-        Err("routing pause is not available on this platform yet".to_owned())
+        pass_now(&self.cycle, "resume")
     }
 
     fn remove_for_sid(&self, _sid: &str) -> Result<(), String> {
-        Err("routing pause is not available on this platform yet".to_owned())
+        pass_now(&self.cycle, "pause")
     }
+}
+
+/// The apply-failure policy the settings page stored, read once at start; a
+/// later change reaches the coordinator through the writer wired below.
+fn stored_apply_failure_policy(conn: &Mutex<rusqlite::Connection>) -> ApplyFailurePolicy {
+    use nrr_storage::policy_settings::{ApplyFailurePolicySettingsRepository, DEFAULT_POLICY_SLUG};
+
+    let slug = match conn.lock() {
+        Ok(guard) => ApplyFailurePolicySettingsRepository::new(&guard)
+            .get_or_default()
+            .map(|record| record.policy)
+            .unwrap_or_else(|_| DEFAULT_POLICY_SLUG.to_owned()),
+        Err(_) => DEFAULT_POLICY_SLUG.to_owned(),
+    };
+    // An unknown slug reads as the store's own default, as on Windows.
+    ApplyFailurePolicy::from_slug(&slug).unwrap_or(ApplyFailurePolicy::BestEffort)
 }
 
 /// The IPC audit emitter this daemon serves with: the real one when there is a
@@ -238,6 +289,7 @@ pub(crate) fn build_ipc_surface(
     cache_store: Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>,
     conn_trace_ring: Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>,
     app_enforcement: nrr_service_runtime::app_enforcement_status::AppEnforcementStatus,
+    shared_ip_exemptions: nrr_service_runtime::app_enforcement_status::SharedIpExemptionStatus,
     conn_trace_log: nrr_service_runtime::boot_settings::ConnTraceLogSwitch,
     verbosity: Option<nrr_service_runtime::TracingVerbosityHandle>,
     key_store: Arc<dyn KeyStore>,
@@ -307,19 +359,32 @@ pub(crate) fn build_ipc_surface(
         activation_audit,
         Arc::new(nrr_service_runtime::production_settings::SystemClock),
         ids,
-        nrr_service_runtime::activation_coordinator::ApplyFailurePolicy::AllOrNothing,
-    );
+        stored_apply_failure_policy(&state_conn),
+    )
+    // No tray feeds the registry here: an activation reaches whoever the pass
+    // plans for. Without it the dispatcher, pre-flight included, saw nobody.
+    .with_served_sids({
+        let cycle = Arc::clone(&cycle);
+        Arc::new(move || cycle.present_stored())
+    });
     let coordinator = Arc::new(signing.sign(coordinator));
     // Before the first enforcement pass reads the rules.
     let revision_watch = signing.enforce_and_watch(Some(&coordinator));
 
-    let pause_coordinator = Arc::new(RoutingPauseCoordinator::new(
-        Arc::clone(&state_conn),
-        sid_registry,
-        Arc::new(UnsupportedPauseDispatcher),
-        Arc::new(NoopRoutingPauseAudit),
-        Arc::new(nrr_service_runtime::production_settings::SystemClock),
-    ));
+    // No tray feeds the registry here: logind says whose policy is live, so a
+    // pause reaches the pass for every signed-in user, tray or not.
+    let pause_coordinator = Arc::new(
+        RoutingPauseCoordinator::new(
+            Arc::clone(&state_conn),
+            sid_registry,
+            Arc::new(CyclePauseDispatcher {
+                cycle: Arc::clone(&cycle),
+            }),
+            Arc::new(NoopRoutingPauseAudit),
+            Arc::new(nrr_service_runtime::production_settings::SystemClock),
+        )
+        .with_presence_source(Arc::new(LogindActivePrincipals)),
+    );
 
     // Every rule change the GUI makes — preset import, table edits, rollback —
     // lands here; without it a preview came back empty and read as "nothing to
@@ -422,7 +487,12 @@ pub(crate) fn build_ipc_surface(
         Arc::new(ProductionLogRetentionConfig::new(Arc::clone(&state_conn))),
         Arc::new(ProductionLogRetentionConfig::new(Arc::clone(&state_conn))),
         Arc::new(ProductionApplyFailurePolicy::new(Arc::clone(&state_conn))),
-        Arc::new(ProductionApplyFailurePolicy::new(Arc::clone(&state_conn))),
+        // The live coordinator hears a change at once; the clients hear it too.
+        Arc::new(
+            ProductionApplyFailurePolicy::new(Arc::clone(&state_conn))
+                .with_coordinator(Arc::clone(&coordinator))
+                .with_event_bus(Arc::clone(&event_bus)),
+        ),
         Arc::new(ProductionStorageUsage::new(
             state_db_path,
             cache_db_path,
@@ -469,6 +539,8 @@ pub(crate) fn build_ipc_surface(
         .with_unix_sys_uid_max(nrr_platform_linux::service_account_uids::read_sys_uid_max())
         // The same status the planner publishes rule conflicts into.
         .with_app_enforcement_status(app_enforcement)
+        // The shared addresses the smart leak-guard spared, for its warning.
+        .with_shared_ip_exemption_status(shared_ip_exemptions)
         // The cycle pushes channel status on change only; a client that
         // connects later reads the standing reports here.
         .with_route_enforcement_status(cycle.enforcement_status().unwrap_or_default())
@@ -510,6 +582,15 @@ pub(crate) fn build_ipc_surface(
             as Arc<
                 dyn nrr_service_runtime::ipc_handlers::doh_resolvers::DohResolverListStore,
             >)
+        // The home-network suffix list the DNS guard leaves to the main link.
+        .with_local_dns_suffixes(
+            Arc::new(ProductionLocalDnsSuffixStore::new(Arc::clone(
+                &stats_state_conn,
+            ))),
+            Arc::new(ProductionLocalDnsSuffixContext::new(Arc::new(
+                ProductionRulesProvider::new(Arc::clone(&stats_state_conn)),
+            ))),
+        )
         // Notice mutes ("don't show"), written to the store the centre loads.
         .with_block_notice_mutes(
             Arc::new(
@@ -893,5 +974,43 @@ mod tests {
         ipc_audit_emitter(None)
             .record_request(&envelope(), &ctx())
             .expect("the no-op reports success");
+    }
+
+    /// The coordinator used to start with all-or-nothing fixed, whatever the
+    /// settings page had stored: the policy the window offered changed nothing.
+    #[test]
+    fn the_coordinator_starts_with_the_stored_apply_failure_policy() {
+        use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+        use nrr_storage::policy_settings::ApplyFailurePolicySettingsRepository;
+        use nrr_storage::repository::MigrationRunner;
+
+        let dir = std::env::temp_dir().join(format!("nrr-ipc-policy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let runner = SqliteMigrationRunner::for_state_db(
+            open_connection(&dir.join("state.db")).expect("open"),
+        );
+        runner.run_pending_migrations().expect("migrate");
+        let conn = Mutex::new(runner.into_connection());
+
+        // The store's own default, before anybody chose.
+        assert_eq!(
+            stored_apply_failure_policy(&conn),
+            ApplyFailurePolicy::BestEffort
+        );
+        for (slug, expected) in [
+            ("all-or-nothing", ApplyFailurePolicy::AllOrNothing),
+            (
+                "pre-flight-then-all-or-nothing",
+                ApplyFailurePolicy::PreFlightThenAllOrNothing,
+            ),
+            ("best-effort", ApplyFailurePolicy::BestEffort),
+        ] {
+            ApplyFailurePolicySettingsRepository::new(&conn.lock().expect("conn"))
+                .set(slug, None, 1_700_000_000)
+                .expect("store the policy");
+            assert_eq!(stored_apply_failure_policy(&conn), expected, "{slug}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

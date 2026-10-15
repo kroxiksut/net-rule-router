@@ -57,14 +57,26 @@ address we never learned, which means a rule for it may not fire and leak
 protection has less to work with.
 
 This is a real trade-off, not a detail: encrypted DNS in the browser and
-name-based routing want the same information. Settings → Routing has a
-**Block browser DoH/DoT** switch for this, off by default; by default it is in
-force only while leak protection is on. It closes the known encrypted-DNS
-services over both IPv4 and IPv6. The built-in list of those services grows
+name-based routing want the same information. So NetRuleRouter blocks browser
+DoH/DoT on its own as soon as you have rules for the additional route, and
+tells you so in Settings → Routing; there you can switch the blocking off or
+set it by hand. It closes the known encrypted-DNS services over both IPv4 and
+IPv6. The built-in list of those services grows
 with new versions of the app, and an update adds the new entries without
 bringing back any you removed yourself. If you leave
 encrypted DNS on in your browser, expect routing for browser traffic to be
 less reliable than for everything else.
+
+## Names of your home network stay at home
+
+A printer, a router or a NAS is reached by a short local name (`printer.lan`,
+`fritz.box`). Those names belong to the network you are on, not to the
+internet, and NetRuleRouter leaves them to that network to answer: they are
+never sent down a route. The list of such network names is shared by every
+user of the computer and comes pre-filled; an administrator can add the suffix
+of your own home network, and the network you join is only ever offered, never
+trusted on its own. A name that one of your rules covers keeps following the
+rule, whatever network you are on.
 
 ## What NetRuleRouter is not
 

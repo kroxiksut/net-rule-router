@@ -337,8 +337,9 @@ fn a_dead_udp_upstream_retires_the_client_and_reports_unreachable() {
 
 #[test]
 fn a_hard_read_error_marks_the_udp_flow_dead() {
-    let replies = UdpReplies::new(StackWaker::new());
-    let worker = spawn_udp_reader(Arc::new(DeadReadDatagram), Arc::clone(&replies));
+    let replies = UdpReplies::new(StackWaker::new(), Arc::new(health::FakeIpHealth::new()));
+    let worker =
+        spawn_udp_reader(Arc::new(DeadReadDatagram), Arc::clone(&replies)).expect("spawn reader");
     worker.join().expect("reader thread");
     assert!(
         replies.is_dead(),

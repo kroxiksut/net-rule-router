@@ -295,6 +295,18 @@ pub enum ServiceControlError {
     Mechanism { detail: String },
 }
 
+/// How long "stop the service and restore the network" waits for a clean stop
+/// before ending the process.
+pub const STOP_FOR_RESET_BUDGET: Duration = Duration::from_secs(30);
+
+/// The service binary's network-reset verb that stops a running service first.
+/// `cleanup` alone refuses while the service runs: it would put the state back.
+pub const STOP_AND_CLEANUP_VERB: &str = "stop-and-cleanup";
+
+/// Exit code of `cleanup` when the service runs; the console and the window
+/// offer the stopping variant on it.
+pub const EXIT_SERVICE_RUNNING: u8 = 4;
+
 /// Exit code of the service binary's own `install` / `reinstall` verbs when the
 /// failure is [`ServiceControlError::Relocation`], so the elevated broker that
 /// ran the verb can say which failure it was without parsing text.
@@ -359,6 +371,22 @@ pub trait ServiceControlPort {
     /// Stop the service and wait up to `timeout` for it to go down. Stopping an
     /// already-stopped service succeeds.
     fn stop(&self, timeout: Duration) -> Result<(), ServiceControlError>;
+
+    /// End the running service process at once, without asking it to stop.
+    /// Only for an undo that cannot wait on a hung service.
+    fn kill(&self) -> Result<(), ServiceControlError> {
+        Err(ServiceControlError::Unsupported { operation: "kill" })
+    }
+
+    /// [`Self::stop`], and when the service does not go down within `timeout`,
+    /// [`Self::kill`]: what "stop the service and restore the network" may do
+    /// to a service that hangs on its way out.
+    fn stop_or_kill(&self, timeout: Duration) -> Result<(), ServiceControlError> {
+        match self.stop(timeout) {
+            Err(ServiceControlError::Timeout { .. }) => self.kill(),
+            other => other,
+        }
+    }
 
     /// Stop then start, in one call, so a privilege prompt is raised once
     /// instead of twice.

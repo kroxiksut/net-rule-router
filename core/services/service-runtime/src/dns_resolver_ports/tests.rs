@@ -34,7 +34,7 @@ use super::*;
 use nrr_domain::canonical::{
     CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
 };
-use nrr_domain::{RouteBehaviorMode, RuleId};
+use nrr_domain::RuleId;
 use nrr_platform_api::dns::DnsResolverError;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -731,7 +731,6 @@ impl RulesProvider for FakeRules {
                 primary: self.primary.clone(),
                 secondary: self.secondary.clone(),
             },
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
         })
     }
 }
@@ -913,6 +912,41 @@ fn reconciler_installs_when_hook_completes_within_deadline() {
     // `Installed` is only returned after the completion signal, which the
     // worker sends AFTER running the hook — so the reconcile really ran.
     assert_eq!(ran.load(Ordering::SeqCst), 1);
+}
+
+/// Each family's first contact reaches its own hook, and a family without
+/// one routes nothing: an AAAA answer never lands in the v4 hook, whose
+/// planner would route nothing for it anyway, and vice versa.
+#[test]
+fn each_familys_first_contact_reaches_its_own_hook() {
+    use std::sync::Mutex;
+    let hook: RouteRecomputeHook = Arc::new(|| {});
+    let seen4 = Arc::new(Mutex::new(Vec::new()));
+    let seen6 = Arc::new(Mutex::new(Vec::new()));
+    let (s4, s6) = (Arc::clone(&seen4), Arc::clone(&seen6));
+    let reconciler = HookSyncReconciler::new(Arc::clone(&hook))
+        .with_first_contact(Arc::new(move |addresses: &[std::net::Ipv4Addr]| {
+            s4.lock().expect("lock").extend_from_slice(addresses);
+            addresses.len()
+        }))
+        .with_first_contact_v6(Arc::new(move |addresses: &[std::net::Ipv6Addr]| {
+            s6.lock().expect("lock").extend_from_slice(addresses);
+            addresses.len()
+        }));
+    let v4 = std::net::Ipv4Addr::new(203, 0, 113, 7);
+    let v6: std::net::Ipv6Addr = "2001:db8::7".parse().expect("literal");
+    assert_eq!(reconciler.install_first_contact(&[v4]), 1);
+    assert_eq!(reconciler.install_first_contact_v6(&[v6]), 1);
+    assert_eq!(*seen4.lock().expect("lock"), vec![v4]);
+    assert_eq!(*seen6.lock().expect("lock"), vec![v6]);
+
+    let v4_only = HookSyncReconciler::new(hook)
+        .with_first_contact(Arc::new(|a: &[std::net::Ipv4Addr]| a.len()));
+    assert_eq!(
+        v4_only.install_first_contact_v6(&[v6]),
+        0,
+        "no v6 hook, no v6 route — the answer waits for the full run as before"
+    );
 }
 
 #[test]
@@ -1132,6 +1166,74 @@ fn direct_udp_gives_the_whole_call_back_inside_the_budget() {
     );
 }
 
+/// The `message_key` lines `run` writes to the operational log.
+fn logged_lines(msg_key: &str, run: impl FnOnce()) -> Vec<serde_json::Value> {
+    use tracing_subscriber::layer::SubscriberExt;
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let writer = Arc::new(nrr_diagnostics::LogWriter::open(
+        nrr_diagnostics::LogWriterConfig::new(dir.path()),
+    ));
+    let subscriber =
+        tracing_subscriber::registry().with(nrr_diagnostics::NdjsonTracingLayer::new(writer));
+    tracing::subscriber::with_default(subscriber, run);
+    let wanted = format!("diag.event.{msg_key}");
+    let mut lines = Vec::new();
+    for entry in std::fs::read_dir(dir.path()).expect("logs dir") {
+        let text = std::fs::read_to_string(entry.expect("entry").path()).expect("read");
+        lines.extend(
+            text.lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("ndjson"))
+                .filter(|line| line["message_key"] == wanted.as_str()),
+        );
+    }
+    lines
+}
+
+/// A zone apex with no address of its own: the second source answers «no such
+/// address» — an answer that agrees, not a failure to report. The seeding of
+/// rule hosts asks exactly these, and each one used to raise a warning.
+#[test]
+fn a_second_source_saying_no_records_agrees_and_raises_no_warning() {
+    let inner = FixedUpstream::new(Err(ResolveError::NoRecords));
+    let second = FixedUpstream::new(Err(ResolveError::NoRecords));
+    let r = PoisonFallbackUpstreamResolver::new(inner as Arc<dyn UpstreamResolver>)
+        .with_fallbacks(vec![second as Arc<dyn UpstreamResolver>]);
+    let lines = logged_lines("dns-resolver-unconfirmed-answer", || {
+        let outcome = r.resolve_within("cdn.example", AddressFamily::Ipv4, Duration::from_secs(2));
+        assert_eq!(outcome, Err(ResolveError::NoRecords));
+    });
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
+/// A second source that could not answer is a real gap, and the line says why.
+#[test]
+fn a_failed_second_source_is_reported_with_its_reason() {
+    let inner = FixedUpstream::new(Err(ResolveError::NoRecords));
+    let second = FixedUpstream::new(Err(ResolveError::Unavailable("receive timed out".into())));
+    let r = PoisonFallbackUpstreamResolver::new(inner as Arc<dyn UpstreamResolver>)
+        .with_fallbacks(vec![second as Arc<dyn UpstreamResolver>]);
+    let lines = logged_lines("dns-resolver-unconfirmed-answer", || {
+        let _ = r.resolve_within(
+            "blocked.example",
+            AddressFamily::Ipv4,
+            Duration::from_secs(2),
+        );
+    });
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["payload"]["second_source"], "receive timed out");
+}
+
+#[test]
+fn an_unconfirmed_round_names_what_cut_it_short() {
+    assert_eq!(unconfirmed_because(true, None), "out of time");
+    assert_eq!(unconfirmed_because(false, Some("refused")), "refused");
+    assert_eq!(
+        unconfirmed_because(true, Some("refused")),
+        "refused; then out of time"
+    );
+    assert_eq!(unconfirmed_because(false, None), "no usable answer");
+}
+
 /// The confirmation round is a second opinion, not a second budget: once the
 /// caller's deadline is gone there is nobody left to answer.
 #[test]
@@ -1333,4 +1435,34 @@ fn hosts_bypass_falls_back_to_system_on_direct_timeout() {
         .resolve("host.example", AddressFamily::Ipv4)
         .expect("fallback answer");
     assert_eq!(rec.addresses, vec![ip(198, 51, 100, 9)]);
+}
+
+/// First contacts are summed and written down once a minute, then counted
+/// afresh: the answer path pays per query, the log does not.
+#[test]
+fn first_contact_timing_reports_once_a_minute_and_starts_over() {
+    let timing = FirstContactTiming::default();
+    let t0 = Instant::now();
+    assert_eq!(timing.add(Duration::from_millis(2), t0), None);
+    assert_eq!(
+        timing.add(Duration::from_millis(12), t0 + Duration::from_secs(30)),
+        None
+    );
+    let summary = timing
+        .add(Duration::from_millis(1), t0 + Duration::from_secs(61))
+        .expect("a minute has passed");
+    assert_eq!(
+        summary,
+        FirstContactSummary {
+            calls: 3,
+            slow: 1,
+            avg_us: 5_000,
+            max_us: 12_000,
+        }
+    );
+    assert_eq!(
+        timing.add(Duration::from_millis(1), t0 + Duration::from_secs(62)),
+        None,
+        "the next minute starts from nothing"
+    );
 }

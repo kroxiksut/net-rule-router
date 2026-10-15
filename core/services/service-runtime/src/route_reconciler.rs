@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use nrr_platform_api::route_table::RouteTablePort;
 use nrr_platform_api::routing::RoutingTransaction;
 use nrr_platform_api::{PlatformError, RouteEntry, RoutingAction};
+use nrr_shared::ip_block::IpBlock;
 
 use crate::route_codegen::{OVERLAY_HIGH, OVERLAY_LOW};
 
@@ -193,14 +194,17 @@ pub fn primary_gateway_v6(routes: &[RouteEntry], primary_ifindex: u32) -> Option
         })
 }
 
-/// the primary interface's
-/// directly-connected IPv4 subnets, as `(network, prefix_len)`.
+/// The interface's directly-connected IPv4 subnets AS THE OS REPORTS THEM, as
+/// `(network, prefix_len)`.
 ///
 /// Derived from the on-link connected routes on `primary_ifindex` (next-hop
-/// `0.0.0.0`, prefix `1..=31` — skips the default route and host routes). The
-/// catch-all kill-switch permits these so DHCP renewal, the local
-/// router/DNS, and LAN devices keep working while everything else off-tunnel
-/// is blocked. Deduplicated, order preserved.
+/// `0.0.0.0`, prefix `1..=31` — skips the default route and host routes).
+/// Deduplicated, order preserved.
+///
+/// Not an exemption list: the network chose these numbers, and a hostile one
+/// chooses a `/1`. Anything a blanket block lets through reads
+/// [`exemptible_local_subnets`] instead; this raw form serves the readers that
+/// describe a link (a tunnel's interior, a settings row).
 ///
 /// Windows carries an on-link `224.0.0.0/4` route on every interface, which
 /// looks exactly like a connected subnet here. Left in, it named a "local
@@ -215,7 +219,7 @@ pub fn primary_local_subnets(routes: &[RouteEntry], primary_ifindex: u32) -> Vec
             r.interface_index == primary_ifindex
                 && r.next_hop.is_unspecified()
                 && (1..=31).contains(&r.prefix_length)
-                && matches!(r.destination, IpAddr::V4(d) if is_unicast_destination(d))
+                && matches!(r.destination, IpAddr::V4(d) if is_unicast_destination(d, r.prefix_length))
         })
         .filter_map(|r| match r.destination {
             IpAddr::V4(d) => Some((d, r.prefix_length)),
@@ -242,35 +246,92 @@ pub fn primary_local_subnets_v6(
         .filter(|r| r.interface_index == primary_ifindex && r.next_hop.is_unspecified())
         .filter(|r| (1..=127).contains(&r.prefix_length))
         .filter_map(|r| match r.destination {
-            IpAddr::V6(d) if is_unicast_destination_v6(d) => Some((d, r.prefix_length)),
+            IpAddr::V6(d) if is_unicast_destination_v6(d, r.prefix_length) => {
+                Some((d, r.prefix_length))
+            }
             _ => None,
         })
         .filter(|s| seen.insert(*s))
         .collect()
 }
 
+/// What a blanket block lets through to one interface's attached segments,
+/// and which reported segments it refused as too wide.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExemptibleLocalSubnets {
+    pub v4: Vec<(Ipv4Addr, u8)>,
+    pub v6: Vec<(Ipv6Addr, u8)>,
+    /// Segments the OS reported wider than a segment can be; nothing of them
+    /// is exempt, and the user is told.
+    pub too_wide: Vec<IpBlock>,
+    /// Public IPv6 prefixes the link is attached to — a home network's own
+    /// addresses. Only the user can vouch for one, so none is exempt here.
+    pub public_v6: Vec<(Ipv6Addr, u8)>,
+}
+
+/// [`primary_local_subnets`] and its v6 twin passed through the one decision
+/// of what part of a reported segment a blanket block may exempt
+/// (`nrr_domain::ip_network_policy::local_segment_exemption`). Both OS
+/// backends read exemptions through here.
+pub fn exemptible_local_subnets(routes: &[RouteEntry], ifindex: u32) -> ExemptibleLocalSubnets {
+    use nrr_domain::ip_network_policy::{local_segment_exemption, LocalSegmentExemption};
+    let mut out = ExemptibleLocalSubnets::default();
+    let reported = primary_local_subnets(routes, ifindex)
+        .into_iter()
+        .filter_map(|(net, prefix)| IpBlock::new(IpAddr::V4(net), prefix))
+        .chain(
+            primary_local_subnets_v6(routes, ifindex)
+                .into_iter()
+                .filter_map(|(net, prefix)| IpBlock::new(IpAddr::V6(net), prefix)),
+        );
+    for segment in reported {
+        match local_segment_exemption(segment) {
+            LocalSegmentExemption::Exempt(blocks) => {
+                for block in blocks {
+                    match block.network() {
+                        IpAddr::V4(net) if !out.v4.contains(&(net, block.prefix_len())) => {
+                            out.v4.push((net, block.prefix_len()));
+                        }
+                        IpAddr::V6(net) if !out.v6.contains(&(net, block.prefix_len())) => {
+                            out.v6.push((net, block.prefix_len()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            LocalSegmentExemption::TooWide => out.too_wide.push(segment),
+            LocalSegmentExemption::NotPrivate => {
+                if let IpAddr::V6(net) = segment.network() {
+                    out.public_v6.push((net, segment.prefix_len()));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `false` for v6 destinations already covered elsewhere or that no host lives
-/// on: multicast, the link-local scope, loopback and the unspecified address.
-fn is_unicast_destination_v6(net: Ipv6Addr) -> bool {
+/// on: multicast, the link-local scope, loopback and the unspecified block.
+///
+/// A segment numbered from `::` with a short prefix is NOT the unspecified
+/// address — it is a network handing out half the internet, which the
+/// exemption decision has to see to refuse and report.
+fn is_unicast_destination_v6(net: Ipv6Addr, prefix: u8) -> bool {
     let s = net.segments();
     !net.is_multicast()
         && (s[0] & 0xffc0) != 0xfe80
         && net != Ipv6Addr::LOCALHOST
-        && !net.is_unspecified()
+        && !(net.is_unspecified() && prefix >= 8)
 }
 
 /// `false` for the destinations that are routing artefacts rather than
-/// segments a host can live on.
-fn is_unicast_destination(net: Ipv4Addr) -> bool {
-    !net.is_multicast() && !net.is_broadcast() && !net.is_loopback() && !net.is_unspecified()
-}
-
-/// `true` for the RFC1918 ranges — the only ones a local virtual network may
-/// claim. A hypervisor adapter carrying a public range is not a local segment
-/// in any useful sense, and exempting it would be a hole, so it is left out.
-fn is_private_v4(net: Ipv4Addr) -> bool {
-    let o = net.octets();
-    o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168)
+/// segments a host can live on. `0.0.0.0/8` is "this network"; `0.0.0.0/1`
+/// is a segment somebody handed out, kept so it can be refused by name.
+fn is_unicast_destination(net: Ipv4Addr, prefix: u8) -> bool {
+    !(net.is_multicast()
+        || net.is_broadcast()
+        || net.is_loopback()
+        || (net.is_unspecified() && prefix >= 8))
 }
 
 /// Directly-connected private subnets of the host's LOCAL virtual-machine
@@ -281,7 +342,9 @@ fn is_private_v4(net: Ipv4Addr) -> bool {
 /// reaches a provider, so a kill-switch blocking them protects nothing and only
 /// takes the user's virtual machines away. What it must NOT do is exempt a
 /// tunnel that happens to use the same address space — see
-/// [`nrr_platform_api::adapters::is_virtual_machine_adapter`].
+/// [`nrr_platform_api::adapters::is_virtual_machine_adapter`]. A hypervisor
+/// adapter carrying a public range is no local segment either, and the same
+/// decision as for the main link keeps it out.
 pub fn virtual_machine_local_subnets(
     routes: &[RouteEntry],
     adapters: &[nrr_platform_api::adapters::AdapterInfo],
@@ -292,8 +355,7 @@ pub fn virtual_machine_local_subnets(
         .iter()
         .filter(|info| Some(info.index) != exclude_ifindex)
         .filter(|info| nrr_platform_api::adapters::is_virtual_machine_adapter(info))
-        .flat_map(|info| primary_local_subnets(routes, info.index))
-        .filter(|(net, _)| is_private_v4(*net))
+        .flat_map(|info| exemptible_local_subnets(routes, info.index).v4)
         .filter(|s| seen.insert(*s))
         .collect()
 }
@@ -1153,6 +1215,57 @@ mod tests {
                 (Ipv4Addr::new(10, 0, 0, 0), 8)
             ]
         );
+    }
+
+    fn raw_route_v6(d: Ipv6Addr, prefix: u8, ifx: u32) -> RouteEntry {
+        RouteEntry {
+            destination: IpAddr::V6(d),
+            prefix_length: prefix,
+            next_hop: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            interface_index: ifx,
+            metric: 5,
+            is_ours: false,
+            table: nrr_platform_api::RouteTableRef::Main,
+        }
+    }
+
+    /// A hostile access point hands out a `/1`: half the internet would read
+    /// as the LAN and leave both the tunnel and Fail-Closed. Nothing of such
+    /// a segment is exempt, and it is reported; a sane segment keeps only its
+    /// private part. Pure over the route table, so the same on both OSes.
+    #[test]
+    fn a_half_internet_segment_is_refused_and_reported_in_both_families() {
+        let routes = vec![
+            raw_route([0, 0, 0, 0], 1, [0, 0, 0, 0], 12, false),
+            raw_route([128, 0, 0, 0], 1, [0, 0, 0, 0], 12, false),
+            raw_route([192, 0, 0, 0], 8, [0, 0, 0, 0], 12, false),
+            raw_route([203, 0, 113, 0], 24, [0, 0, 0, 0], 12, false),
+            raw_route([0, 0, 0, 0], 0, [192, 168, 1, 1], 12, false),
+            raw_route_v6(Ipv6Addr::UNSPECIFIED, 1, 12),
+            raw_route_v6(Ipv6Addr::new(0xfd00, 0x1234, 0, 0, 0, 0, 0, 0), 64, 12),
+            raw_route_v6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 64, 12),
+        ];
+        let got = exemptible_local_subnets(&routes, 12);
+        assert_eq!(got.v4, vec![(Ipv4Addr::new(192, 168, 0, 0), 16)]);
+        assert_eq!(
+            got.v6,
+            vec![(Ipv6Addr::new(0xfd00, 0x1234, 0, 0, 0, 0, 0, 0), 64)]
+        );
+        assert_eq!(
+            got.public_v6,
+            vec![(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 64)],
+            "a public prefix is a candidate, never an exemption"
+        );
+        assert_eq!(
+            got.too_wide,
+            vec![
+                IpBlock::parse("0.0.0.0/1").expect("block"),
+                IpBlock::parse("128.0.0.0/1").expect("block"),
+                IpBlock::parse("::/1").expect("block"),
+            ]
+        );
+        // The raw reading still names the segment, as the link's description.
+        assert!(primary_local_subnets(&routes, 12).contains(&(Ipv4Addr::UNSPECIFIED, 1)));
     }
 
     /// Builds an adapter whose only interesting properties here are its index

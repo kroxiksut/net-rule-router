@@ -32,9 +32,7 @@ pub(crate) enum RequestResponse {
     Ok(Value),
     ServerError {
         op: IpcOperationName,
-        // Preserve the wire code so the launcher's RPC dispatcher can emit
-        // it to the bridge instead of collapsing every server error under
-        // "ipc-call-failed".
+        // The launcher hands this code to the window, which translates it.
         code: nrr_shared::ipc_transport::IpcErrorCode,
         message: String,
     },

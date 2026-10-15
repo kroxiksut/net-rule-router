@@ -147,6 +147,13 @@ pub struct IpcHandlerDeps {
     /// `with_doh_resolver_store(...)`.
     pub doh_resolver_store:
         Option<Arc<dyn crate::ipc_handlers::doh_resolvers::DohResolverListStore>>,
+    /// The machine-wide home-network suffix list behind
+    /// `dns.local-suffixes.get` / `dns.local-suffixes.set`, with what the
+    /// read-back adds. `None` keeps both ops as `UnimplementedHandler`.
+    pub local_dns_suffixes: Option<(
+        Arc<dyn crate::ipc_handlers::local_dns_suffixes::LocalDnsSuffixStore>,
+        Arc<dyn crate::ipc_handlers::local_dns_suffixes::LocalDnsSuffixContext>,
+    )>,
     /// Opt-in browser-history seeder behind
     /// `diagnostics.seed-from-browser-history`. `None` keeps the op as
     /// `UnimplementedHandler`. Wired via `with_browser_history_seeder(...)`.
@@ -299,6 +306,7 @@ impl IpcHandlerDeps {
             link_provider_writer: None,
             principal_data_purger: None,
             doh_resolver_store: None,
+            local_dns_suffixes: None,
             browser_history_seeder: None,
             cache_repository: None,
             dns_cache_control: None,
@@ -518,6 +526,17 @@ impl IpcHandlerDeps {
         store: Arc<dyn crate::ipc_handlers::doh_resolvers::DohResolverListStore>,
     ) -> Self {
         self.doh_resolver_store = Some(store);
+        self
+    }
+
+    /// Attach the home-network suffix list so `dns.local-suffixes.get` /
+    /// `dns.local-suffixes.set` resolve to real handlers.
+    pub fn with_local_dns_suffixes(
+        mut self,
+        store: Arc<dyn crate::ipc_handlers::local_dns_suffixes::LocalDnsSuffixStore>,
+        context: Arc<dyn crate::ipc_handlers::local_dns_suffixes::LocalDnsSuffixContext>,
+    ) -> Self {
+        self.local_dns_suffixes = Some((store, context));
         self
     }
 

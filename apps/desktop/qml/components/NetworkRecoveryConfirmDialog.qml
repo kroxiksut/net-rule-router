@@ -13,6 +13,8 @@ Dialog {
 
     /// ApplicationWindow injected by the caller (`ownerRoot: window`).
     property var ownerRoot: null
+    /// The service runs and is stopped first; the body says so.
+    property bool stopsService: false
     /// Fired when the user confirms; the caller runs the recovery.
     signal confirmed()
 
@@ -41,11 +43,18 @@ Dialog {
             Layout.fillWidth: true
             wrapMode: Text.Wrap
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
-            text: root.tr("dialog.network-recovery.body",
-                "The packet filters, DNS redirect and routes the service applied "
-                + "will be removed. Connections open right now may drop, and "
-                + "routing stays off until the service applies its rules again. "
-                + "Administrator rights are required.")
+            text: root.stopsService
+                ? root.tr("dialog.network-recovery.body-stop",
+                    "The service will be stopped, and ended if it does not stop in "
+                    + "half a minute; then the packet filters, DNS redirect and routes "
+                    + "it applied are removed. Connections open right now may drop, "
+                    + "and routing stays off until the service is started again. "
+                    + "Administrator rights are required.")
+                : root.tr("dialog.network-recovery.body",
+                    "The packet filters, DNS redirect and routes the service applied "
+                    + "will be removed. Connections open right now may drop, and "
+                    + "routing stays off until the service applies its rules again. "
+                    + "Administrator rights are required.")
         }
         RowLayout {
             Layout.fillWidth: true
@@ -59,7 +68,10 @@ Dialog {
             }
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                text: root.tr("dialog.network-recovery.confirm", "Restore network")
+                text: root.stopsService
+                    ? root.tr("settings.service.recovery.action-stop",
+                        "Stop service and restore network")
+                    : root.tr("dialog.network-recovery.confirm", "Restore network")
                 highlighted: true
                 onClicked: { root.close(); root.confirmed() }
             }

@@ -34,7 +34,7 @@ impl FieldDefault {
 
 /// Every route-policy field this build writes, with its default.
 /// `binding-source` is absent on purpose: the writer always stamps it.
-pub const FIELD_DEFAULTS: [(&str, FieldDefault); 26] = [
+pub const FIELD_DEFAULTS: [(&str, FieldDefault); 28] = [
     ("mode", FieldDefault::Text("prefer-primary")),
     (
         "block-secondary-when-unavailable",
@@ -54,6 +54,7 @@ pub const FIELD_DEFAULTS: [(&str, FieldDefault); 26] = [
         "doh-lockdown-scope",
         FieldDefault::Text("leak-protection-only"),
     ),
+    ("doh-lockdown-auto", FieldDefault::Bool(true)),
     ("browser-history-auto-seed", FieldDefault::Bool(false)),
     ("kill-switch-strict-shared-ips", FieldDefault::Bool(false)),
     ("auto-rules-mode", FieldDefault::Text("suggest")),
@@ -67,11 +68,13 @@ pub const FIELD_DEFAULTS: [(&str, FieldDefault); 26] = [
     ("short-name-completion", FieldDefault::Bool(false)),
     ("short-name-suffix", FieldDefault::Text("")),
     ("app-rules-take-all-addresses", FieldDefault::Bool(false)),
+    ("forwarded-outage", FieldDefault::Text("")),
 ];
 
 /// Keys the snapshot carries but the request has no field for: each is
 /// written through its own operation.
-pub const SNAPSHOT_ONLY_KEYS: [&str; 1] = ["secondary-link-provider-apps"];
+pub const SNAPSHOT_ONLY_KEYS: [&str; 2] =
+    ["secondary-link-provider-apps", "doh-lockdown-effective"];
 
 /// The key of the leak-protection protocol bitmask.
 pub const KILL_SWITCH_PROTOCOLS_KEY: &str = "kill-switch-protocols";

@@ -43,6 +43,7 @@ use thiserror::Error;
 
 use crate::launcher::sibling_service_binary;
 use nrr_ipc_client::IpcClient;
+use nrr_shared::client_error_codes as codes;
 use nrr_shared::rules_json::{to_canonical_string, CanonicalRulesJsonV1, RulesJsonCodecError};
 
 /// GUI/launcher protocol version. Mirrors
@@ -92,10 +93,10 @@ impl LocalHandlerError {
     /// goes through the localised status line, not the code itself.
     pub fn wire_code(&self) -> &'static str {
         match self {
-            LocalHandlerError::UnknownOperation(_) => "unknown-operation",
-            LocalHandlerError::MissingField(_) => "missing-field",
-            LocalHandlerError::MalformedRulesJson(_) => "malformed-input",
-            LocalHandlerError::CanonicalisationFailed(_) => "canonicalisation-failed",
+            LocalHandlerError::UnknownOperation(_) => codes::UNKNOWN_OPERATION,
+            LocalHandlerError::MissingField(_) => codes::MISSING_FIELD,
+            LocalHandlerError::MalformedRulesJson(_) => codes::MALFORMED_INPUT,
+            LocalHandlerError::CanonicalisationFailed(_) => codes::CANONICALISATION_FAILED,
             LocalHandlerError::UserSettings { code, .. } => code,
         }
     }

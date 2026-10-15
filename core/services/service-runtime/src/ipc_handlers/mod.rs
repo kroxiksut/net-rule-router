@@ -50,6 +50,7 @@ pub mod contract_negotiate;
 pub mod diagnostics_handlers;
 pub mod doh_resolvers;
 pub mod interfaces_refresh;
+pub mod local_dns_suffixes;
 pub mod logs_list;
 pub mod merge_preview;
 pub mod migration_mark_complete;
@@ -103,6 +104,10 @@ pub use event_bus::{
     EventBus, EventEntry, SubscribeOutcome, SubscriberState, EVENT_BUFFER_CAPACITY,
 };
 pub use interfaces_refresh::InterfacesRefreshHandler;
+pub use local_dns_suffixes::{
+    LocalDnsSuffixContext, LocalDnsSuffixStore, LocalDnsSuffixesGetHandler,
+    LocalDnsSuffixesSetHandler,
+};
 pub use logs_list::LogsListHandler;
 pub use merge_preview::RulesMergePreviewHandler;
 pub use migration_mark_complete::MigrationMarkCompleteHandler;

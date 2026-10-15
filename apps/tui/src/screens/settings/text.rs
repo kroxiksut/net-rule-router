@@ -163,6 +163,10 @@ pub const NEED_TARGET: Key = key(
     "tui.settings.notifications.need-target",
     "Type the host or application name first.",
 );
+pub const NEED_SUFFIX: Key = key(
+    "tui.settings.routing.need-suffix",
+    "Type the network suffix first.",
+);
 pub const DELETE: Key = key("action.delete", "Delete");
 pub const CLEAR: Key = key("action.clear", "Clear");
 pub const ADD: Key = key("action.add", "Add");
@@ -326,15 +330,114 @@ pub const DOH_LEAK_ONLY: Key = key(
     "Only while leak protection is active (recommended)",
 );
 pub const DOH_ALWAYS: Key = key("settings.routing.doh-lockdown.scope-always", "Always");
+pub const DOH_AUTO: Key = key(
+    "settings.routing.doh-lockdown.auto-label",
+    "Decide automatically (recommended)",
+);
+pub const DOH_AUTO_NOTE: Key = key(
+    "settings.routing.doh-lockdown.auto-note",
+    "Blocks encrypted DNS in browsers while you have rules for the additional route, so the sites you route are seen and routed. Turn this off to set the blocking by hand.",
+);
+pub const DOH_AUTO_ON: Key = key(
+    "settings.routing.doh-lockdown.auto-on",
+    "On: you have rules for the additional route.",
+);
+pub const DOH_AUTO_OFF: Key = key(
+    "settings.routing.doh-lockdown.auto-off",
+    "Off: no rules for the additional route yet.",
+);
+pub const SUFFIX_TITLE: Key = key(
+    "settings.routing.local-suffixes.title",
+    "Home and local network names",
+);
+pub const SUFFIX_DESCRIPTION: Key = key(
+    "settings.routing.local-suffixes.description",
+    "Names under these suffixes belong to the network you are on (a printer, a router, a NAS) and are resolved by that network, never sent down a route. One list for every user of this computer; changing it needs an administrator.",
+);
+pub const SUFFIX_EMPTY: Key = key(
+    "settings.routing.local-suffixes.empty",
+    "The list is empty.",
+);
+pub const SUFFIX_COVERS: Key = key(
+    "settings.routing.local-suffixes.covers-rules",
+    "covers your rules for {hosts}; those names keep following their rules",
+);
+pub const SUFFIX_OFFERED: Key = key(
+    "settings.routing.local-suffixes.offered",
+    "Add {suffix}, offered by {link}",
+);
+pub const SUFFIX_FIELD: Key = key("settings.routing.local-suffixes.add-field", "New suffix");
 pub const HOSTS_TITLE: Key = key("settings.routing.hosts-group.title", "Hosts file");
 pub const HOSTS_BYPASS: Key = key(
     "settings.routing.hosts-bypass.label",
     "Resolve routed domains bypassing the hosts file",
 );
 pub const LOCAL_TITLE: Key = key("settings.routing.local-networks.title", "Local networks");
+pub const FWD_TITLE: Key = key(
+    "settings.routing.forwarded-traffic.title",
+    "WSL, containers and virtual machines",
+);
+pub const FWD_CHOICE: Key = key(
+    "settings.routing.forwarded-traffic.choice",
+    "When the additional route is down",
+);
+pub const FWD_NOTE: Key = key(
+    "settings.routing.forwarded-traffic.description",
+    "Programs in WSL, containers and virtual machines reach the internet through this computer, yet leak protection does not see them on its own. Choose what they get while the additional route is down.",
+);
+pub const FWD_AS_COMPUTER: Key = key(
+    "settings.routing.forwarded-traffic.as-computer.label",
+    "Same as this computer (recommended)",
+);
+pub const FWD_UNPROTECTED: Key = key(
+    "settings.routing.forwarded-traffic.unprotected.label",
+    "Do not protect",
+);
+pub const FWD_UNANSWERED: Key = key(
+    "settings.routing.forwarded-traffic.unanswered",
+    "Not chosen yet: they are protected like this computer.",
+);
 pub const LOCAL_AUTO: Key = key(
     "settings.routing.local-networks.auto-accept",
     "Keep newly found local networks reachable without asking",
+);
+pub const LOCAL_EMPTY: Key = key(
+    "settings.routing.local-networks.empty",
+    "No local networks found yet. Add one below if you reach a virtual machine at an address this list does not show.",
+);
+pub const LOCAL_UNDECIDED: Key = key("settings.routing.local-networks.undecided", "no answer yet");
+pub const LOCAL_TOO_WIDE: Key = key(
+    "settings.routing.local-networks.reason.too-wide",
+    "too wide to be a local network, stays blocked",
+);
+pub const LOCAL_NAMES_RULE: Key = key(
+    "settings.routing.local-networks.reason.contains-rule-address",
+    "holds an address your rules name, stays blocked",
+);
+pub const LOCAL_KIND_MANUAL: Key = key(
+    "settings.routing.local-networks.kind-manual",
+    "added by you",
+);
+pub const LOCAL_KIND_MAIN: Key = key(
+    "settings.routing.local-networks.kind-main-link",
+    "main connection: {name}",
+);
+pub const LOCAL_KIND_VM: Key = key(
+    "settings.routing.local-networks.kind-virtual-machine",
+    "virtual machine: {name}",
+);
+pub const LOCAL_FIELD: Key = key("settings.routing.local-networks.add", "Add a network");
+pub const LOCAL_NOT_PRIVATE: Key = key(
+    "settings.routing.local-networks.reject-not-private",
+    "{cidr} is not a local network — only private ranges can be kept reachable.",
+);
+pub const LOCAL_MALFORMED: Key = key(
+    "settings.routing.local-networks.reject-malformed",
+    "{cidr} is not a network address. Write it as 10.0.2.0/24.",
+);
+pub const NEED_NETWORK: Key = key(
+    "tui.settings.routing.need-network",
+    "Type the network first, for example 10.0.2.0/24.",
 );
 pub const SHORT_TITLE: Key = key("settings.routing.short-names.title", "Short names");
 pub const SHORT_NOTE: Key = key("settings.routing.short-names.description", "");
@@ -777,6 +880,7 @@ pub fn all() -> Vec<Key> {
         DAYS,
         MUTE_ADDED,
         NEED_TARGET,
+        NEED_SUFFIX,
         DELETE,
         CLEAR,
         ADD,
@@ -832,10 +936,37 @@ pub fn all() -> Vec<Key> {
         DOH_SCOPE,
         DOH_LEAK_ONLY,
         DOH_ALWAYS,
+        DOH_AUTO,
+        DOH_AUTO_NOTE,
+        DOH_AUTO_ON,
+        DOH_AUTO_OFF,
+        SUFFIX_TITLE,
+        SUFFIX_DESCRIPTION,
+        SUFFIX_EMPTY,
+        SUFFIX_COVERS,
+        SUFFIX_OFFERED,
+        SUFFIX_FIELD,
         HOSTS_TITLE,
         HOSTS_BYPASS,
         LOCAL_TITLE,
+        FWD_TITLE,
+        FWD_CHOICE,
+        FWD_NOTE,
+        FWD_AS_COMPUTER,
+        FWD_UNPROTECTED,
+        FWD_UNANSWERED,
         LOCAL_AUTO,
+        LOCAL_EMPTY,
+        LOCAL_UNDECIDED,
+        LOCAL_TOO_WIDE,
+        LOCAL_NAMES_RULE,
+        LOCAL_KIND_MANUAL,
+        LOCAL_KIND_MAIN,
+        LOCAL_KIND_VM,
+        LOCAL_FIELD,
+        LOCAL_NOT_PRIVATE,
+        LOCAL_MALFORMED,
+        NEED_NETWORK,
         SHORT_TITLE,
         SHORT_NOTE,
         SHORT_ENABLE,

@@ -349,6 +349,21 @@ pub trait UpstreamResolver: Send + Sync {
     ) -> Result<ResolvedAddresses, ResolveError> {
         self.resolve_within(hostname, family, Duration::MAX)
     }
+
+    /// [`Self::resolve_within`] that may leave ONLY through the additional
+    /// link, or not at all. Asked for a rule host while the leak guard blocks:
+    /// the name itself must not reach the main link's resolver. The default
+    /// has no tunnel to use and refuses.
+    fn resolve_tunnel_only_within(
+        &self,
+        _hostname: &str,
+        _family: AddressFamily,
+        _budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        Err(ResolveError::Unavailable(
+            "no tunnel egress for a blocked rule host".into(),
+        ))
+    }
 }
 
 /// Record a freshly-resolved `hostname → IPs` fact into the FQDN cache (union
@@ -564,6 +579,13 @@ pub trait SyncReconciler: Send + Sync {
     /// run — their routes — so a first connect leaves through the link its rule
     /// names. Returns how many of them it covered. Default: none.
     fn install_first_contact(&self, _addresses: &[Ipv4Addr]) -> usize {
+        0
+    }
+
+    /// [`Self::install_first_contact`] for an AAAA answer: a rule host's v6
+    /// front is first contact exactly like its v4 one, and without its `/128`
+    /// the first connect leaves through the main link. Default: none.
+    fn install_first_contact_v6(&self, _addresses: &[std::net::Ipv6Addr]) -> usize {
         0
     }
 }

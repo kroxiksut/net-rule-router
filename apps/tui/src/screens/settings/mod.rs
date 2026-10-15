@@ -22,9 +22,10 @@ use nrr_client_logic::route_policy;
 use nrr_ipc_client::IpcClientError;
 use nrr_platform_api::service_control::ServiceStatusReport;
 use nrr_shared::ipc_payloads::{
-    BlockNoticeMuteDto, BlockNoticeMuteScopeDto, LogRetentionConfigDto,
-    LogRetentionConfigSetRequest, RetentionSettingsDto, RetentionSettingsSetRequest,
-    StorageUsageDto, TrafficStatsGetResponse, TrafficStatsSettingsDto,
+    BlockNoticeMuteDto, BlockNoticeMuteScopeDto, LocalDnsSuffixesGetResponse,
+    LocalNetworksGetResponse, LogRetentionConfigDto, LogRetentionConfigSetRequest,
+    RetentionSettingsDto, RetentionSettingsSetRequest, StorageUsageDto, TrafficStatsGetResponse,
+    TrafficStatsSettingsDto,
 };
 use nrr_shared::ipc_transport::IpcErrorCode;
 use nrr_shared::platform_profile::{PlatformProfile, PlatformSupports};
@@ -186,6 +187,10 @@ pub struct Data {
     /// The raw `route-policy` of the last snapshot, the base of every write.
     pub policy: Loadable<Map<String, Value>>,
     pub stability: Loadable<Map<String, Value>>,
+    /// The machine-wide home-network suffix list, with the network's offers.
+    pub local_suffixes: Loadable<LocalDnsSuffixesGetResponse>,
+    /// The local networks leak protection may leave reachable.
+    pub local_networks: Loadable<LocalNetworksGetResponse>,
     pub mutes: Loadable<Vec<BlockNoticeMuteDto>>,
     pub failure_policy: Loadable<String>,
     pub retention: Loadable<RetentionSettingsDto>,
@@ -291,6 +296,9 @@ pub struct SettingsState {
     pub message: Option<Message>,
     pub data: Data,
     pub mute_form: MuteForm,
+    /// The suffix typed and not yet added.
+    pub local_suffix_new: String,
+    pub local_network_new: String,
     pub export_path: String,
     pub prefs: TuiPrefs,
     /// Where the terminal's settings are saved; `None` cannot save.
@@ -309,6 +317,8 @@ impl Default for SettingsState {
             message: None,
             data: Data::default(),
             mute_form: MuteForm::default(),
+            local_suffix_new: String::new(),
+            local_network_new: String::new(),
             export_path: String::new(),
             prefs: TuiPrefs::default(),
             prefs_path: None,
@@ -614,6 +624,17 @@ pub fn open_category(app: &mut AppState, category: Category) {
     }
 }
 
+/// Another surface changed what `category` shows: re-read it while it is on
+/// screen, unless the user is in the middle of a change of their own.
+pub fn reload_if_open(app: &mut AppState, category: Category) {
+    if app.screen == crate::screens::ScreenId::Settings
+        && app.settings.open == Some(category)
+        && app.settings.mode == Mode::Browse
+    {
+        load(app);
+    }
+}
+
 /// Enter on the cursor row: open the section, or start changing the row.
 fn enter(app: &mut AppState) {
     if app.settings.open.is_none() {
@@ -867,6 +888,12 @@ fn load(app: &mut AppState) {
         Category::Routing => {
             s.data.policy.start();
             queue.push(jobs::load_policy());
+            s.data.local_suffixes.start();
+            queue.push(jobs::load_local_suffixes());
+            if s.supports.local_network_exceptions {
+                s.data.local_networks.start();
+                queue.push(jobs::load_local_networks());
+            }
             if stability_wanted {
                 s.data.stability.start();
                 queue.push(jobs::load_stability());
@@ -919,6 +946,8 @@ fn needs_service(id: ItemId) -> bool {
             | ItemId::MuteForever
             | ItemId::MuteAmount
             | ItemId::MuteUnit
+            | ItemId::LocalSuffixNew
+            | ItemId::LocalNetworkNew
             | ItemId::ExportPath
             | ItemId::Pref(_)
             | ItemId::ServiceStart
@@ -957,6 +986,48 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
             )
         }),
         (ItemId::MuteAdd, Input::Run) => add_mute(app),
+        (ItemId::LocalSuffixNew, Input::Text(suffix)) => {
+            app.settings.local_suffix_new = suffix;
+            None
+        }
+        (ItemId::LocalSuffixAdd, Input::Run) => {
+            let typed = app.settings.local_suffix_new.trim().to_owned();
+            if typed.is_empty() {
+                app.settings.refuse(Words::Key(text::NEED_SUFFIX));
+                return;
+            }
+            local_suffix_change(app, |list| list.push(typed))
+        }
+        (ItemId::LocalSuffixAccept(index), Input::Run) => {
+            let offered = app
+                .settings
+                .data
+                .local_suffixes
+                .ready()
+                .and_then(|l| l.offered.get(index).map(|o| o.suffix.clone()));
+            offered.and_then(|suffix| local_suffix_change(app, |list| list.push(suffix)))
+        }
+        (ItemId::LocalNetwork(index), Input::Toggle) => local_network_cidr(app, index)
+            .map(|cidr| jobs::write_local_networks(vec![(cidr, toggled)], Vec::new())),
+        (ItemId::LocalNetworkForget(index), Input::Run) => local_network_cidr(app, index)
+            .map(|cidr| jobs::write_local_networks(Vec::new(), vec![cidr])),
+        (ItemId::LocalNetworkNew, Input::Text(cidr)) => {
+            app.settings.local_network_new = cidr;
+            None
+        }
+        (ItemId::LocalNetworkAdd, Input::Run) => {
+            let typed = app.settings.local_network_new.trim().to_owned();
+            if typed.is_empty() {
+                app.settings.refuse(Words::Key(text::NEED_NETWORK));
+                return;
+            }
+            Some(jobs::write_local_networks(vec![(typed, true)], Vec::new()))
+        }
+        (ItemId::LocalSuffixRemove(index), Input::Run) => local_suffix_change(app, |list| {
+            if index < list.len() {
+                list.remove(index);
+            }
+        }),
         (ItemId::Policy(key), input) => {
             let value = match input {
                 Input::Toggle => Value::Bool(toggled),
@@ -1185,6 +1256,35 @@ fn hide_kind(app: &mut AppState, kind: &'static str, choice: &str) -> Option<cra
         notice_mute_request(kind, choice, now)?
     };
     Some(jobs::set_mute(request, false))
+}
+
+/// The network a listed row names, as the service spelled it.
+fn local_network_cidr(app: &AppState, index: usize) -> Option<String> {
+    app.settings
+        .data
+        .local_networks
+        .ready()?
+        .networks
+        .get(index)
+        .map(|network| network.cidr.clone())
+}
+
+/// The whole list is sent, as stored now plus `edit`: the service replaces it.
+fn local_suffix_change(
+    app: &mut AppState,
+    edit: impl FnOnce(&mut Vec<String>),
+) -> Option<crate::backend::Job> {
+    let mut list: Vec<String> = app
+        .settings
+        .data
+        .local_suffixes
+        .ready()?
+        .suffixes
+        .iter()
+        .map(|entry| entry.suffix.clone())
+        .collect();
+    edit(&mut list);
+    Some(jobs::write_local_suffixes(list))
 }
 
 fn add_mute(app: &mut AppState) -> Option<crate::backend::Job> {

@@ -134,6 +134,52 @@ pub fn wider_than_fail_closed(block: IpBlock) -> bool {
     block.prefix_len() < fail_closed_widest_prefix(block.network().is_ipv4())
 }
 
+/// What a blanket block may let through to a segment the machine is attached
+/// to, read off the segment the OS reports.
+///
+/// The OS reports whatever the network handed out, and a network is somebody
+/// else's: an access point that assigns a `/1` would otherwise make half the
+/// internet "local" and lift Fail-Closed off it. So only the private part of a
+/// segment is ever exempt, and a segment wider than any rule may name is no
+/// segment at all — nothing of it is exempt, and the user is told.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalSegmentExemption {
+    /// The part of the segment inside private, shared or link-local space, as
+    /// one or more blocks (a `/8` handed out on `192.0.0.0` holds only
+    /// `192.168.0.0/16` of it).
+    Exempt(Vec<IpBlock>),
+    /// Wider than a rule may name: exempt nothing, tell the user.
+    TooWide,
+    /// Sane width but no private address inside: a public segment, exempt
+    /// nothing.
+    NotPrivate,
+}
+
+/// The decision for one reported segment; both OS backends go through here.
+pub fn local_segment_exemption(segment: IpBlock) -> LocalSegmentExemption {
+    if wider_than_rule_allows(segment) {
+        return LocalSegmentExemption::TooWide;
+    }
+    let exempt: Vec<IpBlock> = networks(PRIVATE)
+        .chain(networks(LINK_LOCAL))
+        .filter(|net| net.is_ipv4() == segment.is_ipv4())
+        .filter_map(|net| {
+            if net.covers(segment) {
+                Some(segment)
+            } else if segment.covers(net) {
+                Some(net)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if exempt.is_empty() {
+        LocalSegmentExemption::NotPrivate
+    } else {
+        LocalSegmentExemption::Exempt(exempt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +241,57 @@ mod tests {
         assert!(!is_private(block("8.0.0.0/8")));
         assert!(wider_than_fail_closed(block("10.0.0.0/15")));
         assert!(!wider_than_fail_closed(block("10.0.0.0/16")));
+    }
+
+    /// A `/1` handed out by a hostile access point is no local segment: nothing
+    /// of it is exempt. A sane segment keeps exactly its private part.
+    #[test]
+    fn only_the_private_part_of_a_sane_segment_is_exempt() {
+        use LocalSegmentExemption::{Exempt, NotPrivate, TooWide};
+        assert_eq!(local_segment_exemption(block("0.0.0.0/1")), TooWide);
+        assert_eq!(local_segment_exemption(block("128.0.0.0/1")), TooWide);
+        assert_eq!(local_segment_exemption(block("10.0.0.0/7")), TooWide);
+        assert_eq!(local_segment_exemption(block("::/1")), TooWide);
+        assert_eq!(local_segment_exemption(block("fc00::/7")), TooWide);
+
+        assert_eq!(
+            local_segment_exemption(block("192.168.1.0/24")),
+            Exempt(vec![block("192.168.1.0/24")])
+        );
+        assert_eq!(
+            local_segment_exemption(block("10.0.0.0/8")),
+            Exempt(vec![block("10.0.0.0/8")])
+        );
+        assert_eq!(
+            local_segment_exemption(block("100.64.0.0/10")),
+            Exempt(vec![block("100.64.0.0/10")])
+        );
+        assert_eq!(
+            local_segment_exemption(block("169.254.0.0/16")),
+            Exempt(vec![block("169.254.0.0/16")])
+        );
+        // A sane width that still reaches past private space keeps only the
+        // private part of itself.
+        assert_eq!(
+            local_segment_exemption(block("192.0.0.0/8")),
+            Exempt(vec![block("192.168.0.0/16")])
+        );
+        assert_eq!(
+            local_segment_exemption(block("172.0.0.0/8")),
+            Exempt(vec![block("172.16.0.0/12")])
+        );
+        assert_eq!(local_segment_exemption(block("203.0.113.0/24")), NotPrivate);
+        assert_eq!(local_segment_exemption(block("8.0.0.0/8")), NotPrivate);
+
+        assert_eq!(
+            local_segment_exemption(block("fd00:1234::/64")),
+            Exempt(vec![block("fd00:1234::/64")])
+        );
+        assert_eq!(
+            local_segment_exemption(block("fc00::/16")),
+            Exempt(vec![block("fc00::/16")])
+        );
+        assert_eq!(local_segment_exemption(block("2001:db8::/64")), NotPrivate);
     }
 
     /// Each family has its own limits: IPv4 keeps `/8` and `/16`, IPv6 refuses

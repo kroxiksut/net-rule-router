@@ -24,7 +24,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use nrr_ipc_client::wire::{read_frame, write_frame};
 use nrr_ipc_client::{ipc_error_to_wire, NamedPipeIpcClient};
+use nrr_shared::client_error_codes::{
+    SERVICE_CONTROL_FAILED, SERVICE_RELOCATION_FAILED, UNKNOWN_OPERATION,
+};
 use nrr_shared::ipc::IpcOperationName;
+use nrr_shared::ipc_transport::IpcErrorCode;
 use nrr_shared::product_identity::BinaryRole;
 
 use nrr_platform_windows::trusted_location::{first_reparse_point, owner_is_trusted};
@@ -77,12 +81,24 @@ const ALLOWED_SERVICE_ACTIONS: &[&str] = &[
     // teardown — the same one the console drives — so there is exactly one
     // implementation of "undo what we applied".
     "cleanup",
+    // The same recovery while the service runs: a clean stop, the process ended
+    // if it hangs, then the sweep.
+    "stop-and-cleanup",
 ];
 
 /// Verbs whose first act is to stop a running service. This process is the one
 /// the UAC prompt started, so its first such run is the one that must not begin
 /// while the desktop is still switching back from the prompt.
-const ACTIONS_THAT_STOP_THE_SERVICE: &[&str] = &["stop", "restart", "reinstall", "uninstall"];
+const ACTIONS_THAT_STOP_THE_SERVICE: &[&str] = &[
+    "stop",
+    "restart",
+    "reinstall",
+    "uninstall",
+    "stop-and-cleanup",
+];
+
+const MALFORMED_REQUEST: &str = IpcErrorCode::MalformedRequest.client_slug();
+const UNAUTHORIZED: &str = IpcErrorCode::Unauthorized.client_slug();
 
 /// The settle belongs to the prompt, not to every command after it.
 static SETTLE_SPENT: AtomicBool = AtomicBool::new(false);
@@ -352,9 +368,9 @@ fn run_with_budget(
 /// echoing the verb's English text.
 fn failure_code(exit_code: i32) -> &'static str {
     if exit_code == i32::from(nrr_platform_api::service_control::RELOCATION_FAILED_EXIT_CODE) {
-        "service-relocation-failed"
+        SERVICE_RELOCATION_FAILED
     } else {
-        "service-control-failed"
+        SERVICE_CONTROL_FAILED
     }
 }
 
@@ -372,7 +388,7 @@ fn last_stderr_line(stderr: &str) -> Option<&str> {
 /// elevated token with no new UAC prompt.
 fn run_service_control(hint: Option<&str>, action: &str) -> BrokerResponse {
     if !ALLOWED_SERVICE_ACTIONS.contains(&action) {
-        return BrokerResponse::err("malformed-request", format!("unknown action: {action}"));
+        return BrokerResponse::err(MALFORMED_REQUEST, format!("unknown action: {action}"));
     }
     let service_exe =
         match resolve_service_binary(hint.map(Path::new), current_exe_dir().as_deref()) {
@@ -382,7 +398,7 @@ fn run_service_control(hint: Option<&str>, action: &str) -> BrokerResponse {
                     "service-control: refused {}: {reason}",
                     hint.unwrap_or("<no path>")
                 ));
-                return BrokerResponse::err("malformed-request", reason);
+                return BrokerResponse::err(MALFORMED_REQUEST, reason);
             }
         };
     broker_log(&format!(
@@ -425,7 +441,7 @@ fn run_service_control(hint: Option<&str>, action: &str) -> BrokerResponse {
         }
         Err(e) => {
             broker_log(&format!("service-control: {action} spawn error: {e}"));
-            BrokerResponse::err("service-control-failed", format!("spawn failed: {e}"))
+            BrokerResponse::err(SERVICE_CONTROL_FAILED, format!("spawn failed: {e}"))
         }
     }
 }
@@ -620,7 +636,7 @@ fn exchange(
     } else {
         eprintln!("[nrr-broker] reject: nonce mismatch");
         (
-            BrokerResponse::err("unauthorized", "bad session token"),
+            BrokerResponse::err(UNAUTHORIZED, "bad session token"),
             Served::Continue,
         )
     };
@@ -678,7 +694,7 @@ fn dispatch(
                 .and_then(|v| v.as_str());
             let resp = match action {
                 Some(a) => run_service_control(exe, a),
-                None => BrokerResponse::err("malformed-request", "service-control needs action"),
+                None => BrokerResponse::err(MALFORMED_REQUEST, "service-control needs action"),
             };
             (resp, Served::Continue)
         }
@@ -688,7 +704,7 @@ fn dispatch(
                 None => {
                     return (
                         BrokerResponse::err(
-                            "unknown-operation",
+                            UNKNOWN_OPERATION,
                             format!("unknown operation: {slug}"),
                         ),
                         Served::Continue,

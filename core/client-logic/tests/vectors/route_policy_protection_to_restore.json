@@ -1,0 +1,115 @@
+{
+  "description": "pure.js routePolicyProtectionToRestore: protection the record holds on and the service lost, switched back on without asking",
+  "cases": [
+    {
+      "name": "nothing recorded",
+      "input": {
+        "intent": {},
+        "service": {}
+      },
+      "expected": []
+    },
+    {
+      "name": "on in the record, off at the service",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": true
+        },
+        "service": {
+          "kill-switch-enabled": false
+        }
+      },
+      "expected": [
+        "kill-switch-enabled"
+      ]
+    },
+    {
+      "name": "off by the service's default counts as off",
+      "input": {
+        "intent": {
+          "doh-lockdown-enabled": true
+        },
+        "service": {}
+      },
+      "expected": [
+        "doh-lockdown-enabled"
+      ]
+    },
+    {
+      "name": "already on",
+      "input": {
+        "intent": {
+          "kill-switch-block-all": true
+        },
+        "service": {
+          "kill-switch-block-all": true
+        }
+      },
+      "expected": []
+    },
+    {
+      "name": "never switched off this way",
+      "input": {
+        "intent": {
+          "kill-switch-fail-closed": false
+        },
+        "service": {
+          "kill-switch-fail-closed": true
+        }
+      },
+      "expected": []
+    },
+    {
+      "name": "a damaged value is not on",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": "true",
+          "kill-switch-block-all": 1
+        },
+        "service": {}
+      },
+      "expected": []
+    },
+    {
+      "name": "a non-protective key is not restored here",
+      "input": {
+        "intent": {
+          "resolve-hosts-bypass": false,
+          "kill-switch-strict-shared-ips": true
+        },
+        "service": {}
+      },
+      "expected": [
+        "kill-switch-strict-shared-ips"
+      ]
+    },
+    {
+      "name": "several, sorted",
+      "input": {
+        "intent": {
+          "kill-switch-strict-shared-ips": true,
+          "kill-switch-block-all": true,
+          "doh-lockdown-enabled": true
+        },
+        "service": {
+          "doh-lockdown-enabled": false
+        }
+      },
+      "expected": [
+        "doh-lockdown-enabled",
+        "kill-switch-block-all",
+        "kill-switch-strict-shared-ips"
+      ]
+    },
+    {
+      "name": "fail-closed defaults on, so a record of on is nothing to do",
+      "input": {
+        "intent": {
+          "kill-switch-fail-closed": true
+        },
+        "service": {}
+      },
+      "expected": []
+    }
+  ]
+}

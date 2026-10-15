@@ -482,6 +482,7 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
         // attach a fake provider/writer via `with_service_stability`.
         service_stability_provider: None,
         service_stability_writer: None,
+        local_dns_suffixes: None,
         // Archives config defaults to `None` so the
         // export handler is registered as the unimplemented-operation stub.
         archives_dir: None,
@@ -597,6 +598,8 @@ impl RoutePolicyWriter for FakeRoutePolicyWriter {
             secondary_link_provider_apps: Vec::new(),
             doh_lockdown_enabled: request.doh_lockdown_enabled,
             doh_lockdown_scope: request.doh_lockdown_scope.clone(),
+            doh_lockdown_auto: request.doh_lockdown_auto,
+            doh_lockdown_effective: false,
             browser_history_auto_seed: request.browser_history_auto_seed,
             kill_switch_strict_shared_ips: request.kill_switch_strict_shared_ips,
             auto_rules_mode: request.auto_rules_mode.clone(),
@@ -610,6 +613,7 @@ impl RoutePolicyWriter for FakeRoutePolicyWriter {
             short_name_completion: false,
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
+            forwarded_outage: String::new(),
             binding_source: request.binding_source,
         };
         *self.stored.lock().unwrap() = Some(dto.clone());

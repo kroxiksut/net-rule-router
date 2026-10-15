@@ -292,18 +292,34 @@ fn write_cache(cache: &UpdateCheckCache) {
     }
 }
 
+/// The most a release answer may be. A real one is a few kilobytes; the
+/// server (or whoever answers for it) does not get to pick our allocation.
+const MAX_RELEASE_BODY_BYTES: u64 = 256 * 1024;
+
 /// GET the latest-release `tag_name` + `html_url`. Best-effort: any HTTP or
-/// parse failure returns `None`.
+/// parse failure returns `None`. No redirects are followed: the only answer
+/// trusted is the one the named host gives itself.
 fn fetch_latest_release() -> Option<(String, String)> {
+    use std::io::Read;
     let api_url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/latest");
-    let response = ureq::get(&api_url)
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+    let response = agent
+        .get(&api_url)
         // GitHub requires a UA; name the product honestly.
         .set("User-Agent", "NetRuleRouter-update-check")
         .set("Accept", "application/vnd.github+json")
-        .timeout(std::time::Duration::from_secs(5))
         .call()
         .ok()?;
-    let body: serde_json::Value = response.into_json().ok()?;
+    let mut text = String::new();
+    response
+        .into_reader()
+        .take(MAX_RELEASE_BODY_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
     let tag = body.get("tag_name")?.as_str()?.trim().to_string();
     if tag.is_empty() {
         return None;

@@ -245,12 +245,15 @@ fn after(secs: u64) -> SystemTime {
     later() + Duration::from_secs(secs)
 }
 
+/// The handles of the rules enforcement moved for `sid`, sorted.
 fn moved_ids(sid: &str) -> Vec<String> {
-    crate::verify_overlay::moved_for(sid)
+    let mut ids: Vec<String> = crate::verify_overlay::moved_for(sid)
         .1
         .iter()
-        .map(|id| id.0.clone())
-        .collect()
+        .map(ToString::to_string)
+        .collect();
+    ids.sort();
+    ids
 }
 
 // ── Verdicts ─────────────────────────────────────────────────────────────────
@@ -284,7 +287,7 @@ fn a_main_route_rule_that_does_not_open_there_gets_a_verdict_not_a_rewrite() {
     let verdicts = s.engine.verify_verdicts(sid);
     assert_eq!(verdicts.len(), 1);
     let v = &verdicts[0];
-    assert_eq!(v.rule_id, "r-verify-proton.example");
+    assert_eq!(v.rule_id, "primary:*.proton.example");
     assert_eq!(v.value, "*.proton.example");
     assert_eq!(v.kind, "domain");
     assert_eq!(
@@ -297,7 +300,7 @@ fn a_main_route_rule_that_does_not_open_there_gets_a_verdict_not_a_rewrite() {
     let (role, rule) = find(&s.rules, "r-verify-proton.example").expect("rule kept");
     assert_eq!(role, RouteRole::Primary, "nothing is written silently");
     assert_eq!(rule.action, RuleAction::Verify);
-    assert_eq!(moved_ids(sid), ["r-verify-proton.example"]);
+    assert_eq!(moved_ids(sid), ["primary:*.proton.example"]);
     assert_eq!(s.reapplied(), 1, "the move takes effect now");
     assert_eq!(s.pushed_counts(), [1]);
 }
@@ -364,6 +367,61 @@ fn an_additional_route_rule_is_checked_there_and_offered_the_main_one() {
     );
 }
 
+/// A file import numbers each set from zero, so the primary's `?site-a` and
+/// the secondary's `?site-b` share `r-0000`. Each is checked over its own
+/// link, and a verdict on one moves nothing of the other.
+#[test]
+fn rules_of_the_same_number_in_both_sets_are_two_rules() {
+    let sid = "S-verify-same-number";
+    let numbered = |host: &str| CanonicalRule {
+        id: RuleId("r-0000".into()),
+        action: RuleAction::Verify,
+        ..exact_rule(host)
+    };
+    let s = setup(
+        sid,
+        book_with(
+            vec![numbered("site-a.example")],
+            vec![numbered("site-b.example")],
+        ),
+        PathVerdict::Silent,
+        PathVerdict::Answered,
+    );
+    s.engine
+        .note_verify_candidate(sid, "site-b.example", &[HOST_IP]);
+    s.engine.tick(sid, after(1));
+    assert_eq!(
+        s.probe.calls(),
+        vec![("site-b.example".to_string(), ADDITIONAL)],
+        "a tunnel host is checked over the tunnel, never named over the primary"
+    );
+
+    s.engine
+        .note_verify_candidate(sid, "site-a.example", &[HOST_IP]);
+    s.engine.tick(sid, after(2));
+    s.engine.tick(sid, after(3));
+    let verdicts = s.engine.verify_verdicts(sid);
+    assert_eq!(verdicts.len(), 1);
+    assert_eq!(verdicts[0].rule_id, "primary:site-a.example");
+    assert_eq!(moved_ids(sid), ["primary:site-a.example"]);
+
+    let book = s.rules.book.lock().unwrap_or_else(|p| p.into_inner());
+    let enforced = crate::verify_overlay::effective(&book, sid);
+    let values = |set: &CanonicalRuleSet| -> Vec<String> {
+        set.rules()
+            .iter()
+            .filter_map(|r| r.address_match.as_ref())
+            .map(|a| a.to_display_string())
+            .collect()
+    };
+    assert!(enforced.primary.is_empty());
+    assert_eq!(
+        values(&enforced.secondary),
+        ["site-a.example", "site-b.example"],
+        "site-b stays in the tunnel: nothing was measured about it"
+    );
+}
+
 /// The GUI's "domain" type is stored as an exact rule that covers subdomains
 /// through the user's setting; the check must see `www.` under it the same way.
 #[test]
@@ -380,7 +438,7 @@ fn an_exact_rule_covers_its_subdomains_when_the_user_routes_them() {
     on.engine.tick("S-verify-sub-on", later());
     let verdicts = on.engine.verify_verdicts("S-verify-sub-on");
     assert_eq!(verdicts.len(), 1);
-    assert_eq!(verdicts[0].rule_id, "r-site.example");
+    assert_eq!(verdicts[0].rule_id, "primary:site.example");
 
     let book = main_route_book();
     let off = setup_over(
@@ -526,7 +584,7 @@ fn a_disabled_question_mark_rule_is_never_checked() {
         .into_iter()
         .map(|v| v.rule_id)
         .collect();
-    assert_eq!(ids, ["r-verify-proton.example"]);
+    assert_eq!(ids, ["primary:*.proton.example"]);
 }
 
 // ── Answers ──────────────────────────────────────────────────────────────────
@@ -561,7 +619,7 @@ fn accepting_moves_the_rule_to_the_other_route_with_its_id_and_origin() {
     );
     let moved = s
         .engine
-        .accept_verify_verdicts(sid, &["r-verify-proton.example".to_string()], after(3))
+        .accept_verify_verdicts(sid, &["primary:*.proton.example".to_string()], after(3))
         .expect("accepted");
     assert_eq!(moved, 1);
     let (role, rule) = find(&s.rules, "r-verify-proton.example").expect("rule kept");
@@ -589,7 +647,7 @@ fn accepting_next_to_a_plain_twin_drops_the_question_mark_copy() {
     );
     let moved = s
         .engine
-        .accept_verify_verdicts(sid, &["r-verify-proton.example".to_string()], after(3))
+        .accept_verify_verdicts(sid, &["primary:*.proton.example".to_string()], after(3))
         .expect("accepted");
     assert_eq!(moved, 1);
     assert!(find(&s.rules, "r-verify-proton.example").is_none());
@@ -605,11 +663,11 @@ fn a_refused_accept_keeps_the_verdict() {
     s.author.fail("rules-locked");
     let err = s
         .engine
-        .accept_verify_verdicts(sid, &["r-verify-proton.example".to_string()], after(3))
+        .accept_verify_verdicts(sid, &["primary:*.proton.example".to_string()], after(3))
         .expect_err("refused");
     assert_eq!(err.code, "rules-locked");
     assert_eq!(s.engine.verify_verdicts(sid).len(), 1);
-    assert_eq!(moved_ids(sid), ["r-verify-proton.example"]);
+    assert_eq!(moved_ids(sid), ["primary:*.proton.example"]);
     let (role, _) = find(&s.rules, "r-verify-proton.example").expect("rule kept");
     assert_eq!(role, RouteRole::Primary);
 }
@@ -618,7 +676,7 @@ fn a_refused_accept_keeps_the_verdict() {
 fn not_now_keeps_the_move_and_clears_the_count() {
     let sid = "S-verify-dismiss";
     let s = with_verdict(sid, main_route_book());
-    let ids = ["r-verify-proton.example".to_string()];
+    let ids = ["primary:*.proton.example".to_string()];
     assert_eq!(s.engine.dismiss_verify_verdicts(sid, &ids), 1);
     assert_eq!(
         s.engine.dismiss_verify_verdicts(sid, &ids),
@@ -628,7 +686,7 @@ fn not_now_keeps_the_move_and_clears_the_count() {
     let verdicts = s.engine.verify_verdicts(sid);
     assert_eq!(verdicts.len(), 1);
     assert!(verdicts[0].dismissed);
-    assert_eq!(moved_ids(sid), ["r-verify-proton.example"]);
+    assert_eq!(moved_ids(sid), ["primary:*.proton.example"]);
     assert_eq!(s.pushed_counts(), [1, 0]);
     assert_eq!(s.reapplied(), 1, "nothing enforced changed");
 }
@@ -715,7 +773,7 @@ fn editing_the_rule_drops_its_verdict_and_the_move() {
         .note_verify_candidate(sid, "mail.proton.example", &[HOST_IP]);
     s.engine.tick(sid, after(1));
     s.engine.tick(sid, after(2));
-    assert_eq!(moved_ids(sid), ["r-verify-proton.example"]);
+    assert_eq!(moved_ids(sid), ["primary:*.proton.example"]);
 
     // Same id, another value.
     named.save(
@@ -730,6 +788,40 @@ fn editing_the_rule_drops_its_verdict_and_the_move() {
     assert!(moved_ids(sid).is_empty());
     assert_eq!(s.reapplied(), 2, "back where it is written, now");
     assert_eq!(s.pushed_counts(), [1, 0]);
+}
+
+/// A line inserted above renumbers the rule. The verdict is about the rule,
+/// not its number: it holds, and nothing is re-applied or re-announced.
+#[test]
+fn renumbering_the_rule_keeps_its_verdict() {
+    let sid = "S-verify-renumber";
+    let (s, named) = named_setup(
+        sid,
+        book_with(vec![verify_rule("proton.example")], Vec::new()),
+        Arc::new(BothLinks),
+    );
+    s.engine
+        .note_verify_candidate(sid, "mail.proton.example", &[HOST_IP]);
+    s.engine.tick(sid, after(1));
+    s.engine.tick(sid, after(2));
+    assert_eq!(moved_ids(sid), ["primary:*.proton.example"]);
+
+    // The same rule under another number, with a new line above it.
+    named.save(
+        vec![
+            exact_rule("chat.example"),
+            CanonicalRule {
+                id: RuleId("r-0001".into()),
+                ..verify_rule("proton.example")
+            },
+        ],
+        "rev-2",
+    );
+    s.engine.tick(sid, after(3));
+    assert_eq!(s.engine.verify_verdicts(sid).len(), 1);
+    assert_eq!(moved_ids(sid), ["primary:*.proton.example"]);
+    assert_eq!(s.reapplied(), 1, "nothing enforced changed");
+    assert_eq!(s.pushed_counts(), [1]);
 }
 
 // ── Addresses ────────────────────────────────────────────────────────────────
@@ -765,7 +857,7 @@ fn an_address_rule_is_checked_on_the_port_its_connection_used() {
     assert_eq!(verdicts.len(), 1);
     assert_eq!(verdicts[0].kind, "ip");
     assert_eq!(verdicts[0].value, "203.0.113.5");
-    assert_eq!(moved_ids(sid), ["r-verify-203.0.113.5"]);
+    assert_eq!(moved_ids(sid), ["primary:203.0.113.5"]);
 }
 
 // ── What a step costs, and how often a destination is asked ─────────────────

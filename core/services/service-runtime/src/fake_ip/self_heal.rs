@@ -29,6 +29,8 @@ use nrr_platform_api::vpn_discovery::looks_like_vpn;
 use nrr_platform_api::FlowOwnerLookup;
 
 use super::stack::FlowObserver;
+use crate::service_tasks::ServiceTaskKind;
+use crate::task_liveness::{TaskLiveness, ThreadExit, ThreadLease, Watch};
 
 /// A shared, session-scoped set of hostnames the answerers must keep on their
 /// REAL address even though fake-IP is on. Populated at runtime (currently by
@@ -279,6 +281,10 @@ impl VpnSelfHealObserver {
     /// the worst effect is that a few hosts are probed once more.
     const LEDGER_CAPACITY: usize = 4096;
 
+    /// One probe held longer than this is a worker stuck in the connection
+    /// table, not a slow owner lookup.
+    const PROBE_WORK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
     #[must_use]
     pub fn new(
         owner_lookup: Arc<dyn FlowOwnerLookup>,
@@ -286,9 +292,17 @@ impl VpnSelfHealObserver {
         exclusions: Arc<RuntimeHostExclusions>,
         flush: Arc<dyn Fn() + Send + Sync>,
         persist: Option<HealPersistFn>,
+        liveness: Option<Arc<TaskLiveness>>,
     ) -> Self {
         let (tx, rx) = sync_channel::<HealJob>(Self::QUEUE_DEPTH);
         std::thread::spawn(move || {
+            let lease = liveness.as_ref().map(|l| {
+                l.lease(
+                    ServiceTaskKind::FakeIpSelfHeal,
+                    None,
+                    Watch::Work(Self::PROBE_WORK_DEADLINE),
+                )
+            });
             // Per-hostname probe ledger for this stack lifetime. A host is
             // retired the moment a probe DECIDES it (healed, or provably not a
             // VPN client's); an inconclusive probe — the owner could not be
@@ -296,6 +310,7 @@ impl VpnSelfHealObserver {
             // is the one most likely to race the connection table.
             let mut attempts: HashMap<String, u8> = HashMap::new();
             while let Ok(job) = rx.recv() {
+                let _probe = lease.as_ref().map(ThreadLease::work);
                 let key = normalize_hostname(&job.hostname);
                 if key.is_empty() {
                     continue;
@@ -331,6 +346,9 @@ impl VpnSelfHealObserver {
                         *entry = entry.saturating_add(1);
                     }
                 }
+            }
+            if let Some(lease) = lease {
+                lease.finish(ThreadExit::Stopped);
             }
         });
         Self { tx }

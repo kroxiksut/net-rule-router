@@ -46,6 +46,9 @@ const SIBLING_WALK_MAX_DEPTH: u32 = 3;
 const SIBLING_WALK_MAX_FILES: u32 = 4000;
 const SIBLING_MAX_PATHS: usize = 12;
 
+/// Ownership answers remembered at once; past it the map starts over.
+const OWNERSHIP_CACHE_CAP: usize = 256;
+
 /// Windows [`AppPathResolver`]: unions three sources (App Paths registry,
 /// running-process images, install-root walks), case-insensitively dedups,
 /// keeps only existing exe files, and caches the result briefly.
@@ -56,6 +59,11 @@ pub struct WindowsAppPathResolver {
     walks: BackgroundWalks,
     processes: ProcessImages,
     walk_listener: Arc<OnceLock<Arc<dyn Fn() + Send + Sync>>>,
+    /// Ownership answers for paths outside the program folders, remembered
+    /// for the resolve TTL: a security-descriptor read per client per
+    /// recompute is cheap, but the recompute runs every few seconds.
+    ownership: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, bool)>>,
+    ownership_ttl: Duration,
 }
 
 impl WindowsAppPathResolver {
@@ -114,7 +122,27 @@ impl WindowsAppPathResolver {
             walks: BackgroundWalks::new(walk, walk_ttl, changed),
             processes: ProcessImages::new(Arc::new(running_process_images), Self::PROCESS_LIST_TTL),
             walk_listener,
+            ownership: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ownership_ttl: resolve_ttl,
         }
+    }
+
+    /// [`protected_install`] remembered per path string for the resolve TTL.
+    fn protected_install_cached(&self, exe: &Path, key: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut seen = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, trusted)) = seen.get(key) {
+            if now.saturating_duration_since(*at) < self.ownership_ttl {
+                return *trusted;
+            }
+        }
+        let trusted = protected_install(exe);
+        // Bounded: the keys are the handful of client paths a pass asks about.
+        if seen.len() >= OWNERSHIP_CACHE_CAP {
+            seen.clear();
+        }
+        seen.insert(key.to_string(), (now, trusted));
+        trusted
     }
 
     /// Called when a background walk answers a name differently than
@@ -205,6 +233,73 @@ impl AppPathResolver for WindowsAppPathResolver {
             .collect()
         })
     }
+
+    fn is_protected_install(&self, exe: &Path) -> bool {
+        let key = exe.to_string_lossy().to_ascii_lowercase();
+        self.protected_install_cached(exe, &key)
+    }
+}
+
+/// Whether `exe` sits where only administrators could have put it.
+///
+/// Two conditions, both required. The file's FINAL path — after every
+/// junction, symlink, `..` and short name is resolved by opening it — lies
+/// under a program folder; a lexical prefix test would be satisfied by
+/// `Program Files\..\Users\x\x-vpn.exe`. And no account outside SYSTEM,
+/// Administrators and TrustedInstaller may replace the file, plant beside it
+/// or swap a directory above it, read off the DACLs of that final path. A path
+/// that cannot be opened or inspected is refused: an answer the service could
+/// not verify is not an exemption.
+fn protected_install(exe: &Path) -> bool {
+    let Ok(canonical) = std::fs::canonicalize(exe) else {
+        return false;
+    };
+    let final_text = canonical.to_string_lossy();
+    let final_path = strip_verbatim_prefix(&final_text).to_ascii_lowercase();
+    let under_root = protected_roots_lowercased()
+        .iter()
+        .any(|root| final_path.starts_with(root.as_str()));
+    under_root && crate::trusted_location::untrusted_writer(&canonical) == Ok(None)
+}
+
+/// `\\?\C:\…` → `C:\…`. A UNC form (`\\?\UNC\…`) is left as is: no program
+/// folder is a network share, so it will match no root.
+fn strip_verbatim_prefix(path: &str) -> &str {
+    path.strip_prefix(r"\\?\")
+        .filter(|rest| !rest.starts_with("UNC\\"))
+        .unwrap_or(path)
+}
+
+/// The folders only administrators write to, in final-path spelling, each
+/// with its trailing separator so `Program Files` does not also match
+/// `Program Filesx`. Only `System32` of the Windows folder: the folder itself
+/// holds subtrees any user may write to (`Temp`, `Tasks`, the spooler).
+fn protected_roots_lowercased() -> Vec<String> {
+    let mut roots = Vec::new();
+    let mut push = |dir: PathBuf| {
+        // The same canonical spelling the file gets, or an alias (a short
+        // name, a substituted drive) of the folder would never match.
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        let text = strip_verbatim_prefix(&dir.to_string_lossy())
+            .trim_end_matches(['\\', '/'])
+            .to_ascii_lowercase();
+        if !text.is_empty() {
+            roots.push(format!("{text}\\"));
+        }
+    };
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                push(PathBuf::from(v));
+            }
+        }
+    }
+    if let Ok(windir) = std::env::var("SystemRoot") {
+        if !windir.is_empty() {
+            push(PathBuf::from(windir).join("System32"));
+        }
+    }
+    roots
 }
 
 /// The directory an application was installed into, or `None` when that
@@ -615,6 +710,77 @@ mod tests {
             !names.iter().any(|n| n.ends_with(".txt")),
             "only executables: {names:?}",
         );
+    }
+
+    /// The built-in exemption keys on a file NAME, so where the file sits is
+    /// the whole difference between a client and a download named like one.
+    #[test]
+    fn a_vpn_named_binary_in_a_user_folder_is_not_a_protected_install() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // An elevated test run creates objects owned by Administrators, which
+        // would make the user's folder look protected.
+        let sid = crate::win32_ffi::console_session::current_process_user_sid().expect("own SID");
+        let planted = dir.path().join("x-vpn.exe");
+        std::fs::write(&planted, b"placeholder").expect("write");
+        let done = std::process::Command::new(crate::system_shell::system32_exe("icacls.exe"))
+            .arg(dir.path())
+            .args(["/setowner", &format!("*{sid}"), "/T", "/Q"])
+            .output()
+            .expect("run icacls");
+        assert!(done.status.success(), "icacls /setowner: {done:?}");
+
+        let resolver = WindowsAppPathResolver::new();
+        assert!(
+            !resolver.is_protected_install(&planted),
+            "a binary the user could plant must not be trusted by its name",
+        );
+        assert!(
+            resolver.is_protected_install(&crate::system_shell::system32_exe("cmd.exe")),
+            "positive control: a system binary is out of the user's reach",
+        );
+        let program_files =
+            std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
+        assert!(
+            !resolver.is_protected_install(
+                &PathBuf::from(&program_files).join("vendor vpn/vendor vpn.exe")
+            ),
+            "a path that cannot be opened is refused, protected folder or not",
+        );
+        // Lexically under Program Files, actually the user's folder: the
+        // final path is what gets matched.
+        let dir_text = dir.path().to_string_lossy().into_owned();
+        let same_drive = dir_text.starts_with(&program_files[..3]);
+        if let Some(rest) = dir_text.get(3..).filter(|_| same_drive) {
+            let dotted = PathBuf::from(&program_files)
+                .join("..")
+                .join(rest)
+                .join("x-vpn.exe");
+            assert!(
+                !resolver.is_protected_install(&dotted),
+                "{}: `..` must not walk a user file under a protected root",
+                dotted.display(),
+            );
+        }
+        // A user-writable corner of the Windows folder is not a program folder.
+        if let Ok(windir) = std::env::var("SystemRoot") {
+            let temp = PathBuf::from(windir).join("Temp").join("nrr-x-vpn.exe");
+            if std::fs::write(&temp, b"placeholder").is_ok() {
+                assert!(
+                    !resolver.is_protected_install(&temp),
+                    "the Windows folder's Temp is writable by any user",
+                );
+                let _ = std::fs::remove_file(&temp);
+            }
+        }
+    }
+
+    #[test]
+    fn the_verbatim_prefix_is_stripped_for_drive_paths_only() {
+        let drive = r"\\?\C:\Program Files\a.exe";
+        assert_eq!(strip_verbatim_prefix(drive), r"C:\Program Files\a.exe");
+        assert_eq!(strip_verbatim_prefix(r"C:\a.exe"), r"C:\a.exe");
+        let unc = r"\\?\UNC\srv\share\a.exe";
+        assert_eq!(strip_verbatim_prefix(unc), unc);
     }
 
     #[test]

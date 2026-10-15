@@ -243,17 +243,11 @@ fn vpn_drop_obs(spec_id: Option<u64>) -> ConnectionObservation {
     }
 }
 
-/// Build a consumer wired with a VPN-endpoint learner that records into
-/// the returned sink, and (when `check` is `Some`) the role-verification
-/// gate backed by that closure. `active_sid` always returns `None`, so
+/// Build a consumer wired with the role-verification gate backed by `check`
+/// (one refusing every id when `None`). `active_sid` always returns `None`, so
 /// `consume()` never needs a live route coordinator — the field is only
 /// present to satisfy the constructor.
-fn test_consumer(
-    check: Option<KillswitchDropCheckFn>,
-) -> (
-    ConnectionObservationConsumer,
-    Arc<Mutex<Vec<std::net::Ipv4Addr>>>,
-) {
+fn test_consumer(check: Option<KillswitchDropCheckFn>) -> ConnectionObservationConsumer {
     let api: Arc<dyn nrr_platform_api::route_table::RouteTablePort> =
         Arc::new(nrr_platform_api::windows_api::MockWindowsApi::new());
     let coordinator = Arc::new(SecondaryRouteCoordinator::new(
@@ -266,68 +260,8 @@ fn test_consumer(
         Arc::new(|| false),
     ));
     let active_sid: ActiveSidFn = Arc::new(|| None);
-    let learned: Arc<Mutex<Vec<std::net::Ipv4Addr>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&learned);
-    // The gate is no longer optional here: the builder takes it with the
-    // learner, so "learner wired, gate missing" is not a state a caller can
-    // reach. A gate that refuses every id is the reachable equivalent.
-    let consumer = ConnectionObservationConsumer::new(api, coordinator, active_sid, false)
-        .with_vpn_endpoint_learner(
-            Arc::new(move |ip| {
-                sink.lock().unwrap_or_else(|p| p.into_inner()).push(ip);
-            }),
-            check.unwrap_or_else(|| Arc::new(|_| false)),
-        );
-    (consumer, learned)
-}
-
-#[test]
-fn vpn_learn_fires_when_spec_id_is_role_verified() {
-    let check: KillswitchDropCheckFn = Arc::new(|id| id == 80122);
-    let (consumer, learned) = test_consumer(Some(check));
-    let summary = consumer.consume(&[vpn_drop_obs(Some(80122))], SystemTime::now());
-    assert_eq!(summary.vpn_endpoints_learned, 1);
-    assert_eq!(
-        *learned.lock().unwrap_or_else(|p| p.into_inner()),
-        vec![Ipv4Addr::new(203, 0, 113, 50)]
-    );
-}
-
-#[test]
-fn vpn_learn_skips_when_spec_id_unknown_to_registry() {
-    // Simulates a foreign drop or the user's own Block rule: a spec id
-    // exists (so `blocked_by_nrr` alone would have taught it under the
-    // pre-fix logic) but the role-verification check rejects it.
-    let check: KillswitchDropCheckFn = Arc::new(|_id| false);
-    let (consumer, learned) = test_consumer(Some(check));
-    let summary = consumer.consume(&[vpn_drop_obs(Some(80122))], SystemTime::now());
-    assert_eq!(summary.vpn_endpoints_learned, 0);
-    assert!(learned.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
-}
-
-#[test]
-fn vpn_learn_skips_when_spec_id_absent() {
-    // The observation carries no decoded spec id at all (undecodable or
-    // pre-dating the encoding) even though the check would accept
-    // anything — absence of a spec id must never be treated as verified.
-    let check: KillswitchDropCheckFn = Arc::new(|_id| true);
-    let (consumer, learned) = test_consumer(Some(check));
-    let summary = consumer.consume(&[vpn_drop_obs(None)], SystemTime::now());
-    assert_eq!(summary.vpn_endpoints_learned, 0);
-    assert!(learned.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
-}
-
-#[test]
-fn vpn_learn_skips_when_the_gate_refuses_the_id() {
-    // A matching VPN process name + a spec id present is not sufficient: the
-    // role-verification gate decides. This used to pin "no gate wired at all",
-    // which the builder no longer lets a caller express — the learner takes its
-    // gate with it. A gate that refuses is what remains reachable, and it is
-    // the shape production actually hits (a drop by someone else's filter).
-    let (consumer, learned) = test_consumer(None);
-    let summary = consumer.consume(&[vpn_drop_obs(Some(80122))], SystemTime::now());
-    assert_eq!(summary.vpn_endpoints_learned, 0);
-    assert!(learned.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+    ConnectionObservationConsumer::new(api, coordinator, active_sid, false)
+        .with_killswitch_drop_check(check.unwrap_or_else(|| Arc::new(|_| false)))
 }
 
 // ── Proactive VPN-client (app-scoped) learning ─────────────
@@ -352,7 +286,7 @@ fn with_app_learner(
 #[test]
 fn vpn_client_app_learner_fires_on_role_verified_drop() {
     let check: KillswitchDropCheckFn = Arc::new(|id| id == 80122);
-    let (consumer, _) = test_consumer(Some(check));
+    let consumer = test_consumer(Some(check));
     let (consumer, apps) = with_app_learner(consumer);
     let summary = consumer.consume(&[vpn_drop_obs(Some(80122))], SystemTime::now());
     assert_eq!(summary.vpn_client_apps_learned, 1);
@@ -367,9 +301,20 @@ fn vpn_client_app_learner_skips_unverified_drops() {
     // Same drop, but the spec id fails role verification (a user's own
     // Block rule / foreign filter): the client app must NOT be learned.
     let check: KillswitchDropCheckFn = Arc::new(|_id| false);
-    let (consumer, _) = test_consumer(Some(check));
+    let consumer = test_consumer(Some(check));
     let (consumer, apps) = with_app_learner(consumer);
     let summary = consumer.consume(&[vpn_drop_obs(Some(80122))], SystemTime::now());
+    assert_eq!(summary.vpn_client_apps_learned, 0);
+    assert!(apps.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+}
+
+#[test]
+fn vpn_client_app_learner_skips_a_drop_without_a_spec_id() {
+    // No decoded spec id at all, while the check would accept anything:
+    // absence of a spec id is never taken as verified.
+    let consumer = test_consumer(Some(Arc::new(|_id| true)));
+    let (consumer, apps) = with_app_learner(consumer);
+    let summary = consumer.consume(&[vpn_drop_obs(None)], SystemTime::now());
     assert_eq!(summary.vpn_client_apps_learned, 0);
     assert!(apps.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
 }
@@ -380,7 +325,7 @@ fn vpn_client_app_learner_dedups_within_a_batch_across_rotated_ips() {
     // several ROTATING remote IPs in one batch — the app sink is invoked
     // once and the summary counts one newly-learned client.
     let check: KillswitchDropCheckFn = Arc::new(|id| id == 80122);
-    let (consumer, _) = test_consumer(Some(check));
+    let consumer = test_consumer(Some(check));
     let (consumer, apps) = with_app_learner(consumer);
     let mut second = vpn_drop_obs(Some(80122));
     second.remote = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 51), 443));
@@ -435,6 +380,7 @@ impl crate::per_sid_orchestrator::RoutePolicySource for OneSecondaryPolicy {
             link_provider_exe_paths: Vec::new(),
             doh_lockdown_enabled: false,
             doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
+            doh_lockdown_auto: false,
             doh_resolver_ips: Vec::new(),
             auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
             primary_probe_auto: false,
@@ -444,6 +390,7 @@ impl crate::per_sid_orchestrator::RoutePolicySource for OneSecondaryPolicy {
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
             app_rules_take_all_addresses: false,
+            guard_forwarded_traffic: true,
         })
     }
 }
@@ -549,8 +496,11 @@ fn established(
     owner: Option<&str>,
 ) -> nrr_platform_api::fake_ip::stale_flows::EstablishedFlow {
     nrr_platform_api::fake_ip::stale_flows::EstablishedFlow {
-        local,
-        remote: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 50), remote_port),
+        local: SocketAddr::V4(local),
+        remote: SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(203, 0, 113, 50),
+            remote_port,
+        )),
         owner: owner.map(str::to_owned),
         pid: None,
         image: None,
@@ -585,7 +535,10 @@ fn destination_scoped_drop_with_live_secondary_tears_the_stale_flow_down() {
         SystemTime::now(),
     );
 
-    assert_eq!(reset.queried(), vec![Ipv4Addr::new(203, 0, 113, 50)]);
+    assert_eq!(
+        reset.queried(),
+        vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50))]
+    );
     assert_eq!(reset.reset_flows(), vec![dropped]);
 }
 
@@ -632,7 +585,7 @@ fn a_drop_with_an_unresolved_secondary_is_never_torn_down() {
     // The outage case: nowhere better for those sockets to go.
     let reset = Arc::new(nrr_platform_api::fake_ip::stale_flows::MockStaleFlowReset::new());
     let check: KillswitchDropCheckFn = Arc::new(|id| id == 80122);
-    let (consumer, _) = test_consumer(Some(check));
+    let consumer = test_consumer(Some(check));
     let consumer = consumer.with_stale_flow_reset(Arc::clone(&reset) as Arc<dyn StaleFlowReset>);
 
     consumer.consume(&[vpn_drop_obs(Some(80122))], SystemTime::now());
@@ -645,7 +598,7 @@ fn killswitch_drop_with_unresolved_secondary_is_not_counted() {
     // No active SID → no resolved secondary → the drop is the block-all
     // doing exactly its job during an outage window.
     let check: KillswitchDropCheckFn = Arc::new(|id| id == 80122);
-    let (consumer, _) = test_consumer(Some(check));
+    let consumer = test_consumer(Some(check));
     let summary = consumer.consume(&[vpn_drop_obs(Some(80122))], SystemTime::now());
     assert_eq!(summary.killswitch_drops_live_secondary, 0);
 }

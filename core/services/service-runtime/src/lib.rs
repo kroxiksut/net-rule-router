@@ -62,6 +62,7 @@ pub mod app_destination_memory;
 pub mod app_enforcement_status;
 pub mod app_main_link_reach;
 pub mod app_observation_lookup;
+pub mod apply_health;
 mod applying_revision_overlay;
 pub mod auto_rules;
 pub mod block_notice_center;
@@ -90,6 +91,7 @@ pub mod dns_resolver_service;
 pub mod dns_stack;
 pub mod dns_upstream;
 pub mod dns_wire;
+pub mod doh_lockdown_policy;
 pub mod doh_seed;
 pub mod enforced_addresses;
 pub mod enforcement_planner;
@@ -109,6 +111,9 @@ pub mod killswitch_drop_registry;
 pub mod known_direct;
 pub mod lifecycle;
 pub mod lifecycle_journal;
+pub mod lifecycle_matrix;
+pub mod local_dns_namespaces;
+pub mod local_dns_suffixes;
 pub mod local_namespace_fallback;
 pub mod logon_rearm;
 pub mod machine_reading;
@@ -137,6 +142,7 @@ pub mod production_coordinator;
 pub mod production_diagnostics;
 pub mod production_handlers_misc;
 pub mod production_ipc_audit;
+pub mod production_local_dns_suffixes;
 pub mod production_local_networks;
 pub mod production_merge_preview;
 pub mod production_mutation_executor;
@@ -161,6 +167,7 @@ pub mod route_reconciler;
 pub mod route_table_owner;
 pub mod routed_host_flow_refresh;
 pub mod routing_pause;
+pub mod rule_book_facts;
 pub mod rule_conflicts;
 pub mod rule_hostname_seeder;
 pub mod runtime_loop;
@@ -177,6 +184,7 @@ pub mod short_name_suffixes;
 pub mod state;
 pub mod supervised_runtime;
 pub mod tamper_bootstrap;
+pub mod task_liveness;
 pub mod timed_window;
 pub mod tls_hello;
 pub mod traffic_sampler;
@@ -185,7 +193,7 @@ pub mod verbose_logging;
 pub mod verbosity_control;
 mod verify_overlay;
 pub mod vpn_client_registry;
-pub mod vpn_endpoint_learning;
+pub mod vpn_client_trust;
 mod wfp_bands;
 pub mod wfp_codegen;
 pub mod wfp_filter_ledger;
@@ -365,7 +373,7 @@ pub struct ServiceRuntimeOrchestrationSnapshot {
 /// Maturity of each runtime dimension, as the `status` verb reports it.
 ///
 /// The two `partial` entries name what is missing rather than rounding up:
-/// health does not publish per-component statuses or degraded modes yet, and
+/// health is read on request but never pushed (`health-changed` is not sent), and
 /// the update hook stops after draining and backing up the state database —
 /// replacing the binary is the installer's half.
 pub const fn service_runtime_orchestration_snapshot() -> ServiceRuntimeOrchestrationSnapshot {

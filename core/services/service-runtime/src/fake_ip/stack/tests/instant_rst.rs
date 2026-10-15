@@ -8,7 +8,7 @@ use super::*;
 // through a real smoltcp handshake would only make the window-exhaustion
 // and mid-hold-death cases slow and harder to reason about. `retry_interval`
 // / `retry_window` are passed in milliseconds here (never the real
-// `HOLD_RETRY_INTERVAL`/`HOLD_RETRY_WINDOW` constants `spawn_dial_worker`
+// `HOLD_RETRY_INTERVAL`/`HOLD_RETRY_WINDOW` constants `run_tcp_dial`
 // uses) so these tests run fast and deterministically.
 
 use std::sync::atomic::AtomicU32;

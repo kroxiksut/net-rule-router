@@ -503,9 +503,12 @@ impl RoutePolicySource for ProductionRoutePolicySource {
         } else {
             record.doh_lockdown_scope
         };
-        // Resolve the DoH-resolver list only when the lockdown is
+        // Forced is on for everyone; automatic is decided by the planner from
+        // the rule book, so the list is resolved for it too.
+        let doh_lockdown_auto = record.doh_lockdown_auto && !self.doh_lockdown_forced;
+        // Resolve the DoH-resolver list only when the lockdown can be
         // on (avoid the list read + cache lookups otherwise).
-        let doh_resolver_ips = if doh_lockdown_enabled {
+        let doh_resolver_ips = if doh_lockdown_enabled || doh_lockdown_auto {
             self.resolve_doh_resolver_ips(&conn)
         } else {
             Vec::new()
@@ -526,6 +529,7 @@ impl RoutePolicySource for ProductionRoutePolicySource {
             link_provider_exe_paths,
             doh_lockdown_enabled,
             doh_lockdown_scope,
+            doh_lockdown_auto,
             doh_resolver_ips,
             auto_rules_mode: record.auto_rules_mode,
             primary_probe_auto: record.primary_probe_auto,
@@ -535,6 +539,7 @@ impl RoutePolicySource for ProductionRoutePolicySource {
             local_networks_auto_accept: record.local_networks_auto_accept,
             zone_priority_over_ip: record.zone_priority_over_ip,
             app_rules_take_all_addresses: record.app_rules_take_all_addresses,
+            guard_forwarded_traffic: record.forwarded_outage != "unprotected",
         })
     }
 }
@@ -649,21 +654,35 @@ impl RoutePolicyProvider for ProductionRoutePolicyProvider {
 }
 
 /// The caller's stored policy as the wire carries it.
-fn stored_policy(conn: &Mutex<Connection>, sid: &str) -> Option<RoutePolicyDto> {
-    let conn = conn.lock().ok()?;
-    let repo = RouteBindingsRepository::new(&conn);
-    // A policy with no adapter bound yet is still the user's: hiding it made
-    // every client rebuild the next full write from defaults, so binding an
-    // adapter after choosing the protections switched them off again.
-    if !repo.has_policy_for_sid(sid).ok()? {
-        return None;
-    }
-    let record = repo.load_for_sid(sid).ok()?;
-    // Best-effort — a provider-set read failure must not hide the policy.
-    let providers = repo
-        .load_link_provider_apps(sid, "secondary")
-        .unwrap_or_default();
-    Some(record_to_dto(record, providers))
+fn stored_policy(conn: &Arc<Mutex<Connection>>, sid: &str) -> Option<RoutePolicyDto> {
+    let (record, providers) = {
+        let guard = conn.lock().ok()?;
+        let repo = RouteBindingsRepository::new(&guard);
+        // A policy with no adapter bound yet is still the user's: hiding it
+        // made every client rebuild the next full write from defaults, so
+        // binding an adapter after choosing the protections switched them off.
+        if !repo.has_policy_for_sid(sid).ok()? {
+            return None;
+        }
+        let record = repo.load_for_sid(sid).ok()?;
+        // Best-effort — a provider-set read failure must not hide the policy.
+        let providers = repo
+            .load_link_provider_apps(sid, "secondary")
+            .unwrap_or_default();
+        (record, providers)
+    };
+    // Read after the lock is released: the rules provider takes it itself.
+    let has_secondary_rules = has_secondary_rules_for(conn, sid);
+    Some(record_to_dto(record, providers, has_secondary_rules))
+}
+
+/// Whether the caller routes anything down the additional link, through the
+/// one rules provider the service reads rules by.
+fn has_secondary_rules_for(conn: &Arc<Mutex<Connection>>, sid: &str) -> bool {
+    use crate::per_sid_orchestrator::RulesProvider;
+    crate::production_rules_provider::ProductionRulesProvider::new(Arc::clone(conn))
+        .active_rules_for(sid)
+        .is_some_and(|snapshot| crate::rule_book_facts::has_secondary_rules(&snapshot.rule_book))
 }
 
 pub struct ProductionRoutePolicyWriter {
@@ -728,6 +747,7 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
                 &request.doh_lockdown_scope,
             )
             .unwrap_or_default(),
+            doh_lockdown_auto: request.doh_lockdown_auto,
             browser_history_auto_seed: request.browser_history_auto_seed,
             kill_switch_strict_shared_ips: request.kill_switch_strict_shared_ips,
             // Auto-rules mode. Unknown slug (older/other peer) →
@@ -747,23 +767,29 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
             short_name_completion: request.short_name_completion,
             short_name_suffix,
             app_rules_take_all_addresses: request.app_rules_take_all_addresses,
+            forwarded_outage: request.forwarded_outage.clone(),
             binding_source: dto_source_to_storage(request.binding_source),
         };
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| RoutePolicyWriteError::Storage("connection mutex poisoned".into()))?;
-        let repo = RouteBindingsRepository::new(&conn);
-        repo.update_for_sid(sid, &record, now_secs())
-            .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
-        let written = repo
-            .load_for_sid(sid)
-            .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
-        crate::short_name_suffixes::global_user_short_name_suffixes().publish(sid, &written);
-        let providers = repo
-            .load_link_provider_apps(sid, "secondary")
-            .unwrap_or_default();
-        Ok(record_to_dto(written, providers))
+        let (written, providers) = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| RoutePolicyWriteError::Storage("connection mutex poisoned".into()))?;
+            let repo = RouteBindingsRepository::new(&conn);
+            repo.update_for_sid(sid, &record, now_secs())
+                .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
+            let written = repo
+                .load_for_sid(sid)
+                .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
+            crate::short_name_suffixes::global_user_short_name_suffixes().publish(sid, &written);
+            let providers = repo
+                .load_link_provider_apps(sid, "secondary")
+                .unwrap_or_default();
+            (written, providers)
+        };
+        // After the lock is released: the rules provider takes it itself.
+        let has_secondary_rules = has_secondary_rules_for(&self.conn, sid);
+        Ok(record_to_dto(written, providers, has_secondary_rules))
     }
 }
 
@@ -890,7 +916,15 @@ fn provider_record_to_dto(rec: LinkProviderAppRecord) -> LinkProviderAppDto {
 fn record_to_dto(
     rec: RoutePolicyRecord,
     secondary_link_providers: Vec<LinkProviderAppRecord>,
+    has_secondary_rules: bool,
 ) -> RoutePolicyDto {
+    let doh_lockdown_effective = crate::doh_lockdown_policy::doh_lockdown_active(
+        rec.doh_lockdown_auto,
+        rec.doh_lockdown_enabled,
+        rec.doh_lockdown_scope,
+        rec.kill_switch_enabled,
+        has_secondary_rules,
+    );
     RoutePolicyDto {
         primary: rec.primary.map(record_binding_to_dto),
         secondary: rec.secondary.map(record_binding_to_dto),
@@ -911,6 +945,8 @@ fn record_to_dto(
             .collect(),
         doh_lockdown_enabled: rec.doh_lockdown_enabled,
         doh_lockdown_scope: rec.doh_lockdown_scope.as_slug().to_string(),
+        doh_lockdown_auto: rec.doh_lockdown_auto,
+        doh_lockdown_effective,
         browser_history_auto_seed: rec.browser_history_auto_seed,
         kill_switch_strict_shared_ips: rec.kill_switch_strict_shared_ips,
         auto_rules_mode: rec.auto_rules_mode.as_slug().to_string(),
@@ -924,6 +960,7 @@ fn record_to_dto(
         short_name_completion: rec.short_name_completion,
         short_name_suffix: rec.short_name_suffix,
         app_rules_take_all_addresses: rec.app_rules_take_all_addresses,
+        forwarded_outage: rec.forwarded_outage,
         binding_source: storage_source_to_dto(rec.binding_source),
     }
 }

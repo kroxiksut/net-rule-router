@@ -66,6 +66,8 @@ pub fn layer_ord(layer: WfpLayerKey) -> u8 {
         WfpLayerKey::AleAuthConnectV6 => 2,
         WfpLayerKey::OutboundIpPacketV6 => 3,
         WfpLayerKey::OutboundTransportV4 => 4,
+        WfpLayerKey::IpForwardV4 => 5,
+        WfpLayerKey::IpForwardV6 => 6,
     }
 }
 

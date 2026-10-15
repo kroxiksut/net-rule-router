@@ -828,6 +828,10 @@ fn replay_subscription<S: Read + Write>(inner: &Arc<ClientInner>, io: &mut S) ->
     replay["request-id"] = Value::String(request_id.clone());
     drop(guard);
 
+    // The new subscription starts at the service's current head: nothing
+    // published while the connection was down is replayed, so the stream has a
+    // hole in it whatever else happens, and the subscriber hears so first.
+    inner.push_gap.store(true, Ordering::SeqCst);
     if let Err(e) = write_frame(io, &replay) {
         client_trace!("nrr-ipc-client: resubscribe write failed: {e}");
         return !e.is_transport_dead();
@@ -864,6 +868,9 @@ fn replay_subscription<S: Read + Write>(inner: &Arc<ClientInner>, io: &mut S) ->
                 // The server allocated a NEW subscription for this connection;
                 // the id from the caller's original subscribe is dead.
                 remember_subscription_id(inner, &frame);
+                // A quiet service sends nothing for a while; the hole is
+                // announced now, not ahead of a frame that may be hours away.
+                flush_push_gap(inner);
             }
             client_trace!(
                 "nrr-ipc-client: resubscribed after reconnect, ok={ok} (subscription={})",
@@ -908,22 +915,36 @@ fn route_push_frame(inner: &Arc<ClientInner>, frame: &Value, source: &str) {
         client_trace!("nrr-ipc-client: push {event_type} discarded — nobody subscribed");
         return;
     };
-    // A dropped frame is a hole in the event stream, and the subscriber has no
-    // way of knowing it. Announce the hole once, so the GUI can re-read the
-    // snapshots it would otherwise keep rendering from stale pushes.
-    if inner.push_gap.swap(false, Ordering::SeqCst) {
-        let gap = serde_json::json!({ "event": { "type": "push-gap" } });
-        if tx.try_send(gap).is_err() {
-            // Still full — keep the debt and try again with the next frame.
-            inner.push_gap.store(true, Ordering::SeqCst);
-        }
-    }
+    send_pending_gap(inner, tx);
     match tx.try_send(payload) {
         Ok(()) => client_trace!("nrr-ipc-client: push {event_type} delivered (source={source})"),
         Err(e) => {
             client_trace!("nrr-ipc-client: push {event_type} dropped — channel full ({e})");
             inner.push_gap.store(true, Ordering::SeqCst);
         }
+    }
+}
+
+/// A dropped frame or a replayed subscription is a hole in the event stream,
+/// and the subscriber has no way of knowing it. Announce the hole once, so the
+/// surface re-reads the snapshots it would otherwise keep rendering from stale
+/// pushes. On a full channel the debt stays for the next attempt.
+fn send_pending_gap(inner: &Arc<ClientInner>, tx: &SyncSender<Value>) {
+    if inner.push_gap.swap(false, Ordering::SeqCst) {
+        let gap = serde_json::json!({ "event": { "type": "push-gap" } });
+        if tx.try_send(gap).is_err() {
+            inner.push_gap.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Deliver a pending hole now rather than ahead of the next frame.
+fn flush_push_gap(inner: &Arc<ClientInner>) {
+    let Ok(guard) = inner.push_tx.lock() else {
+        return;
+    };
+    if let Some(tx) = guard.as_ref() {
+        send_pending_gap(inner, tx);
     }
 }
 

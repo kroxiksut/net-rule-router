@@ -22,7 +22,7 @@
 //! socket, so callers log the outcome and carry on.
 
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 
 use nrr_shared::ip_block::IpBlock;
@@ -47,11 +47,13 @@ impl StaleFlowSweep {
     }
 }
 
-/// One established TCP connection and the user it belongs to.
+/// One established TCP connection and the user it belongs to. Either
+/// family: a rule host's IPv6 front holds a browser's sockets exactly like
+/// its IPv4 one, and a sweep that read only the v4 table left them standing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EstablishedFlow {
-    pub local: SocketAddrV4,
-    pub remote: SocketAddrV4,
+    pub local: SocketAddr,
+    pub remote: SocketAddr,
     /// The owning user in the stored principal form (`S-1-5-21-…`,
     /// `unix:uid:<n>`). `None` when the owner could not be resolved — the
     /// process exited, or the OS refused to say.
@@ -93,20 +95,19 @@ impl FlowLinks {
     ) -> Self {
         let unicast = adapters
             .iter()
-            .flat_map(|a| a.ipv4_addresses.iter().map(|ip| (IpAddr::V4(*ip), a.index)))
+            .flat_map(|a| {
+                a.ipv4_addresses
+                    .iter()
+                    .map(|ip| (IpAddr::V4(*ip), a.index))
+                    .chain(a.ipv6_addresses.iter().map(|ip| (IpAddr::V6(*ip), a.index)))
+            })
             .collect();
         Self::new(unicast, primary, secondary)
     }
 
     #[must_use]
-    pub fn role_of(&self, local: Ipv4Addr) -> EgressRole {
-        resolve_egress(
-            IpAddr::V4(local),
-            &self.unicast,
-            self.primary,
-            self.secondary,
-        )
-        .role
+    pub fn role_of(&self, local: IpAddr) -> EgressRole {
+        resolve_egress(local, &self.unicast, self.primary, self.secondary).role
     }
 }
 
@@ -114,22 +115,21 @@ impl FlowLinks {
 /// networks, read from one pass over the connection table.
 ///
 /// A network rule names every address inside it, so a flow to any of them sits
-/// behind the rule. Only IPv4 networks can hold a listed flow; an IPv6 block
-/// matches nothing here.
+/// behind the rule. Hosts and networks of either family.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FlowTargets {
-    hosts: Vec<Ipv4Addr>,
+    hosts: Vec<IpAddr>,
     networks: Vec<IpBlock>,
 }
 
 impl FlowTargets {
     #[must_use]
-    pub fn new(hosts: Vec<Ipv4Addr>, networks: Vec<IpBlock>) -> Self {
+    pub fn new(hosts: Vec<IpAddr>, networks: Vec<IpBlock>) -> Self {
         Self { hosts, networks }
     }
 
     #[must_use]
-    pub fn hosts(&self) -> &[Ipv4Addr] {
+    pub fn hosts(&self) -> &[IpAddr] {
         &self.hosts
     }
 
@@ -156,19 +156,21 @@ impl FlowTargets {
 /// [`FlowTargets`] prepared for a per-row membership test.
 #[derive(Debug)]
 pub struct FlowTargetMatcher<'a> {
-    hosts: HashSet<Ipv4Addr>,
+    hosts: HashSet<IpAddr>,
     networks: &'a [IpBlock],
 }
 
 impl FlowTargetMatcher<'_> {
-    /// Is `remote` one of the hosts, or inside one of the networks?
+    /// Is `remote` one of the hosts, or inside one of the networks? A
+    /// v4-mapped IPv6 remote is the IPv4 host it maps to: a dual-stack socket
+    /// reaches a v4 front through one.
     #[must_use]
-    pub fn matches(&self, remote: Ipv4Addr) -> bool {
-        self.hosts.contains(&remote)
-            || self
-                .networks
-                .iter()
-                .any(|net| net.contains(IpAddr::V4(remote)))
+    pub fn matches(&self, remote: IpAddr) -> bool {
+        let remote = match remote {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(remote, IpAddr::V4),
+            IpAddr::V4(_) => remote,
+        };
+        self.hosts.contains(&remote) || self.networks.iter().any(|net| net.contains(remote))
     }
 }
 
@@ -187,7 +189,7 @@ pub trait StaleFlowReset: Send + Sync {
 
     /// Established TCP connections to any of `targets`, each with its owner.
     /// [`Self::established_flows_matching`] over hosts only.
-    fn established_flows_to(&self, targets: &[Ipv4Addr]) -> Vec<EstablishedFlow> {
+    fn established_flows_to(&self, targets: &[IpAddr]) -> Vec<EstablishedFlow> {
         self.established_flows_matching(&FlowTargets::new(targets.to_vec(), Vec::new()))
     }
 
@@ -229,7 +231,7 @@ pub struct MockStaleFlowReset {
 #[derive(Debug, Default)]
 struct MockInner {
     calls: Vec<(Ipv4Addr, u8)>,
-    queried: Vec<Ipv4Addr>,
+    queried: Vec<IpAddr>,
     queried_networks: Vec<IpBlock>,
     answer: StaleFlowSweep,
     flows: Vec<EstablishedFlow>,
@@ -260,7 +262,7 @@ impl MockStaleFlowReset {
     /// Every address [`StaleFlowReset::established_flows_to`] was asked about,
     /// in call order.
     #[must_use]
-    pub fn queried(&self) -> Vec<Ipv4Addr> {
+    pub fn queried(&self) -> Vec<IpAddr> {
         self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -309,7 +311,7 @@ impl StaleFlowReset for MockStaleFlowReset {
         inner
             .flows
             .iter()
-            .filter(|flow| matcher.matches(*flow.remote.ip()))
+            .filter(|flow| matcher.matches(flow.remote.ip()))
             .cloned()
             .collect()
     }
@@ -324,6 +326,7 @@ impl StaleFlowReset for MockStaleFlowReset {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddrV4;
 
     const POOL: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 0);
 
@@ -352,10 +355,12 @@ mod tests {
 
     #[test]
     fn noop_lists_and_resets_nothing() {
-        assert!(NoopStaleFlowReset.established_flows_to(&[POOL]).is_empty());
+        assert!(NoopStaleFlowReset
+            .established_flows_to(&[IpAddr::V4(POOL)])
+            .is_empty());
         let flow = EstablishedFlow {
-            local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 50_000),
-            remote: SocketAddrV4::new(POOL, 443),
+            local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 50_000)),
+            remote: SocketAddr::V4(SocketAddrV4::new(POOL, 443)),
             owner: None,
             pid: None,
             image: None,
@@ -367,8 +372,8 @@ mod tests {
     fn mock_lists_only_flows_to_the_asked_addresses() {
         let mock = MockStaleFlowReset::new();
         let to = |ip: Ipv4Addr| EstablishedFlow {
-            local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 50_000),
-            remote: SocketAddrV4::new(ip, 443),
+            local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 50_000)),
+            remote: SocketAddr::V4(SocketAddrV4::new(ip, 443)),
             owner: Some("S-1-5-21-1-2-3-1001".into()),
             pid: None,
             image: None,
@@ -376,10 +381,10 @@ mod tests {
         let wanted = Ipv4Addr::new(203, 0, 113, 1);
         mock.set_flows(vec![to(wanted), to(Ipv4Addr::new(203, 0, 113, 2))]);
 
-        let listed = mock.established_flows_to(&[wanted]);
+        let listed = mock.established_flows_to(&[IpAddr::V4(wanted)]);
 
         assert_eq!(listed, vec![to(wanted)]);
-        assert_eq!(mock.queried(), vec![wanted]);
+        assert_eq!(mock.queried(), vec![IpAddr::V4(wanted)]);
         assert_eq!(mock.reset_established(&listed), 1);
         assert_eq!(mock.reset_flows(), listed);
     }
@@ -387,28 +392,46 @@ mod tests {
     #[test]
     fn a_network_target_matches_every_address_inside_it_and_nothing_outside() {
         let net = IpBlock::parse("203.0.113.0/28").expect("test network");
-        let targets = FlowTargets::new(vec![Ipv4Addr::new(198, 51, 100, 7)], vec![net]);
+        let targets = FlowTargets::new(vec![v4(198, 51, 100, 7)], vec![net]);
         let matcher = targets.matcher();
-        assert!(matcher.matches(Ipv4Addr::new(203, 0, 113, 0)));
-        assert!(matcher.matches(Ipv4Addr::new(203, 0, 113, 15)));
-        assert!(!matcher.matches(Ipv4Addr::new(203, 0, 113, 16)));
-        assert!(matcher.matches(Ipv4Addr::new(198, 51, 100, 7)));
-        assert!(!matcher.matches(Ipv4Addr::new(198, 51, 100, 8)));
+        assert!(matcher.matches(v4(203, 0, 113, 0)));
+        assert!(matcher.matches(v4(203, 0, 113, 15)));
+        assert!(!matcher.matches(v4(203, 0, 113, 16)));
+        assert!(matcher.matches(v4(198, 51, 100, 7)));
+        assert!(!matcher.matches(v4(198, 51, 100, 8)));
     }
 
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    fn v6(text: &str) -> IpAddr {
+        IpAddr::V6(text.parse().expect("test address"))
+    }
+
+    /// A v6 front of a rule host is a target like its v4 one, a v6 network
+    /// holds the flows inside it, and a v4 host never matches a v6 remote —
+    /// except the mapped form a dual-stack socket reaches it through.
     #[test]
-    fn an_ipv6_network_matches_no_listed_flow() {
-        let v6 = IpBlock::parse("::/0").expect("test network");
-        let targets = FlowTargets::new(Vec::new(), vec![v6]);
-        assert!(!targets.matcher().matches(Ipv4Addr::new(203, 0, 113, 1)));
+    fn ipv6_hosts_and_networks_match_their_own_family() {
+        let net6 = IpBlock::parse("2001:db8:1::/48").expect("test network");
+        let targets = FlowTargets::new(vec![v6("2001:db8::7"), v4(203, 0, 113, 1)], vec![net6]);
+        let matcher = targets.matcher();
+        assert!(matcher.matches(v6("2001:db8::7")));
+        assert!(!matcher.matches(v6("2001:db8::8")));
+        assert!(matcher.matches(v6("2001:db8:1::ffff")));
+        assert!(!matcher.matches(v6("2001:db8:2::1")));
+        assert!(!matcher.matches(v6("::ffff:203.0.113.2")));
+        assert!(matcher.matches(v6("::ffff:203.0.113.1")));
+        assert!(!matcher.matches(v4(203, 0, 113, 2)));
     }
 
     #[test]
     fn mock_lists_flows_into_an_asked_network() {
         let mock = MockStaleFlowReset::new();
         let to = |ip: Ipv4Addr| EstablishedFlow {
-            local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 50_000),
-            remote: SocketAddrV4::new(ip, 443),
+            local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 50_000)),
+            remote: SocketAddr::V4(SocketAddrV4::new(ip, 443)),
             owner: None,
             pid: None,
             image: None,
@@ -435,15 +458,36 @@ mod tests {
             Some(23),
             Some(28),
         );
-        assert_eq!(links.role_of(v4(1)), EgressRole::Primary);
-        assert_eq!(links.role_of(v4(2)), EgressRole::Secondary);
-        assert_eq!(links.role_of(v4(3)), EgressRole::Other);
-        assert_eq!(links.role_of(v4(9)), EgressRole::Unknown);
+        assert_eq!(links.role_of(IpAddr::V4(v4(1))), EgressRole::Primary);
+        assert_eq!(links.role_of(IpAddr::V4(v4(2))), EgressRole::Secondary);
+        assert_eq!(links.role_of(IpAddr::V4(v4(3))), EgressRole::Other);
+        assert_eq!(links.role_of(IpAddr::V4(v4(9))), EgressRole::Unknown);
         assert_eq!(
-            FlowLinks::default().role_of(v4(1)),
+            FlowLinks::default().role_of(IpAddr::V4(v4(1))),
             EgressRole::Unknown,
             "a reading that failed knows no link"
         );
+    }
+
+    /// An adapter's IPv6 addresses name its link as its IPv4 ones do, so a
+    /// v6 connection is not read as leaving through an unknown link.
+    #[test]
+    fn an_adapters_v6_address_names_the_same_link() {
+        let adapter = AdapterInfo {
+            index: 28,
+            adapter_name: "{tunnel}".to_string(),
+            description: "tunnel".to_string(),
+            friendly_name: "tunnel".to_string(),
+            mac: None,
+            interface_type: crate::adapters::InterfaceType::Tunnel,
+            oper_status: crate::adapters::IfOperStatus::Up,
+            ipv4_addresses: vec![Ipv4Addr::new(192, 0, 2, 2)],
+            ipv6_addresses: vec!["2001:db8::2".parse().expect("test address")],
+            gateways: Vec::new(),
+        };
+        let links = FlowLinks::from_adapters(&[adapter], Some(23), Some(28));
+        assert_eq!(links.role_of(v6("2001:db8::2")), EgressRole::Secondary);
+        assert_eq!(links.role_of(v6("2001:db8::3")), EgressRole::Unknown);
     }
 
     #[test]

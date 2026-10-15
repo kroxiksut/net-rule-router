@@ -581,6 +581,16 @@ impl AddressOwnership {
             .copied()
     }
 
+    /// Whether a rule names anything inside `block`: an address, literally or
+    /// through a host, an address a Block names, or a network that meets it.
+    /// A local network holding one would carry that rule's traffic past it.
+    #[must_use]
+    pub fn names_inside(&self, block: IpBlock) -> bool {
+        !self.explicit_inside(block).is_empty()
+            || self.literal_blocks.keys().any(|ip| block.contains(*ip))
+            || self.networks.sorted.iter().any(|net| net.overlaps(block))
+    }
+
     /// The narrowest network of `link`'s holding `ip`.
     #[must_use]
     pub fn network_of(&self, ip: IpAddr, link: Link) -> Option<IpBlock> {

@@ -50,6 +50,29 @@ pub(crate) fn nameservers(text: &str) -> Vec<Ipv4Addr> {
     servers
 }
 
+/// The IPv6 `nameserver` addresses, in file order. Link-local ones are left
+/// out: without the scope id the file does not carry, nothing can reach them.
+#[must_use]
+pub(crate) fn nameservers_v6(text: &str) -> Vec<std::net::Ipv6Addr> {
+    let mut servers = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some(rest) = line.strip_prefix("nameserver") else {
+            continue;
+        };
+        let Ok(server) = rest.trim().parse::<std::net::Ipv6Addr>() else {
+            continue;
+        };
+        if server.is_loopback() || server.is_unspecified() || server.is_unicast_link_local() {
+            continue;
+        }
+        if !servers.contains(&server) {
+            servers.push(server);
+        }
+    }
+    servers
+}
+
 /// `servers` without the ones on this machine. A loopback server is our own
 /// listener or a local cache (dnsmasq, unbound, resolved's stub) that forwards
 /// to whatever `resolv.conf` names — us, once redirected — so forwarding to it
@@ -337,6 +360,16 @@ impl SystemDnsServersPort for ResolvConfFileServers {
         forwardable(nameservers(&self.system_text()))
             .into_iter()
             .map(|s| UpstreamDnsCandidate::new(None, s))
+            .collect()
+    }
+
+    fn upstream_candidates_v6(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        nameservers_v6(&self.system_text())
+            .into_iter()
+            .map(|s| nrr_platform_api::dns::UpstreamDnsServer {
+                interface_index: None,
+                server: std::net::IpAddr::V6(s),
+            })
             .collect()
     }
 }

@@ -26,6 +26,8 @@ use nrr_platform_api::fake_ip::{
 };
 
 use crate::dns_resolver::ScopedFakeIpAnswerer;
+use crate::service_tasks::ServiceTaskKind;
+use crate::task_liveness::{TaskLiveness, ThreadExit, Watch};
 
 use super::dialer::RelayDialer;
 use super::relay::{RelayCore, RouteSelector, UpstreamAddressResolver};
@@ -330,6 +332,8 @@ struct ControllerInner {
     disarmed: bool,
     /// Shared datapath pulse the watchdog reads (answers vs. ingress).
     health: Option<Arc<super::health::FakeIpHealth>>,
+    /// Where the stack thread reports its exit.
+    liveness: Option<Arc<TaskLiveness>>,
     watchdog: WatchdogState,
     /// Stack threads that ignored the stop grace and were detached — a wedged
     /// TUN datapath can hold `join()` (and this controller's mutex) for
@@ -428,6 +432,11 @@ impl FakeIpController {
         self.lock().health = Some(health);
     }
 
+    /// Report the stack thread's exit to `liveness`.
+    pub fn set_liveness(&self, liveness: Arc<TaskLiveness>) {
+        self.lock().liveness = Some(liveness);
+    }
+
     /// Reconcile to `enabled`: `true` → ensure running, `false` → ensure stopped.
     pub fn apply(&self, enabled: bool) {
         if enabled {
@@ -486,17 +495,31 @@ impl FakeIpController {
         let stop = Arc::new(AtomicBool::new(false));
         let control = stack.control();
         let thread_stop = Arc::clone(&stop);
+        let liveness = inner.liveness.clone();
         let join = std::thread::spawn(move || {
+            // The loop blocks in the device read for as long as it likes; only
+            // its exit is watched.
+            let lease = liveness
+                .as_ref()
+                .map(|l| l.lease(ServiceTaskKind::FakeIpStack, None, Watch::None));
             // A device error ends the loop — and under an armed block-all a
             // silently dead relay blacks out the whole machine, so the exit
             // itself must be loud.
-            if let Err(e) = stack.run(&thread_stop) {
-                tracing::warn!(
-                    target: "nrr::fake-ip",
-                    msg_key = "fakeip-run-loop-exited",
-                    error = %e,
-                    "fake-IP stack run loop exited on a device error — relay is DOWN until restarted",
-                );
+            let exit = match stack.run(&thread_stop) {
+                Ok(()) if thread_stop.load(Ordering::SeqCst) => ThreadExit::Stopped,
+                Ok(()) => ThreadExit::Ended("run loop returned without a stop".to_owned()),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "nrr::fake-ip",
+                        msg_key = "fakeip-run-loop-exited",
+                        error = %e,
+                        "fake-IP stack run loop exited on a device error — relay is DOWN until restarted",
+                    );
+                    ThreadExit::Ended(format!("device error: {e}"))
+                }
+            };
+            if let Some(lease) = lease {
+                lease.finish(exit);
             }
         });
         inner.running = Some(RunningStack {

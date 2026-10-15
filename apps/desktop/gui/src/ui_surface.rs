@@ -888,11 +888,12 @@ pub fn write_qt_context_file_at(
         // cache; see `crate::update_check`). `null` when up to date / never
         // checked / cache unreadable / the check is switched off — the QML
         // notification only fires on a concrete newer version.
-        "updateCheck": preferences
-            .update_check_enabled
+        "updateCheck": (crate::update_check::UPDATE_CHECK_AVAILABLE
+            && preferences.update_check_enabled)
             .then(|| crate::update_check::update_available(env!("CARGO_PKG_VERSION")))
             .flatten()
             .map(|(version, url)| json!({ "latestVersion": version, "url": url })),
+        "updateCheckAvailable": crate::update_check::UPDATE_CHECK_AVAILABLE,
         // The frequency dropdown offers exactly what the preference accepts.
         "updateCheckIntervalChoices":
             nrr_ui_support::ui_preferences::UPDATE_CHECK_INTERVAL_DAYS_CHOICES,

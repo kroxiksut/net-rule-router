@@ -23,6 +23,11 @@ use std::env;
 
 use nrr_service_runtime::service_runtime_orchestration_snapshot;
 
+// A panic on foreign bytes is contained by unwinding; under abort one bad
+// packet would stop the service and lift its protection.
+#[cfg(panic = "abort")]
+compile_error!("the service must be built with panic = \"unwind\"");
+
 #[cfg(windows)]
 mod console_ctrl;
 #[cfg(windows)]
@@ -265,6 +270,12 @@ fn main() -> std::process::ExitCode {
         // Backs the `scripts/reset-network.ps1` wrapper.
         #[cfg(windows)]
         "cleanup" => runtime_deps::run_offline_reset(),
+        // The same reset for a service that still runs: a clean stop, the
+        // process ended if it hangs, then the sweep.
+        #[cfg(windows)]
+        nrr_platform_api::service_control::STOP_AND_CLEANUP_VERB => {
+            runtime_deps::run_stop_and_cleanup()
+        }
         // SCM runs this once the crash restarts are spent.
         #[cfg(windows)]
         "after-crash" => runtime_deps::run_after_crash(),
@@ -598,21 +609,13 @@ fn run_console() -> std::process::ExitCode {
         "crash recovery probe complete",
     );
     let mut artifacts = artifacts;
-    if let nrr_service_runtime::CrashRecoveryOutcome::ManualActionRequired { .. }
-    | nrr_service_runtime::CrashRecoveryOutcome::Aborted { .. } = recovery_outcome
-    {
-        // Block the runtime from going Running. The
-        // supervisor's `run_supervised_runtime` checks
-        // `artifacts.is_ready_to_run()` and walks straight to
-        // `RecoveryRequired` when blocking is set.
-        artifacts.report.blocking = true;
-    }
+    // A blocking outcome walks the runtime straight to `RecoveryRequired`;
+    // a stale marker only adds a warning to the health card.
+    recovery_outcome.record_in(&mut artifacts.report);
 
-    // Persist-on-stop — defensive standalone strip of any orphaned
-    // block/fail-closed/kill-switch WFP filter a hard-killed prior instance
-    // left behind. Runs before deps are built so a kill-switch is removed even
-    // on a recovery-BLOCKED boot (where the orchestrator — and its own startup
-    // strip — is never constructed). Idempotent on a healthy boot.
+    // The blocks a hard-killed prior instance left behind: stripped before
+    // deps are built only when nobody has leak protection on; otherwise they
+    // hold until the first pass adopts them (`lifecycle_matrix`).
     #[cfg(windows)]
     runtime_deps::strip_orphaned_block_filters_standalone();
 

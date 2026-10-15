@@ -19,6 +19,12 @@ pub enum Command {
     RestoreDns,
     /// Undo everything a dead daemon left on the machine: DNS, nft, routes.
     Cleanup,
+    /// The same undo for a daemon that still runs: stopped first, killed when
+    /// it hangs.
+    StopAndCleanup,
+    /// The unit's last word once the restarts are spent: DNS is handed back,
+    /// and the policy goes too unless someone's leak protection keeps it.
+    AfterCrash,
     /// `package-files <DIR>` — write the install footprint a distribution
     /// package ships under DIR, for the packaging script.
     PackageFiles,
@@ -45,6 +51,8 @@ pub fn parse_command(args: &[String]) -> Command {
         "status" => Command::Status,
         "restore-dns" => Command::RestoreDns,
         "cleanup" => Command::Cleanup,
+        "stop-and-cleanup" => Command::StopAndCleanup,
+        "after-crash" => Command::AfterCrash,
         "package-files" => Command::PackageFiles,
         "help" | "h" | "" => Command::Help,
         other => Command::Unknown(other.to_string()),
@@ -68,6 +76,16 @@ mod tests {
         assert_eq!(
             parse(&[nrr_platform_linux::systemd::DAEMON_RESTORE_DNS_VERB]),
             Command::RestoreDns
+        );
+    }
+
+    /// The console's `reset-network --stop-service` runs this word.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_console_stop_and_reset_verb_is_one_this_daemon_knows() {
+        assert_eq!(
+            parse(&[nrr_platform_api::service_control::STOP_AND_CLEANUP_VERB]),
+            Command::StopAndCleanup
         );
     }
 
@@ -104,6 +122,11 @@ mod tests {
         assert_eq!(parse(&["--run"]), Command::Run);
         assert_eq!(parse(&["--INSTALL"]), Command::Install);
         assert_eq!(parse(&["-h"]), Command::Help);
+    }
+
+    #[test]
+    fn the_failure_hook_has_its_own_verb() {
+        assert_eq!(parse(&["after-crash"]), Command::AfterCrash);
     }
 
     #[test]

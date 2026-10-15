@@ -142,7 +142,8 @@ fn upstream_reader_survives_timeouts_and_exits_on_dead() {
             reader: Box::new(StallingReader),
             writer: Box::new(SinkWriter),
         },
-    );
+    )
+    .expect("spawn workers");
     std::thread::sleep(std::time::Duration::from_millis(60));
     assert!(
         !shared.upstream_eof.load(Ordering::SeqCst),
@@ -198,7 +199,8 @@ fn a_hard_upstream_read_error_is_a_reset_not_an_eof() {
             reader: Box::new(ResettingReader),
             writer: Box::new(SinkWriter),
         },
-    );
+    )
+    .expect("spawn workers");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !shared.upstream_was_reset() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -317,7 +319,8 @@ fn a_reader_parks_while_the_client_bound_queue_is_full() {
             reader: Box::new(FloodingReader),
             writer: Box::new(SinkWriter),
         },
-    );
+    )
+    .expect("spawn workers");
     // Nobody drains: the queue must settle just past the high-water mark
     // (one chunk of overshoot), not keep growing.
     std::thread::sleep(std::time::Duration::from_millis(120));
@@ -611,6 +614,7 @@ impl Device for PipeClientDevice {
 
 mod echo_relay;
 mod end_to_end;
+mod hostile_peer;
 mod instant_rst;
 mod poll_cost;
 mod port_unreachable;

@@ -9,6 +9,7 @@ The workspace baseline is green when all of the following pass:
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
 - `cargo deny check advisories licenses bans sources`
+- `qmllint` over every published `.qml` file prints no `[syntax]` line (skipped with a warning when Qt is absent locally; CI requires it)
 
 Use `scripts/check.ps1` as the canonical local entrypoint for these checks.
 

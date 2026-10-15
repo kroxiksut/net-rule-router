@@ -198,6 +198,26 @@ pub fn parse_packet(body: &[u8]) -> Result<DroppedPacket, PacketRejection> {
     })
 }
 
+/// One received datagram, walked exactly as the observer's reader thread walks
+/// it. Exists only for the fuzz target: the walk itself is crate-private.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_datagram(datagram: &[u8]) {
+    for (message_type, body) in messages(datagram) {
+        match message_type {
+            NFULNL_PACKET => {
+                if let Ok(packet) = parse_packet(body) {
+                    let _ = reported_tag(packet.tag, &packet.remote);
+                }
+            }
+            NLMSG_ERROR => {
+                let _ = error_code(body);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The tag a consumer should read. On Windows IPv6 is closed by its own
 /// filter; here the block-all is family-less and drops IPv6 first, so an IPv6
 /// packet it dropped is the same news as the Windows IPv6 cut.

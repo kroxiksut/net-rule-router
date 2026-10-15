@@ -100,20 +100,21 @@ mod types;
 pub use types::{
     ActiveRulesSnapshot, NoopPerSidApplyAudit, NoopRulesProvider, OrchestratorError,
     PerSidApplyAudit, PerSidApplyAuditKind, PerSidApplyAuditRecord, PerSidBehaviorMode,
-    PerSidBinding, PerSidPolicySnapshot, RoutePolicySource, RulesProvider,
+    PerSidBinding, PerSidPolicySnapshot, RoutePolicySource, RulesProvider, RulesRead,
 };
 
 mod compute;
+pub(crate) use compute::behavior_mode_for_codegen;
 use compute::*;
-pub use compute::{PerSidFilterSet, SidApplyPreview};
+pub use compute::{behavior_mode_of, PerSidFilterSet, SidApplyPreview};
 
 mod state;
 use state::*;
 pub use state::{
-    FailClosedExemptionsResolver, FakeIpContextProvider, FilterFailureModeSource,
-    FlowLinksResolver, Ipv6GuardResolver, KillSwitchResolver, MachineReader,
-    PerSidApplyOrchestrator, PrimaryDnsServersFn, RouteSyncHook, RoutedElsewhereFn, RoutingOwnerFn,
-    ServiceAccountWiring, UnresolvedHostsSink, VpnClientAppsProvider,
+    EnforcedSidsSource, FailClosedExemptionsResolver, FakeIpContextProvider,
+    FilterFailureModeSource, FlowLinksResolver, Ipv6GuardResolver, KillSwitchResolver,
+    MachineReader, PerSidApplyOrchestrator, PrimaryDnsServersFn, RouteSyncHook, RoutedElsewhereFn,
+    RoutingOwnerFn, ServiceAccountWiring, UnresolvedHostsSink, VpnClientAppsProvider,
 };
 
 mod posture;

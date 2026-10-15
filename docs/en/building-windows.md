@@ -144,12 +144,16 @@ kept, and the app links the same Qt libraries a user runs. Set
 ### Quality checks (for contributors)
 
 ```powershell
-# fmt + clippy + tests + license/dependency audit
+# QML syntax (qmllint) + fmt + clippy + tests + license/dependency audit
 powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
 ```
 
 For the `-RequireCargoDeny` flag you need [cargo-deny](https://github.com/EmbarkStudios/cargo-deny):
 `cargo install cargo-deny`. Without it — the same script without the flag.
+
+The QML check uses `qmllint` from the same Qt the build finds (`CMAKE_PREFIX_PATH`,
+otherwise the newest under `C:\Qt`). Without Qt it is skipped with a warning;
+`-RequireQmlLint` makes that a failure, and `-QmlLintOnly` runs the QML check alone.
 
 ## Environment variables
 

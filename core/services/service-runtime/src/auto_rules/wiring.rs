@@ -38,6 +38,7 @@ impl AutoRulesEngine {
             refusing_anchors: None,
             main_link_pass_enabled: None,
             primary_behavior_of: None,
+            behavior_mode_for: None,
             evidence_store: None,
             evidence_saved_at: Mutex::new(HashMap::new()),
             twin_cleanup: Mutex::new(HashMap::new()),
@@ -139,6 +140,15 @@ impl AutoRulesEngine {
     #[must_use]
     pub fn with_primary_behavior_source(mut self, source: PrimaryBehaviorFn) -> Self {
         self.primary_behavior_of = Some(source);
+        self
+    }
+
+    /// Wire the principal's behaviour mode. Without it every principal reads
+    /// as prefer-main, and a user whose unmatched traffic already takes the
+    /// additional route is offered moves that change nothing.
+    #[must_use]
+    pub fn with_behavior_mode_source(mut self, source: BehaviorModeFn) -> Self {
+        self.behavior_mode_for = Some(source);
         self
     }
 

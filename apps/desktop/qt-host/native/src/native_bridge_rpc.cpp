@@ -160,6 +160,15 @@ QString NrrNativeBridge::rpcDohResolversSet(const QString &resolversJson) {
     return emitRpcRequest(QStringLiteral("doh.resolvers.set"), obj);
 }
 
+QString NrrNativeBridge::rpcLocalDnsSuffixesGet() {
+    return emitRpcRequest(QStringLiteral("dns.local-suffixes.get"), QJsonObject());
+}
+
+QString NrrNativeBridge::rpcLocalDnsSuffixesSet(const QVariantMap &payload) {
+    return emitRpcRequest(QStringLiteral("dns.local-suffixes.set"),
+                          QJsonObject::fromVariantMap(payload));
+}
+
 QString NrrNativeBridge::rpcBrokerRevoke() {
     return emitRpcRequest(QStringLiteral("local.broker-revoke"), QJsonObject());
 }

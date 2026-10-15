@@ -181,6 +181,10 @@ impl AppPathResolver for PersistentAppPathResolver {
     fn sibling_executables(&self, exe: &std::path::Path) -> Vec<PathBuf> {
         self.inner.sibling_executables(exe)
     }
+
+    fn is_protected_install(&self, exe: &std::path::Path) -> bool {
+        self.inner.is_protected_install(exe)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

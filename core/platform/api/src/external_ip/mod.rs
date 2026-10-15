@@ -24,6 +24,10 @@
 mod probe;
 mod stun;
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use stun::{parse_binding_response, TransactionId};
+
 use std::net::Ipv4Addr;
 
 use nrr_shared::ExternalIpStatus;

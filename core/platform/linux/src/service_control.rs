@@ -41,6 +41,8 @@ const WATCHDOG_SEC: u32 = 30;
 
 /// How often the state after `start` / `stop` is re-checked while waiting.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// How long a killed unit takes to read as inactive.
+const KILL_SETTLE: Duration = Duration::from_secs(10);
 
 // ── The side-effect seam ─────────────────────────────────────────────────────
 
@@ -618,6 +620,14 @@ impl ServiceControlPort for LinuxServiceControl {
         self.await_state(false, timeout, "stop")
     }
 
+    fn kill(&self) -> Result<(), ServiceControlError> {
+        if self.query()?.is_none() {
+            return Err(ServiceControlError::NotInstalled);
+        }
+        self.run_checked(&systemctl(&["kill", "--signal=SIGKILL", SYSTEMD_UNIT_NAME]))?;
+        self.await_state(false, KILL_SETTLE, "kill")
+    }
+
     fn query(&self) -> Result<Option<ServiceStatusReport>, ServiceControlError> {
         let argv = systemctl(&[
             "show",
@@ -642,6 +652,13 @@ pub fn package_install_plan() -> SystemdInstallPlan {
     let spec = ServiceInstallSpec::production_defaults(installed_daemon_path());
     let mut plan = plan_install(&unit_config(&spec), UnitActivation::LeaveDisabled);
     plan.unit_path = Path::new(PACKAGE_UNIT_DIRS[0]).join(SYSTEMD_UNIT_NAME);
+    // The failure unit ships beside the main one.
+    let after_crash = crate::systemd::after_crash_unit_name();
+    for file in &mut plan.additional_files {
+        if file.path.ends_with(&after_crash) {
+            file.path = Path::new(PACKAGE_UNIT_DIRS[0]).join(&after_crash);
+        }
+    }
     plan.post_write_commands.clear();
     plan
 }
@@ -983,6 +1000,7 @@ mod tests {
                 "write /etc/systemd/system/netrulerouter.service 644".to_string(),
                 "write /etc/logrotate.d/netrulerouter 644".to_string(),
                 "write /usr/share/polkit-1/actions/netrulerouter.policy 644".to_string(),
+                "write /etc/systemd/system/netrulerouter-after-crash.service 644".to_string(),
                 "link /usr/libexec/netrulerouter/nrr-service -> /usr/libexec/netrulerouter/nrr-serviced"
                     .to_string(),
                 "run systemctl daemon-reload".to_string(),
@@ -1098,6 +1116,7 @@ mod tests {
             vec![
                 PathBuf::from("/etc/logrotate.d/netrulerouter"),
                 PathBuf::from("/usr/share/polkit-1/actions/netrulerouter.policy"),
+                PathBuf::from("/usr/lib/systemd/system/netrulerouter-after-crash.service"),
             ]
         );
         assert_eq!(
@@ -1180,6 +1199,7 @@ mod tests {
                 "remove /etc/systemd/system/netrulerouter.service".to_string(),
                 "remove /etc/logrotate.d/netrulerouter".to_string(),
                 "remove /usr/share/polkit-1/actions/netrulerouter.policy".to_string(),
+                "remove /etc/systemd/system/netrulerouter-after-crash.service".to_string(),
                 "remove /usr/libexec/netrulerouter/nrr-service".to_string(),
                 "run systemctl daemon-reload".to_string(),
             ]

@@ -216,9 +216,6 @@ QtObject {
         }
         if (kept.length !== _pushNotices.length) _pushNotices = kept
     }
-    // Set by RoutingSettings._reseedTogglesFromPrefs when it
-    // restores an enabled kill-switch the service had lost; cleared on dismiss.
-    property bool killSwitchRestoredNoticeActive: false
     readonly property int notificationCount: root.activeNotifications.length
     // Highest severity present drives the footer chip colour.
     readonly property string notificationTopSeverity: {
@@ -240,7 +237,11 @@ QtObject {
         else if (actionKey === "verify-verdicts-move") root.moveVerifyVerdicts()
         else if (actionKey === "verify-verdicts-later") root.dismissVerifyVerdicts()
         else if (actionKey === "open-routing-settings") root.section = "settings"
+        else if (actionKey === "open-restore-network") root.focusSetting("restore-network", {})
+        else if (actionKey === "open-forwarded-traffic") root.focusSetting("forwarded-traffic", {})
         else if (actionKey === "restore-settings") root.settingsRestoreController.restore()
+        else if (actionKey === "trust-vpn-client") root._trustVpnClient(actionArg, false)
+        else if (actionKey === "trust-vpn-client-bundle") root._trustVpnClient(actionArg, true)
         else if (actionKey === "open-release-page") {
             // The release the notice names; else the project's releases page.
             var u = (root.updateCheckController.offer || {}).url || ""
@@ -287,8 +288,6 @@ QtObject {
             // across GUI restarts until a NEW unresolved app appears.
             root.updatePrefs({ unenforcedAppsAckSig: root._unenforcedAppRulesAckSig })
             root.emitPrefs()
-        } else if (notificationId === "kill-switch-restored") {
-            killSwitchRestoredNoticeActive = false
         } else if (notificationId === "update-available") {
             // Remembered by version: the notice comes back only for a release
             // other than the one dismissed.

@@ -1021,6 +1021,51 @@ fn strict_secondary_fail_closed_emits_block_catch_all() {
     );
 }
 
+/// With IPv6 in play the default block has a twin on the v6 layer: Strict
+/// closes the family too, or every v6 flow to an unnamed host leaves.
+#[test]
+fn strict_default_block_has_a_v6_twin_when_the_family_is_in_scope() {
+    let cache = MockFqdnCacheLookup::new();
+    let rule_book = book(vec![], vec![]);
+    let out = generate_filters(CodegenInput {
+        sid: "S",
+        rule_book: &rule_book,
+        behavior_mode: RouteBehaviorMode::StrictSecondaryFailClosed,
+        fqdn_cache: &cache,
+        app_observations: &MockAppObservationLookup::new(),
+        app_resolver: &NoopAppPathResolver,
+        secondary_ip_denylist: &std::collections::HashSet::new(),
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        families: crate::enforcement_planner::FamilyScope::Both,
+        packet_blocks: true,
+    });
+    assert_eq!(out.filters.len(), 2, "one default block per family");
+    let v6 = out
+        .filters
+        .iter()
+        .find(|f| f.layer == WfpLayerKey::AleAuthConnectV6)
+        .expect("the v6 twin");
+    assert_eq!(v6.action, WfpAction::Block);
+    assert_eq!(v6.weight, DEFAULT_BLOCK_WEIGHT);
+    assert!(v6.remote_ip_set_v6.is_empty() && v6.remote_subnet_v6.is_none());
+    assert_eq!(v6.user_sid.as_deref(), Some("S"));
+    assert_ne!(
+        out.filters[0].id, out.filters[1].id,
+        "a twin needs its own id"
+    );
+    assert_eq!(
+        out.diagnostics,
+        vec![CodegenDiagnostic::FailClosedDefaultEmitted],
+        "one default, two layers"
+    );
+    assert_eq!(
+        default_block_ids("S"),
+        [out.filters[0].id.raw, out.filters[1].id.raw],
+        "the drop classifier must recognise both halves"
+    );
+}
+
 #[test]
 fn prefer_primary_does_not_emit_default_block() {
     let cache = MockFqdnCacheLookup::new();

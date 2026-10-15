@@ -7,6 +7,7 @@
 //! so they share the overlay too, and no wiring can hand a reader a different
 //! instance. An in-memory database has no path and never overlays.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
@@ -83,9 +84,73 @@ pub(crate) fn publish(conn: &Connection, principal: &str, rules_json: &str) -> O
     }
 }
 
-/// The rules-JSON being applied for exactly `principal`, if any.
+/// A revision one thread plans with before it is applied.
+struct Preview {
+    key: String,
+    principal: String,
+    rules_json: Arc<str>,
+}
+
+thread_local! {
+    // Per thread so a pre-flight plans with the candidate while every other
+    // reader — ticks, route hooks — keeps what is in force.
+    static PREVIEW: RefCell<Option<Preview>> = const { RefCell::new(None) };
+}
+
+/// Withdraws this thread's preview on drop.
+#[must_use = "the preview is withdrawn when the guard drops"]
+pub(crate) struct PreviewGuard {
+    armed: bool,
+}
+
+impl Drop for PreviewGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            PREVIEW.with(|p| *p.borrow_mut() = None);
+        }
+    }
+}
+
+/// Serve `rules_json` as `principal`'s rules to reads on THIS thread only,
+/// until the guard drops. Readers on other threads are unaffected, so nothing
+/// can enforce a revision that is only being checked.
+pub(crate) fn preview_on_this_thread(
+    conn: &Connection,
+    principal: &str,
+    rules_json: &str,
+) -> PreviewGuard {
+    let Some(key) = key_of(conn) else {
+        return PreviewGuard { armed: false };
+    };
+    PREVIEW.with(|p| {
+        *p.borrow_mut() = Some(Preview {
+            key,
+            principal: principal.to_owned(),
+            rules_json: Arc::from(rules_json),
+        });
+    });
+    PreviewGuard { armed: true }
+}
+
+/// Whether this thread is planning with a previewed revision: what it finds
+/// is not in force and must not be published as if it were.
+pub(crate) fn previewing() -> bool {
+    PREVIEW.with(|p| p.borrow().is_some())
+}
+
+/// The rules-JSON being applied for exactly `principal`, if any; on a thread
+/// previewing a revision, that one.
 pub(crate) fn applying_for(conn: &Connection, principal: &str) -> Option<Arc<str>> {
     let key = key_of(conn)?;
+    let previewed = PREVIEW.with(|p| {
+        p.borrow()
+            .as_ref()
+            .filter(|v| v.key == key && v.principal == principal)
+            .map(|v| Arc::clone(&v.rules_json))
+    });
+    if previewed.is_some() {
+        return previewed;
+    }
     let map = registry().read().unwrap_or_else(PoisonError::into_inner);
     map.get(&key)
         .filter(|e| e.principal == principal)
@@ -143,6 +208,27 @@ mod tests {
         assert!(published > before);
         drop(guard);
         assert!(changes() > published);
+    }
+
+    #[test]
+    fn a_preview_is_served_on_its_own_thread_only_until_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = file_conn(&dir, "state.db");
+        let guard = preview_on_this_thread(&conn, "S-A", "{candidate}");
+        assert!(previewing());
+        assert_eq!(applying_for(&conn, "S-A").as_deref(), Some("{candidate}"));
+        assert_eq!(applying_for(&conn, "S-B"), None);
+        let path = dir.path().join("state.db");
+        let elsewhere = std::thread::spawn(move || {
+            let other = Connection::open(path).expect("open");
+            (previewing(), applying_for(&other, "S-A"))
+        })
+        .join()
+        .expect("reader thread");
+        assert_eq!(elsewhere, (false, None), "another thread saw the preview");
+        drop(guard);
+        assert!(!previewing());
+        assert_eq!(applying_for(&conn, "S-A"), None);
     }
 
     #[test]

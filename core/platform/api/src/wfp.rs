@@ -44,7 +44,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    error::{ErrorClass, PlatformError},
+    error::{ErrorClass, MutationIntent, PlatformError},
     types::{
         WfpAction, WfpEngineToken, WfpFilterAction, WfpFilterId, WfpFilterRecord, WfpFilterSpec,
     },
@@ -309,14 +309,12 @@ impl WfpSession {
                             );
                             return Err(e);
                         }
-                        Err(e)
-                            if e.classify() == ErrorClass::Idempotent
-                                || e.classify() == ErrorClass::Conflict =>
-                        {
-                            // Already present — idempotent success. Safe ONLY
-                            // because the sub-layer stage was ruled out above:
-                            // this error is now provably about the filter itself.
-                        }
+                        // Already present — success. Safe ONLY because the
+                        // sub-layer stage was ruled out above: this error is now
+                        // provably about the filter itself. Classified as an
+                        // ADD, so a "not found" (a missing sub-layer or callout)
+                        // is the failure it is, never a phantom install.
+                        Err(e) if e.classify_for(MutationIntent::Add) == ErrorClass::Conflict => {}
                         Err(e) if e.is_unmaterializable_filter() => match mode {
                             // A single filter that can't be materialized
                             // (absent app, degenerate app-id blob, rejected

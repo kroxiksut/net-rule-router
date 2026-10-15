@@ -70,6 +70,24 @@ impl AppPathResolver for LinuxAppPathResolver {
         .take(SIBLING_MAX_PATHS)
         .collect()
     }
+
+    fn is_protected_install(&self, exe: &std::path::Path) -> bool {
+        root_owned(exe)
+    }
+}
+
+/// Root owns the file and the directory it sits in: what a package manager
+/// leaves behind, and not what a user can drop into their own home.
+#[cfg(target_os = "linux")]
+fn root_owned(exe: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let owned = |path: &std::path::Path| std::fs::metadata(path).is_ok_and(|m| m.uid() == 0);
+    owned(exe) && exe.parent().is_some_and(owned)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn root_owned(_exe: &std::path::Path) -> bool {
+    false
 }
 
 /// Install-tree walk limits — same reasoning as the Windows backend: deep

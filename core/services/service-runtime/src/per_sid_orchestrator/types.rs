@@ -77,6 +77,9 @@ pub struct PerSidPolicySnapshot {
     /// [`DohLockdownScope::LeakProtectionOnly`] (only while the kill-switch master
     /// toggle is on) or [`DohLockdownScope::Always`].
     pub doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope,
+    /// The lockdown decides itself from the rule book (see
+    /// [`crate::doh_lockdown_policy`]); the two fields above then say nothing.
+    pub doh_lockdown_auto: bool,
     /// The ALREADY-RESOLVED resolver addresses to block, both families
     /// (literal entries as-is + host entries through the FQDN cache), resolved
     /// by the composition root so the orchestrator stays mechanism-free. Empty
@@ -108,6 +111,10 @@ pub struct PerSidPolicySnapshot {
     /// other link's address rules name. Off by default. Read by the
     /// address-ownership arbiter and the per-app kill-switch.
     pub app_rules_take_all_addresses: bool,
+    /// Traffic the machine forwards (WSL, Docker Desktop) gets this user's
+    /// leak guard while the tunnel is down. Off only when the user chose to
+    /// leave it unprotected.
+    pub guard_forwarded_traffic: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,13 +148,12 @@ pub trait RoutePolicySource: Send + Sync {
     fn load_for_sid(&self, sid: &str) -> Option<PerSidPolicySnapshot>;
 }
 
-/// Snapshot of the currently-active rules revision plus its
-/// behaviour mode. Fed into the WFP codegen on every install /
-/// recompile pass.
+/// Snapshot of the currently-active rules revision. Fed into the WFP
+/// codegen on every install / recompile pass; the behaviour mode comes
+/// from the per-user policy, not from here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveRulesSnapshot {
     pub rule_book: CanonicalRuleBook,
-    pub behavior_mode: RouteBehaviorMode,
 }
 
 /// Trait the orchestrator uses to read the currently-active rules
@@ -162,6 +168,18 @@ pub struct ActiveRulesSnapshot {
 /// `StrictSecondaryFailClosed → Block`) still runs only if rules
 /// are available; without rules the orchestrator is effectively
 /// pass-through.
+/// What a rules read found. A book that could not be read is not an empty
+/// one: nothing is removed on its account.
+#[derive(Clone, Debug)]
+pub enum RulesRead {
+    Rules(ActiveRulesSnapshot),
+    /// The principal has no book, and no baseline to read through to.
+    NoPolicy,
+    /// The book exists but could not be read or decoded; the reason is for
+    /// the log and the health card.
+    Unreadable(String),
+}
+
 pub trait RulesProvider: Send + Sync {
     fn active_rules(&self) -> Option<ActiveRulesSnapshot>;
 
@@ -180,6 +198,16 @@ pub trait RulesProvider: Send + Sync {
     /// with read-through to the baseline (lazy divergence).
     fn active_rules_for(&self, _principal: &str) -> Option<ActiveRulesSnapshot> {
         self.active_rules()
+    }
+
+    /// [`Self::active_rules_for`] that tells "no policy" from "could not
+    /// read". Only the first may remove enforcement; the second keeps the
+    /// last applied set in force. Fixtures never fail to read.
+    fn rules_read_for(&self, principal: &str) -> RulesRead {
+        match self.active_rules_for(principal) {
+            Some(snapshot) => RulesRead::Rules(snapshot),
+            None => RulesRead::NoPolicy,
+        }
     }
 
     /// The principal's rules exactly as stored, for a caller that writes them
@@ -279,9 +307,15 @@ pub enum OrchestratorError {
     /// has an `S-…` SID, so this only fires on a programming error.
     BaselineNotRoutable,
     /// WFP plan execution failed. Carries the platform error formatted
-    /// for audit/log; structured propagation lands in 16.8.3.4 along
-    /// with health/audit wiring.
+    /// for audit/log.
     WfpFailed(String),
+    /// The decider could not say who holds a filter set (a pause-flag read
+    /// failed). Nothing was touched: an unknown answer must never strip a
+    /// guard, and must never reinstall a paused user's.
+    MembershipUnknown(String),
+    /// The principal's rule book could not be read or decoded. Nothing was
+    /// touched: what is installed stays until the book reads again.
+    RulesUnreadable(String),
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -292,6 +326,10 @@ impl std::fmt::Display for OrchestratorError {
                 write!(f, "baseline principal is not a routable per-SID target")
             }
             Self::WfpFailed(m) => write!(f, "wfp plan failed: {m}"),
+            Self::RulesUnreadable(m) => write!(f, "rule book unreadable, nothing changed: {m}"),
+            Self::MembershipUnknown(m) => {
+                write!(f, "who holds a filter set could not be decided: {m}")
+            }
         }
     }
 }

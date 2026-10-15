@@ -21,6 +21,7 @@ fn a_foreign_tunnel_keeps_carrying_its_own_traffic_under_the_block_all() {
         foreign_tunnel_luids: vec![FOREIGN],
         primary_dest_ips: Vec::new(),
         allow_dns_over_primary: false,
+        dns_servers: Vec::new(),
         known_direct_ips: Vec::new(),
         probe_target_ips: Vec::new(),
         secondary_luid: LUID,
@@ -62,6 +63,7 @@ fn our_own_tunnel_is_not_permitted_twice() {
         foreign_tunnel_luids: vec![LUID],
         primary_dest_ips: Vec::new(),
         allow_dns_over_primary: false,
+        dns_servers: Vec::new(),
         known_direct_ips: Vec::new(),
         probe_target_ips: Vec::new(),
         secondary_luid: LUID,
@@ -110,6 +112,7 @@ fn every_emitted_filter_is_expressible_at_its_layer() {
         foreign_tunnel_luids: Vec::new(),
         primary_dest_ips: vec![ip(198, 51, 100, 200)],
         allow_dns_over_primary: true,
+        dns_servers: Vec::new(),
         known_direct_ips: vec![ip(203, 0, 113, 68)],
         probe_target_ips: vec![ip(10, 91, 192, 1)],
         secondary_luid: 0,
@@ -438,7 +441,9 @@ fn catch_all_user_sid_stamped_on_ale_filters_only() {
             }
             WfpLayerKey::OutboundIpPacketV4
             | WfpLayerKey::OutboundIpPacketV6
-            | WfpLayerKey::OutboundTransportV4 => {
+            | WfpLayerKey::OutboundTransportV4
+            | WfpLayerKey::IpForwardV4
+            | WfpLayerKey::IpForwardV6 => {
                 assert_eq!(f.user_sid, None, "no ALE_USER_ID below the ALE layers")
             }
         }

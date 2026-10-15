@@ -13,6 +13,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use nrr_platform_linux::systemd::{installed_daemon_path, SYSTEMD_UNIT_NAME};
+use nrr_shared::client_error_codes::{
+    SERVICE_CONTROL_FAILED, SERVICE_NOT_INSTALLED, UNSUPPORTED_PLATFORM,
+};
+use nrr_shared::ipc_transport::ELEVATION_DECLINED_CLIENT_SLUG;
 
 /// Long enough for the user to read and answer an authentication prompt.
 const PROMPT_BUDGET: Duration = Duration::from_secs(90);
@@ -39,6 +43,9 @@ pub fn plan(action: &str) -> Option<Step> {
         "install" | "reinstall" => Some(Step::Daemon("install")),
         "uninstall" => Some(Step::Daemon("uninstall")),
         "cleanup" => Some(Step::Daemon("cleanup")),
+        nrr_platform_api::service_control::STOP_AND_CLEANUP_VERB => Some(Step::Daemon(
+            nrr_platform_api::service_control::STOP_AND_CLEANUP_VERB,
+        )),
         // Nothing on Linux starts the service with the app, so a unit that
         // does not start at boot would never run.
         _ => None,
@@ -65,7 +72,7 @@ impl Refusal {
 pub fn run(action: &str) -> Result<serde_json::Value, Refusal> {
     let step = plan(action).ok_or_else(|| {
         Refusal::new(
-            "unsupported-platform",
+            UNSUPPORTED_PLATFORM,
             format!("`{action}` is not available for the service on this system"),
         )
     })?;
@@ -78,7 +85,7 @@ pub fn run(action: &str) -> Result<serde_json::Value, Refusal> {
         Step::Daemon(verb) => {
             if !is_executable(&daemon) {
                 return Err(Refusal::new(
-                    "service-not-installed",
+                    SERVICE_NOT_INSTALLED,
                     format!(
                         "{} is not installed; install the package first",
                         daemon.display()
@@ -93,7 +100,7 @@ pub fn run(action: &str) -> Result<serde_json::Value, Refusal> {
     };
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = nrr_platform_linux::command::output_with_timeout(program, &borrowed, PROMPT_BUDGET)
-        .map_err(|e| Refusal::new("service-control-failed", format!("{program}: {e}")))?;
+        .map_err(|e| Refusal::new(SERVICE_CONTROL_FAILED, format!("{program}: {e}")))?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     classify(&step, out.status.code(), &stderr).map(|()| serde_json::json!({ "action": action }))
 }
@@ -120,7 +127,7 @@ fn classify(step: &Step, code: Option<i32>, stderr: &str) -> Result<(), Refusal>
     };
     if declined {
         return Err(Refusal::new(
-            "uac-declined",
+            ELEVATION_DECLINED_CLIENT_SLUG,
             "Administrator approval is required for this service action.",
         ));
     }
@@ -131,7 +138,7 @@ fn classify(step: &Step, code: Option<i32>, stderr: &str) -> Result<(), Refusal>
         .find(|l| !l.is_empty())
         .unwrap_or("no detail");
     Err(Refusal::new(
-        "service-control-failed",
+        SERVICE_CONTROL_FAILED,
         format!("exit {}: {detail}", code.unwrap_or(-1)),
     ))
 }
@@ -153,6 +160,10 @@ mod tests {
         assert_eq!(plan("install"), Some(Step::Daemon("install")));
         assert_eq!(plan("reinstall"), Some(Step::Daemon("install")));
         assert_eq!(plan("cleanup"), Some(Step::Daemon("cleanup")));
+        assert_eq!(
+            plan("stop-and-cleanup"),
+            Some(Step::Daemon("stop-and-cleanup"))
+        );
     }
 
     /// Nothing on Linux would start a unit that does not start at boot.

@@ -105,7 +105,17 @@ impl PowerResumeRearm {
         rearm_hook: Arc<dyn Fn() + Send + Sync>,
         window: Duration,
     ) -> Result<Self, PlatformError> {
-        let trigger = DebouncedTrigger::new(
+        Self::start_observed(observer, rearm_hook, window, None)
+    }
+
+    /// [`Self::start`], with the debounce worker reporting to `liveness`.
+    pub fn start_observed(
+        observer: &dyn PowerEventObserver,
+        rearm_hook: Arc<dyn Fn() + Send + Sync>,
+        window: Duration,
+        liveness: Option<Arc<crate::task_liveness::TaskLiveness>>,
+    ) -> Result<Self, PlatformError> {
+        let trigger = DebouncedTrigger::new_observed(
             Arc::new(move || {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
@@ -116,6 +126,7 @@ impl PowerResumeRearm {
                 rearm_hook();
             }),
             window,
+            liveness.map(|liveness| (liveness, "power")),
         );
         let poke = trigger.poker();
         let subscription = observer.subscribe(Arc::new(move |event| {

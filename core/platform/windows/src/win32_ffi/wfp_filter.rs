@@ -40,7 +40,7 @@
 //! | `remote_port` | `FWPM_CONDITION_IP_REMOTE_PORT` | `FWP_UINT16` | exact port |
 //! | `app_pattern` | `FWPM_CONDITION_ALE_APP_ID` | `FWP_BYTE_BLOB_TYPE` | NT-format app path blob |
 //! | `user_sid` | `FWPM_CONDITION_ALE_USER_ID` | `FWP_SECURITY_DESCRIPTOR_TYPE` | SD whose DACL grants Custom Control to the SID |
-//! | `local_interface_luid` | `FWPM_CONDITION_IP_LOCAL_INTERFACE` | `FWP_UINT64` (LUID, by pointer) | exact egress interface — kill-switch |
+//! | `local_interface_luid` | `FWPM_CONDITION_IP_LOCAL_INTERFACE` (`..._IP_FORWARD_INTERFACE` at the forwarding layers) | `FWP_UINT64` (LUID, by pointer) | exact egress interface — kill-switch |
 //!
 //! ⚠ The remote-address key MUST be the layer-agnostic
 //! `FWPM_CONDITION_IP_REMOTE_ADDRESS` (the layer determines the address
@@ -94,16 +94,18 @@ use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmFilterAdd0, FwpmFilterCreateEnumHandle0, FwpmFilterDeleteByKey0,
     FwpmFilterDestroyEnumHandle0, FwpmFilterEnum0, FwpmFreeMemory0, FWPM_ACTION0,
-    FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_ALE_USER_ID, FWPM_CONDITION_IP_LOCAL_INTERFACE,
+    FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_ALE_USER_ID, FWPM_CONDITION_IP_DESTINATION_ADDRESS,
+    FWPM_CONDITION_IP_FORWARD_INTERFACE, FWPM_CONDITION_IP_LOCAL_INTERFACE,
     FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT,
     FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_FILTER_ENUM_TEMPLATE0,
     FWPM_FILTER_FLAGS, FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_LAYER_OUTBOUND_IPPACKET_V4,
-    FWPM_LAYER_OUTBOUND_IPPACKET_V6, FWPM_LAYER_OUTBOUND_TRANSPORT_V4, FWP_ACTION_BLOCK,
-    FWP_ACTION_PERMIT, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0,
-    FWP_CONDITION_VALUE0_0, FWP_FILTER_ENUM_TYPE, FWP_MATCH_EQUAL, FWP_SECURITY_DESCRIPTOR_TYPE,
-    FWP_UINT16, FWP_UINT32, FWP_UINT64, FWP_UINT8, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
-    FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_LAYER_IPFORWARD_V4, FWPM_LAYER_IPFORWARD_V6,
+    FWPM_LAYER_OUTBOUND_IPPACKET_V4, FWPM_LAYER_OUTBOUND_IPPACKET_V6,
+    FWPM_LAYER_OUTBOUND_TRANSPORT_V4, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_BLOB,
+    FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_FILTER_ENUM_TYPE,
+    FWP_MATCH_EQUAL, FWP_SECURITY_DESCRIPTOR_TYPE, FWP_UINT16, FWP_UINT32, FWP_UINT64, FWP_UINT8,
+    FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0,
+    FWP_VALUE0_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -344,6 +346,18 @@ pub fn add_filter(
     if let Some(proto) = spec.ip_protocol {
         conditions.push(condition_ip_protocol(proto));
     }
+    // A forwarded packet has no remote end of ours: the same address is its
+    // destination, and its egress is the interface it is forwarded out of
+    // (the local interface there is the one it arrived on).
+    if spec.layer.is_forwarding() {
+        for cond in &mut conditions {
+            if cond.fieldKey == FWPM_CONDITION_IP_REMOTE_ADDRESS {
+                cond.fieldKey = FWPM_CONDITION_IP_DESTINATION_ADDRESS;
+            } else if cond.fieldKey == FWPM_CONDITION_IP_LOCAL_INTERFACE {
+                cond.fieldKey = FWPM_CONDITION_IP_FORWARD_INTERFACE;
+            }
+        }
+    }
 
     // --- 5. Assemble FWPM_FILTER0. -----------------------------------
     let layer_key = match spec.layer {
@@ -352,6 +366,8 @@ pub fn add_filter(
         WfpLayerKey::AleAuthConnectV6 => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
         WfpLayerKey::OutboundIpPacketV6 => FWPM_LAYER_OUTBOUND_IPPACKET_V6,
         WfpLayerKey::OutboundTransportV4 => FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
+        WfpLayerKey::IpForwardV4 => FWPM_LAYER_IPFORWARD_V4,
+        WfpLayerKey::IpForwardV6 => FWPM_LAYER_IPFORWARD_V6,
     };
     let action_type = match spec.action {
         WfpAction::Block => FWP_ACTION_BLOCK,
@@ -490,6 +506,8 @@ pub fn enumerate_our_filters(
         FWPM_LAYER_ALE_AUTH_CONNECT_V6,
         FWPM_LAYER_OUTBOUND_IPPACKET_V6,
         FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
+        FWPM_LAYER_IPFORWARD_V4,
+        FWPM_LAYER_IPFORWARD_V6,
     ] {
         match enumerate_layer(handle, layer) {
             Ok(records) => {
@@ -660,6 +678,10 @@ fn decode_filter_row(row: &FWPM_FILTER0) -> Option<WfpFilterRecord> {
         WfpLayerKey::OutboundIpPacketV6
     } else if row.layerKey == FWPM_LAYER_OUTBOUND_TRANSPORT_V4 {
         WfpLayerKey::OutboundTransportV4
+    } else if row.layerKey == FWPM_LAYER_IPFORWARD_V4 {
+        WfpLayerKey::IpForwardV4
+    } else if row.layerKey == FWPM_LAYER_IPFORWARD_V6 {
+        WfpLayerKey::IpForwardV6
     } else {
         // Filter on a layer we don't model. Skip rather than fabricate
         // a synthetic layer enum value.
@@ -741,6 +763,13 @@ struct DecodedConditions {
     user_sid: Option<String>,
 }
 
+/// The address a filter names: remote at the local layers, destination at
+/// the forwarding ones.
+fn is_address_key(cond: &FWPM_FILTER_CONDITION0) -> bool {
+    cond.fieldKey == FWPM_CONDITION_IP_REMOTE_ADDRESS
+        || cond.fieldKey == FWPM_CONDITION_IP_DESTINATION_ADDRESS
+}
+
 fn decode_conditions(row: &FWPM_FILTER0) -> DecodedConditions {
     let mut out = DecodedConditions::default();
     if row.numFilterConditions == 0 || row.filterCondition.is_null() {
@@ -755,16 +784,12 @@ fn decode_conditions(row: &FWPM_FILTER0) -> DecodedConditions {
         )
     };
     for cond in slice {
-        if cond.fieldKey == FWPM_CONDITION_IP_REMOTE_ADDRESS
-            && cond.conditionValue.r#type == FWP_UINT32
-        {
+        if is_address_key(cond) && cond.conditionValue.r#type == FWP_UINT32 {
             // SAFETY: `r#type == FWP_UINT32` selects the `uint32: u32`
             // arm.
             let host_order = unsafe { cond.conditionValue.Anonymous.uint32 };
             out.v4_hosts.push(Ipv4Addr::from(host_order));
-        } else if cond.fieldKey == FWPM_CONDITION_IP_REMOTE_ADDRESS
-            && cond.conditionValue.r#type == FWP_V4_ADDR_MASK
-        {
+        } else if is_address_key(cond) && cond.conditionValue.r#type == FWP_V4_ADDR_MASK {
             // Same field key as the exact-host arm above, distinguished by
             // value type. SAFETY: `r#type == FWP_V4_ADDR_MASK` selects the
             // `v4AddrMask: *mut FWP_V4_ADDR_AND_MASK` arm; Win32-owned,
@@ -775,9 +800,7 @@ fn decode_conditions(row: &FWPM_FILTER0) -> DecodedConditions {
                 let am = unsafe { *p };
                 out.remote_subnet = Some((Ipv4Addr::from(am.addr), mask_to_prefix(am.mask)));
             }
-        } else if cond.fieldKey == FWPM_CONDITION_IP_REMOTE_ADDRESS
-            && cond.conditionValue.r#type == FWP_V6_ADDR_MASK
-        {
+        } else if is_address_key(cond) && cond.conditionValue.r#type == FWP_V6_ADDR_MASK {
             // IPv6 twin of the subnet arm above (catch-all kill-switch). SAFETY:
             // `r#type == FWP_V6_ADDR_MASK` selects the
             // `v6AddrMask: *mut FWP_V6_ADDR_AND_MASK` arm; Win32-owned, valid
@@ -798,7 +821,8 @@ fn decode_conditions(row: &FWPM_FILTER0) -> DecodedConditions {
             // SAFETY: `r#type == FWP_UINT16` selects the `uint16: u16`
             // arm.
             out.remote_port = Some(unsafe { cond.conditionValue.Anonymous.uint16 });
-        } else if cond.fieldKey == FWPM_CONDITION_IP_LOCAL_INTERFACE
+        } else if (cond.fieldKey == FWPM_CONDITION_IP_LOCAL_INTERFACE
+            || cond.fieldKey == FWPM_CONDITION_IP_FORWARD_INTERFACE)
             && cond.conditionValue.r#type == FWP_UINT64
         {
             // SAFETY: `r#type == FWP_UINT64` selects the `uint64: *mut u64`
@@ -1393,6 +1417,39 @@ mod tests {
             Some(1),
             "egress-interface LUID must round-trip through enumeration"
         );
+
+        delete_filter(&token, spec.id).expect("delete_filter");
+        transaction_commit(&token).expect("FwpmTransactionCommit0");
+        engine_close(token).expect("FwpmEngineClose0");
+    }
+
+    /// The forwarding layers name the egress by their own key; a pin there
+    /// must install and read back as the same LUID.
+    #[test]
+    #[ignore = "requires admin: FwpmFilterAdd0 needs elevation"]
+    fn a_forwarding_layer_pin_round_trips_its_egress_on_windows() {
+        let token = engine_open().expect("FwpmEngineOpen0");
+        transaction_begin(&token).expect("FwpmTransactionBegin0");
+
+        let mut spec = sample_spec();
+        spec.id = WfpFilterId {
+            raw: 0xA5A5_5A5A_F00D_BAC2,
+        };
+        spec.layer = WfpLayerKey::IpForwardV4;
+        spec.action = WfpAction::Permit;
+        spec.remote_port = None;
+        spec.local_interface_luid = Some(1);
+        spec.validate_layer_conditions()
+            .expect("a forwarding pin is a valid spec");
+
+        add_filter(&token, &spec).expect("add_filter at IPFORWARD with an egress");
+        let found = enumerate_our_filters(&token)
+            .expect("enumerate_our_filters")
+            .into_iter()
+            .find(|r| r.id == spec.id)
+            .expect("filter must appear in enumeration");
+        assert_eq!(found.local_interface_luid, Some(1));
+        assert_eq!(found.remote_ip, Some(Ipv4Addr::new(203, 0, 113, 17)));
 
         delete_filter(&token, spec.id).expect("delete_filter");
         transaction_commit(&token).expect("FwpmTransactionCommit0");

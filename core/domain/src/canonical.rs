@@ -26,7 +26,7 @@
 //! the operational SQLite store.
 
 use core::fmt;
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 use nrr_shared::ip_block::{IpBlock, IpRange};
@@ -436,6 +436,38 @@ impl CanonicalRuleSet {
     }
 }
 
+/// What a `?` verdict is about: the set the rule is written in and its
+/// address. Never the rule number — numbers restart at zero in each set and
+/// shift when a line is inserted above, so a number names a different rule
+/// in the other set and another one after the next edit.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct VerifyKey {
+    pub written: RouteRole,
+    pub address: CanonicalAddressMatch,
+}
+
+impl VerifyKey {
+    /// `rule`'s key in the `written` set; `None` for a rule without an
+    /// address, which the check never covers.
+    pub fn of(written: RouteRole, rule: &CanonicalRule) -> Option<Self> {
+        Some(Self {
+            written,
+            address: rule.address_match.clone()?,
+        })
+    }
+
+    fn names(&self, written: RouteRole, rule: &CanonicalRule) -> bool {
+        self.written == written && rule.address_match.as_ref() == Some(&self.address)
+    }
+}
+
+/// The handle clients echo back: `primary:*.mail.example.net`.
+impl fmt::Display for VerifyKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.written.slug(), self.address)
+    }
+}
+
 /// Canonically ordered rule book covering primary and secondary routes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CanonicalRuleBook {
@@ -479,13 +511,16 @@ impl CanonicalRuleBook {
     }
 
     /// The book as enforcement must see it: every [`RuleAction::Verify`]
-    /// rule is a `Route` of its own set, except one in `moved` (a verdict the
-    /// user has not accepted yet), which is a `Route` of the other set.
+    /// rule is a `Route` of its own set, except one `moved` names (a verdict
+    /// the user has not accepted yet), which is a `Route` of the other set.
     /// Enforcement-only, like [`Self::with_subdomain_coverage`] and applied
     /// before it; never stored, hashed or written back.
-    pub fn with_verify_effective(&self, moved: &BTreeSet<crate::RuleId>) -> CanonicalRuleBook {
+    pub fn with_verify_effective(&self, moved: &HashSet<VerifyKey>) -> CanonicalRuleBook {
         let is_verify = |r: &CanonicalRule| r.action == RuleAction::Verify;
-        let is_moved = |r: &CanonicalRule| is_verify(r) && moved.contains(&r.id);
+        // `moved` holds a handful of keys at most: a scan beats building one.
+        let is_moved = |written: RouteRole, r: &CanonicalRule| {
+            is_verify(r) && moved.iter().any(|k| k.names(written, r))
+        };
         if !self
             .primary
             .rules
@@ -505,19 +540,25 @@ impl CanonicalRuleBook {
                 r.clone()
             }
         };
-        let settle = |own: &CanonicalRuleSet, other: &CanonicalRuleSet| {
-            let rules = own
+        let settle = |own: RouteRole, other: RouteRole| {
+            let rules = self
+                .set_for(own)
                 .rules
                 .iter()
-                .filter(|r| !is_moved(r))
-                .chain(other.rules.iter().filter(|r| is_moved(r)))
+                .filter(|r| !is_moved(own, r))
+                .chain(
+                    self.set_for(other)
+                        .rules
+                        .iter()
+                        .filter(|r| is_moved(other, r)),
+                )
                 .map(as_route)
                 .collect();
             CanonicalRuleSet::from_rules(rules)
         };
         CanonicalRuleBook {
-            primary: settle(&self.primary, &self.secondary),
-            secondary: settle(&self.secondary, &self.primary),
+            primary: settle(RouteRole::Primary, RouteRole::Secondary),
+            secondary: settle(RouteRole::Secondary, RouteRole::Primary),
         }
     }
 
@@ -877,7 +918,7 @@ mod tests {
             ..r.clone()
         };
 
-        let unmoved = book.with_verify_effective(&BTreeSet::new());
+        let unmoved = book.with_verify_effective(&HashSet::new());
         assert_eq!(
             unmoved.primary,
             CanonicalRuleSet::from_rules(vec![block.clone(), as_route(&verify_p)])
@@ -890,10 +931,14 @@ mod tests {
             ])
         );
 
-        let moved: BTreeSet<crate::RuleId> = [
-            verify_s.id.clone(),
-            verify_p.id.clone(),
-            crate::RuleId("s-route".into()),
+        let key = |written, rule: &CanonicalRule| VerifyKey::of(written, rule).expect("address");
+        let moved: HashSet<VerifyKey> = [
+            key(RouteRole::Secondary, &verify_s),
+            key(RouteRole::Primary, &verify_p),
+            key(
+                RouteRole::Secondary,
+                &exact_fqdn_rule("s-route", "chat.example"),
+            ),
         ]
         .into_iter()
         .collect();
@@ -915,6 +960,48 @@ mod tests {
             effective,
             "nothing left to move"
         );
+    }
+
+    /// A file import numbers each set from zero: a verdict on the primary's
+    /// `r-0000` must leave the secondary's `r-0000` where it is written.
+    #[test]
+    fn a_verdict_names_a_rule_by_its_set_and_address_not_by_its_number() {
+        let site_a = CanonicalRule {
+            action: RuleAction::Verify,
+            ..exact_fqdn_rule("r-0000", "site-a.example")
+        };
+        let site_b = CanonicalRule {
+            action: RuleAction::Verify,
+            ..exact_fqdn_rule("r-0000", "site-b.example")
+        };
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![site_a.clone()]),
+            secondary: CanonicalRuleSet::from_rules(vec![site_b.clone()]),
+        };
+        let as_route = |r: &CanonicalRule| CanonicalRule {
+            action: RuleAction::Route,
+            ..r.clone()
+        };
+        let key = VerifyKey::of(RouteRole::Primary, &site_a).expect("address");
+        let moved: HashSet<VerifyKey> = [key.clone()].into_iter().collect();
+        let effective = book.with_verify_effective(&moved);
+        assert!(effective.primary.is_empty());
+        assert_eq!(
+            effective.secondary,
+            CanonicalRuleSet::from_rules(vec![as_route(&site_a), as_route(&site_b)]),
+            "site-b stays in the tunnel: nothing was measured about it"
+        );
+
+        // The same content under another number is still the rule named.
+        let renumbered = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![CanonicalRule {
+                id: crate::RuleId("r-0001".into()),
+                ..site_a.clone()
+            }]),
+            secondary: book.secondary.clone(),
+        };
+        assert!(renumbered.with_verify_effective(&moved).primary.is_empty());
+        assert_eq!(key.to_string(), "primary:site-a.example");
     }
 
     #[test]

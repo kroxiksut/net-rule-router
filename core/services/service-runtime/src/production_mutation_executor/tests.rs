@@ -1704,7 +1704,6 @@ impl crate::per_sid_orchestrator::RulesProvider for EmptyBook {
     fn active_rules(&self) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
         Some(crate::per_sid_orchestrator::ActiveRulesSnapshot {
             rule_book: CanonicalRuleBook::default(),
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
         })
     }
 }

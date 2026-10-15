@@ -335,6 +335,13 @@ impl<P: SystemDnsServersPort> SystemDnsServersPort for FollowingNext<P> {
         }
     }
 
+    fn upstream_candidates_v6(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        match self.next.get() {
+            Some((_, parts)) => parts.servers.upstream_candidates_v6(),
+            None => self.own.upstream_candidates_v6(),
+        }
+    }
+
     fn report_all_unreachable(&self, servers: &[UpstreamDnsCandidate]) {
         match self.next.get() {
             Some((_, parts)) => parts.servers.report_all_unreachable(servers),

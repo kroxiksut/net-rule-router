@@ -717,7 +717,6 @@ mod tests {
         fn active_rules(&self) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
             Some(crate::per_sid_orchestrator::ActiveRulesSnapshot {
                 rule_book: self.0.clone(),
-                behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
             })
         }
     }

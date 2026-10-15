@@ -70,6 +70,12 @@ const CONFIRM_FLAG: FlagSpec = FlagSpec {
     summary: "required: this drops leftover network state, so it is never implied",
 };
 
+const STOP_SERVICE_FLAG: FlagSpec = FlagSpec {
+    name: "stop-service",
+    value: None,
+    summary: "stop a running service first, ending it if it hangs, then restore the network",
+};
+
 const TAIL_FLAG: FlagSpec = FlagSpec {
     name: "tail",
     value: Some("N"),
@@ -174,7 +180,7 @@ pub static VERBS: &[VerbSpec] = &[
     VerbSpec {
         name: "reset-network",
         summary: "Remove network state a crashed service left behind",
-        flags: &[CONFIRM_FLAG, ELEVATE_FLAG],
+        flags: &[CONFIRM_FLAG, STOP_SERVICE_FLAG, ELEVATE_FLAG],
         privilege: Privilege::Administrator,
         subverbs: &[],
     },
@@ -411,7 +417,7 @@ mod tests {
             ("diag doctor", &[]),
             ("diag logs", &["tail"]),
             ("diag export", &[]),
-            ("reset-network", &["confirm", "elevate"]),
+            ("reset-network", &["confirm", "stop-service", "elevate"]),
             ("version", &[]),
             ("help", &[]),
         ];

@@ -47,6 +47,7 @@ fn the_catch_all_spares_what_its_twin_spares() {
         foreign_tunnel_luids: Vec::new(),
         primary_dest_ips: vec![primary],
         allow_dns_over_primary: false,
+        dns_servers: Vec::new(),
         known_direct_ips: vec![direct],
         probe_target_ips: Vec::new(),
         secondary_luid: 0,
@@ -326,6 +327,7 @@ fn full_resolution() -> KillSwitchResolution {
 
 mod catch_all;
 mod fail_closed;
+mod forwarded;
 mod ipv6;
 mod networks;
 mod per_app;

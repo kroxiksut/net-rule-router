@@ -89,6 +89,14 @@ pub const FIX_INSTALL: Key = key(
     "To install it, run: {command}",
 );
 pub const FIX_START: Key = key("tui.connection.fix-start", "To start it, run: {command}");
+pub const FIX_RESTORE_NETWORK: Key = key(
+    "tui.connection.fix-restore-network",
+    "To restore the network, run: {command}",
+);
+pub const FIX_STOP_AND_RESTORE_NETWORK: Key = key(
+    "tui.connection.fix-stop-and-restore-network",
+    "To stop the service and restore the network, run: {command}",
+);
 pub const VERSIONS: Key = key(
     "tui.connection.versions",
     "The service speaks protocol version {server}, this program version {client}. Update NetRuleRouter so both match.",
@@ -254,6 +262,23 @@ pub const APP_UNRESOLVED_BODY: Key = key(
     "NetRuleRouter couldn't find these programs (they may not be installed in a standard location, or aren't running), so their traffic isn't routed by your rules: {apps}. Launch the app, or check the program name in Rules.",
 );
 pub const APP_UNRESOLVED_MORE: Key = key("status.app-unresolved-more", "+{n} more");
+pub const VPN_TRUST_TITLE: Key = key("notifications.vpn-client-trust.title", "Is this your VPN?");
+pub const VPN_TRUST_BODY: Key = key(
+    "notifications.vpn-client-trust.tui-body",
+    "{apps}: named like a VPN client, but not installed in a protected program folder, so leak protection does not trust it on its own.",
+);
+pub const VPN_TRUST_HINT: Key = key(
+    "notifications.vpn-client-trust.tui-hint",
+    "t: confirm these as your VPN (with the programs each ships with in its protected folder).",
+);
+pub const VPN_TRUST_DONE: Key = key(
+    "notifications.vpn-client-trust.tui-done",
+    "{count} program(s) confirmed as your VPN; leak protection keeps them working over the main link.",
+);
+pub const VPN_TRUST_FAILED: Key = key(
+    "notifications.vpn-client-trust.tui-failed",
+    "Could not save the confirmation to the routing service ({error}).",
+);
 
 // ── Notices ──────────────────────────────────────────────────────────────────
 
@@ -261,6 +286,10 @@ pub const NOTICES_TITLE: Key = key("notifications.title", "Notifications");
 pub const NOTICES_EMPTY: Key = key("notifications.empty", "No notifications.");
 pub const LEVEL_WARNING: Key = key("settings.logs.level.option-warning", "Warning");
 pub const LEVEL_INFO: Key = key("settings.logs.level.option-info", "Info");
+pub const SYSTEM_DNS_TITLE: Key = key(
+    "notifications.system-dns-not-restored.title",
+    "Sites may not open by name",
+);
 pub const HOST_UNREACHABLE_TITLE: Key = key(
     "notifications.host-unreachable.title",
     "A site does not answer on either link",
@@ -283,6 +312,108 @@ pub const ROUTES_HELD_TITLE: Key = key(
 pub const ROUTES_HELD_BODY: Key = key(
     "notifications.routes-held.body",
     "Another user signed in to this computer already routes some addresses from your rules through a different connection. Addresses affected: {count}. While that user stays signed in, these addresses follow their route, or are blocked for you if leak protection is on. Among them: {list}.",
+);
+pub const BLOCK_NOTICE_TITLE: Key = key("notifications.block-notice.title", "Connection blocked");
+pub const BLOCK_NOTICE_BODY: Key = key(
+    "notifications.block-notice.body",
+    "{reason} Destination: {destination}. Application: {app}. Attempts: {attempts}.",
+);
+pub const BLOCK_NOTICE_APP_UNKNOWN: Key = key(
+    "notifications.block-notice.app-unknown",
+    "unknown application",
+);
+pub const BLOCK_NOTICE_REASON_UNKNOWN: Key = key(
+    "notifications.block-notice.reason.unknown",
+    "This connection was blocked.",
+);
+/// `BLOCK_NOTICE_REASON_UNKNOWN` is the fallback; the reason slug the service
+/// names selects a sibling key under this prefix.
+pub const BLOCK_NOTICE_REASON_PREFIX: &str = "notifications.block-notice.reason.";
+pub const LOCAL_NETWORK_TITLE: Key = key(
+    "notifications.local-networks.title",
+    "A local network was found",
+);
+pub const LOCAL_NETWORK_OFFER: Key = key(
+    "status.local-network-offer",
+    "Found a local network on this computer: {cidr} ({adapter}). Keep it reachable while routed traffic is blocked?",
+);
+pub const LOCAL_NETWORK_OFFER_OPEN: Key = key(
+    "status.local-network-offer-open",
+    "Found your home network's IPv6 addresses: {cidr} ({adapter}). Open them to devices on this network while routed traffic is blocked?",
+);
+pub const LOCAL_NETWORK_OFFER_MORE: Key =
+    key("status.local-network-offer-more", "{count} more found.");
+pub const ANSWER_IN_ROUTING_HINT: Key = key(
+    "tui.answer-in-routing-settings",
+    "Answer in Settings, Routing section (c2).",
+);
+pub const FORWARDED_TITLE: Key = key(
+    "notifications.forwarded-traffic.title",
+    "WSL or containers are running",
+);
+pub const FORWARDED_BODY: Key = key(
+    "notifications.forwarded-traffic.body",
+    "Choose what WSL, containers and virtual machines get when the additional route goes down. Until you choose, they are protected like this computer.",
+);
+pub const BLOCK_NOTICE_BACKLOG_TITLE: Key = key(
+    "notifications.block-notice.backlog.title",
+    "Blocked while the app was closed",
+);
+pub const BLOCK_NOTICE_BACKLOG_BODY: Key = key(
+    "notifications.block-notice.backlog.body",
+    "The service blocked {count} connection(s) while NetRuleRouter was not open.",
+);
+pub const BLOCK_NOTICE_BACKLOG_DESTINATIONS: Key = key(
+    "notifications.block-notice.backlog.destinations",
+    "Destinations: {list}.",
+);
+pub const BLOCK_NOTICE_BACKLOG_MORE: Key = key(
+    "notifications.block-notice.backlog.more",
+    "and {count} more",
+);
+pub const UNASSIGNED_TUNNEL_TITLE: Key = key(
+    "notifications.unassigned-tunnel.title",
+    "The additional route is not assigned",
+);
+pub const UNASSIGNED_TUNNEL_BODY: Key = key(
+    "notifications.unassigned-tunnel.body",
+    "{adapter} is up, but no connection is assigned to the additional route — so the sites your rules send there will not open.",
+);
+pub const LOCAL_NETWORK_TOO_WIDE_TITLE: Key = key(
+    "notifications.local-network-too-wide.title",
+    "This network looks suspicious",
+);
+pub const LOCAL_NETWORK_TOO_WIDE_BODY: Key = key(
+    "notifications.local-network-too-wide.body",
+    "{adapter} reports {network} as its local network — far wider than any local network can be. It is not treated as local: devices on it stay blocked while leak protection is on, and sites inside it still follow your rules.",
+);
+pub const RULE_DUPLICATES_TITLE: Key = key(
+    "notifications.rule-duplicates.title",
+    "A rule is set on both routes",
+);
+pub const RULE_DUPLICATES_BODY: Key = key(
+    "notifications.rule-duplicates.body",
+    "{count} of your rules are enabled on both routes, starting with {sample}. Which one carries the traffic is decided by evaluation order.",
+);
+pub const APP_RULE_LEARNING_TITLE: Key = key(
+    "notifications.app-rule-learning.title",
+    "New application rule is settling in",
+);
+pub const APP_RULE_LEARNING_BODY: Key = key(
+    "notifications.app-rule-learning.body",
+    "{apps}: the service is still learning which addresses this program uses, so its first connection attempts may fail. Restart the program if it is already open.",
+);
+pub const PROTECTION_COVERAGE_TITLE: Key = key(
+    "notifications.protection-coverage.title",
+    "Leak protection coverage changed",
+);
+pub const PROTECTION_BLANKET_BLOCK_NOT_ARMED: Key = key(
+    "status.protection.blanket-block-not-armed",
+    "Full blocking is not switched on: the address of the additional link is unknown, and blocking everything without it would cut the link itself. Traffic outside your rules is not blocked.",
+);
+pub const PROTECTION_MACHINE_WIDE_CUT: Key = key(
+    "status.protection.machine-wide-cut-by-another-user",
+    "Another user of this computer switched on leak protection. Part of it cannot be limited to one account, so IPv6 and ping are off for everyone until they switch it off.",
 );
 pub const ROUTES_HELD_CLEARED: Key = key(
     "notifications.routes-held.cleared",
@@ -357,6 +488,8 @@ pub const ALL: &[Key] = &[
     BANNER_REFUSED,
     FIX_INSTALL,
     FIX_START,
+    FIX_RESTORE_NETWORK,
+    FIX_STOP_AND_RESTORE_NETWORK,
     VERSIONS,
     REFUSED_REASON,
     RETRYING,
@@ -410,10 +543,17 @@ pub const ALL: &[Key] = &[
     APP_UNRESOLVED_TITLE,
     APP_UNRESOLVED_BODY,
     APP_UNRESOLVED_MORE,
+    VPN_TRUST_TITLE,
+    VPN_TRUST_BODY,
+    VPN_TRUST_HINT,
+    VPN_TRUST_DONE,
+    VPN_TRUST_FAILED,
+    crate::vpn_trust::HELP,
     NOTICES_TITLE,
     NOTICES_EMPTY,
     LEVEL_WARNING,
     LEVEL_INFO,
+    SYSTEM_DNS_TITLE,
     HOST_UNREACHABLE_TITLE,
     HOST_UNREACHABLE_BODY,
     EXTERNAL_ADDRESS_TITLE,
@@ -422,6 +562,32 @@ pub const ALL: &[Key] = &[
     ROUTES_HELD_TITLE,
     ROUTES_HELD_BODY,
     ROUTES_HELD_CLEARED,
+    BLOCK_NOTICE_TITLE,
+    BLOCK_NOTICE_BODY,
+    BLOCK_NOTICE_APP_UNKNOWN,
+    BLOCK_NOTICE_REASON_UNKNOWN,
+    BLOCK_NOTICE_BACKLOG_TITLE,
+    BLOCK_NOTICE_BACKLOG_BODY,
+    LOCAL_NETWORK_TITLE,
+    LOCAL_NETWORK_OFFER,
+    LOCAL_NETWORK_OFFER_OPEN,
+    LOCAL_NETWORK_OFFER_MORE,
+    ANSWER_IN_ROUTING_HINT,
+    FORWARDED_TITLE,
+    FORWARDED_BODY,
+    BLOCK_NOTICE_BACKLOG_DESTINATIONS,
+    BLOCK_NOTICE_BACKLOG_MORE,
+    UNASSIGNED_TUNNEL_TITLE,
+    UNASSIGNED_TUNNEL_BODY,
+    LOCAL_NETWORK_TOO_WIDE_TITLE,
+    LOCAL_NETWORK_TOO_WIDE_BODY,
+    RULE_DUPLICATES_TITLE,
+    RULE_DUPLICATES_BODY,
+    APP_RULE_LEARNING_TITLE,
+    APP_RULE_LEARNING_BODY,
+    PROTECTION_COVERAGE_TITLE,
+    PROTECTION_BLANKET_BLOCK_NOT_ARMED,
+    PROTECTION_MACHINE_WIDE_CUT,
     HELP_TITLE,
     HELP_SCREENS,
     HELP_MOVE,

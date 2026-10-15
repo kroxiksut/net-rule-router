@@ -81,6 +81,46 @@ pub enum IpcErrorCode {
     Internal,
 }
 
+impl IpcErrorCode {
+    /// Every variant; the `client_error_codes` contract test reads the enum
+    /// body and fails on a variant missing here.
+    pub const ALL: [Self; 13] = [
+        Self::Unauthorized,
+        Self::Forbidden,
+        Self::RulesLocked,
+        Self::SecurityAlertUnacknowledged,
+        Self::InvalidVersion,
+        Self::MalformedRequest,
+        Self::BusyConflict,
+        Self::PreconditionFailed,
+        Self::ConfirmationExpired,
+        Self::ConfirmationUnknown,
+        Self::ServiceDegraded,
+        Self::RecoveryRequired,
+        Self::Internal,
+    ];
+
+    /// The code as a client receives it: kebab-case, the `errors.<slug>`
+    /// locale key. Not the serde spelling, which is the envelope's.
+    pub const fn client_slug(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::RulesLocked => RULES_LOCKED_CLIENT_SLUG,
+            Self::SecurityAlertUnacknowledged => SECURITY_ALERT_UNACKNOWLEDGED_CLIENT_SLUG,
+            Self::InvalidVersion => "invalid-version",
+            Self::MalformedRequest => "malformed-request",
+            Self::BusyConflict => "busy-conflict",
+            Self::PreconditionFailed => "precondition-failed",
+            Self::ConfirmationExpired => "confirmation-expired",
+            Self::ConfirmationUnknown => "confirmation-unknown",
+            Self::ServiceDegraded => "service-degraded",
+            Self::RecoveryRequired => "recovery-required",
+            Self::Internal => "internal",
+        }
+    }
+}
+
 impl IpcTransportKind {
     pub const fn slug(self) -> &'static str {
         match self {
@@ -490,6 +530,8 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         | IpcOperationName::RulesMergePreview
         // Read the shared DoH resolver baseline list.
         | IpcOperationName::DohResolversGet
+        // Read the shared home-network suffix list and the network's offer.
+        | IpcOperationName::LocalDnsSuffixesGet
         // Read-only traffic-stats query.
         | IpcOperationName::TrafficStatsGet
         // Read the caller's local-network exemptions and what we discovered.
@@ -550,6 +592,9 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // catalog is a declaration, not a gate — nothing reads it at runtime, so
         // it must not be cited as one.
         IpcOperationName::DohResolversSet => IpcOperationClass::UserScopedConfiguration,
+        // The home-network suffix list: the same machine-wide replace, gated by
+        // value in its handler.
+        IpcOperationName::LocalDnsSuffixesSet => IpcOperationClass::UserScopedConfiguration,
         // Opt-in browser-history seed; a GUI-only maintenance command like
         // CacheClear.
         IpcOperationName::SeedFromBrowserHistory => IpcOperationClass::UserScopedConfiguration,

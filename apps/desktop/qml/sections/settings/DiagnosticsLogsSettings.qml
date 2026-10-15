@@ -1138,10 +1138,6 @@ GroupBox {
             ColumnLayout {
                 anchors.fill: parent
                 spacing: root.uiTheme.spacingSm
-                ServiceIntentDivergenceNote {
-                    root: group.root
-                    keys: ["conn-trace-gui"]
-                }
                 ConnTraceSwitches {
                     root: group.root
                     Layout.fillWidth: true
@@ -1243,10 +1239,6 @@ GroupBox {
                         "Network policy enforcement runs independently.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
-                }
-                ServiceIntentDivergenceNote {
-                    root: group.root
-                    keys: ["ipc-accept-policy", "conn-trace-gui", "cache-refresh-interval-secs"]
                 }
 
                 GridLayout {

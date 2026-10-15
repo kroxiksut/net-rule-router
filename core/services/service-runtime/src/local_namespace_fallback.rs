@@ -90,6 +90,18 @@ impl LocalNamespaceFallbackResolver {
 }
 
 impl UpstreamResolver for LocalNamespaceFallbackResolver {
+    /// The private resolvers sit on the main link; while the guard blocks they
+    /// are not asked.
+    fn resolve_tunnel_only_within(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+        budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        self.inner
+            .resolve_tunnel_only_within(hostname, family, budget)
+    }
+
     fn resolve_within(
         &self,
         hostname: &str,

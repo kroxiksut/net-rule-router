@@ -50,8 +50,7 @@ use crate::service_tasks::{
     build_adapter_monitor_task, build_diagnostics_audit_cleanup_task,
     build_diagnostics_cleanup_task, build_health_aggregator_task, build_ipc_accept_task_bundle,
     build_operation_results_gc_task, build_revisions_retention_task,
-    build_route_reconcile_safety_task, build_secondary_liveness_task, TASK_ID_ADAPTER_MONITOR,
-    TASK_ID_DIAGNOSTICS_CLEANUP, TASK_ID_IPC_ACCEPT_LOOP, TASK_ID_IPC_SHUTDOWN_WATCHER,
+    build_route_reconcile_safety_task, build_secondary_liveness_task, ServiceTaskKind, TaskHealth,
 };
 use crate::state::{ServiceHealthSeverity, ServiceRuntimeState};
 
@@ -159,6 +158,10 @@ pub struct SupervisedRuntimeDeps {
     /// module would desync from the IPC reader's `Arc`, so IPC would
     /// report `state=starting, components=[]` forever.
     pub health: Arc<HealthAggregator>,
+    /// Where every long-lived task reports its liveness. The runtime deps
+    /// builder makes it so the threads it spawns before the supervisor exists
+    /// can hold a lease; `None` lets the runtime make one of its own.
+    pub liveness: Option<Arc<crate::task_liveness::TaskLiveness>>,
     /// Production IPC server. The supervised runtime calls `bind()`
     /// once eagerly inside the IPC-task bundle build so a bad SDDL or
     /// CreateEvent failure surfaces as a health record before the
@@ -381,14 +384,14 @@ pub type EnforcementModeSource =
 
 /// `TaskFailureSink` impl that turns task failures into health records.
 ///
-/// A fatal retirement flips the task's component to `Blocking`. An `Optional`
-/// task between a failure and its restart holds `BackgroundTasks` at
-/// `Degraded`, naming every task that is down, until each has ticked again.
-/// `Recoverable` restarts stay out of the roll-up: they are brief and bounded,
-/// and exhausting them ends in the fatal path.
+/// A task gone for good — retired, or ended outside a stop — lands where
+/// [`ServiceTaskKind::health`] says. An `Optional` task between a failure and
+/// its restart holds `BackgroundTasks` at `Degraded`, naming every task that is
+/// down, until each has ticked again. `Recoverable` restarts stay out of the
+/// roll-up: they are brief and bounded, and exhausting them ends in retirement.
 struct HealthFailureSink {
     health: Arc<HealthAggregator>,
-    /// Optional tasks currently down → the failure that took them down.
+    /// Tasks currently not running → why.
     down: Mutex<BTreeMap<String, String>>,
 }
 
@@ -416,8 +419,31 @@ impl HealthFailureSink {
         self.health.record(
             HealthComponent::BackgroundTasks,
             ServiceHealthSeverity::Degraded,
-            format!("stopped, restart pending: {}", names.join(", ")),
+            format!("not running: {}", names.join(", ")),
         );
+    }
+
+    /// A task that will not run again. An id the registry does not know still
+    /// shows, under `BackgroundTasks`: invisible must be a decision.
+    fn task_gone(&self, id: &TaskId, why: String) {
+        match ServiceTaskKind::from_id(id.0.as_str()).map(ServiceTaskKind::health) {
+            Some(TaskHealth::Invisible(_)) => {}
+            Some(TaskHealth::Reports {
+                component: HealthComponent::BackgroundTasks,
+                ..
+            })
+            | None => {
+                let mut down = self.down.lock().unwrap_or_else(|p| p.into_inner());
+                down.insert(id.0.clone(), why);
+                self.record_background(&down);
+            }
+            Some(TaskHealth::Reports {
+                component,
+                severity,
+            }) => self
+                .health
+                .record(component, severity, format!("task '{}' {why}", id.0)),
+        }
     }
 }
 
@@ -454,7 +480,7 @@ impl TaskFailureSink for HealthFailureSink {
             return;
         }
         let mut down = self.down.lock().unwrap_or_else(|p| p.into_inner());
-        down.insert(id.0.clone(), message.to_owned());
+        down.insert(id.0.clone(), format!("restart pending: {message}"));
         self.record_background(&down);
     }
 
@@ -482,26 +508,18 @@ impl TaskFailureSink for HealthFailureSink {
             error = %message,
             "task retired fatally",
         );
-        if let Some(component) = component_for_task(id.0.as_str()) {
-            self.health.record(
-                component,
-                ServiceHealthSeverity::Blocking,
-                format!("task '{}' retired: {message}", id.0),
-            );
-        }
+        self.task_gone(id, format!("retired: {message}"));
     }
-}
 
-/// Map a task id slug to the health component that should reflect
-/// its retirement. Returns `None` for tasks whose retirement does not
-/// have a meaningful component-level effect (e.g. the watcher), so the
-/// health roll-up is not polluted by spurious Blocking severities.
-fn component_for_task(id: &str) -> Option<HealthComponent> {
-    match id {
-        TASK_ID_IPC_ACCEPT_LOOP | TASK_ID_IPC_SHUTDOWN_WATCHER => Some(HealthComponent::Ipc),
-        TASK_ID_ADAPTER_MONITOR => Some(HealthComponent::Adapters),
-        TASK_ID_DIAGNOSTICS_CLEANUP => Some(HealthComponent::Diagnostics),
-        _ => None,
+    fn task_exited(&self, id: &TaskId, class: TaskClass) {
+        tracing::error!(
+            target: "nrr::supervisor",
+            msg_key = "supervised-task-exited",
+            task = id.0.as_str(),
+            class = ?class,
+            "task ended while the service runs",
+        );
+        self.task_gone(id, "ended while the service runs".to_owned());
     }
 }
 
@@ -533,6 +551,10 @@ pub fn run_supervised_runtime(
     // second aggregator here would break `ServiceHealthGet` (IPC would
     // serve a different, never-cleared aggregator).
     let health = Arc::clone(&deps.health);
+    let liveness = match deps.liveness.clone() {
+        Some(liveness) => liveness,
+        None => Arc::new(crate::task_liveness::TaskLiveness::new(Arc::clone(&health))),
+    };
     health.record_bootstrap(&artifacts.report);
     if let Some(load) = &artifacts.policy_load {
         health.record_policy(load);
@@ -541,7 +563,8 @@ pub fn run_supervised_runtime(
     // Supervisor: the failure sink translates task retirements into
     // health records, so a fatal task surfaces in the GUI snapshot.
     let sink: Arc<dyn TaskFailureSink> = Arc::new(HealthFailureSink::new(Arc::clone(&health)));
-    let supervisor = ServiceSupervisor::new(stop.clone(), sink);
+    let supervisor =
+        ServiceSupervisor::new(stop.clone(), sink).with_liveness(Arc::clone(&liveness));
 
     // Mode B (live re-arm): the DNS resolver runs on its own thread (binds
     // `:53`, blocking-serves), owned by a shared controller so the
@@ -560,10 +583,34 @@ pub fn run_supervised_runtime(
     let mut logon_rearm: Option<crate::logon_rearm::LogonSessionRearm> = None;
 
     if blocked {
-        // Bootstrap reported Blocking — stay in recovery, no tasks.
-        // The IPC listener stays down on purpose so the GUI sees the
-        // service as unreachable instead of half-functional.
+        // Bootstrap reported Blocking: nothing enforces and nothing is torn
+        // down, but the reason has to reach a client. A listener that stays
+        // down reads as "service unavailable", the one state nobody can act
+        // on; the router refuses everything but reads while this is set.
+        crate::lifecycle::mark_recovery_required();
+        let reason = artifacts
+            .report
+            .blocking_reason()
+            .unwrap_or_else(|| "start blocked for an unrecorded reason".to_string());
+        tracing::error!(
+            target: "nrr::lifecycle",
+            msg_key = "supervised-start-blocked",
+            reason = %reason,
+            "start blocked — recovery required; reads are answered, nothing is applied or removed",
+        );
+        health.record(
+            HealthComponent::Policy,
+            ServiceHealthSeverity::Blocking,
+            reason,
+        );
+        health.clear_lifecycle_override();
         controller.report(ServiceRuntimeState::RecoveryRequired);
+        spawn_health_and_ipc_tasks(
+            &supervisor,
+            &deps,
+            Arc::clone(&health),
+            Arc::clone(&liveness),
+        );
     } else {
         // Mode B (live re-arm): arm the local DNS resolver to the persisted boot
         // mode BEFORE the IPC accept loop comes up, so a `set(enforcement_mode)`
@@ -584,7 +631,12 @@ pub fn run_supervised_runtime(
             );
             controller.apply(resolver_boot_mode);
         }
-        spawn_production_tasks(&supervisor, &deps, Arc::clone(&health));
+        spawn_production_tasks(
+            &supervisor,
+            &deps,
+            Arc::clone(&health),
+            Arc::clone(&liveness),
+        );
         // Clear the
         // `Starting` lifecycle override on the HealthAggregator so
         // `ServiceHealthGet` over IPC reports `running` once tasks are
@@ -633,10 +685,11 @@ pub fn run_supervised_runtime(
                     hook();
                 }
             });
-            match crate::network_rearm::NetworkChangeRearm::start(
+            match crate::network_rearm::NetworkChangeRearm::start_observed(
                 observer.as_ref(),
                 on_change,
                 crate::network_rearm::NETWORK_CHANGE_DEBOUNCE,
+                Some(Arc::clone(&liveness)),
             ) {
                 Ok(rearm) => {
                     deps.adapter_monitor.change_feed_live();
@@ -664,10 +717,11 @@ pub fn run_supervised_runtime(
             deps.power_event_observer.as_ref(),
             deps.route_recompute_hook.as_ref(),
         ) {
-            match crate::power_resume::PowerResumeRearm::start(
+            match crate::power_resume::PowerResumeRearm::start_observed(
                 observer.as_ref(),
                 Arc::clone(hook),
                 crate::power_resume::RESUME_DEBOUNCE,
+                Some(Arc::clone(&liveness)),
             ) {
                 Ok(rearm) => {
                     tracing::info!(
@@ -704,7 +758,7 @@ pub fn run_supervised_runtime(
                         arrival_window: crate::logon_rearm::LOGON_ROUTE_DEBOUNCE,
                         departure_window: crate::logon_rearm::LOGOFF_ROUTE_DEBOUNCE,
                     });
-            match crate::logon_rearm::LogonSessionRearm::start_with_routes(
+            match crate::logon_rearm::LogonSessionRearm::start_with_routes_observed(
                 observer.as_ref(),
                 on_signed_in(
                     resolver_controller.clone(),
@@ -713,6 +767,7 @@ pub fn run_supervised_runtime(
                 ),
                 crate::logon_rearm::LOGON_DEBOUNCE,
                 route_pass,
+                Some(Arc::clone(&liveness)),
             ) {
                 Ok(rearm) => {
                     tracing::info!(
@@ -773,10 +828,16 @@ pub fn run_supervised_runtime(
     // Latch BEFORE anything is stripped: workers that never got a stop-token
     // clone (fake-IP watchdog, network-change re-arm) would otherwise re-install
     // routes and WFP filters behind the teardown, and those outlive the process.
-    crate::lifecycle::begin_teardown();
+    // The reason travels with the latch: the hooks plan a machine shutdown
+    // differently from a service stop.
+    let stop_reason = stop
+        .stop_reason()
+        .unwrap_or(crate::lifecycle_matrix::StopReason::ServiceStop);
+    crate::lifecycle::begin_teardown_for(stop_reason);
     tracing::info!(
         target: "nrr::lifecycle",
         msg_key = "supervised-stop-requested-teardown-begins",
+        reason = ?stop_reason,
         "stop requested — teardown begins",
     );
     controller.report(ServiceRuntimeState::Stopping);
@@ -800,10 +861,10 @@ pub fn run_supervised_runtime(
                 }
                 // Every step before the route/filter teardown is time-boxed, so
                 // past this point the wait is that one — and the only thing in
-                // it that can take minutes is a filtering engine that has
-                // stopped answering. Say so once: without this the stop is a
-                // silent hang, and the natural reaction (kill it) is the one
-                // that leaves the filters in place.
+                // it that can take long is a filtering engine that has stopped
+                // answering. Say so once: without this the stop is a silent
+                // hang, and the natural reaction (kill it) is the one that
+                // leaves the filters in place.
                 if !explained
                     && elapsed >= STOP_SLOW_EXPLAIN
                     && !teardown_done.load(Ordering::Relaxed)
@@ -813,7 +874,8 @@ pub fn run_supervised_runtime(
                         target: "nrr::lifecycle",
                         msg_key = "supervised-stop-taking-long",
                         elapsed_secs = elapsed.as_secs(),
-                        "stop is taking unusually long — waiting on the packet-filter teardown, which is not time-boxed on purpose: filters left behind would block traffic until the next start. If the filtering engine has wedged this will not finish; killing the service leaves the filters, and a reboot clears them",
+                        deadline_secs = crate::lifecycle_matrix::FILTER_TEARDOWN_DEADLINE.as_secs(),
+                        "stop is taking unusually long — waiting on the packet-filter teardown. The stop goes on without it at the deadline; filters left behind are cleared by the next start or a reboot",
                     );
                 }
             }
@@ -894,12 +956,11 @@ pub fn run_supervised_runtime(
                 "supervisor drained cleanly",
             );
         }
-        // restore pristine networking on stop: now that the
-        // supervisor's tasks (which could re-add routes) have stopped, remove every
-        // NRR-owned route. Runs on every graceful stop path (SCM Stop / Shutdown /
-        // Ctrl+C). A crash skips this; startup orphan-adoption cleans up next run.
-        // Deliberately NOT time-boxed: a filter left behind blocks traffic until
-        // the next start, so this one is worth waiting for however long it takes.
+        // Now that the supervisor's tasks (which could re-add routes) have
+        // stopped, the hook runs the stop plan for `teardown_reason()`: routes
+        // first, filters last under `FILTER_TEARDOWN_DEADLINE`, nothing at all
+        // on a machine shutdown. A crash skips this; the next start adopts or
+        // strips what was left.
         if let Some(teardown) = deps.route_teardown_hook.as_ref() {
             let hook_began = Instant::now();
             tracing::info!(
@@ -922,6 +983,7 @@ pub fn run_supervised_runtime(
     });
 
     controller.report(ServiceRuntimeState::Stopped);
+    crate::lifecycle::clear_recovery_required();
     tracing::info!(
         target: "nrr::lifecycle",
         msg_key = "supervised-teardown-complete",
@@ -1002,6 +1064,7 @@ fn spawn_production_tasks(
     supervisor: &ServiceSupervisor,
     deps: &SupervisedRuntimeDeps,
     health: Arc<HealthAggregator>,
+    liveness: Arc<crate::task_liveness::TaskLiveness>,
 ) {
     // 1. adapter-monitor-tick — foundation for health checks.
     if let Err(e) = supervisor.spawn(build_adapter_monitor_task(
@@ -1116,8 +1179,22 @@ fn spawn_production_tasks(
         }
     }
 
+    spawn_health_and_ipc_tasks(supervisor, deps, health, liveness);
+}
+
+/// The two tasks a blocked start still needs: a fresh health snapshot and a
+/// listener to serve it over.
+fn spawn_health_and_ipc_tasks(
+    supervisor: &ServiceSupervisor,
+    deps: &SupervisedRuntimeDeps,
+    health: Arc<HealthAggregator>,
+    liveness: Arc<crate::task_liveness::TaskLiveness>,
+) {
     // 2. health-aggregator-tick — keeps snapshot fresh.
-    if let Err(e) = supervisor.spawn(build_health_aggregator_task(Arc::clone(&health))) {
+    if let Err(e) = supervisor.spawn(build_health_aggregator_task(
+        Arc::clone(&health),
+        Some(liveness),
+    )) {
         tracing::error!(
             target: "nrr::supervisor",
             msg_key = "supervised-spawn-health-aggregator-failed",

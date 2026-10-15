@@ -127,6 +127,13 @@ fn profile_for_program(program: &str) -> Option<IpcClientProfile> {
 /// might think - but finite, which is the whole point.
 const FIRST_FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long one frame may take to reach the peer, responses and push frames
+/// alike. A client that stopped reading is indistinguishable from a slow one
+/// until the window expires, and an unbounded write parks the worker — with
+/// it one of the 32 slots, and the stop that joins every worker — for as long
+/// as that peer cares to sulk. Same window as the Windows pipe server.
+const PUSH_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Production AF_UNIX IPC server. Holds the router it dispatches to and the
 /// socket path to bind. Cheap to construct — the `UnixListener::bind` happens in
 /// [`IpcServer::bind`].
@@ -461,6 +468,9 @@ fn handle_connection(
         }
     };
     let (reader_tx, reader_rx) = std::sync::mpsc::sync_channel::<ReaderMsg>(8);
+    // Past the window the write fails, the loop below breaks, and teardown
+    // drops the subscription and frees the slot.
+    let _ = stream.set_write_timeout(Some(PUSH_WRITE_TIMEOUT));
     // Idle timeout for the FIRST frame only. A connection that says nothing
     // holds one of 32 slots for as long as it likes, and 32 silent connections
     // make the service unreachable without a single malformed byte. After the
@@ -607,6 +617,7 @@ fn narrow_profile_from_handshake(
 /// Synthetic response written when the concurrency cap rejects a connection
 /// before any protocol exchange.
 fn write_busy_response(mut stream: UnixStream) -> std::io::Result<()> {
+    let _ = stream.set_write_timeout(Some(PUSH_WRITE_TIMEOUT));
     let env = error_response(
         IpcErrorCode::Internal,
         "service is busy; max concurrent connections reached",
@@ -1122,6 +1133,63 @@ mod tests {
         let _ = ticker.join().expect("ticker thread");
         acceptor.request_shutdown();
         acceptor.join_workers();
+    }
+
+    /// A subscriber that stops reading used to hold its worker in `write` for
+    /// good: the slot stayed taken and a stop waited on it in `join_workers`.
+    #[test]
+    fn a_subscriber_that_stops_reading_gives_its_slot_back() {
+        use nrr_shared::ipc::IpcOperationName;
+        use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+        present_as(IpcClientProfile::GuiInteractive);
+        let dir = temp_dir();
+        let sock = dir.0.join("service.sock");
+        let bus = Arc::new(EventBus::new());
+        let server = UnixDomainSocketServer::new_at(serving_router(Arc::clone(&bus)), &sock)
+            .with_event_bus(Arc::clone(&bus));
+        let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
+
+        let acc = Arc::clone(&acceptor);
+        let ticker = thread::spawn(move || acc.accept_one());
+
+        let mut client = connect(&sock);
+        let mut request = request_for(IpcOperationName::StatusUpdatesSubscribe);
+        request.payload = serde_json::json!({ "client-id": "sulking-client" });
+        write_frame(&mut client, &request).expect("client writes subscribe");
+        let response: IpcResponseEnvelope = read_frame(&mut client).expect("client reads response");
+        assert!(
+            response.ok,
+            "subscribe must succeed, got {:?}",
+            response.error
+        );
+        let _ = ticker.join().expect("ticker thread");
+
+        // From here the client reads nothing. Frames well past any socket
+        // buffer: the push pump fills it and then sits in `write`.
+        for _ in 0..8 {
+            bus.publish(StatusUpdateEvent::AdaptersChanged {
+                data_source: "x".repeat(64 * 1024),
+            });
+        }
+
+        let deadline = Instant::now() + PUSH_WRITE_TIMEOUT + Duration::from_secs(10);
+        while acceptor.active_connections() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the worker is still parked on a peer that stopped reading",
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        // The stop no longer has anybody to wait for.
+        acceptor.request_shutdown();
+        acceptor.join_workers();
+        assert_eq!(
+            bus.subscriber_count(),
+            0,
+            "the dead subscription was dropped"
+        );
+        drop(client);
     }
 
     /// `request_shutdown` unblocks a pending `accept_one` (via self-connect)

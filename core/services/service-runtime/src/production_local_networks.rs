@@ -15,10 +15,12 @@
 use std::sync::{Arc, Mutex};
 
 use nrr_domain::ipv4_network::Ipv4Network;
+use nrr_shared::ip_block::IpBlock;
 use nrr_shared::ipc_payloads::{
     LocalNetworkDto, LocalNetworkRejectionDto, LocalNetworksGetResponse, LocalNetworksSetRequest,
     LocalNetworksSetResponse, LOCAL_NETWORK_KIND_MAIN_LINK, LOCAL_NETWORK_KIND_MANUAL,
-    LOCAL_NETWORK_KIND_VIRTUAL_MACHINE,
+    LOCAL_NETWORK_KIND_VIRTUAL_MACHINE, LOCAL_NETWORK_REASON_NAMES_RULE,
+    LOCAL_NETWORK_REASON_TOO_WIDE,
 };
 use nrr_storage::local_network_rules::{
     LocalNetworkOrigin, LocalNetworkRule, LocalNetworkRulesRepository,
@@ -106,9 +108,39 @@ impl ProductionLocalNetworks {
                     // Discovered networks are exempt unless the user said no.
                     allowed: decided.unwrap_or(true),
                     decided_by_user: decided.is_some() || auto_accept,
+                    reason: String::new(),
                 }
             })
             .collect();
+
+        // The main link's public IPv6 prefixes: closed until answered. A
+        // prefix holding a rule's address, or one too wide to be local, stays
+        // closed whatever is answered and is listed with the reason.
+        let candidates = self.coordinator.local_network_candidates(sid);
+        for network in &candidates.public_v6 {
+            out.push(LocalNetworkDto {
+                cidr: network.block.to_string(),
+                kind: LOCAL_NETWORK_KIND_MAIN_LINK.to_string(),
+                adapter: candidates.adapter.clone(),
+                allowed: network.allowed,
+                decided_by_user: network.decided || network.names_rule,
+                reason: if network.names_rule {
+                    LOCAL_NETWORK_REASON_NAMES_RULE.to_string()
+                } else {
+                    String::new()
+                },
+            });
+        }
+        for block in &candidates.too_wide {
+            out.push(LocalNetworkDto {
+                cidr: block.to_string(),
+                kind: LOCAL_NETWORK_KIND_MAIN_LINK.to_string(),
+                adapter: candidates.adapter.clone(),
+                allowed: false,
+                decided_by_user: true,
+                reason: LOCAL_NETWORK_REASON_TOO_WIDE.to_string(),
+            });
+        }
 
         // The user's own entries, minus the ones that also turned up in
         // discovery — those are already listed above with their real adapter.
@@ -131,6 +163,7 @@ impl ProductionLocalNetworks {
                 adapter: String::new(),
                 allowed: rule.allow,
                 decided_by_user: true,
+                reason: String::new(),
             });
         }
         out
@@ -181,6 +214,13 @@ impl LocalNetworksProvider for ProductionLocalNetworks {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let discovered = self.coordinator.discovered_local_networks(sid);
+        let public_v6: Vec<IpBlock> = self
+            .coordinator
+            .local_network_candidates(sid)
+            .public_v6
+            .iter()
+            .map(|n| n.block)
+            .collect();
         let mut rejected: Vec<LocalNetworkRejectionDto> = Vec::new();
         {
             let guard = self
@@ -190,10 +230,39 @@ impl LocalNetworksProvider for ProductionLocalNetworks {
             let repo = LocalNetworkRulesRepository::new(&guard);
             for decision in &request.decisions {
                 let Some(network) = Ipv4Network::parse(&decision.cidr) else {
-                    rejected.push(LocalNetworkRejectionDto {
-                        cidr: decision.cidr.clone(),
-                        reason: REJECT_MALFORMED.to_string(),
-                    });
+                    // An IPv6 answer is taken only about a public prefix the
+                    // main link carries right now; it names no adapter, so it
+                    // never carries over to another segment.
+                    let refusal = match IpBlock::parse(&decision.cidr) {
+                        Some(block) if public_v6.contains(&block) => {
+                            let rule = LocalNetworkRule {
+                                cidr: block.to_string(),
+                                allow: decision.allowed,
+                                origin: LocalNetworkOrigin::Discovered,
+                                adapter: String::new(),
+                                updated_at: 0,
+                            };
+                            if let Err(e) = repo.upsert(sid, &rule, now) {
+                                tracing::warn!(
+                                    target: "nrr::local-networks",
+                                    msg_key = "prod-networks-store-decision-failed",
+                                    sid = %sid,
+                                    cidr = %rule.cidr,
+                                    error = %e,
+                                    "could not store the local-network decision",
+                                );
+                            }
+                            None
+                        }
+                        Some(block) => Some((block.to_string(), REJECT_NOT_PRIVATE)),
+                        None => Some((decision.cidr.clone(), REJECT_MALFORMED)),
+                    };
+                    if let Some((cidr, reason)) = refusal {
+                        rejected.push(LocalNetworkRejectionDto {
+                            cidr,
+                            reason: reason.to_string(),
+                        });
+                    }
                     continue;
                 };
                 // A public range is not a local segment, and exempting one
@@ -256,6 +325,7 @@ impl LocalNetworksProvider for ProductionLocalNetworks {
             for cidr in &request.forget {
                 let canonical = Ipv4Network::parse(cidr)
                     .map(|n| n.to_cidr_string())
+                    .or_else(|| IpBlock::parse(cidr).map(|b| b.to_string()))
                     .unwrap_or_else(|| cidr.clone());
                 let _ = repo.remove(sid, &canonical);
             }
@@ -267,10 +337,14 @@ impl LocalNetworksProvider for ProductionLocalNetworks {
     }
 }
 
-/// RFC1918 only — the ranges a local segment may claim.
+/// The ranges a local segment may claim — the one table in `nrr-domain`,
+/// shared with the decision the enforcement applies to discovered segments.
 fn is_private(network: Ipv4Network) -> bool {
-    let o = network.network().octets();
-    o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168)
+    nrr_shared::ip_block::IpBlock::new(
+        std::net::IpAddr::V4(network.network()),
+        network.prefix_len(),
+    )
+    .is_some_and(nrr_domain::ip_network_policy::is_private)
 }
 
 // ── Sites that refuse main-link addresses ────────────────────────────────────

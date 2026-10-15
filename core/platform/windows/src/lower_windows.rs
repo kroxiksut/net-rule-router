@@ -132,7 +132,7 @@ const _: () = {
 /// user, and the service-accounts principal the apply layer expands.
 fn user_sid_of(scope: &PrincipalScope) -> Option<String> {
     match scope {
-        PrincipalScope::Machine => None,
+        PrincipalScope::Machine | PrincipalScope::Forwarded => None,
         PrincipalScope::User(user) => Some(user.as_stored().to_string()),
         PrincipalScope::ServiceAccounts => Some(SERVICE_ACCOUNTS_PRINCIPAL.to_string()),
     }

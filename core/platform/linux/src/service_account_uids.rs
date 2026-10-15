@@ -1,8 +1,9 @@
 //! Which uids are the machine's service accounts: the system range from
 //! `/etc/login.defs` and `nobody`, minus every user who is present.
 //!
-//! A present user is excluded even from the system range — a root console
-//! session is a person, and their traffic follows their own plan.
+//! A present user is excluded even from the system range: their routes follow
+//! their own plan. A present root is filtered by nobody — uid 0 is also the
+//! daemon's, sshd's and the VPN clients' (`lower_linux::is_root_user`).
 
 /// `SYS_UID_MAX` when `login.defs` does not say: the shadow-utils default.
 pub const DEFAULT_SYS_UID_MAX: u32 = 999;

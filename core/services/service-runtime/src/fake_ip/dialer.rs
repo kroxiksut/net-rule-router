@@ -14,11 +14,12 @@
 //! bytes through untouched, which is why fake-IP needs no certificates and
 //! survives encrypted SNI.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nrr_platform_api::icmp_echo::{EchoOutcome, EchoProbe, IcmpEchoPort};
 use nrr_shared::RouteRole;
@@ -31,6 +32,21 @@ use nrr_shared::RouteRole;
 /// top of that — while staying inside what a browser is still willing to wait,
 /// so the reset arrives before the user has given up on their own.
 pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Addresses one TCP dial tries, the first included. The application sees only
+/// the virtual address, so the host's other addresses are its fallback only if
+/// the dial tries them; bounded so a long answer cannot outlast the ceiling.
+pub const MAX_DIAL_ADDRESSES: usize = 4;
+
+/// What one address gets while another waits behind it. The last address
+/// always gets what is left of [`UPSTREAM_CONNECT_TIMEOUT`], so a single-address
+/// host keeps the whole ceiling for a slow tunnel.
+pub const PER_ADDRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long an address that did not answer goes to the back of its host's
+/// list: without it every new flow to the host pays the dead address again.
+const FAILED_ADDRESS_MEMORY: Duration = Duration::from_secs(120);
+const FAILED_ADDRESS_CAP: usize = 256;
 
 /// How often a UDP reader wakes to check for teardown when no datagram is
 /// arriving. Short enough that a torn-down flow's worker exits promptly.
@@ -58,6 +74,9 @@ pub struct UpstreamTarget {
     /// the decision that produced this target runs on the shared poll loop,
     /// where a blocking lookup would stall every other flow.
     pub address: Option<SocketAddr>,
+    /// The host's further addresses, tried in order when `address` does not
+    /// answer. Empty for a single-address host.
+    pub fallbacks: Vec<SocketAddr>,
     /// Port the client asked for. Known even when the address is not.
     pub port: u16,
     /// Route the policy picked for this hostname.
@@ -72,6 +91,7 @@ impl UpstreamTarget {
             hostname,
             port: address.port(),
             address: Some(address),
+            fallbacks: Vec::new(),
             route,
         }
     }
@@ -273,6 +293,54 @@ pub struct SystemRelayDialer {
     names: Option<Arc<dyn RelayNameResolver>>,
     /// Sends relayed echoes. Unwired, `ping` to a virtual address stays silent.
     icmp: Option<Arc<dyn IcmpEchoPort>>,
+    /// Shared by clones: every dial thread learns from the others' failures.
+    failed: Arc<FailedAddresses>,
+}
+
+/// Addresses that recently did not answer, per route: an address dead over the
+/// primary link may well answer over the secondary.
+#[derive(Default)]
+struct FailedAddresses {
+    at: Mutex<HashMap<(RouteRole, IpAddr), Instant>>,
+}
+
+impl FailedAddresses {
+    fn remember(&self, route: RouteRole, ip: IpAddr, now: Instant) {
+        let mut at = self.at.lock().unwrap_or_else(|p| p.into_inner());
+        if at.len() >= FAILED_ADDRESS_CAP {
+            at.retain(|_, failed| now.saturating_duration_since(*failed) < FAILED_ADDRESS_MEMORY);
+        }
+        if at.len() >= FAILED_ADDRESS_CAP {
+            if let Some(oldest) = at
+                .iter()
+                .min_by_key(|(_, failed)| **failed)
+                .map(|(k, _)| *k)
+            {
+                at.remove(&oldest);
+            }
+        }
+        at.insert((route, ip), now);
+    }
+
+    fn forget(&self, route: RouteRole, ip: IpAddr) {
+        self.at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(route, ip));
+    }
+
+    /// Recently failed addresses move to the back; the order is kept otherwise.
+    fn order(&self, route: RouteRole, candidates: &mut [SocketAddr], now: Instant) {
+        let at = self.at.lock().unwrap_or_else(|p| p.into_inner());
+        if at.is_empty() {
+            return;
+        }
+        candidates.sort_by_key(|address| {
+            at.get(&(route, address.ip())).is_some_and(|failed| {
+                now.saturating_duration_since(*failed) < FAILED_ADDRESS_MEMORY
+            })
+        });
+    }
 }
 
 impl std::fmt::Debug for SystemRelayDialer {
@@ -332,20 +400,37 @@ impl SystemRelayDialer {
     }
 
     /// The address to dial: the one the target carries, or one looked up now.
+    fn dial_address(&self, target: &UpstreamTarget) -> Result<SocketAddr, RelayError> {
+        let mut addresses = self.dial_addresses(target)?;
+        Ok(addresses.swap_remove(0))
+    }
+
+    /// Every address a dial may try, best first, never empty: the target's own,
+    /// or the ones looked up now.
     ///
     /// This is the only DNS on the relay path, and it is on the dial thread by
     /// construction.
-    fn dial_address(&self, target: &UpstreamTarget) -> Result<SocketAddr, RelayError> {
+    fn dial_addresses(&self, target: &UpstreamTarget) -> Result<Vec<SocketAddr>, RelayError> {
         if let Some(address) = target.address {
-            return Ok(address);
+            let mut addresses = Vec::with_capacity(1 + target.fallbacks.len());
+            addresses.push(address);
+            addresses.extend(target.fallbacks.iter().copied());
+            addresses.truncate(MAX_DIAL_ADDRESSES);
+            return Ok(addresses);
         }
         let Some(names) = self.names.as_ref() else {
             return Err(RelayError::Upstream {
                 detail: format!("no address for {} and no resolver wired", target.hostname),
             });
         };
-        let started = std::time::Instant::now();
-        let Some(ip) = names.resolve(&target.hostname).into_iter().next() else {
+        let started = Instant::now();
+        let addresses: Vec<SocketAddr> = names
+            .resolve(&target.hostname)
+            .into_iter()
+            .take(MAX_DIAL_ADDRESSES)
+            .map(|ip| SocketAddr::new(ip, target.port))
+            .collect();
+        let Some(first) = addresses.first() else {
             return Err(RelayError::Upstream {
                 detail: format!("could not find out where {} lives", target.hostname),
             });
@@ -353,11 +438,37 @@ impl SystemRelayDialer {
         tracing::debug!(
             target: "nrr::fake_ip",
             hostname = %target.hostname,
-            address = %ip,
+            address = %first,
+            addresses = addresses.len(),
             elapsed_ms = started.elapsed().as_millis(),
             "resolved a flow's destination at dial time — nothing was cached for it",
         );
-        Ok(SocketAddr::new(ip, target.port))
+        Ok(addresses)
+    }
+
+    /// One TCP connect to one address, waiting at most `timeout`.
+    fn connect_one(
+        &self,
+        route: RouteRole,
+        address: SocketAddr,
+        timeout: Duration,
+    ) -> Result<TcpStream, RelayError> {
+        let started = Instant::now();
+        let bind = self.bind_address_for(route, &address)?;
+        // `std` can neither bind nor mark a socket before connect; `socket2` can.
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(address),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        nrr_platform_api::own_traffic::mark_own_socket(&socket);
+        if let Some(bind) = bind {
+            socket.bind(&bind.into())?;
+        }
+        socket
+            .connect_timeout(&address.into(), timeout)
+            .map_err(|e| dial_failed(e, address, started.elapsed()))?;
+        Ok(TcpStream::from(socket))
     }
 
     /// Resolve the bind decision for `address`, verifying address families: a
@@ -384,6 +495,41 @@ impl SystemRelayDialer {
                 Ok(Some(SocketAddr::new(source, 0)))
             }
         }
+    }
+}
+
+/// Time for the attempt at `index` of `count`: the last one gets all that is
+/// `left`, the others a share that leaves the rest something to try with.
+fn attempt_timeout(index: usize, count: usize, left: Duration) -> Duration {
+    if index + 1 >= count {
+        left
+    } else {
+        left.min(PER_ADDRESS_CONNECT_TIMEOUT)
+    }
+}
+
+/// One error for a dial whose every address failed: the only one's own when
+/// there was one address, otherwise how many were tried and the last reason.
+fn no_address_answered(
+    hostname: &str,
+    mut failures: Vec<(SocketAddr, RelayError)>,
+    elapsed: Duration,
+) -> RelayError {
+    let tried = failures.len();
+    match failures.pop() {
+        Some((_, only)) if tried == 1 => only,
+        Some((_, last)) => RelayError::Upstream {
+            detail: format!(
+                "none of {tried} addresses of {hostname} answered within {} ms; last: {last}",
+                elapsed.as_millis()
+            ),
+        },
+        None => RelayError::Upstream {
+            detail: format!(
+                "no time left to connect to {hostname} (limit {} s)",
+                UPSTREAM_CONNECT_TIMEOUT.as_secs()
+            ),
+        },
     }
 }
 
@@ -448,23 +594,59 @@ impl RelayDialer for SystemRelayDialer {
     }
 
     fn connect_tcp(&self, target: &UpstreamTarget) -> Result<Box<dyn RelayStream>, RelayError> {
-        let address = self.dial_address(target)?;
-        let started = std::time::Instant::now();
-        let bind = self.bind_address_for(target.route, &address)?;
-        // `std` can neither bind nor mark a socket before connect; `socket2` can.
-        let socket = socket2::Socket::new(
-            socket2::Domain::for_address(address),
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )?;
-        nrr_platform_api::own_traffic::mark_own_socket(&socket);
-        if let Some(bind) = bind {
-            socket.bind(&bind.into())?;
+        let mut candidates = self.dial_addresses(target)?;
+        let started = Instant::now();
+        let several = candidates.len() > 1;
+        if several {
+            self.failed.order(target.route, &mut candidates, started);
         }
-        socket
-            .connect_timeout(&address.into(), UPSTREAM_CONNECT_TIMEOUT)
-            .map_err(|e| dial_failed(e, address, started.elapsed()))?;
-        let stream = TcpStream::from(socket);
+        let mut failures: Vec<(SocketAddr, RelayError)> = Vec::new();
+        let mut connected = None;
+        for (index, &address) in candidates.iter().enumerate() {
+            let left = UPSTREAM_CONNECT_TIMEOUT.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            let timeout = attempt_timeout(index, candidates.len(), left);
+            match self.connect_one(target.route, address, timeout) {
+                Ok(stream) => {
+                    connected = Some((address, stream));
+                    break;
+                }
+                // Policy refuses the route, not the address: every other
+                // address would be refused the same way.
+                Err(refused @ RelayError::SourcePolicyRefused { .. }) => return Err(refused),
+                Err(error) => {
+                    if several {
+                        self.failed
+                            .remember(target.route, address.ip(), Instant::now());
+                    }
+                    failures.push((address, error));
+                }
+            }
+        }
+        let Some((address, stream)) = connected else {
+            return Err(no_address_answered(
+                &target.hostname,
+                failures,
+                started.elapsed(),
+            ));
+        };
+        if several {
+            self.failed.forget(target.route, address.ip());
+        }
+        if let Some((failed, _)) = failures.first() {
+            tracing::info!(
+                target: "nrr::fake_ip",
+                msg_key = "fakeip-dial-next-address",
+                hostname = %target.hostname,
+                failed = %failed,
+                connected = %address,
+                tried = failures.len() + 1,
+                route = ?target.route,
+                "a host's first address did not answer; the relay connected through the next one",
+            );
+        }
         stream.set_nodelay(true).ok();
         // Both timeouts exist so worker threads stay joinable: the reader turns
         // a silent-forever upstream into periodic teardown checks, the writer
@@ -899,6 +1081,7 @@ mod tests {
         UpstreamTarget {
             hostname: hostname.to_string(),
             address: None,
+            fallbacks: Vec::new(),
             port,
             route: RouteRole::Primary,
         }
@@ -1126,6 +1309,113 @@ mod tests {
         stream.shutdown_write().expect("half close");
 
         assert_eq!(accepted.join().expect("join"), b"ping");
+    }
+
+    /// An address no connect can reach: port 0 is refused at once on every OS,
+    /// with no SYN retries for a loaded machine to stretch out.
+    fn closed_port() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 0))
+    }
+
+    /// The application holds only the virtual address; without the next
+    /// address it would get a reset where a direct connect would have gone on.
+    #[test]
+    fn a_dead_first_address_falls_through_to_the_next() {
+        let dead = closed_port();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let live = listener.local_addr().expect("addr");
+        let accepted = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 16];
+            let read = socket.read(&mut buffer).expect("read");
+            buffer[..read].to_vec()
+        });
+
+        let dialer = SystemRelayDialer::new();
+        let mut target =
+            UpstreamTarget::at("several.example".to_string(), dead, RouteRole::Primary);
+        target.fallbacks = vec![live];
+        let mut stream = dialed(
+            dialer.connect_tcp(&target),
+            "connect through the next address",
+        );
+        stream.write_all(b"ping").expect("write");
+        stream.shutdown_write().expect("half close");
+
+        assert_eq!(accepted.join().expect("join"), b"ping");
+    }
+
+    #[test]
+    fn every_address_failing_names_how_many_were_tried() {
+        let dialer = SystemRelayDialer::new();
+        let mut target = UpstreamTarget::at(
+            "nowhere.example".to_string(),
+            closed_port(),
+            RouteRole::Primary,
+        );
+        target.fallbacks = vec![closed_port()];
+        let error = dial_error(dialer.connect_tcp(&target));
+        let text = error.to_string();
+        assert!(text.contains("none of 2 addresses"), "{text}");
+        assert!(text.contains("nowhere.example"), "{text}");
+    }
+
+    #[test]
+    fn only_the_last_address_gets_the_rest_of_the_ceiling() {
+        let left = UPSTREAM_CONNECT_TIMEOUT;
+        assert_eq!(
+            attempt_timeout(0, 1, left),
+            left,
+            "a lone address keeps it all"
+        );
+        assert_eq!(attempt_timeout(0, 3, left), PER_ADDRESS_CONNECT_TIMEOUT);
+        assert_eq!(attempt_timeout(1, 3, left), PER_ADDRESS_CONNECT_TIMEOUT);
+        assert_eq!(attempt_timeout(2, 3, left), left);
+        let short = Duration::from_secs(2);
+        assert_eq!(
+            attempt_timeout(0, 3, short),
+            short,
+            "never past what is left"
+        );
+        // The worst case still fits the ceiling the user experiences.
+        let worst =
+            PER_ADDRESS_CONNECT_TIMEOUT * u32::try_from(MAX_DIAL_ADDRESSES - 1).expect("small");
+        assert!(worst < UPSTREAM_CONNECT_TIMEOUT);
+    }
+
+    #[test]
+    fn a_failed_address_is_forgotten_after_a_while_and_per_route() {
+        let failed = FailedAddresses::default();
+        let a: SocketAddr = "192.0.2.1:443".parse().expect("a");
+        let b: SocketAddr = "192.0.2.2:443".parse().expect("b");
+        let then = Instant::now();
+        failed.remember(RouteRole::Primary, a.ip(), then);
+
+        let mut order = vec![a, b];
+        failed.order(RouteRole::Secondary, &mut order, then);
+        assert_eq!(
+            order,
+            vec![a, b],
+            "dead over the primary says nothing of the secondary"
+        );
+
+        failed.order(RouteRole::Primary, &mut order, then);
+        assert_eq!(order, vec![b, a]);
+
+        let mut order = vec![a, b];
+        failed.order(RouteRole::Primary, &mut order, then + FAILED_ADDRESS_MEMORY);
+        assert_eq!(order, vec![a, b], "the memory expires");
+    }
+
+    #[test]
+    fn the_failed_address_memory_is_bounded() {
+        let failed = FailedAddresses::default();
+        let now = Instant::now();
+        for n in 0..u32::try_from(FAILED_ADDRESS_CAP + 50).expect("small") {
+            failed.remember(RouteRole::Primary, IpAddr::from(n.to_be_bytes()), now);
+        }
+        let held = failed.at.lock().expect("lock").len();
+        assert_eq!(held, FAILED_ADDRESS_CAP);
     }
 
     #[test]

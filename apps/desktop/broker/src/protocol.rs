@@ -24,9 +24,11 @@ use serde::{Deserialize, Serialize};
 pub const MAX_FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a `broker.service-control` child may run before the broker kills
-/// it. Generous — `reinstall` restarts a service — but finite: it runs in the
+/// it. Generous — "stop and restore the network" may wait out a hung stop, end
+/// the process and sweep a wedged filtering engine, and a child killed midway
+/// leaves the service's restart-on-failure off — but finite: it runs in the
 /// broker's only accept loop.
-pub const SERVICE_CONTROL_BUDGET: Duration = Duration::from_secs(90);
+pub const SERVICE_CONTROL_BUDGET: Duration = Duration::from_secs(150);
 
 /// What the launcher waits beyond the broker's own bound: scheduling, the frame
 /// round-trip, a service call overrunning its timeout by a reconnect.

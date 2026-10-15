@@ -2,16 +2,21 @@
 //! service restart left pointing at now-dead fake addresses (see the port's
 //! module doc in `nrr_platform_api::fake_ip::stale_flows` for why).
 //!
-//! Reads the IPv4 TCP connection table the same way `flow_owner` does
-//! (`GetExtendedTcpTable` / `TCP_TABLE_OWNER_PID_ALL`), then asks the OS to
-//! delete the control block of every row whose remote address falls in the
-//! given range via `SetTcpEntry` + `MIB_TCP_STATE_DELETE_TCB`. Only
+//! Reads the TCP connection tables of both families the same way `flow_owner`
+//! does (`GetExtendedTcpTable` / `TCP_TABLE_OWNER_PID_ALL`), then asks the OS
+//! to delete the control block of every IPv4 row whose remote address falls in
+//! the given range via `SetTcpEntry` + `MIB_TCP_STATE_DELETE_TCB`. Only
 //! `ESTABLISHED` rows are attempted: `SetTcpEntry` rejects any other state,
 //! and a row that was never established was never a candidate, so that
 //! rejection would not be a real failure — filtering up front keeps `found`
 //! meaningful and avoids counting expected refusals as lost teardowns.
 //! Deleting a control block needs administrator rights; without them every
 //! row is simply skipped, which is why teardown is best-effort by contract.
+//!
+//! IPv6 connections are listed but never torn down here: iphlpapi has no v6
+//! counterpart of `SetTcpEntry`. Their fate rests on WFP ALE re-authorisation
+//! — the filter change that follows a rule or link change re-classifies every
+//! established flow, and one the new filters block is cut by the stack.
 //!
 //! The owner of a listed connection is the user of its owning process
 //! (`dwOwningPid` -> process token -> SID string), resolved once per process.
@@ -20,18 +25,18 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use windows::Win32::NetworkManagement::IpHelper::{
-    SetTcpEntry, MIB_TCPROW_LH, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
-    MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB,
+    SetTcpEntry, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_LH,
+    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB,
 };
 
 use nrr_platform_api::fake_ip::stale_flows::{
     EstablishedFlow, FlowTargets, StaleFlowReset, StaleFlowSweep,
 };
 
-use crate::flow_owner::{read_tcp_owner_pid_table, row_endpoint};
+use crate::flow_owner::{read_tcp6_owner_pid_table, read_tcp_owner_pid_table, row_endpoint};
 use crate::win32_ffi::console_session::process_user_sid;
 
 /// Production [`StaleFlowReset`] over the Windows TCP connection table.
@@ -126,23 +131,61 @@ impl StaleFlowReset for WindowsStaleFlowReset {
             return Vec::new();
         }
         let wanted = targets.matcher();
-        let Some(buffer) = read_tcp_owner_pid_table() else {
-            return Vec::new();
-        };
-        let mut matched: Vec<(SocketAddrV4, SocketAddrV4, u32)> = Vec::new();
-        // SAFETY: same invariant as `reset_flows_to` above — the buffer holds a
-        // valid `MIB_TCPTABLE_OWNER_PID` and we read only its declared rows.
-        unsafe {
-            let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
-            let count = (*table).dwNumEntries as usize;
-            let rows = std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>();
-            for i in 0..count {
-                let row = &*rows.add(i);
-                if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32
-                    && wanted.matches(Ipv4Addr::from(u32::from_be(row.dwRemoteAddr)))
-                {
-                    let (local, remote) = row_endpoints(row);
-                    matched.push((local, remote, row.dwOwningPid));
+        let mut matched: Vec<(SocketAddr, SocketAddr, u32)> = Vec::new();
+        let any_v4 = targets.hosts().iter().any(IpAddr::is_ipv4)
+            || targets.networks().iter().any(|net| net.is_ipv4());
+        let any_v6 = targets.hosts().iter().any(IpAddr::is_ipv6)
+            || targets.networks().iter().any(|net| !net.is_ipv4());
+        // One table read per family asked about: a v4-only sweep never pays
+        // for the v6 table.
+        if any_v4 {
+            if let Some(buffer) = read_tcp_owner_pid_table() {
+                // SAFETY: same invariant as `reset_flows_to` above — the buffer
+                // holds a valid `MIB_TCPTABLE_OWNER_PID` and we read only its
+                // declared rows.
+                unsafe {
+                    let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
+                    let count = (*table).dwNumEntries as usize;
+                    let rows = std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>();
+                    for i in 0..count {
+                        let row = &*rows.add(i);
+                        if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32
+                            && wanted
+                                .matches(IpAddr::V4(Ipv4Addr::from(u32::from_be(row.dwRemoteAddr))))
+                        {
+                            let (local, remote) = row_endpoints(row);
+                            matched.push((
+                                SocketAddr::V4(local),
+                                SocketAddr::V4(remote),
+                                row.dwOwningPid,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if any_v6 {
+            if let Some(buffer) = read_tcp6_owner_pid_table() {
+                // SAFETY: `read_tcp6_owner_pid_table` fills the buffer with a
+                // valid `MIB_TCP6TABLE_OWNER_PID`; its `dwNumEntries` header is
+                // followed by that many contiguous rows, and only those are read.
+                unsafe {
+                    let table = buffer.as_ptr().cast::<MIB_TCP6TABLE_OWNER_PID>();
+                    let count = (*table).dwNumEntries as usize;
+                    let rows = std::ptr::addr_of!((*table).table).cast::<MIB_TCP6ROW_OWNER_PID>();
+                    for i in 0..count {
+                        let row = &*rows.add(i);
+                        if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32
+                            && wanted.matches(IpAddr::V6(Ipv6Addr::from(row.ucRemoteAddr)))
+                        {
+                            let (local, remote) = row6_endpoints(row);
+                            matched.push((
+                                SocketAddr::V6(local),
+                                SocketAddr::V6(remote),
+                                row.dwOwningPid,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -173,11 +216,44 @@ impl StaleFlowReset for WindowsStaleFlowReset {
     }
 
     fn reset_established(&self, flows: &[EstablishedFlow]) -> usize {
-        flows
-            .iter()
-            .filter(|flow| delete_tcb(&delete_tcb_entry_for(flow)))
-            .count()
+        let mut torn_down = 0usize;
+        let mut v6_left = 0usize;
+        for flow in flows {
+            match delete_tcb_entry_for(flow) {
+                Some(entry) => torn_down += usize::from(delete_tcb(&entry)),
+                None => v6_left += 1,
+            }
+        }
+        if v6_left > 0 {
+            tracing::info!(
+                target: "nrr::flow-reset",
+                msg_key = "windows-flow-reset-v6-left-to-ale",
+                left = v6_left,
+                "IPv6 connections were listed but not reset: Windows offers no teardown for them; the filter change re-authorises them at WFP ALE, which cuts the ones it now blocks",
+            );
+        }
+        torn_down
     }
+}
+
+/// A v6 table row's local and remote endpoints, host order. The scope id is
+/// the row's own, as the stack reported it.
+fn row6_endpoints(row: &MIB_TCP6ROW_OWNER_PID) -> (SocketAddrV6, SocketAddrV6) {
+    let port = |p: u32| (((p & 0xff) << 8) | ((p >> 8) & 0xff)) as u16;
+    (
+        SocketAddrV6::new(
+            Ipv6Addr::from(row.ucLocalAddr),
+            port(row.dwLocalPort),
+            0,
+            row.dwLocalScopeId,
+        ),
+        SocketAddrV6::new(
+            Ipv6Addr::from(row.ucRemoteAddr),
+            port(row.dwRemotePort),
+            0,
+            row.dwRemoteScopeId,
+        ),
+    )
 }
 
 /// A table row's local and remote endpoints, host order.
@@ -232,17 +308,21 @@ fn delete_tcb_entry(row: &MIB_TCPROW_OWNER_PID) -> MIB_TCPROW_LH {
 }
 
 /// The same delete request for a listed connection: the inverse of
-/// [`row_endpoints`], back to network byte order.
-fn delete_tcb_entry_for(flow: &EstablishedFlow) -> MIB_TCPROW_LH {
+/// [`row_endpoints`], back to network byte order. `None` for an IPv6
+/// connection — there is no row type `SetTcpEntry` takes for one.
+fn delete_tcb_entry_for(flow: &EstablishedFlow) -> Option<MIB_TCPROW_LH> {
+    let (SocketAddr::V4(local), SocketAddr::V4(remote)) = (flow.local, flow.remote) else {
+        return None;
+    };
     let mut entry = MIB_TCPROW_LH {
-        dwLocalAddr: u32::from(*flow.local.ip()).to_be(),
-        dwLocalPort: u32::from(flow.local.port().to_be()),
-        dwRemoteAddr: u32::from(*flow.remote.ip()).to_be(),
-        dwRemotePort: u32::from(flow.remote.port().to_be()),
+        dwLocalAddr: u32::from(*local.ip()).to_be(),
+        dwLocalPort: u32::from(local.port().to_be()),
+        dwRemoteAddr: u32::from(*remote.ip()).to_be(),
+        dwRemotePort: u32::from(remote.port().to_be()),
         ..Default::default()
     };
     entry.Anonymous.State = MIB_TCP_STATE_DELETE_TCB;
-    entry
+    Some(entry)
 }
 
 /// Ask the OS to tear down one `ESTABLISHED` connection. Best-effort: a
@@ -346,13 +426,13 @@ mod tests {
         );
 
         let flow = EstablishedFlow {
-            local,
-            remote,
+            local: SocketAddr::V4(local),
+            remote: SocketAddr::V4(remote),
             owner: None,
             pid: None,
             image: None,
         };
-        let from_flow = delete_tcb_entry_for(&flow);
+        let from_flow = delete_tcb_entry_for(&flow).expect("an IPv4 connection has a row");
         let from_row = delete_tcb_entry(&row);
         assert_eq!(from_flow.dwLocalAddr, from_row.dwLocalAddr);
         assert_eq!(from_flow.dwLocalPort, from_row.dwLocalPort);
@@ -363,12 +443,44 @@ mod tests {
         assert_eq!(state, MIB_TCP_STATE_DELETE_TCB);
     }
 
+    /// A v6 row decodes to the endpoints the stack reported, ports in host
+    /// order and the scope id kept; it has no `SetTcpEntry` row, so a reset
+    /// counts it as left standing rather than failing the batch.
+    #[test]
+    fn a_v6_row_is_listed_with_its_endpoints_and_never_handed_to_set_tcp_entry() {
+        let local_ip: Ipv6Addr = "2001:db8::2".parse().expect("literal");
+        let remote_ip: Ipv6Addr = "2001:db8::7".parse().expect("literal");
+        let row = MIB_TCP6ROW_OWNER_PID {
+            ucLocalAddr: local_ip.octets(),
+            dwLocalScopeId: 0,
+            dwLocalPort: 0x0000_50C3, // 50000
+            ucRemoteAddr: remote_ip.octets(),
+            dwRemoteScopeId: 3,
+            dwRemotePort: 0x0000_BB01, // 443
+            dwState: MIB_TCP_STATE_ESTAB.0 as u32,
+            dwOwningPid: 4242,
+        };
+        let (local, remote) = row6_endpoints(&row);
+        assert_eq!(local, SocketAddrV6::new(local_ip, 50_000, 0, 0));
+        assert_eq!(remote, SocketAddrV6::new(remote_ip, 443, 0, 3));
+        let flow = EstablishedFlow {
+            local: SocketAddr::V6(local),
+            remote: SocketAddr::V6(remote),
+            owner: None,
+            pid: None,
+            image: None,
+        };
+        assert!(delete_tcb_entry_for(&flow).is_none());
+        assert_eq!(WindowsStaleFlowReset.reset_established(&[flow]), 0);
+    }
+
     /// Listing only reads the table, so it is safe against the live machine.
     #[test]
     fn listing_an_address_nothing_talks_to_finds_nothing() {
-        let nobody = Ipv4Addr::new(192, 0, 2, 254);
+        let nobody = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 254));
+        let nobody6 = IpAddr::V6("2001:db8::fe".parse().expect("literal"));
         assert!(WindowsStaleFlowReset
-            .established_flows_to(&[nobody])
+            .established_flows_to(&[nobody, nobody6])
             .is_empty());
         assert!(WindowsStaleFlowReset.established_flows_to(&[]).is_empty());
         let unused = nrr_shared::ip_block::IpBlock::parse("192.0.2.240/28").expect("test network");

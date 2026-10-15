@@ -144,9 +144,10 @@ function sectionGlyph(sectionId) {
 // Labels stay as (key, fallback) pairs: a `.pragma library` has no `tr()`.
 // `icon` names an asset under assets/icons/ui/ (ui-hc/ mirrors it). Empty
 // string means no existing icon fits the category closely enough — leave it
-// unmarked rather than force a loose match.
-function settingsCategories() {
-    return [
+// unmarked rather than force a loose match. "Updates" is listed only when the
+// build carries the release check (`context.updateCheckAvailable`).
+function settingsCategories(updateCheckAvailable) {
+    var all = [
         { id: "application", key: "settings.category.application", fallback: "Application", icon: "settings" },
         { id: "notifications", key: "settings.category.notifications", fallback: "Notifications", icon: "bell" },
         { id: "diagnostics", key: "settings.group.logs-diagnostics", fallback: "Logs and diagnostics", icon: "diagnostics" },
@@ -157,6 +158,8 @@ function settingsCategories() {
         { id: "experimental", key: "settings.group.experimental", fallback: "Experimental", icon: "experimental" },
         { id: "updates", key: "settings.group.updates", fallback: "Updates", icon: "download" }
     ]
+    return updateCheckAvailable === true
+        ? all : all.filter(function(c) { return c.id !== "updates" })
 }
 
 // Schemes the app is willing to hand to the OS. A URL string reaches this
@@ -393,14 +396,8 @@ var STABILITY_FIELD_DEFAULTS = {
 // above but are still part of the config the writer round-trips.
 var STABILITY_STRUCTURED_KEYS = ["ipc-accept-policy"]
 
-// The administrator's rules lock: never recorded as a user's intent, never
-// replayed and never carried forward out of one user's preferences.
+// The administrator's rules lock: a write carries it only from the live row.
 var STABILITY_INTENT_EXCLUDED_KEYS = ["allow-user-rule-edits"]
-
-// Row fields whose value belongs to the calling user. Empty: the service keeps
-// ONE stability row per machine and refuses an unelevated change of any field
-// (`service_stability_handlers.rs`), so every other key is machine-wide.
-var STABILITY_PER_USER_KEYS = []
 
 // Service-side clamps for the numeric fields. `non-positive` is the value a
 // zero-or-negative input resolves to (0 = "disabled" for the liveness window,
@@ -422,92 +419,6 @@ var STABILITY_FIELD_CHOICES = {
 function stabilityKeyIsKnown(key) {
     return STABILITY_FIELD_DEFAULTS[key] !== undefined
         || STABILITY_STRUCTURED_KEYS.indexOf(key) >= 0
-}
-
-// True when a recorded intent for `key` may be kept at all. A one-shot request
-// such as `verbose-logging-change` or `conn-trace-ndjson-change` never is:
-// replayed on the next connect it would re-open a window that had ended. Neither is the rules lock, nor a key
-// this build no longer has.
-function stabilityIntentIsRecordable(key) {
-    return stabilityKeyIsKnown(key) && STABILITY_INTENT_EXCLUDED_KEYS.indexOf(key) < 0
-}
-
-function stabilityKeyIsMachineWide(key) {
-    return STABILITY_PER_USER_KEYS.indexOf(key) < 0
-}
-
-// What a full-row write may carry forward out of the recorded intent without
-// the user naming it. Never a machine-wide value, not even from an elevated
-// GUI: it would overwrite what another administrator chose.
-function stabilityIntentMayReplay(key) {
-    return stabilityIntentIsRecordable(key) && !stabilityKeyIsMachineWide(key)
-}
-
-function _stabilitySame(a, b) {
-    return JSON.stringify(a) === JSON.stringify(b)
-}
-
-// The part of the recorded intent a full-row write may carry forward.
-function stabilityReplayableIntent(intent) {
-    var out = {}
-    for (var key in (intent || {})) {
-        if (stabilityIntentMayReplay(key)) out[key] = intent[key]
-    }
-    return out
-}
-
-// Recorded intents the live row holds otherwise, as key -> { mine, service },
-// for the settings panels to show: a connect writes nothing back. Parked keys
-// belong to the pending-changes flow.
-function stabilityIntentDivergence(intent, live, parked) {
-    var out = {}
-    for (var key in (intent || {})) {
-        if (!stabilityIntentIsRecordable(key)) continue
-        if (parked && parked.hasOwnProperty(key)) continue
-        var service = stabilityEffective(live, key)
-        if (_stabilitySame(stabilityEffective(intent, key), service)) continue
-        out[key] = { "mine": intent[key], "service": service }
-    }
-    return out
-}
-
-// The recorded intent without `key`: the user chose to keep the service's
-// value. Returns null when there was nothing recorded for it.
-function stabilityIntentWithout(intent, key) {
-    if (!intent || !intent.hasOwnProperty(key)) return null
-    var out = {}
-    for (var k in intent) {
-        if (k !== key) out[k] = intent[k]
-    }
-    return out
-}
-
-// The recorded intent after a user's write the service CONFIRMED. `before` is
-// the row the write was merged onto. A machine-wide key is recorded only when
-// the write was carried out elevated: the GUI itself is, or the value really
-// changed, which the service accepts from nobody else. Any other key the write
-// named loses its old record, since the service now holds the user's latest
-// choice. Returns null when nothing changes.
-function stabilityIntentAfterWrite(intent, partial, before, appElevated) {
-    var out = {}
-    var key
-    for (key in (intent || {})) out[key] = intent[key]
-    var changed = false
-    for (key in (partial || {})) {
-        var value = partial[key]
-        if (value === undefined || !stabilityIntentIsRecordable(key)) continue
-        var elevatedWrite = appElevated === true || !stabilityKeyIsMachineWide(key)
-            || !_stabilitySame(stabilityEffective(partial, key), stabilityEffective(before, key))
-        if (elevatedWrite) {
-            if (_stabilitySame(out[key], value)) continue
-            out[key] = value
-            changed = true
-        } else if (out.hasOwnProperty(key)) {
-            delete out[key]
-            changed = true
-        }
-    }
-    return changed ? out : null
 }
 
 // The requests a log-window control (verbose logging, the connection trace on
@@ -1235,6 +1146,86 @@ function verifyVerdictNotice(verdicts) {
     return { ids: ids, shown: shown, more: ids.length - shown.length }
 }
 
+// What the service's `apply` health message opens with when the resolver
+// could not hand the system DNS back (`SYSTEM_DNS_NOT_RESTORED` in nrr-shared).
+var SYSTEM_DNS_NOT_RESTORED = "system DNS could not be restored"
+
+// Whether a health answer says the system DNS was not restored. Twin of
+// `nrr_client_logic::system_dns::not_restored`.
+function systemDnsNotRestored(health) {
+    var components = (health && health.components) || []
+    if (!Array.isArray(components)) return false
+    return components.some(function(c) {
+        return !!c && c.component === "apply"
+            && !!c.message && String(c.message).indexOf(SYSTEM_DNS_NOT_RESTORED) >= 0
+    })
+}
+
+// One reading of that state, from a push or a health answer: raise the notice
+// when the state appears, keep a dismissed one down while it lasts. Twin of
+// `nrr_client_logic::system_dns::notice_step`.
+function systemDnsNoticeStep(wasRaised, notRestored) {
+    var now = notRestored === true
+    return { raise: now && wasRaised !== true, raised: now }
+}
+
+// A network this computer forwards for: WSL's adapter (`vEthernet (WSL)`, or
+// `vEthernet (WSL (Hyper-V firewall))` on newer builds) or a Linux container or
+// VM bridge. Twin of `nrr_client_logic::forwarded::is_forwarding_adapter_name`.
+var FORWARDING_BRIDGE_PREFIXES = ["docker", "br-", "virbr", "lxcbr", "lxdbr", "incusbr",
+    "cni-podman", "podman"]
+function isForwardingAdapterName(name) {
+    if (typeof name !== "string") return false
+    if (name.slice(0, 14).toLowerCase() === "vethernet (wsl") return true
+    for (var i = 0; i < FORWARDING_BRIDGE_PREFIXES.length; ++i) {
+        if (name.indexOf(FORWARDING_BRIDGE_PREFIXES[i]) === 0) return true
+    }
+    return false
+}
+
+// Whether any live interface row is such a network. Twin of
+// `forwarded::forwarding_present`.
+function forwardingPresent(rows) {
+    var list = rows || []
+    for (var i = 0; i < list.length; ++i) {
+        if (list[i] && isForwardingAdapterName(list[i].name)) return true
+    }
+    return false
+}
+
+// Ask when such a network appears unanswered for a user with an additional
+// route; a dismissed request stays down while it stays up, and it coming up
+// again asks again. Twin of `forwarded::notice_step`.
+function forwardedNoticeStep(wasRaised, present, routed, answer) {
+    var waiting = present === true && routed === true
+        && !(typeof answer === "string" && answer !== "")
+    return { raise: waiting && wasRaised !== true, raised: waiting }
+}
+
+// The one summary of blocks the service kept while no surface was open: every
+// entry counted, the first five distinct destinations named, and the largest
+// id read, which is what the acknowledgement covers. Null when there are none.
+function blockNoticeBacklog(entries) {
+    var shownMax = 5
+    var list = entries || []
+    if (list.length === 0) return null
+    var throughId = 0
+    var destinations = []
+    for (var i = 0; i < list.length; i += 1) {
+        var id = Number(list[i].id || 0)
+        if (id > throughId) throughId = id
+        var dest = String(list[i].destination || "")
+        if (dest !== "" && destinations.indexOf(dest) < 0) destinations.push(dest)
+    }
+    var shown = destinations.slice(0, shownMax)
+    return {
+        count: list.length,
+        throughId: throughId,
+        shown: shown,
+        more: destinations.length - shown.length
+    }
+}
+
 // Warnings ahead of everything else, each group in the order given: what
 // needs the user's hand must not sit under the news.
 function noticesWarningsFirst(notices) {
@@ -1562,6 +1553,7 @@ var ROUTE_POLICY_FIELD_DEFAULTS = {
     "resolve-hosts-bypass": true,
     "doh-lockdown-enabled": false,
     "doh-lockdown-scope": "leak-protection-only",
+    "doh-lockdown-auto": true,
     "browser-history-auto-seed": false,
     "kill-switch-strict-shared-ips": false,
     "auto-rules-mode": "suggest",
@@ -1574,13 +1566,46 @@ var ROUTE_POLICY_FIELD_DEFAULTS = {
     "zone-priority-over-ip": false,
     "short-name-completion": false,
     "short-name-suffix": "",
-    "app-rules-take-all-addresses": false
+    "app-rules-take-all-addresses": false,
+    "forwarded-outage": ""
 }
 
 // Keys the policy SNAPSHOT carries but the update REQUEST must not: they are
 // written through their own dedicated operation and the request DTO has no
 // field for them.
-var ROUTE_POLICY_SNAPSHOT_ONLY_KEYS = ["secondary-link-provider-apps"]
+var ROUTE_POLICY_SNAPSHOT_ONLY_KEYS = ["secondary-link-provider-apps", "doh-lockdown-effective"]
+
+// Wire key -> the preference that mirrors it for a launch without the service.
+// A mirror follows a write the service confirmed and nothing else: written
+// ahead of the write, a declined prompt left it ON while the service held
+// OFF, and every later visit to the panel re-sent the stale value.
+var ROUTE_POLICY_PREF_MIRRORS = {
+    "mode": "routeBehaviorMode",
+    "kill-switch-enabled": "routeKillSwitchEnabled",
+    "kill-switch-fail-closed": "routeKillSwitchFailClosed",
+    "kill-switch-block-all": "routeKillSwitchBlockAll",
+    "kill-switch-protocols": "routeKillSwitchProtocols",
+    "allow-dns-over-primary": "routeAllowDnsOverPrimary",
+    "include-subdomains": "routeIncludeSubdomains",
+    "shared-ip-policy": "routeSharedIpPolicy",
+    "mode-a-coverage-strategy": "routeModeACoverageStrategy",
+    "resolve-hosts-bypass": "routeResolveHostsBypass"
+}
+
+// The preferences patch a confirmed write leaves behind: the mirrored keys
+// among `keys`, at the value `req` sent. Empty when the write named none.
+function routePolicyPrefMirrorPatch(req, keys) {
+    var patch = {}
+    var list = keys || []
+    for (var i = 0; i < list.length; i += 1) {
+        var pref = ROUTE_POLICY_PREF_MIRRORS[list[i]]
+        if (pref === undefined) continue
+        var value = (req || {})[list[i]]
+        if (value === undefined || value === null) continue
+        patch[pref] = value
+    }
+    return patch
+}
 
 // Bit masks for the numeric wire fields (the protocol bitmask is the only one).
 // A masked value is a selection only when it sets a bit that blocks something
@@ -1697,22 +1722,6 @@ function isUserWriteOrigin(origin) {
 // The two adapter-binding slots of the route policy.
 var ROUTE_BINDING_KEYS = ["primary", "secondary"]
 
-// The recorded intent (`serviceIntentJson`) with namespace `ns` replaced by
-// `value`, every other namespace kept. `null` drops the namespace; a record
-// that does not parse starts empty.
-function intentWithNamespace(rawJson, ns, value) {
-    var whole = {}
-    try {
-        var parsed = JSON.parse(String(rawJson || "") || "{}")
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) whole = parsed
-    } catch (e) {
-        whole = {}
-    }
-    if (value === null || value === undefined) delete whole[ns]
-    else whole[ns] = value
-    return whole
-}
-
 // The route-policy record after a write the service confirmed: every key the
 // write named takes the request's value; a key the request leaves out or sets
 // to null (an unbinding) is dropped.
@@ -1769,8 +1778,44 @@ function routePolicyIntentDivergence(intent, service) {
     return out
 }
 
+// The protective settings. After the service lost them they come back without
+// asking, and only ever switched ON that way: a damaged or stale record can
+// never be what turns protection off. Twin of `restore::PROTECTIVE_KEYS`.
+var ROUTE_POLICY_PROTECTIVE_KEYS = [
+    "doh-lockdown-enabled",
+    "kill-switch-block-all",
+    "kill-switch-enabled",
+    "kill-switch-fail-closed",
+    "kill-switch-strict-shared-ips"
+]
+
+// The protective keys the record holds on and the service holds off, sorted.
+function routePolicyProtectionToRestore(intent, service) {
+    var mine = intent || {}
+    var out = []
+    for (var i = 0; i < ROUTE_POLICY_PROTECTIVE_KEYS.length; i += 1) {
+        var key = ROUTE_POLICY_PROTECTIVE_KEYS[i]
+        if (mine[key] === undefined) continue
+        if (routePolicyCoerce(key, mine[key]) === true
+                && routePolicyEffective(service || {}, key) === false) out.push(key)
+    }
+    return out
+}
+
+// The one apply-only write that switches them back on, over the service's
+// row; null when nothing the record holds on is off.
+function routePolicyProtectionRestore(intent, service) {
+    var keys = routePolicyProtectionToRestore(intent, service)
+    if (keys.length === 0) return null
+    var request = buildFullRoutePolicyReq(service || {}, "")
+    for (var i = 0; i < keys.length; i += 1) request[keys[i]] = true
+    request["apply-only"] = keys.slice()
+    return request
+}
+
 // "Restore my settings": the diverging keys as one apply-only write over the
-// service's row, `{ request, keys, missing }`. A binding goes only when its
+// service's row, `{ request, keys, missing }`. Protection the record holds on
+// is not offered: `routePolicyProtectionRestore` has sent it. A binding goes only when its
 // adapter is on the machine now (`presentIds`); otherwise it is listed in
 // `missing` as `{ role, name }` and left out. `request` is null when nothing
 // can be restored.
@@ -1779,8 +1824,10 @@ function routePolicyRestorePlan(intent, service, presentIds) {
     var plan = { request: null, keys: [], missing: [] }
     var present = presentIds || []
     var diverging = routePolicyIntentDivergence(intent, service)
+    var automatic = routePolicyProtectionToRestore(intent, service)
     for (var i = 0; i < diverging.length; i += 1) {
         var key = diverging[i]
+        if (automatic.indexOf(key) >= 0) continue
         var mine = intent[key]
         if (ROUTE_BINDING_KEYS.indexOf(key) >= 0) {
             var id = _bindingId(mine)
@@ -2395,4 +2442,74 @@ function groupBlockNotices(entries, groupableReasons) {
         rows[byKey[key]].entries.push(e)
     }
     return rows
+}
+
+// ---- a VPN client leak protection does not trust by place ----
+//
+// The service lists programs named like a VPN client that sit where the user
+// could have put them, each with the executables of its own product that DO
+// sit in a protected install tree. One question per program; on "yes" the
+// link provider set is REPLACED with everything confirmed so far plus the
+// answer. Twin of `nrr_client_logic::vpn_client_trust`.
+
+function _vpnTrustSamePath(a, b) {
+    return String(a || "").toLowerCase() === String(b || "").toLowerCase()
+}
+
+function _vpnTrustFileName(path) {
+    var parts = String(path || "").trim().split(/[\\\/]/)
+    return String(parts[parts.length - 1] || "").trim()
+}
+
+function vpnClientTrustOffers(pending) {
+    var offers = []
+    var has = function (list, path) {
+        for (var k = 0; k < list.length; k += 1) {
+            if (_vpnTrustSamePath(list[k], path)) return true
+        }
+        return false
+    }
+    for (var i = 0; i < (pending || []).length; i += 1) {
+        var entry = pending[i] || {}
+        var exePath = String(entry["exe-path"] || "").trim()
+        if (exePath === "") continue
+        var repeat = false
+        for (var j = 0; j < offers.length; j += 1) {
+            if (_vpnTrustSamePath(offers[j].exePath, exePath)) repeat = true
+        }
+        if (repeat) continue
+        var bundle = []
+        var raw = entry["bundled-exe-paths"] || []
+        for (var s = 0; s < raw.length; s += 1) {
+            var sibling = String(raw[s] || "").trim()
+            if (sibling === "" || _vpnTrustSamePath(sibling, exePath) || has(bundle, sibling)) continue
+            bundle.push(sibling)
+        }
+        offers.push({ exePath: exePath, name: _vpnTrustFileName(exePath), bundledExePaths: bundle })
+    }
+    return offers
+}
+
+function vpnClientTrustConfirmedApps(existing, offer, withBundle) {
+    var out = []
+    var push = function (exePath, displayName) {
+        var path = String(exePath || "").trim()
+        if (path === "") return
+        for (var k = 0; k < out.length; k += 1) {
+            if (_vpnTrustSamePath(out[k]["exe-path"], path)) return
+        }
+        var name = String(displayName || "").trim()
+        out.push({ "exe-path": path, "display-name": name !== "" ? name : _vpnTrustFileName(path) })
+    }
+    for (var i = 0; i < (existing || []).length; i += 1) {
+        var app = existing[i] || {}
+        push(app["exe-path"], app["display-name"])
+    }
+    var o = offer || {}
+    push(o.exePath, o.name)
+    if (withBundle) {
+        var bundle = o.bundledExePaths || []
+        for (var b = 0; b < bundle.length; b += 1) push(bundle[b], "")
+    }
+    return out
 }

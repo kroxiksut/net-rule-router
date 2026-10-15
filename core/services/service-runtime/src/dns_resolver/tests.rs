@@ -28,6 +28,8 @@ fn oracle(hosts: &[&str]) -> FakeOracle {
     }
 }
 
+/// Answers the same over the tunnel: the fixture for every test about what
+/// happens AFTER a rule host resolved, blocking guard or not.
 struct FakeUpstream {
     answer: Result<ResolvedAddresses, ResolveError>,
 }
@@ -40,6 +42,96 @@ impl UpstreamResolver for FakeUpstream {
     ) -> Result<ResolvedAddresses, ResolveError> {
         self.answer.clone()
     }
+
+    fn resolve_tunnel_only_within(
+        &self,
+        _hostname: &str,
+        _family: AddressFamily,
+        _budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        self.answer.clone()
+    }
+}
+
+/// An upstream with no tunnel of its own, which remembers whether it was
+/// asked over the main link at all.
+#[derive(Default)]
+struct MainLinkUpstream {
+    asked: std::sync::atomic::AtomicUsize,
+}
+impl UpstreamResolver for MainLinkUpstream {
+    fn resolve_within(
+        &self,
+        _hostname: &str,
+        _family: AddressFamily,
+        _budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(resolved(&[ip(100, 64, 0, 159)]))
+    }
+}
+
+/// With protection blocking and no tunnel to ask over, a rule host's name
+/// never goes to the main link's resolver: the query is refused outright,
+/// and nothing is recorded or reconciled on an answer that never came.
+#[test]
+fn a_rule_host_under_a_blocking_guard_is_never_asked_over_the_main_link() {
+    let log = CallLog::default();
+    let upstream = MainLinkUpstream::default();
+    let out = handle_a_query(
+        "assistant.example",
+        aaaa_hold(),
+        &oracle(&["assistant.example"]),
+        &upstream,
+        &FakeSink(&log),
+        &FakeReconciler {
+            log: &log,
+            outcome: ReconcileOutcome::Installed,
+        },
+        &NoopFakeIpAnswerer,
+        &|| true,
+        &NoEnforcement,
+    );
+    assert_eq!(out, QueryOutcome::Withheld);
+    assert_eq!(
+        upstream.asked.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the name must not leave over the main link"
+    );
+    assert!(log.snapshot().is_empty());
+
+    // The AAAA path holds the same line.
+    let out = handle_aaaa_query(
+        "assistant.example",
+        aaaa_hold(),
+        &upstream,
+        &FakeSink(&log),
+        &FakeReconciler {
+            log: &log,
+            outcome: ReconcileOutcome::Installed,
+        },
+        &|| true,
+    );
+    assert_eq!(out, AaaaOutcome::Withheld);
+    assert_eq!(upstream.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // A direct host is not a rule host: asked as ever, guard or no guard.
+    let out = handle_a_query(
+        "news.example",
+        aaaa_hold(),
+        &oracle(&["assistant.example"]),
+        &upstream,
+        &FakeSink(&log),
+        &FakeReconciler {
+            log: &log,
+            outcome: ReconcileOutcome::Installed,
+        },
+        &NoopFakeIpAnswerer,
+        &|| true,
+        &NoEnforcement,
+    );
+    assert!(matches!(out, QueryOutcome::Answer { .. }));
+    assert_eq!(upstream.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 struct FakeSink<'a>(&'a CallLog);
@@ -658,6 +750,83 @@ fn a_wait_that_cannot_finish_is_not_attempted() {
         }
     );
     assert_eq!(log.snapshot(), ["record", "request_reconcile"]);
+}
+
+/// A full run slower than the hold used to skip the wait and answer, so the
+/// guard's withhold never fired on the machines where runs are slow — the
+/// answer left with no filter and no route while the additional link was down.
+#[test]
+fn a_futile_wait_under_a_blocking_guard_withholds_an_unenforced_answer() {
+    let log = CallLog::default();
+    let out = handle_a_query(
+        "assistant.example",
+        AnswerHold {
+            budget: Duration::from_secs(3),
+            deadline: Duration::from_millis(900),
+            fast_answers: true,
+        },
+        &oracle(&["assistant.example"]),
+        &FakeUpstream {
+            answer: Ok(resolved(&[ip(100, 64, 0, 159)])),
+        },
+        &FakeSink(&log),
+        &SlowReconciler(&log),
+        &NoopFakeIpAnswerer,
+        &|| true,
+        &NoEnforcement,
+    );
+    assert_eq!(out, QueryOutcome::Withheld);
+    // The run is still asked for, so the re-query moments later finds it.
+    assert_eq!(log.snapshot(), ["record", "request_reconcile"]);
+}
+
+/// The same slow run with every answered address already installed: nothing
+/// would leak, so the guard has nothing to hold back.
+#[test]
+fn a_futile_wait_under_a_blocking_guard_still_answers_what_is_installed() {
+    let log = CallLog::default();
+    let addr = ip(100, 64, 0, 159);
+    let out = handle_a_query(
+        "assistant.example",
+        AnswerHold {
+            budget: Duration::from_secs(3),
+            deadline: Duration::from_millis(900),
+            fast_answers: false,
+        },
+        &oracle(&["assistant.example"]),
+        &FakeUpstream {
+            answer: Ok(resolved(&[addr])),
+        },
+        &FakeSink(&log),
+        &SlowReconciler(&log),
+        &NoopFakeIpAnswerer,
+        &|| true,
+        &Enforcing(vec![addr]),
+    );
+    assert_eq!(
+        out,
+        QueryOutcome::Answer {
+            ips: vec![addr],
+            enforced: true,
+        }
+    );
+}
+
+#[test]
+fn a_futile_ipv6_wait_under_a_blocking_guard_withholds_the_answer() {
+    let log = CallLog::default();
+    let v6: std::net::Ipv6Addr = "fd00::1".parse().expect("v6");
+    let out = handle_aaaa_query(
+        "assistant.example",
+        aaaa_hold(),
+        &FakeUpstream {
+            answer: Ok(resolved6(&[v6])),
+        },
+        &FakeSink(&log),
+        &SlowReconciler(&log),
+        &|| true,
+    );
+    assert_eq!(out, AaaaOutcome::Withheld);
 }
 
 /// Slow like production, and records what it was asked to route at once.

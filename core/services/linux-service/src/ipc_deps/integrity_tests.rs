@@ -135,6 +135,7 @@ impl Machine {
                 .expect("cache"),
             Arc::new(nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing::new(16)),
             nrr_service_runtime::app_enforcement_status::AppEnforcementStatus::new(),
+            nrr_service_runtime::app_enforcement_status::SharedIpExemptionStatus::new(),
             nrr_service_runtime::boot_settings::ConnTraceLogSwitch::at_boot(None, None),
             None,
             Arc::new(FileKeyStore::in_state_dir(&self.state_dir())),

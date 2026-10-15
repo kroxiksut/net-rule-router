@@ -10,20 +10,6 @@ GroupBox {
     title: root.tr("settings.group.updates", "Check for updates")
     Layout.fillWidth: true
 
-    // Resolve a compat-banner-mode slug to a
-    // localized label for the dropdown.
-    function _compatModeLabel(mode) {
-        switch (String(mode)) {
-            case "always":
-                return root.tr("settings.updates.compat-banner-mode.option-always", "Always show")
-            case "never":
-                return root.tr("settings.updates.compat-banner-mode.option-never", "Never show")
-            default:
-                return root.tr("settings.updates.compat-banner-mode.option-auto",
-                    "Show on mismatch (automatic)")
-        }
-    }
-
     function _intervalLabel(days) {
         return root.tr("settings.updates.auto-check.every-days", "Every {days} days")
             .replace("{days}", String(days))
@@ -105,61 +91,6 @@ GroupBox {
             font.pixelSize: root.uiTheme.baseFontSizePx - 1
             text: root.tr("settings.updates.auto-check.description",
                 "The app asks the project's release page on GitHub whether a newer version is out and shows a notice if it is. Nothing is downloaded or installed, and routing is not touched. The count starts at the first start and restarts after every check, including one from the Help menu. Turned off, the app sends no such request. Takes effect at the next start.")
-        }
-
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 1
-            Layout.topMargin: root.uiTheme.spacingXs
-            Layout.bottomMargin: root.uiTheme.spacingXs
-            color: root.uiTheme.colorBorder
-        }
-
-        Label {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
-            text: root.tr("label.version", "Version") + ": "
-                + ((root.context.about || {}).version || "n/a")
-            color: root.textColor
-        }
-
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 1
-            Layout.topMargin: root.uiTheme.spacingXs
-            Layout.bottomMargin: root.uiTheme.spacingXs
-            color: root.uiTheme.colorBorder
-        }
-
-        // ── Compatibility banner visibility ──────────────────────────
-        Label {
-            Layout.fillWidth: true
-            text: root.tr("settings.updates.compat-banner-mode.label",
-                "Compatibility banner")
-            color: root.textColor
-            font.bold: true
-        }
-        ThemedComboBox {
-            id: compatModeCombo
-            theme: root.uiTheme
-            Layout.fillWidth: true
-            model: [ "auto", "always", "never" ]
-            labelResolver: function(item) { return group._compatModeLabel(item) }
-            displayText: root.uiRevision >= 0 && currentIndex >= 0
-                ? group._compatModeLabel(model[currentIndex]) : ""
-            currentIndex: Pure.optionIndexByValue(model, root.prefs.compatBannerMode, 0)
-            popup.width: root.comboPopupWidth(compatModeCombo, compatModeCombo.model, "",
-                function(item) { return group._compatModeLabel(item) })
-            onActivated: root.updatePrefs({ compatBannerMode: model[currentIndex] })
-        }
-        Label {
-            Layout.fillWidth: true
-            Layout.leftMargin: root.uiTheme.spacingLg
-            color: root.mutedTextColor
-            wrapMode: Text.WordWrap
-            font.pixelSize: root.uiTheme.baseFontSizePx - 1
-            text: root.tr("settings.updates.compat-banner-mode.description",
-                "Controls when the GUI shows the version-mismatch banner. \"Automatic\" only warns on an incompatible protocol.")
         }
     }
 }

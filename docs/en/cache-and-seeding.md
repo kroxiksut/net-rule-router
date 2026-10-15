@@ -39,16 +39,12 @@ resulting IP address(es) are recorded. This is the primary, always-on source,
 and it requires no configuration — it is simply how the cache stays current
 with the sites you actually visit while NetRuleRouter is active.
 
-### 2. Confirming a hostname from its address
+### 2. Sites opened without a name lookup through the service
 
-The service can also work the other way round and establish which hostname an
-address belongs to. A name is only accepted once it has been confirmed to
-genuinely belong to that address, so a wrong or spoofed answer is discarded and
-never reaches the cache — an address does not inherit your rules just because
-something claimed a name for it.
-
-These lookups go only to the DNS server configured for your connection —
-nothing is sent to any third-party service.
+If a program reached an address without asking the service for its name first,
+the service can still find out which site that address belongs to, so your
+rules recognise it too. These lookups go only to the DNS server configured for
+your connection; nothing is sent to any third-party service.
 
 ### 3. Seeding from browser history (opt-in)
 

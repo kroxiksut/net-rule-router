@@ -176,6 +176,44 @@ fn a_primary_address_inside_the_held_slash_24_stays_open() {
         .any(|f| f.action == WfpAction::Block && f.remote_ip == Some(MAIN_HOST)));
 }
 
+/// Under a block-all the blanket sits below the main-link rule band, so a
+/// program the user routes to the main link passes it. The held network must
+/// still stop it while the tunnel is down: its block outranks that whole band.
+#[test]
+fn a_main_link_program_cannot_reach_a_held_network_under_a_block_all() {
+    let holds = holds_for(&network_book());
+    let (_api, orch, _src, _rules, _audit) = fixture();
+    let filters = orch.fail_closed_filters(
+        SID,
+        RouteBehaviorMode::PreferPrimary,
+        &[IpAddr::V4(SECONDARY_HOST)],
+        &holds,
+        &exemptions(),
+        KillSwitchProtocols::ALL,
+        FailClosedPosture { block_all: true },
+    );
+    let top_of_primary_band = crate::wfp_bands::BASE_PRIMARY + crate::wfp_bands::BAND_WIDTH;
+    let hold = filters
+        .iter()
+        .find(|f| {
+            f.action == WfpAction::Block
+                && f.layer == WfpLayerKey::AleAuthConnectV4
+                && f.remote_subnet == Some((Ipv4Addr::new(198, 51, 100, 0), 24))
+        })
+        .expect("the held /24 is blocked by name under the blanket");
+    assert!(
+        hold.weight >= top_of_primary_band,
+        "the hold must outrank every main-link rule permit, a program's included: {:#x}",
+        hold.weight
+    );
+    assert!(
+        filters.iter().any(|f| f.action == WfpAction::Block
+            && f.weight < crate::wfp_bands::BASE_PRIMARY
+            && !f.names_a_destination()),
+        "the blanket itself stays below the main-link band"
+    );
+}
+
 #[test]
 fn without_networks_the_hold_is_free_and_adds_nothing() {
     let holds = NetworkHolds::for_pass(
@@ -227,10 +265,7 @@ fn network_rules_install_on_top_of_the_address_book() {
                 ..Default::default()
             }
         }));
-        rules.set(ActiveRulesSnapshot {
-            rule_book: book,
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
-        });
+        rules.set(ActiveRulesSnapshot { rule_book: book });
         src.set(SID, snap_block("Wi-Fi", "TAP"));
         orch.install_for_sid(SID).expect("install");
         let filters: Vec<WfpFilterRecord> = api.wfp_filters.lock().expect("filters").clone();

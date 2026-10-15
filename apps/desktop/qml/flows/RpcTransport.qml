@@ -293,6 +293,18 @@ QtObject {
             ? bridge.rpcLocalNetworksSet(payload)
             : ""
     }
+    // The machine-wide home-network suffix list. Read for everyone; the
+    // replace is an administrator's change the launcher relays on refusal.
+    function rpcLocalDnsSuffixesGet() {
+        return (bridgeAvailable && typeof bridge.rpcLocalDnsSuffixesGet === "function")
+            ? bridge.rpcLocalDnsSuffixesGet()
+            : ""
+    }
+    function rpcLocalDnsSuffixesSet(payload) {
+        return (bridgeAvailable && typeof bridge.rpcLocalDnsSuffixesSet === "function")
+            ? bridge.rpcLocalDnsSuffixesSet(payload)
+            : ""
+    }
 
     // Auto-rule suggestions. The tray fetches the pending candidate list and
     // then either accepts or dismisses a set of ids; both mutations take

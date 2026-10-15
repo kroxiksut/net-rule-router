@@ -1,18 +1,10 @@
 //! Task constructors for the production `ServiceSupervisor`.
 //!
-//! Five long-lived `ServiceTask` shapes consumed by the runtime entry-point.
 //! Each builder returns a freshly-constructed `ServiceTask` that the
 //! supervisor can `spawn()` — no global state, no implicit ordering.
-//! Cross-task dependencies (`ipc-accept-loop` ↔ `ipc-shutdown-watcher`) are
-//! threaded through `Arc` so each task sees the same listener state.
-//!
-//! | Task id                  | Class       | Interval | Failure semantics                                 |
-//! |--------------------------|-------------|----------|----------------------------------------------------|
-//! | `health-aggregator-tick` | Recoverable | 5s       | Restarted up to 20× with supervisor backoff        |
-//! | `adapter-monitor-tick`   | Recoverable | 1s       | Restarted up to 20×; degraded mode on retire       |
-//! | `diagnostics-cleanup`    | Optional    | 1h       | Restarted with exponential backoff, never retired |
-//! | `operation-results-gc`   | Optional    | 5min     | Restarted with exponential backoff, never retired |
-//! | `ipc-accept-loop`        | per policy  | event    | Recoverable / Critical from `ServiceStabilityConfig` |
+//! [`ServiceTaskKind`] is the full list, with where each task's loss shows in
+//! health. Cross-task dependencies (`ipc-accept-loop` ↔ `ipc-shutdown-watcher`)
+//! are threaded through `Arc` so each task sees the same listener state.
 //!
 //! The IPC bundle is special:
 //!
@@ -53,6 +45,7 @@ mod dns;
 mod ipc;
 mod maintenance;
 mod observation;
+mod registry;
 mod routing;
 
 pub use auto_rules::*;
@@ -60,6 +53,7 @@ pub use dns::*;
 pub use ipc::*;
 pub use maintenance::*;
 pub use observation::*;
+pub use registry::*;
 pub use routing::*;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -215,18 +209,24 @@ pub const APP_DESTINATION_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Periodic snapshot recompute. Cheap — `HealthAggregator::snapshot()`
 /// is O(N) over component count. The task body throws the snapshot away
-/// because the GUI polls on demand; the only purpose of the periodic
-/// run is to keep `snapshot_refreshed_at` fresh and to detect aggregator
-/// poisoning (a poisoned mutex makes `snapshot()` return a synthesised
-/// `RecoveryRequired` snapshot, which is observable even from a tick
-/// that doesn't read the result).
-pub fn build_health_aggregator_task(health: Arc<HealthAggregator>) -> ServiceTask {
+/// because the GUI polls on demand; the periodic run keeps
+/// `snapshot_refreshed_at` fresh, detects aggregator poisoning (a poisoned
+/// mutex makes `snapshot()` return a synthesised `RecoveryRequired` snapshot,
+/// observable even from a tick that doesn't read the result) and audits every
+/// task's liveness, so a hung tick or thread lands in the next snapshot.
+pub fn build_health_aggregator_task(
+    health: Arc<HealthAggregator>,
+    liveness: Option<Arc<crate::task_liveness::TaskLiveness>>,
+) -> ServiceTask {
     ServiceTask::periodic(
         TASK_ID_HEALTH_AGGREGATOR,
         TaskClass::Recoverable,
         HEALTH_AGGREGATOR_INTERVAL,
         RECOVERABLE_DEFAULT_MAX_RESTARTS,
         move |_stop| {
+            if let Some(liveness) = liveness.as_ref() {
+                liveness.audit();
+            }
             // Touch the aggregator so a poisoned mutex is detected.
             // Discarding the snapshot is intentional — the GUI reads
             // through `service.health.get` on its own cadence.

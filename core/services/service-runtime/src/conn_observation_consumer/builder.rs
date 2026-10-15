@@ -45,7 +45,6 @@ impl ConnectionObservationConsumer {
             app_destination_forget: None,
             routed_apps: None,
             trace_ring: None,
-            vpn_endpoint_learner: None,
             killswitch_drop_check: None,
             killswitch_app_scope_check: None,
             ipv6_cut_drop_check: None,
@@ -195,31 +194,9 @@ impl ConnectionObservationConsumer {
         self
     }
 
-    /// Wire the VPN-endpoint learner together with the role-verification gate
-    /// it requires: a kill-switch drop of a VPN-client flow teaches the
-    /// exemption set the tunnel's server IP, but only when the dropping
-    /// filter's spec id passes `drop_check` (in production: membership in the
-    /// live kill-switch/fail-closed Block id registry).
-    ///
-    /// One call rather than two, because the learner without the gate is
-    /// PERMANENTLY INERT — it compiles, it wires, it reports nothing, and
-    /// nothing says so. Taking both arguments makes that combination
-    /// unrepresentable instead of documented.
-    pub fn with_vpn_endpoint_learner(
-        mut self,
-        learner: VpnEndpointLearnFn,
-        drop_check: KillswitchDropCheckFn,
-    ) -> Self {
-        self.vpn_endpoint_learner = Some(learner);
-        self.killswitch_drop_check = Some(drop_check);
-        self
-    }
-
-    /// Wire the role-verification gate on its own, for the callers that read it
-    /// WITHOUT learning: the scope-bug counter classifies a drop by the same
-    /// registry and learns nothing. The learner cannot use this path — it takes
-    /// its gate in [`Self::with_vpn_endpoint_learner`], so it can never be left
-    /// without one.
+    /// Wire the role-verification gate (in production: membership in the live
+    /// kill-switch/fail-closed Block id registry). The client-app learner and
+    /// the scope-bug counter both read it; without it neither ever fires.
     pub fn with_killswitch_drop_check(mut self, check: KillswitchDropCheckFn) -> Self {
         self.killswitch_drop_check = Some(check);
         self

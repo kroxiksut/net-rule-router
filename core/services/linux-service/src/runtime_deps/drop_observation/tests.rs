@@ -124,7 +124,6 @@ fn rig(reports_start: bool) -> Rig {
             }
         }),
         notice_sink: notice_sink(center),
-        vpn_endpoint_learner: Arc::new(|_ip: Ipv4Addr| {}),
         log_ndjson: Arc::default(),
         stale_flow_reset: None,
     };

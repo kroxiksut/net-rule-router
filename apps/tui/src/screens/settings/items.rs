@@ -147,6 +147,18 @@ pub enum ItemId {
     Protocol(i32),
     ShortToggle,
     ShortSuffix,
+    /// One entry of the machine-wide home-network suffix list.
+    LocalSuffixRemove(usize),
+    /// One suffix the main link offered.
+    LocalSuffixAccept(usize),
+    LocalSuffixNew,
+    LocalSuffixAdd,
+    /// A listed local network, answered by toggling.
+    LocalNetwork(usize),
+    /// A network the user added, removed.
+    LocalNetworkForget(usize),
+    LocalNetworkNew,
+    LocalNetworkAdd,
     ProbeReset,
     /// A field of the service-stability row.
     Stability(&'static str),
@@ -487,6 +499,123 @@ fn notifications(app: &AppState) -> Vec<Item> {
     v
 }
 
+/// The machine-wide list of home and local network suffixes: every entry with
+/// the rule hosts it would cover, the main link's offers, and a row to add.
+/// A change needs an administrator; the service says so when it refuses.
+fn local_suffixes(app: &AppState) -> Vec<Item> {
+    let mut v = vec![
+        heading(t::SUFFIX_TITLE),
+        info(Words::Key(t::SUFFIX_DESCRIPTION)),
+    ];
+    let list = match &app.settings.data.local_suffixes {
+        Loadable::Ready(list) => list,
+        other => {
+            v.push(pending(app, other));
+            return v;
+        }
+    };
+    if list.suffixes.is_empty() {
+        v.push(info(Words::Key(t::SUFFIX_EMPTY)));
+    }
+    for (index, entry) in list.suffixes.iter().enumerate() {
+        let mut label = vec![raw(entry.suffix.clone())];
+        if !entry.covers_rule_hosts.is_empty() {
+            label.push(raw("  "));
+            label.push(Words::Fill(
+                t::SUFFIX_COVERS,
+                vec![("hosts", entry.covers_rule_hosts.join(", "))],
+            ));
+        }
+        v.push(Item::new(
+            ItemId::LocalSuffixRemove(index),
+            Words::Join(label),
+            Kind::Action { confirm: true },
+        ));
+    }
+    for (index, offer) in list.offered.iter().enumerate() {
+        v.push(Item::new(
+            ItemId::LocalSuffixAccept(index),
+            Words::Fill(
+                t::SUFFIX_OFFERED,
+                vec![
+                    ("suffix", offer.suffix.clone()),
+                    ("link", offer.link.clone()),
+                ],
+            ),
+            Kind::Action { confirm: false },
+        ));
+    }
+    v.push(Item::new(
+        ItemId::LocalSuffixNew,
+        Words::Key(t::SUFFIX_FIELD),
+        Kind::Text(app.settings.local_suffix_new.clone()),
+    ));
+    v.push(action(ItemId::LocalSuffixAdd, t::ADD, false));
+    v
+}
+
+/// The local networks leak protection may leave reachable, as the window lists
+/// them: an answer per row, a reason where no answer opens one.
+fn local_networks(app: &AppState) -> Vec<Item> {
+    let mut v = Vec::new();
+    let list = match &app.settings.data.local_networks {
+        Loadable::Ready(list) => list,
+        other => {
+            v.push(pending(app, other));
+            return v;
+        }
+    };
+    if list.networks.is_empty() {
+        v.push(info(Words::Key(t::LOCAL_EMPTY)));
+    }
+    for (index, network) in list.networks.iter().enumerate() {
+        let origin = match network.kind.as_str() {
+            "manual" => Words::Key(t::LOCAL_KIND_MANUAL),
+            "main-link" => Words::Fill(t::LOCAL_KIND_MAIN, vec![("name", network.adapter.clone())]),
+            _ => Words::Fill(t::LOCAL_KIND_VM, vec![("name", network.adapter.clone())]),
+        };
+        let mut label = vec![raw(network.cidr.clone()), raw("  "), origin];
+        let reason = match network.reason.as_str() {
+            "too-wide" => Some(t::LOCAL_TOO_WIDE),
+            "contains-rule-address" => Some(t::LOCAL_NAMES_RULE),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            label.push(raw(" — "));
+            label.push(Words::Key(reason));
+            v.push(info(Words::Join(label)));
+            continue;
+        }
+        if !network.decided_by_user {
+            label.push(raw("  "));
+            label.push(Words::Key(t::LOCAL_UNDECIDED));
+        }
+        v.push(Item::new(
+            ItemId::LocalNetwork(index),
+            Words::Join(label),
+            Kind::Toggle(network.allowed),
+        ));
+        if network.kind == "manual" {
+            v.push(Item::new(
+                ItemId::LocalNetworkForget(index),
+                Words::Join(vec![
+                    Words::Key(t::DELETE),
+                    raw(" "),
+                    raw(network.cidr.clone()),
+                ]),
+                Kind::Action { confirm: true },
+            ));
+        }
+    }
+    v.push(Item::new(
+        ItemId::LocalNetworkNew,
+        Words::Key(t::LOCAL_FIELD),
+        Kind::Text(app.settings.local_network_new.clone()),
+    ));
+    v.push(action(ItemId::LocalNetworkAdd, t::ADD, false));
+    v
+}
+
 // ── Routing behaviour ────────────────────────────────────────────────────────
 
 /// The leak-protection protocol boxes, in the GUI's order.
@@ -691,18 +820,31 @@ fn routing(app: &AppState) -> Vec<Item> {
     }
 
     v.push(heading(t::DOH_TITLE));
-    v.push(policy_toggle(policy, "doh-lockdown-enabled", t::DOH_ENABLE));
-    if policy_bool(policy, "doh-lockdown-enabled") {
-        v.push(choice(
-            ItemId::Policy("doh-lockdown-scope"),
-            t::DOH_SCOPE,
-            vec![
-                opt("leak-protection-only", t::DOH_LEAK_ONLY),
-                opt("always", t::DOH_ALWAYS),
-            ],
-            &policy_text(policy, "doh-lockdown-scope"),
-        ));
+    v.push(policy_toggle(policy, "doh-lockdown-auto", t::DOH_AUTO).note(t::DOH_AUTO_NOTE));
+    if policy_bool(policy, "doh-lockdown-auto") {
+        // What the service decided, read back rather than guessed.
+        v.push(info(Words::Key(
+            if policy_bool(policy, "doh-lockdown-effective") {
+                t::DOH_AUTO_ON
+            } else {
+                t::DOH_AUTO_OFF
+            },
+        )));
+    } else {
+        v.push(policy_toggle(policy, "doh-lockdown-enabled", t::DOH_ENABLE));
+        if policy_bool(policy, "doh-lockdown-enabled") {
+            v.push(choice(
+                ItemId::Policy("doh-lockdown-scope"),
+                t::DOH_SCOPE,
+                vec![
+                    opt("leak-protection-only", t::DOH_LEAK_ONLY),
+                    opt("always", t::DOH_ALWAYS),
+                ],
+                &policy_text(policy, "doh-lockdown-scope"),
+            ));
+        }
     }
+    v.extend(local_suffixes(app));
     v.push(heading(t::HOSTS_TITLE));
     v.push(policy_toggle(
         policy,
@@ -716,6 +858,26 @@ fn routing(app: &AppState) -> Vec<Item> {
             "local-networks-auto-accept",
             t::LOCAL_AUTO,
         ));
+        v.extend(local_networks(app));
+    }
+    if s.supports.forwarded_traffic_guard {
+        let answer = policy_text(policy, "forwarded-outage");
+        v.push(heading(t::FWD_TITLE));
+        let row = choice(
+            ItemId::Policy("forwarded-outage"),
+            t::FWD_CHOICE,
+            vec![
+                opt("as-computer", t::FWD_AS_COMPUTER),
+                opt("unprotected", t::FWD_UNPROTECTED),
+            ],
+            &answer,
+        )
+        .note(t::FWD_NOTE);
+        v.push(if answer.is_empty() {
+            row.shown(Words::Key(t::FWD_UNANSWERED))
+        } else {
+            row
+        });
     }
     v.push(heading(t::SHORT_TITLE));
     v.push(
@@ -883,6 +1045,20 @@ fn service(app: &AppState) -> Vec<Item> {
                 }
                 _ => {}
             }
+            // The GUI's "restore network": a live service would put the state
+            // straight back, so it is stopped first, and ended if it hangs.
+            let (hint, verb) = if report.run_state == ServiceRunState::Stopped {
+                (crate::keys::FIX_RESTORE_NETWORK, "reset-network --confirm")
+            } else {
+                (
+                    crate::keys::FIX_STOP_AND_RESTORE_NETWORK,
+                    "reset-network --confirm --stop-service",
+                )
+            };
+            v.push(info(Words::Fill(
+                hint,
+                vec![("command", admin_command(verb))],
+            )));
         }
         Loadable::Failed(failure) => v.push(info(Words::Failed(
             t::SERVICE_QUERY_FAILED,

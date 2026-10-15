@@ -63,10 +63,7 @@ impl ProductionDiagnosticsFacade {
         // the probe must answer "<query> → primary", never "no route". A user
         // never needs to save a rule for traffic to flow via the primary NIC;
         // claiming otherwise was misleading and looked like broken routing.
-        let mut rule_book = self
-            .load_active_rule_book(caller_sid)
-            .map(|content| content.rule_book)
-            .unwrap_or_default();
+        let mut rule_book = self.load_active_rule_book(caller_sid).unwrap_or_default();
         // The routing-check must model ENFORCEMENT, not the
         // bare stored rules. `ProductionRulesProvider::active_rules_for` applies
         // subdomain coverage before the WFP/route codegen and the DNS seeder ever
@@ -349,37 +346,24 @@ impl ProductionDiagnosticsFacade {
         }
     }
 
-    /// Pull the active rules revision from the state DB and decode it
-    /// through `nrr_shared::rules_json::from_canonical_string` +
-    /// `nrr_domain::rules_json_codec::decode`. Returns `None` if no
-    /// state DB is wired, no revision is active, or the stored JSON
-    /// fails to decode (treated as missing for the synthetic probe;
-    /// the full apply pipeline surfaces decode errors elsewhere).
+    /// The caller's stored rule book (own revision, else the baseline), read
+    /// through the rules provider so a revision mid-activation answers rather
+    /// than the one it replaces. Bare: the caller applies the enforcement
+    /// widening itself. `None` when no state DB is wired, nothing is active,
+    /// or the stored JSON does not decode.
     fn load_active_rule_book(
         &self,
         caller_sid: &str,
-    ) -> Option<nrr_domain::rules_revision::RulesRevisionContent> {
-        let conn_arc = self.state_conn.as_ref()?;
-        let conn = conn_arc.lock().ok()?;
-        let repo = nrr_storage::revisions::RevisionsRepository::new(&conn);
-        // Per-SID read-through: the caller's OWN active revision, falling back
-        // to the admin baseline — mirrors `ProductionRulesProvider::
-        // active_rules_for`.
-        let active = if caller_sid.is_empty() {
-            repo.get_active().ok().flatten()?
-        } else {
-            repo.get_active_for(caller_sid)
-                .ok()
-                .flatten()
-                .or_else(|| repo.get_active().ok().flatten())?
-        };
-        let dto = crate::production_rules_provider::read_stored_rules(
-            &active.rules_json,
-            &active.revision_id,
-        )
-        .ok()?;
-        nrr_domain::rules_json_codec::decode(dto, nrr_domain::rules_file::HostPlatform::compiled())
-            .ok()
+    ) -> Option<nrr_domain::canonical::CanonicalRuleBook> {
+        use crate::per_sid_orchestrator::RulesProvider;
+        // A fresh provider per probe: the bare read skips its decode cache, so
+        // there is nothing a long-lived one would keep.
+        let provider = crate::production_rules_provider::ProductionRulesProvider::new(Arc::clone(
+            self.state_conn.as_ref()?,
+        ));
+        provider
+            .stored_rules_for(caller_sid)
+            .map(|snapshot| snapshot.rule_book)
     }
 
     /// The caller's Zone-vs-ExactIp order, as enforcement reads it.

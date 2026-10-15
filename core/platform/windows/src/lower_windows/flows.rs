@@ -26,35 +26,40 @@ pub(super) fn lower_flow(flow: &FlowRule) -> Vec<WfpFilterSpec> {
     let weight = base + u64::from(flow.precedence.ordinal);
 
     // The fail-closed default block (`StrictSecondaryFailClosed`): a
-    // user-scoped ALE `Block` with NO remote condition at the lowest band. Matches
-    // `wfp_codegen::default_block_spec`.
-    if flow.precedence.class == PrecedenceClass::DefaultCatchAll
-        && action == WfpAction::Block
-        && matches!(flow.flow.dst, DstMatch::Any)
-    {
-        return vec![WfpFilterSpec {
-            layer: WfpLayerKey::AleAuthConnectV4,
-            action: WfpAction::Block,
-            remote_ip: None,
-            remote_ip_set: Vec::new(),
-            remote_ip_set_v6: Vec::new(),
-            remote_port: None,
-            weight,
-            id: derive_catch_all_id(
-                user_sid.as_deref(),
-                WfpLayerKey::AleAuthConnectV4,
-                WfpAction::Block,
+    // user-scoped ALE `Block` with NO remote condition at the lowest band of
+    // its family's layer. Matches `wfp_codegen::default_block_spec`: `Any` is
+    // the v4 half, the planner's `::/0` twin the v6 one.
+    if flow.precedence.class == PrecedenceClass::DefaultCatchAll && action == WfpAction::Block {
+        let layer = match flow.flow.dst {
+            DstMatch::Any => Some(WfpLayerKey::AleAuthConnectV4),
+            DstMatch::SubnetV6 { prefix: 0, .. } => Some(WfpLayerKey::AleAuthConnectV6),
+            _ => None,
+        };
+        if let Some(layer) = layer {
+            return vec![WfpFilterSpec {
+                layer,
+                action: WfpAction::Block,
+                remote_ip: None,
+                remote_ip_set: Vec::new(),
+                remote_ip_set_v6: Vec::new(),
+                remote_port: None,
                 weight,
-                // The real catch-all: no conditions, so nothing else to name.
-                "",
-            ),
-            user_sid,
-            app_pattern: None,
-            local_interface_luid: None,
-            remote_subnet: None,
-            remote_subnet_v6: None,
-            ip_protocol: None,
-        }];
+                id: derive_catch_all_id(
+                    user_sid.as_deref(),
+                    layer,
+                    WfpAction::Block,
+                    weight,
+                    // The real catch-all: no conditions, so nothing else to name.
+                    "",
+                ),
+                user_sid,
+                app_pattern: None,
+                local_interface_luid: None,
+                remote_subnet: None,
+                remote_subnet_v6: None,
+                ip_protocol: None,
+            }];
+        }
     }
 
     // An `Application` flow lowers to per-exe `ALE_APP_ID` filters (no remote IP,

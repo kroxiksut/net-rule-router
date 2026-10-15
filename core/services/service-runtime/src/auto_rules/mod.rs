@@ -61,7 +61,7 @@ use nrr_shared::ipc_payloads::{
     AUTO_RULE_SIGNAL_CO_ACTIVITY, AUTO_RULE_SIGNAL_DELIVERY_NAME,
     AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED, AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER,
 };
-use nrr_shared::{AutoRuleReason, RouteRole};
+use nrr_shared::{AutoRuleReason, RouteBehaviorMode, RouteRole};
 use nrr_storage::auto_rule_dismissals::AutoRuleDismissal;
 use nrr_storage::auto_rule_pending::AutoRulePendingRecord;
 use nrr_storage::auto_rules::AutoRulesMode;
@@ -160,6 +160,11 @@ const MAX_TRACKED_PRINCIPALS: usize = 8;
 /// `secondary_block_policy` row is.
 pub type AutoRulesModeFn = Arc<dyn Fn(&str) -> AutoRulesMode + Send + Sync>;
 
+/// Reads a principal's behaviour mode — which route unmatched traffic takes.
+/// From the per-user policy, never from the rules snapshot, whose mode is a
+/// placeholder. Unwired reads as prefer-main.
+pub type BehaviorModeFn = Arc<dyn Fn(&str) -> RouteBehaviorMode + Send + Sync>;
+
 /// Reads a principal's `auto_rules_eager_delivery_names` opt-in — same per-SID
 /// source and same reason for being a closure as [`AutoRulesModeFn`]. Unwired
 /// means "not opted in", which is also the stored default.
@@ -200,6 +205,7 @@ pub type PrimaryBehaviorFn = Arc<dyn Fn(&str) -> PrimaryBehavior + Send + Sync>;
 struct PrincipalSettings {
     mode: AutoRulesMode,
     eager_delivery_names: bool,
+    behavior_mode: RouteBehaviorMode,
 }
 
 /// One principal's ledger plus the setting it was constructed with.
@@ -531,6 +537,8 @@ pub struct AutoRulesEngine {
     main_link_pass_enabled: Option<MainLinkPassEnabledFn>,
     /// Current main-link verdict for a host by name (see [`PrimaryBehaviorFn`]).
     primary_behavior_of: Option<PrimaryBehaviorFn>,
+    /// The principal's behaviour mode (see [`BehaviorModeFn`]).
+    behavior_mode_for: Option<BehaviorModeFn>,
     /// Durable mirror of the ledgers. A proposal needs two windows, and a
     /// restart used to reset the count to zero — a machine that restarts a few
     /// times a day therefore never reached the second one. `None` (no state DB)

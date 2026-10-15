@@ -178,7 +178,7 @@ impl SecondaryRouteCoordinator {
             };
         };
         self.clear_no_policy(sid);
-        let mode = route_behavior_mode(policy.mode);
+        let mode = behavior_mode_for_codegen(&policy);
         let live;
         let infos = match reading {
             Some(reading) => reading.adapters_or_error(),
@@ -275,6 +275,11 @@ impl SecondaryRouteCoordinator {
                     }
                 }
             }
+        }
+        // Off the pass's own reading only: a resolve without one would have to
+        // read the table just to say this, and the next pass will.
+        if let (Some(p), Some(routes)) = (primary, reading.and_then(|r| r.routes())) {
+            self.warn_too_wide_local_networks(sid, routes, infos, p.interface_index);
         }
         RouteResolution {
             mode,

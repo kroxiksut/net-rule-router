@@ -1,0 +1,115 @@
+[package]
+name = "nrr-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MPL-2.0"
+
+# A workspace of its own: cargo-fuzz needs nightly and libfuzzer, and neither
+# may reach the stable gate, clippy or cargo-deny of the product workspace.
+# Run through `scripts/fuzz.sh`; one target by hand is
+# `cargo +nightly fuzz run <target>` from the repository root.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+nrr-shared = { path = "../shared/contracts" }
+nrr-domain = { path = "../core/domain" }
+nrr-platform-api = { path = "../core/platform/api", features = ["fuzzing"] }
+nrr-platform-linux = { path = "../core/platform/linux", features = ["fuzzing"] }
+nrr-service-runtime = { path = "../core/services/service-runtime" }
+
+# A fuzz run wants the production optimisation level; debug assertions stay on
+# so an overflow in a parser is a finding, not silent wraparound.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "dns_wire_query"
+path = "fuzz_targets/dns_wire_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_wire_reply"
+path = "fuzz_targets/dns_wire_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stun"
+path = "fuzz_targets/stun.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_hello"
+path = "fuzz_targets/tls_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nflog"
+path = "fuzz_targets/nflog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fake_ip_packet"
+path = "fuzz_targets/fake_ip_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fake_ip_stack"
+path = "fuzz_targets/fake_ip_stack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_frame"
+path = "fuzz_targets/ipc_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_payloads"
+path = "fuzz_targets/ipc_payloads.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rules_file"
+path = "fuzz_targets/rules_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "preset_file"
+path = "fuzz_targets/preset_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "user_settings"
+path = "fuzz_targets/user_settings.rs"
+test = false
+doc = false
+bench = false

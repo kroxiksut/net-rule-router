@@ -81,6 +81,15 @@ impl UpstreamResolver for Upstream {
     ) -> Result<ResolvedAddresses, ResolveError> {
         self.0.clone()
     }
+
+    fn resolve_tunnel_only_within(
+        &self,
+        _h: &str,
+        _family: AddressFamily,
+        _budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        self.0.clone()
+    }
 }
 struct NoopSink;
 impl FactSink for NoopSink {
@@ -754,7 +763,11 @@ fn the_budget_cuts_a_forward_short_of_its_own_timeout() {
     );
     let started = Instant::now();
     assert_eq!(
-        l.forward_within(&query("example.com", QTYPE_A), Duration::from_millis(200)),
+        l.forward_within(
+            &query("example.com", QTYPE_A),
+            Duration::from_millis(200),
+            Transport::Udp,
+        ),
         None
     );
     assert!(
@@ -769,7 +782,11 @@ fn an_exhausted_budget_forwards_nothing_at_all() {
     let l = listener(&[], Ok(resolved(&[])));
     let started = Instant::now();
     assert_eq!(
-        l.forward_within(&query("example.com", QTYPE_A), Duration::ZERO),
+        l.forward_within(
+            &query("example.com", QTYPE_A),
+            Duration::ZERO,
+            Transport::Udp
+        ),
         None
     );
     assert!(started.elapsed() < Duration::from_millis(50));
@@ -1463,6 +1480,9 @@ fn an_oversized_datagram_is_skipped_on_windows() {
 /// query is still read.
 #[test]
 fn an_oversized_datagram_leaves_the_socket_serving() {
+    // Smaller than the listener's own buffer, which no datagram can exceed;
+    // what is under test is the OS's behaviour at the boundary.
+    const BUFFER: usize = 1024;
     let server = UdpSocket::bind("127.0.0.1:0").expect("bind server");
     server
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1470,11 +1490,11 @@ fn an_oversized_datagram_leaves_the_socket_serving() {
     let client = UdpSocket::bind("127.0.0.1:0").expect("bind client");
     let target = server.local_addr().expect("server addr");
     client
-        .send_to(&vec![0u8; DNS_DATAGRAM_BUFFER_BYTES + 512], target)
+        .send_to(&vec![0u8; BUFFER + 512], target)
         .expect("send oversized");
     client.send_to(b"next", target).expect("send next");
 
-    let mut buf = [0u8; DNS_DATAGRAM_BUFFER_BYTES];
+    let mut buf = [0u8; BUFFER];
     let mut next_seen = false;
     for _ in 0..2 {
         match server.recv_from(&mut buf) {
@@ -1483,7 +1503,7 @@ fn an_oversized_datagram_leaves_the_socket_serving() {
                 next_seen = true;
                 break;
             }
-            Ok((n, _)) => assert_eq!(n, DNS_DATAGRAM_BUFFER_BYTES),
+            Ok((n, _)) => assert_eq!(n, BUFFER),
             Err(e) => assert_eq!(
                 classify_recv_error(&e),
                 RecvErrorClass::PerDatagram,
@@ -1744,4 +1764,318 @@ fn a_rule_host_whose_forward_also_failed_is_reported() {
         assert_eq!(buf[3] & 0x0F, RCODE_SERVFAIL);
     }
     assert_eq!(noted.names(), ["routed.example"], "the A question only");
+}
+
+// ── Containment, shedding, DNS over TCP ───────────────────────────────────
+
+/// Serves `l` on a loopback socket until the returned stop flag is set.
+type Serving = (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>);
+
+fn serving(l: Arc<DnsInterceptListener>) -> Serving {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("listener socket");
+    let addr = socket.local_addr().expect("listener addr");
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            let _ = l.serve_udp(&socket, &stop);
+        }
+    });
+    (addr, stop, thread)
+}
+
+fn ask(client: &UdpSocket, to: SocketAddr, packet: &[u8]) -> Vec<u8> {
+    client.send_to(packet, to).expect("send");
+    let mut buf = [0u8; 4096];
+    let n = client.recv(&mut buf).expect("a reply, not silence");
+    buf[..n].to_vec()
+}
+
+/// An oracle that panics on one name: the shape of any bug in one handler.
+struct PanicsOn(&'static str);
+impl RuleHostOracle for PanicsOn {
+    fn is_rule_host(&self, hostname: &str) -> bool {
+        assert_ne!(hostname, self.0, "a handler bug for exactly this name");
+        true
+    }
+}
+
+/// A panic in handling one datagram costs that datagram a SERVFAIL; the
+/// worker and the listener go on answering everything else.
+#[test]
+fn a_panicking_handler_costs_one_query_and_the_listener_keeps_serving() {
+    let l = Arc::new(DnsInterceptListener::new(
+        Arc::new(PanicsOn("boom.example")),
+        Arc::new(Upstream(Ok(resolved(&[Ipv4Addr::new(100, 64, 0, 7)])))),
+        Arc::new(NoopSink),
+        Arc::new(OkReconciler),
+        "192.0.2.1:53".parse().expect("test-net address"),
+        Duration::from_millis(150),
+        Duration::from_millis(150),
+    ));
+    let (addr, stop, thread) = serving(l);
+    let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client socket");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("client timeout");
+    // More panics than there are workers: every worker must survive one.
+    for _ in 0..(SERVE_WORKER_THREADS * 2) {
+        let reply = ask(&client, addr, &query("boom.example", QTYPE_A));
+        assert_eq!(
+            reply[3] & 0x0F,
+            RCODE_SERVFAIL,
+            "the panicking query is failed, not dropped"
+        );
+    }
+    let reply = ask(&client, addr, &query("fine.example", QTYPE_A));
+    assert_eq!(reply[3] & 0x0F, RCODE_NOERROR);
+    assert_eq!(&reply[6..8], &[0, 1], "one A record from the upstream");
+    stop.store(true, Ordering::SeqCst);
+    thread
+        .join()
+        .expect("the serve loop returns normally after panics in its workers");
+}
+
+/// One source gets its share and no more; the next source is untouched by it.
+#[test]
+fn a_source_past_its_share_is_refused_and_another_is_not() {
+    let mut limiter = SourceLimiter::default();
+    let now = Instant::now();
+    let noisy: SocketAddr = "127.0.0.1:40000".parse().expect("addr");
+    let quiet: SocketAddr = "127.0.0.1:40001".parse().expect("addr");
+    let admitted = (0..1000).filter(|_| limiter.admit(noisy, now)).count();
+    assert_eq!(admitted as f64, SOURCE_BURST, "the burst, then refusal");
+    assert!(
+        limiter.admit(quiet, now),
+        "another source has its own share"
+    );
+    // The share refills with time, at the steady rate.
+    let later = now + Duration::from_millis(100);
+    let refilled = (0..1000).filter(|_| limiter.admit(noisy, later)).count();
+    let expected = (SOURCE_RATE_PER_SEC / 10.0) as usize;
+    assert!(
+        (expected - 1..=expected + 1).contains(&refilled),
+        "{refilled}"
+    );
+    // The table is bounded: a flood from many sockets does not grow it past the cap.
+    for port in 1..(SOURCE_TABLE_CAP as u16 + 500) {
+        limiter.admit(SocketAddr::from((Ipv4Addr::LOCALHOST, port)), later);
+    }
+    assert!(limiter.buckets.len() <= SOURCE_TABLE_CAP);
+}
+
+/// A flood from one socket is answered with failures on the receive thread
+/// and never waits on the network; a query from another socket still gets
+/// through, promptly.
+#[test]
+fn a_flood_from_one_program_does_not_stall_another() {
+    let l = Arc::new(listener(
+        &["routed.example"],
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 0, 9)])),
+    ));
+    let (addr, stop, thread) = serving(l);
+    let noisy = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("noisy socket");
+    for _ in 0..(SOURCE_BURST as usize + 300) {
+        let _ = noisy.send_to(&query("routed.example", QTYPE_A), addr);
+    }
+    let quiet = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("quiet socket");
+    quiet
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("client timeout");
+    let started = Instant::now();
+    let reply = ask(&quiet, addr, &query("routed.example", QTYPE_A));
+    assert_eq!(
+        reply[3] & 0x0F,
+        RCODE_NOERROR,
+        "the other program is answered"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "and not after the flood drained"
+    );
+    stop.store(true, Ordering::SeqCst);
+    thread.join().expect("serve loop");
+}
+
+/// The reply check reads the echoed question as raw labels, so a compressed
+/// echo still has to match and a question the parser refuses still counts.
+#[test]
+fn a_forwarded_reply_with_a_compressed_or_unlearnable_question_is_still_checked() {
+    use crate::dns_wire::{build_address_query, build_error_response, DNS_HEADER_LEN};
+    let query = build_address_query(0x2222, "shop.example", QTYPE_A).expect("query");
+    // The echoed question as a pointer to a copy of the name placed after it.
+    let mut compressed = query[..DNS_HEADER_LEN].to_vec();
+    compressed.extend_from_slice(&[0xC0, 0x12, 0, 1, 0, 1]);
+    compressed.extend_from_slice(&query[DNS_HEADER_LEN..DNS_HEADER_LEN + 14]);
+    compressed[2] |= 0x80;
+    assert!(reply_answers_query(&query, &compressed));
+    // The same pointer, but to another name: not our answer.
+    let mut other = build_address_query(0x2222, "evil.example", QTYPE_A).expect("query");
+    other[2] |= 0x80;
+    let mut forged = other[..DNS_HEADER_LEN].to_vec();
+    forged.extend_from_slice(&[0xC0, 0x12, 0, 1, 0, 1]);
+    forged.extend_from_slice(&other[DNS_HEADER_LEN..DNS_HEADER_LEN + 14]);
+    assert!(!reply_answers_query(&query, &forged));
+
+    // An SRV name the product never learns: still matched, not waved through.
+    let srv = build_address_query(0x3333, "_ldap._tcp.dc.example", 33).expect("srv");
+    let mut echoed = srv.clone();
+    echoed[2] |= 0x80;
+    assert!(reply_answers_query(&srv, &echoed));
+    let mut wrong = build_address_query(0x3333, "_ldap._tcp.other.example", 33).expect("srv");
+    wrong[2] |= 0x80;
+    assert!(!reply_answers_query(&srv, &wrong));
+
+    // A reply with no question at all is accepted only as an error reply.
+    let mut formerr = build_error_response(&srv, 1).expect("formerr");
+    formerr.truncate(DNS_HEADER_LEN);
+    formerr[4..6].copy_from_slice(&[0, 0]);
+    assert!(reply_answers_query(&srv, &formerr));
+    let mut empty_ok = formerr.clone();
+    empty_ok[3] &= 0xF0;
+    assert!(
+        !reply_answers_query(&srv, &empty_ok),
+        "a NOERROR with no question is not ours"
+    );
+}
+
+/// A UDP socket and a TCP listener on one loopback port, as the resolver binds
+/// them. A free UDP port can sit in a range Windows reserves for TCP, so a
+/// few ports are tried.
+fn udp_and_tcp_on_one_port() -> (UdpSocket, TcpListener) {
+    for _ in 0..32 {
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("udp");
+        let addr = udp.local_addr().expect("udp addr");
+        if let Ok(tcp) = TcpListener::bind(addr) {
+            return (udp, tcp);
+        }
+    }
+    panic!("no loopback port took both UDP and TCP");
+}
+
+/// An upstream whose UDP answer does not fit sets TC; the OS retries over
+/// TCP to us, and that retry must come back whole — asked of the upstream
+/// over TCP in turn.
+#[test]
+fn a_truncated_answer_is_served_whole_over_tcp() {
+    use crate::dns_wire::{read_tcp_message, write_tcp_message};
+    use std::io::{Read, Write};
+    let full = [Ipv4Addr::new(192, 0, 2, 10), Ipv4Addr::new(192, 0, 2, 11)];
+    // The fake upstream: UDP answers with TC and one address, TCP with both.
+    let (udp_up, tcp_up) = udp_and_tcp_on_one_port();
+    let up_addr = udp_up.local_addr().expect("upstream addr");
+    udp_up
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("upstream timeout");
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = udp_up.recv_from(&mut buf) {
+            if let Some(mut reply) = build_a_response(&buf[..n], &full[..1], 60) {
+                reply[2] |= 0x02; // TC
+                let _ = udp_up.send_to(&reply, from);
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = tcp_up.accept() {
+            if let Ok(Some(q)) = read_tcp_message(&mut stream, 4096) {
+                if let Some(reply) = build_a_response(&q, &full, 60) {
+                    let _ = write_tcp_message(&mut stream, &reply);
+                }
+            }
+        }
+    });
+
+    let l = Arc::new(DnsInterceptListener::new(
+        Arc::new(Oracle(Vec::new())),
+        Arc::new(Upstream(Ok(resolved(&[])))),
+        Arc::new(NoopSink),
+        Arc::new(OkReconciler),
+        up_addr,
+        Duration::from_millis(150),
+        Duration::from_millis(500),
+    ));
+    let (socket, tcp) = udp_and_tcp_on_one_port();
+    let addr = socket.local_addr().expect("listener addr");
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = std::thread::spawn({
+        let l = Arc::clone(&l);
+        let stop = Arc::clone(&stop);
+        move || {
+            let _ = l.serve_observed(&socket, Some(&tcp), &stop, &|| {}, &|| {});
+        }
+    });
+
+    // Over UDP the client sees the truncation, as the OS would.
+    let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client socket");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("client timeout");
+    let over_udp = ask(&client, addr, &query("big.example", QTYPE_A));
+    assert!(crate::dns_wire::is_truncated(&over_udp), "TC relayed as is");
+
+    // The retry over TCP comes back whole.
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).expect("tcp client");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("tcp timeout");
+    write_tcp_message(&mut stream, &query("big.example", QTYPE_A)).expect("framed query");
+    let over_tcp = read_tcp_message(&mut stream, 65_535)
+        .expect("framed reply")
+        .expect("a reply, not a closed stream");
+    assert!(!crate::dns_wire::is_truncated(&over_tcp));
+    assert_eq!(&over_tcp[6..8], &[0, 2], "both addresses");
+    // A second query on the same connection, then the frame bound is enforced.
+    write_tcp_message(&mut stream, &query("big.example", QTYPE_A)).expect("second query");
+    assert!(read_tcp_message(&mut stream, 65_535)
+        .expect("second reply")
+        .is_some());
+    stream
+        .write_all(&[0xFF, 0xFF])
+        .expect("an oversized length prefix");
+    let mut rest = [0u8; 16];
+    assert!(
+        matches!(stream.read(&mut rest), Ok(0) | Err(_)),
+        "the connection is closed, not read"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    thread.join().expect("serve loop");
+}
+
+/// A peer that sends one byte just inside every idle timeout must still lose
+/// the connection at its deadline: the per-call timeout alone let it hold a
+/// thread for hours.
+#[test]
+fn a_trickling_peer_is_cut_off_at_the_deadline() {
+    use std::io::Write;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listener");
+    let addr = listener.local_addr().expect("addr");
+    let trickle = std::thread::spawn(move || {
+        let mut peer = TcpStream::connect(addr).expect("connect");
+        // A length prefix promising 4000 bytes, then the body a byte at a time.
+        let _ = peer.write_all(&[0x0F, 0xA0]);
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            if peer.write_all(&[0]).is_err() {
+                return;
+            }
+        }
+    });
+    let (mut stream, _) = listener.accept().expect("accept");
+    let started = Instant::now();
+    let mut reader = DeadlineStream::new(
+        &mut stream,
+        Duration::from_millis(400),
+        Duration::from_millis(300),
+    );
+    let read = crate::dns_wire::read_tcp_message(&mut reader, 4096);
+    assert!(read.is_err(), "the trickle never completed the message");
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "cut off at the deadline, not after the whole trickle: {:?}",
+        started.elapsed()
+    );
+    drop(stream);
+    let _ = trickle.join();
 }

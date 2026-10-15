@@ -1696,6 +1696,7 @@ fn an_activation_waits_for_the_one_in_flight_and_is_refused_past_the_wait() {
 struct OverlayProbe {
     reader: Mutex<Connection>,
     fail_apply: bool,
+    fail_pre_flight: bool,
     seen: Mutex<Vec<(&'static str, Option<String>)>>,
 }
 
@@ -1712,6 +1713,25 @@ impl OverlayProbe {
             .lock()
             .expect("seen")
             .push((phase, applying.map(|s| s.to_string())));
+    }
+
+    /// What a reader on ANOTHER thread sees at this moment.
+    fn record_elsewhere(&self, phase: &'static str) {
+        let path = self
+            .reader
+            .lock()
+            .expect("reader")
+            .path()
+            .map(str::to_owned)
+            .expect("file database");
+        let applying = std::thread::spawn(move || {
+            let other = Connection::open(path).expect("other reader");
+            crate::applying_revision_overlay::applying_for(&other, nrr_storage::BASELINE_PRINCIPAL)
+                .map(|s| s.to_string())
+        })
+        .join()
+        .expect("reader thread");
+        self.seen.lock().expect("seen").push((phase, applying));
     }
 }
 
@@ -1732,9 +1752,17 @@ impl RulesApplyDispatcher for OverlayProbe {
 
     fn pre_flight_for_sid(
         &self,
-        _sid: &str,
+        sid: &str,
         _rules_json: &str,
     ) -> Result<Vec<PreFlightWarning>, DispatchFailure> {
+        self.record("pre-flight");
+        self.record_elsewhere("pre-flight, another thread");
+        if self.fail_pre_flight {
+            return Err(DispatchFailure {
+                sid: sid.to_string(),
+                message: "nft refused the ruleset".into(),
+            });
+        }
         Ok(Vec::new())
     }
 
@@ -1755,9 +1783,22 @@ impl RulesApplyDispatcher for OverlayProbe {
     }
 }
 
-#[allow(clippy::expect_used)]
 fn activate_with_probe(
     fail_apply: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<OverlayProbe>,
+    Connection,
+    ActivationOutcome,
+) {
+    activate_with_probe_under(ApplyFailurePolicy::AllOrNothing, fail_apply, false)
+}
+
+#[allow(clippy::expect_used)]
+fn activate_with_probe_under(
+    policy: ApplyFailurePolicy,
+    fail_apply: bool,
+    fail_pre_flight: bool,
 ) -> (
     // First, so the bindings that hold the database drop before it.
     tempfile::TempDir,
@@ -1773,6 +1814,7 @@ fn activate_with_probe(
     let probe = Arc::new(OverlayProbe {
         reader: Mutex::new(Connection::open(&path).expect("reader")),
         fail_apply,
+        fail_pre_flight,
         seen: Mutex::new(Vec::new()),
     });
     let registry = Arc::new(ActiveSidRegistry::new());
@@ -1784,7 +1826,7 @@ fn activate_with_probe(
         Arc::new(RecordingAudit::new()) as Arc<dyn ActivationAuditEmitter>,
         FixedClock::new(1_700_000_000) as Arc<dyn Clock>,
         Arc::new(CounterIds::new()) as Arc<dyn IdGenerator>,
-        ApplyFailurePolicy::AllOrNothing,
+        policy,
     );
     registry.on_connect("S-1-5-21-A", IpcClientProfile::TrayLightweight);
     let id = coordinator
@@ -1837,6 +1879,57 @@ fn the_revert_after_a_failed_apply_reads_the_stored_revision() {
             ("apply", Some(r#"{"applying":1}"#.to_string())),
             ("revert", None),
         ]
+    );
+}
+
+/// The pre-flight plans with the revision under check, and only its own
+/// thread sees it: a tick or route hook running meanwhile keeps enforcing the
+/// stored one.
+#[test]
+fn the_pre_flight_alone_sees_the_revision_under_check() {
+    let (_dir, probe, _after, outcome) =
+        activate_with_probe_under(ApplyFailurePolicy::PreFlightThenAllOrNothing, false, false);
+    assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
+    let candidate = Some(r#"{"applying":1}"#.to_string());
+    let seen = probe.seen.lock().expect("seen").clone();
+    assert_eq!(
+        seen,
+        vec![
+            ("pre-flight", candidate.clone()),
+            ("pre-flight, another thread", None),
+            ("apply", candidate),
+        ]
+    );
+}
+
+/// A refused check rejects the revision before anything is applied, and
+/// leaves nothing previewed behind.
+#[test]
+fn a_refused_pre_flight_applies_nothing_and_leaves_no_preview() {
+    let (_dir, probe, after, outcome) =
+        activate_with_probe_under(ApplyFailurePolicy::PreFlightThenAllOrNothing, false, true);
+    match outcome {
+        ActivationOutcome::PreFlightFailed { sid_failures, .. } => {
+            assert_eq!(
+                sid_failures,
+                vec![(
+                    "S-1-5-21-A".to_string(),
+                    "nft refused the ruleset".to_string()
+                )]
+            );
+        }
+        other => panic!("expected PreFlightFailed, got {other:?}"),
+    }
+    let seen = probe.seen.lock().expect("seen").clone();
+    assert!(
+        seen.iter()
+            .all(|(phase, _)| phase.starts_with("pre-flight")),
+        "something ran past a refused pre-flight: {seen:?}"
+    );
+    assert!(!crate::applying_revision_overlay::previewing());
+    assert_eq!(
+        crate::applying_revision_overlay::applying_for(&after, nrr_storage::BASELINE_PRINCIPAL),
+        None
     );
 }
 

@@ -1,0 +1,45 @@
+{
+  "description": "pure.js vpnClientTrustOffers: one question per pending VPN-named program, named by its file name, with only the protected siblings the service listed",
+  "cases": [
+    {
+      "name": "one plain client",
+      "input": { "pending": [ { "exe-path": "C:\\Users\\someone\\Downloads\\x-vpn.exe" } ] },
+      "expected": [ { "exePath": "C:\\Users\\someone\\Downloads\\x-vpn.exe", "name": "x-vpn.exe", "bundledExePaths": [] } ]
+    },
+    {
+      "name": "a bundle keeps its order, drops the client itself and repeats",
+      "input": { "pending": [ { "exe-path": "C:\\Apps\\vendor vpn.exe", "bundled-exe-paths": [ "C:\\Apps\\OpenVPN\\openvpn.exe", "c:\\apps\\VENDOR VPN.EXE", "C:\\Apps\\XRay\\xray.exe", "C:\\Apps\\openvpn\\OPENVPN.EXE", " " ] } ] },
+      "expected": [ { "exePath": "C:\\Apps\\vendor vpn.exe", "name": "vendor vpn.exe", "bundledExePaths": [ "C:\\Apps\\OpenVPN\\openvpn.exe", "C:\\Apps\\XRay\\xray.exe" ] } ]
+    },
+    {
+      "name": "repeated and blank clients fold",
+      "input": { "pending": [ { "exe-path": "C:\\A\\a-vpn.exe" }, { "exe-path": "c:\\a\\A-VPN.EXE" }, { "exe-path": "  " }, { "exe-path": "/opt/b/b-vpn" } ] },
+      "expected": [ { "exePath": "C:\\A\\a-vpn.exe", "name": "a-vpn.exe", "bundledExePaths": [] }, { "exePath": "/opt/b/b-vpn", "name": "b-vpn", "bundledExePaths": [] } ]
+    },
+    {
+      "name": "nothing pending",
+      "input": { "pending": [] },
+      "expected": []
+    },
+    {
+      "name": "both slash kinds end the file name",
+      "input": { "pending": [ { "exe-path": "C:/Apps/mixed\\tool-vpn.exe" } ] },
+      "expected": [ { "exePath": "C:/Apps/mixed\\tool-vpn.exe", "name": "tool-vpn.exe", "bundledExePaths": [] } ]
+    },
+    {
+      "name": "padding around a path is trimmed",
+      "input": { "pending": [ { "exe-path": "  C:\\A\\p-vpn.exe  ", "bundled-exe-paths": [ "  C:\\A\\p-helper.exe " ] } ] },
+      "expected": [ { "exePath": "C:\\A\\p-vpn.exe", "name": "p-vpn.exe", "bundledExePaths": [ "C:\\A\\p-helper.exe" ] } ]
+    },
+    {
+      "name": "two clients keep their order and their own bundles",
+      "input": { "pending": [ { "exe-path": "C:\\A\\a-vpn.exe", "bundled-exe-paths": [ "C:\\A\\core.exe" ] }, { "exe-path": "C:\\B\\b-vpn.exe" } ] },
+      "expected": [ { "exePath": "C:\\A\\a-vpn.exe", "name": "a-vpn.exe", "bundledExePaths": [ "C:\\A\\core.exe" ] }, { "exePath": "C:\\B\\b-vpn.exe", "name": "b-vpn.exe", "bundledExePaths": [] } ]
+    },
+    {
+      "name": "an entry without a path is dropped",
+      "input": { "pending": [ { "bundled-exe-paths": [ "C:\\A\\core.exe" ] } ] },
+      "expected": []
+    }
+  ]
+}

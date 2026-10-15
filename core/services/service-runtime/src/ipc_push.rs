@@ -2,8 +2,8 @@
 //!
 //! Both IPC servers owe a subscribed client the same thing: after a
 //! `StatusUpdatesSubscribe`, drain that subscription's pending events onto the
-//! connection in order, advance its cursor past what was delivered, and count a
-//! drop when a write fails. Only the framing differs — a Win32 named pipe on one
+//! connection in order, advance its cursor past what was delivered, and give the
+//! connection up when a write fails. Only the framing differs — a Win32 named pipe on one
 //! side, an `AF_UNIX` stream on the other — so the decision logic lives here and
 //! each server passes in its own writer.
 
@@ -77,7 +77,8 @@ pub fn adopt_subscription(
 }
 
 /// One push pump tick. Returns `true` when a write failed, which the caller
-/// must treat as "close this connection".
+/// must treat as "close this connection": the client then reconnects, replays
+/// its subscription and tells its surface about the gap.
 ///
 /// `write` sends one envelope over the connection; its error text is only
 /// logged. The cursor advances to the last envelope written, so a failed frame
@@ -132,7 +133,6 @@ where
             error: None,
         };
         if let Err(e) = write(&env) {
-            event_bus.record_drop(subscription_id, 1);
             tracing::warn!(
                 target: "nrr::ipc-push",
                 msg_key = "ipcpush-write-failed",
@@ -140,7 +140,7 @@ where
                 event_id = entry.event_id,
                 event_type,
                 error = %e,
-                "push frame write failed, subscriber dropped it"
+                "push frame write failed, connection given up"
             );
             return true;
         }
@@ -314,10 +314,10 @@ mod tests {
     }
 
     /// A failed write must not consume the event: the cursor stays put so a
-    /// re-subscribe can replay it, one drop is recorded, and the caller is told
-    /// to close the connection.
+    /// re-subscribe can replay it, and the caller is told to close the
+    /// connection.
     #[test]
-    fn a_failed_write_records_a_drop_and_asks_for_a_close() {
+    fn a_failed_write_leaves_the_event_pending_and_asks_for_a_close() {
         let bus = EventBus::new();
         let s = bus.subscribe("client-1".into(), None);
         let id1 = bus.publish(adapters_event());
@@ -330,11 +330,6 @@ mod tests {
         let pending = bus.peek_pending_for(&s.subscription_id, 32);
         assert_eq!(pending.len(), 2, "no events delivered yet");
         assert_eq!((pending[0].event_id, pending[1].event_id), (id1, id2));
-        assert_eq!(
-            bus.take_dropped_count(&s.subscription_id),
-            1,
-            "exactly one drop recorded for the failed frame"
-        );
     }
 
     #[test]

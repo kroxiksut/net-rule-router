@@ -109,6 +109,9 @@ pub struct PlatformSupports {
     /// Local network segments can be exempted from leak protection by name.
     /// Needs the route coordinator that discovers and enforces them.
     pub local_network_exceptions: bool,
+    /// Traffic the machine forwards — WSL, containers, virtual machines — can
+    /// be kept under the leak guard while the tunnel is down.
+    pub forwarded_traffic_guard: bool,
     /// Blocked-connection notices: the per-SID journal, its mutes, and the
     /// offer to re-route a blocked destination. Fed by the connection observer.
     pub block_notices: bool,
@@ -187,6 +190,7 @@ impl PlatformProfile {
                 service_stability_config: true,
                 verbose_logging: true,
                 local_network_exceptions: true,
+                forwarded_traffic_guard: true,
                 block_notices: true,
                 audit_chain_restart: true,
                 conn_trace_log: true,
@@ -201,9 +205,8 @@ impl PlatformProfile {
         }
     }
 
-    /// Linux (nftables / systemd / polkit). Provisional until the Linux
-    /// enforcement backend lands; per-process routing and the ETW-style DNS
-    /// observer have no analogue wired yet, so they report `false`.
+    /// Linux (nftables / systemd / polkit). Per-process routing has no
+    /// analogue wired yet, so it reports `false`.
     pub fn linux() -> Self {
         Self {
             os: "linux",
@@ -214,10 +217,13 @@ impl PlatformProfile {
             supports: PlatformSupports {
                 kill_switch: true,
                 app_routing: false,
-                dns_observe: false,
+                // The daemon reads what systemd-resolved answered; where
+                // resolved does not serve the machine, the log says so.
+                dns_observe: true,
                 dns_resolver: true,
                 // The TUN port is a stub that never opens an adapter.
                 fake_ip: false,
+                // The rule-host resolver stands behind the hosts-file posture.
                 hosts_pin: true,
                 background_service: true,
                 autostart: true,
@@ -229,6 +235,7 @@ impl PlatformProfile {
                 // start, whatever happens to the rest of the stored row.
                 verbose_logging: true,
                 local_network_exceptions: false,
+                forwarded_traffic_guard: true,
                 // Fed by the drop reports our nftables rules send back.
                 block_notices: true,
                 // The coordinator signs with the daemon's key, and the restart
@@ -272,6 +279,7 @@ impl PlatformProfile {
                 service_stability_config: false,
                 verbose_logging: false,
                 local_network_exceptions: false,
+                forwarded_traffic_guard: false,
                 block_notices: false,
                 audit_chain_restart: false,
                 conn_trace_log: false,
@@ -378,6 +386,14 @@ mod tests {
     #[test]
     fn the_audit_chain_restart_is_offered_where_the_key_is_wired() {
         assert!(PlatformProfile::linux().supports.audit_chain_restart);
+    }
+
+    /// The Linux daemon learns rule-host addresses from systemd-resolved, so
+    /// the window may name that method; macOS has no observer yet.
+    #[test]
+    fn dns_observation_is_offered_where_the_daemon_watches_the_resolver() {
+        assert!(PlatformProfile::linux().supports.dns_observe);
+        assert!(!PlatformProfile::macos().supports.dns_observe);
     }
 
     /// Linux writes the connection trace to the service log; macOS has no

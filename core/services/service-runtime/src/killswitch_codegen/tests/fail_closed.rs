@@ -104,10 +104,11 @@ fn fail_closed_no_protocols_yields_no_filters() {
 }
 
 #[test]
-fn fail_closed_allow_dns_over_primary_adds_port_scoped_dns_permits() {
-    // opt-in: with `allow_dns_over_primary` the block-all set
-    // gains port-scoped (remote UDP/TCP 53) ALE permits so name resolution keeps
-    // working over the primary link; off (the strict default) it must not.
+fn fail_closed_allow_dns_over_primary_permits_port_53_to_the_system_resolvers_only() {
+    // Opt-in: with `allow_dns_over_primary` the block-all set gains port-53
+    // ALE permits, one UDP+TCP pair per system resolver and nothing wider;
+    // off (the strict default) it must not, and with no resolver listed
+    // there is nothing to permit.
     let strict = fail_closed_block_all_filters(
         "S",
         &FailClosedExemptions::default(),
@@ -117,9 +118,20 @@ fn fail_closed_allow_dns_over_primary_adds_port_scoped_dns_permits() {
         !strict.iter().any(|f| f.remote_port == Some(53)),
         "strict block-all must NOT permit DNS over the primary link"
     );
+    let unlisted = FailClosedExemptions {
+        allow_dns_over_primary: true,
+        ..FailClosedExemptions::default()
+    };
+    let out = fail_closed_block_all_filters("S", &unlisted, KillSwitchProtocols::ALL);
+    assert!(
+        !out.iter().any(|f| f.remote_port == Some(53)),
+        "no resolver listed: port 53 stays closed rather than open to any host"
+    );
 
+    let resolvers = [ip(192, 0, 2, 53), ip(192, 0, 2, 54)];
     let ex = FailClosedExemptions {
         allow_dns_over_primary: true,
+        dns_servers: resolvers.to_vec(),
         ..FailClosedExemptions::default()
     };
     let out = fail_closed_block_all_filters("S", &ex, KillSwitchProtocols::ALL);
@@ -131,11 +143,19 @@ fn fail_closed_allow_dns_over_primary_adds_port_scoped_dns_permits() {
                 && f.remote_port == Some(53)
         })
         .collect();
-    assert_eq!(dns.len(), 2, "expected exactly UDP-53 + TCP-53 permits");
-    assert!(dns.iter().any(|f| f.ip_protocol == Some(17)), "UDP permit");
-    assert!(dns.iter().any(|f| f.ip_protocol == Some(6)), "TCP permit");
-    // Port-scoped, not a full-host tunnel: no remote_ip pin.
-    assert!(dns.iter().all(|f| f.remote_ip.is_none()));
+    assert_eq!(dns.len(), 4, "UDP-53 + TCP-53 per resolver");
+    for resolver in resolvers {
+        assert!(dns
+            .iter()
+            .any(|f| f.remote_ip == Some(resolver) && f.ip_protocol == Some(17)));
+        assert!(dns
+            .iter()
+            .any(|f| f.remote_ip == Some(resolver) && f.ip_protocol == Some(6)));
+    }
+    // Pinned to the resolvers: never a permit for any host on port 53.
+    assert!(dns.iter().all(|f| f.remote_ip.is_some()));
+    let ids: std::collections::HashSet<_> = dns.iter().map(|f| f.id).collect();
+    assert_eq!(ids.len(), 4, "one id per resolver and protocol");
 }
 
 #[test]

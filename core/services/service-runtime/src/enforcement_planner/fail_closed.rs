@@ -353,8 +353,8 @@ pub fn plan_doh_dot_block(sid: &str, resolver_ips: &[IpAddr], block_dot: bool) -
 /// (there is none — so no egress-via-secondary permit) and WITHOUT requiring
 /// server IPs. The exemptions are loopback / link-local / broadcast / servers /
 /// liveness-probe targets / local subnets (ALE + packet mirror), plus opt-in
-/// DNS-over-primary (port-53
-/// UDP/TCP, ALE only). The ALE catch-all block is narrowed to the ALE protocol and
+/// DNS-over-primary (port-53 UDP/TCP to each of `dns_servers`, the machine's
+/// own resolvers, ALE only). The ALE catch-all block is narrowed to the ALE protocol and
 /// emitted only when TCP/UDP is selected; the packet blocks reproduce
 /// `packet_protocol_blocks`; the IPv6 cut always applies. Empty when no protocol is
 /// selected.
@@ -371,6 +371,7 @@ pub fn plan_fail_closed_block_all(
     known_direct_ips: &[Ipv4Addr],
     v6: Ipv6Exemptions<'_>,
     allow_dns_over_primary: bool,
+    dns_servers: &[Ipv4Addr],
     protocols: KillSwitchProtocols,
 ) -> Vec<FlowRule> {
     let any_selected = protocols.tcp
@@ -529,26 +530,33 @@ pub fn plan_fail_closed_block_all(
             e += 1;
         }
     }
-    // Opt-in DNS-over-primary: port-53 UDP then TCP, ALE only (no packet mirror).
+    // Opt-in DNS-over-primary: port-53 UDP then TCP per system resolver, ALE
+    // only (no packet mirror). Same order and cap as the codegen.
     if allow_dns_over_primary {
-        for proto in [L4Proto::Udp, L4Proto::Tcp] {
-            flows.push(FlowRule {
-                verdict: Verdict::Permit,
-                precedence: Precedence {
-                    class: PrecedenceClass::CatchAllExempt,
-                    ordinal: e,
-                },
-                flow: FlowMatch {
-                    dst: DstMatch::Any,
-                    dst_port: Some(53),
-                    protocol: Some(proto),
-                },
-                principal: principal.clone(),
-                app: AppScope::Any,
-                egress: EgressConstraint::Any,
-                coverage: Coverage::ConnectOnly,
-            });
-            e += 1;
+        for ip in dns_servers
+            .iter()
+            .filter(|ip| !nrr_platform_api::is_exempt_from_blocking(**ip))
+            .take(crate::killswitch_codegen::MAX_DNS_SERVER_PERMITS)
+        {
+            for proto in [L4Proto::Udp, L4Proto::Tcp] {
+                flows.push(FlowRule {
+                    verdict: Verdict::Permit,
+                    precedence: Precedence {
+                        class: PrecedenceClass::CatchAllExempt,
+                        ordinal: e,
+                    },
+                    flow: FlowMatch {
+                        dst: DstMatch::HostV4(*ip),
+                        dst_port: Some(53),
+                        protocol: Some(proto),
+                    },
+                    principal: principal.clone(),
+                    app: AppScope::Any,
+                    egress: EgressConstraint::Any,
+                    coverage: Coverage::ConnectOnly,
+                });
+                e += 1;
+            }
         }
     }
 

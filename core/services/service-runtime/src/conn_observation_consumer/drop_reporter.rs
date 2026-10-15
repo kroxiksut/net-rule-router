@@ -13,16 +13,14 @@ use super::*;
 /// The sockets a destination pin was seen dropping to one address this batch.
 #[derive(Debug, Default)]
 pub(super) struct PinDropVictims {
-    locals: Vec<std::net::SocketAddrV4>,
+    locals: Vec<SocketAddr>,
     owners: Vec<String>,
 }
 
 impl PinDropVictims {
     pub(super) fn note(&mut self, local: SocketAddr, owner: Option<&str>) {
-        if let SocketAddr::V4(local) = local {
-            if !self.locals.contains(&local) {
-                self.locals.push(local);
-            }
+        if !self.locals.contains(&local) {
+            self.locals.push(local);
         }
         if let Some(owner) = owner {
             if !self.owners.iter().any(|o| o.eq_ignore_ascii_case(owner)) {
@@ -38,12 +36,12 @@ impl PinDropVictims {
 /// no address census applies: the dropped socket is dead on this link anyway.
 pub(super) fn stale_flows_behind_drops(
     candidates: Vec<EstablishedFlow>,
-    victims: &std::collections::BTreeMap<std::net::Ipv4Addr, PinDropVictims>,
+    victims: &std::collections::BTreeMap<std::net::IpAddr, PinDropVictims>,
 ) -> Vec<EstablishedFlow> {
     candidates
         .into_iter()
         .filter(|flow| {
-            victims.get(flow.remote.ip()).is_some_and(|v| {
+            victims.get(&flow.remote.ip()).is_some_and(|v| {
                 v.locals.contains(&flow.local)
                     || flow
                         .owner
@@ -60,7 +58,7 @@ impl ConnectionObservationConsumer {
     /// pre-rule DNS answer". Bounded like every other per-session set here.
     // `pub(super)` because the impl is split across files and the caller
     // is now another module.
-    pub(super) fn note_torn_down(&self, ip: std::net::Ipv4Addr) {
+    pub(super) fn note_torn_down(&self, ip: std::net::IpAddr) {
         let mut seen = self
             .torn_down_before
             .lock()
@@ -73,7 +71,7 @@ impl ConnectionObservationConsumer {
 
     // `pub(super)` because the impl is split across files and the caller
     // is now another module.
-    pub(super) fn was_torn_down_before(&self, ip: std::net::Ipv4Addr) -> bool {
+    pub(super) fn was_torn_down_before(&self, ip: std::net::IpAddr) -> bool {
         self.torn_down_before
             .lock()
             .unwrap_or_else(|p| p.into_inner())

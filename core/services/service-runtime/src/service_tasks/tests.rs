@@ -126,7 +126,7 @@ fn fresh_health() -> Arc<HealthAggregator> {
 
 #[test]
 fn health_aggregator_task_has_correct_shape() {
-    let task = build_health_aggregator_task(fresh_health());
+    let task = build_health_aggregator_task(fresh_health(), None);
     assert_eq!(task.id.0, TASK_ID_HEALTH_AGGREGATOR);
     assert_eq!(task.class, TaskClass::Recoverable);
     assert_eq!(task.interval, Some(HEALTH_AGGREGATOR_INTERVAL));

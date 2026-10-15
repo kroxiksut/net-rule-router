@@ -143,6 +143,46 @@ pub fn plan_service_account_flows(
     flows
 }
 
+/// The guard for what the machine forwards (WSL, containers, guests), on every
+/// protocol — the forwarding path carries no narrower match. A pin is keyed on
+/// the interface the packet leaves by, so it closes the instant the tunnel goes,
+/// as the owner's does, instead of waiting for the next pass.
+#[must_use]
+pub fn plan_forwarded_flows(owner: &str, guard: &ServiceAccountGuard) -> Vec<FlowRule> {
+    let all = KillSwitchProtocols::ALL;
+    let mut flows = match guard.posture {
+        ServiceAccountPosture::Pin => {
+            let mut flows = plan_kill_switch_destinations(owner, &guard.destinations, all);
+            flows.extend(plan_kill_switch_networks(owner, &guard.holds, all));
+            flows
+        }
+        ServiceAccountPosture::Block => {
+            let mut flows = plan_fail_closed_destinations(owner, &guard.destinations, all);
+            flows.extend(plan_fail_closed_networks(owner, &guard.holds, all));
+            flows
+        }
+    };
+    onto_forwarded(&mut flows);
+    flows
+}
+
+/// The owner's blanket block with the tunnel gone, for what the machine
+/// forwards: its connect half, re-scoped. The caller states the floor the
+/// blanket keeps open, with the main link's resolvers among the direct hosts —
+/// a guest names its resolvers by address.
+#[must_use]
+pub fn plan_forwarded_block_all(mut blanket: Vec<FlowRule>) -> Vec<FlowRule> {
+    onto_forwarded(&mut blanket);
+    blanket
+}
+
+fn onto_forwarded(flows: &mut Vec<FlowRule>) {
+    flows.retain(|flow| flow.coverage == Coverage::ConnectOnly);
+    for flow in flows.iter_mut() {
+        flow.principal = PrincipalScope::Forwarded;
+    }
+}
+
 /// Announces the spared DNS servers once per change, not once per pass.
 #[derive(Default)]
 pub struct ServiceAccountDnsLog {
@@ -357,6 +397,39 @@ mod tests {
                 "{posture:?}: {live:?} vs {lowered:?}"
             );
             assert!(arbitration_order_preserved(&live, &lowered), "{posture:?}");
+        }
+    }
+
+    /// The forwarded share lowers to the forwarding-layer filters the live
+    /// Windows path installs, for a pin and a block alike.
+    #[cfg(windows)]
+    #[test]
+    fn the_forwarded_flows_lower_to_the_live_forwarding_filters() {
+        use crate::killswitch_codegen::forwarded_guard_filters;
+        use nrr_platform_api::enforcement::EnforcementPlan;
+        use nrr_platform_api::wfp_behavioral::behaviorally_equivalent;
+        use nrr_platform_windows::lower_windows::lower_kill_switch;
+
+        let owner = "S-1-5-21-1-2-3-1001";
+        let luid = 0x0001_0000_0000_0007_u64;
+        let holds = NetworkHolds::default();
+        let dests = [v4(203, 0, 113, 5), v4(198, 51, 100, 8)];
+        for posture in [ServiceAccountPosture::Pin, ServiceAccountPosture::Block] {
+            let guard = service_account_guard(&input(Some(posture), &dests, &holds))
+                .expect("owner with a guard");
+            let live = forwarded_guard_filters(owner, &guard, luid);
+            let plan = EnforcementPlan {
+                principal: UserPrincipal::from_windows_sid(owner).expect("valid sid"),
+                flows: plan_forwarded_flows(owner, &guard),
+                routes: Vec::new(),
+                policy_rules: Vec::new(),
+            };
+            let lowered = lower_kill_switch(&plan, luid);
+            assert!(!live.is_empty(), "{posture:?}");
+            assert!(
+                behaviorally_equivalent(&live, &lowered),
+                "{posture:?}: {live:?} vs {lowered:?}"
+            );
         }
     }
 }

@@ -74,7 +74,6 @@ mod tests {
     use crate::per_sid_orchestrator::{ActiveRulesSnapshot, RulesProvider};
     use nrr_domain::canonical::{CanonicalRuleBook, CanonicalRuleSet};
     use nrr_domain::user_principal::UserPrincipal;
-    use nrr_domain::RouteBehaviorMode;
     use nrr_platform_api::browser_history::{BrowserHistoryError, BrowserHistoryReadPort};
     use nrr_platform_api::dns::{AddressFamily, DnsResolverError, DnsResolverPort, ResolvedRecord};
     use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
@@ -112,7 +111,6 @@ mod tests {
                     primary: CanonicalRuleSet::from_rules(vec![]),
                     secondary: CanonicalRuleSet::from_rules(vec![]),
                 },
-                behavior_mode: RouteBehaviorMode::PreferPrimary,
             })
         }
     }

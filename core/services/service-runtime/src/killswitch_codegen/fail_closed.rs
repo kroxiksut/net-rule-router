@@ -40,6 +40,11 @@ pub struct FailClosedExemptions {
     /// port 53 so it is NOT a full-host tunnel; it is still a deliberate
     /// DNS-over-primary leak, which is why it is opt-in and defaults off.
     pub allow_dns_over_primary: bool,
+    /// The machine's own resolvers. The port-53 permit above reaches these
+    /// and nothing else: a permit for any host on port 53 is a tunnel for
+    /// every program that runs its own DNS. Empty when the OS has not listed
+    /// them yet, which permits nothing.
+    pub dns_servers: Vec<Ipv4Addr>,
     /// destinations POSITIVELY established as DIRECT
     /// (non-rule) hosts (see [`crate::known_direct::KnownDirectRegistry`]): a
     /// Mode-B steered direct answer, or an FCrDNS forward-confirmed name that
@@ -263,7 +268,11 @@ pub fn fail_closed_block_all_filters(
     // opt-in: keep name resolution working over the primary
     // link while blocked (port-scoped UDP/TCP 53). See `allow_dns_over_primary`.
     if exemptions.allow_dns_over_primary {
-        filters.extend(exempt_dns_over_primary(sid, weight));
+        filters.extend(exempt_dns_over_primary(
+            sid,
+            &exemptions.dns_servers,
+            weight,
+        ));
     }
     // The catch-all ALE block — TCP/UDP egress this user sends, narrowed to the
     // TCP/UDP selection. Skipped entirely when neither TCP nor UDP is selected.

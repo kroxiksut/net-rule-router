@@ -548,10 +548,12 @@ fn builtin_vpn_globs_resolve_to_paths_no_glob_in_fail_closed_set() {
     let audit = Arc::new(CollectAudit::default());
     // Map the built-in `openvpn*` glob to a concrete exe; the other built-ins
     // resolve to nothing (client not installed) and simply drop out.
-    let resolver = nrr_platform_api::MockAppPathResolver::new().with(
-        "openvpn.exe",
-        vec![std::path::PathBuf::from(r"C:\Tools\openvpn.exe")],
-    );
+    let resolver = nrr_platform_api::MockAppPathResolver::new()
+        .with(
+            "openvpn.exe",
+            vec![std::path::PathBuf::from(r"C:\Tools\openvpn.exe")],
+        )
+        .with_protected_root(r"C:\Tools");
     let orch = Arc::new(
         PerSidApplyOrchestrator::new(
             session,
@@ -589,36 +591,27 @@ fn builtin_vpn_globs_resolve_to_paths_no_glob_in_fail_closed_set() {
     );
 }
 
-/// A client's TRANSPORT is a different process from the binary we resolved, and
-/// it is the transport that talks to the server. Exempting only the resolved
-/// one is why an observed outage held for 88 minutes: every protocol the
-/// user tried ran from a nested executable no permit named.
+/// The exemption keys on a file name, and a name is something anyone can give
+/// a file: `x-vpn.exe` in a download folder matched `*vpn*` and walked around
+/// the leak guard with no rule and no confirmation. Only a client from a place
+/// the user could not have written to is exempt by name; the rest is listed
+/// for the user to confirm, and exempted from nothing until they do.
 #[test]
-fn a_clients_nested_transport_is_exempt_while_an_unrelated_app_is_not() {
+fn a_vpn_named_binary_outside_the_program_folders_waits_for_confirmation() {
     let api = Arc::new(MockWindowsApi::new());
     let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
     let source = Arc::new(ScriptedSource::default());
     let rules = Arc::new(ScriptedRules::default());
     let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
     let audit = Arc::new(CollectAudit::default());
-    const CLIENT: &str = r"C:\Program Files\vendor vpn\vendor vpn.exe";
-    // The nested directory is a placeholder; the file name is the functional
-    // subject — it must NOT match the built-in `*vpn*` glob.
-    const TRANSPORT: &str = r"C:\Program Files\vendor vpn\dir-c\xray.exe";
-    const UNRELATED: &str = r"C:\Program Files\mail\mail.exe";
+    const INSTALLED: &str = r"C:\Program Files\vendor vpn\vendor vpn.exe";
+    const PLANTED: &str = r"C:\Users\someone\Downloads\x-vpn.exe";
+    // Both match the built-in `*vpn*` glob by file name; only one sits where
+    // an administrator put it.
     let resolver = nrr_platform_api::MockAppPathResolver::new()
-        // The built-in `*vpn*` glob recognises the client by its file name.
-        .with("vendor vpn.exe", vec![std::path::PathBuf::from(CLIENT)])
-        // …and this is what actually ships beside it.
-        .with_siblings(CLIENT, vec![std::path::PathBuf::from(TRANSPORT)])
-        // An ordinary application's tree must stay out of the exemption, so
-        // seed one and assert its sibling never appears.
-        .with_siblings(
-            UNRELATED,
-            vec![std::path::PathBuf::from(
-                r"C:\Program Files\mail\updater.exe",
-            )],
-        );
+        .with("vendor vpn.exe", vec![std::path::PathBuf::from(INSTALLED)])
+        .with("x-vpn.exe", vec![std::path::PathBuf::from(PLANTED)])
+        .with_protected_root(r"C:\Program Files");
     let orch = Arc::new(
         PerSidApplyOrchestrator::new(
             session,
@@ -632,30 +625,201 @@ fn a_clients_nested_transport_is_exempt_while_an_unrelated_app_is_not() {
         .with_kill_switch_resolver(Arc::new(|_, _| None)),
     );
     rules.set(rules_with_n_primary_ips(1));
-    source.set("S-1-5-21-A", snap_full("Wi-Fi", "TAP"));
+    source.set("S-1-5-21-K5A", snap_full("Wi-Fi", "TAP"));
 
-    orch.install_for_sid("S-1-5-21-A").unwrap();
+    orch.install_for_sid("S-1-5-21-K5A").unwrap();
     let filters = api.wfp_filters.lock().unwrap();
     let exempt_paths: Vec<String> = filters
         .iter()
-        .filter(|f| {
-            f.action == WfpAction::Permit && f.remote_ip.is_none() && f.remote_ip_set.is_empty()
-        })
+        .filter(|f| f.action == WfpAction::Permit && f.weight >= 0x0060_0000)
         .filter_map(|f| f.app_pattern.clone())
         .collect();
 
     assert!(
-        exempt_paths.iter().any(|p| p == CLIENT),
-        "positive control: the confirmed client itself is exempt: {exempt_paths:?}",
+        exempt_paths.iter().any(|p| p == INSTALLED),
+        "positive control: the installed client is exempt: {exempt_paths:?}",
     );
     assert!(
-        exempt_paths.iter().any(|p| p == TRANSPORT),
-        "the process that performs the handshake must be exempt too: {exempt_paths:?}",
+        !exempt_paths.iter().any(|p| p == PLANTED),
+        "a VPN-named file in a user folder must not be exempt by name: {exempt_paths:?}",
     );
+    assert_eq!(
+        crate::vpn_client_trust::global_pending_vpn_clients().for_sid("S-1-5-21-K5A"),
+        vec![PLANTED.to_string()],
+        "the planted one is listed for the user to confirm",
+    );
+
+    // The user's word is the way in: confirmed as the link provider, the
+    // same file is exempt wherever it sits, and leaves the pending list.
+    let mut confirmed = snap_full("Wi-Fi", "TAP");
+    confirmed.link_provider_exe_paths = vec![PLANTED.to_string()];
+    source.set("S-1-5-21-K5A", confirmed);
+    drop(filters);
+    orch.install_for_sid("S-1-5-21-K5A").unwrap();
+    let filters = api.wfp_filters.lock().unwrap();
     assert!(
-        !exempt_paths.iter().any(|p| p.contains("updater.exe")),
-        "an ordinary app's install tree is not a tunnel client's: {exempt_paths:?}",
+        filters.iter().any(|f| f.action == WfpAction::Permit
+            && f.weight >= 0x0060_0000
+            && f.app_pattern.as_deref() == Some(PLANTED)),
+        "a confirmed client is exempt whatever its folder",
     );
+    assert!(crate::vpn_client_trust::global_pending_vpn_clients()
+        .for_sid("S-1-5-21-K5A")
+        .is_empty());
+}
+
+/// An address a rule names belongs to that rule, whatever program dials it. A
+/// program routed to the MAIN link used to sit in the exemption band above
+/// every block, so while the tunnel was down it reached the tunnel's own
+/// rule hosts over the main link. Now its pass-through is its rule permit,
+/// below the block lane: the catch-all lets it out, the pins do not.
+#[test]
+fn a_main_link_app_cannot_reach_a_tunnel_host_while_the_tunnel_is_down() {
+    use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
+    const MAIL: &str = r"C:\Program Files\mail\mail.exe";
+    let tunnel_host = Ipv4Addr::new(203, 0, 113, 9);
+    for mode_b in [false, true] {
+        let api = Arc::new(MockWindowsApi::new());
+        let session =
+            Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+        let source = Arc::new(ScriptedSource::default());
+        let rules = Arc::new(ScriptedRules::default());
+        let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
+        let audit = Arc::new(CollectAudit::default());
+        // In a protected folder on purpose: place is not what decides here,
+        // the name matches no VPN pattern and the user confirmed nothing.
+        let resolver = nrr_platform_api::MockAppPathResolver::new()
+            .with("mail.exe", vec![std::path::PathBuf::from(MAIL)])
+            .with_protected_root(r"C:\Program Files");
+        let orch = Arc::new(
+            PerSidApplyOrchestrator::new(
+                session,
+                Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+                Arc::clone(&rules) as Arc<dyn RulesProvider>,
+                cache,
+                Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
+            )
+            .with_app_resolver(Arc::new(resolver))
+            .with_kill_switch_resolver(Arc::new(|_, _| None)), // tunnel down
+        );
+        let mut book = rules_with_one_app("mail.exe").rule_book;
+        book.secondary = CanonicalRuleSet::from_rules(vec![primary_ip_rule("r-sec", tunnel_host)]);
+        rules.set(ActiveRulesSnapshot { rule_book: book });
+        let snap = if mode_b {
+            snap_block_mode_b("Wi-Fi", "TAP")
+        } else {
+            let mut s = snap_block("Wi-Fi", "TAP");
+            s.mode_a_coverage_strategy = ModeACoverageStrategy::FailClosedUnknown;
+            s
+        };
+        source.set("S-1-5-21-A", snap);
+
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        let filters = api.wfp_filters.lock().unwrap();
+        let app_permit = filters
+            .iter()
+            .filter(|f| f.action == WfpAction::Permit && f.app_pattern.as_deref() == Some(MAIL))
+            .max_by_key(|f| f.weight)
+            .unwrap_or_else(|| panic!("mode_b={mode_b}: the app's own rule permit exists"));
+        assert!(
+            app_permit.weight < 0x0030_0000,
+            "mode_b={mode_b}: a main-link app is not a tunnel client and gets no exemption ({:#x})",
+            app_permit.weight
+        );
+        let host_block = filters
+            .iter()
+            .filter(|f| {
+                f.layer == WfpLayerKey::AleAuthConnectV4
+                    && f.action == WfpAction::Block
+                    && f.covers_v4(tunnel_host)
+            })
+            .max_by_key(|f| f.weight)
+            .unwrap_or_else(|| {
+                panic!("mode_b={mode_b}: the tunnel's host is pinned by name under the block-all")
+            });
+        assert!(
+            host_block.weight > app_permit.weight,
+            "mode_b={mode_b}: the pin must outrank the app's permit, or the app reaches the host over the main link",
+        );
+    }
+}
+
+/// The same for a NETWORK the tunnel's rules name: the blanket block sits
+/// below the main-link rule band, so only a hold above it keeps a main-link
+/// program off the tunnel's subnet while the tunnel is down.
+#[test]
+fn a_main_link_app_cannot_reach_a_tunnel_subnet_while_the_tunnel_is_down() {
+    use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
+    use nrr_shared::ip_block::IpBlock;
+    const MAIL: &str = r"C:\Program Files\mail\mail.exe";
+    let subnet = (Ipv4Addr::new(198, 51, 100, 0), 24u8);
+    for mode_b in [false, true] {
+        let api = Arc::new(MockWindowsApi::new());
+        let session =
+            Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+        let source = Arc::new(ScriptedSource::default());
+        let rules = Arc::new(ScriptedRules::default());
+        let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
+        let audit = Arc::new(CollectAudit::default());
+        let resolver = nrr_platform_api::MockAppPathResolver::new()
+            .with("mail.exe", vec![std::path::PathBuf::from(MAIL)])
+            .with_protected_root(r"C:\Program Files");
+        let orch = Arc::new(
+            PerSidApplyOrchestrator::new(
+                session,
+                Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+                Arc::clone(&rules) as Arc<dyn RulesProvider>,
+                cache,
+                Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
+            )
+            .with_app_resolver(Arc::new(resolver))
+            .with_kill_switch_resolver(Arc::new(|_, _| None)), // tunnel down
+        );
+        let mut book = rules_with_one_app("mail.exe").rule_book;
+        book.secondary = CanonicalRuleSet::from_rules(vec![CanonicalRule {
+            id: RuleId("r-net".into()),
+            enabled: true,
+            address_match: Some(CanonicalAddressMatch::Subnet(
+                IpBlock::parse("198.51.100.0/24").expect("subnet"),
+            )),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_domain::RuleAction::Route,
+            origin: None,
+        }]);
+        rules.set(ActiveRulesSnapshot { rule_book: book });
+        let snap = if mode_b {
+            snap_block_mode_b("Wi-Fi", "TAP")
+        } else {
+            let mut s = snap_block("Wi-Fi", "TAP");
+            s.mode_a_coverage_strategy = ModeACoverageStrategy::FailClosedUnknown;
+            s
+        };
+        source.set("S-1-5-21-A", snap);
+
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        let filters = api.wfp_filters.lock().unwrap();
+        let app_permit = filters
+            .iter()
+            .filter(|f| f.action == WfpAction::Permit && f.app_pattern.as_deref() == Some(MAIL))
+            .max_by_key(|f| f.weight)
+            .unwrap_or_else(|| panic!("mode_b={mode_b}: the app's own rule permit exists"));
+        let hold = filters
+            .iter()
+            .filter(|f| {
+                f.layer == WfpLayerKey::AleAuthConnectV4
+                    && f.action == WfpAction::Block
+                    && f.remote_subnet == Some(subnet)
+            })
+            .max_by_key(|f| f.weight)
+            .unwrap_or_else(|| {
+                panic!("mode_b={mode_b}: the tunnel's subnet is held under the block-all")
+            });
+        assert!(
+            hold.weight > app_permit.weight,
+            "mode_b={mode_b}: the hold must outrank the app's permit, or the app reaches the subnet over the main link",
+        );
+    }
 }
 
 #[test]
@@ -1067,10 +1231,7 @@ fn filters_for(
     )
     .with_app_resolver(Arc::new(resolver))
     .with_kill_switch_resolver(Arc::new(move |_, _| Some(resolution.clone())));
-    rules.set(ActiveRulesSnapshot {
-        rule_book: book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
-    });
+    rules.set(ActiveRulesSnapshot { rule_book: book });
     source.set("S-1-5-21-A", snap);
     match orch
         .compute_filters_for_sid("S-1-5-21-A", false, None, ComputeIntent::Apply)

@@ -436,7 +436,7 @@ maintainer_prelude() {
   local var value
   for var in NRR_PRODUCT_NAME NRR_PRODUCT_NAME_UNIX NRR_UNIT_NAME NRR_SERVICE_INSTALL_DIR \
     NRR_STAGED_SERVICE_BINARY NRR_UNIT_FILE NRR_LOGROTATE_CONFIG NRR_POLKIT_POLICY \
-    NRR_STATE_DIR NRR_AUDIT_DIR NRR_LOG_DIR NRR_RUNTIME_DIR; do
+    NRR_STATE_DIR NRR_AUDIT_DIR NRR_LOG_DIR NRR_RUNTIME_DIR NRR_NFT_FAMILY NRR_NFT_TABLE; do
     value="${!var}"
     case "$value" in
       ''|*\'*) die "$var is empty or holds a quote" ;;

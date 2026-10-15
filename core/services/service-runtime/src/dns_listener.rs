@@ -12,13 +12,17 @@
 //! Blocking + thread-based (no tokio) to match the service supervisor's task
 //! model. Binding the socket is neutral (std UDP); *pointing the OS at* this
 //! listener is a separate, per-OS concern behind `SystemDnsRedirectPort`.
-//! TCP fallback for truncated (`TC=1`) answers is a known gap — classic UDP
-//! DNS fits the vast majority of rule-host `A` answers, and the passive
-//! observer remains a backstop.
+//! DNS over TCP is served on the same address through the same answer path,
+//! so a truncated (`TC=1`) answer the OS retries over TCP comes back whole.
+//!
+//! Every byte read here is shaped by another party — a local process or an
+//! upstream — so each stage is bounded (queue, per-source share, connection
+//! count, frame size, time), and a failure in one query, a panic included,
+//! costs that query alone.
 
-use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -49,9 +53,103 @@ pub const RESPONSE_TTL_SECS: u32 = 60;
 const SERVE_WORKER_THREADS: usize = 8;
 
 /// Bounded hand-off queue between the receive loop and the workers. On
-/// overflow the loop handles the datagram inline (backpressure, old serial
-/// behaviour) rather than dropping it.
-const SERVE_QUEUE_DEPTH: usize = 128;
+/// overflow the datagram is answered SERVFAIL at once: backpressure into the
+/// receive loop turned one program's flood into everybody's lost queries.
+const SERVE_QUEUE_DEPTH: usize = 512;
+
+/// Steady share of the listener one source (one socket, by address and port)
+/// may take, and how far it may burst past it. Beyond that its queries are
+/// failed on the spot, so the queue stays open to everyone else. On Windows
+/// the DNS Client service is the one source for every program, so this is
+/// also the machine-wide ceiling there; a page load stays well inside the burst.
+const SOURCE_RATE_PER_SEC: f64 = 200.0;
+const SOURCE_BURST: f64 = 400.0;
+/// Sources remembered at once; a source quiet for a second is forgotten.
+const SOURCE_TABLE_CAP: usize = 1024;
+const SOURCE_IDLE: Duration = Duration::from_secs(1);
+
+/// DNS over TCP: how many connections are served at once, what one may send,
+/// and how long it may hold a thread. Every one of these is set by the peer.
+const TCP_MAX_CONNECTIONS: usize = 16;
+const TCP_MAX_QUERY_BYTES: usize = 4096;
+const TCP_MAX_QUERIES_PER_CONNECTION: usize = 8;
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const TCP_CONNECTION_LIFETIME: Duration = Duration::from_secs(10);
+const TCP_ACCEPT_POLL: Duration = Duration::from_millis(50);
+
+/// Which transport a query arrived on; the forward to the upstream uses the
+/// same one, so a TCP client's answer is never cut to datagram size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transport {
+    Udp,
+    Tcp,
+}
+
+/// Token buckets per source, owned by the receive thread: one map lookup and
+/// a subtraction per datagram.
+#[derive(Default)]
+struct SourceLimiter {
+    buckets: HashMap<SocketAddr, (f64, Instant)>,
+}
+
+impl SourceLimiter {
+    fn admit(&mut self, src: SocketAddr, now: Instant) -> bool {
+        if self.buckets.len() >= SOURCE_TABLE_CAP && !self.buckets.contains_key(&src) {
+            self.buckets
+                .retain(|_, (_, seen)| now.duration_since(*seen) < SOURCE_IDLE);
+            if self.buckets.len() >= SOURCE_TABLE_CAP {
+                // A flood from thousands of sockets has filled the table; the
+                // queue bound still holds, and a newcomer is not refused for it.
+                return true;
+            }
+        }
+        let (tokens, seen) = self.buckets.entry(src).or_insert((SOURCE_BURST, now));
+        let refill = now.duration_since(*seen).as_secs_f64() * SOURCE_RATE_PER_SEC;
+        *tokens = (*tokens + refill).min(SOURCE_BURST);
+        *seen = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShedReason {
+    QueueFull,
+    SourceShare,
+}
+
+/// Counts shed datagrams and says so once per interval: the shedding itself
+/// is per datagram, the line about it must not be.
+#[derive(Default)]
+struct ShedLog {
+    shed: u64,
+    last_log: Option<Instant>,
+}
+
+impl ShedLog {
+    fn note(&mut self, reason: ShedReason, src: SocketAddr) {
+        self.shed += 1;
+        if self
+            .last_log
+            .is_some_and(|at| at.elapsed() < RECV_NOISE_LOG_INTERVAL)
+        {
+            return;
+        }
+        self.last_log = Some(Instant::now());
+        tracing::warn!(
+            target: "nrr::dns-resolver",
+            msg_key = "dns-listener-query-shed",
+            reason = ?reason,
+            source = %src,
+            shed = self.shed,
+            "Mode B: a DNS query was failed at once instead of queued — the listener is saturated or one source is past its share",
+        );
+    }
+}
 
 /// Everything one client datagram may cost, end to end. The per-stage timeouts
 /// (rule-host resolve, second opinion, fail-open forward, rotation retry,
@@ -243,18 +341,19 @@ pub struct DnsInterceptListener {
     deadline: Duration,
     forward_timeout: Duration,
     response_ttl: u32,
+    /// When a handler panic was last reported; see [`Self::note_handler_panic`].
+    last_panic_log: Mutex<Option<Instant>>,
+    /// DNS-over-TCP connections being served right now.
+    tcp_active: AtomicUsize,
 }
 
-/// Receive buffer for both directions of the DNS path.
-///
-/// 1500 was the old value, chosen for an Ethernet frame - but EDNS lets a
-/// client advertise 4096, and this listener forwards the query verbatim, OPT
-/// record included, so the answer can legitimately be that big. Undersized, the
-/// two failure modes are worse than a truncated packet: on Windows the receive
-/// fails with "message too long" instead of truncating, and on the upstream
-/// path a healthy server got a `note_failure` for an answer we could not hold -
-/// three of those rotate it away.
-const DNS_DATAGRAM_BUFFER_BYTES: usize = 4096;
+/// Receive buffer for both directions of the DNS path: the largest UDP payload
+/// there is, so no datagram is ever cut. Undersized, the two failure modes were
+/// worse than a truncated packet: on Windows the receive fails with "message
+/// too long" and a healthy upstream collected a failure for an answer we could
+/// not hold (three of those rotated it away); on Linux the answer was relayed
+/// cut short without the TC bit. Stack-only; the copy is the bytes received.
+const DNS_DATAGRAM_BUFFER_BYTES: usize = 65_535;
 
 /// How many consecutive receive errors of a kind we do not recognise are
 /// tolerated before the serve loop gives up.
@@ -350,7 +449,15 @@ impl DnsInterceptListener {
             deadline,
             forward_timeout,
             response_ttl: RESPONSE_TTL_SECS,
+            last_panic_log: Mutex::new(None),
+            tcp_active: AtomicUsize::new(0),
         }
+    }
+
+    /// The pool the forward path reads; the resolver service watches it for
+    /// "nothing answers".
+    pub(crate) fn upstream_pool(&self) -> &Arc<crate::dns_upstream::UpstreamDnsPool> {
+        &self.upstream_dns
     }
 
     /// Forward through a self-healing pool instead of the fixed address passed
@@ -788,6 +895,10 @@ impl DnsInterceptListener {
             // over the very addresses the guard is holding back.
             AaaaOutcome::Withheld => build_error_response(query, RCODE_SERVFAIL)
                 .map_or(ListenerAction::Drop, ListenerAction::Respond),
+            AaaaOutcome::Upstream(ResolveError::Unavailable(_)) if self.leak_guard.blocking() => {
+                build_error_response(query, RCODE_SERVFAIL)
+                    .map_or(ListenerAction::Drop, ListenerAction::Respond)
+            }
             AaaaOutcome::Upstream(ResolveError::Unavailable(_)) => ListenerAction::Forward,
         }
     }
@@ -880,6 +991,13 @@ impl DnsInterceptListener {
             QueryOutcome::Upstream(ResolveError::NoRecords) => {
                 negative_answer(query).map_or(ListenerAction::Forward, ListenerAction::Respond)
             }
+            // The guard is blocking: a raw forward would carry this rule host's
+            // name over the main link, the very thing it holds back.
+            QueryOutcome::Upstream(ResolveError::Unavailable(_)) if self.leak_guard.blocking() => {
+                self.unresolved.note_unresolved(&q.qname);
+                build_error_response(query, RCODE_SERVFAIL)
+                    .map_or(ListenerAction::Drop, ListenerAction::Respond)
+            }
             // Our resolver could not reach upstream — fail open by forwarding the
             // raw query (the OS's configured server may still answer). No
             // enforcement installed this round, but general DNS keeps working.
@@ -896,19 +1014,44 @@ impl DnsInterceptListener {
     }
 
     /// Blocking serve loop over `socket`. Returns when `stop` is set. Datagrams
-    /// are handed to a small worker pool; a per-datagram failure is logged and
-    /// skipped — the loop never dies on one bad packet or a slow upstream.
-    ///
-    /// The loop itself does no per-datagram work: handling a datagram inline
-    /// would serialize the WHOLE system's DNS behind one slow answer, since
-    /// under the armed block-all every new direct host holds the pipeline for
-    /// the full direct-answer-gate budget — a page touching twenty new hosts
-    /// would stall name resolution for everything for seconds. Workers instead
-    /// carry the slow parts (upstream forward, bounded reconcile, gate)
-    /// concurrently; the loop only receives and dispatches. When the hand-off
-    /// queue is full the datagram is handled inline — backpressure degrades to
-    /// serial handling instead of dropping queries.
+    /// are handed to a worker pool; a per-datagram failure — a panic included —
+    /// costs that datagram and nothing else.
     pub fn serve_udp(&self, socket: &UdpSocket, stop: &AtomicBool) -> std::io::Result<()> {
+        self.serve_observed(socket, None, stop, &|| {}, &|| {})
+    }
+
+    /// [`Self::serve_udp`] calling `beat` once per receive, timeout included,
+    /// so a watcher can tell a stuck loop from an idle one.
+    pub fn serve_udp_observed(
+        &self,
+        socket: &UdpSocket,
+        stop: &AtomicBool,
+        beat: &dyn Fn(),
+    ) -> std::io::Result<()> {
+        self.serve_observed(socket, None, stop, beat, &|| {})
+    }
+
+    /// The full serve loop: UDP on `socket`, DNS over TCP on `tcp` when given
+    /// (the OS retries a truncated answer there), `beat` once per receive, and
+    /// `on_stop` the moment the receive loop ends — BEFORE the workers are
+    /// joined, so whatever must happen at stop (restoring the system's DNS)
+    /// does not wait for queued datagrams.
+    ///
+    /// The loop itself does no per-datagram work beyond admission: handling a
+    /// datagram inline serialized the whole machine's DNS behind one slow
+    /// answer, and even a wait for a rule-host slot there was a wait for every
+    /// client at once. A datagram the pool cannot take right now, or one past
+    /// its source's share, is answered SERVFAIL on the spot: the client re-asks
+    /// in a moment, and the kernel's receive buffer never fills up with
+    /// everybody else's queries behind one program's flood.
+    pub fn serve_observed(
+        &self,
+        socket: &UdpSocket,
+        tcp: Option<&TcpListener>,
+        stop: &AtomicBool,
+        beat: &dyn Fn(),
+        on_stop: &dyn Fn(),
+    ) -> std::io::Result<()> {
         // A read timeout lets the loop observe `stop` promptly instead of
         // blocking forever in `recv_from`.
         socket.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -925,18 +1068,28 @@ impl DnsInterceptListener {
                         guard.recv()
                     };
                     match msg {
-                        Ok((query, src)) => {
-                            self.handle_datagram(socket, &query, src, RULE_HOST_LANE_WAIT)
-                        }
+                        // Stopping: the system's DNS is restored already and
+                        // nobody is waiting on us; the queue is thrown away.
+                        Ok(_) if stop.load(Ordering::Relaxed) => continue,
+                        Ok((query, src)) => self.handle_datagram_contained(socket, &query, src),
                         // Sender dropped — the serve loop exited; drain is done.
                         Err(_) => return,
                     }
                 });
             }
+            if let Some(tcp) = tcp {
+                scope.spawn(move || self.accept_tcp(tcp, stop, scope));
+            }
             let mut buf = [0u8; DNS_DATAGRAM_BUFFER_BYTES];
             let mut consecutive_errors = 0u32;
             let mut last_noise_log: Option<Instant> = None;
-            while !stop.load(Ordering::Relaxed) {
+            let mut sources = SourceLimiter::default();
+            let mut shed = ShedLog::default();
+            let result = loop {
+                if stop.load(Ordering::Relaxed) {
+                    break Ok(());
+                }
+                beat();
                 let (n, src) = match socket.recv_from(&mut buf) {
                     Ok(v) => v,
                     Err(e) => match classify_recv_error(&e) {
@@ -960,7 +1113,7 @@ impl DnsInterceptListener {
                         RecvErrorClass::Unrecognised => {
                             consecutive_errors += 1;
                             if consecutive_errors >= DNS_RECV_ERROR_TOLERANCE {
-                                return Err(e);
+                                break Err(e);
                             }
                             tracing::warn!(
                                 target: "nrr::dns_resolver",
@@ -974,28 +1127,131 @@ impl DnsInterceptListener {
                     },
                 };
                 consecutive_errors = 0;
+                if !sources.admit(src, Instant::now()) {
+                    shed.note(ShedReason::SourceShare, src);
+                    self.answer_servfail(socket, &buf[..n], src);
+                    continue;
+                }
                 match tx.try_send((buf[..n].to_vec(), src)) {
                     Ok(()) => {}
                     Err(TrySendError::Full((query, src))) => {
-                        // Inline, so no waiting for a rule-host slot: this is
-                        // the thread that receives, and a wait here is a wait
-                        // for every client at once.
-                        self.handle_datagram(socket, &query, src, Duration::ZERO);
+                        shed.note(ShedReason::QueueFull, src);
+                        self.answer_servfail(socket, &query, src);
                     }
                     // Unreachable while workers live inside this scope; treat
                     // as shutdown just in case.
-                    Err(TrySendError::Disconnected(_)) => break,
+                    Err(TrySendError::Disconnected(_)) => break Ok(()),
                 }
-            }
+            };
+            on_stop();
             drop(tx); // disconnect → workers drain the queue and exit
-            Ok(())
+            result
         })
     }
 
+    /// One datagram, with its failure contained: a panic in the handler costs
+    /// this query a SERVFAIL and the worker nothing.
+    fn handle_datagram_contained(&self, socket: &UdpSocket, query: &[u8], src: SocketAddr) {
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.handle_datagram(socket, query, src, RULE_HOST_LANE_WAIT)
+        }));
+        if handled.is_err() {
+            self.note_handler_panic(query.len());
+            self.answer_servfail(socket, query, src);
+        }
+    }
+
+    /// Said at most once per interval: any local process can make it happen.
+    fn note_handler_panic(&self, bytes: usize) {
+        let mut last = self
+            .last_panic_log
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if last.is_some_and(|at| at.elapsed() < RECV_NOISE_LOG_INTERVAL) {
+            return;
+        }
+        *last = Some(Instant::now());
+        tracing::error!(
+            target: "nrr::dns-resolver",
+            msg_key = "dns-listener-handler-panicked",
+            bytes,
+            "Mode B: handling one DNS query panicked — the query was failed and the listener goes on serving",
+        );
+    }
+
+    /// Accept DNS-over-TCP connections until `stop`. Each connection is one
+    /// scoped thread, at most [`TCP_MAX_CONNECTIONS`] at a time; anything past
+    /// that is closed unread. Polling with a short sleep keeps `stop` honoured:
+    /// `accept` has no timeout of its own.
+    fn accept_tcp<'scope, 'env: 'scope>(
+        &'scope self,
+        tcp: &'scope TcpListener,
+        stop: &'scope AtomicBool,
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+    ) {
+        if tcp.set_nonblocking(true).is_err() {
+            return;
+        }
+        let active = &self.tcp_active;
+        while !stop.load(Ordering::Relaxed) {
+            let stream = match tcp.accept() {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    // Nothing pending, or one bad accept: neither ends serving.
+                    std::thread::sleep(TCP_ACCEPT_POLL);
+                    continue;
+                }
+            };
+            if active.fetch_add(1, Ordering::AcqRel) >= TCP_MAX_CONNECTIONS {
+                active.fetch_sub(1, Ordering::AcqRel);
+                drop(stream);
+                continue;
+            }
+            scope.spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.serve_tcp_connection(stream, stop);
+                }));
+                active.fetch_sub(1, Ordering::AcqRel);
+            });
+        }
+    }
+
+    /// One client connection: a few framed queries, each answered through the
+    /// same path as a datagram, with the upstream asked over TCP so a large
+    /// answer comes back whole. Bounded in idle time, lifetime, query size and
+    /// query count; the peer shapes every byte read here.
+    fn serve_tcp_connection(&self, mut stream: TcpStream, stop: &AtomicBool) {
+        use crate::dns_wire::{read_tcp_message, write_tcp_message};
+        if stream.set_nonblocking(false).is_err() {
+            return;
+        }
+        let _ = stream.set_nodelay(true);
+        let opened = Instant::now();
+        let mut stream =
+            DeadlineStream::new(&mut stream, TCP_CONNECTION_LIFETIME, TCP_IDLE_TIMEOUT);
+        for _ in 0..TCP_MAX_QUERIES_PER_CONNECTION {
+            if stop.load(Ordering::Relaxed) || opened.elapsed() >= TCP_CONNECTION_LIFETIME {
+                return;
+            }
+            let Ok(Some(query)) = read_tcp_message(&mut stream, TCP_MAX_QUERY_BYTES) else {
+                return;
+            };
+            let reply = self
+                .answer_bytes(&query, Transport::Tcp)
+                .or_else(|| build_error_response(&query, RCODE_SERVFAIL));
+            let Some(reply) = reply else {
+                return;
+            };
+            if write_tcp_message(&mut stream, &reply).is_err() {
+                return;
+            }
+        }
+    }
+
     /// Fully process one query datagram and send its response (if any) back to
-    /// `src` over the shared listener socket. Runs on a pool worker (or inline
-    /// under backpressure) — everything here may block for its own bounded
-    /// budgets without stalling other queries.
+    /// `src` over the shared listener socket. Runs on a pool worker —
+    /// everything here may block for its own bounded budgets without stalling
+    /// other queries.
     fn handle_datagram(
         &self,
         socket: &UdpSocket,
@@ -1003,6 +1259,23 @@ impl DnsInterceptListener {
         src: SocketAddr,
         lane_wait: Duration,
     ) {
+        if let Some(reply) = self.answer_bytes_within(query, Transport::Udp, lane_wait) {
+            let _ = socket.send_to(&reply, src);
+        }
+    }
+
+    /// The bytes one query is answered with, whatever transport it came on.
+    /// `None` only where silence is the deliberate answer.
+    fn answer_bytes(&self, query: &[u8], transport: Transport) -> Option<Vec<u8>> {
+        self.answer_bytes_within(query, transport, RULE_HOST_LANE_WAIT)
+    }
+
+    fn answer_bytes_within(
+        &self,
+        query: &[u8],
+        transport: Transport,
+        lane_wait: Duration,
+    ) -> Option<Vec<u8>> {
         let started = Instant::now();
         let left = || QUERY_BUDGET.saturating_sub(started.elapsed());
         // Parsed once: the direct path below reads the question at every step.
@@ -1012,33 +1285,23 @@ impl DnsInterceptListener {
             None => ListenerAction::Forward, // unparseable → transparent proxy
         };
         match action {
-            ListenerAction::Respond(resp) => {
-                let _ = socket.send_to(&resp, src);
-            }
-            ListenerAction::Forward => {
-                match self.forward_within(query, left()) {
-                    Some(resp) => {
-                        let _ = socket.send_to(&resp, src);
-                    }
-                    // Silence costs the client its own timeout on top of ours.
-                    None => {
-                        self.answer_servfail(socket, query, src);
-                        self.note_failed_rule_host_forward(question.as_ref());
-                    }
+            ListenerAction::Respond(resp) => Some(resp),
+            ListenerAction::Forward => match self.forward_within(query, left(), transport) {
+                Some(resp) => Some(resp),
+                // Silence costs the client its own timeout on top of ours.
+                None => {
+                    self.note_failed_rule_host_forward(question.as_ref());
+                    build_error_response(query, RCODE_SERVFAIL)
                 }
-            }
-            ListenerAction::Drop => {}
+            },
+            ListenerAction::Drop => None,
             ListenerAction::ForwardFiltered => {
                 // Only a parsed question yields this action.
-                let Some(q) = question.as_ref() else {
-                    return;
+                let q = question.as_ref()?;
+                let Some(resp) = self.forward_within(query, left(), transport) else {
+                    return build_error_response(query, RCODE_SERVFAIL);
                 };
-                let Some(resp) = self.forward_within(query, left()) else {
-                    self.answer_servfail(socket, query, src);
-                    return;
-                };
-                let reply = self.answer_direct(query, q, resp, left());
-                let _ = socket.send_to(&reply, src);
+                Some(self.answer_direct(query, q, resp, left()))
             }
         }
     }
@@ -1152,7 +1415,7 @@ impl DnsInterceptListener {
             return (reply, false);
         }
         // Whole answer pinned — try ONE fresh upstream answer (pools rotate).
-        if let Some(retry) = self.forward_within(query, budget) {
+        if let Some(retry) = self.forward_within(query, budget, Transport::Udp) {
             if let AddressResponseOutcome::Answers { addresses, .. } =
                 parse_address_response(id, &q.qname, QTYPE_A, &retry)
             {
@@ -1314,14 +1577,23 @@ impl DnsInterceptListener {
     /// Forward within what is left of this datagram's budget. The rotation
     /// retry only runs if the budget can still pay for it — an answer nobody is
     /// waiting for is worth less than the client's own retry.
-    fn forward_within(&self, query: &[u8], budget: Duration) -> Option<Vec<u8>> {
+    fn forward_within(
+        &self,
+        query: &[u8],
+        budget: Duration,
+        transport: Transport,
+    ) -> Option<Vec<u8>> {
         let started = Instant::now();
         let left = || budget.saturating_sub(started.elapsed());
         if left().is_zero() {
             return None;
         }
         let upstream = self.upstream_dns.current()?;
-        if let Some(reply) = self.forward_to(query, upstream, self.forward_timeout.min(left())) {
+        let forward = |target: SocketAddr, window: Duration| match transport {
+            Transport::Udp => self.forward_to(query, target, window),
+            Transport::Tcp => self.forward_tcp_to(query, target, window),
+        };
+        if let Some(reply) = forward(upstream, self.forward_timeout.min(left())) {
             self.upstream_dns.note_success();
             // "No such name" from ONE server is not "no such name". The
             // machine may hold a resolver for a namespace the public
@@ -1366,7 +1638,7 @@ impl DnsInterceptListener {
         if window.is_zero() {
             return None;
         }
-        let reply = self.forward_to(query, replacement, window)?;
+        let reply = forward(replacement, window)?;
         self.upstream_dns.note_success();
         Some(reply)
     }
@@ -1459,7 +1731,7 @@ impl DnsInterceptListener {
     /// client's stub resolver, so an accepted forgery poisons the OS cache and,
     /// through it, the rule host cache that routes and pins are derived from.
     fn forward_to(&self, query: &[u8], upstream: SocketAddr, window: Duration) -> Option<Vec<u8>> {
-        let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        let sock = UdpSocket::bind(unspecified_for(upstream)).ok()?;
         nrr_platform_api::own_traffic::mark_own_socket(&sock);
         sock.set_read_timeout(Some(window)).ok()?;
         sock.connect(upstream).ok()?;
@@ -1481,6 +1753,81 @@ impl DnsInterceptListener {
             // else's answer.
         }
     }
+
+    /// The same exchange over TCP: one connection, one framed query, one framed
+    /// reply, all inside `window`. The reply is bounded by the frame and still
+    /// checked against the query — a stream is no more trusted than a datagram.
+    fn forward_tcp_to(
+        &self,
+        query: &[u8],
+        upstream: SocketAddr,
+        window: Duration,
+    ) -> Option<Vec<u8>> {
+        use crate::dns_wire::{read_tcp_message, write_tcp_message, DNS_TCP_MAX_MESSAGE};
+        let started = Instant::now();
+        let mut stream = TcpStream::connect_timeout(&upstream, window).ok()?;
+        nrr_platform_api::own_traffic::mark_own_socket(&stream);
+        let left = window.saturating_sub(started.elapsed());
+        let mut stream = DeadlineStream::new(&mut stream, left, left);
+        write_tcp_message(&mut stream, query).ok()?;
+        let reply = read_tcp_message(&mut stream, DNS_TCP_MAX_MESSAGE).ok()??;
+        reply_answers_query(query, &reply).then_some(reply)
+    }
+}
+
+/// A stream whose every read and write ends by one deadline, however the peer
+/// paces it. A timeout set once bounds each call, not the exchange: a peer
+/// sending one byte per timeout held a thread for hours.
+struct DeadlineStream<'a> {
+    stream: &'a mut TcpStream,
+    deadline: Instant,
+    idle: Duration,
+}
+
+impl<'a> DeadlineStream<'a> {
+    fn new(stream: &'a mut TcpStream, within: Duration, idle: Duration) -> Self {
+        Self {
+            stream,
+            deadline: Instant::now() + within,
+            idle,
+        }
+    }
+
+    /// What is left before the deadline, capped by the idle bound.
+    fn window(&self) -> std::io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        Ok(left.min(self.idle))
+    }
+}
+
+impl std::io::Read for DeadlineStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.window()?))?;
+        std::io::Read::read(self.stream, buf)
+    }
+}
+
+impl std::io::Write for DeadlineStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.window()?))?;
+        std::io::Write::write(self.stream, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(self.stream)
+    }
+}
+
+/// The wildcard address of `target`'s family, so a v6 upstream is reached
+/// from a v6 socket.
+fn unspecified_for(target: SocketAddr) -> SocketAddr {
+    match target {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    }
 }
 
 /// Whether `reply` is an answer to `query`: same transaction id, the response
@@ -1489,7 +1836,7 @@ impl DnsInterceptListener {
 /// Matching on the id alone is not enough — the id is 16 bits and, on this
 /// path, sequential.
 fn reply_answers_query(query: &[u8], reply: &[u8]) -> bool {
-    use crate::dns_wire::parse_question;
+    use crate::dns_wire::question_key;
     if reply.len() < 12 || query.len() < 12 {
         return false;
     }
@@ -1500,12 +1847,20 @@ fn reply_answers_query(query: &[u8], reply: &[u8]) -> bool {
     if reply[2] & 0x80 == 0 {
         return false;
     }
-    match (parse_question(query), parse_question(reply)) {
-        (Some(q), Some(r)) => q.qtype == r.qtype && q.qname.eq_ignore_ascii_case(&r.qname),
-        // A server may answer a malformed or empty-question query (FORMERR)
-        // with no question section; the id plus the connected socket is all
-        // there is to go on there.
-        (None, _) | (_, None) => true,
+    // Compared as raw labels, pointers followed: a question the product would
+    // not learn from (an SRV name, say) still has to be echoed, and a server
+    // that compresses the echoed name is not thereby excused from echoing it.
+    match (question_key(query), question_key(reply)) {
+        (Some(q), Some(r)) => q == r,
+        // A server answers a query it could not read (FORMERR) with no
+        // question section, and only then; anything else without one is
+        // somebody else's answer.
+        (Some(_), None) => {
+            u16::from_be_bytes([reply[4], reply[5]]) == 0 && (reply[3] & 0x0F) != RCODE_NOERROR
+        }
+        // Our own query has no readable question: there is nothing to match
+        // beyond the id and the connected socket.
+        (None, _) => true,
     }
 }
 

@@ -47,14 +47,34 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\service-paths.ps1')
 
 $root = Split-Path -Parent $PSScriptRoot
-# Must match `dns_redirect.rs::NRPT_MARKER`, `NRPT_RULE_KEY` and
-# `route_codegen.rs::SECONDARY_ROUTE_METRIC` — emergency mode reproduces the
-# binary's own sweeps, and a drifted constant here would either miss our state
-# or delete somebody else's.
-$nrptMarker = 'NetRuleRouter-ModeB-DnsRedirect'
-$nrptRuleKey = '{5E0C2A17-8B3D-4F61-9C4A-2D7E6F1B0A93}'
-$nrptTable = 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig'
-$routeMetric = 5
+# Must match `route_codegen.rs::is_owned_route` — emergency mode reproduces the
+# binary's own sweep, and a drifted constant here would either miss our routes
+# or delete somebody else's. The NRPT constants live in lib\service-paths.ps1
+# beside the sweep that uses them.
+$routeMetric = 5          # SECONDARY_ROUTE_METRIC: host routes and overlay halves
+$networkRouteMetric = 4   # NETWORK_ROUTE_METRIC: a network rule's routes
+$overlayMaxPrefix = 13    # TUNNEL_CATCH_ALL_MAX_PREFIX + 1
+$networkMinPrefixV4 = 8   # widest_rule_prefix(v4)
+$networkMinPrefixV6 = 16  # widest_rule_prefix(v6)
+
+function Test-NrrOwnedRoute($route) {
+    $parts = $route.DestinationPrefix -split '/'
+    if ($parts.Count -ne 2) { return $false }
+    $length = 0
+    if (-not [int]::TryParse($parts[1], [ref]$length)) { return $false }
+    $v6 = $parts[0].Contains(':')
+    switch ($route.RouteMetric) {
+        $routeMetric {
+            if ($v6) { return $length -eq 128 }
+            return $length -eq 32 -or ($length -ge 1 -and $length -le $overlayMaxPrefix)
+        }
+        $networkRouteMetric {
+            if ($v6) { return $length -ge $networkMinPrefixV6 -and $length -le 128 }
+            return $length -ge $networkMinPrefixV4 -and $length -le 32
+        }
+    }
+    return $false
+}
 
 $targetRoot = Resolve-TargetRoot $root
 
@@ -96,8 +116,14 @@ else {
 
 $cleanupOk = $false
 if ($exePath) {
-    Write-Host "==> $exePath cleanup" -ForegroundColor Cyan
-    $code = Invoke-NativeCommand -FilePath $exePath -ArgumentList @('cleanup')
+    # Stops a service the `sc stop` above did not, ending it if it hangs; a
+    # binary that predates the verb answers 2 and gets the plain `cleanup`.
+    Write-Host "==> $exePath stop-and-cleanup" -ForegroundColor Cyan
+    $code = Invoke-NativeCommand -FilePath $exePath -ArgumentList @('stop-and-cleanup')
+    if ($code -eq 2) {
+        Write-Host "==> $exePath cleanup" -ForegroundColor Cyan
+        $code = Invoke-NativeCommand -FilePath $exePath -ArgumentList @('cleanup')
+    }
     if ($code -eq 0) { $cleanupOk = $true }
     else { Write-Warning "cleanup returned $code - falling back to emergency mode." }
 }
@@ -109,55 +135,15 @@ else {
 if (-not $cleanupOk) {
     Write-Host "==> emergency mode: PowerShell only" -ForegroundColor Yellow
 
-    # Marker-scoped, so an admin's or a VPN's own NRPT rules are untouched.
-    Write-Host "--> removing our NRPT rule (Mode-B DNS redirect)" -ForegroundColor Cyan
-    try {
-        $rules = @(Get-DnsClientNrptRule -ErrorAction Stop |
-            Where-Object { $_.Comment -eq $nrptMarker })
-        foreach ($rule in $rules) {
-            Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop
-        }
-        Write-Host "    NRPT rules removed: $($rules.Count)"
-        Clear-DnsClientCache -ErrorAction SilentlyContinue
-    }
-    catch {
-        Write-Warning "NRPT sweep failed: $($_.Exception.Message)"
-    }
+    # The same marker-scoped sweep the uninstaller falls back to
+    # (lib\service-paths.ps1), so the two cannot drift apart.
+    $null = Remove-NrrDnsRedirect
 
-    # The cmdlet reads the whole table, so one half-written key (the service
-    # died between creating it and writing its values) fails it for every
-    # rule. The registry sweep is the binary's: our fixed key, any copy with
-    # our marker, and any key without `Version`, which no DNS client can use.
-    Write-Host "--> sweeping the NRPT table in the registry" -ForegroundColor Cyan
+    # Same signature the binary's offline reset adopts: host routes, overlay
+    # halves and network-rule routes, each at its own metric.
+    Write-Host "--> removing our routes (metrics $routeMetric and $networkRouteMetric)" -ForegroundColor Cyan
     try {
-        $swept = 0
-        if (Test-Path -LiteralPath $nrptTable) {
-            foreach ($key in @(Get-ChildItem -LiteralPath $nrptTable -ErrorAction Stop)) {
-                $values = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
-                $ours = $key.PSChildName -eq $nrptRuleKey -or
-                    ($values -and $values.Comment -eq $nrptMarker)
-                $halfWritten = -not ($values -and $null -ne $values.Version)
-                if ($ours -or $halfWritten) {
-                    Remove-Item -LiteralPath $key.PSPath -Recurse -Force -ErrorAction Stop
-                    $swept += 1
-                }
-            }
-        }
-        Write-Host "    NRPT keys removed: $swept"
-        Clear-DnsClientCache -ErrorAction SilentlyContinue
-    }
-    catch {
-        Write-Warning "NRPT registry sweep failed: $($_.Exception.Message)"
-    }
-
-    # Same signature the binary's offline reset adopts: our metric at /32 (the
-    # secondary host routes) or /2 (the mode-A counter-overlay halves).
-    Write-Host "--> removing our routes (metric $routeMetric at /32 and /2)" -ForegroundColor Cyan
-    try {
-        $ours = @(Get-NetRoute -ErrorAction Stop | Where-Object {
-                $_.RouteMetric -eq $routeMetric -and
-                ($_.DestinationPrefix -like '*/32' -or $_.DestinationPrefix -like '*/2')
-            })
+        $ours = @(Get-NetRoute -ErrorAction Stop | Where-Object { Test-NrrOwnedRoute $_ })
         foreach ($route in $ours) {
             Remove-NetRoute -InputObject $route -Confirm:$false -ErrorAction Stop
         }

@@ -184,6 +184,8 @@ fn sample_record(source: BindingSource) -> RoutePolicyRecord {
         // v31 DoH-lockdown columns round-trip rather than reading the default.
         doh_lockdown_enabled: true,
         doh_lockdown_scope: DohLockdownScope::Always,
+        // Non-default (default is `true`): a hand-set lockdown stays set.
+        doh_lockdown_auto: false,
         // Non-default (default is `false`) — proves the v32 auto-seed column
         // round-trips rather than reading the default.
         browser_history_auto_seed: true,
@@ -207,6 +209,8 @@ fn sample_record(source: BindingSource) -> RoutePolicyRecord {
         short_name_suffix: "corp.example".to_string(),
         // Non-default (default is `false`) — proves the v70 column round-trips.
         app_rules_take_all_addresses: true,
+        // Non-default (default is "") — proves the v73 column round-trips.
+        forwarded_outage: "unprotected".to_string(),
         binding_source: source,
     }
 }
@@ -676,6 +680,7 @@ fn row_defaults_as_wire() -> Vec<(&'static str, serde_json::Value)> {
             "doh-lockdown-scope",
             json!(row.doh_lockdown_scope.as_slug()),
         ),
+        ("doh-lockdown-auto", json!(row.doh_lockdown_auto)),
         (
             "browser-history-auto-seed",
             json!(row.browser_history_auto_seed),
@@ -713,6 +718,7 @@ fn row_defaults_as_wire() -> Vec<(&'static str, serde_json::Value)> {
             "app-rules-take-all-addresses",
             json!(row.app_rules_take_all_addresses),
         ),
+        ("forwarded-outage", json!(row.forwarded_outage)),
     ]
 }
 

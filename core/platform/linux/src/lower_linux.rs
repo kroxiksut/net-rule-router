@@ -197,9 +197,10 @@ pub fn lower_scoped(plans: &[ScopedPlan<'_>]) -> LoweredPlan {
 ///
 /// Every other plan's service-account rules are dropped: one owner speaks for
 /// the machine, and a second set would pin system traffic to two tunnels.
-/// When any is emitted, the chain opens with an accept for our own mark — the
-/// service runs as a service account, and its relay, resolver and probes must
-/// leave by the link they chose.
+/// Every non-empty chain opens with an accept for our own mark: the service
+/// runs as a service account, and its relay, resolver and probes must leave by
+/// the link they chose. root's flows never lower ([`is_root_user`]); its
+/// routes are applied like anyone's.
 pub fn lower_scoped_with(
     plans: &[ScopedPlan<'_>],
     service_accounts: &ServiceAccountScope,
@@ -215,7 +216,12 @@ pub fn lower_scoped_with(
                 .iter()
                 .enumerate()
                 .filter(move |(_, flow)| {
-                    speaks || flow.principal != PrincipalScope::ServiceAccounts
+                    (speaks
+                        || !matches!(
+                            flow.principal,
+                            PrincipalScope::ServiceAccounts | PrincipalScope::Forwarded
+                        ))
+                        && !is_root_user(flow)
                 })
                 .map(move |(flow_idx, flow)| (plan_idx, flow_idx, flow))
         })
@@ -234,13 +240,22 @@ pub fn lower_scoped_with(
     });
 
     let mut rules: Vec<NftRule> = Vec::new();
+    let mut forward: Vec<NftRule> = Vec::new();
     let mut unsupported = Vec::new();
 
-    let mut serves_system_traffic = false;
     for (plan_idx, index, flow) in indexed {
-        serves_system_traffic |= flow.principal == PrincipalScope::ServiceAccounts;
         let lowered = lower_flow(flow, plans[plan_idx].egress, &service_accounts.uids);
-        rules.extend(lowered.rules);
+        if flow.principal == PrincipalScope::Forwarded {
+            // No process to tell about a forwarded packet's drop.
+            forward.extend(lowered.rules.into_iter().map(|mut rule| {
+                if rule.verdict.is_drop() {
+                    rule.verdict = NftVerdict::Drop;
+                }
+                rule
+            }));
+        } else {
+            rules.extend(lowered.rules);
+        }
         if let Some(reason) = lowered.unsupported {
             unsupported.push(UnsupportedRule {
                 index,
@@ -250,7 +265,7 @@ pub fn lower_scoped_with(
         }
     }
     let mut rules = crate::nft_merge::fold_into_sets(prune_unreachable(rules));
-    if serves_system_traffic {
+    if !rules.is_empty() {
         rules.insert(
             0,
             NftRule {
@@ -267,14 +282,22 @@ pub fn lower_scoped_with(
             table: NRR_TABLE.to_owned(),
             chain: NRR_CHAIN.to_owned(),
             rules,
+            forward: crate::nft_merge::fold_into_sets(prune_unreachable(forward)),
         },
         unsupported,
     }
 }
 
-/// Lower one rule. An `OnlyVia` pin becomes TWO rules — accept when leaving the
-/// pinned interface, drop otherwise — which is the leak-proof shape: the drop
-/// is scoped to the same destination, so nothing else is affected.
+/// Whether `flow` is scoped to root. uid 0 is the daemon's own, sshd's and
+/// every VPN client's: a rule on it judges the daemon's DNS forwarding and each
+/// SSH reply, so root is not a person for filtering.
+fn is_root_user(flow: &FlowRule) -> bool {
+    match &flow.principal {
+        PrincipalScope::User(principal) => principal.as_unix_uid() == Some(0),
+        _ => false,
+    }
+}
+
 /// Drop the rules no packet can ever reach.
 ///
 /// Every verdict here is terminal, so an earlier rule whose conditions are a
@@ -353,7 +376,8 @@ fn lower_flow(flow: &FlowRule, egress: &EgressNames, service_uids: &[(u32, u32)]
             }
             base.push(NftMatch::SkUidSet(service_uids.to_vec()));
         }
-        PrincipalScope::Machine => {}
+        // Matched by the hook it is lowered into, not by a condition.
+        PrincipalScope::Machine | PrincipalScope::Forwarded => {}
     }
     base.extend(lower_flow_match(&flow.flow));
 
@@ -567,6 +591,19 @@ mod tests {
         }
     }
 
+    /// The rules behind the accept for our own marked traffic, which opens
+    /// every non-empty chain.
+    fn policy_rules(lowered: &LoweredPlan) -> &[NftRule] {
+        match lowered.ruleset.rules.split_first() {
+            None => &[],
+            Some((first, rest)) => {
+                assert_eq!(first.matches, vec![NftMatch::Mark(OWN_TRAFFIC_MARK)]);
+                assert_eq!(first.verdict, NftVerdict::Accept);
+                rest
+            }
+        }
+    }
+
     /// The core of the port: Windows arbitrates by weight, Linux by position.
     /// A higher band must be emitted BEFORE a lower one whatever order the
     /// planner listed them in, or a catch-all block would shadow the exemption
@@ -595,9 +632,7 @@ mod tests {
         ]);
 
         let lowered = lower_plan(&plan, &names());
-        let bands: Vec<&str> = lowered
-            .ruleset
-            .rules
+        let bands: Vec<&str> = policy_rules(&lowered)
             .iter()
             .map(|r| r.comment.as_str())
             .collect();
@@ -631,9 +666,7 @@ mod tests {
         ]);
 
         let lowered = lower_plan(&plan, &names());
-        let comments: Vec<&str> = lowered
-            .ruleset
-            .rules
+        let comments: Vec<&str> = policy_rules(&lowered)
             .iter()
             .map(|r| r.comment.as_str())
             .collect();
@@ -656,15 +689,15 @@ mod tests {
         pinned.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
 
         let lowered = lower_plan(&plan_of(vec![pinned]), &names());
-        assert_eq!(lowered.ruleset.rules.len(), 2);
+        assert_eq!(policy_rules(&lowered).len(), 2);
 
-        let accept = &lowered.ruleset.rules[0];
+        let accept = &policy_rules(&lowered)[0];
         assert_eq!(accept.verdict, NftVerdict::Accept);
         assert!(accept
             .matches
             .contains(&NftMatch::OutInterface("tun0".into())));
 
-        let guard = &lowered.ruleset.rules[1];
+        let guard = &policy_rules(&lowered)[1];
         assert_eq!(guard.verdict, pin_drop());
         assert!(
             !guard
@@ -697,7 +730,7 @@ mod tests {
         };
 
         let lowered = lower_plan(&plan_of(vec![app_rule]), &names());
-        assert!(lowered.ruleset.rules.is_empty());
+        assert!(policy_rules(&lowered).is_empty());
         assert_eq!(
             lowered.unsupported,
             vec![UnsupportedRule {
@@ -735,9 +768,7 @@ mod tests {
         let lowered = lower_plans(&[alice, bob], &names());
 
         assert!(lowered.unsupported.is_empty());
-        let uids: Vec<u32> = lowered
-            .ruleset
-            .rules
+        let uids: Vec<u32> = policy_rules(&lowered)
             .iter()
             .filter_map(|r| {
                 r.matches.iter().find_map(|m| match m {
@@ -768,7 +799,7 @@ mod tests {
         let lowered = lower_plan(&foreign, &names());
 
         assert!(
-            lowered.ruleset.rules.is_empty(),
+            policy_rules(&lowered).is_empty(),
             "a rule that cannot be scoped to its user must not be applied at all",
         );
         assert!(matches!(
@@ -801,12 +832,10 @@ mod tests {
         // Never an unpinned ACCEPT — that is what would widen the rule. What
         // does stay is the leak guard: the destination the pin confined is
         // dropped rather than allowed to follow the default route.
-        assert!(lowered
-            .ruleset
-            .rules
+        assert!(policy_rules(&lowered)
             .iter()
             .all(|r| r.verdict == pin_drop()));
-        assert_eq!(lowered.ruleset.rules.len(), 1);
+        assert_eq!(policy_rules(&lowered).len(), 1);
         assert_eq!(
             lowered.unsupported,
             vec![UnsupportedRule {
@@ -861,8 +890,8 @@ mod tests {
         // The pin cannot widen: no accept is emitted. Its guard stays, so a
         // link that went down blocks the traffic it carried instead of handing
         // it to the default route.
-        assert_eq!(lowered.ruleset.rules.len(), 1);
-        assert_eq!(lowered.ruleset.rules[0].verdict, pin_drop());
+        assert_eq!(policy_rules(&lowered).len(), 1);
+        assert_eq!(policy_rules(&lowered)[0].verdict, pin_drop());
         assert_eq!(
             lowered.unsupported[0].reason,
             UnsupportedReason::UnresolvedEgress
@@ -889,7 +918,7 @@ mod tests {
         scoped.principal = PrincipalScope::User(UserPrincipal::from_linux_uid(1001));
 
         let lowered = lower_plan(&plan_of(vec![scoped]), &names());
-        assert!(lowered.ruleset.rules[0]
+        assert!(policy_rules(&lowered)[0]
             .matches
             .contains(&NftMatch::SkUid(1001)));
     }
@@ -906,7 +935,7 @@ mod tests {
         dns.flow.dst_port = Some(53);
 
         let lowered = lower_plan(&plan_of(vec![dns]), &names());
-        let matches = &lowered.ruleset.rules[0].matches;
+        let matches = &policy_rules(&lowered)[0].matches;
         assert!(matches.contains(&NftMatch::Protocol(17)));
         assert!(matches.contains(&NftMatch::DstPort(53)));
     }
@@ -973,11 +1002,11 @@ mod tests {
         let lowered = lower_plan(&plan, &egress);
 
         assert_eq!(
-            lowered.ruleset.rules.len(),
+            policy_rules(&lowered).len(),
             1,
             "the guard would block everything"
         );
-        assert_eq!(lowered.ruleset.rules[0].verdict, NftVerdict::Accept);
+        assert_eq!(policy_rules(&lowered)[0].verdict, NftVerdict::Accept);
     }
 
     /// The plan states a rule twice — once for the connect decision, once per
@@ -1010,7 +1039,7 @@ mod tests {
 
         let lowered = lower_plan(&plan, &EgressNames::default());
 
-        assert_eq!(lowered.ruleset.rules.len(), 1);
+        assert_eq!(policy_rules(&lowered).len(), 1);
     }
 
     /// A blanket drop settles every packet of that user, so the protocol-specific
@@ -1044,8 +1073,8 @@ mod tests {
 
         let lowered = lower_plan(&plan, &EgressNames::default());
 
-        assert_eq!(lowered.ruleset.rules.len(), 1);
-        assert!(lowered.ruleset.rules[0]
+        assert_eq!(policy_rules(&lowered).len(), 1);
+        assert!(policy_rules(&lowered)[0]
             .matches
             .contains(&NftMatch::SkUid(uid)));
     }
@@ -1083,8 +1112,8 @@ mod tests {
 
         let lowered = lower_plan(&plan, &EgressNames::default());
 
-        assert_eq!(lowered.ruleset.rules.len(), 1);
-        let rule = &lowered.ruleset.rules[0];
+        assert_eq!(policy_rules(&lowered).len(), 1);
+        let rule = &policy_rules(&lowered)[0];
         assert!(rule.matches.contains(&NftMatch::DstV6 {
             net: std::net::Ipv6Addr::UNSPECIFIED,
             prefix: 0,
@@ -1124,7 +1153,7 @@ mod tests {
 
         let lowered = lower_plans(&[blanket(1000), blanket(1001)], &EgressNames::default());
 
-        assert_eq!(lowered.ruleset.rules.len(), 2);
+        assert_eq!(policy_rules(&lowered).len(), 2);
     }
     /// A pin whose interface is gone keeps its GUARD.
     ///
@@ -1211,6 +1240,86 @@ mod tests {
         );
     }
 
+    /// What the owner's guard blocks for forwarded traffic lands in the forward
+    /// chain, silently and with no user condition; no other plan speaks for it.
+    #[test]
+    fn the_owners_forwarded_blocks_lower_into_the_forward_chain_only() {
+        let mut flow = rule(
+            PrecedenceClass::KillSwitchBlock,
+            0,
+            DstMatch::HostV4(v4(203, 0, 113, 5)),
+            Verdict::Block,
+        );
+        flow.principal = PrincipalScope::Forwarded;
+        let plan = plan_of(vec![flow]);
+        let egress = names();
+        let scoped = [ScopedPlan {
+            plan: &plan,
+            egress: &egress,
+        }];
+        let lowered = lower_scoped_with(&scoped, &owner_scope());
+        assert!(
+            lowered.ruleset.rules.is_empty(),
+            "{:?}",
+            lowered.ruleset.rules
+        );
+        assert_eq!(lowered.ruleset.forward.len(), 1);
+        let fwd = &lowered.ruleset.forward[0];
+        assert_eq!(fwd.verdict, NftVerdict::Drop);
+        assert!(
+            fwd.matches
+                .iter()
+                .all(|m| !matches!(m, NftMatch::SkUid(_) | NftMatch::SkUidSet(_))),
+            "{fwd:?}"
+        );
+        let other_owner = ServiceAccountScope {
+            owner: Some(UserPrincipal::from_linux_uid(1001)),
+            ..owner_scope()
+        };
+        assert!(lower_scoped_with(&scoped, &other_owner)
+            .ruleset
+            .forward
+            .is_empty());
+    }
+
+    /// A forwarded pin is the owner's pair in the forward chain: out the tunnel
+    /// accepted, out any other interface dropped, from the same packet on.
+    #[test]
+    fn a_forwarded_pin_lowers_to_the_tunnel_or_nothing_in_the_forward_chain() {
+        let mut flow = rule(
+            PrecedenceClass::KillSwitchPermit,
+            0,
+            DstMatch::HostV4(v4(203, 0, 113, 5)),
+            Verdict::Permit,
+        );
+        flow.principal = PrincipalScope::Forwarded;
+        flow.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
+        let plan = plan_of(vec![flow]);
+        let egress = names();
+        let scoped = [ScopedPlan {
+            plan: &plan,
+            egress: &egress,
+        }];
+        let lowered = lower_scoped_with(&scoped, &owner_scope());
+        assert!(
+            lowered.ruleset.rules.is_empty(),
+            "{:?}",
+            lowered.ruleset.rules
+        );
+        let fwd = &lowered.ruleset.forward;
+        assert_eq!(fwd.len(), 2, "{fwd:?}");
+        assert_eq!(fwd[0].verdict, NftVerdict::Accept);
+        assert!(fwd[0]
+            .matches
+            .iter()
+            .any(|m| matches!(m, NftMatch::OutInterface(_))));
+        assert_eq!(fwd[1].verdict, NftVerdict::Drop);
+        assert!(!fwd[1]
+            .matches
+            .iter()
+            .any(|m| matches!(m, NftMatch::OutInterface(_))));
+    }
+
     #[test]
     fn service_account_rules_of_a_plan_that_does_not_own_the_table_never_lower() {
         let plan = plan_of(vec![service_pin(v4(198, 51, 100, 1))]);
@@ -1225,7 +1334,7 @@ mod tests {
         };
         for scope in [ServiceAccountScope::default(), other_owner] {
             let lowered = lower_scoped_with(&scoped, &scope);
-            assert!(lowered.ruleset.rules.is_empty(), "{scope:?}");
+            assert!(policy_rules(&lowered).is_empty(), "{scope:?}");
         }
         assert!(lower_plan(&plan, &egress).ruleset.rules.is_empty());
     }
@@ -1288,6 +1397,100 @@ mod tests {
         );
     }
 
+    /// root shares uid 0 with the daemon, sshd and the VPN clients: a rule on
+    /// uid 0 judges the daemon's DNS forwarding and every SSH reply. So root's
+    /// filters never lower, and the accept for our own marked traffic opens
+    /// the chain whatever else it holds.
+    #[test]
+    fn root_is_never_filtered_so_ssh_sessions_and_the_daemons_dns_survive_a_block_all() {
+        let root = UserPrincipal::from_linux_uid(0);
+        let mut block_all = rule(
+            PrecedenceClass::CatchAllBlock,
+            0,
+            DstMatch::Any,
+            Verdict::Block,
+        );
+        block_all.principal = PrincipalScope::User(root.clone());
+        let mut dns = rule(
+            PrecedenceClass::CatchAllExempt,
+            0,
+            DstMatch::Any,
+            Verdict::Permit,
+        );
+        dns.flow.protocol = Some(L4Proto::Udp);
+        dns.flow.dst_port = Some(53);
+        dns.principal = PrincipalScope::User(root.clone());
+        let root_plan = EnforcementPlan {
+            principal: root,
+            flows: vec![dns, block_all],
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+        let mut alice = plan_of(vec![rule(
+            PrecedenceClass::KillSwitchBlock,
+            0,
+            DstMatch::HostV4(v4(198, 51, 100, 5)),
+            Verdict::Block,
+        )]);
+        alice.flows[0].principal = PrincipalScope::User(UserPrincipal::from_linux_uid(1000));
+
+        let lowered = lower_plans(&[root_plan, alice], &names());
+
+        assert!(lowered.unsupported.is_empty(), "{:?}", lowered.unsupported);
+        let rules = &lowered.ruleset.rules;
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r.matches.contains(&NftMatch::SkUid(0))),
+            "a rule on uid 0 judges sshd's replies and the daemon's DNS: {rules:?}"
+        );
+        assert_eq!(rules[0].matches, vec![NftMatch::Mark(OWN_TRAFFIC_MARK)]);
+        assert_eq!(rules[0].verdict, NftVerdict::Accept);
+        assert_eq!(
+            policy_rules(&lowered).len(),
+            1,
+            "the other user's guard still lowers"
+        );
+    }
+
+    /// The strict default block is stated twice by the planner — family-less
+    /// and as `::/0` for a backend whose `Any` is one family. One chain judges
+    /// both families, so the v6 twin decides nothing and is dropped.
+    #[test]
+    fn the_v6_twin_of_the_default_block_folds_into_the_family_less_one() {
+        let uid = 1000;
+        let block = |ordinal, dst| {
+            let mut flow = rule(
+                PrecedenceClass::DefaultCatchAll,
+                ordinal,
+                dst,
+                Verdict::Block,
+            );
+            flow.principal = PrincipalScope::User(UserPrincipal::from_linux_uid(uid));
+            flow
+        };
+        let v6_all = DstMatch::SubnetV6 {
+            net: std::net::Ipv6Addr::UNSPECIFIED,
+            prefix: 0,
+        };
+        let plan = EnforcementPlan {
+            principal: UserPrincipal::from_linux_uid(uid),
+            flows: vec![block(0, DstMatch::Any), block(1, v6_all)],
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+
+        let lowered = lower_plan(&plan, &EgressNames::default());
+
+        let rules = policy_rules(&lowered);
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert_eq!(rules[0].matches, vec![NftMatch::SkUid(uid)]);
+        assert_eq!(
+            rules[0].verdict,
+            NftVerdict::DropReported(DropTag::user(DropKind::Default))
+        );
+    }
+
     /// Folding keeps working on reported drops: guards of one band still
     /// become one set, and the set keeps the band's tag.
     #[test]
@@ -1305,7 +1508,7 @@ mod tests {
             })
             .collect();
         let lowered = lower_plan(&plan_of(flows), &names());
-        let rules = &lowered.ruleset.rules;
+        let rules = policy_rules(&lowered);
         assert_eq!(rules.len(), 2, "{rules:?}");
         assert_eq!(rules[0].verdict, NftVerdict::Accept);
         assert_eq!(rules[1].verdict, pin_drop());

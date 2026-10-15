@@ -20,14 +20,34 @@ pub fn handle_a_query(
     enforced_view: &dyn EnforcedAddressView,
 ) -> QueryOutcome {
     let started = std::time::Instant::now();
-    // Upstream resolve is needed for BOTH paths — do it first.
-    let resolved = match upstream.resolve_within(hostname, AddressFamily::Ipv4, hold.budget) {
+    // Asked BEFORE the upstream: while the guard blocks, a rule host's name
+    // may leave only through the tunnel, and a query over the main link would
+    // hand the provider exactly the name the guard withholds the address of.
+    let rule_host = oracle.is_rule_host(hostname);
+    let resolve = if rule_host && leak_guard.blocking() {
+        upstream.resolve_tunnel_only_within(hostname, AddressFamily::Ipv4, hold.budget)
+    } else {
+        upstream.resolve_within(hostname, AddressFamily::Ipv4, hold.budget)
+    };
+    let resolved = match resolve {
         // Asked for v4, so nothing is dropped here; the narrowing marks the
         // whole handler as still speaking one family.
         Ok(r) => ResolvedAddressesV4 {
             addresses: crate::dns_wire::only_v4(&r.addresses),
             ttl_seconds: r.ttl_seconds,
         },
+        // A rule host the tunnel could not resolve while the guard blocks is
+        // withheld, never forwarded: the forward would be the leak.
+        Err(ResolveError::Unavailable(reason)) if rule_host && leak_guard.blocking() => {
+            tracing::info!(
+                target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-withheld-name-leak-guard",
+                host = %hostname,
+                reason = %reason,
+                "leak guard is blocking: this rule host's name was not asked over the main link — withholding the answer",
+            );
+            return QueryOutcome::Withheld;
+        }
         Err(e) => {
             let reason = describe_resolve_failure(&e);
             tracing::debug!(
@@ -42,7 +62,7 @@ pub fn handle_a_query(
 
     // Fail-open: a non-rule host (the majority) returns immediately with no
     // policy work, so general DNS never depends on enforcement health.
-    if !oracle.is_rule_host(hostname) {
+    if !rule_host {
         tracing::debug!(
             target: "nrr::dns-resolver",
             host = %hostname,
@@ -212,6 +232,28 @@ pub fn handle_a_query(
         reconciler.reconcile_now(hold_deadline)
     };
     let enforced = all_enforced || matches!(reconcile, ReconcileOutcome::Installed);
+    // Fail-open on latency is right while the additional link is UP: the worst
+    // case is a moment on the wrong route. While the guard blocks a link it
+    // could not resolve there is no route to be early for and no filter yet, so
+    // the caller would connect over the main link — the leak the guard exists to
+    // stop. A wait skipped as futile is the same miss as one that ran out: the
+    // full run is slower than the hold, which is exactly when it matters most.
+    // `Deferred` and an all-enforced answer are installed already and pass.
+    let missed_install = match reconcile {
+        ReconcileOutcome::DeadlineExceeded => true,
+        ReconcileOutcome::AheadOfEnforcement => !all_enforced,
+        ReconcileOutcome::Installed | ReconcileOutcome::Deferred => false,
+    };
+    if missed_install && leak_guard.blocking() {
+        tracing::warn!(
+            target: "nrr::dns-resolver",
+            msg_key = "dns-resolver-withheld-leak-guard",
+            host = %hostname,
+            addresses = ?answered,
+            "leak guard is blocking with the additional link unresolved and enforcement for this answer did not install in time — withholding the addresses instead of leaking them to the main link",
+        );
+        return QueryOutcome::Withheld;
+    }
     tracing::debug!(
         target: "nrr::dns-resolver",
         host = %hostname,
@@ -238,27 +280,6 @@ pub fn handle_a_query(
             routed_now,
             "answering ahead of enforcement: the filters for these addresses come with the next run; `routed_now` of them already leave through their rule's link",
         );
-    }
-    // Fail-open on latency is the right trade while the additional link is UP:
-    // the worst case is a fraction of a second on the wrong route. It is the
-    // wrong one while the guard is blocking a link it could not resolve —
-    // there is no route to be early for, nothing has a filter for these
-    // addresses yet, and the caller connects the instant it holds them. That is
-    // an egress over the main link for exactly the destination the guard exists
-    // to hold back, so the answer is withheld instead.
-    //
-    // Only the missed deadline qualifies: `Deferred` means every answered
-    // address was already cached-routable (its filters are installed), and
-    // withholding those would cost connectivity the guard never protects.
-    if matches!(reconcile, ReconcileOutcome::DeadlineExceeded) && leak_guard.blocking() {
-        tracing::warn!(
-            target: "nrr::dns-resolver",
-            msg_key = "dns-resolver-withheld-leak-guard",
-            host = %hostname,
-            addresses = ?answered,
-            "leak guard is blocking with the additional link unresolved and enforcement for this answer did not install in time — withholding the addresses instead of leaking them to the main link",
-        );
-        return QueryOutcome::Withheld;
     }
     QueryOutcome::Answer {
         ips: answered,
@@ -290,8 +311,16 @@ pub fn handle_aaaa_query(
     leak_guard: &dyn LeakGuardPosture,
 ) -> AaaaOutcome {
     let started = std::time::Instant::now();
-    let resolved = match upstream.resolve_within(hostname, AddressFamily::Ipv6, hold.budget) {
+    // Every caller here holds a rule host; the same tunnel-only rule as the A
+    // path applies while the guard blocks.
+    let resolve = if leak_guard.blocking() {
+        upstream.resolve_tunnel_only_within(hostname, AddressFamily::Ipv6, hold.budget)
+    } else {
+        upstream.resolve_within(hostname, AddressFamily::Ipv6, hold.budget)
+    };
+    let resolved = match resolve {
         Ok(r) => r,
+        Err(ResolveError::Unavailable(_)) if leak_guard.blocking() => return AaaaOutcome::Withheld,
         Err(e) => return AaaaOutcome::Upstream(e),
     };
     let all: Vec<std::net::Ipv6Addr> = resolved
@@ -320,6 +349,9 @@ pub fn handle_aaaa_query(
             ttl_seconds: resolved.ttl_seconds,
         },
     );
+    // The route alone decides which link the first connect leaves through, as
+    // on the A path; the filters still come with the full run.
+    let routed_now = reconciler.install_first_contact_v6(&answered);
     // No "already enforced" shortcut: the installed-address view is IPv4. The
     // wait is skipped only when it is known to be futile, as on the A path.
     let hold_deadline = hold
@@ -335,7 +367,13 @@ pub fn handle_aaaa_query(
     } else {
         reconciler.reconcile_now(hold_deadline)
     };
-    if matches!(reconcile, ReconcileOutcome::DeadlineExceeded) && leak_guard.blocking() {
+    // No installed-address view for IPv6, so a skipped wait counts as a miss
+    // under the guard, as on the A path.
+    let missed_install = matches!(
+        reconcile,
+        ReconcileOutcome::DeadlineExceeded | ReconcileOutcome::AheadOfEnforcement
+    );
+    if missed_install && leak_guard.blocking() {
         tracing::warn!(
             target: "nrr::dns-resolver",
             msg_key = "dns-resolver-withheld-leak-guard-ipv6",
@@ -349,6 +387,7 @@ pub fn handle_aaaa_query(
         target: "nrr::dns-resolver",
         host = %hostname,
         addresses = ?answered,
+        routed_now,
         reconcile = ?reconcile,
         "Mode B: rule host IPv6 resolved and reconciled before answering",
     );

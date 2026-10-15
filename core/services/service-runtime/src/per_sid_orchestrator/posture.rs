@@ -101,7 +101,47 @@ fn exempt_tunnel_servers(
         .collect()
 }
 
+/// The tunnel's own destinations — addresses and networks — blocked by name
+/// on top of a blanket block.
+///
+/// The blanket sits below the main-link rule band, so a program the user
+/// routes to the main link passes it — and would reach a host or a network
+/// the tunnel owns over the main link while the tunnel is down. The pins and
+/// the holds sit above that band: an address a rule names belongs to that
+/// rule, whatever program dials it. ALE only — the blanket already covers the
+/// packet layer, and the per-chunk packet blocks would share its weights.
+fn named_destination_blocks_under_block_all(
+    sid: &str,
+    protected_secondary_ips: &[std::net::IpAddr],
+    holds: &crate::enforcement_planner::NetworkHolds,
+    exemptions: &FailClosedExemptions,
+    protocols: crate::killswitch_codegen::KillSwitchProtocols,
+) -> Vec<WfpFilterSpec> {
+    let ale_only = crate::killswitch_codegen::KillSwitchProtocols {
+        icmp: false,
+        igmp: false,
+        gre: false,
+        esp: false,
+        other: false,
+        ..protocols
+    };
+    let protected = exempt_tunnel_servers(protected_secondary_ips, exemptions);
+    let mut out =
+        crate::killswitch_codegen::fail_closed_block_destinations(sid, &protected, ale_only);
+    out.extend(crate::killswitch_codegen::fail_closed_network_filters(
+        sid, holds, ale_only,
+    ));
+    out
+}
+
 impl PerSidApplyOrchestrator {
+    /// Executables recognised as VPN clients by name but not yet trusted by
+    /// place are listed per principal; a principal whose enforcement is gone
+    /// has none to ask about.
+    pub(super) fn clear_pending_vpn_clients(&self, sid: &str) {
+        crate::vpn_client_trust::global_pending_vpn_clients().publish(sid, &[]);
+    }
+
     /// Record whether the latest compute for `sid` produced a fail-closed
     /// block-all set and flush the OS resolver cache on the transition
     /// EDGE (both directions):
@@ -199,6 +239,7 @@ impl PerSidApplyOrchestrator {
         self.note_block_all_state(sid, false);
         self.note_fail_closed_state(sid, false);
         self.update_killswitch_registry(sid, KillswitchBlockIds::default());
+        self.clear_pending_vpn_clients(sid);
         self.posture_log_state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -388,9 +429,17 @@ impl PerSidApplyOrchestrator {
                 // while the secondary adapter is down; otherwise it blocks only the enumerated
                 // secondary destinations (the historic per-IP behaviour).
                 if block_all {
-                    crate::killswitch_codegen::fail_closed_block_all_filters(
+                    let mut out = crate::killswitch_codegen::fail_closed_block_all_filters(
                         sid, exemptions, protocols,
-                    )
+                    );
+                    out.extend(named_destination_blocks_under_block_all(
+                        sid,
+                        protected_secondary_ips,
+                        holds,
+                        exemptions,
+                        protocols,
+                    ));
+                    out
                 } else {
                     // honour the VPN-server (bootstrap) exemption on
                     // the mode-A per-IP path too: subtract the exempted server IPs
@@ -423,9 +472,17 @@ impl PerSidApplyOrchestrator {
                 // anyway, cutting every egress on a live tunnel and
                 // deadlocking the very cache warm-up that would lift it.
                 if block_all {
-                    crate::killswitch_codegen::fail_closed_block_all_filters(
+                    let mut out = crate::killswitch_codegen::fail_closed_block_all_filters(
                         sid, exemptions, protocols,
-                    )
+                    );
+                    out.extend(named_destination_blocks_under_block_all(
+                        sid,
+                        protected_secondary_ips,
+                        holds,
+                        exemptions,
+                        protocols,
+                    ));
+                    out
                 } else {
                     let protected: Vec<std::net::IpAddr> =
                         exempt_tunnel_servers(protected_secondary_ips, exemptions);

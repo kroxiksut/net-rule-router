@@ -239,3 +239,55 @@ pub struct AutostartToggleRequest {
 }
 
 pub type AutostartToggleResponse = AutostartDto;
+
+// ── Home and local network suffixes ──────────────────────────────────────
+
+/// One suffix of the machine-wide list, with the rule hosts it would cover.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LocalDnsSuffixDto {
+    /// Normalised: lower-case, no leading or trailing dot.
+    pub suffix: String,
+    /// Names of the caller's rules that fall under this suffix. Those names
+    /// keep following their rule; the list entry only earns a warning.
+    #[serde(default)]
+    pub covers_rule_hosts: Vec<String>,
+}
+
+/// A suffix the main link's network offered and the list does not hold.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct OfferedDnsSuffixDto {
+    pub suffix: String,
+    /// The connection that offered it, by the name the interfaces list shows.
+    /// Empty when the OS reports none.
+    #[serde(default)]
+    pub link: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LocalDnsSuffixesGetRequest {}
+
+/// `dns.local-suffixes.get` — the list and what the network offers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LocalDnsSuffixesGetResponse {
+    #[serde(default)]
+    pub suffixes: Vec<LocalDnsSuffixDto>,
+    #[serde(default)]
+    pub offered: Vec<OfferedDnsSuffixDto>,
+}
+
+/// `dns.local-suffixes.set` — the whole list, as an administrator wants it.
+/// Entries are normalised by the service; one malformed entry refuses the
+/// whole write.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LocalDnsSuffixesSetRequest {
+    #[serde(default)]
+    pub suffixes: Vec<String>,
+}
+
+/// The list as stored after the write — the same shape as the read.
+pub type LocalDnsSuffixesSetResponse = LocalDnsSuffixesGetResponse;

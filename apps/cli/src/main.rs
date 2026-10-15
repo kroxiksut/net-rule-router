@@ -117,7 +117,10 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
         }
         Command::DiagLogs { tail } => logs::run(exe, tail),
         Command::DiagExport => export::run(exe),
-        Command::ResetNetwork { confirmed } => reset_network(confirmed, ctx),
+        Command::ResetNetwork {
+            confirmed,
+            stop_service,
+        } => reset_network(confirmed, stop_service, ctx),
         Command::Install { start_mode } => with_port(exe, "install", |port| {
             let binary_path = match service_binary_path() {
                 Ok(path) => path,
@@ -506,9 +509,14 @@ fn report_failure(
 /// only thing that knows every piece of it; a second implementation here would
 /// be a copy that drifts, and the copy that runs during an outage is the worst
 /// place to discover the drift.
-fn reset_network(confirmed: bool, ctx: &Ctx<'_>) -> u8 {
+fn reset_network(confirmed: bool, stop_service: bool, ctx: &Ctx<'_>) -> u8 {
     let exe = ctx.exe;
-    let Some(verb) = platform::offline_reset_verb() else {
+    let verb = if stop_service {
+        platform::stop_and_reset_verb()
+    } else {
+        platform::offline_reset_verb()
+    };
+    let Some(verb) = verb else {
         eprintln!("This build has no network reset.");
         eprintln!(
             "The service binary on this platform carries no reset verb, so there is \
@@ -517,11 +525,19 @@ fn reset_network(confirmed: bool, ctx: &Ctx<'_>) -> u8 {
         eprintln!("Stop the service, and reboot if the machine is still cut off.");
         return exit::UNSUPPORTED;
     };
+    let repeat = if stop_service {
+        "reset-network --confirm --stop-service"
+    } else {
+        "reset-network --confirm"
+    };
     if !confirmed {
         eprintln!("`{exe} reset-network` drops the network state the service applied:");
         eprintln!("  packet filters, the DNS redirect, and the routes it added.");
+        if stop_service {
+            eprintln!("A running service is stopped first, and ended if it hangs.");
+        }
         eprintln!("Connections open right now may break. Re-run it as:");
-        eprintln!("  {exe} reset-network --confirm");
+        eprintln!("  {exe} {repeat}");
         return exit::NOT_CONFIRMED;
     }
     let binary = match service_binary_path() {
@@ -539,8 +555,12 @@ fn reset_network(confirmed: bool, ctx: &Ctx<'_>) -> u8 {
         .map(|status| status.code());
     match read_reset_run(&run) {
         ResetRun::Done => exit::SUCCESS,
-        ResetRun::NeedsPrivilege => {
-            needs_elevation("reset-network", ctx, "reset-network --confirm")
+        ResetRun::NeedsPrivilege => needs_elevation("reset-network", ctx, repeat),
+        // The service binary already said so; the console names its own way.
+        ResetRun::ServiceRunning => {
+            eprintln!("To stop the service and restore the network, run:");
+            eprintln!("  {exe} reset-network --confirm --stop-service");
+            exit::FAILED
         }
         ResetRun::Unfinished(how) => {
             eprintln!("The service binary could not finish the reset ({how}).");
@@ -558,6 +578,8 @@ fn reset_network(confirmed: bool, ctx: &Ctx<'_>) -> u8 {
 enum ResetRun {
     Done,
     NeedsPrivilege,
+    /// Plain `cleanup` refused: the service runs.
+    ServiceRunning,
     /// It ran and did not succeed; it has already said why.
     Unfinished(String),
     NotStarted(String),
@@ -572,6 +594,11 @@ fn read_reset_run(run: &std::io::Result<Option<i32>>) -> ResetRun {
         // classified and the elevation offer in `main` fires for the one
         // command a locked-out user was told to run.
         Ok(Some(code)) if *code == i32::from(exit::NEEDS_PRIVILEGE) => ResetRun::NeedsPrivilege,
+        Ok(Some(code))
+            if *code == i32::from(nrr_platform_api::service_control::EXIT_SERVICE_RUNNING) =>
+        {
+            ResetRun::ServiceRunning
+        }
         Ok(Some(code)) => ResetRun::Unfinished(format!("exit code {code}")),
         Ok(None) => ResetRun::Unfinished("terminated by a signal".to_string()),
         // A binary whose manifest demands elevation is refused before it runs,
@@ -714,9 +741,12 @@ mod tests {
     fn other_endings_are_failures_not_privilege() {
         assert_eq!(read_reset_run(&Ok(Some(0))), ResetRun::Done);
         assert_eq!(
-            read_reset_run(&Ok(Some(4))),
-            ResetRun::Unfinished("exit code 4".to_string())
+            read_reset_run(&Ok(Some(1))),
+            ResetRun::Unfinished("exit code 1".to_string())
         );
+        // The plain verb's refusal of a live service: the console then names
+        // the stopping variant.
+        assert_eq!(read_reset_run(&Ok(Some(4))), ResetRun::ServiceRunning);
         assert!(matches!(read_reset_run(&Ok(None)), ResetRun::Unfinished(_)));
         assert!(matches!(
             read_reset_run(&Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
@@ -778,7 +808,7 @@ mod tests {
     #[test]
     fn an_unconfirmed_reset_runs_nothing() {
         assert_eq!(
-            reset_network(false, &ctx(elevate::ElevationPlan::NotOffered)),
+            reset_network(false, false, &ctx(elevate::ElevationPlan::NotOffered)),
             if platform::offline_reset_verb().is_some() {
                 exit::NOT_CONFIRMED
             } else {

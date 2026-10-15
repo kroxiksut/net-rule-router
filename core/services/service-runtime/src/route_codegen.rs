@@ -756,6 +756,14 @@ pub fn generate_routes_with(
         support,
     );
     push_network_plan(plan, primary_target, secondary_target, &mut out);
+    // A host on an attached segment is reached directly; a name resolving to
+    // it does not pull it into the tunnel. The same gate the neutral planner
+    // applies (`NetworkRouteFacts::keeps_host_direct`).
+    out.routes.retain(|r| {
+        !(r.interface_index == secondary_target.interface_index
+            && r.prefix_length == host_prefix_for(r.destination)
+            && networks.keeps_host_direct(&rule_book.secondary, r.destination))
+    });
     out
 }
 

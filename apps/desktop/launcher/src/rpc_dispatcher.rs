@@ -24,7 +24,12 @@ use std::time::{Duration, Instant};
 use nrr_broker::protocol::client_answer_timeout;
 use nrr_broker::BrokerHandle;
 use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
+use nrr_shared::client_error_codes::{
+    AUTOSTART_LOCAL_ERROR, BROKER_UNAVAILABLE, CONSOLE_PATH_ERROR, ELEVATED_OPERATION_RUNNING,
+    SIDECAR_ERROR, UNKNOWN_OPERATION,
+};
 use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
+use nrr_shared::ipc_transport::ELEVATION_DECLINED_CLIENT_SLUG;
 use nrr_shared::launcher_rpc::{
     encode_push_line, encode_response_line, parse_request_line, HostAnswerDeadlines,
     LauncherRpcPush, LauncherRpcRequest, LauncherRpcResponse,
@@ -63,7 +68,7 @@ const LOCAL_OPERATION_PREFIX: &str = "local.";
 const SERVICE_CONTROL_OP: &str = "local.service-control";
 /// The elevated broker is alive but still on an earlier (or this) operation.
 /// Not `Forbidden`: nothing was refused, and a retry must not look needed.
-const BROKER_BUSY_CODE: &str = "elevated-operation-running";
+const BROKER_BUSY_CODE: &str = ELEVATED_OPERATION_RUNNING;
 
 /// The GUI's "revoke administrator approval" action. Retires the live
 /// session elevation broker (the elevated process exits) so the next
@@ -305,7 +310,7 @@ pub fn dispatch_request(
             Ok(payload) => LauncherRpcResponse::ok(parsed.correlation_id.clone(), payload),
             Err(e) => LauncherRpcResponse::err(
                 parsed.correlation_id.clone(),
-                "sidecar-error",
+                SIDECAR_ERROR,
                 format!("{e}"),
             ),
         };
@@ -366,14 +371,14 @@ pub fn dispatch_request(
             Ok(value) => LauncherRpcResponse::ok(parsed.correlation_id.clone(), value),
             Err(nrr_broker::BrokerCallError::Declined) => LauncherRpcResponse::err(
                 parsed.correlation_id.clone(),
-                "uac-declined",
+                ELEVATION_DECLINED_CLIENT_SLUG,
                 "Administrator approval is required for this service action.".to_string(),
             ),
             Err(nrr_broker::BrokerCallError::ServerError { code, message }) => {
                 LauncherRpcResponse::err(parsed.correlation_id.clone(), &code, message)
             }
             Err(nrr_broker::BrokerCallError::Unavailable(e)) => {
-                LauncherRpcResponse::err(parsed.correlation_id.clone(), "broker-unavailable", e)
+                LauncherRpcResponse::err(parsed.correlation_id.clone(), BROKER_UNAVAILABLE, e)
             }
             Err(nrr_broker::BrokerCallError::StillRunning(e)) => {
                 LauncherRpcResponse::err(parsed.correlation_id.clone(), BROKER_BUSY_CODE, e)
@@ -437,7 +442,7 @@ pub fn dispatch_request(
         ) {
             Ok(payload) => LauncherRpcResponse::ok(parsed.correlation_id.clone(), payload),
             Err(e) => {
-                LauncherRpcResponse::err(parsed.correlation_id.clone(), "autostart-local-error", e)
+                LauncherRpcResponse::err(parsed.correlation_id.clone(), AUTOSTART_LOCAL_ERROR, e)
             }
         };
         write_response(stdin, &response);
@@ -455,7 +460,7 @@ pub fn dispatch_request(
         ) {
             Ok(payload) => LauncherRpcResponse::ok(parsed.correlation_id.clone(), payload),
             Err(e) => {
-                LauncherRpcResponse::err(parsed.correlation_id.clone(), "console-path-error", e)
+                LauncherRpcResponse::err(parsed.correlation_id.clone(), CONSOLE_PATH_ERROR, e)
             }
         };
         write_response(stdin, &response);
@@ -465,7 +470,11 @@ pub fn dispatch_request(
     // The user's own "Check for updates": a network request, so matched before
     // the pure `local.*` functions.
     if parsed.operation == crate::update_check_fetch::MANUAL_CHECK_OP {
-        let response = match crate::update_check_fetch::run_manual_check() {
+        // A build without the check never asks, whoever sends the request.
+        let answer = nrr_desktop_gui::update_check::UPDATE_CHECK_AVAILABLE
+            .then(crate::update_check_fetch::run_manual_check)
+            .flatten();
+        let response = match answer {
             Some(payload) => LauncherRpcResponse::ok(parsed.correlation_id.clone(), payload),
             None => LauncherRpcResponse::err(
                 parsed.correlation_id.clone(),
@@ -524,7 +533,7 @@ pub fn dispatch_request(
                 Err(nrr_broker::BrokerCallError::Declined) => {
                     response = LauncherRpcResponse::err(
                         parsed.correlation_id.clone(),
-                        "uac-declined",
+                        ELEVATION_DECLINED_CLIENT_SLUG,
                         "Administrator approval is required to apply this change.".to_string(),
                     );
                 }
@@ -737,7 +746,7 @@ fn handle_request(req: &LauncherRpcRequest, client: &dyn IpcClient) -> LauncherR
         None => {
             return LauncherRpcResponse::err(
                 req.correlation_id.clone(),
-                "unknown-operation",
+                UNKNOWN_OPERATION,
                 format!("unknown operation slug: {}", req.operation),
             );
         }
@@ -811,10 +820,7 @@ fn handle_request(req: &LauncherRpcRequest, client: &dyn IpcClient) -> LauncherR
             if matches!(e, nrr_ipc_client::IpcClientError::Disconnected) {
                 client.force_reconnect();
             }
-            // Surface the typed wire code so QML can look up
-            // `errors.<code>.*` locale strings. Without this every
-            // server error collapsed to "ipc-call-failed" and the GUI
-            // rendered raw kebab in toasts.
+            // The typed wire code is what the window looks up under `errors.<code>`.
             let (code, message) = ipc_error_to_wire(&e);
             LauncherRpcResponse::err(req.correlation_id.clone(), code, message)
         }

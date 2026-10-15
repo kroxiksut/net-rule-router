@@ -159,6 +159,18 @@ pub fn plan_routes_with(
         support,
     );
     push_network_intents(plan, families, &mut routes);
+    // A host on an attached segment is reached directly; a name resolving to
+    // it does not pull it into the tunnel — the gate the Windows codegen
+    // applies too (`NetworkRouteFacts::keeps_host_direct`).
+    routes.retain(|r| {
+        let host = match r.dst {
+            DstMatch::HostV4(ip) => Some(IpAddr::V4(ip)),
+            DstMatch::HostV6(ip) => Some(IpAddr::V6(ip)),
+            _ => None,
+        };
+        !(r.egress == EgressRef::Secondary
+            && host.is_some_and(|ip| networks.keeps_host_direct(&rule_book.secondary, ip)))
+    });
     routes
 }
 
@@ -362,10 +374,16 @@ fn overlay_intent(net: Ipv4Addr, prefix: u8, egress: EgressRef) -> RouteIntent {
 /// tunnel servers and the attached subnets. `server_ips` / `local_subnets` may
 /// be empty (a machine whose route table has not been read yet); the
 /// machine-independent part of the floor is planned regardless.
+///
+/// The block is family-less on a backend that judges both families in one
+/// chain, so the floor carries the IPv6 exemptions the blanket postures carry
+/// (`v6`): without them the block cuts `::1`, the link scope and the tunnel's
+/// own v6 endpoint.
 pub fn plan_default_block_exemptions(
     sid: &str,
     server_ips: &[Ipv4Addr],
     local_subnets: &[(Ipv4Addr, u8)],
+    v6: Ipv6Exemptions<'_>,
 ) -> Vec<FlowRule> {
     let principal = principal_scope(sid);
     let mut dsts: Vec<DstMatch> = vec![
@@ -392,6 +410,7 @@ pub fn plan_default_block_exemptions(
                 prefix: *prefix,
             }),
     );
+    dsts.extend(super::kill_switch::ipv6_exempt_matches(v6));
 
     dsts.into_iter()
         .enumerate()

@@ -159,8 +159,23 @@ pub struct RuleDto {
     /// so old readers and new readers agree on every pre-existing payload. A
     /// bump would force the codec to reject revisions that are still perfectly
     /// decodable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// An origin this build cannot read (a newer build's kind) reads as none:
+    /// the rule still applies, as the user's, rather than the book failing.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "origin_or_none"
+    )]
     pub origin: Option<RuleOriginDto>,
+}
+
+fn origin_or_none<'de, D>(deserializer: D) -> Result<Option<RuleOriginDto>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 impl RuleDto {
@@ -170,6 +185,10 @@ impl RuleDto {
     pub fn is_unrecognized(&self) -> bool {
         matches!(self.address_match, Some(AddressMatchDto::Unrecognized(_)))
             || matches!(self.action, RuleAction::Unrecognized(_))
+            || self
+                .app_match
+                .as_ref()
+                .is_some_and(|m| matches!(m.pattern, AppPatternDto::Unrecognized(_)))
     }
 }
 
@@ -348,6 +367,20 @@ pub enum AppPatternDto {
         /// The glob pattern.
         value: String,
     },
+    /// A kind this build does not know, kept verbatim. A newer build may have
+    /// written it; the rule is stored and re-sent unchanged, never applied.
+    #[serde(untagged)]
+    Unrecognized(serde_json::Value),
+}
+
+impl AppPatternDto {
+    /// The pattern text; empty for a kind this build does not know.
+    pub fn value(&self) -> &str {
+        match self {
+            Self::Exact { value } | Self::Glob { value } => value,
+            Self::Unrecognized(_) => "",
+        }
+    }
 }
 
 /// Errors produced by the canonical-string codec helpers.
@@ -513,9 +546,10 @@ pub fn first_forbidden_field_text(dto: &CanonicalRulesJsonV1) -> Option<Forbidde
             // Never written into the rules file: it carries no kind the file has.
             AddressMatchDto::Unrecognized(_) => false,
         });
-        let app = rule.app_match.as_ref().is_some_and(|m| match &m.pattern {
-            AppPatternDto::Exact { value } | AppPatternDto::Glob { value } => bad(value),
-        });
+        let app = rule
+            .app_match
+            .as_ref()
+            .is_some_and(|m| bad(m.pattern.value()));
         let origin = rule.origin.as_ref().is_some_and(|o| match o {
             RuleOrigin::Auto { anchor, added, .. } => bad(anchor) || bad(added),
         });
@@ -594,6 +628,8 @@ fn fold_rule(rule: &mut RuleDto) {
             AppPatternDto::Glob { value } => {
                 *value = crate::app_identity::canonical_glob_process_pattern(value)
             }
+            // Compared as the newer build wrote it.
+            AppPatternDto::Unrecognized(_) => {}
         }
     }
 }
@@ -714,6 +750,7 @@ fn comparison_key(rule: &RuleDto) -> String {
             let (k, v) = match &app.pattern {
                 AppPatternDto::Exact { value } => ("app:exact", value.as_str()),
                 AppPatternDto::Glob { value } => ("app:glob", value.as_str()),
+                AppPatternDto::Unrecognized(_) => ("app:unrecognized", ""),
             };
             (k, v, app.include_child_processes)
         }

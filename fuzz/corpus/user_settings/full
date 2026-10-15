@@ -1,0 +1,15 @@
+{
+  "format": 1,
+  "rules-folder": "C:/Users/someone/NetRuleRouter",
+  "rules-files": {
+    "primary": "rules_primary.txt",
+    "secondary": "rules_secondary.txt"
+  },
+  "selected-set": "home",
+  "service-intent": {
+    "stability": {
+      "grace-seconds": 5
+    },
+    "route-policy": {}
+  }
+}

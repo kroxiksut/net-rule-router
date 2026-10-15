@@ -38,10 +38,10 @@ inline constexpr unsigned long kRelocationFailedExitCode = 9;
 
 // How long the GUI waits for the launcher to answer a broker-routed action.
 // Must exceed the broker's own bound for it (`client_answer_timeout` for
-// `broker.service-control`: settle 1.5 s + child budget 90 s + margin 5 s),
+// `broker.service-control`: settle 1.5 s + child budget 150 s + margin 5 s),
 // or a slow restart that succeeds reads as a failure; the direct run's
 // allowance on top covers the prompt and the RPC hop. A Rust test pins it.
-inline constexpr int kBrokerServiceControlTimeoutMs = 96500 + kElevatedRunTimeoutMs;
+inline constexpr int kBrokerServiceControlTimeoutMs = 156500 + kElevatedRunTimeoutMs;
 
 inline QString nrrServiceOperationTimedOut() {
     return QStringLiteral("Timed out waiting for service operation");
@@ -263,6 +263,13 @@ public:
     /// QML's job; by the time this is called the user has already agreed.
     Q_INVOKABLE void resetNetwork() {
         dispatch(QStringLiteral("cleanup"), QStringLiteral("cleanup"));
+    }
+
+    /// The same recovery while the service runs: a clean stop (the process is
+    /// ended if it hangs), then the teardown. The plain verb refuses a live
+    /// service, which would put the state straight back.
+    Q_INVOKABLE void stopServiceAndResetNetwork() {
+        dispatch(QStringLiteral("stop-and-cleanup"), QStringLiteral("stop-and-cleanup"));
     }
 
     /// Switch the service start mode (admin-opt-in).

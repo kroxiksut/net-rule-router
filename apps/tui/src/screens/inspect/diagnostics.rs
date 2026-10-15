@@ -36,7 +36,7 @@ use super::{
 };
 use crate::backend::Reply;
 use crate::i18n::{Key, Texts};
-use crate::screens::Screen;
+use crate::screens::{Screen, ScreenId};
 use crate::state::AppState;
 use crate::view::{Panel, ScreenView, Segment, StateTone, ViewLine};
 
@@ -214,6 +214,15 @@ fn load_status(app: &mut AppState) {
         let read = read_status(client);
         Reply::new(move |app| apply_status(&mut app.inspect.diag, read))
     });
+}
+
+/// An alert was raised or acknowledged elsewhere: the list on screen is
+/// re-read, so it does not keep an answered alert as open.
+pub fn reload_alerts(app: &mut AppState) {
+    if app.screen != ScreenId::Diagnostics || !app.link.is_connected() || app.inspect.diag.loading {
+        return;
+    }
+    load_status(app);
 }
 
 /// Tamper and key-reset alerts trust rule sets when acknowledged, so the rows
@@ -902,12 +911,25 @@ fn service_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
                 texts.get(keys::REVISION)
             )));
         }
-        if !h.degraded_modes.is_empty() {
+        // Revisions the service holds unapplied, from its diagnostics answer.
+        if let Some(pending) = state
+            .status
+            .as_ref()
+            .map(|s| s.service_health.pending_changes)
+            .filter(|n| *n > 0)
+        {
             lines.push(ViewLine::text(format!(
-                "{}: {}",
-                texts.get(keys::PENDING),
-                h.degraded_modes.len()
+                "{}: {pending}",
+                texts.get(keys::PENDING)
             )));
+        }
+        if serde_json::to_value(h)
+            .is_ok_and(|health| nrr_client_logic::system_dns::not_restored(&health))
+        {
+            lines.push(ViewLine::new(vec![Segment::state(
+                texts.get(keys::DNS_NOT_RESTORED),
+                StateTone::Bad,
+            )]));
         }
     }
     if state.loading && state.status.is_none() {

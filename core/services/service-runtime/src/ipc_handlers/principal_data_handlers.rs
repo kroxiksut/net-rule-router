@@ -301,6 +301,49 @@ mod tests {
             .is_empty());
     }
 
+    /// Erasing every user's data is machine-wide; erasing one's own is not.
+    /// The same operation carries both, so the handler is the only gate.
+    #[test]
+    fn purging_every_principal_needs_elevation_and_purging_ones_own_does_not() {
+        let everyone = || {
+            let mut envelope = req();
+            envelope.payload = serde_json::json!({ "all-principals": true });
+            envelope
+        };
+        let calls = |purger: &RecordingPurger| {
+            purger
+                .calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        };
+
+        let purger = Arc::new(RecordingPurger::new(Ok(
+            PrincipalDataPurgeResponse::default(),
+        )));
+        let handler =
+            PrincipalDataPurgeHandler::new(Arc::clone(&purger) as Arc<dyn PrincipalDataPurger>);
+        let err = handler
+            .handle(&everyone(), &ctx(Some("S-A")))
+            .expect_err("an unelevated caller must not erase other users' data");
+        assert_eq!(err.code, IpcErrorCode::Forbidden);
+        assert!(calls(&purger).is_empty(), "nothing may be purged");
+
+        handler
+            .handle(&req(), &ctx(Some("S-A")))
+            .expect("resetting one's own data needs no rights");
+        assert_eq!(calls(&purger), vec!["S-A".to_string()]);
+
+        let admin = IpcRequestContext {
+            caller_is_elevated: true,
+            ..ctx(Some("S-A"))
+        };
+        handler
+            .handle(&everyone(), &admin)
+            .expect("an administrator may clear every user");
+        assert_eq!(calls(&purger), vec!["S-A".to_string(), "*".to_string()]);
+    }
+
     #[test]
     fn a_storage_failure_maps_to_internal() {
         let purger = Arc::new(RecordingPurger::new(Err(RoutePolicyWriteError::Storage(

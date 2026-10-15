@@ -31,6 +31,7 @@
 
 use serde_json::{json, Value};
 
+use nrr_shared::client_error_codes::{MALFORMED_PRESET_PAYLOAD, UNKNOWN_PRESET_OPERATION};
 use nrr_shared::preset_parser::{parse_canonical_rules, PresetParseResult};
 
 /// Outcome of one `preset.*` request. The handler returns the payload
@@ -61,8 +62,8 @@ impl PresetHandlerError {
     /// Kebab-case wire slug for the RPC error envelope.
     pub fn wire_code(&self) -> &'static str {
         match self {
-            PresetHandlerError::UnknownOperation(_) => "unknown-preset-operation",
-            PresetHandlerError::MalformedPayload(_) => "malformed-preset-payload",
+            PresetHandlerError::UnknownOperation(_) => UNKNOWN_PRESET_OPERATION,
+            PresetHandlerError::MalformedPayload(_) => MALFORMED_PRESET_PAYLOAD,
         }
     }
 }

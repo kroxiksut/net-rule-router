@@ -254,7 +254,6 @@ fn conn_trace_with_book(
         fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
             Some(ActiveRulesSnapshot {
                 rule_book: self.0.clone(),
-                behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
             })
         }
     }
@@ -747,7 +746,6 @@ fn cache_entries_carry_expected_route_when_expectation_wired() {
                         CanonicalAddressMatch::SuffixDomain("example.com".into()),
                     )]),
                 },
-                behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
             })
         }
     }
@@ -1097,6 +1095,8 @@ fn health_json_carries_enrichment_from_providers() {
         secondary_link_provider_apps: Vec::new(),
         doh_lockdown_enabled: false,
         doh_lockdown_scope: "leak-protection-only".into(),
+        doh_lockdown_auto: true,
+        doh_lockdown_effective: false,
         browser_history_auto_seed: false,
         kill_switch_strict_shared_ips: false,
         auto_rules_mode: "suggest".to_string(),
@@ -1110,6 +1110,7 @@ fn health_json_carries_enrichment_from_providers() {
         short_name_completion: false,
         short_name_suffix: String::new(),
         app_rules_take_all_addresses: false,
+        forwarded_outage: String::new(),
         binding_source: BindingSourceDto::UserAssigned,
     });
 

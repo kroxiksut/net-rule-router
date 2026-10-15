@@ -190,6 +190,12 @@ impl IpcHandler for SnapshotInitialHandler {
         } else {
             self.route_enforcement.routes_held(ctx.caller_stored())
         };
+        // The caller's own: a client waits for the user who can confirm it.
+        let pending_vpn_clients = if ctx.caller_stored().is_empty() {
+            Vec::new()
+        } else {
+            crate::vpn_client_trust::global_pending_vpn_clients().dtos_for(ctx.caller_stored())
+        };
 
         let resp = SnapshotInitialResponse {
             health,
@@ -211,6 +217,7 @@ impl IpcHandler for SnapshotInitialHandler {
             rule_conflicts,
             enforcement_status,
             routes_held_by_another_user,
+            pending_vpn_clients,
         };
         serde_json::to_value(resp).map_err(|e| IpcError {
             code: IpcErrorCode::Internal,

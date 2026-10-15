@@ -6,41 +6,21 @@
 //! never the message: the message is English prose for a person.
 
 use crate::connection::IpcClientError;
-use nrr_shared::ipc_transport::IpcErrorCode;
+use nrr_shared::client_error_codes as codes;
 
 /// Map an [`IpcClientError`] to `(wire_slug, message)`.
 pub fn ipc_error_to_wire(err: &IpcClientError) -> (&'static str, String) {
     match err {
-        IpcClientError::Disconnected => ("transport-disconnected", err.to_string()),
-        IpcClientError::Timeout => ("timeout", err.to_string()),
-        IpcClientError::BadResponse { reason } => ("bad-response", reason.clone()),
-        IpcClientError::SerializationFailed(s) => ("serialization-failed", s.clone()),
-        IpcClientError::ClientShutdown => ("client-shutdown", err.to_string()),
-        IpcClientError::ServerError { code, message, .. } => {
-            let slug = match code {
-                IpcErrorCode::Unauthorized => "unauthorized",
-                IpcErrorCode::Forbidden => "forbidden",
-                // Kept separate from `forbidden` all the way to the GUI: this
-                // is the slug the rules section keys its read-only state off,
-                // not a one-off toast.
-                IpcErrorCode::RulesLocked => nrr_shared::ipc_transport::RULES_LOCKED_CLIENT_SLUG,
-                // Not `forbidden`: the launcher would retry that through the
-                // elevated broker, and elevation cannot lift the alert gate.
-                IpcErrorCode::SecurityAlertUnacknowledged => {
-                    nrr_shared::ipc_transport::SECURITY_ALERT_UNACKNOWLEDGED_CLIENT_SLUG
-                }
-                IpcErrorCode::InvalidVersion => "invalid-version",
-                IpcErrorCode::MalformedRequest => "malformed-request",
-                IpcErrorCode::BusyConflict => "busy-conflict",
-                IpcErrorCode::PreconditionFailed => "precondition-failed",
-                IpcErrorCode::ConfirmationExpired => "confirmation-expired",
-                IpcErrorCode::ConfirmationUnknown => "confirmation-unknown",
-                IpcErrorCode::ServiceDegraded => "service-degraded",
-                IpcErrorCode::RecoveryRequired => "recovery-required",
-                IpcErrorCode::Internal => "internal",
-            };
-            (slug, message.clone())
-        }
+        IpcClientError::Disconnected => (codes::TRANSPORT_DISCONNECTED, err.to_string()),
+        IpcClientError::Timeout => (codes::TIMEOUT, err.to_string()),
+        IpcClientError::BadResponse { reason } => (codes::BAD_RESPONSE, reason.clone()),
+        IpcClientError::SerializationFailed(s) => (codes::SERIALIZATION_FAILED, s.clone()),
+        IpcClientError::ClientShutdown => (codes::CLIENT_SHUTDOWN, err.to_string()),
+        // `rules-locked` and `security-alert-unacknowledged` keep their own
+        // slugs: the rules section keys its read-only state off the first, and
+        // `forbidden` would send the second to the elevated broker, which
+        // cannot lift the alert gate.
+        IpcClientError::ServerError { code, message, .. } => (code.client_slug(), message.clone()),
     }
 }
 
@@ -48,6 +28,7 @@ pub fn ipc_error_to_wire(err: &IpcClientError) -> (&'static str, String) {
 mod tests {
     use super::*;
     use nrr_shared::ipc::IpcOperationName;
+    use nrr_shared::ipc_transport::IpcErrorCode;
 
     #[test]
     fn forbidden_maps_to_forbidden_slug() {

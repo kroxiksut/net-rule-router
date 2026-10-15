@@ -26,7 +26,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::dns::{SystemDnsServersPort, UpstreamDnsCandidate};
+use crate::dns::{SystemDnsServersPort, UpstreamDnsCandidate, UpstreamDnsServer};
 use crate::dns_config_change::DnsConfigChangeObserver;
 use crate::error::PlatformError;
 use crate::network_change::{NetworkChangeObserver, NetworkChangeSubscription};
@@ -296,6 +296,12 @@ impl SystemDnsServersPort for NetworkChangeCachedDnsServers {
 
     fn upstream_candidates_v4_within(&self, budget: Duration) -> Vec<UpstreamDnsCandidate> {
         self.shared.lookup(Some(budget))
+    }
+
+    /// Not cached: asked only by the forwarding pool's re-selection, which is
+    /// floored on its own.
+    fn upstream_candidates_v6(&self) -> Vec<UpstreamDnsServer> {
+        self.shared.inner.upstream_candidates_v6()
     }
 
     fn report_all_unreachable(&self, servers: &[UpstreamDnsCandidate]) {

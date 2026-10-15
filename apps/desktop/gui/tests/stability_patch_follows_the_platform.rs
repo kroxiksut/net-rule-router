@@ -169,10 +169,6 @@ fn every_writer_and_reader_goes_through_the_one_rule() {
     assert!(save.contains("root.applyServiceStabilityPatch(patch,"));
     assert!(save.contains("root._recordOfflineRoutingIntent(\"stability\", key, patch[key])"));
 
-    let intent = repo_file("apps/desktop/qml/flows/ServiceIntentController.qml");
-    assert!(intent.contains("intent = root.stabilityPatchForPlatform(intent)"));
-    assert!(!intent.contains("if (!root.serviceStabilitySupported) return"));
-
     let offline = repo_file("apps/desktop/qml/flows/OfflinePendingController.qml");
     assert_eq!(
         offline

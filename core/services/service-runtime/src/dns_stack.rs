@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use nrr_platform_api::dns::SystemDnsServersPort;
 use nrr_platform_api::dns_config_change::DnsConfigChangeObserver;
-use nrr_platform_api::dns_redirect::{DnsNamespaceExemption, SystemDnsRedirectPort};
+use nrr_platform_api::dns_redirect::SystemDnsRedirectPort;
 use nrr_platform_api::dns_servers_cache::NetworkChangeCachedDnsServers;
 use nrr_platform_api::network_change::{NetworkChangeObserver, NetworkChangeSubscription};
 use rusqlite::Connection;
@@ -39,10 +39,12 @@ pub struct DnsStackPlatform {
     pub redirect: Arc<dyn SystemDnsRedirectPort>,
     /// Where the listener binds — the address the redirect points the OS at.
     pub listen_addr: SocketAddr,
-    /// Namespaces other connections claim, read fresh on every call. Called
-    /// on the arm, on a change the two feeds below report and once per safety
-    /// interval — never per query.
-    pub claimed_namespaces: Arc<dyn Fn() -> Vec<DnsNamespaceExemption> + Send + Sync>,
+    /// Namespaces other connections claim, with the kind of link that
+    /// claims each, read fresh on every call. Called on the arm, on a change
+    /// the two feeds below report and once per safety interval — never per
+    /// query. Which of them the redirect honours is decided here, not by the
+    /// OS: see [`crate::local_dns_namespaces`].
+    pub claimed_namespaces: crate::local_dns_namespaces::ClaimsFn,
     /// Link and route changes.
     pub network_changes: Arc<dyn NetworkChangeObserver>,
     /// DNS settings changes that move no link or route.
@@ -72,8 +74,15 @@ pub struct DnsStackInputs {
     pub signed_in: Option<Flag>,
     /// Routes a rule host's never-seen addresses before its answer goes out.
     pub route_coordinator: Option<Arc<crate::route_coordinator::SecondaryRouteCoordinator>>,
+    /// The same, for a platform without the coordinator; the coordinator wins
+    /// where both are given.
+    pub first_contact: Option<crate::dns_resolver_ports::FirstContactFn>,
+    /// [`Self::first_contact`] for an AAAA answer.
+    pub first_contact_v6: Option<crate::dns_resolver_ports::FirstContactV6Fn>,
     /// Where a rule host that got no address during an outage is listed.
     pub outage_blocks: Option<Arc<crate::outage_blocks::OutageBlocks>>,
+    /// Where the resolver's threads report their liveness.
+    pub liveness: Option<Arc<crate::task_liveness::TaskLiveness>>,
 }
 
 /// The factory the [`DnsResolverController`] calls on each start. The
@@ -92,10 +101,26 @@ pub fn build_dns_resolver_factory(
         namespace_recheck(),
     );
     let fed = watch.is_some();
+    // Only a foreign tunnel's claim is honoured by itself; the main link's is
+    // offered, the administrator's list is left to the main link's resolvers,
+    // and a rule host under either stays with the listener.
+    let namespaces = Arc::new(crate::local_dns_namespaces::NamespacePolicy::new(
+        Arc::clone(&platform.claimed_namespaces),
+        crate::local_dns_suffixes::global_local_dns_suffixes(),
+        Arc::clone(&platform.system_dns),
+        Arc::clone(&platform.redirect),
+        platform.listen_addr,
+        Arc::new(ProductionRulesProvider::new(Arc::clone(
+            &inputs.settings_conn,
+        ))),
+        Arc::clone(&inputs.settings_conn),
+    ));
+    let exemptions: crate::dns_resolver_service::DnsNamespaceExemptionsFn =
+        Arc::new(move || namespaces.exemptions());
     Arc::new(move || {
         // Subscribed for as long as a resolver can be built on it.
         let _subscribed = &watch;
-        build_dns_resolver_instance(&inputs, &platform, fed)
+        build_dns_resolver_instance(&inputs, &platform, fed, Arc::clone(&exemptions))
     })
 }
 
@@ -201,6 +226,7 @@ fn build_dns_resolver_instance(
     inputs: &DnsStackInputs,
     platform: &DnsStackPlatform,
     fed: bool,
+    exemptions: crate::dns_resolver_service::DnsNamespaceExemptionsFn,
 ) -> Result<DnsResolverService, ArmRefusal> {
     use crate::dns_listener::DnsInterceptListener;
     use crate::dns_resolver_ports::{
@@ -272,13 +298,43 @@ fn build_dns_resolver_instance(
         }),
     );
     let sink = Arc::new(CacheFactSink::new(Arc::clone(&inputs.cache)));
-    let mut reconciler = HookSyncReconciler::new(inputs.recompute_hook.clone());
-    if let Some(coordinator) = inputs.route_coordinator.clone() {
-        let sid = Arc::clone(active_sid);
-        reconciler =
-            reconciler.with_first_contact(Arc::new(move |addresses: &[std::net::Ipv4Addr]| {
-                sid().map_or(0, |sid| coordinator.route_first_contact(&sid, addresses))
-            }));
+    let mut reconciler = HookSyncReconciler::new(inputs.recompute_hook.clone())
+        .with_liveness(inputs.liveness.clone());
+    let first_contact: Option<crate::dns_resolver_ports::FirstContactFn> =
+        match inputs.route_coordinator.clone() {
+            Some(coordinator) => {
+                let sid = Arc::clone(active_sid);
+                Some(Arc::new(move |addresses: &[std::net::Ipv4Addr]| {
+                    let addresses: Vec<std::net::IpAddr> = addresses
+                        .iter()
+                        .copied()
+                        .map(std::net::IpAddr::V4)
+                        .collect();
+                    sid().map_or(0, |sid| coordinator.route_first_contact(&sid, &addresses))
+                }))
+            }
+            None => inputs.first_contact.clone(),
+        };
+    let first_contact_v6: Option<crate::dns_resolver_ports::FirstContactV6Fn> =
+        match inputs.route_coordinator.clone() {
+            Some(coordinator) => {
+                let sid = Arc::clone(active_sid);
+                Some(Arc::new(move |addresses: &[std::net::Ipv6Addr]| {
+                    let addresses: Vec<std::net::IpAddr> = addresses
+                        .iter()
+                        .copied()
+                        .map(std::net::IpAddr::V6)
+                        .collect();
+                    sid().map_or(0, |sid| coordinator.route_first_contact(&sid, &addresses))
+                }))
+            }
+            None => inputs.first_contact_v6.clone(),
+        };
+    if let Some(route) = first_contact {
+        reconciler = reconciler.with_first_contact(route);
+    }
+    if let Some(route) = first_contact_v6 {
+        reconciler = reconciler.with_first_contact_v6(route);
     }
     let reconciler = Arc::new(reconciler);
     // Replies for non-rule hosts are filtered against the secondary-pinned set,
@@ -323,6 +379,14 @@ fn build_dns_resolver_instance(
                 msg_key = "dns-stack-short-name-suffixes-unread",
                 error = %e,
                 "the short-name domains could not be read; the ones read before stay in use",
+            );
+        }
+        if let Err(e) = crate::local_dns_suffixes::global_local_dns_suffixes().reload(&conn) {
+            tracing::warn!(
+                target: "nrr::dns-resolver",
+                msg_key = "dns-stack-local-suffixes-unread",
+                error = %e,
+                "the home-network suffix list could not be read; the one read before stays in use",
             );
         }
     }
@@ -418,9 +482,10 @@ fn build_dns_resolver_instance(
         Arc::clone(&platform.redirect),
         platform.listen_addr,
     )
+    .with_liveness(inputs.liveness.clone())
     // A corporate VPN announces its domain and servers; the product stays out
     // of names it has no business answering.
-    .with_namespace_exemptions(Arc::clone(&platform.claimed_namespaces))
+    .with_namespace_exemptions(exemptions)
     // The OS completes a short name before it asks anyone, and the redirect
     // can cost it the suffixes to complete with.
     .with_short_name_suffixes(Arc::new(move || user_suffix().into_iter().collect()));

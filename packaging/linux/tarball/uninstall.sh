@@ -71,7 +71,8 @@ reset_script="$NRR_SERVICE_INSTALL_DIR/scripts/reset-network.sh"
 if [ -f "$reset_script" ]; then
   bash "$reset_script" --binary "$NRR_STAGED_SERVICE_BINARY" || failures=$((failures + 1))
 else
-  nrr_yellow "    $reset_script is missing; reboot to drop whatever the service left"
+  nrr_yellow "    $reset_script is missing; giving DNS back by hand"
+  nrr_pkg_undo_dns_by_hand || failures=$((failures + 1))
 fi
 
 nrr_cyan "==> commands in $NRR_COMMAND_LINK_DIR"

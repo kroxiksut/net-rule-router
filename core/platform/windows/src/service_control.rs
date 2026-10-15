@@ -1,7 +1,7 @@
 //! Windows implementation of the service-control port: the Service Control
 //! Manager.
 //!
-//! This is mechanism only вЂ” every decision about *whether* an operation may run
+//! This is mechanism only — every decision about *whether* an operation may run
 //! and *what the user is told* lives in the caller. The module was extracted
 //! from the service binary so the administrative console can drive the same
 //! code path the service's own verbs and the elevation broker drive; a binary
@@ -37,13 +37,15 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 /// Poll cadence while waiting for a state transition.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How long an ended service process takes to read as stopped.
+const KILL_SETTLE: Duration = Duration::from_secs(10);
 
 /// The most a pending service's own wait hint may stretch a start wait: past
 /// it, a hint reads as a hang rather than a slow step.
 const MAX_WAIT_HINT: Duration = Duration::from_secs(120);
 
 /// Best-effort drain budget applied when uninstall has to stop a running
-/// service first. Uninstall proceeds even if the service is slow to go down вЂ”
+/// service first. Uninstall proceeds even if the service is slow to go down —
 /// SCM marks a still-running service for deletion on exit.
 const UNINSTALL_STOP_BUDGET: Duration = Duration::from_secs(10);
 
@@ -70,7 +72,7 @@ impl WindowsServiceControl {
 pub const BASE_FILTERING_ENGINE_SERVICE: &str = "BFE";
 
 /// Is the filtering engine running? `None` when the question cannot be answered
-/// (no rights to ask, SCM unreachable) вЂ” absence of an answer is not an answer.
+/// (no rights to ask, SCM unreachable) — absence of an answer is not an answer.
 ///
 /// Windows-only by nature: there is no equivalent to interrogate elsewhere, so
 /// this stays out of the neutral port.
@@ -85,12 +87,127 @@ pub fn filtering_engine_running() -> Option<bool> {
     Some(status.current_state == ServiceState::Running)
 }
 
+/// The file a deliberate stop leaves in the service data root, so the service
+/// can tell it from a stop the filtering engine forced. Writable by
+/// administrators only: anyone else could switch off the restart that follows
+/// the engine coming back.
+const DELIBERATE_STOP_MARKER: &str = "deliberate-stop";
+
+/// How long a marker speaks for a stop. A stop that never arrived must not
+/// silence a later one the engine forces.
+const DELIBERATE_STOP_FRESHNESS: Duration = Duration::from_secs(120);
+
+fn deliberate_stop_marker() -> Option<PathBuf> {
+    service_data_root()
+        .ok()
+        .map(|root| root.join(DELIBERATE_STOP_MARKER))
+}
+
+/// Say that the next stop is a person's, not the filtering engine's.
+fn mark_deliberate_stop() {
+    if let Some(path) = deliberate_stop_marker() {
+        let _ = std::fs::write(path, b"");
+    }
+}
+
+/// Whether the stop under way was asked for by one of our own verbs. Consumes
+/// the marker; a stale one counts for nothing.
+#[must_use]
+pub fn take_deliberate_stop_marker() -> bool {
+    let Some(path) = deliberate_stop_marker() else {
+        return false;
+    };
+    let fresh = std::fs::symlink_metadata(&path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|at| at.elapsed().ok())
+        .is_some_and(|age| age <= DELIBERATE_STOP_FRESHNESS);
+    let _ = std::fs::remove_file(&path);
+    fresh
+}
+
+/// The service's recovery actions, switched off until [`RecoveryHold::release`]
+/// or drop. The SCM restarts a process that ends without reporting itself
+/// stopped, so ending a hung service with these on would bring it back in the
+/// middle of the cleanup that follows.
+pub struct RecoveryHold {
+    saved: Option<(windows_service::service::ServiceFailureActions, bool)>,
+}
+
+/// Switch the recovery actions off, remembering them.
+pub fn hold_recovery() -> Result<RecoveryHold, ServiceControlError> {
+    use windows_service::service::{ServiceFailureActions, ServiceFailureResetPeriod};
+    let manager = open_manager(ServiceManagerAccess::CONNECT)?;
+    let service = manager
+        .open_service(
+            WINDOWS_SERVICE_NAME,
+            ServiceAccess::QUERY_CONFIG | ServiceAccess::CHANGE_CONFIG,
+        )
+        .map_err(map_service_error)?;
+    let actions = service
+        .get_failure_actions()
+        .map_err(|e| ServiceControlError::Mechanism {
+            detail: format!("read failure actions: {e}"),
+        })?;
+    let non_crash = service
+        .get_failure_actions_on_non_crash_failures()
+        .unwrap_or(true);
+    service
+        .update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::ZERO),
+            reboot_msg: None,
+            command: None,
+            actions: Some(Vec::new()),
+        })
+        .map_err(|e| ServiceControlError::Mechanism {
+            detail: format!("suspend failure actions: {e}"),
+        })?;
+    let _ = service.set_failure_actions_on_non_crash_failures(false);
+    Ok(RecoveryHold {
+        saved: Some((actions, non_crash)),
+    })
+}
+
+impl RecoveryHold {
+    /// Put the recovery actions back.
+    pub fn release(mut self) -> Result<(), ServiceControlError> {
+        self.restore()
+    }
+
+    fn restore(&mut self) -> Result<(), ServiceControlError> {
+        let Some((actions, non_crash)) = self.saved.take() else {
+            return Ok(());
+        };
+        let manager = open_manager(ServiceManagerAccess::CONNECT)?;
+        let service = manager
+            .open_service(WINDOWS_SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+            .map_err(map_service_error)?;
+        service
+            .update_failure_actions(actions)
+            .map_err(|e| ServiceControlError::Mechanism {
+                detail: format!("restore failure actions: {e}"),
+            })?;
+        service
+            .set_failure_actions_on_non_crash_failures(non_crash)
+            .map_err(|e| ServiceControlError::Mechanism {
+                detail: format!("restore failure actions on non-crash failures: {e}"),
+            })
+    }
+}
+
+impl Drop for RecoveryHold {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 impl ServiceControlPort for WindowsServiceControl {
     fn install(
         &self,
         spec: &ServiceInstallSpec,
     ) -> Result<ServiceInstallReport, ServiceControlError> {
-        // Step 1 вЂ” the privileged handle, before anything is written.
+        // Step 1 — the privileged handle, before anything is written.
         //
         // Registration is what this install cannot do without, and it is the
         // step that refuses an unelevated caller. Taken first, an access-denied
@@ -109,7 +226,7 @@ impl ServiceControlPort for WindowsServiceControl {
             Placement::AlreadyRegistered => return Ok(refresh_registration(&manager, spec)),
         };
 
-        // Step 2 вЂ” data directories, locked down before anything is registered.
+        // Step 2 — data directories, locked down before anything is registered.
         // A tree that already exists is locked down too: `%ProgramData%` lets
         // any user create it first and stay its owner.
         let mut dirs_created = Vec::new();
@@ -145,7 +262,7 @@ impl ServiceControlPort for WindowsServiceControl {
             launch_arguments: vec![],
             // Every filter this product installs goes through the Base Filtering
             // Engine, and its API calls block rather than fail while BFE is still
-            // coming up вЂ” an auto-start service that races it at OS boot can sit
+            // coming up — an auto-start service that races it at OS boot can sit
             // in START_PENDING until the SCM gives up. Declaring the dependency
             // hands the ordering to the SCM.
             dependencies: vec![ServiceDependency::Service(OsString::from("BFE"))],
@@ -156,18 +273,18 @@ impl ServiceControlPort for WindowsServiceControl {
             .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
             .map_err(map_service_error)?;
 
-        // Step 3 вЂ” description.
+        // Step 3 — description.
         service
             .set_description(WINDOWS_SERVICE_DESCRIPTION)
             .map_err(map_service_error)?;
 
-        // Step 4 вЂ” crash recovery actions. Best-effort: a service that is
+        // Step 4 — crash recovery actions. Best-effort: a service that is
         // registered but lacks failure actions is still a working install, and
         // the report says which of the two happened.
         let recovery_configured =
             configure_recovery(&service, &spec.recovery, &binary_path).is_ok();
 
-        // Step 5 вЂ” event-source registration, so lifecycle records show up under
+        // Step 5 — event-source registration, so lifecycle records show up under
         // our name instead of as "description cannot be found". Best-effort for
         // the same reason as recovery actions: a service that logs plainly is
         // still an installed service.
@@ -210,6 +327,7 @@ impl ServiceControlPort for WindowsServiceControl {
             // accept control right now, or one this caller may not stop, never
             // reaches STOPPED, and waiting out the full budget to discover that
             // just turns a clear refusal into a timeout.
+            mark_deliberate_stop();
             if service.stop().is_ok() {
                 stopped = wait_for_stopped(&service, UNINSTALL_STOP_BUDGET).is_ok();
             } else {
@@ -233,7 +351,7 @@ impl ServiceControlPort for WindowsServiceControl {
         // ONLY when the service really did stop. Sweeping under a live service
         // is worse than not sweeping at all: its next pass puts everything back,
         // the delete then succeeds, and the machine keeps orphaned filters and
-        // an NRPT rule pointing at a resolver that no longer exists вЂ” with
+        // an NRPT rule pointing at a resolver that no longer exists — with
         // nothing installed that would sweep them at boot. The report says which
         // of the two happened rather than claiming the machine is clean.
         let machine_state_cleared = if stopped {
@@ -283,7 +401,7 @@ impl ServiceControlPort for WindowsServiceControl {
             .map_err(map_service_error)?;
 
         // Already running: nothing to do. A start already in flight is NOT
-        // "done" вЂ” the poll below waits for it, so a caller that asked for a
+        // "done" — the poll below waits for it, so a caller that asked for a
         // running service gets one or an error, never a maybe.
         let status = service.query_status().map_err(map_service_error)?;
         if status.current_state == ServiceState::Running {
@@ -304,7 +422,7 @@ impl ServiceControlPort for WindowsServiceControl {
         // of a race.
         //
         // Only RUNNING ends the wait: accepting START_PENDING made a wedged
-        // service read as started. STOPPED is terminal too вЂ” the service ran
+        // service read as started. STOPPED is terminal too — the service ran
         // and gave up.
         //
         // A pending service names how long its next step may take (wait hint)
@@ -354,8 +472,30 @@ impl ServiceControlPort for WindowsServiceControl {
             return Ok(());
         }
 
+        mark_deliberate_stop();
         let _ = service.stop();
         wait_for_stopped(&service, timeout)
+    }
+
+    fn kill(&self) -> Result<(), ServiceControlError> {
+        let manager = open_manager(ServiceManagerAccess::CONNECT)?;
+        let service = manager
+            .open_service(WINDOWS_SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+            .map_err(map_service_error)?;
+        let status = service.query_status().map_err(map_service_error)?;
+        if status.current_state == ServiceState::Stopped {
+            return Ok(());
+        }
+        // A stop under way can leave the process gone before the state says so.
+        let Some(pid) = status.process_id else {
+            return wait_for_stopped(&service, KILL_SETTLE);
+        };
+        if !crate::win32_ffi::process::terminate(pid) {
+            return Err(ServiceControlError::Mechanism {
+                detail: format!("process {pid} could not be ended"),
+            });
+        }
+        wait_for_stopped(&service, KILL_SETTLE)
     }
 
     fn query(&self) -> Result<Option<ServiceStatusReport>, ServiceControlError> {
@@ -542,7 +682,7 @@ impl WindowsServiceControl {
                     target: "nrr::service-control",
                     msg_key = "win-svcctl-untrusted-binary-location",
                     problem = %problem,
-                    "registering a service binary that non-administrators can change вЂ” development build only",
+                    "registering a service binary that non-administrators can change — development build only",
                 );
             }
             return Ok(Placement::Register(source.to_path_buf()));
@@ -603,7 +743,7 @@ fn write_protected_copy(
 }
 
 /// What the service manager has registered, measured against the protected
-/// copy's path вЂ” a location this process computed, never one it was handed.
+/// copy's path — a location this process computed, never one it was handed.
 fn registered_from(
     manager: &ServiceManager,
     copy: &Path,
@@ -700,7 +840,7 @@ fn same_file_path(left: &Path, right: &Path) -> bool {
 }
 
 /// Translate an SCM failure into the neutral taxonomy. Only two OS codes carry
-/// meaning a caller can act on вЂ” everything else is reported verbatim.
+/// meaning a caller can act on — everything else is reported verbatim.
 fn map_service_error(err: windows_service::Error) -> ServiceControlError {
     // ERROR_ACCESS_DENIED = 5, ERROR_SERVICE_DOES_NOT_EXIST = 1060.
     if let windows_service::Error::Winapi(io_err) = &err {
@@ -760,17 +900,24 @@ fn configure_recovery(
         })
         .map_err(|e| ServiceControlError::Mechanism {
             detail: format!("set failure actions: {e}"),
+        })?;
+    // A stop that reports an error — the service going down with the filtering
+    // engine — gets the same recovery as a crash.
+    service
+        .set_failure_actions_on_non_crash_failures(true)
+        .map_err(|e| ServiceControlError::Mechanism {
+            detail: format!("set failure actions on non-crash failures: {e}"),
         })
 }
 
 /// Restrict the service-owned data directory to the security baseline.
 ///
-/// SYSTEM and Administrators only вЂ” no `Users` entry anywhere under the tree.
+/// SYSTEM and Administrators only — no `Users` entry anywhere under the tree.
 /// The state DB carries every SID's rule set, route bindings and session list;
 /// the audit directory is the tamper-evident record of who changed what; the
 /// operational log names the hosts each user's traffic touched. Reads of those
 /// go through the service, scoped to the caller, and a diagnostics archive is
-/// handed over by `file_handoff` вЂ” nothing needs the folder itself.
+/// handed over by `file_handoff` — nothing needs the folder itself.
 ///
 /// The owner becomes Administrators and explicit entries below the root are
 /// dropped: under `%ProgramData%` any account may create the tree first, and
@@ -882,7 +1029,7 @@ const SWEEP_BUDGET: Duration = Duration::from_secs(30);
 /// Run `work` on a worker thread and give up on it after `budget`.
 ///
 /// `None` means it did not answer in time. The thread is abandoned rather than
-/// cancelled вЂ” a blocked RPC into the filtering engine cannot be interrupted,
+/// cancelled — a blocked RPC into the filtering engine cannot be interrupted,
 /// and this runs in a short-lived process that is about to exit anyway.
 fn within<T, F>(budget: Duration, work: F) -> Option<T>
 where
@@ -912,14 +1059,14 @@ where
 /// the next reboot, and adopting them needs the reconciler from the service
 /// layer, which this crate must not depend on.
 ///
-/// Returns `false` if either sweep could not run вЂ” the caller reports it rather
+/// Returns `false` if either sweep could not run — the caller reports it rather
 /// than failing the removal, because a registered service is the worse outcome.
 fn sweep_enforcement_state() -> bool {
     let api: std::sync::Arc<dyn nrr_platform_api::windows_api::WindowsApiPort> =
         std::sync::Arc::new(crate::windows_api::ProductionWindowsApi);
     // Budgeted: opening the engine and sweeping it are both RPC into the Base
     // Filtering Engine, and a wedged engine answers neither. Removal must not
-    // be the command that hangs вЂ” a service left registered is the worse
+    // be the command that hangs — a service left registered is the worse
     // outcome, and our filters are not persistent, so a reboot clears whatever
     // this could not.
     let filters_swept = within(SWEEP_BUDGET, move || {
@@ -929,7 +1076,7 @@ fn sweep_enforcement_state() -> bool {
     })
     .unwrap_or(false);
     // Only once the filters are gone: the sub-layer cannot be deleted while
-    // anything still references it. Its own handle rather than the session's вЂ”
+    // anything still references it. Its own handle rather than the session's —
     // that one belongs to the neutral layer and does not hand out its token.
     if filters_swept {
         if let Ok(token) = crate::win32_ffi::wfp_engine::engine_open() {
@@ -945,13 +1092,13 @@ fn sweep_enforcement_state() -> bool {
         }
     }
     // Machine-wide engine options, including ones an instance that was killed
-    // rather than stopped left changed вЂ” it wrote down what they held.
+    // rather than stopped left changed — it wrote down what they held.
     crate::conn_observe::wfp_events::restore_engine_options();
     // The autostart entry, for whoever is running the removal.
     //
     // Per-user by nature (`HKCU`), so this reaches exactly one hive: the
     // caller's. Another account that also enabled autostart keeps its entry,
-    // and reaching it would mean walking other users' registry вЂ” invasive, and
+    // and reaching it would mean walking other users' registry — invasive, and
     // still blind to anyone not logged in. The residue is inert (it names an
     // executable that no longer exists), so the honest split is: clear what we
     // can reach here, and leave the rest to a per-user uninstall action.

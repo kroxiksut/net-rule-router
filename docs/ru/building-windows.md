@@ -141,12 +141,16 @@ cargo clean -p nrr-qt-host; cargo build -p nrr-qt-host
 ### Проверка качества (для контрибьюторов)
 
 ```powershell
-# fmt + clippy + тесты + аудит лицензий/зависимостей
+# синтаксис QML (qmllint) + fmt + clippy + тесты + аудит лицензий/зависимостей
 powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
 ```
 
 Для флага `-RequireCargoDeny` нужен [cargo-deny](https://github.com/EmbarkStudios/cargo-deny):
 `cargo install cargo-deny`. Без него — тот же скрипт без флага.
+
+Проверка QML берёт `qmllint` из того же Qt, что находит сборка (`CMAKE_PREFIX_PATH`,
+иначе самый новый в `C:\Qt`). Без Qt она пропускается с предупреждением;
+`-RequireQmlLint` превращает пропуск в ошибку, а `-QmlLintOnly` запускает только её.
 
 ## Переменные окружения
 

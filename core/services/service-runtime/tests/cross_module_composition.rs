@@ -231,7 +231,7 @@ fn event_bus_publish_subscribe_advance_round_trip() {
         service_state: "running".to_string(),
         worst_severity: "ok".to_string(),
     });
-    let id3 = bus.publish(StatusUpdateEvent::Overflow { dropped_count: 2 });
+    let id3 = bus.publish(StatusUpdateEvent::SecurityAlertsChanged);
 
     let pending = bus.peek_pending_for(&s.subscription_id, 16);
     assert_eq!(pending.len(), 3);
@@ -244,9 +244,6 @@ fn event_bus_publish_subscribe_advance_round_trip() {
         bus.peek_pending_for(&s.subscription_id, 16).is_empty(),
         "after advance to {id3}, no pending events should remain"
     );
-
-    // Drop counter is 0 after a clean delivery (no record_drop calls).
-    assert_eq!(bus.take_dropped_count(&s.subscription_id), 0);
 
     // NoopRecoveryAuditSink import sanity — the type is part of the
     // public surface and constructible without args. (Compile-time

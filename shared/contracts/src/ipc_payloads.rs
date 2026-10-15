@@ -103,9 +103,7 @@ pub struct ServiceHealthRequest {}
 
 /// Wire-format mirror of the GUI's "service health" surface. `components`
 /// carries the aggregator's per-component breakdown, so a `worst_severity` of
-/// "degraded" always names what is degraded. `degraded_modes` stays empty until
-/// the runtime tracks named modes; the field is in the schema so filling it
-/// later is non-breaking.
+/// "degraded" always names what is degraded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ServiceHealthResponse {
@@ -114,7 +112,6 @@ pub struct ServiceHealthResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_revision_id: Option<String>,
     pub components: Vec<HealthComponentResponse>,
-    pub degraded_modes: Vec<String>,
     /// Live fake-IP datapath status. `desired && !running` means the
     /// user's fake-IP toggle is ON but the datapath is down — the GUI
     /// must surface that outage instead of staying silent. Optional
@@ -149,6 +146,11 @@ pub struct HealthComponentResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
+
+/// Opens the `apply` health message when the local resolver could not hand
+/// the system DNS back; clients read it through
+/// `nrr_client_logic::system_dns::not_restored`.
+pub const SYSTEM_DNS_NOT_RESTORED: &str = "system DNS could not be restored";
 
 // ── SnapshotInterfaces ───────────────────────────────────────────────────────
 
@@ -557,9 +559,8 @@ pub type InterfacesRefreshResponse = SnapshotInterfacesResponse;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct StatusUpdatesSubscribeRequest {
-    /// Stable client id chosen by the GUI/Tray (not the per-pipe
-    /// session id). Lets the server attribute dropped-event counters
-    /// across reconnects of the same client process.
+    /// Stable client id chosen by the GUI/Tray (not the per-pipe session id),
+    /// so a reconnect of the same client replaces its earlier subscription.
     pub client_id: String,
     /// Last `event_id` the client successfully processed before the
     /// previous disconnect. `None` ⇒ first-time subscribe; the client
@@ -625,10 +626,6 @@ pub enum StatusUpdateEvent {
     /// clients re-read the list. Everyone's news: a blocking alert refuses
     /// every user's rule changes until someone acknowledges it.
     SecurityAlertsChanged,
-    /// Buffer overflow signal — client should issue
-    /// `SnapshotInitialGet` to fully resync. Carries the count of
-    /// events dropped on the way out.
-    Overflow { dropped_count: u64 },
     // ── Settings push events ──────────────────────────────────────
     /// A revision row's status changed (candidate → active → superseded
     /// / rolled-back / rejected). GUI may refresh its pending list.
@@ -721,6 +718,15 @@ pub enum StatusUpdateEvent {
     /// broken until it is restarted. The user is told rather than left to
     /// guess.
     AppRuleLearningDestinations { sid: String, apps: Vec<String> },
+    /// Programs named like a VPN client sit outside the protected program
+    /// folders, so leak protection does not exempt them by name. Published on
+    /// change with the caller's whole pending list (empty when the last one
+    /// was confirmed or left); the client offers to confirm each as the link
+    /// provider, and the snapshot carries the same list for a later connect.
+    VpnClientAwaitingConfirmation {
+        sid: String,
+        clients: Vec<PendingVpnClientDto>,
+    },
     /// The additional route (re)connected and the service observed the address
     /// the outside world sees behind it. The tray shows it for a few seconds —
     /// an additional link whose own client cannot report its exit address is
@@ -752,6 +758,18 @@ pub enum StatusUpdateEvent {
         /// Adapter description as the interfaces list shows it, so the notice
         /// can name the connection the user just started.
         adapter_name: String,
+    },
+    /// The network handed the main link a "local" segment wider than any
+    /// local network can be — half the internet, on a hostile access point.
+    /// Leak protection keeps blocking it rather than let it through as the
+    /// LAN, so devices on that segment stay unreachable while routed traffic
+    /// is cut; the user is told which link and which number.
+    LocalNetworkTooWide {
+        sid: String,
+        /// Adapter description as the interfaces list shows it.
+        adapter_name: String,
+        /// The segment as reported, with its prefix.
+        network: String,
     },
     /// A new block episode was recorded for `sid` and survived muting — the
     /// tray shows it as a notice. Fires once per episode (see
@@ -833,6 +851,11 @@ pub enum StatusUpdateEvent {
         #[serde(default)]
         sample: Vec<String>,
     },
+    /// The local resolver ended without handing the system DNS back, so name
+    /// resolution on this machine may fail until the network is restored.
+    /// Everyone's news: the redirect is machine-wide. The standing state rides
+    /// the health answer ([`SYSTEM_DNS_NOT_RESTORED`]).
+    SystemDnsNotRestored,
 }
 
 impl StatusUpdateEvent {
@@ -854,8 +877,10 @@ impl StatusUpdateEvent {
             | Self::RuleDuplicatesDetected { sid, .. }
             | Self::HostUnreachableOnBothRoutes { sid, .. }
             | Self::AppRuleLearningDestinations { sid, .. }
+            | Self::VpnClientAwaitingConfirmation { sid, .. }
             | Self::SecondaryExternalAddressObserved { sid, .. }
             | Self::UnassignedTunnelDetected { sid, .. }
+            | Self::LocalNetworkTooWide { sid, .. }
             | Self::BlockNoticeRaised { sid, .. }
             | Self::BlockNoticeMutesChanged { sid }
             | Self::VerifyVerdictsChanged { sid, .. }
@@ -870,9 +895,9 @@ impl StatusUpdateEvent {
             | Self::ProtectionCoverageChanged { .. }
             | Self::AdaptersChanged { .. }
             | Self::SecurityAlertsChanged
-            | Self::Overflow { .. }
             | Self::ApplyFailurePolicyChanged { .. }
-            | Self::RetentionSettingsChanged => None,
+            | Self::RetentionSettingsChanged
+            | Self::SystemDnsNotRestored => None,
         }
     }
 }
@@ -1049,6 +1074,12 @@ pub struct SnapshotInitialResponse {
     /// Wire key: `routes-held-by-another-user`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routes_held_by_another_user: Option<RoutesHeldDto>,
+    /// The caller's programs named like a VPN client that leak protection does
+    /// not trust by place, awaiting confirmation as the link provider — the
+    /// standing twin of `VpnClientAwaitingConfirmation`. Wire key:
+    /// `pending-vpn-clients`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_vpn_clients: Vec<PendingVpnClientDto>,
 }
 
 /// The payload of [`StatusUpdateEvent::RoutesHeldByAnotherUser`] without the SID.

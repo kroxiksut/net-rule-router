@@ -1,6 +1,9 @@
 ﻿param(
     [switch]$RequireCargoDeny,
-    [switch]$CommentHygieneOnly
+    [switch]$CommentHygieneOnly,
+    # CI passes it: a runner without qmllint means the Qt install step broke.
+    [switch]$RequireQmlLint,
+    [switch]$QmlLintOnly
 )
 
 Set-StrictMode -Version Latest
@@ -332,9 +335,157 @@ function Test-PublicDocsTerms {
     }
 }
 
+# Containing a panic on foreign bytes (catch_unwind on every parser path, the
+# DNS restore in Drop) works only while panics unwind: under `abort` one bad
+# packet stops the service. Cargo takes profiles from the workspace root alone,
+# but a config file or the environment can force the strategy as well.
+$PanicAbortPattern = 'panic\s*=\s*["'']?abort\b'
+
+function Find-PanicAbort([string[]]$Paths) {
+    $found = New-Object System.Collections.Generic.List[string]
+    foreach ($path in $Paths) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $lineNo = 0
+        foreach ($line in [System.IO.File]::ReadLines($path)) {
+            $lineNo += 1
+            if (($line -replace '(^|\s)#.*$', '') -match $PanicAbortPattern) {
+                $found.Add("${path}:${lineNo}: $($line.Trim())")
+            }
+        }
+    }
+    , $found
+}
+
+function Test-PanicStrategy {
+    $fixture = Join-Path $PSScriptRoot 'tests\panic-strategy'
+    $probe = Find-PanicAbort @((Join-Path $fixture 'Cargo.toml.fixture'), (Join-Path $fixture 'config.toml.fixture'))
+    if ($probe.Count -ne 3) {
+        $probe | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+        throw "panic strategy self-test failed: expected 3 findings in $fixture, got $($probe.Count)."
+    }
+
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $offences = Find-PanicAbort @(
+        (Join-Path $repoRoot 'Cargo.toml'),
+        (Join-Path $repoRoot '.cargo\config.toml'),
+        (Join-Path $repoRoot '.cargo\config'))
+    foreach ($var in Get-ChildItem Env:) {
+        $flags = $var.Name -match '^(RUSTFLAGS|CARGO_\w*RUSTFLAGS)$' -and $var.Value -match $PanicAbortPattern
+        $strategy = $var.Name -match '^CARGO_PROFILE_\w+_PANIC$' -and $var.Value.Trim() -eq 'abort'
+        if ($flags -or $strategy) { $offences.Add("environment: $($var.Name)=$($var.Value)") }
+    }
+    if ($offences.Count -gt 0) {
+        $offences | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+        throw "panic strategy: $($offences.Count) setting(s) make panics abort; the service relies on unwinding."
+    }
+}
+
+# Nothing compiles QML, so a syntax error that keeps the main window from
+# loading passes every Rust gate. qmllint tags such an error `[syntax]` yet may
+# still exit 0, so the tag is the verdict; its ordinary warnings (unresolved
+# imports, unqualified access) are not.
+function Find-QmlLint {
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if ($env:CMAKE_PREFIX_PATH) {
+        foreach ($entry in $env:CMAKE_PREFIX_PATH.Split(';')) {
+            # Either the kit or its lib\cmake, as the Qt host's build script takes it.
+            $kit = $entry.Trim().TrimEnd('\', '/') -replace '[\\/]lib[\\/]cmake$', ''
+            if ($kit) { $candidates.Add((Join-Path $kit 'bin\qmllint.exe')) }
+        }
+    }
+    # The fallback the Qt host's build script and package-windows.ps1 apply:
+    # the newest version under C:\Qt, compared as a version, not a string.
+    $kitNames = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { @('msvc2022_arm64', 'msvc2022_64') } else { @('msvc2022_64') }
+    Get-ChildItem -Path 'C:\Qt' -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
+        Sort-Object { [version]$_.Name } -Descending |
+        ForEach-Object {
+            foreach ($kitName in $kitNames) { $candidates.Add((Join-Path $_.FullName "$kitName\bin\qmllint.exe")) }
+        }
+    $onPath = Get-Command 'qmllint.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $onPath) { $candidates.Add($onPath.Source) }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    $null
+}
+
+# Runs qmllint from $Dir; stdout and stderr come back as plain lines.
+function Invoke-QmlLint([string]$Tool, [string]$Dir, [string[]]$Files) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    Push-Location -LiteralPath $Dir
+    try {
+        $lines = @(& $Tool @Files 2>&1 | ForEach-Object { "$_" })
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+        $ErrorActionPreference = $previous
+    }
+    [pscustomobject]@{ Code = $code; Lines = $lines }
+}
+
+function Test-QmlLint {
+    $tool = Find-QmlLint
+    if ($null -eq $tool) {
+        $message = 'qmllint not found (CMAKE_PREFIX_PATH, C:\Qt\<version>\<kit>\bin, PATH): QML is NOT checked by this run.'
+        if ($RequireQmlLint) { throw $message }
+        Write-Host "[check] $message" -ForegroundColor Yellow
+        return
+    }
+
+    # The gate first proves it still sees a syntax error: a qmllint that stops
+    # tagging them would otherwise pass every file silently.
+    $fixture = Join-Path $PSScriptRoot 'tests\qmllint'
+    $probe = Invoke-QmlLint $tool $fixture @('broken.qml')
+    if (@($probe.Lines | Where-Object { $_.Contains('[syntax]') }).Count -eq 0) {
+        $probe.Lines | Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+        throw "qmllint self-test failed: '$tool' reports no [syntax] line for $fixture\broken.qml."
+    }
+
+    # Every QML file git would publish, wherever it lives; the fixture is not one.
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $consoleEncoding = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $listing = & git -C $repoRoot -c core.quotepath=off ls-files --cached --others --exclude-standard
+    } finally {
+        [Console]::OutputEncoding = $consoleEncoding
+    }
+    if ($LASTEXITCODE -ne 0) { throw 'qmllint: git ls-files failed.' }
+    $files = @($listing | Where-Object {
+            $_.EndsWith('.qml', [StringComparison]::Ordinal) -and
+            -not $_.StartsWith('scripts/tests/qmllint/', [StringComparison]::Ordinal) -and
+            (Test-Path -LiteralPath (Join-Path $repoRoot $_) -PathType Leaf)
+        })
+    if ($files.Count -eq 0) { throw 'qmllint: git lists no .qml file, so the scan would check nothing.' }
+
+    Write-Host "[check] qmllint: $tool over $($files.Count) file(s)" -ForegroundColor Cyan
+    $run = Invoke-QmlLint $tool $repoRoot $files
+    $syntax = @($run.Lines | Where-Object { $_.Contains('[syntax]') })
+    if ($syntax.Count -gt 0) {
+        $syntax | Select-Object -First 20 | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+        if ($syntax.Count -gt 20) {
+            Write-Host "  ... and $($syntax.Count - 20) more" -ForegroundColor Yellow
+        }
+        throw "qmllint: $($syntax.Count) syntax error(s); a QML file with one does not load."
+    }
+    if ($run.Code -ne 0) {
+        $run.Lines | Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+        throw "qmllint failed with exit code $($run.Code)."
+    }
+}
+
+if ($QmlLintOnly) {
+    Test-QmlLint
+    Write-Host '[check] qmllint only: passed' -ForegroundColor Green
+    exit 0
+}
+
 Write-Host '[check] NetRuleRouter workspace quality baseline' -ForegroundColor Cyan
 
 Write-Host '[check] sync duplicates' -ForegroundColor Cyan
+& (Join-Path $PSScriptRoot 'clean-sync-duplicates.ps1') -SelfTest
 & (Join-Path $PSScriptRoot 'clean-sync-duplicates.ps1')
 
 Write-Host '[check] comment hygiene: no task references or dates in comments' -ForegroundColor Cyan
@@ -346,10 +497,16 @@ Test-DoubledWords
 Write-Host '[check] public docs: no internal mechanism or private-document terms' -ForegroundColor Cyan
 Test-PublicDocsTerms
 
+Write-Host '[check] panic strategy: panics unwind' -ForegroundColor Cyan
+Test-PanicStrategy
+
 if ($CommentHygieneOnly) {
     Write-Host '[check] comment hygiene only: passed' -ForegroundColor Green
     exit 0
 }
+
+Write-Host '[check] qmllint: no QML syntax errors' -ForegroundColor Cyan
+Test-QmlLint
 
 # Invoked as `cargo-fmt`, not `cargo fmt`: a user-level cargo alias named `fmt`
 # shadows the subcommand and makes cargo emit a warning on stderr, which this

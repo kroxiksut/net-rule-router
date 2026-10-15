@@ -87,6 +87,51 @@ fn an_accepted_resubscribe_remembers_the_new_subscription_id() {
     );
 }
 
+/// A replayed subscription starts at the service's head, so whatever was
+/// published while the connection was down is gone: the subscriber hears
+/// `push-gap` before any frame of the new subscription.
+#[test]
+fn an_accepted_resubscribe_announces_the_hole_to_the_subscriber() {
+    let inner = inner_with_remembered_subscription();
+    let (tx, rx) = sync_channel::<Value>(8);
+    *inner.push_tx.lock().expect("lock") = Some(tx);
+    let (mut client_io, mut server_io) = loopback_pair();
+    let server = thread::spawn(move || {
+        let req: Value = read_frame(&mut server_io).expect("server read");
+        let request_id = req
+            .get("request-id")
+            .and_then(|v| v.as_str())
+            .expect("request-id")
+            .to_string();
+        // A frame queued ahead of the reply, as a live service does.
+        let push = serde_json::json!({
+            "request-id": "",
+            "ok": true,
+            "payload": { "event": { "type": "adapters-changed" } },
+        });
+        write_frame(&mut server_io, &push).expect("server push");
+        let resp = serde_json::json!({
+            "ok": true,
+            "request-id": request_id,
+            "payload": {"subscription-id": "new-sub-43"},
+        });
+        write_frame(&mut server_io, &resp).expect("server write");
+    });
+
+    assert!(replay_subscription(&inner, &mut client_io));
+    server.join().expect("server thread");
+
+    let first = rx.try_recv().expect("the hole is announced");
+    assert_eq!(first["event"]["type"], "push-gap", "{first}");
+    let second = rx.try_recv().expect("the frame behind it");
+    assert_eq!(second["event"]["type"], "adapters-changed", "{second}");
+    assert!(rx.try_recv().is_err(), "the hole is announced once");
+    assert!(
+        !inner.push_gap.load(Ordering::SeqCst),
+        "the debt is settled"
+    );
+}
+
 /// A transport that dies mid-resubscribe (the read never returns a frame) is
 /// the one case that must still force a reconnect.
 #[test]

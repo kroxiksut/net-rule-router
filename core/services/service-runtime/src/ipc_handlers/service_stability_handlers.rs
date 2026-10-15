@@ -86,26 +86,18 @@ impl IpcHandler for ServiceStabilityConfigGetHandler {
 
 pub struct ServiceStabilityConfigSetHandler {
     writer: Arc<dyn ServiceStabilityConfigWriter>,
-    /// Reader for the current row, used to tell an actual change of the
-    /// machine-wide change from a client merely echoing the row back. `None`
-    /// (stub wiring) leaves that check inert — there is no stored row to
-    /// protect when the whole settings subsystem is a stub.
-    provider: Option<Arc<dyn ServiceStabilityConfigProvider>>,
+    /// Reader for the current row: tells a real change of a machine-wide
+    /// field from a client echoing the row back. Required, so the gate cannot
+    /// be wired inert.
+    provider: Arc<dyn ServiceStabilityConfigProvider>,
 }
 
 impl ServiceStabilityConfigSetHandler {
-    pub fn new(writer: Arc<dyn ServiceStabilityConfigWriter>) -> Self {
-        Self {
-            writer,
-            provider: None,
-        }
-    }
-
-    /// Attach the reader so the handler can tell a change from an echo.
-    #[must_use]
-    pub fn with_provider(mut self, provider: Arc<dyn ServiceStabilityConfigProvider>) -> Self {
-        self.provider = Some(provider);
-        self
+    pub fn new(
+        writer: Arc<dyn ServiceStabilityConfigWriter>,
+        provider: Arc<dyn ServiceStabilityConfigProvider>,
+    ) -> Self {
+        Self { writer, provider }
     }
 
     /// Wire names of the fields this request would change. Clients
@@ -113,10 +105,7 @@ impl ServiceStabilityConfigSetHandler {
     /// pure echo and must keep passing; anything else is an administrator's
     /// call. A lock of `None` means "leave it alone" and is never a change.
     fn machine_changes(&self, requested: &ServiceStabilityConfigDto) -> Vec<String> {
-        let Some(provider) = self.provider.as_ref() else {
-            return Vec::new();
-        };
-        let current = provider.get();
+        let current = self.provider.get();
         let (Ok(serde_json::Value::Object(mut want)), Ok(serde_json::Value::Object(have))) = (
             serde_json::to_value(requested),
             serde_json::to_value(&current),
@@ -181,7 +170,7 @@ impl IpcHandler for ServiceStabilityConfigSetHandler {
                 "refused a non-elevated change of machine-wide service settings",
             );
             return Err(crate::machine_scoped::machine_scoped_refusal(
-                "This service setting",
+                crate::machine_scoped::MachineScopedSetting::ServiceStability,
             ));
         }
         let sid = if ctx.caller_stored().is_empty() {
@@ -284,6 +273,12 @@ mod tests {
         }
     }
 
+    fn default_provider() -> Arc<dyn ServiceStabilityConfigProvider> {
+        Arc::new(FakeProvider {
+            config: Mutex::new(ServiceStabilityConfigDto::default()),
+        })
+    }
+
     #[test]
     fn get_returns_provider_value() {
         let dto = ServiceStabilityConfigDto::default();
@@ -310,7 +305,7 @@ mod tests {
             config: Mutex::new(None),
             reject: false,
         });
-        let h = ServiceStabilityConfigSetHandler::new(Arc::clone(&writer));
+        let h = ServiceStabilityConfigSetHandler::new(Arc::clone(&writer), default_provider());
         let payload = serde_json::json!({
             "config": {
                 "ipc-accept-policy": {
@@ -335,7 +330,7 @@ mod tests {
             config: Mutex::new(None),
             reject: false,
         });
-        let h = ServiceStabilityConfigSetHandler::new(writer);
+        let h = ServiceStabilityConfigSetHandler::new(writer, default_provider());
         let payload = serde_json::json!({
             "config": {
                 "ipc-accept-policy": { "kind": "critical" }
@@ -356,7 +351,7 @@ mod tests {
             config: Mutex::new(None),
             reject: true,
         });
-        let h = ServiceStabilityConfigSetHandler::new(writer);
+        let h = ServiceStabilityConfigSetHandler::new(writer, default_provider());
         let payload = serde_json::json!({
             "config": {
                 "ipc-accept-policy": {
@@ -408,7 +403,7 @@ mod tests {
     fn handler_with(
         writer: Arc<dyn ServiceStabilityConfigWriter>,
     ) -> ServiceStabilityConfigSetHandler {
-        ServiceStabilityConfigSetHandler::new(writer).with_provider(provider_with_lock(false))
+        ServiceStabilityConfigSetHandler::new(writer, provider_with_lock(false))
     }
 
     fn recording_writer() -> Arc<FakeWriter> {
@@ -448,8 +443,7 @@ mod tests {
             config: Mutex::new(None),
             reject: false,
         });
-        let h =
-            ServiceStabilityConfigSetHandler::new(writer).with_provider(provider_with_lock(true));
+        let h = ServiceStabilityConfigSetHandler::new(writer, provider_with_lock(true));
         let err = h
             .handle(
                 &env(
@@ -579,7 +573,7 @@ mod tests {
             config: Mutex::new(None),
             reject: false,
         });
-        let h = ServiceStabilityConfigSetHandler::new(writer);
+        let h = ServiceStabilityConfigSetHandler::new(writer, default_provider());
         let payload = serde_json::json!({
             "config": { "ipc-accept-policy": { "kind": "unknown" } }
         });

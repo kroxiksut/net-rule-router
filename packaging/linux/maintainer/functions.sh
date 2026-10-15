@@ -72,12 +72,121 @@ nrr_pkg_restart_if_running() {
   fi
 }
 
+# Give DNS back without the daemon: every mechanism, each acting only on a
+# trace of its own, since the machine may have changed since the daemon ran.
+# Mirrors platform/linux dns_redirect (OURS_MARKER, DnsFiles::system,
+# REDIRECT_LINK, the NetworkManager drop-in, the resolvconf record) and the
+# by-hand undo of reset-network.sh; a drifted value here would miss the
+# daemon's redirect or touch somebody else's. Returns 1 when a step failed,
+# with the copies that step restores from left in place.
+nrr_pkg_undo_dns_by_hand() {
+  marker="# NetRuleRouter answers DNS here; the system's own file returns when it stops."
+  resolv_conf="/etc/resolv.conf"
+  copy="$NRR_STATE_DIR/resolv.conf.system"
+  link_note="$NRR_STATE_DIR/resolv.conf.system-link"
+  taken="$NRR_STATE_DIR/dns-catch-all-taken"
+  drop_in="/run/NetworkManager/conf.d/99-$NRR_PRODUCT_NAME_UNIX-dns.conf"
+  record="lo.$NRR_PRODUCT_NAME_UNIX"
+  failed=0
+
+  # systemd-resolved: hand `~.` back to every link it was taken from, then
+  # drop the dummy link, which makes resolved forget our server.
+  if [ -f "$taken" ] && command -v resolvectl >/dev/null 2>&1; then
+    given_back=1
+    while IFS= read -r name || [ -n "$name" ]; do
+      name=$(printf '%s' "$name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      [ -n "$name" ] || continue
+      # One `Link N (name): values` line; a link that is gone reclaims `~.`
+      # itself when it returns.
+      shown=$(resolvectl domain "$name" 2>/dev/null) || continue
+      values=$(printf '%s\n' "$shown" | sed -n 's/^[[:space:]]*Link [0-9][0-9]* ([^)]*):[[:space:]]*//p' | head -n 1)
+      case " $values " in
+        *" ~. "*) continue ;;
+      esac
+      # shellcheck disable=SC2086
+      if ! resolvectl domain "$name" $values '~.'; then
+        given_back=0
+      fi
+    done <"$taken"
+    if [ "$given_back" -eq 1 ]; then
+      rm -f -- "$taken"
+    else
+      failed=1
+    fi
+  fi
+  if command -v ip >/dev/null 2>&1 && ip link show dev "$NRR_PRODUCT_NAME_UNIX" >/dev/null 2>&1; then
+    ip link del "$NRR_PRODUCT_NAME_UNIX" || failed=1
+  fi
+
+  if [ -e "$drop_in" ]; then
+    if rm -f -- "$drop_in"; then
+      nmcli general reload >/dev/null 2>&1 || true
+    else
+      failed=1
+    fi
+  fi
+
+  for dir in /run/resolvconf/interface /run/resolvconf/interfaces; do
+    [ -e "$dir/$record" ] || continue
+    # openresolv wants -f to stay quiet about a record that just went away;
+    # Debian's resolvconf does not know it.
+    resolvconf -f -d "$record" 2>/dev/null || resolvconf -d "$record" || failed=1
+    break
+  done
+
+  # The system's resolv.conf back in place of ours; anyone else's file standing
+  # there now is newer than our copy, so the copy goes either way.
+  if [ -r "$copy" ]; then
+    ours=0
+    if [ -r "$resolv_conf" ]; then
+      first=$(head -n 1 "$resolv_conf" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      [ "$first" = "$marker" ] && ours=1
+    fi
+    restored=1
+    if [ "$ours" -eq 1 ]; then
+      if [ -r "$link_note" ]; then
+        target=$(head -n 1 "$link_note" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        tmp="/etc/.resolv.conf.$NRR_PRODUCT_NAME_UNIX-link"
+        rm -f -- "$tmp"
+        if ! { ln -s -- "$target" "$tmp" && mv -f -- "$tmp" "$resolv_conf"; }; then
+          rm -f -- "$tmp"
+          restored=0
+        fi
+      else
+        tmp="/etc/.resolv.conf.$NRR_PRODUCT_NAME_UNIX-new"
+        if ! { cat -- "$copy" >"$tmp" && chmod 0644 -- "$tmp" && mv -f -- "$tmp" "$resolv_conf"; }; then
+          rm -f -- "$tmp"
+          restored=0
+        fi
+      fi
+    fi
+    if [ "$restored" -eq 1 ]; then
+      rm -f -- "$copy" "$link_note"
+    else
+      failed=1
+    fi
+  fi
+
+  if command -v resolvectl >/dev/null 2>&1; then
+    resolvectl flush-caches >/dev/null 2>&1 || true
+  fi
+  return "$failed"
+}
+
 # Removal: stop for good, then give the network back through reset-network.sh,
 # which runs the daemon's own `cleanup` and undoes by hand what that cannot.
-# Never fails the removal: a stuck package would leave the same state behind.
+# Without the script, or when it fails, the DNS redirect and the packet
+# filters go by hand: nothing removed with the package could lift a redirect
+# that outlives the reboot. Never fails the removal: a stuck package would
+# leave the same state behind.
 nrr_pkg_stop_and_reset_network() {
   if nrr_pkg_have_systemd; then
     systemctl disable --now "$NRR_UNIT_NAME" >/dev/null 2>&1 || true
+    # A daemon stuck in its stop would refuse the cleanup and put back what
+    # the undo by hand removes.
+    if systemctl is-active --quiet "$NRR_UNIT_NAME"; then
+      systemctl kill -s KILL "$NRR_UNIT_NAME" >/dev/null 2>&1 || true
+    fi
   fi
   reset_script="$NRR_SERVICE_INSTALL_DIR/scripts/reset-network.sh"
   if [ -f "$reset_script" ] && command -v bash >/dev/null 2>&1; then
@@ -89,17 +198,37 @@ nrr_pkg_stop_and_reset_network() {
       return 0
     fi
   fi
-  echo "$NRR_PRODUCT_NAME: the network may not be fully restored; a reboot clears what is left." >&2
+  if command -v nft >/dev/null 2>&1; then
+    nft delete table "$NRR_NFT_FAMILY" "$NRR_NFT_TABLE" >/dev/null 2>&1 || true
+  fi
+  if nrr_pkg_undo_dns_by_hand; then
+    echo "$NRR_PRODUCT_NAME: DNS was given back; a reboot clears what else is left." >&2
+  else
+    echo "$NRR_PRODUCT_NAME: the network may not be fully restored; a reboot clears what is left." >&2
+  fi
   return 0
 }
 
 # Erase the service data. The audit trail stays, as with purge-data.sh: it is
-# a security record, and deleting it is a separate, deliberate step.
+# a security record, and deleting it is a separate, deliberate step. The saved
+# system DNS settings are restored first and erased only once they have been:
+# erased unused, a redirect left by an earlier removal could never be undone.
 nrr_pkg_purge_data() {
   audit_name=$(basename "$NRR_AUDIT_DIR")
+  keep_dns_copies=0
+  if ! nrr_pkg_undo_dns_by_hand; then
+    keep_dns_copies=1
+    echo "$NRR_PRODUCT_NAME: DNS could not be given back; the saved system DNS settings stay in $NRR_STATE_DIR." >&2
+  fi
   if [ -d "$NRR_STATE_DIR" ] && nrr_pkg_assert_removable "$NRR_STATE_DIR"; then
-    find "$NRR_STATE_DIR" -mindepth 1 -maxdepth 1 ! -name "$audit_name" -exec rm -rf -- {} +
-    if ! rmdir "$NRR_STATE_DIR" 2>/dev/null; then
+    if [ "$keep_dns_copies" -eq 1 ]; then
+      find "$NRR_STATE_DIR" -mindepth 1 -maxdepth 1 ! -name "$audit_name" \
+        ! -name resolv.conf.system ! -name resolv.conf.system-link ! -name dns-catch-all-taken \
+        -exec rm -rf -- {} +
+    else
+      find "$NRR_STATE_DIR" -mindepth 1 -maxdepth 1 ! -name "$audit_name" -exec rm -rf -- {} +
+    fi
+    if ! rmdir "$NRR_STATE_DIR" 2>/dev/null && [ -d "$NRR_AUDIT_DIR" ]; then
       echo "$NRR_PRODUCT_NAME: the audit trail is kept in $NRR_AUDIT_DIR; delete it by hand if it is not needed."
     fi
   fi

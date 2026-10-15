@@ -31,7 +31,9 @@ use nrr_platform_api::enforcement::{
 };
 use nrr_platform_api::fake_ip::stale_flows::FlowLinks;
 
-use crate::lower_linux::{lower_scoped_with, EgressNames, ScopedPlan, ServiceAccountScope};
+use crate::lower_linux::{
+    lower_scoped_with, EgressNames, LoweredPlan, ScopedPlan, ServiceAccountScope,
+};
 use crate::nft_apply::{NftApplyError, NftCliEnforcement};
 use crate::nft_ir::NftRuleset;
 
@@ -134,6 +136,34 @@ impl NftPolicyEnforcer {
     pub fn probe(&self) -> Result<(), EnforcementFailure> {
         self.cli.probe().map_err(failure)
     }
+
+    /// What the kernel holds of ours, as a pass input: `0` for no table, else
+    /// the rule count plus one; `None` when `nft` cannot say. One terse chain
+    /// listing per tick. A ruleset another program flushed (`systemctl restart
+    /// nftables`) moves nothing else a pass reads, and the enforcer's own
+    /// "unchanged" shortcut would keep trusting it until the recheck, so a
+    /// mismatch with the last apply forgets that apply as well.
+    pub fn installed_fingerprint(&self) -> Option<u64> {
+        let listed = self
+            .cli
+            .installed_rule_count(&self.table, crate::lower_linux::NRR_CHAIN)
+            .ok()?;
+        let mut applied = self.applied.lock().unwrap_or_else(|p| p.into_inner());
+        if applied
+            .as_ref()
+            .is_some_and(|last| listed != Some(last.rules))
+        {
+            tracing::info!(
+                target: "nrr::enforcement",
+                msg_key = "nft-ruleset-changed-outside",
+                present = listed.is_some(),
+                rules = listed.unwrap_or(0),
+                "our nftables rules were changed or removed by another program; this pass reapplies them",
+            );
+            *applied = None;
+        }
+        Some(listed.map_or(0, |rules| rules as u64 + 1))
+    }
 }
 
 /// Only a hung `nft` may go through on the next pass unchanged; a refusal, a
@@ -188,11 +218,10 @@ impl NftPolicyEnforcer {
     }
 }
 
-impl PolicyEnforcer for NftPolicyEnforcer {
-    fn enforce(&self, plans: &[EnforcementPlan]) -> Result<ApplyReport, EnforcementFailure> {
-        // Read the links ONCE for the pass: every plan is resolved against the
-        // same snapshot, so two users cannot be enforced against two different
-        // states of the machine.
+impl NftPolicyEnforcer {
+    /// The ruleset `plans` lower to on the links present now. Links are read
+    /// ONCE, so two users cannot be lowered against two states of the machine.
+    fn lower(&self, plans: &[EnforcementPlan]) -> Result<LoweredPlan, EnforcementFailure> {
         let adapters = self.adapters.enumerate_all().map_err(|e| {
             EnforcementFailure::transient(format!("adapters could not be read: {e}"))
         })?;
@@ -208,7 +237,6 @@ impl PolicyEnforcer for NftPolicyEnforcer {
             .map(|(plan, egress)| ScopedPlan { plan, egress })
             .collect();
 
-        let started = Instant::now();
         let service_accounts = self
             .service_accounts
             .as_ref()
@@ -222,6 +250,28 @@ impl PolicyEnforcer for NftPolicyEnforcer {
             .unwrap_or_default();
         let mut lowered = lower_scoped_with(&scoped, &service_accounts);
         lowered.ruleset.table.clone_from(&self.table);
+        Ok(lowered)
+    }
+}
+
+/// Bounds `nft`'s words before they travel into a refusal the user reads and
+/// the audit keeps: the tool echoes the offending input back.
+fn bounded_detail(detail: &str) -> String {
+    const MAX: usize = 1024;
+    if detail.len() <= MAX {
+        return detail.to_owned();
+    }
+    let mut end = MAX;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &detail[..end])
+}
+
+impl PolicyEnforcer for NftPolicyEnforcer {
+    fn enforce(&self, plans: &[EnforcementPlan]) -> Result<ApplyReport, EnforcementFailure> {
+        let started = Instant::now();
+        let lowered = self.lower(plans)?;
         let lowered_at = Instant::now();
         let notes_for_unsupported = || -> Vec<String> {
             lowered
@@ -293,6 +343,30 @@ impl PolicyEnforcer for NftPolicyEnforcer {
             skipped: lowered.unsupported.len() + outcome.skipped.len(),
             failed: 0,
             notes,
+        })
+    }
+
+    /// The whole batch `enforce` would hand over, under `nft --check`. Strict:
+    /// a rule the best-effort apply would drop refuses the plans here. Never
+    /// moves the record of what is installed.
+    fn check(&self, plans: &[EnforcementPlan]) -> Result<(), EnforcementFailure> {
+        let lowered = self.lower(plans)?;
+        // The kernel already took this exact ruleset whole.
+        let accepted = self
+            .applied
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|last| last.ruleset == lowered.ruleset);
+        if accepted {
+            return Ok(());
+        }
+        self.cli.check(&lowered.ruleset).map_err(|e| {
+            let bounded = bounded_detail(&e.to_string());
+            match e {
+                NftApplyError::TimedOut { .. } => EnforcementFailure::transient(bounded),
+                _ => EnforcementFailure::persistent(bounded),
+            }
         })
     }
 
@@ -522,6 +596,44 @@ mod tests {
         assert_eq!(logged(&log, "run"), 3, "a chain that differs was trusted");
     }
 
+    /// The pass input: a flushed or altered table reads as a different value,
+    /// and the pass it wakes reapplies at once instead of trusting the cache
+    /// until the recheck window runs out.
+    #[test]
+    fn a_table_flushed_behind_our_back_moves_the_pass_input_and_is_reapplied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs");
+        let listing = dir.path().join("listing");
+        let enforcer = counting(&log, &listing);
+
+        enforcer.enforce(&[]).expect("first apply");
+        put_listing(&listing, installed_rules(&enforcer));
+        let in_place = enforcer.installed_fingerprint().expect("nft answered");
+        assert_ne!(in_place, 0, "a present table reads as absent");
+        enforcer.enforce(&[]).expect("unchanged apply");
+        assert_eq!(logged(&log, "run"), 1, "an unchanged table was reapplied");
+
+        std::fs::remove_file(&listing).expect("flush");
+        assert_eq!(enforcer.installed_fingerprint(), Some(0));
+        enforcer.enforce(&[]).expect("restoring apply");
+        assert_eq!(logged(&log, "run"), 2, "a flushed table was not put back");
+
+        put_listing(&listing, installed_rules(&enforcer) + 1);
+        assert_ne!(enforcer.installed_fingerprint(), Some(in_place));
+        enforcer.enforce(&[]).expect("restoring apply");
+        assert_eq!(logged(&log, "run"), 3, "an altered chain was trusted");
+
+        std::fs::remove_file(&listing).expect("nft gone");
+        let broken: &'static [&'static str] = Box::leak(Box::new(["-c", "exit 2", "nft"]));
+        let mut mute = counting(&log, &listing);
+        mute.cli = NftCliEnforcement::with_program("/bin/sh", broken, Duration::from_secs(10));
+        assert_eq!(
+            mute.installed_fingerprint(),
+            None,
+            "an unreadable kernel must not settle"
+        );
+    }
+
     /// Down asks the user to wait, absent to choose again: a missing tunnel
     /// is one switched off, a missing main link one to replace.
     #[test]
@@ -592,6 +704,79 @@ mod tests {
             }
         );
         assert!(!dongle_gone.availability().primary);
+    }
+
+    /// A stand-in `nft` that logs `check` for a `--check` run and `run` for an
+    /// apply, and refuses every check when `refuse` is set.
+    fn checking(log: &std::path::Path, refuse: bool) -> NftPolicyEnforcer {
+        let verdict = if refuse {
+            "echo 'Error: Could not process rule: Invalid argument' >&2; exit 1"
+        } else {
+            "exit 0"
+        };
+        let script: &'static str = Box::leak(
+            format!(
+                "case \"$*\" in *--check*) cat >/dev/null; echo check >> '{log}'; {verdict};; \
+                 *) cat >/dev/null; echo run >> '{log}';; esac",
+                log = log.display(),
+            )
+            .into_boxed_str(),
+        );
+        let args: &'static [&'static str] = Box::leak(Box::new(["-c", script, "nft"]));
+        let mut enforcer =
+            NftPolicyEnforcer::new(Arc::new(Unbound), Arc::new(MockAdapterEventSource::new()));
+        enforcer.cli = NftCliEnforcement::with_program("/bin/sh", args, Duration::from_secs(10));
+        enforcer
+    }
+
+    #[test]
+    fn a_ruleset_nft_refuses_to_check_is_refused_and_nothing_is_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs");
+        let enforcer = checking(&log, true);
+
+        let refusal = enforcer.check(&[]).expect_err("a refused check passed");
+        assert!(refusal.is_persistent(), "a refusal is not worth a timer");
+        assert!(
+            refusal.reason.contains("Invalid argument"),
+            "the refusal lost nft's words: {}",
+            refusal.reason
+        );
+        assert_eq!(logged(&log, "check"), 1);
+        assert_eq!(logged(&log, "run"), 0, "a check touched the live table");
+        assert!(
+            enforcer
+                .applied
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none(),
+            "a check moved the record of what is installed"
+        );
+    }
+
+    #[test]
+    fn a_ruleset_nft_accepts_is_checked_once_and_not_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs");
+        let enforcer = checking(&log, false);
+
+        enforcer.check(&[]).expect("an accepted check refused");
+        assert_eq!(logged(&log, "check"), 1);
+        assert_eq!(logged(&log, "run"), 0, "a check touched the live table");
+
+        // What the kernel already took whole needs no second opinion.
+        enforcer.enforce(&[]).expect("apply");
+        enforcer.check(&[]).expect("the installed ruleset refused");
+        assert_eq!(logged(&log, "check"), 1, "an installed ruleset was checked");
+    }
+
+    #[test]
+    fn a_long_refusal_is_cut_on_a_character_boundary() {
+        let long = "ж".repeat(2000);
+        let cut = bounded_detail(&long);
+        assert!(cut.len() <= 1024 + "…".len());
+        assert!(cut.ends_with('…'));
+        assert_eq!(bounded_detail("short"), "short");
     }
 
     #[test]

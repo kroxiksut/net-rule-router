@@ -132,7 +132,7 @@ There is no telemetry and no account login. Besides the traffic you route, the p
 - looks up the host names named in your rules and keeps their addresses fresh;
 - checks that the additional connection is alive, and asks a public address-discovery (STUN) service which public address it exits from;
 - when you use rule suggestions, tests whether a site answers over the main connection;
-- every N days (14 by default, adjustable), from the app window, makes one anonymous request to the project's GitHub releases page to see whether a newer version exists. It only shows a notification: it never downloads, installs or changes routing. The check can be turned off in Settings, and then the request is not made at all. Help → Check for updates makes the same single request when you choose it, whether or not the automatic check is on.
+- once the first release is published (before that, no such request is made), every N days (14 by default, adjustable), from the app window, makes one anonymous request to the project's GitHub releases page to see whether a newer version exists. It only shows a notification: it never downloads, installs or changes routing. The check can be turned off in Settings, and then the request is not made at all. Help → Check for updates makes the same single request when you choose it, whether or not the automatic check is on.
 
 Logging is minimal by default. Verbose logging is an explicit choice that switches itself off after the chosen period or at the next restart. Browser-history seeding is opt-in and reads only the requesting user's own browser profiles.
 
@@ -142,7 +142,6 @@ These are directions, not current behaviour, and nothing above depends on them:
 - a linked import that watches a file and turns its changes into a pending review;
 - a browser extension that could propose a single exact-host rule on an explicit click;
 - publisher- or signature-aware identity for application rules;
-- signed rule bundles and signed release packages;
-- property-based or fuzz testing of the parsers (today they are covered by unit and fixture tests).
+- signed rule bundles and signed release packages.
 
-Engineering practice that does exist: dependency license and advisory policy enforced by `cargo deny` in the quality gate, `unsafe` Rust denied workspace-wide and allowed only in the modules that call the operating system.
+Engineering practice that does exist: dependency license and advisory policy enforced by `cargo deny` in the quality gate, `unsafe` Rust denied workspace-wide and allowed only in the modules that call the operating system, and fuzz testing of every parser that reads data another party can shape.

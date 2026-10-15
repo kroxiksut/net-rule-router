@@ -15,6 +15,7 @@ use crate::link::{admin_command, Link};
 use crate::restore;
 use crate::state::{enforcement_text, AppState, NoticeLevel, RoutingState};
 use crate::view::{Panel, ScreenView, Segment, StateTone, ViewLine};
+use crate::vpn_trust;
 
 pub struct StatusScreen;
 
@@ -43,19 +44,27 @@ impl Screen for StatusScreen {
     }
 
     fn help(&self) -> &'static [Key] {
-        &[keys::HELP_STATUS_FEED, restore::HELP]
+        &[keys::HELP_STATUS_FEED, restore::HELP, vpn_trust::HELP]
     }
 
     fn plain_help(&self) -> &'static [Key] {
-        &[restore::PLAIN_HELP]
+        &[restore::PLAIN_HELP, vpn_trust::HELP]
     }
 
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
-        key.code == KeyCode::Char('r') && restore::restore(app)
+        match key.code {
+            KeyCode::Char('r') => restore::restore(app),
+            KeyCode::Char('t') => vpn_trust::trust_pending(app),
+            _ => false,
+        }
     }
 
     fn on_line(&self, app: &mut AppState, line: &str) -> bool {
-        line == "r" && restore::restore(app)
+        match line {
+            "r" => restore::restore(app),
+            "t" => vpn_trust::trust_pending(app),
+            _ => false,
+        }
     }
 }
 
@@ -202,7 +211,25 @@ fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         lines.push(ViewLine::text(texts.get(restore::OFFER_LINE)));
     }
     lines.extend(unresolved_app_lines(app, texts));
+    lines.extend(pending_vpn_client_lines(app, texts));
     lines
+}
+
+/// VPN-named programs leak protection does not trust by place: standing,
+/// named, with the key that answers.
+fn pending_vpn_client_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
+    if !app.link.is_connected() || app.vpn_trust.pending.is_empty() {
+        return Vec::new();
+    }
+    let names = vpn_trust::names(&app.vpn_trust.pending);
+    vec![
+        ViewLine::new(vec![Segment::state(
+            texts.get(keys::VPN_TRUST_TITLE),
+            StateTone::Caution,
+        )]),
+        ViewLine::text(texts.fill(keys::VPN_TRUST_BODY, &[("apps", names.join(", "))])),
+        ViewLine::text(texts.get(keys::VPN_TRUST_HINT)),
+    ]
 }
 
 /// The caller's app rules that found no program: standing while it lasts, so
@@ -366,5 +393,40 @@ mod tests {
         );
         app.link = Link::Offline;
         assert!(!shown(&app).iter().any(|l| l.contains("weren't found")));
+    }
+
+    /// A VPN-named program the service does not trust by place stands under
+    /// the state with the key that confirms it; `t` writes the confirmation
+    /// once, and nothing while offline.
+    #[test]
+    fn a_pending_vpn_client_is_named_with_its_key_and_t_confirms_it() {
+        use nrr_shared::ipc_payloads::PendingVpnClientDto;
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        assert!(!shown(&app).iter().any(|l| l.contains("Is this your VPN?")));
+        app.vpn_trust.pending = vec![PendingVpnClientDto {
+            exe_path: r"C:\Users\someone\Downloads\x-vpn.exe".into(),
+            bundled_exe_paths: Vec::new(),
+        }];
+        let lines = shown(&app);
+        assert!(lines.iter().any(|l| l == "Is this your VPN?"), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("x-vpn.exe: ")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.starts_with("t: ")), "{lines:?}");
+
+        assert!(
+            vpn_trust::trust_pending(&mut app),
+            "t sends the confirmation"
+        );
+        assert!(app.vpn_trust.busy);
+        assert!(
+            !vpn_trust::trust_pending(&mut app),
+            "a second press while the write is in flight does nothing"
+        );
+        assert_eq!(app.outbox.take().len(), 1);
+
+        app.link = Link::Offline;
+        assert!(!shown(&app).iter().any(|l| l.contains("Is this your VPN?")));
     }
 }

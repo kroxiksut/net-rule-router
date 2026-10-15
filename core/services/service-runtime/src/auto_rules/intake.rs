@@ -198,7 +198,7 @@ impl AutoRulesEngine {
             );
             return false;
         };
-        if snapshot.behavior_mode.default_route_role() == RouteRole::Secondary
+        if self.default_route_role(sid) == RouteRole::Secondary
             || app_covered(&snapshot.rule_book, &program)
         {
             return false;
@@ -494,7 +494,7 @@ impl AutoRulesEngine {
         if exclusions.is_rule_host(&host)
             || exclusions.is_matched_by_existing_rule(&host)
             || exclusions.is_platform_infrastructure(&host)
-            || snapshot.behavior_mode.default_route_role() == RouteRole::Secondary
+            || self.default_route_role(sid) == RouteRole::Secondary
         {
             tracing::debug!(
                 target: "nrr::auto-rules",
@@ -502,8 +502,7 @@ impl AutoRulesEngine {
                 rule_host = exclusions.is_rule_host(&host),
                 covered = exclusions.is_matched_by_existing_rule(&host),
                 infrastructure = exclusions.is_platform_infrastructure(&host),
-                default_is_secondary =
-                    snapshot.behavior_mode.default_route_role() == RouteRole::Secondary,
+                default_is_secondary = self.default_route_role(sid) == RouteRole::Secondary,
                 "not offered: a rule already covers this host, or moving it would change nothing",
             );
             return false;

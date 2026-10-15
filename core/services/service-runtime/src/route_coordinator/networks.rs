@@ -74,9 +74,11 @@ impl SecondaryRouteCoordinator {
                 .map(|info| preferred_display_name(info).to_string())
                 .unwrap_or_default()
         };
+        // The exemptible part only: a segment the enforcement refuses must not
+        // be offered as something to keep reachable.
         let mut out: Vec<(Ipv4Network, String, bool)> = Vec::new();
         if let Some(primary) = resolution.primary {
-            for (net, prefix) in primary_local_subnets(&routes, primary.interface_index) {
+            for (net, prefix) in exemptible_local_subnets(&routes, primary.interface_index).v4 {
                 if let Some(network) = Ipv4Network::new(net, prefix) {
                     out.push((network, name_of(primary.interface_index), true));
                 }
@@ -87,7 +89,7 @@ impl SecondaryRouteCoordinator {
             .filter(|info| Some(info.index) != resolution.secondary.map(|s| s.interface_index))
             .filter(|info| nrr_platform_api::adapters::is_virtual_machine_adapter(info))
         {
-            for (net, prefix) in primary_local_subnets(&routes, info.index) {
+            for (net, prefix) in exemptible_local_subnets(&routes, info.index).v4 {
                 let Some(network) = Ipv4Network::new(net, prefix) else {
                     continue;
                 };
@@ -98,6 +100,120 @@ impl SecondaryRouteCoordinator {
             }
         }
         out
+    }
+
+    /// The public IPv6 prefixes the main link carries, each with what is
+    /// decided about it. Exempt only on the user's "yes", or on auto-accept
+    /// outside the blanket block (there it always asks), and never while a rule
+    /// names something inside: the rule's traffic would leave past it.
+    ///
+    /// The rule check resolves the whole rule book, so a pass runs it only for
+    /// a prefix that would otherwise be opened; `for_display` runs it for every
+    /// prefix, for the settings list. Never per packet.
+    pub fn public_v6_local_networks(
+        &self,
+        sid: &str,
+        routes: &[RouteEntry],
+        primary_ifindex: u32,
+        for_display: bool,
+    ) -> Vec<PublicV6Network> {
+        let candidates = exemptible_local_subnets(routes, primary_ifindex).public_v6;
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let answers = self
+            .local_networks
+            .as_ref()
+            .map(|read| read(sid).answers_v6)
+            .unwrap_or_default();
+        let auto_accept = self
+            .route_source
+            .load_for_sid(sid)
+            .is_some_and(|p| p.local_networks_auto_accept && !p.kill_switch_block_all);
+        let ownership = std::cell::OnceCell::new();
+        let names_rule = |block: nrr_shared::ip_block::IpBlock| {
+            ownership
+                .get_or_init(|| {
+                    let rules = self.rules_provider.active_rules_for(sid)?;
+                    let snapshot = self.fqdn_cache.snapshot_for_compute();
+                    let cache: &dyn FqdnCacheLookup = match snapshot.as_ref() {
+                        Some(snapshot) => snapshot,
+                        None => self.fqdn_cache.as_ref(),
+                    };
+                    Some(crate::address_ownership::AddressOwnership::resolve(
+                        &rules.rule_book,
+                        cache,
+                    ))
+                })
+                .as_ref()
+                .is_some_and(|o: &crate::address_ownership::AddressOwnership| o.names_inside(block))
+        };
+        candidates
+            .into_iter()
+            .filter_map(|(net, prefix)| {
+                nrr_shared::ip_block::IpBlock::new(std::net::IpAddr::V6(net), prefix)
+            })
+            .map(|block| {
+                let answer = answers.iter().find(|(b, _)| *b == block).map(|(_, a)| *a);
+                let wanted = answer.unwrap_or(auto_accept);
+                let names_rule = (wanted || for_display) && names_rule(block);
+                PublicV6Network {
+                    block,
+                    allowed: wanted && !names_rule,
+                    decided: answer.is_some() || auto_accept,
+                    names_rule,
+                }
+            })
+            .collect()
+    }
+
+    /// What the settings list shows beyond the exemptible private segments:
+    /// the main link's public IPv6 prefixes with their state, and the segments
+    /// too wide to be local at all, each with the main link's name. Empty when
+    /// there is no main link or the table cannot be read.
+    pub fn local_network_candidates(&self, sid: &str) -> LocalNetworkCandidates {
+        let Some(primary) = self.resolve(sid).primary else {
+            return LocalNetworkCandidates::default();
+        };
+        let Ok(routes) = self.api.get_ip_forward_table() else {
+            return LocalNetworkCandidates::default();
+        };
+        let adapter = self
+            .api
+            .get_adapter_infos()
+            .ok()
+            .and_then(|infos| {
+                infos
+                    .iter()
+                    .find(|info| info.index == primary.interface_index)
+                    .map(|info| preferred_display_name(info).to_string())
+            })
+            .unwrap_or_default();
+        LocalNetworkCandidates {
+            public_v6: self.public_v6_local_networks(sid, &routes, primary.interface_index, true),
+            too_wide: exemptible_local_subnets(&routes, primary.interface_index).too_wide,
+            adapter,
+        }
+    }
+
+    /// The opened public prefixes as exemption pairs.
+    pub(super) fn opened_public_v6(
+        &self,
+        sid: &str,
+        routes: &[RouteEntry],
+        primary_ifindex: Option<u32>,
+    ) -> Vec<(std::net::Ipv6Addr, u8)> {
+        let Some(primary) = primary_ifindex else {
+            return Vec::new();
+        };
+        self.public_v6_local_networks(sid, routes, primary, false)
+            .into_iter()
+            .filter(|n| n.allowed)
+            .filter_map(|n| match n.block.network() {
+                std::net::IpAddr::V6(net) => Some((net, n.block.prefix_len())),
+                std::net::IpAddr::V4(_) => None,
+            })
+            .collect()
     }
 
     /// The route table from `reading`, or read live when there is none.
@@ -180,7 +296,9 @@ impl SecondaryRouteCoordinator {
                 .iter()
                 .filter(|info| preferred_display_name(info) == adapter)
             {
-                for (net, prefix) in primary_local_subnets(routes, info.index) {
+                // A "yes" about an adapter never reopens what the enforcement
+                // refuses: the answer carries over to the exemptible part only.
+                for (net, prefix) in exemptible_local_subnets(routes, info.index).v4 {
                     let Some(network) = Ipv4Network::new(net, prefix) else {
                         continue;
                     };
@@ -244,6 +362,39 @@ impl SecondaryRouteCoordinator {
                 sid: sid.to_string(),
                 adapter_name: name,
             },
+        );
+    }
+
+    /// Tell the user the main link reported a segment too wide to be a local
+    /// network — a hostile access point handing out a `/1`. The enforcement
+    /// already refuses it; what the user needs to hear is that devices on that
+    /// network stay cut while routed traffic is blocked, and why.
+    ///
+    pub(super) fn warn_too_wide_local_networks(
+        &self,
+        sid: &str,
+        routes: &[RouteEntry],
+        infos: &[AdapterInfo],
+        primary_ifindex: u32,
+    ) {
+        let Some(bus) = self.events.as_ref() else {
+            return;
+        };
+        let too_wide = exemptible_local_subnets(routes, primary_ifindex).too_wide;
+        if too_wide.is_empty() {
+            return;
+        }
+        let adapter_name = infos
+            .iter()
+            .find(|info| info.index == primary_ifindex)
+            .map(|info| preferred_display_name(info).to_string())
+            .unwrap_or_default();
+        self.too_wide_local_network_notified.publish(
+            bus,
+            sid,
+            &adapter_name,
+            &too_wide,
+            std::time::Instant::now(),
         );
     }
 

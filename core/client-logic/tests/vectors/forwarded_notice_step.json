@@ -1,0 +1,135 @@
+{
+  "description": "pure.js forwardedNoticeStep: ask when WSL appears unanswered for a user with an additional route, keep a dismissed request down while it runs",
+  "cases": [
+    {
+      "name": "appears unanswered",
+      "input": {
+        "wasRaised": false,
+        "present": true,
+        "routed": true,
+        "answer": ""
+      },
+      "expected": {
+        "raise": true,
+        "raised": true
+      }
+    },
+    {
+      "name": "still running after the request",
+      "input": {
+        "wasRaised": true,
+        "present": true,
+        "routed": true,
+        "answer": ""
+      },
+      "expected": {
+        "raise": false,
+        "raised": true
+      }
+    },
+    {
+      "name": "stops",
+      "input": {
+        "wasRaised": true,
+        "present": false,
+        "routed": true,
+        "answer": ""
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "starts again",
+      "input": {
+        "wasRaised": false,
+        "present": true,
+        "routed": true,
+        "answer": ""
+      },
+      "expected": {
+        "raise": true,
+        "raised": true
+      }
+    },
+    {
+      "name": "answered meanwhile",
+      "input": {
+        "wasRaised": true,
+        "present": true,
+        "routed": true,
+        "answer": "as-computer"
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "appears answered",
+      "input": {
+        "wasRaised": false,
+        "present": true,
+        "routed": true,
+        "answer": "unprotected"
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "answer missing reads as unanswered",
+      "input": {
+        "wasRaised": false,
+        "present": true,
+        "routed": true,
+        "answer": null
+      },
+      "expected": {
+        "raise": true,
+        "raised": true
+      }
+    },
+    {
+      "name": "absent",
+      "input": {
+        "wasRaised": false,
+        "present": false,
+        "routed": true,
+        "answer": ""
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "no additional route",
+      "input": {
+        "wasRaised": false,
+        "present": true,
+        "routed": false,
+        "answer": ""
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "route removed while asked",
+      "input": {
+        "wasRaised": true,
+        "present": true,
+        "routed": false,
+        "answer": ""
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    }
+  ]
+}

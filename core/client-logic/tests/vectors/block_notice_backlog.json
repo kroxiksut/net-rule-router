@@ -1,0 +1,488 @@
+{
+  "description": "pure.js blockNoticeBacklog: the one summary of blocks kept while no surface was open",
+  "cases": [
+    {
+      "name": "nothing",
+      "input": {
+        "entries": []
+      },
+      "expected": null
+    },
+    {
+      "name": "one",
+      "input": {
+        "entries": [
+          {
+            "id": 1,
+            "raised-at-unix-ms": 1767225600001,
+            "destination": "203.0.113.7",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          }
+        ]
+      },
+      "expected": {
+        "count": 1,
+        "throughId": 1,
+        "shown": [
+          "203.0.113.7"
+        ],
+        "more": 0
+      }
+    },
+    {
+      "name": "one destination twice counts both",
+      "input": {
+        "entries": [
+          {
+            "id": 3,
+            "raised-at-unix-ms": 1767225600003,
+            "destination": "cdn.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 4,
+            "raised-at-unix-ms": 1767225600004,
+            "destination": "cdn.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          }
+        ]
+      },
+      "expected": {
+        "count": 2,
+        "throughId": 4,
+        "shown": [
+          "cdn.example"
+        ],
+        "more": 0
+      }
+    },
+    {
+      "name": "ids out of order",
+      "input": {
+        "entries": [
+          {
+            "id": 9,
+            "raised-at-unix-ms": 1767225600009,
+            "destination": "a.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 2,
+            "raised-at-unix-ms": 1767225600002,
+            "destination": "b.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 5,
+            "raised-at-unix-ms": 1767225600005,
+            "destination": "c.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          }
+        ]
+      },
+      "expected": {
+        "count": 3,
+        "throughId": 9,
+        "shown": [
+          "a.example",
+          "b.example",
+          "c.example"
+        ],
+        "more": 0
+      }
+    },
+    {
+      "name": "empty destination counted, not named",
+      "input": {
+        "entries": [
+          {
+            "id": 1,
+            "raised-at-unix-ms": 1767225600001,
+            "destination": "",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 2,
+            "raised-at-unix-ms": 1767225600002,
+            "destination": "a.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          }
+        ]
+      },
+      "expected": {
+        "count": 2,
+        "throughId": 2,
+        "shown": [
+          "a.example"
+        ],
+        "more": 0
+      }
+    },
+    {
+      "name": "only empty destinations",
+      "input": {
+        "entries": [
+          {
+            "id": 6,
+            "raised-at-unix-ms": 1767225600006,
+            "destination": "",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 7,
+            "raised-at-unix-ms": 1767225600007,
+            "destination": "",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          }
+        ]
+      },
+      "expected": {
+        "count": 2,
+        "throughId": 7,
+        "shown": [],
+        "more": 0
+      }
+    },
+    {
+      "name": "exactly five",
+      "input": {
+        "entries": [
+          {
+            "id": 1,
+            "raised-at-unix-ms": 1767225600001,
+            "destination": "h1.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 2,
+            "raised-at-unix-ms": 1767225600002,
+            "destination": "h2.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 3,
+            "raised-at-unix-ms": 1767225600003,
+            "destination": "h3.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 4,
+            "raised-at-unix-ms": 1767225600004,
+            "destination": "h4.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 5,
+            "raised-at-unix-ms": 1767225600005,
+            "destination": "h5.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          }
+        ]
+      },
+      "expected": {
+        "count": 5,
+        "throughId": 5,
+        "shown": [
+          "h1.example",
+          "h2.example",
+          "h3.example",
+          "h4.example",
+          "h5.example"
+        ],
+        "more": 0
+      }
+    },
+    {
+      "name": "six names five",
+      "input": {
+        "entries": [
+          {
+            "id": 1,
+            "raised-at-unix-ms": 1767225600001,
+            "destination": "h1.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 2,
+            "raised-at-unix-ms": 1767225600002,
+            "destination": "h2.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 3,
+            "raised-at-unix-ms": 1767225600003,
+            "destination": "h3.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 4,
+            "raised-at-unix-ms": 1767225600004,
+            "destination": "h4.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 5,
+            "raised-at-unix-ms": 1767225600005,
+            "destination": "h5.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 6,
+            "raised-at-unix-ms": 1767225600006,
+            "destination": "h6.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          }
+        ]
+      },
+      "expected": {
+        "count": 6,
+        "throughId": 6,
+        "shown": [
+          "h1.example",
+          "h2.example",
+          "h3.example",
+          "h4.example",
+          "h5.example"
+        ],
+        "more": 1
+      }
+    },
+    {
+      "name": "more counts distinct destinations",
+      "input": {
+        "entries": [
+          {
+            "id": 1,
+            "raised-at-unix-ms": 1767225600001,
+            "destination": "h1.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 2,
+            "raised-at-unix-ms": 1767225600002,
+            "destination": "h2.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 3,
+            "raised-at-unix-ms": 1767225600003,
+            "destination": "h3.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 4,
+            "raised-at-unix-ms": 1767225600004,
+            "destination": "h4.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 5,
+            "raised-at-unix-ms": 1767225600005,
+            "destination": "h5.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 6,
+            "raised-at-unix-ms": 1767225600006,
+            "destination": "h6.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 7,
+            "raised-at-unix-ms": 1767225600007,
+            "destination": "h0.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 8,
+            "raised-at-unix-ms": 1767225600008,
+            "destination": "h1.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 9,
+            "raised-at-unix-ms": 1767225600009,
+            "destination": "h2.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 10,
+            "raised-at-unix-ms": 1767225600010,
+            "destination": "h3.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 11,
+            "raised-at-unix-ms": 1767225600011,
+            "destination": "h4.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 12,
+            "raised-at-unix-ms": 1767225600012,
+            "destination": "h5.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 13,
+            "raised-at-unix-ms": 1767225600013,
+            "destination": "h6.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 14,
+            "raised-at-unix-ms": 1767225600014,
+            "destination": "h0.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          }
+        ]
+      },
+      "expected": {
+        "count": 14,
+        "throughId": 14,
+        "shown": [
+          "h1.example",
+          "h2.example",
+          "h3.example",
+          "h4.example",
+          "h5.example"
+        ],
+        "more": 2
+      }
+    },
+    {
+      "name": "zero and negative ids leave nothing to acknowledge",
+      "input": {
+        "entries": [
+          {
+            "id": 0,
+            "raised-at-unix-ms": 1767225600000,
+            "destination": "a.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": -4,
+            "raised-at-unix-ms": 1767225599996,
+            "destination": "b.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          }
+        ]
+      },
+      "expected": {
+        "count": 2,
+        "throughId": 0,
+        "shown": [
+          "a.example",
+          "b.example"
+        ],
+        "more": 0
+      }
+    },
+    {
+      "name": "case is not folded",
+      "input": {
+        "entries": [
+          {
+            "id": 1,
+            "raised-at-unix-ms": 1767225600001,
+            "destination": "A.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          },
+          {
+            "id": 2,
+            "raised-at-unix-ms": 1767225600002,
+            "destination": "a.example",
+            "app": "chatgpt.exe",
+            "reason": "route-unavailable",
+            "attempts": 1
+          }
+        ]
+      },
+      "expected": {
+        "count": 2,
+        "throughId": 2,
+        "shown": [
+          "A.example",
+          "a.example"
+        ],
+        "more": 0
+      }
+    }
+  ]
+}

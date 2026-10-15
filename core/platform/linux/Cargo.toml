@@ -63,5 +63,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # one that runs; `std` has no way to send a signal.
 libc = "0.2"
 
+[features]
+# Opens the crate-private NFLOG datagram walk to the fuzz targets under
+# `fuzz/`; never set by a shipped build.
+fuzzing = []
+
 [lints]
 workspace = true

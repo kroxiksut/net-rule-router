@@ -572,6 +572,8 @@ fn send_protection(app: &mut AppState) {
         move |request| {
             request.insert("kill-switch-enabled".into(), Value::Bool(kill_switch));
             request.insert("doh-lockdown-enabled".into(), Value::Bool(doh_lockdown));
+            // "Yes" is the automatic posture; "no" is a choice that holds.
+            request.insert("doh-lockdown-auto".into(), Value::Bool(doh_lockdown));
         },
         |app, result| {
             let outcome = match result {

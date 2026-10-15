@@ -194,7 +194,7 @@ pub use dns::{
     OsCachedResolution,
 };
 pub use dns_observe::{DnsObservation, DnsObservationSource, MockDnsObservationSource};
-pub use error::{ErrorClass, PlatformError};
+pub use error::{ErrorClass, MutationIntent, PlatformError};
 pub use external_ip::{probe_external_ipv4_batch, ExternalIpProbeOutcome};
 pub use fail_closed::{is_exempt_from_blocking, BlockReason};
 pub use fake_ip::{

@@ -11,9 +11,10 @@ jobs:
   baseline:
     runs-on: windows-latest
 
-    # No Qt on the runner, and every step that touches cargo builds the Qt
-    # host's build script — bootstrap runs `cargo check --workspace` before the
-    # quality gate is reached. Job scope, not step scope: setting it on one step
+    # The Qt host is not built here (Qt is installed for qmllint only), and
+    # every step that touches cargo builds the Qt host's build script —
+    # bootstrap runs `cargo check --workspace` before the quality gate is
+    # reached. Job scope, not step scope: setting it on one step
     # only moves the failure to whichever step runs first.
     env:
       NRR_SKIP_QT_HOST: "1"
@@ -47,9 +48,21 @@ jobs:
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
 
+      # qmllint for the QML gate, nothing else: the Qt host stays skipped.
+      # Version and action as in release.yml, so the QML is checked against
+      # the Qt that ships.
+      - name: Install Qt
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
+        with:
+          version: "6.8.3"
+          host: windows
+          arch: win64_msvc2022_64
+          cache: true
+
       - name: Run quality baseline
         shell: pwsh
-        # The Rust gate (fmt, clippy, tests, cargo-deny) runs; the C++ Qt host
-        # is skipped by the job-level switch above. Building it here would need
-        # a full Qt install per run.
-        run: powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
+        # The Rust gate (fmt, clippy, tests, cargo-deny) and qmllint run; the
+        # C++ Qt host is skipped by the job-level switch above.
+        # -RequireQmlLint: a missing qmllint here means the Qt step broke, and
+        # a gate that skips QML must not pass.
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny -RequireQmlLint

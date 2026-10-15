@@ -52,7 +52,6 @@ use nrr_service_runtime::route_coordinator::{RuleScopeProvider, SecondaryRouteCo
 use nrr_shared::rules_json::{
     to_canonical_string, AddressMatchDto, CanonicalRulesJsonV1, RuleDto, RULES_JSON_SCHEMA_VERSION,
 };
-use nrr_shared::RouteBehaviorMode;
 use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
 use nrr_storage::repository::MigrationRunner;
 use nrr_storage::route_bindings::{
@@ -244,6 +243,7 @@ fn route_policy_record(sid: &str, mode: BehaviorMode) -> RoutePolicyRecord {
         resolve_hosts_bypass: true,
         doh_lockdown_enabled: false,
         doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
+        doh_lockdown_auto: true,
         browser_history_auto_seed: false,
         kill_switch_strict_shared_ips: false,
         auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
@@ -257,15 +257,13 @@ fn route_policy_record(sid: &str, mode: BehaviorMode) -> RoutePolicyRecord {
         short_name_completion: false,
         short_name_suffix: String::new(),
         app_rules_take_all_addresses: false,
+        forwarded_outage: String::new(),
         binding_source: BindingSource::UserAssigned,
     }
 }
 
 fn applied_rules_snapshot(book: CanonicalRuleBook) -> ActiveRulesSnapshot {
-    ActiveRulesSnapshot {
-        rule_book: book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
-    }
+    ActiveRulesSnapshot { rule_book: book }
 }
 
 // ── Route half ───────────────────────────────────────────────────────────────
@@ -450,7 +448,7 @@ fn a_secondary_route_rule_becomes_a_slash32_over_the_additional_link_not_a_block
         "the route pass ran once, before any filter reached the engine"
     );
     assert!(
-        flow_reset.queried().contains(&destination),
+        flow_reset.queried().contains(&IpAddr::V4(destination)),
         "sockets opened before the rule must be looked up for teardown"
     );
 }

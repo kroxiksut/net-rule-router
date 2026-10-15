@@ -332,6 +332,12 @@ public:
     /// DoH-lockdown blocks at once.
     Q_INVOKABLE QString rpcDohResolversSet(const QString &resolversJson);
 
+    /// The machine-wide home-network suffix list: read it with what the
+    /// current network offers, or replace it (an administrator's change; the
+    /// launcher relays the refusal through the broker).
+    Q_INVOKABLE QString rpcLocalDnsSuffixesGet();
+    Q_INVOKABLE QString rpcLocalDnsSuffixesSet(const QVariantMap &payload);
+
     /// Revoke the session elevation broker (the GUI's "revoke administrator
     /// approval" action). Routed to the launcher's
     /// `local.broker-revoke`, which retires the live elevated broker so the

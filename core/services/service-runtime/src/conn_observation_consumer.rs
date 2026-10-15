@@ -61,13 +61,6 @@ pub struct ConnConsumeSummary {
     /// never named. `> 0` fires a recompute the same way a new pair does: the
     /// `/32` has to come off promptly, not at the next apply.
     pub app_ips_retracted: u32,
-    /// Count of VPN bootstrap endpoints learned
-    /// this batch: distinct remote IPs of flows that OUR kill-switch dropped
-    /// from a process whose name matches a VPN-client pattern. `> 0` means the
-    /// fail-closed exemption set just grew, so the conn-observe task fires a
-    /// recompute to arm the new server hole promptly (else the VPN's retry is
-    /// dropped again until the 30 s safety tick).
-    pub vpn_endpoints_learned: u32,
     /// Count of VPN CLIENT APPLICATIONS newly learned this batch: distinct
     /// process paths of role-verified kill-switch drops from VPN-named
     /// processes. `> 0` means the app-scoped block-all exemption
@@ -493,19 +486,11 @@ pub struct ConnectionObservationConsumer {
     /// this ring so the Diagnostics panel can read recent connections over IPC.
     /// `None` keeps the observer log-only.
     trace_ring: Option<Arc<ConnectionTraceRing>>,
-    /// When wired, each distinct remote IP of a
-    /// flow that OUR kill-switch dropped from a VPN-client process is handed to
-    /// this sink (which persists it as a bootstrap endpoint). `None` keeps the
-    /// observer from learning.
-    vpn_endpoint_learner: Option<VpnEndpointLearnFn>,
-    /// Role-verification gate for the VPN-endpoint learner: given a dropping
-    /// filter's decoded NRR spec id, returns whether that filter is a
-    /// kill-switch/fail-closed Block (as opposed to, say, the user's own Block
-    /// rule). The learner only fires when this is wired AND the observation
-    /// carries a spec id AND the check returns `true` — closing the review
-    /// finding that provider-only attribution (`blocked_by_nrr`) cannot tell a
-    /// leak-guard drop from a user's own Block rule. `None` keeps the learner
-    /// permanently inert even if [`Self::vpn_endpoint_learner`] is wired.
+    /// Role-verification gate: given a dropping filter's decoded NRR spec id,
+    /// whether that filter is a kill-switch/fail-closed Block rather than, say,
+    /// the user's own Block rule — `blocked_by_nrr` alone cannot tell them
+    /// apart. Learning fires only when this is wired, the observation carries
+    /// a spec id and the check passes; `None` keeps it inert.
     killswitch_drop_check: Option<KillswitchDropCheckFn>,
     /// Scope classifier for a role-verified drop: `true` when the
     /// dropping filter is an APP-SCOPED block (no destination condition). Only
@@ -526,7 +511,7 @@ pub struct ConnectionObservationConsumer {
     dns_lockdown_drop_check: Option<KillswitchDropCheckFn>,
     /// Classifier for the service-account twins of the owner's guard: `true`
     /// when the dropping filter guards system traffic. Such a drop may teach a
-    /// tunnel endpoint and nothing else — no notice, no outage row, no name
+    /// VPN client and nothing else — no notice, no outage row, no name
     /// learning, no flow reset. `None` treats every drop as a user's.
     service_account_drop_check: Option<KillswitchDropCheckFn>,
     /// Proactive VPN-client learning — when wired, the OBSERVED
@@ -534,10 +519,9 @@ pub struct ConnectionObservationConsumer {
     /// process is handed to this sink, which registers the client for an
     /// app-scoped block-all exemption (and persists it across sessions). The
     /// sink returns `true` when the client is NEW — counted in the summary so
-    /// the observe task fires a recompute. Gated by the SAME role-verification
-    /// as [`Self::vpn_endpoint_learner`]: without a wired
-    /// [`Self::killswitch_drop_check`] it never fires. `None` keeps the
-    /// observer from learning client apps — the per-IP endpoint learner alone.
+    /// the observe task fires a recompute. Without a wired
+    /// [`Self::killswitch_drop_check`] it never fires; `None` keeps the
+    /// observer from learning client apps.
     vpn_client_app_learner: Option<VpnClientAppLearnFn>,
     /// When wired (FCrDNS), each distinct remote
     /// IP of ANY flow OUR enforcement dropped (`blocked_by_nrr == Some(true)`,
@@ -590,7 +574,7 @@ pub struct ConnectionObservationConsumer {
     /// `remember_program`).
     connection_programs: Mutex<std::collections::HashMap<(SocketAddr, SocketAddr), (String, u64)>>,
     /// Destinations already torn down once (see [`Self::note_torn_down`]).
-    torn_down_before: Mutex<HashSet<std::net::Ipv4Addr>>,
+    torn_down_before: Mutex<HashSet<std::net::IpAddr>>,
     /// Last time traffic left over the SECONDARY link, as a cheap proxy for
     /// "the user is on a routed site right now". Gates the reverse lookup
     /// below: without it every direct connection on an idle machine would
@@ -637,14 +621,6 @@ const DROP_LOG_KEY_CAP: usize = 8192;
 /// Destinations one batch may sweep for stale flows; the rest ride the next
 /// tick, seconds away.
 const MAX_STALE_FLOW_RESETS_PER_BATCH: usize = 64;
-
-/// Sink for a learned VPN bootstrap endpoint IP.
-/// The production impl persists it via
-/// `nrr_storage::vpn_bootstrap_endpoints::VpnBootstrapEndpointsRepository`; the
-/// route coordinator's exemption loader reads it back, so a
-/// learned server is exempted on the next recompute. `Send + Sync` so the
-/// consumer can live behind an `Arc` shared with the supervised task.
-pub type VpnEndpointLearnFn = Arc<dyn Fn(std::net::Ipv4Addr) + Send + Sync>;
 
 /// A principal's usable `(primary, secondary)` interface indexes; `None` for a
 /// link unbound, absent or (secondary) declared dead.

@@ -39,6 +39,12 @@ pub struct NetworkRouteFacts {
     /// The tunnel's server endpoints: routed into the tunnel, they seal its
     /// own reconnect.
     pub tunnel_servers: Vec<IpAddr>,
+    /// The private part of the segments the links OTHER than the tunnel are
+    /// attached to — the same set leak protection lets through. A host inside
+    /// one is reached directly; a name that resolves to it (split horizon,
+    /// a home NAS, a media server's own relay) is not sent into the tunnel
+    /// unless a rule names the address itself.
+    pub lan_segments: Vec<IpBlock>,
 }
 
 impl NetworkRouteFacts {
@@ -83,11 +89,53 @@ impl NetworkRouteFacts {
         let mut tunnel_servers = servers;
         tunnel_servers.sort_unstable();
         tunnel_servers.dedup();
+        let mut lan_segments: Vec<IpBlock> = adapters
+            .iter()
+            .filter(|a| Some(a.index) != tunnel)
+            .flat_map(|a| {
+                let attached = crate::route_reconciler::exemptible_local_subnets(routes, a.index);
+                attached
+                    .v4
+                    .into_iter()
+                    .filter_map(|(net, prefix)| IpBlock::new(IpAddr::V4(net), prefix))
+                    .chain(
+                        attached
+                            .v6
+                            .into_iter()
+                            .filter_map(|(net, prefix)| IpBlock::new(IpAddr::V6(net), prefix)),
+                    )
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        lan_segments.sort_unstable();
+        lan_segments.dedup();
         Self {
             tunnel_routes,
             local_networks,
             tunnel_servers,
+            lan_segments,
         }
+    }
+
+    /// Whether a host route for `ip` into the tunnel is withheld: the address
+    /// sits on an attached segment and no rule of `rules` names it itself.
+    ///
+    /// The narrower rule wins. A segment is the widest thing a link can be
+    /// attached to; a name resolving into it is the name's claim on the
+    /// address, which the segment's own connected route out-specifics anyway —
+    /// routing it into the tunnel only makes the device unreachable from every
+    /// account on the machine. A literal address is narrower than the segment
+    /// and is honoured as written.
+    #[must_use]
+    pub fn keeps_host_direct(&self, rules: &CanonicalRuleSet, ip: IpAddr) -> bool {
+        self.lan_segments.iter().any(|s| s.contains(ip))
+            && !rules.rules().iter().any(|rule| {
+                rule.enabled
+                    && matches!(
+                        rule.address_match,
+                        Some(nrr_domain::canonical::CanonicalAddressMatch::ExactIp(named)) if named == ip
+                    )
+            })
     }
 }
 

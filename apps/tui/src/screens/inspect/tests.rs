@@ -200,7 +200,7 @@ fn service() -> FakeService {
     fake.answer(
         IpcOperationName::ServiceHealthGet,
         json!({ "service-state": "running", "worst-severity": "ok", "active-revision-id": "rev-7",
-                "components": [], "degraded-modes": [] }),
+                "components": [] }),
     );
     fake.answer(
         IpcOperationName::SnapshotDiagnosticsGet,
@@ -352,6 +352,23 @@ fn why_this_route_runs_the_probe_in_diagnostics() {
 }
 
 #[test]
+fn a_system_dns_left_redirected_tells_the_user_how_to_repair_it() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::ServiceHealthGet,
+        json!({ "service-state": "degraded", "worst-severity": "degraded",
+                "components": [{
+                    "component": "apply", "severity": "degraded",
+                    "message": "task 'dns-resolver' ended: system DNS could not be restored: x"
+                }] }),
+    );
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    let picture = render(&app, 200, 40);
+    assert!(picture.contains("System DNS could not"), "{picture}");
+}
+
+#[test]
 fn clearing_the_cache_asks_first() {
     let fake = service();
     let mut app = connected();
@@ -372,6 +389,42 @@ fn clearing_the_cache_asks_first() {
     assert!(
         picture.contains("Cache cleared: 3 resolution(s) removed."),
         "{picture}"
+    );
+}
+
+/// Another surface acknowledging an alert reaches this screen as a push; the
+/// list is re-read on the spot, and only while it is the screen on show.
+#[test]
+fn an_alert_change_elsewhere_re_reads_the_list_on_screen() {
+    let fake = service();
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    let reads_before = fake
+        .operations()
+        .iter()
+        .filter(|op| **op == IpcOperationName::SnapshotDiagnosticsGet)
+        .count();
+
+    fn alerts_changed() -> crate::backend::BackendEvent {
+        crate::backend::BackendEvent::Push(crate::backend::PushEvent::Status(Box::new(
+            nrr_shared::ipc_payloads::StatusUpdateEvent::SecurityAlertsChanged,
+        )))
+    }
+    app.apply(alerts_changed(), &texts_en(), Instant::now());
+    settle(&mut app, &fake);
+    let reads_after = fake
+        .operations()
+        .iter()
+        .filter(|op| **op == IpcOperationName::SnapshotDiagnosticsGet)
+        .count();
+    assert_eq!(reads_after, reads_before + 1, "the alert list is re-read");
+
+    app.open(ScreenId::Status);
+    app.outbox.take();
+    app.apply(alerts_changed(), &texts_en(), Instant::now());
+    assert!(
+        app.outbox.take().is_empty(),
+        "nothing is read for a screen that is not on show"
     );
 }
 

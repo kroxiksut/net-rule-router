@@ -262,6 +262,10 @@ pub const SERVICE_RECOVERY: Key = key(
 pub const SERVICE_UNAVAILABLE: Key = key("diag.status.service-unavailable", "Service unavailable");
 pub const REVISION: Key = key("diag.service.revision-label", "Active revision");
 pub const PENDING: Key = key("diag.service.pending-changes-label", "Pending changes");
+pub const DNS_NOT_RESTORED: Key = key(
+    "tui.service.dns-not-restored",
+    "System DNS could not be restored. Run nrr-cli reset-network as administrator.",
+);
 pub const STARTED_AFTER: Key = key(
     "diag.service.started-after-sign-in",
     "The service started %1 s after this boot reached the sign-in screen.",
@@ -526,6 +530,7 @@ pub const ALL: &[Key] = &[
     SERVICE_UNAVAILABLE,
     REVISION,
     PENDING,
+    DNS_NOT_RESTORED,
     STARTED_AFTER,
     STARTED_BEFORE,
     STALE,

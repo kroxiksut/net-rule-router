@@ -18,8 +18,7 @@ fn snapshot_without_enforcement() -> Value {
         "health": {
             "service-state": "running",
             "worst-severity": "ok",
-            "components": [],
-            "degraded-modes": []
+            "components": []
         },
         "adapters": { "data-source": "windows-live", "adapters": [], "rows": [] },
         "diagnostics": serde_json::to_value(DiagnosticsStatusDto::unavailable())

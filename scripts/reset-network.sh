@@ -327,11 +327,19 @@ fi
 cleaned=0
 dns_step="by-hand"
 if [ -n "$exe_path" ]; then
-  nrr_cyan "==> $exe_path cleanup"
-  if "$exe_path" cleanup; then
+  # Stops a service the step above did not, killing it if it hangs; a binary
+  # that predates the verb answers 2 and gets the plain `cleanup`.
+  nrr_cyan "==> $exe_path stop-and-cleanup"
+  code=0
+  "$exe_path" stop-and-cleanup || code=$?
+  if [ "$code" -eq 2 ]; then
+    nrr_cyan "==> $exe_path cleanup"
+    code=0
+    "$exe_path" cleanup || code=$?
+  fi
+  if [ "$code" -eq 0 ]; then
     cleaned=1
   else
-    code=$?
     case "$code" in
       2)
         dns_step="restore-dns"

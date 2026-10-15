@@ -13,6 +13,9 @@ Ethernet. No tunnel of its own, no cloud, no account.
 Windows builds today; Linux is in progress, macOS next.
 
 [![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](#license)
+[![windows-quality](https://github.com/kroxiksut/net-rule-router/actions/workflows/windows-quality.yml/badge.svg?branch=main)](https://github.com/kroxiksut/net-rule-router/actions/workflows/windows-quality.yml)
+[![linux-quality](https://github.com/kroxiksut/net-rule-router/actions/workflows/linux-quality.yml/badge.svg?branch=main)](https://github.com/kroxiksut/net-rule-router/actions/workflows/linux-quality.yml)
+![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fkroxiksut%2Fnet-rule-router%2Fmain%2Frust-toolchain.toml&query=%24.toolchain.channel&label=rust&color=orange)
 ![Platform: Windows, Linux in progress](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20(in%20progress)-0078D6.svg)
 ![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-red.svg)
 
@@ -86,6 +89,7 @@ versions it runs on, and which have been checked, is in
 - **Traffic statistics** — how much went through each connection today, during the current session of the additional connection and over every day kept (you choose how many), with a CSV export for any period.
 - **Per-name routing** — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
 - **Leak protection** — if the additional route goes down, matching traffic is held rather than silently leaking to `primary`.
+- **WSL, containers and virtual machines** — you choose whether their programs get the same leak protection as this computer or go unprotected while the additional route is down. Not yet verified on a live setup.
 - **Suggested addresses** — a routed site often pulls in helper domains of its own. The app collects them, shows which of your sites needs each one, and proposes adding them. Nothing is added behind your back, and ignoring a suggestion simply leaves that address on the main route.
 - **Overlaps** — when rules of the two routes cover the same sites (a zone on one route, a site inside it on the other), the narrower rule wins, and the app lists every such pair with the route its sites actually take. Confirm each one, or send those sites over the other route in one click. The same screen points out applied rules that work
   differently from how they read — for example an address block that also
@@ -264,7 +268,7 @@ for your own rules. It runs only interactively — scripts use `nrr-cli`. See
 - No mandatory login for core local routing.
 - Telemetry is **off by default**; no hidden background network actions.
 - Privileged policy changes go over a local, DACL-protected named-pipe IPC boundary — there is no localhost HTTP control plane for privileged mutations.
-- Every N days (14 by default, adjustable in Settings) the app asks the project's official release page whether a newer version is out and, if so, shows a notice. It never downloads, installs or changes routing, and you can turn the check off in Settings. Help → Check for updates asks the same question on demand, even with the automatic check off.
+- Until the first release is published the app does not check for updates at all. From then on, every N days (14 by default, adjustable in Settings) it asks the project's official release page whether a newer version is out and, if so, shows a notice. It never downloads, installs or changes routing, and you can turn the check off in Settings. Help → Check for updates asks the same question on demand, even with the automatic check off.
 
 See [`SECURITY.md`](SECURITY.md) for the full trust model.
 

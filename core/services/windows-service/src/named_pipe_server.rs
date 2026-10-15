@@ -1208,9 +1208,10 @@ mod tests {
     /// is precisely the round-trip we want to assert.
     fn connect_test_client() -> windows::core::Result<HANDLE> {
         let wide: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-        // Retry briefly: if the test thread races ahead of the server's
-        // first CreateNamedPipeW, CreateFileW returns ERROR_FILE_NOT_FOUND.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Retry: if the test thread races ahead of the server's
+        // CreateNamedPipeW, CreateFileW returns ERROR_FILE_NOT_FOUND. A loaded
+        // gate machine took longer than 2 s; only a failure waits this long.
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             // SAFETY: wide is null-terminated UTF-16; we open with standard
             // duplex access.

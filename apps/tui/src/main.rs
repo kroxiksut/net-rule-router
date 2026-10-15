@@ -8,10 +8,13 @@
 
 mod args;
 mod backend;
+mod block_backlog;
+mod forwarded_traffic;
 mod full;
 mod i18n;
 mod keys;
 mod link;
+mod local_network_offer;
 mod plain;
 mod platform;
 mod restore;
@@ -20,6 +23,7 @@ mod state;
 #[cfg(test)]
 mod testing;
 mod view;
+mod vpn_trust;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;

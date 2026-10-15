@@ -167,13 +167,17 @@ impl BlockNoticeCenter {
                 launched_by = %notice.launched_by.join(" < "),
                 "blocked connection — new episode",
             );
-            // Journalled before publishing, and unconditionally: whether a
-            // subscriber exists is not knowable here, and a duplicate the user
-            // sees twice beats a block they are never told about. The surface
-            // that shows a backlog entry acknowledges it, which is what stops
-            // the repeat.
+            // Journalled only when none of the user's surfaces is subscribed:
+            // a live push already told them, and the backlog would repeat it
+            // as "blocked while the app was closed".
             if let Some(journal) = self.journal.as_ref() {
-                journal.append(sid, &notice, now_ms as i64);
+                let heard_live = self
+                    .events
+                    .as_ref()
+                    .is_some_and(|bus| bus.has_subscriber_for(sid));
+                if !heard_live {
+                    journal.append(sid, &notice, now_ms as i64);
+                }
             }
             if let Some(bus) = self.events.as_ref() {
                 bus.publish_for(
@@ -257,7 +261,6 @@ const BLOCKED_BOOK_TTL: Duration = Duration::from_secs(5);
 /// One principal's book as the network lookup needs it.
 struct BlockedBook {
     book: CanonicalRuleBook,
-    behavior_mode: RouteBehaviorMode,
     /// Every block an enabled network Block rule names: the cheap first test,
     /// so a drop outside them never reaches the matcher.
     blocks: Vec<nrr_shared::ip_block::IpBlock>,
@@ -307,7 +310,9 @@ impl BlockedNetworks {
             Some(ip),
             attempt.app.as_deref(),
             ZonePriorityPolicy::default(),
-            book.behavior_mode,
+            // Only a matched rule is read below; the mode decides the default
+            // route alone, so no principal's policy is needed here.
+            RouteBehaviorMode::PreferPrimary,
         );
         let RequestedRouteDecision::MatchedRoute { candidate } = decision else {
             return None;
@@ -348,7 +353,6 @@ impl BlockedNetworks {
             .collect();
         let book = Arc::new(BlockedBook {
             book: snapshot.rule_book,
-            behavior_mode: snapshot.behavior_mode,
             blocks,
         });
         if memo.len() >= MAX_TRACKED_PRINCIPALS && !memo.contains_key(sid) {
@@ -518,6 +522,28 @@ mod tests {
     }
 
     #[test]
+    fn a_notice_a_subscribed_surface_heard_live_is_not_journalled() {
+        let bus = Arc::new(EventBus::new());
+        let sub = bus.subscribe_as("tray".to_string(), Some(ALICE.to_string()), None);
+        let journal =
+            Arc::new(crate::block_notice_journal_store::InMemoryBlockNoticeJournalStore::new());
+        let center = BlockNoticeCenter::new()
+            .with_event_bus(Arc::clone(&bus))
+            .with_journal(journal.clone());
+
+        center.record(ALICE, &attempt());
+        center.record(BOB, &attempt());
+
+        assert_eq!(bus.peek_pending_for(&sub.subscription_id, 10).len(), 1);
+        assert!(journal.list_pending(ALICE, i64::MAX).is_empty());
+        assert_eq!(
+            journal.list_pending(BOB, i64::MAX).len(),
+            1,
+            "another user's subscriber is no audience for this one"
+        );
+    }
+
+    #[test]
     fn a_muted_episode_journals_nothing_either() {
         let journal =
             Arc::new(crate::block_notice_journal_store::InMemoryBlockNoticeJournalStore::new());
@@ -560,11 +586,7 @@ mod tests {
     fn ancestry_is_asked_once_per_episode_and_rides_on_the_notice() {
         let bus = Arc::new(EventBus::new());
         let sub = bus.subscribe_as("test-client".to_string(), Some(ALICE.to_string()), None);
-        let journal =
-            Arc::new(crate::block_notice_journal_store::InMemoryBlockNoticeJournalStore::new());
-        let center = BlockNoticeCenter::new()
-            .with_event_bus(Arc::clone(&bus))
-            .with_journal(journal.clone());
+        let center = BlockNoticeCenter::new().with_event_bus(Arc::clone(&bus));
         let lineage = counting();
         center.attach_process_lineage(lineage.clone());
 
@@ -592,6 +614,17 @@ mod tests {
             }
             other => panic!("expected BlockNoticeRaised, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_backlog_entry_carries_the_ancestry_too() {
+        let journal =
+            Arc::new(crate::block_notice_journal_store::InMemoryBlockNoticeJournalStore::new());
+        let center = BlockNoticeCenter::new().with_journal(journal.clone());
+        center.attach_process_lineage(counting());
+
+        center.record_observed(ALICE, &attempt(), Some(1_234));
+
         let journalled = journal.list_pending(ALICE, i64::MAX);
         assert_eq!(journalled[0].notice.launched_by.len(), 2);
     }
@@ -664,7 +697,6 @@ mod tests {
         ) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
             Some(crate::per_sid_orchestrator::ActiveRulesSnapshot {
                 rule_book: self.0.clone(),
-                behavior_mode: RouteBehaviorMode::PreferPrimary,
             })
         }
     }

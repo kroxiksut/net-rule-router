@@ -94,6 +94,7 @@ RowLayout {
                         spacing: root.uiTheme.spacingMd
                         DiagnosticsLogsSettings { root: section.root; Layout.fillWidth: true }
                         StorageUsagePanel { root: section.root; Layout.fillWidth: true }
+                        VersionCompatSettings { root: section.root; Layout.fillWidth: true }
                     }
                 }
                 Loader {
@@ -153,7 +154,8 @@ RowLayout {
                 Loader {
                     Layout.fillWidth: true
                     property bool keepLoaded: false
-                    active: section.activeCategory === "updates" || keepLoaded
+                    active: root.updateCheckAvailable
+                        && (section.activeCategory === "updates" || keepLoaded)
                     onActiveChanged: if (active) keepLoaded = true
                     visible: section.activeCategory === "updates"
                     asynchronous: root.sectionLoadsAsync

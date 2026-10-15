@@ -11,10 +11,10 @@
 //! robust by delegation, and dependency-free (no hickory / async framework
 //! — the service runtime is blocking, not tokio).
 //!
-//! Names in a QUESTION are uncompressed (stub resolvers never compress the
-//! question). Anything we cannot parse confidently returns `None`, and the
-//! listener forwards it raw — so a codec limitation degrades to a transparent
-//! proxy, never to a wrong answer.
+//! A client never compresses its question; a server may compress the one it
+//! echoes, and both are read. Anything we cannot parse confidently returns
+//! `None`, and the listener forwards it raw — so a codec limitation degrades
+//! to a transparent proxy, never to a wrong answer.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -104,7 +104,15 @@ pub fn parse_question(packet: &[u8]) -> Option<ParsedQuestion> {
     if qdcount == 0 {
         return None;
     }
-    let (qname, after_name) = parse_qname(packet, DNS_HEADER_LEN)?;
+    // A client never compresses its question, but a server may compress the
+    // one it echoes; the reply still has to pass the same checks as any other.
+    let (qname, after_name) = match parse_qname(packet, DNS_HEADER_LEN) {
+        Some(parsed) => parsed,
+        None => (
+            decode_name(packet, DNS_HEADER_LEN)?,
+            skip_encoded_name(packet, DNS_HEADER_LEN)?,
+        ),
+    };
     // QTYPE (2) + QCLASS (2) follow the name.
     let qtype = u16::from_be_bytes([*packet.get(after_name)?, *packet.get(after_name + 1)?]);
     let _qclass = u16::from_be_bytes([*packet.get(after_name + 2)?, *packet.get(after_name + 3)?]);
@@ -688,8 +696,161 @@ pub fn parse_address_response(
     }
 }
 
+/// The first question as raw material for comparison: the name's labels
+/// lower-cased and joined (pointers followed, no character rules), QTYPE and
+/// QCLASS. Where [`parse_question`] answers "what was asked", this answers "is
+/// that the same question" for queries the product does not read — a name with
+/// characters it would not learn is still forwarded, and its reply still has to
+/// echo it. `None` when the packet has no question or it is malformed.
+pub fn question_key(packet: &[u8]) -> Option<(Vec<u8>, u16, u16)> {
+    if packet.len() < DNS_HEADER_LEN || u16::from_be_bytes([packet[4], packet[5]]) == 0 {
+        return None;
+    }
+    let mut key = Vec::new();
+    let mut off = DNS_HEADER_LEN;
+    let mut jumps = 0usize;
+    loop {
+        let len = *packet.get(off)? as usize;
+        if len == 0 {
+            break;
+        }
+        if len & 0xC0 == 0xC0 {
+            let target = ((len & 0x3F) << 8) | *packet.get(off + 1)? as usize;
+            jumps += 1;
+            if jumps > 32 || target >= packet.len() {
+                return None;
+            }
+            off = target;
+            continue;
+        }
+        if len & 0xC0 != 0 {
+            return None;
+        }
+        let label = packet.get(off + 1..off + 1 + len)?;
+        key.extend(label.iter().map(u8::to_ascii_lowercase));
+        key.push(b'.');
+        if key.len() > 255 {
+            return None;
+        }
+        off += 1 + len;
+    }
+    let after_name = skip_encoded_name(packet, DNS_HEADER_LEN)?;
+    let fixed = packet.get(after_name..after_name + 4)?;
+    Some((
+        key,
+        u16::from_be_bytes([fixed[0], fixed[1]]),
+        u16::from_be_bytes([fixed[2], fixed[3]]),
+    ))
+}
+
+/// TC bit of a response header.
+pub fn is_truncated(reply: &[u8]) -> bool {
+    reply.len() >= DNS_HEADER_LEN && reply[2] & 0x02 != 0
+}
+
+/// Largest message DNS over TCP can frame (RFC 1035 §4.2.2, two-byte length).
+pub const DNS_TCP_MAX_MESSAGE: usize = 65_535;
+
+/// Read one length-prefixed message. `Ok(None)` on a clean end of stream
+/// before the first byte; a length above `max` is an error, never an
+/// allocation — the peer picks the length.
+pub fn read_tcp_message<R: std::io::Read>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len = [0u8; 2];
+    match reader.read(&mut len[..1])? {
+        0 => return Ok(None),
+        _ => reader.read_exact(&mut len[1..])?,
+    }
+    let n = usize::from(u16::from_be_bytes(len));
+    if n == 0 || n > max.min(DNS_TCP_MAX_MESSAGE) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "DNS/TCP message length out of bounds",
+        ));
+    }
+    let mut body = vec![0u8; n];
+    reader.read_exact(&mut body)?;
+    Ok(Some(body))
+}
+
+/// Write one length-prefixed message. A message the frame cannot carry is an
+/// error rather than a silently truncated frame.
+pub fn write_tcp_message<W: std::io::Write>(writer: &mut W, message: &[u8]) -> std::io::Result<()> {
+    let len = u16::try_from(message.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "DNS message too long for TCP framing",
+        )
+    })?;
+    writer.write_all(&len.to_be_bytes())?;
+    writer.write_all(message)?;
+    writer.flush()
+}
+
 #[cfg(test)]
 mod tests {
+    /// A server may compress the question it echoes; the reply still has to
+    /// read as an answer to the same question, or every gate behind
+    /// `parse_question` is bypassed by one pointer.
+    #[test]
+    fn a_compressed_question_in_a_reply_still_parses() {
+        let query = super::build_address_query(7, "shop.example", QTYPE_A).expect("query");
+        // Question name as a pointer back to the real one appended after it.
+        let mut packet = query[..super::DNS_HEADER_LEN].to_vec();
+        packet.extend_from_slice(&[0xC0, 0x12]); // pointer to offset 18
+        packet.extend_from_slice(&QTYPE_A.to_be_bytes());
+        packet.extend_from_slice(&[0, 1]);
+        packet.extend_from_slice(&query[super::DNS_HEADER_LEN..super::DNS_HEADER_LEN + 14]);
+        packet[2] |= 0x80;
+        let q = super::parse_question(&packet).expect("parsed through the pointer");
+        assert_eq!(q.qname, "shop.example");
+        assert_eq!(q.question_end, super::DNS_HEADER_LEN + 6);
+        // A pointer loop is refused, not followed forever.
+        packet[super::DNS_HEADER_LEN + 1] = 0x0C;
+        assert!(super::parse_question(&packet).is_none());
+    }
+
+    /// Characters the product never learns still make a question the reply has
+    /// to echo — an SRV name with underscores is forwarded, not guessed at.
+    #[test]
+    fn the_question_key_compares_names_the_parser_refuses() {
+        let mut q = super::build_address_query(1, "_ldap._tcp.dc.example", 33).expect("query");
+        q[2] |= 0x80;
+        let (key, qtype, qclass) = super::question_key(&q).expect("key");
+        assert_eq!(key, b"_ldap._tcp.dc.example.");
+        assert_eq!((qtype, qclass), (33, 1));
+        let upper = super::build_address_query(1, "_LDAP._tcp.DC.example", 33).expect("query");
+        assert_eq!(super::question_key(&upper).map(|k| k.0), Some(key));
+        assert!(super::question_key(&q[..5]).is_none());
+    }
+
+    #[test]
+    fn tcp_framing_round_trips_and_bounds_the_length() {
+        let msg = super::build_address_query(9, "shop.example", QTYPE_A).expect("query");
+        let mut wire = Vec::new();
+        super::write_tcp_message(&mut wire, &msg).expect("write");
+        assert_eq!(&wire[..2], &(msg.len() as u16).to_be_bytes());
+        let mut reader = std::io::Cursor::new(wire.clone());
+        assert_eq!(
+            super::read_tcp_message(&mut reader, 4096).expect("read"),
+            Some(msg.clone())
+        );
+        assert_eq!(
+            super::read_tcp_message(&mut reader, 4096).expect("eof"),
+            None
+        );
+        // Over the cap: refused before a single body byte is read.
+        let mut big = std::io::Cursor::new(vec![0xFF, 0xFF, 0, 0]);
+        assert!(super::read_tcp_message(&mut big, 4096).is_err());
+        // Short body: an error, not a hang on a zero-length frame.
+        let mut short = std::io::Cursor::new(vec![0, 5, 1, 2]);
+        assert!(super::read_tcp_message(&mut short, 4096).is_err());
+        let mut zero = std::io::Cursor::new(vec![0, 0]);
+        assert!(super::read_tcp_message(&mut zero, 4096).is_err());
+    }
+
     /// Without an SOA a stub resolver has nothing to cache, so it re-asks on
     /// every lookup — the DoH canary was answered once per page load.
     #[test]

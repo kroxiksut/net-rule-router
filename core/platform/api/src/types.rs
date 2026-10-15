@@ -190,6 +190,16 @@ pub enum WfpLayerKey {
     /// stack), and like the packet layer it has NO `ALE_USER_ID` / `ALE_APP_ID`
     /// — `user_sid` and `app_pattern` MUST be `None` here.
     OutboundTransportV4,
+    /// `FWPM_LAYER_IPFORWARD_V4` — IPv4 packets the machine forwards for
+    /// others (WSL, Docker Desktop, connection sharing). Locally originated
+    /// traffic never reaches it, and nothing above it does either: no user,
+    /// app, protocol or port condition — the destination, and the interface
+    /// the packet is forwarded out of.
+    IpForwardV4,
+    /// `FWPM_LAYER_IPFORWARD_V6` — the IPv6 twin of [`IpForwardV4`].
+    ///
+    /// [`IpForwardV4`]: WfpLayerKey::IpForwardV4
+    IpForwardV6,
 }
 
 impl WfpLayerKey {
@@ -202,7 +212,10 @@ impl WfpLayerKey {
     pub fn supports_ip_protocol(self) -> bool {
         !matches!(
             self,
-            WfpLayerKey::OutboundIpPacketV4 | WfpLayerKey::OutboundIpPacketV6
+            WfpLayerKey::OutboundIpPacketV4
+                | WfpLayerKey::OutboundIpPacketV6
+                | WfpLayerKey::IpForwardV4
+                | WfpLayerKey::IpForwardV6
         )
     }
 
@@ -212,8 +225,16 @@ impl WfpLayerKey {
     pub fn is_v6(self) -> bool {
         matches!(
             self,
-            WfpLayerKey::AleAuthConnectV6 | WfpLayerKey::OutboundIpPacketV6
+            WfpLayerKey::AleAuthConnectV6
+                | WfpLayerKey::OutboundIpPacketV6
+                | WfpLayerKey::IpForwardV6
         )
+    }
+
+    /// Whether this layer classifies forwarded packets, where a filter of ours
+    /// may carry only the destination and the egress interface.
+    pub fn is_forwarding(self) -> bool {
+        matches!(self, WfpLayerKey::IpForwardV4 | WfpLayerKey::IpForwardV6)
     }
 
     /// Whether `FWPM_CONDITION_ALE_USER_ID` / `FWPM_CONDITION_ALE_APP_ID` are
@@ -434,6 +455,9 @@ impl WfpFilterSpec {
             if !self.layer.is_v6() {
                 return Err("an IPv6 address condition needs an IPv6 layer");
             }
+        }
+        if self.layer.is_forwarding() && self.remote_port.is_some() {
+            return Err("the forwarding layers take no port condition");
         }
         if !self.layer.supports_ale_scoping() {
             if self.user_sid.is_some() {

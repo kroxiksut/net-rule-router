@@ -17,6 +17,54 @@ pub const BINDING_KEYS: [&str; 2] = ["primary", "secondary"];
 
 const APPLY_ONLY_KEY: &str = "apply-only";
 
+/// The protective settings. After the service lost them they come back without
+/// asking, and only ever switched ON that way: a damaged or stale record can
+/// never be what turns protection off.
+pub const PROTECTIVE_KEYS: [&str; 5] = [
+    "doh-lockdown-enabled",
+    "kill-switch-block-all",
+    "kill-switch-enabled",
+    "kill-switch-fail-closed",
+    "kill-switch-strict-shared-ips",
+];
+
+/// The protective keys the record holds on and the service holds off, sorted
+/// (`routePolicyProtectionToRestore`).
+pub fn protection_to_restore(
+    intent: &Map<String, Value>,
+    service: &Map<String, Value>,
+) -> Vec<String> {
+    PROTECTIVE_KEYS
+        .iter()
+        .filter(|key| {
+            intent
+                .get(**key)
+                .is_some_and(|mine| coerce(key, mine) == Value::Bool(true))
+                && effective(service, key) == Some(Value::Bool(false))
+        })
+        .map(|key| (*key).to_owned())
+        .collect()
+}
+
+/// The one apply-only write that switches them back on, over the service's
+/// row; `None` when nothing the record holds on is off
+/// (`routePolicyProtectionRestore`).
+pub fn protection_restore(
+    intent: &Map<String, Value>,
+    service: &Map<String, Value>,
+) -> Option<Map<String, Value>> {
+    let keys = protection_to_restore(intent, service);
+    if keys.is_empty() {
+        return None;
+    }
+    let mut request = build_full_update_request(service, "");
+    for key in &keys {
+        request.insert(key.clone(), Value::Bool(true));
+    }
+    request.insert(APPLY_ONLY_KEY.to_owned(), Value::from(keys));
+    Some(request)
+}
+
 /// A recorded binding whose adapter is not on this machine now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MissingAdapter {
@@ -103,7 +151,8 @@ pub fn route_policy_divergence(
 
 /// The restore of the diverging keys as one `apply-only` write over the
 /// service's row. A binding goes only when its adapter is on the machine now
-/// (`present_ids`); otherwise it is reported missing and left out.
+/// (`present_ids`); otherwise it is reported missing and left out. Protection
+/// the record holds on is not offered: [`protection_restore`] has sent it.
 pub fn restore_plan(
     intent: &Map<String, Value>,
     service: &Map<String, Value>,
@@ -111,7 +160,11 @@ pub fn restore_plan(
 ) -> RestorePlan {
     let mut request = build_full_update_request(service, "");
     let mut plan = RestorePlan::default();
+    let automatic = protection_to_restore(intent, service);
     for key in route_policy_divergence(intent, service) {
+        if automatic.contains(&key) {
+            continue;
+        }
         let Some(mine) = intent.get(&key) else {
             continue;
         };

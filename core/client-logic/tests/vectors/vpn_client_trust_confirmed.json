@@ -1,0 +1,45 @@
+{
+  "description": "pure.js vpnClientTrustConfirmedApps: the link provider set to write after a yes — what was confirmed before, the client, then its bundle only when asked",
+  "cases": [
+    {
+      "name": "first client, no bundle",
+      "input": { "existing": [], "offer": { "exePath": "C:\\Users\\someone\\Downloads\\x-vpn.exe", "name": "x-vpn.exe", "bundledExePaths": [] }, "withBundle": false },
+      "expected": [ { "exe-path": "C:\\Users\\someone\\Downloads\\x-vpn.exe", "display-name": "x-vpn.exe" } ]
+    },
+    {
+      "name": "existing kept first, bundle appended with file names",
+      "input": { "existing": [ { "exe-path": "C:\\Program Files\\Old\\old.exe", "display-name": "Old VPN" } ], "offer": { "exePath": "C:\\Apps\\vendor vpn.exe", "name": "vendor vpn.exe", "bundledExePaths": [ "C:\\Apps\\OpenVPN\\openvpn.exe" ] }, "withBundle": true },
+      "expected": [ { "exe-path": "C:\\Program Files\\Old\\old.exe", "display-name": "Old VPN" }, { "exe-path": "C:\\Apps\\vendor vpn.exe", "display-name": "vendor vpn.exe" }, { "exe-path": "C:\\Apps\\OpenVPN\\openvpn.exe", "display-name": "openvpn.exe" } ]
+    },
+    {
+      "name": "bundle left out when not asked for",
+      "input": { "existing": [], "offer": { "exePath": "C:\\Apps\\vendor vpn.exe", "name": "vendor vpn.exe", "bundledExePaths": [ "C:\\Apps\\OpenVPN\\openvpn.exe" ] }, "withBundle": false },
+      "expected": [ { "exe-path": "C:\\Apps\\vendor vpn.exe", "display-name": "vendor vpn.exe" } ]
+    },
+    {
+      "name": "a client already confirmed keeps its first entry and name",
+      "input": { "existing": [ { "exe-path": "c:\\apps\\VENDOR VPN.EXE", "display-name": "Vendor" }, { "exe-path": " ", "display-name": "blank" } ], "offer": { "exePath": "C:\\Apps\\vendor vpn.exe", "name": "vendor vpn.exe", "bundledExePaths": [] }, "withBundle": true },
+      "expected": [ { "exe-path": "c:\\apps\\VENDOR VPN.EXE", "display-name": "Vendor" } ]
+    },
+    {
+      "name": "an existing entry without a name gets its file name",
+      "input": { "existing": [ { "exe-path": "C:\\Program Files\\Old\\old.exe", "display-name": "" } ], "offer": { "exePath": "C:\\Apps\\a-vpn.exe", "name": "", "bundledExePaths": [] }, "withBundle": false },
+      "expected": [ { "exe-path": "C:\\Program Files\\Old\\old.exe", "display-name": "old.exe" }, { "exe-path": "C:\\Apps\\a-vpn.exe", "display-name": "a-vpn.exe" } ]
+    },
+    {
+      "name": "a bundle repeating itself or its client folds",
+      "input": { "existing": [], "offer": { "exePath": "C:\\Apps\\vendor vpn.exe", "name": "vendor vpn.exe", "bundledExePaths": [ "C:\\Apps\\OpenVPN\\openvpn.exe", "c:\\apps\\openvpn\\OPENVPN.EXE", "C:\\APPS\\VENDOR VPN.EXE" ] }, "withBundle": true },
+      "expected": [ { "exe-path": "C:\\Apps\\vendor vpn.exe", "display-name": "vendor vpn.exe" }, { "exe-path": "C:\\Apps\\OpenVPN\\openvpn.exe", "display-name": "openvpn.exe" } ]
+    },
+    {
+      "name": "a bundle member already confirmed keeps its entry",
+      "input": { "existing": [ { "exe-path": "c:\\apps\\openvpn\\openvpn.exe", "display-name": "OpenVPN" } ], "offer": { "exePath": "C:\\Apps\\vendor vpn.exe", "name": "vendor vpn.exe", "bundledExePaths": [ "C:\\Apps\\OpenVPN\\openvpn.exe" ] }, "withBundle": true },
+      "expected": [ { "exe-path": "c:\\apps\\openvpn\\openvpn.exe", "display-name": "OpenVPN" }, { "exe-path": "C:\\Apps\\vendor vpn.exe", "display-name": "vendor vpn.exe" } ]
+    },
+    {
+      "name": "a unix path is named by its last segment",
+      "input": { "existing": [], "offer": { "exePath": "/opt/b/b-vpn", "name": "", "bundledExePaths": [] }, "withBundle": false },
+      "expected": [ { "exe-path": "/opt/b/b-vpn", "display-name": "b-vpn" } ]
+    }
+  ]
+}

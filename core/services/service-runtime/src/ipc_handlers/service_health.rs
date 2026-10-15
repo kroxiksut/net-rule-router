@@ -76,7 +76,6 @@ pub fn build_service_health_response(
                 message: (!message.is_empty()).then_some(message),
             })
             .collect(),
-        degraded_modes: health.degraded_modes(),
         fake_ip_datapath: fake_ip_datapath.map(|probe| fake_ip_datapath_to_dto(probe())),
     }
 }
@@ -200,7 +199,6 @@ mod tests {
         // This reporter tracks no components; the empty list is its answer, not
         // a hard-coded one (see the aggregator test below).
         assert!(parsed.components.is_empty());
-        assert!(parsed.degraded_modes.is_empty());
         // No probe wired -> the field is omitted, not fabricated.
         assert!(parsed.fake_ip_datapath.is_none());
     }

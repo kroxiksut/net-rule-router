@@ -56,6 +56,12 @@ pub fn offline_reset_verb() -> Option<&'static str> {
     Some("cleanup")
 }
 
+/// The reset verb that stops a running service first; `None` where there is
+/// no reset at all.
+pub fn stop_and_reset_verb() -> Option<&'static str> {
+    offline_reset_verb().map(|_| nrr_platform_api::service_control::STOP_AND_CLEANUP_VERB)
+}
+
 /// The service binary's own network-reset verb, when this platform has one.
 #[cfg(target_os = "linux")]
 pub fn offline_reset_verb() -> Option<&'static str> {

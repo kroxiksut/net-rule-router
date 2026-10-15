@@ -54,8 +54,8 @@ pub struct FakeIpHealth {
     /// UDP upstream dial outcomes since the process started.
     udp_dial_ok: AtomicU64,
     /// UDP dials that failed specifically because source-address policy
-    /// refused them. UDP dials run inline on the poll thread and are never
-    /// held (see `fake_ip::stack::udp_forward_upstream`).
+    /// refused them. UDP dials are never held (see
+    /// `fake_ip::stack::udp_forward_upstream`).
     udp_dial_refused: AtomicU64,
     /// UDP dials that failed for any other reason (genuine network error).
     udp_dial_failed: AtomicU64,
@@ -77,6 +77,18 @@ pub struct FakeIpHealth {
     /// this is the per-packet cost of the pump — the number that says whether
     /// the stack is servicing the flows with work or walking all of them.
     tcp_flow_visits: AtomicU64,
+    /// Upstream UDP datagrams dropped because a flow's reply queue was full —
+    /// a peer answering faster than the poll loop drains, or a flood.
+    udp_replies_dropped: AtomicU64,
+    /// Dials refused because every dial worker was busy and the backlog full,
+    /// or no worker thread could be started. Each is a flow failed at once.
+    dial_pool_refused: AtomicU64,
+    /// Worker threads the OS refused to start (dial workers, splice workers,
+    /// UDP readers). The flow concerned failed; the stack went on.
+    worker_spawn_failed: AtomicU64,
+    /// Poll steps that panicked and were contained. Nonzero is a bug report
+    /// in itself; a streak ends the run loop so the watchdog rebuilds.
+    poll_step_panics: AtomicU64,
 }
 
 impl FakeIpHealth {
@@ -225,5 +237,45 @@ impl FakeIpHealth {
     #[must_use]
     pub fn udp_unreachable_sent(&self) -> u64 {
         self.udp_unreachable_sent.load(Ordering::Relaxed)
+    }
+
+    /// An upstream datagram was dropped at a full reply queue.
+    pub fn record_udp_reply_dropped(&self) {
+        self.udp_replies_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn udp_replies_dropped(&self) -> u64 {
+        self.udp_replies_dropped.load(Ordering::Relaxed)
+    }
+
+    /// A dial was refused by the worker pool.
+    pub fn record_dial_pool_refused(&self) {
+        self.dial_pool_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn dial_pool_refused(&self) -> u64 {
+        self.dial_pool_refused.load(Ordering::Relaxed)
+    }
+
+    /// The OS refused to start a worker thread.
+    pub fn record_worker_spawn_failed(&self) {
+        self.worker_spawn_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn worker_spawn_failed(&self) -> u64 {
+        self.worker_spawn_failed.load(Ordering::Relaxed)
+    }
+
+    /// A poll step panicked and the run loop contained it.
+    pub fn record_poll_step_panic(&self) {
+        self.poll_step_panics.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn poll_step_panics(&self) -> u64 {
+        self.poll_step_panics.load(Ordering::Relaxed)
     }
 }

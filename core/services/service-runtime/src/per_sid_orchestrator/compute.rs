@@ -25,7 +25,7 @@ pub struct PerSidFilterSet {
     /// Destinations the installed set scopes to. Kept so the NEXT install can
     /// name what just came under enforcement — see
     /// [`PerSidApplyOrchestrator::tear_down_flows_to_new_destinations`].
-    pub destinations: Vec<std::net::Ipv4Addr>,
+    pub destinations: Vec<std::net::IpAddr>,
     /// Was the additional adapter resolvable when this set was installed?
     /// Read off the LUID-conditional permits the leak-guard emits only once it
     /// has an adapter; the false → true edge is "the tunnel just came up".
@@ -224,14 +224,26 @@ pub(super) fn in_any_subnet(ip: std::net::Ipv4Addr, subnets: &[(std::net::Ipv4Ad
     })
 }
 
-/// Choose the behaviour mode the codegen sees for a SID. The per-SID
-/// policy's `mode` always wins over the active revision's default —
-/// individual users can opt into `StrictSecondaryFailClosed` even on a
-/// `PreferPrimary` default profile.
-pub(super) fn behavior_mode_for_codegen(
-    policy: &PerSidPolicySnapshot,
-    _revision_default: RouteBehaviorMode,
+/// The behaviour mode a principal is planned under, on every OS: the per-user
+/// policy's `mode`. The rules snapshot carries only a placeholder default, so
+/// a planner that reads the mode from there plans everyone as prefer-main.
+pub(crate) fn behavior_mode_for_codegen(policy: &PerSidPolicySnapshot) -> RouteBehaviorMode {
+    behavior_mode_of_snapshot(policy)
+}
+
+/// `principal`'s mode from its stored policy; a principal with no policy row
+/// never bound their links and is read as prefer-main, the GUI's default.
+pub fn behavior_mode_of(
+    policy: &dyn crate::per_sid_orchestrator::RoutePolicySource,
+    principal: &str,
 ) -> RouteBehaviorMode {
+    policy
+        .load_for_sid(principal)
+        .map(|snapshot| behavior_mode_of_snapshot(&snapshot))
+        .unwrap_or(RouteBehaviorMode::PreferPrimary)
+}
+
+fn behavior_mode_of_snapshot(policy: &PerSidPolicySnapshot) -> RouteBehaviorMode {
     // The two enums share variant names — keep the mapping by hand
     // so a future divergence (extra variant on one side) becomes a
     // compile error.

@@ -385,38 +385,7 @@ pub(super) fn push_ipv6_cut(
     flows: &mut Vec<FlowRule>,
     v6: Ipv6Exemptions<'_>,
 ) {
-    let v6_exempts = [
-        DstMatch::SubnetV6 {
-            net: Ipv6Addr::LOCALHOST,
-            prefix: 128,
-        },
-        DstMatch::SubnetV6 {
-            net: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
-            prefix: 10,
-        },
-        // Neighbour discovery, MLD, mDNS and DHCPv6 address the group, not
-        // `fe80::` — cutting this scope breaks the link, leaks nothing.
-        DstMatch::SubnetV6 {
-            net: Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0),
-            prefix: 16,
-        },
-    ];
-    let scoped = v6
-        .server_ips
-        .iter()
-        .map(|ip| DstMatch::SubnetV6 {
-            net: *ip,
-            prefix: 128,
-        })
-        .chain(
-            v6.local_subnets
-                .iter()
-                .map(|(net, prefix)| DstMatch::SubnetV6 {
-                    net: *net,
-                    prefix: *prefix,
-                }),
-        );
-    for (e, dst) in v6_exempts.into_iter().chain(scoped).enumerate() {
+    for (e, dst) in ipv6_exempt_matches(v6).into_iter().enumerate() {
         flows.push(catch_all_flow(
             principal,
             Verdict::Permit,
@@ -462,6 +431,43 @@ pub(super) fn push_ipv6_cut(
         Coverage::AllPackets,
         0,
     ));
+}
+
+/// What any block over `::/0` must leave open, in order: the link-scope
+/// prefixes every posture exempts, then the tunnel's endpoints and the local
+/// prefixes. One list for the blanket postures and the strict floor.
+pub(super) fn ipv6_exempt_matches(v6: Ipv6Exemptions<'_>) -> Vec<DstMatch> {
+    let link_scope = [
+        DstMatch::SubnetV6 {
+            net: Ipv6Addr::LOCALHOST,
+            prefix: 128,
+        },
+        DstMatch::SubnetV6 {
+            net: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
+            prefix: 10,
+        },
+        // Neighbour discovery, MLD, mDNS and DHCPv6 address the group, not
+        // `fe80::` — cutting this scope breaks the link, leaks nothing.
+        DstMatch::SubnetV6 {
+            net: Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0),
+            prefix: 16,
+        },
+    ];
+    link_scope
+        .into_iter()
+        .chain(v6.server_ips.iter().map(|ip| DstMatch::SubnetV6 {
+            net: *ip,
+            prefix: 128,
+        }))
+        .chain(
+            v6.local_subnets
+                .iter()
+                .map(|(net, prefix)| DstMatch::SubnetV6 {
+                    net: *net,
+                    prefix: *prefix,
+                }),
+        )
+        .collect()
 }
 
 /// Build one catch-all [`FlowRule`], `app = Any`.

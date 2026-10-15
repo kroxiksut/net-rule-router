@@ -30,11 +30,12 @@ use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::killswitch_codegen::{FailClosedExemptions, KillSwitchResolution};
 use crate::machine_reading::MachineReading;
 use crate::per_sid_orchestrator::{
-    PerSidBehaviorMode, PerSidBinding, RoutePolicySource, RulesProvider,
+    behavior_mode_for_codegen, PerSidBinding, RoutePolicySource, RulesProvider,
 };
 use crate::route_codegen::SecondaryRouteTarget;
 use crate::route_reconciler::{
-    bootstrap_server_ips, primary_local_subnets, RouteReconcileDelta, SecondaryRouteReconciler,
+    bootstrap_server_ips, exemptible_local_subnets, primary_local_subnets, RouteReconcileDelta,
+    SecondaryRouteReconciler,
 };
 use crate::secondary_liveness::SecondaryLivenessTracker;
 
@@ -72,21 +73,6 @@ pub struct RouteResolution {
     pub secondary: Option<SecondaryRouteTarget>,
 }
 
-/// 1:1 map of the per-SID behavior mode onto the codegen's
-/// [`RouteBehaviorMode`] (mirrors
-/// `per_sid_orchestrator::behavior_mode_for_codegen`, kept in sync).
-fn route_behavior_mode(mode: PerSidBehaviorMode) -> RouteBehaviorMode {
-    match mode {
-        PerSidBehaviorMode::PreferPrimary => RouteBehaviorMode::PreferPrimary,
-        PerSidBehaviorMode::PreferSecondaryWhenAvailable => {
-            RouteBehaviorMode::PreferSecondaryWhenAvailable
-        }
-        PerSidBehaviorMode::StrictSecondaryFailClosed => {
-            RouteBehaviorMode::StrictSecondaryFailClosed
-        }
-    }
-}
-
 /// reads the current routing scope: `true` =
 /// service-driven (enforce the console user's policy continuously, even with
 /// no tray connected — including from boot), `false` = app-driven (only while a
@@ -120,6 +106,31 @@ pub struct LocalNetworkPolicy {
     /// longer exists and the settings screen would promise what enforcement
     /// does not do.
     pub adapter_answers: Vec<(String, bool)>,
+    /// The user's answers about public IPv6 prefixes. Never inherited through
+    /// an adapter: a "yes" about a link's private segment says nothing about
+    /// the public addresses it also carries.
+    pub answers_v6: Vec<(nrr_shared::ip_block::IpBlock, bool)>,
+}
+
+/// See [`SecondaryRouteCoordinator::local_network_candidates`].
+#[derive(Clone, Debug, Default)]
+pub struct LocalNetworkCandidates {
+    pub public_v6: Vec<PublicV6Network>,
+    pub too_wide: Vec<nrr_shared::ip_block::IpBlock>,
+    /// The main link's display name.
+    pub adapter: String,
+}
+
+/// A public IPv6 prefix the main link carries, and what is decided about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicV6Network {
+    pub block: nrr_shared::ip_block::IpBlock,
+    /// Exempt from the blanket block.
+    pub allowed: bool,
+    /// The user answered, or auto-accept answered for them.
+    pub decided: bool,
+    /// A rule names something inside: never exempt, whatever was answered.
+    pub names_rule: bool,
 }
 
 /// Reads [`LocalNetworkPolicy`] for a principal. A closure over the state DB at
@@ -187,6 +198,10 @@ const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 /// route set for the served users.
 pub struct SecondaryRouteCoordinator {
     reconciler: SecondaryRouteReconciler,
+    /// Held from reading who is served and paused through to the table write.
+    /// The reconciler locks only the write, so a pause landing between a
+    /// pass's read and its write used to get its routes put straight back.
+    pass_lock: Mutex<()>,
     api: Arc<dyn RouteTablePort>,
     rules_provider: Arc<dyn RulesProvider>,
     route_source: Arc<dyn RoutePolicySource>,
@@ -245,6 +260,8 @@ pub struct SecondaryRouteCoordinator {
     /// cadence — hundreds of times an hour — so without this the reminder would
     /// be a stream rather than a notice.
     unassigned_tunnel_notified: Mutex<HashMap<String, std::time::Instant>>,
+    /// Once a day per segment, like the tunnel latch above.
+    too_wide_local_network_notified: crate::catch_all_exemptions::TooWideLocalNetworkNotices,
     /// MAC anchors already handed to the persist callback this session, keyed by
     /// `"{sid}|{role}|{anchor}"`. The binding snapshot the resolve reads may be
     /// a cycle behind the write, so without this the same anchor would be
@@ -345,15 +362,6 @@ pub struct SecondaryRouteCoordinator {
     /// so the source-bound query sockets actually egress the tunnel. `None`
     /// (tests / degraded boot) behaves exactly as before: no such routes.
     dns_via_secondary: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// Reactive VPN-endpoint learning — bounded, session-scoped, role-verified
-    /// server IPs (see [`crate::vpn_endpoint_learning::LearnedVpnEndpoints`]
-    /// and [`crate::conn_observation_consumer`]). Merged into both
-    /// [`Self::kill_switch_exemptions`]'s and [`Self::fail_closed_exemptions`]'s
-    /// `bootstrap_server_ips`, deduped against the route-observed set, so a
-    /// learned endpoint gets exactly the same treatment as one seen on the
-    /// wire. `None` (tests / degraded boot) leaves the exemption sets
-    /// unchanged (today's behaviour).
-    learned_vpn_endpoints: Option<Arc<crate::vpn_endpoint_learning::LearnedVpnEndpoints>>,
     /// The rule shapes the routes are planned under — this build's answer,
     /// overridable in tests so network routing is exercised before it ships.
     network_support: nrr_domain::rule_shape::RuleShapeSupport,

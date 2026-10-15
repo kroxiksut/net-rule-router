@@ -69,7 +69,7 @@ fn platform_profile_stub_matches_the_contract() {
 /// Flags whose value differs between the shipped OS profiles and that the GUI
 /// therefore has to ask about — a `false` here is a capability the user would
 /// otherwise be offered and never get.
-const GATED_IN_QML: [&str; 11] = [
+const GATED_IN_QML: [&str; 12] = [
     "appRouting",
     "dnsObserve",
     "fakeIp",
@@ -77,6 +77,7 @@ const GATED_IN_QML: [&str; 11] = [
     "serviceStabilityConfig",
     "verboseLogging",
     "localNetworkExceptions",
+    "forwardedTrafficGuard",
     "blockNotices",
     "auditChainRestart",
     "connTraceLog",

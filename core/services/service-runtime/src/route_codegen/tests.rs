@@ -809,6 +809,61 @@ fn book(primary: Vec<CanonicalRule>, secondary: Vec<CanonicalRule>) -> Canonical
     }
 }
 
+/// A name on the additional link that resolves to the home LAN — split
+/// horizon, a NAS, a media server's own relay — is not pulled into the tunnel:
+/// the device would become unreachable from every account on the machine. A
+/// literal address is narrower than the segment and is honoured as written.
+#[test]
+fn a_lan_address_behind_a_name_stays_direct_unless_named_literally() {
+    let cache = MockFqdnCacheLookup::new();
+    cache.set_ips(
+        "nas.home.example",
+        vec![ip(192, 168, 1, 5), ip(203, 0, 113, 5)],
+    );
+    let rb = book(
+        Vec::new(),
+        vec![
+            rule(
+                "R-nas",
+                true,
+                CanonicalAddressMatch::ExactFqdn("nas.home.example".to_string()),
+            ),
+            rule(
+                "R-literal",
+                true,
+                CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(192, 168, 1, 6))),
+            ),
+        ],
+    );
+    let networks = network_routes::NetworkRouteFacts {
+        lan_segments: vec![nrr_shared::ip_block::IpBlock::parse("192.168.1.0/24").expect("block")],
+        ..Default::default()
+    };
+    let out = generate_routes_with(
+        RouteBehaviorMode::PreferPrimary,
+        &rb,
+        None,
+        &target(),
+        &cache,
+        &no_apps(),
+        &std::collections::HashSet::new(),
+        crate::address_ownership::ZoneVsIpOrder::default(),
+        &[],
+        &networks,
+        crate::wfp_codegen::current_rule_shape_support(),
+    );
+    let dests: Vec<IpAddr> = out.routes.iter().map(|r| r.destination).collect();
+    assert!(dests.contains(&IpAddr::V4(ip(203, 0, 113, 5))));
+    assert!(
+        dests.contains(&IpAddr::V4(ip(192, 168, 1, 6))),
+        "a literal address is honoured as written: {dests:?}"
+    );
+    assert!(
+        !dests.contains(&IpAddr::V4(ip(192, 168, 1, 5))),
+        "the LAN host behind a name stays direct: {dests:?}"
+    );
+}
+
 /// The regression: an application routed over the additional link reaches
 /// a site the user put on the MAIN link by name. The destination is learned
 /// from that first blocked attempt, and a `/32` pin would then take the
@@ -1284,4 +1339,37 @@ fn link_scoped_v6_destinations_are_never_routed() {
     );
 
     assert!(out.routes.is_empty());
+}
+
+/// The emergency sweep in `reset-network.ps1` runs with no binary to ask, so it
+/// restates the route signature; a drift there leaves our routes behind, or
+/// deletes somebody else's.
+#[test]
+fn the_reset_script_restates_the_route_signature() {
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../scripts/reset-network.ps1"),
+    )
+    .expect("the reset script");
+    for (name, value) in [
+        ("$routeMetric", SECONDARY_ROUTE_METRIC),
+        ("$networkRouteMetric", NETWORK_ROUTE_METRIC),
+        (
+            "$overlayMaxPrefix",
+            u32::from(TUNNEL_CATCH_ALL_MAX_PREFIX) + 1,
+        ),
+        (
+            "$networkMinPrefixV4",
+            u32::from(nrr_domain::ip_network_policy::widest_rule_prefix(true)),
+        ),
+        (
+            "$networkMinPrefixV6",
+            u32::from(nrr_domain::ip_network_policy::widest_rule_prefix(false)),
+        ),
+    ] {
+        let line = format!("{name} = {value} ");
+        assert!(
+            script.lines().any(|l| l.starts_with(&line)),
+            "{name} must be {value}"
+        );
+    }
 }

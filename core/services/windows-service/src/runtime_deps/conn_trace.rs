@@ -17,11 +17,14 @@ pub(super) fn spawn_fcrdns_learner_worker(
     rx: std::sync::mpsc::Receiver<(std::net::Ipv4Addr, bool, ReverseLearnOrigin)>,
     consumer: Arc<nrr_service_runtime::dns_observation_consumer::DnsObservationConsumer>,
     companion: Option<CompanionFromReverseDeps<'_>>,
+    liveness: Arc<TaskLiveness>,
 ) {
     use nrr_service_runtime::dns_resolver_ports::{
         ConsumerConfirmedHostSink, FcrdnsUpstreamResolver,
     };
     use nrr_service_runtime::fcrdns_learner::{LearnOutcome, ReverseDnsLearner};
+    use nrr_service_runtime::service_tasks::ServiceTaskKind;
+    use nrr_service_runtime::task_liveness::{ThreadExit, Watch};
     use std::time::Duration;
 
     // Cap distinct IPs named per service run — a backstop against a drop storm
@@ -57,7 +60,15 @@ pub(super) fn spawn_fcrdns_learner_worker(
     let spawned = std::thread::Builder::new()
         .name("nrr-fcrdns".into())
         .spawn(move || {
+            // One address held longer than two upstream timeouts is a stuck
+            // learner, not a slow one.
+            let lease = liveness.lease(
+                ServiceTaskKind::FcrdnsLearner,
+                None,
+                Watch::Work(Duration::from_secs(60)),
+            );
             for (ip, allow_direct, origin) in rx {
+                let _learning = lease.work();
                 // The two feeds mean different things; only one of them is a
                 // drop. Naming the wrong one costs the next reader a hunt for
                 // a filter that never fired.
@@ -110,21 +121,18 @@ pub(super) fn spawn_fcrdns_learner_worker(
                     LearnOutcome::NotConfirmed | LearnOutcome::Skipped => {}
                 }
             }
+            lease.finish(ThreadExit::Stopped);
         });
     if let Err(e) = spawned {
         tracing::warn!(target: "nrr::fcrdns", msg_key = "svc-conntrace-fcrdns-worker-spawn-failed", error = %e, "could not spawn FCrDNS learner worker");
     }
 }
 
-/// Reactive VPN-endpoint learning deps for [`build_conn_trace_pair`], bundled
-/// to keep the function's argument count sane: the bounded, session-scoped
-/// server set the learner writes into (see
-/// `nrr_service_runtime::vpn_endpoint_learning`) and the kill-switch/
-/// fail-closed Block-id registry that role-verifies a drop before the
-/// learner trusts it (see `nrr_service_runtime::killswitch_drop_registry`).
+/// VPN-client learning deps for [`build_conn_trace_pair`], bundled to keep
+/// the function's argument count sane: the kill-switch/fail-closed Block-id
+/// registry that role-verifies a drop (see
+/// `nrr_service_runtime::killswitch_drop_registry`) and the sinks below.
 pub(super) struct VpnLearningDeps<'a> {
-    pub(super) learned_vpn_endpoints:
-        &'a Arc<nrr_service_runtime::vpn_endpoint_learning::LearnedVpnEndpoints>,
     pub(super) killswitch_drop_registry:
         &'a Arc<nrr_service_runtime::killswitch_drop_registry::KillswitchBlockFilterRegistry>,
     /// Proactive VPN-client learning: the verified-client
@@ -266,42 +274,12 @@ pub(super) fn build_conn_trace_pair(
     if let Some(ring) = trace_ring {
         consumer_builder = consumer_builder.with_trace_ring(ring);
     }
-    // Reactive VPN self-learning: a flow our kill-switch/fail-closed BLOCK
-    // drops, from a process matching a VPN-client pattern, teaches the
-    // exemption set the tunnel's server IP so the client's own retry gets
-    // through and the tunnel can reconnect without the user disabling
-    // protection. A bare process-name glob, provider- not role-based drop
-    // attribution, and an unbounded system-wide persisted exemption were all
-    // rejected as too loose to ship; each concern is closed here:
-    //   1. Role, not just ownership: the consumer only trusts a drop whose
-    //      decoded WFP spec id is a member of `killswitch_drop_registry`
-    //      (published from the per-SID orchestrator's kill-switch/fail-closed
-    //      Block set) — a user's own Block rule can never pass this gate.
-    //   2. Bounded: `learned_vpn_endpoints` caps at a handful of entries with
-    //      a hard TTL (see `LearnedVpnEndpoints`), each independently expiring.
-    //   3. In-memory only, never persisted — the set is session-scoped and
-    //      rebuilds itself on the next handshake if the service restarts.
-    // Rides the existing sid-scoped bootstrap-server exemption band (merged in
-    // `SecondaryRouteCoordinator::kill_switch_exemptions` /
-    // `fail_closed_exemptions`), so no new codegen surface is introduced.
+    // Role verification against `killswitch_drop_registry`: a user's Block
+    // rule never qualifies a drop for learning.
     {
-        let learned = Arc::clone(vpn_learning.learned_vpn_endpoints);
-        let learner: nrr_service_runtime::conn_observation_consumer::VpnEndpointLearnFn =
-            Arc::new(move |ip: std::net::Ipv4Addr| {
-                if learned.register(ip, std::time::SystemTime::now()) {
-                    tracing::info!(
-                        target: "nrr::vpn-learn",
-                        msg_key = "svc-conntrace-vpn-endpoint-learned",
-                        server = %ip,
-                        "reactive learner: new role-verified VPN bootstrap endpoint",
-                    );
-                }
-            });
         let registry = Arc::clone(vpn_learning.killswitch_drop_registry);
-        // Learner and its role-verification gate go in together — see the
-        // builder: apart, the learner is inert and says nothing about it.
-        consumer_builder = consumer_builder
-            .with_vpn_endpoint_learner(learner, Arc::new(move |id| registry.contains(id)));
+        consumer_builder =
+            consumer_builder.with_killswitch_drop_check(Arc::new(move |id| registry.contains(id)));
         // The same registry classifies the drop's blocking scope,
         // so the scope-bug detector can tell an app pin's expected first
         // contact from a destination pin that outran its route.
@@ -319,7 +297,7 @@ pub(super) fn build_conn_trace_pair(
         consumer_builder = consumer_builder
             .with_dns_lockdown_drop_check(Arc::new(move |id| dns_registry.is_dns_lockdown(id)));
         // …and the service accounts' share of the guard, whose drops are system
-        // traffic: they may teach a tunnel endpoint and nothing else.
+        // traffic: they may teach a VPN client and nothing else.
         let service_registry = Arc::clone(vpn_learning.killswitch_drop_registry);
         consumer_builder = consumer_builder.with_service_account_drop_check(Arc::new(move |id| {
             service_registry.is_service_account(id)

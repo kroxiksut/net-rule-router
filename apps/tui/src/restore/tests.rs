@@ -86,13 +86,13 @@ fn recorded(file: &Path) -> Value {
 fn a_lost_setting_is_offered_on_the_feed_and_nothing_is_sent() {
     let dir = Scratch::new("restore-offer");
     let fake = wiped_service();
-    let intent = json!({ "route-policy": { "kill-switch-enabled": true } });
+    let intent = json!({ "route-policy": { "include-subdomains": false } });
     let app = connected(Some(settings_file(&dir)), intent, &fake);
 
     assert_eq!(
         app.restore.offer,
         Some(Offer {
-            keys: vec!["kill-switch-enabled".into()],
+            keys: vec!["include-subdomains".into()],
             mutes: 0
         })
     );
@@ -101,7 +101,7 @@ fn a_lost_setting_is_offered_on_the_feed_and_nothing_is_sent() {
         said.starts_with("The service does not have your settings"),
         "{said}"
     );
-    assert!(said.contains("Enable leak protection"), "{said}");
+    assert!(said.contains("Also cover subdomains"), "{said}");
     assert!(fake.sent(IpcOperationName::RoutePolicyUpdate).is_empty());
 }
 
@@ -109,7 +109,7 @@ fn a_lost_setting_is_offered_on_the_feed_and_nothing_is_sent() {
 fn r_restores_with_one_apply_only_write_and_records_it_again() {
     let dir = Scratch::new("restore-write");
     let fake = wiped_service();
-    let intent = json!({ "route-policy": { "kill-switch-enabled": true } });
+    let intent = json!({ "route-policy": { "include-subdomains": false } });
     let mut app = connected(Some(settings_file(&dir)), intent, &fake);
 
     assert!(screen(ScreenId::Status).on_line(&mut app, "r"));
@@ -117,13 +117,59 @@ fn r_restores_with_one_apply_only_write_and_records_it_again() {
 
     let sent = fake.sent(IpcOperationName::RoutePolicyUpdate);
     assert_eq!(sent.len(), 1, "{sent:?}");
-    assert_eq!(sent[0]["apply-only"], json!(["kill-switch-enabled"]));
-    assert_eq!(sent[0]["kill-switch-enabled"], json!(true));
+    assert_eq!(sent[0]["apply-only"], json!(["include-subdomains"]));
+    assert_eq!(sent[0]["include-subdomains"], json!(false));
     assert_eq!(app.restore.offer, None);
     assert!(last_notice(&app).contains("Your settings were restored."));
     assert_eq!(
         recorded(&settings_file(&dir))["route-policy"],
-        json!({ "kill-switch-enabled": true })
+        json!({ "include-subdomains": false })
+    );
+}
+
+/// Protection the record holds on goes back on at the connect, unasked, and
+/// the feed says so; it is never part of the offer.
+#[test]
+fn lost_protection_is_switched_back_on_at_once_and_said() {
+    let dir = Scratch::new("restore-protection");
+    let fake = wiped_service();
+    let intent = json!({ "route-policy": {
+        "kill-switch-enabled": true,
+        "include-subdomains": false
+    } });
+    let app = connected(Some(settings_file(&dir)), intent, &fake);
+
+    let sent = fake.sent(IpcOperationName::RoutePolicyUpdate);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["apply-only"], json!(["kill-switch-enabled"]));
+    assert_eq!(sent[0]["kill-switch-enabled"], json!(true));
+    assert_eq!(
+        app.restore.offer,
+        Some(Offer {
+            keys: vec!["include-subdomains".into()],
+            mutes: 0
+        })
+    );
+    let said: Vec<String> = app.notices.iter().map(|n| n.title.clone()).collect();
+    assert!(
+        said.iter()
+            .any(|t| t == "Protection restored after a service failure"),
+        "{said:?}"
+    );
+}
+
+/// A record that holds protection OFF never switches it off unasked.
+#[test]
+fn a_record_of_protection_off_is_only_offered() {
+    let dir = Scratch::new("restore-protection-off");
+    let fake = wiped_service();
+    let intent = json!({ "route-policy": { "kill-switch-fail-closed": false } });
+    let app = connected(Some(settings_file(&dir)), intent, &fake);
+
+    assert!(fake.sent(IpcOperationName::RoutePolicyUpdate).is_empty());
+    assert_eq!(
+        app.restore.offer.as_ref().map(|o| o.keys.clone()),
+        Some(vec!["kill-switch-fail-closed".to_string()])
     );
 }
 

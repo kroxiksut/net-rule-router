@@ -128,12 +128,23 @@ pub fn run() -> ExitCode {
     // installed and the only way out of it is a kill.
     let stop_on_signal = stop.clone();
     if let Err(e) = nrr_platform_linux::signals::install_stop_signals(move || {
+        use nrr_platform_api::power::MachineShutdownProbe;
+        use nrr_service_runtime::lifecycle_matrix::StopReason;
+        // The same SIGTERM arrives for `systemctl stop` and for a power-off;
+        // only systemd knows which, and the teardown plans differently.
+        let reason = if nrr_platform_linux::systemd::SystemdShutdownProbe.machine_is_shutting_down()
+        {
+            StopReason::MachineShutdown
+        } else {
+            StopReason::ServiceStop
+        };
         tracing::info!(
             target: "nrr::lifecycle",
             msg_key = "linux-svc-stop-signal-received",
+            reason = ?reason,
             "stop signal received; shutting down"
         );
-        stop_on_signal.request_stop();
+        stop_on_signal.request_stop_for(reason);
     }) {
         tracing::error!(
             target: "nrr::lifecycle",

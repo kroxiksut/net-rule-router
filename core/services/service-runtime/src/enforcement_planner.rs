@@ -415,22 +415,35 @@ pub fn plan_route_rules_with_shapes(
     // lowest band). Any rule-driven `Permit` above still wins.
     // (report is returned with the flows at the end)
     if matches!(behavior_mode, RouteBehaviorMode::StrictSecondaryFailClosed) {
-        flows.push(FlowRule {
+        let default_block = |ordinal: u32, dst: DstMatch| FlowRule {
             verdict: Verdict::Block,
             precedence: Precedence {
                 class: PrecedenceClass::DefaultCatchAll,
-                ordinal: 0,
+                ordinal,
             },
             flow: FlowMatch {
-                dst: DstMatch::Any,
+                dst,
                 dst_port: None,
                 protocol: None,
             },
-            principal,
+            principal: principal.clone(),
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
-        });
+        };
+        flows.push(default_block(0, DstMatch::Any));
+        // Named separately so a backend whose `Any` is one family (the WFP
+        // layers are per family) closes IPv6 too: Strict means nothing a
+        // rule did not name leaves, in either family.
+        if families == FamilyScope::Both {
+            flows.push(default_block(
+                1,
+                DstMatch::SubnetV6 {
+                    net: Ipv6Addr::UNSPECIFIED,
+                    prefix: 0,
+                },
+            ));
+        }
     }
     (flows, report)
 }

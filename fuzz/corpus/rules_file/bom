@@ -1,0 +1,14 @@
+﻿# NetRuleRouter rules
+--- Zones
+.example
+--- Domains
+host.example
+*.cdn.example +block
+# disabled.example
+--- IP
+192.0.2.0/24
+2001:db8::/32
+--- Windows
+app.exe +children
+--- Auto
+auto.example # learned

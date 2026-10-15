@@ -67,9 +67,8 @@ impl SecondaryRouteCoordinator {
     }
 
     /// Every tunnel server this coordinator knows: the live bootstrap routes,
-    /// the ones cached across a reconnect, the learned ones, and (when asked)
-    /// the persisted ones. Read-only — refreshing the caches is the
-    /// kill-switch path's job.
+    /// the ones cached across a reconnect and (when asked) the persisted ones.
+    /// Read-only — refreshing the caches is the kill-switch path's job.
     fn known_tunnel_servers(
         &self,
         resolution: &RouteResolution,
@@ -99,14 +98,9 @@ impl SecondaryRouteCoordinator {
                 .flatten()
                 .map(|ip| IpAddr::V4(*ip)),
         );
-        if let Some(learned) = self.learned_vpn_endpoints.as_ref() {
-            servers.extend(
-                learned
-                    .current(std::time::SystemTime::now())
-                    .into_iter()
-                    .map(IpAddr::V4),
-            );
-        }
+        // Not the learned endpoints: a network is spared for the server it
+        // holds, and an address a client was dropped on may be a shared front
+        // whose network also holds the user's rule hosts.
         if remembered {
             if let Some(loader) = self.server_ip_loader.as_ref() {
                 servers.extend(loader().into_iter().map(IpAddr::V4));

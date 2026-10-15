@@ -17,10 +17,16 @@
 //!   that lost them.
 //! - [`adapters`] — which adapter may take which route.
 //! - [`auto_rules`] — suggested addresses grouped, filtered and sorted.
+//! - [`block_notices`] — the summary of blocks kept while no surface was
+//!   open.
 //! - [`conn_trace`] — the connection trace's view filters.
 //! - [`diagnostics`] — security alert lists and whether an acknowledgement took.
+//! - [`forwarded`] — whether WSL runs, and asking what it gets when the
+//!   tunnel is down.
 //! - [`notice_mutes`] — hiding whole notice kinds for a while.
 //! - [`stability`] — the full-replacement `settings.service-stability.set` row.
+//! - [`system_dns`] — whether the system DNS was left redirected, and when to
+//!   say so.
 //! - [`units`] — byte counts as people read them.
 //! - [`verify_verdicts`] — the notice for `?` rules that work only on the
 //!   other route.
@@ -29,8 +35,10 @@
 
 pub mod adapters;
 pub mod auto_rules;
+pub mod block_notices;
 pub mod conn_trace;
 pub mod diagnostics;
+pub mod forwarded;
 mod js;
 pub mod notice_mutes;
 pub mod placeholders;
@@ -41,8 +49,10 @@ pub mod rule_sets;
 pub mod rules_overlaps;
 pub mod rules_table;
 pub mod stability;
+pub mod system_dns;
 pub mod units;
 pub mod verify_verdicts;
+pub mod vpn_client_trust;
 pub mod vpn_gateway;
 
 /// One of the two adapter routes. Also names the rules file that holds it.

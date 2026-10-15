@@ -2,12 +2,9 @@
 //! kill-switch drop (see [`crate::conn_observation_consumer`] and
 //! [`crate::killswitch_drop_registry`]).
 //!
-//! The reactive VPN-endpoint learner ([`crate::vpn_endpoint_learning`])
-//! exempts one server IP per drop — which fails against providers that run
-//! their client's connectivity checks over ROTATING infrastructure IPs: every
-//! rotation is a fresh ~72 s hang-until-drop before the next per-IP exemption
-//! lands (observed live in field logs — examplevpn over Google front-ends). The
-//! client PROCESS, however, is stable across rotations, and its whole egress
+//! An address the client dialled is never exempted: providers run their
+//! client's checks over ROTATING infrastructure IPs, and a CDN front a rule
+//! host shares would become a hole. The client PROCESS, however, is stable across rotations, and its whole egress
 //! is the tunnel's transport — so once its role is verified, the process
 //! itself earns an app-scoped exemption whenever a block-all posture arms,
 //! proactively, before the first drop of a session.

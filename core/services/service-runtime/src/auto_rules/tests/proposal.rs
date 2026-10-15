@@ -71,8 +71,7 @@ fn the_dropped_side_follows_the_behavior_mode() {
     // Mirror of the case above: when unmatched traffic already takes the
     // secondary, it is the primary-route companions that carry information.
     let f = fixture(AutoRulesMode::Suggest);
-    f.rules
-        .set_behavior_mode(RouteBehaviorMode::PreferSecondaryWhenAvailable);
+    f.set_behavior_mode(RouteBehaviorMode::PreferSecondaryWhenAvailable);
     two_visits_anchored(&f.engine, RouteRole::Primary, &["cdn.example"]);
 
     let summary = f.engine.tick(SID, later());

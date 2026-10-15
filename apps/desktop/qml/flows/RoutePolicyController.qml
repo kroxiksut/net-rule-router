@@ -13,13 +13,18 @@ import "../lib/pure.js" as Pure
 // Main.qml instantiates one, injects itself as `root`, and exposes it as
 // `root.routePolicyController`; RoutingSettings / InterfacesRoutesSection /
 // DiagnosticsSection drive the handlers through `root.routePolicyController.<fn>`.
-// Every apply* handler that persists a local mirror writes `root.prefs` +
-// `root.emitPrefs()` first, then pushes the authoritative per-SID key through
-// the shared `_applyRoutePolicyKey`. RPC goes through `root.rpc`;
-// `nrrNativeBridge` is a global QML context property, referenced bare.
+// Every apply* handler pushes the authoritative per-SID key through the
+// shared `_applyRoutePolicyKey`; the local preference mirrors follow a write
+// the service confirmed (`_mirrorConfirmedPolicy`), never precede it. RPC goes
+// through `root.rpc`; `nrrNativeBridge` is a global QML context property,
+// referenced bare.
 QtObject {
     id: routePolicyController
     property var root
+
+    /// The service refused a write: `confirmed` maps each key the write named
+    /// to the value the service still holds, for the controls to show again.
+    signal policyWriteRefused(var confirmed)
 
     /// One key, the common case. Thin wrapper over the many-key form so both
     /// take exactly one read and one write.
@@ -155,9 +160,10 @@ QtObject {
         if (!readCorr) { finish(false, "bridge-unavailable", "read"); return }
         root.rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
             if (!ok || !p) { finish(false, code, "read"); return }
+            var cur = (p["route-policy"] || p.routePolicy) || {}
             var req = null
             try {
-                req = job.build((p["route-policy"] || p.routePolicy) || {})
+                req = job.build(cur)
             } catch (e) {
                 console.log("route-policy write: building the request failed:", e)
                 finish(false, "gui-internal", "read")
@@ -166,24 +172,44 @@ QtObject {
             if (!req) { finish(true, "", "unchanged"); return }
             // Only what this write changes: a whole row restating the rest would
             // revert whatever the tray wrote since the read.
-            var changed = Pure.routePolicyChangedKeys(
-                Pure.buildFullRoutePolicyReq((p["route-policy"] || p.routePolicy) || {}, ""), req)
+            var changed = Pure.routePolicyChangedKeys(Pure.buildFullRoutePolicyReq(cur, ""), req)
             if (changed.length === 0) { finish(true, "", "unchanged"); return }
             req["apply-only"] = changed
+            // What the service keeps if it refuses: the row this write is built on.
+            var confirmed = {}
+            for (var c = 0; c < changed.length; c += 1)
+                confirmed[changed[c]] = root._routePolicyEffective(cur, changed[c])
             var wCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
-            if (!wCorr) { finish(false, "bridge-unavailable", "write"); return }
+            if (!wCorr) {
+                policyWriteRefused(confirmed)
+                finish(false, "bridge-unavailable", "write")
+                return
+            }
             root.rpc.registerRpcCallback(wCorr, function(ok2, p2, code2, msg2) {
+                if (ok2) _mirrorConfirmedPolicy(req, changed)
+                else policyWriteRefused(confirmed)
                 if (ok2 && Pure.isUserWriteOrigin(job.origin) && root.settingsRestoreController)
                     root.settingsRestoreController.recordRoutePolicy(req, changed)
                 finish(ok2, code2, "write")
             })
         })
     }
-    /// Default route for unmatched traffic. The legacy
-    /// `updatePrefs({routeBehaviorMode})` path only touched the deprecated
-    /// UiPreferences mirror and never reached enforcement; this writes the
-    /// authoritative per-SID policy the WFP codegen reads. The local prefs mirror
-    /// is already written at the call site.
+
+    /// The local preference mirrors follow a write the service confirmed,
+    /// whoever sent it: the user, the parked delivery, a restore. Reassigning
+    /// the preferences also recomputes `strictKillSwitchActive` from them.
+    function _mirrorConfirmedPolicy(req, changed) {
+        var patch = Pure.routePolicyPrefMirrorPatch(req, changed)
+        if (Object.keys(patch).length === 0) return
+        root.commitPrefs(patch)
+        // The strict-kill-switch notice means nothing while the master is OFF.
+        if (patch.routeKillSwitchEnabled === false) root.strictKillSwitchActive = false
+        // Coverage decides whether `x` and `*.x` are one rule or two.
+        if (patch.hasOwnProperty("routeIncludeSubdomains")) root.refreshRulesOverlaps()
+    }
+    /// Default route for unmatched traffic: the authoritative per-SID policy
+    /// the codegen reads. The `routeBehaviorMode` preference mirrors it once
+    /// the service confirms.
     function applyRouteBehaviorMode(modeSlug) {
         var slug = String(modeSlug || "")
         if (slug === "") return
@@ -197,12 +223,9 @@ QtObject {
         })
     }
     /// Kill-switch FAILURE POSTURE. fail-closed (default) blocks when the
-    /// additional adapter can't be resolved; fail-open allows + warns. Persisted
-    /// locally first so the posture survives a service-DB wipe / offline toggle.
+    /// additional adapter can't be resolved; fail-open allows + warns.
     function applyKillSwitchFailClosed(failClosed) {
         var want = failClosed === true
-        root.prefs.routeKillSwitchFailClosed = want
-        root.emitPrefs()
         _applyRoutePolicyKey("kill-switch-fail-closed", want, {
             ok: want
                 ? root.tr("status.kill-switch-fail-closed-on",
@@ -219,15 +242,8 @@ QtObject {
     /// the service expands every bare-domain rule to also
     /// cover its subdomains (apex kept); the stored rules and their canonical
     /// hash are untouched. Turning it off narrows rules back to exact hosts.
-    /// Persisted locally
-    /// first (the UiPreferences mirror is the SSOT of user intent; the service is
-    /// re-seeded from it on reconnect).
     function applyIncludeSubdomains(enabled) {
         var want = enabled === true
-        root.prefs.routeIncludeSubdomains = want
-        root.emitPrefs()
-        // Coverage decides whether `x` and `*.x` are one rule or two.
-        root.refreshRulesOverlaps()
         _applyRoutePolicyKey("include-subdomains", want, {
             ok: want
                 ? root.tr("status.include-subdomains-on",
@@ -261,12 +277,30 @@ QtObject {
                 "Could not change how programs in rules are routed: ")
         })
     }
+    /// What forwarded traffic gets while the tunnel is down: `as-computer` |
+    /// `unprotected`.
+    function applyForwardedOutage(slug, onFailed) {
+        _applyRoutePolicyKey("forwarded-outage", slug, {
+            onApplied: function(v) {
+                root.updateRoutingState({ forwardedOutage: v })
+                root._onForwardedReading()
+            },
+            onFailed: onFailed,
+            ok: slug === "unprotected"
+                ? root.tr("status.forwarded-traffic-unprotected",
+                    "WSL, containers and virtual machines are no longer protected while the additional route is down.")
+                : root.tr("status.forwarded-traffic-as-computer",
+                    "WSL, containers and virtual machines are now protected like this computer."),
+            uac: root.tr("status.route-policy-uac-declined",
+                "Administrator approval was declined; the setting was not changed."),
+            failPrefix: root.tr("status.forwarded-traffic-failed",
+                "Could not change protection of WSL and containers: ")
+        })
+    }
     /// Shared-IP policy slug (`majority-of-ip` | `majority-of-rules` |
     /// `any-rule-domain`).
     function applySharedIpPolicy(slug) {
         var want = String(slug || "majority-of-ip")
-        root.prefs.routeSharedIpPolicy = want
-        root.emitPrefs()
         _applyRoutePolicyKey("shared-ip-policy", want, {
             ok: root.tr("status.shared-ip-policy-set",
                 "Shared-IP handling updated."),
@@ -283,8 +317,6 @@ QtObject {
     /// unmatched browsing while armed).
     function applyModeACoverageStrategy(slug) {
         var want = String(slug || root.routePolicyDefault("mode-a-coverage-strategy"))
-        root.prefs.routeModeACoverageStrategy = want
-        root.emitPrefs()
         _applyRoutePolicyKey("mode-a-coverage-strategy", want, {
             ok: root.tr("status.mode-a-coverage-set",
                 "Leak protection behavior updated."),
@@ -300,8 +332,6 @@ QtObject {
     /// file.
     function applyResolveHostsBypass(enabled) {
         var want = enabled !== false
-        root.prefs.routeResolveHostsBypass = want
-        root.emitPrefs()
         _applyRoutePolicyKey("resolve-hosts-bypass", want, {
             ok: root.tr("status.hosts-bypass-set",
                 "Rule-domain resolution updated."),
@@ -539,14 +569,12 @@ QtObject {
         })
     }
     /// Kill-switch PROTOCOL bitmask (which IP protocols the emergency block cuts:
-    /// TCP=1, UDP=2, ICMP=4, IGMP=8, GRE=16, ESP=32; bit 64 has no box, the caller keeps it as stored). Persisted locally
-    /// first so the selection (incl. ICMP) survives a service-DB wipe. A mask
-    /// that selects nothing is not sent: the service refuses it.
+    /// TCP=1, UDP=2, ICMP=4, IGMP=8, GRE=16, ESP=32; bit 64 has no box, the
+    /// caller keeps it as stored). A mask that selects nothing is not sent: the
+    /// service refuses it.
     function applyKillSwitchProtocols(bitmask) {
         var want = bitmask | 0
         if (Pure.routePolicyCoerce("kill-switch-protocols", want) !== want) return
-        root.prefs.routeKillSwitchProtocols = want
-        root.emitPrefs()
         _applyRoutePolicyKey("kill-switch-protocols", want, {
             ok: root.tr("status.kill-switch-protocols-applied",
                 "Leak protection protocols updated."),
@@ -559,14 +587,10 @@ QtObject {
     /// Aggressive kill-switch SCOPE. When ON, the split-mode fail-closed block
     /// cuts ALL egress (except explicitly primary-routed + exemptions) while the
     /// additional adapter is unavailable, instead of only the cached secondary
-    /// destination IPs. `strictKillSwitchActive` mirrors the reactive notice the
-    /// notifications centre gates on (the in-place prefs mutation fires no
-    /// prefsChanged).
+    /// destination IPs. `strictKillSwitchActive`, the notice the notifications
+    /// centre gates on, follows the preference mirror once the service confirms.
     function applyKillSwitchBlockAll(enabled) {
         var want = enabled === true
-        root.prefs.routeKillSwitchBlockAll = want
-        root.strictKillSwitchActive = want
-        root.emitPrefs()
         _applyRoutePolicyKey("kill-switch-block-all", want, {
             ok: want
                 ? root.tr("status.kill-switch-block-all-on",
@@ -585,30 +609,46 @@ QtObject {
     /// `origin` names who answered: the wizard is the user's own choice, an
     /// answer sheet is the administrator's and is not recorded as theirs.
     function applyFirstRunProtections(killSwitch, dohLockdown, origin) {
-        var ks = _mirrorKillSwitch(killSwitch)
+        var ks = killSwitch === true
         var o = _killSwitchMessages(ks)
         o.origin = origin || "user:first-run"
+        // "Yes" is the automatic posture; "no" is a choice that holds.
         _applyRoutePolicyKeys({
             "kill-switch-enabled": ks,
-            "doh-lockdown-enabled": dohLockdown === true
+            "doh-lockdown-enabled": dohLockdown === true,
+            "doh-lockdown-auto": dohLockdown === true
         }, o)
+    }
+    /// The DoH/DoT lockdown either decides itself (automatic) or follows the
+    /// hand-set toggle; both keys travel in ONE write so the service never
+    /// sees a toggle without the posture it belongs to.
+    function applyDohLockdownChoice(auto, enabled) {
+        var wantAuto = auto === true
+        var want = enabled === true
+        _applyRoutePolicyKeys({
+            "doh-lockdown-auto": wantAuto,
+            "doh-lockdown-enabled": want
+        }, {
+            ok: wantAuto
+                ? root.tr("status.doh-lockdown-auto",
+                    "Browser DoH/DoT blocking now decides itself: on while you have rules for the additional route.")
+                : want
+                    ? root.tr("status.doh-lockdown-on",
+                        "Browser DoH/DoT blocking enabled: DNS falls back to plaintext so routed sites are seen.")
+                    : root.tr("status.doh-lockdown-off",
+                        "Browser DoH/DoT blocking disabled."),
+            uac: root.tr("status.route-policy-uac-declined",
+                "Administrator approval was declined; the setting was not changed."),
+            failPrefix: root.tr("status.doh-lockdown-failed",
+                "Could not update DoH/DoT blocking: ")
+        })
     }
     /// MASTER kill-switch toggle (the explicit opt-in). When OFF (default) the
     /// whole leak-guard is disarmed regardless of sub-settings; when ON the gated
     /// sub-settings take effect.
     function applyKillSwitchEnabled(enabled) {
-        var want = _mirrorKillSwitch(enabled)
-        _applyRoutePolicyKey("kill-switch-enabled", want, _killSwitchMessages(want))
-    }
-    /// The strict-kill-switch notice only means something while the master is
-    /// ON, so its mirror is cleared the moment it goes OFF.
-    function _mirrorKillSwitch(enabled) {
         var want = enabled === true
-        root.prefs.routeKillSwitchEnabled = want
-        if (!want)
-            root.strictKillSwitchActive = false
-        root.emitPrefs()
-        return want
+        _applyRoutePolicyKey("kill-switch-enabled", want, _killSwitchMessages(want))
     }
     function _killSwitchMessages(want) {
         return {
@@ -630,8 +670,6 @@ QtObject {
     /// which the FQDN cache can never fill).
     function applyAllowDnsOverPrimary(enabled) {
         var want = enabled === true
-        root.prefs.routeAllowDnsOverPrimary = want
-        root.emitPrefs()
         _applyRoutePolicyKey("allow-dns-over-primary", want, {
             ok: want
                 ? root.tr("status.allow-dns-over-primary-on",

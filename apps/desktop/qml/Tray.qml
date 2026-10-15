@@ -46,6 +46,9 @@ SystemTrayIcon {
     /// notice may name the destination at all. Same launch-time snapshot rule.
     property bool notifyBlockNotices: true
     property bool hideBlockNoticeAddresses: false
+    /// Per-kind mute for the "a rule is set on both routes" notice. Same
+    /// launch-time snapshot rule.
+    property bool notifyRuleDuplicates: true
     /// Whole-window opacity of the notice, in percent (Settings → General).
     property int noticeOpacityPercent: 100
     property int autoCloseMs: 0
@@ -313,6 +316,7 @@ SystemTrayIcon {
     // Read-only view of what the main window published: whether it is running
     // and focused, and which files back the user's rules.
     property var guiPresence: GuiPresence {}
+    property var readableToolTips: ReadableToolTips {}
 
     // File-vs-service rules comparison, the tray's own. See `RulesDriftWatch`.
     property var rulesDriftWatch: RulesDriftWatch {
@@ -468,6 +472,30 @@ SystemTrayIcon {
                 break
             case "unassigned-tunnel-detected":
                 _onUnassignedTunnel(event)
+                break
+            case "local-network-too-wide":
+                _onLocalNetworkTooWide(event)
+                break
+            case "rule-duplicates-detected":
+                _onRuleDuplicatesDetected(event)
+                break
+            case "system-dns-not-restored":
+                _onSystemDnsReading(true)
+                break
+            case "adapters-changed":
+                _checkForwarded()
+                break
+            case "app-rule-learning-destinations":
+                _onAppRuleLearning(event)
+                break
+            case "vpn-client-awaiting-confirmation":
+                _onVpnClientAwaitingConfirmation(event)
+                break
+            case "protection-coverage-changed":
+                _onProtectionCoverageChanged(event)
+                break
+            case "push-gap":
+                _onPushGap()
                 break
             case "revision-status-changed":
             case "health-changed":
@@ -2223,8 +2251,11 @@ SystemTrayIcon {
             if (pending.length === 0) return
             tray._localNetworkAskedAtMs = Date.now()
             var first = pending[0] || {}
-            var body = tray.tr("notifications.local-networks.body",
+            var body = (first.allowed === true
+                ? tray.tr("notifications.local-networks.body",
                     "{cidr} on {adapter} stays reachable while routed traffic is blocked. Keep it that way?")
+                : tray.tr("notifications.local-networks.body-open",
+                    "Your home network's IPv6 addresses {cidr} on {adapter} are closed while routed traffic is blocked. Open them to devices on this network?"))
                 .replace("{cidr}", String(first.cidr || ""))
                 .replace("{adapter}", String(first.adapter || ""))
             tray._offerNotice("local-networks", "local-networks", function() {
@@ -2250,6 +2281,34 @@ SystemTrayIcon {
         repeat: true
         triggeredOnStart: true
         onTriggered: tray._checkPendingLocalNetworks()
+    }
+
+    /// The main link reported a "local" network far wider than any local
+    /// network can be; the service already refuses it and decides WHEN to
+    /// say so (once a day per segment). The tray names the link and the
+    /// number, while the window is not on screen to carry the card itself.
+    function _onLocalNetworkTooWide(event) {
+        var adapter = String(event["adapter-name"] || "")
+        var network = String(event["network"] || "")
+        if (network === "") return
+        if (!showNotifications) {
+            console.log("tray local-network-too-wide notice: suppressed — notifications are off")
+            return
+        }
+        var presence = guiPresence ? guiPresence.read() : { windowActive: false }
+        if (presence.windowActive) return
+        tray._presentOrQueue("local-network-too-wide", function() {
+            promptWindow.present({
+                titleText: tr("notifications.local-network-too-wide.title",
+                    "This network looks suspicious"),
+                bodyText: tr("notifications.local-network-too-wide.body",
+                        "{adapter} reports {network} as its local network — far wider than any local network can be. It is not treated as local: devices on it stay blocked while leak protection is on, and sites inside it still follow your rules.")
+                    .replace("{adapter}", adapter)
+                    .replace("{network}", network),
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
     }
 
     /// A tunnel is up and nothing is bound to the additional route, so every
@@ -2280,6 +2339,229 @@ SystemTrayIcon {
                 dismissActionId: "enforcement-dismiss",
                 autoRetireMs: tray._enforcementNoticeMs
             })
+        })
+    }
+
+    /// Notices the window carries in its own list: the tray raises them only
+    /// while no window is on screen. A window closed to the tray exits, so
+    /// "not visible" is "not running" too.
+    function _windowOnScreen() {
+        var presence = guiPresence ? guiPresence.read() : { windowVisible: false }
+        return presence.windowVisible === true
+    }
+
+    /// The system DNS left redirected: said when it appears, with the way out,
+    /// while no window is on screen to say it. A dismissed notice stays down
+    /// while the state lasts.
+    property bool _systemDnsNoticeRaised: false
+    function _onSystemDnsReading(notRestored) {
+        var step = Pure.systemDnsNoticeStep(_systemDnsNoticeRaised, notRestored)
+        _systemDnsNoticeRaised = step.raised
+        if (!step.raise || !showNotifications || _windowOnScreen()) return
+        _presentOrQueue("system-dns-not-restored", function() {
+            promptWindow.present({
+                titleText: tr("notifications.system-dns-not-restored.title",
+                    "Sites may not open by name"),
+                bodyText: tr("notifications.system-dns-not-restored.body",
+                    "NetRuleRouter could not hand the system DNS settings back. Restore network removes what the service left behind."),
+                primaryAction: {
+                    label: tr("settings.service.recovery.action", "Restore network"),
+                    actionId: "system-dns-open-restore-network",
+                    accent: true
+                },
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
+    /// A forwarded network (WSL, a container or VM bridge) came up and the user
+    /// has not said what it gets while the tunnel is down: asked while no window
+    /// is on screen. Read on an adapter change, the policy only once one is up.
+    property bool _forwardedNoticeRaised: false
+    function _checkForwarded() {
+        if (!supports("forwardedTrafficGuard")) return
+        if (!bridgeAvailable || typeof nrrNativeBridge === "undefined"
+                || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcSnapshotInterfacesGet !== "function"
+                || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") {
+            return
+        }
+        var corr = nrrNativeBridge.rpcSnapshotInterfacesGet()
+        rpc.registerRpcCallback(corr, function(ok, payload) {
+            if (!ok || !payload) return
+            if (!Pure.forwardingPresent(payload.rows || [])) {
+                tray._onForwardedReading(false, false, "")
+                return
+            }
+            var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
+            tray.rpc.registerRpcCallback(readCorr, function(ok2, p2) {
+                if (!ok2 || !p2) return
+                var policy = p2["route-policy"] || p2.routePolicy || {}
+                tray._onForwardedReading(true, !!policy.secondary,
+                    String(policy["forwarded-outage"] || ""))
+            })
+        })
+    }
+    function _onForwardedReading(present, routed, answer) {
+        var step = Pure.forwardedNoticeStep(_forwardedNoticeRaised, present, routed, answer)
+        _forwardedNoticeRaised = step.raised
+        if (!step.raise || !showNotifications || _windowOnScreen()) return
+        _presentOrQueue("forwarded-traffic", function() {
+            promptWindow.present({
+                titleText: tr("notifications.forwarded-traffic.title", "WSL or containers are running"),
+                bodyText: tr("notifications.forwarded-traffic.body",
+                    "Choose what WSL, containers and virtual machines get when the additional route goes down. Until you choose, they are protected like this computer."),
+                primaryAction: {
+                    label: tr("action.configure", "Configure"),
+                    actionId: "forwarded-traffic-open-settings",
+                    accent: true
+                },
+                dismissActionId: "enforcement-dismiss"
+            })
+        })
+    }
+    property Timer _forwardedStartCheck: Timer {
+        interval: 30000
+        running: true
+        repeat: false
+        onTriggered: tray._checkForwarded()
+    }
+
+    /// Two of the user's rules claim the same traffic for both routes. The
+    /// tray's own add-rule form can do that with no window open to say so.
+    function _onRuleDuplicatesDetected(event) {
+        var count = Number(event.count || 0)
+        if (!(count > 0)) return
+        if (!showNotifications || !notifyRuleDuplicates) {
+            console.log("tray rule-duplicates: suppressed — this notice kind is silenced")
+            return
+        }
+        if (_windowOnScreen()) return
+        var sample = String(event.sample || "")
+        _presentOrQueue("rule-duplicates", function() {
+            promptWindow.present({
+                titleText: tr("notifications.rule-duplicates.title",
+                    "A rule is set on both routes"),
+                bodyText: tr("notifications.rule-duplicates.body",
+                        "{count} of your rules are enabled on both routes, starting with {sample}. Which one carries the traffic is decided by evaluation order.")
+                    .replace("{count}", String(count))
+                    .replace("{sample}", sample),
+                primaryAction: {
+                    label: tr("action.open-rules", "Open rules"),
+                    actionId: "rule-duplicates-open-rules",
+                    accent: true
+                },
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
+    /// A new application rule spends its first minutes learning the program's
+    /// addresses; with no window open, nothing else explains the refusals.
+    function _onAppRuleLearning(event) {
+        var apps = []
+        var raw = event.apps || []
+        for (var i = 0; i < raw.length; i += 1) {
+            var name = String(raw[i] || "")
+            if (name !== "") apps.push(name)
+        }
+        if (apps.length === 0 || !showNotifications) return
+        if (_windowOnScreen()) return
+        _presentOrQueue("app-rule-learning", function() {
+            promptWindow.present({
+                titleText: tr("notifications.app-rule-learning.title",
+                    "New application rule is settling in"),
+                bodyText: tr("notifications.app-rule-learning.body",
+                        "{apps}: the service is still learning which addresses this program uses, so its first connection attempts may fail. Restart the program if it is already open.")
+                    .replace("{apps}", apps.join(", ")),
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
+    /// A VPN-named program leak protection does not trust by place. The
+    /// question itself is asked in the window; the tray says it is waiting
+    /// there, and only while the window is not on screen.
+    function _onVpnClientAwaitingConfirmation(event) {
+        var offers = Pure.vpnClientTrustOffers(event.clients || [])
+        if (offers.length === 0 || !showNotifications) return
+        if (_windowOnScreen()) return
+        var names = []
+        for (var i = 0; i < offers.length; i += 1) names.push(offers[i].name)
+        _presentOrQueue("vpn-client-trust", function() {
+            promptWindow.present({
+                titleText: tr("notifications.vpn-client-trust.title", "Is this your VPN?"),
+                bodyText: tr("notifications.vpn-client-trust.tray-body",
+                        "{apps} looks like a VPN client, but it is not installed in a protected program folder. Open NetRuleRouter to confirm it, or leak protection keeps blocking it while the additional route is down.")
+                    .replace("{apps}", names.join(", ")),
+                primaryAction: {
+                    label: tr("action.open-main-window", "Open NetRuleRouter"),
+                    actionId: "vpn-client-trust-open-window",
+                    accent: true
+                },
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
+    /// Leak protection is not what the user's settings ask for, or is in force
+    /// because of another user's. The reason picks the sentence; one this
+    /// build does not know has none and is dropped rather than shown raw.
+    function _onProtectionCoverageChanged(event) {
+        var body = _protectionCoverageText(String(event.reason || ""))
+        if (body === "") {
+            console.log("tray protection-coverage: unknown reason ignored")
+            return
+        }
+        if (!showNotifications) return
+        if (_windowOnScreen()) return
+        _presentOrQueue("protection-coverage", function() {
+            promptWindow.present({
+                titleText: tr("notifications.protection-coverage.title",
+                    "Leak protection coverage changed"),
+                bodyText: body,
+                primaryAction: {
+                    label: tr("action.open-settings", "Open settings"),
+                    actionId: "protection-coverage-open-settings",
+                    accent: true
+                },
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
+    /// The sentence for a protection-coverage reason, "" for an unknown one.
+    function _protectionCoverageText(reason) {
+        if (reason === "blanket-block-not-armed")
+            return tr("status.protection.blanket-block-not-armed",
+                "Full blocking is not switched on: the address of the additional link is unknown, and blocking everything without it would cut the link itself. Traffic outside your rules is not blocked.")
+        if (reason === "machine-wide-cut-by-another-user")
+            return tr("status.protection.machine-wide-cut-by-another-user",
+                "Another user of this computer switched on leak protection. Part of it cannot be limited to one account, so IPv6 and ping are off for everyone until they switch it off.")
+        return ""
+    }
+
+    /// The client dropped frames, or re-subscribed after a reconnect: whatever
+    /// the tray derived from pushes may be behind, so it is re-read.
+    function _onPushGap() {
+        _refreshRoutingPaused()
+        _refreshEnforcementState()
+        verifyVerdicts.refresh()
+    }
+
+    function _refreshRoutingPaused() {
+        if (!bridgeAvailable || !rpc) return
+        var corr = nrrNativeBridge.rpcRoutingPauseGet()
+        if (!corr || corr === "") return
+        rpc.registerRpcCallback(corr, function(ok, p) {
+            if (ok && p && typeof p.paused !== "undefined") {
+                tray.routingPaused = !!p.paused
+            }
         })
     }
 
@@ -2817,6 +3099,39 @@ SystemTrayIcon {
         }
         if (action === "enforcement-dismiss") {
             _enforcementNoticeKind = ""
+            _scheduleDrain()
+            return
+        }
+        if (action === "rule-duplicates-open-rules") {
+            triggerAction("rules")
+            _scheduleDrain()
+            return
+        }
+        if (action === "system-dns-open-restore-network") {
+            if (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
+                    && typeof nrrNativeBridge.openMainGuiFocused === "function")
+                nrrNativeBridge.openMainGuiFocused("settings", "restore-network", "{}")
+            else
+                triggerAction("settings")
+            _scheduleDrain()
+            return
+        }
+        if (action === "forwarded-traffic-open-settings") {
+            if (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
+                    && typeof nrrNativeBridge.openMainGuiFocused === "function")
+                nrrNativeBridge.openMainGuiFocused("settings", "forwarded-traffic", "{}")
+            else
+                triggerAction("settings")
+            _scheduleDrain()
+            return
+        }
+        if (action === "vpn-client-trust-open-window") {
+            triggerAction("open-main-window")
+            _scheduleDrain()
+            return
+        }
+        if (action === "protection-coverage-open-settings") {
+            triggerAction("settings")
             _scheduleDrain()
             return
         }
@@ -3561,6 +3876,7 @@ SystemTrayIcon {
         showNotifications = context.showNotifications !== false
         notifySuggestionChanges = context.notifySuggestionChanges !== false
         notifyBlockNotices = context.notifyBlockNotices !== false
+        notifyRuleDuplicates = context.notifyRuleDuplicates !== false
         hideBlockNoticeAddresses = context.hideBlockNoticeAddresses === true
         if (context.trayNoticeOpacityPercent !== undefined) {
             noticeOpacityPercent = parseInt(context.trayNoticeOpacityPercent) || 100
@@ -3607,6 +3923,7 @@ SystemTrayIcon {
                 || payload.activeRevisionId || "")
             tray._enforcementActive = revision !== ""
             tray._enforcementKnown = true
+            tray._onSystemDnsReading(Pure.systemDnsNotRestored(payload))
             tray.refreshTooltip()
         })
     }
@@ -3708,12 +4025,7 @@ SystemTrayIcon {
             if (typeof nrrNativeBridge.pushEvent !== "undefined") {
                 nrrNativeBridge.pushEvent.connect(handlePushEvent)
             }
-            var corrFetch = nrrNativeBridge.rpcRoutingPauseGet()
-            rpc.registerRpcCallback(corrFetch, function(ok, p) {
-                if (ok && p && typeof p.paused !== "undefined") {
-                    routingPaused = !!p.paused
-                }
-            })
+            _refreshRoutingPaused()
             // The desktop can switch light/dark while the tray sits in the
             // notification area for days. Its own prompt windows are themed
             // from this snapshot, so without the refresh they keep the
@@ -3821,19 +4133,11 @@ SystemTrayIcon {
         if (!corr || corr === "") return
         rpc.registerRpcCallback(corr, function(ok, p) {
             if (!ok || !p) return
-            var entries = (p && p.entries) || []
-            if (entries.length === 0) return
-            var throughId = 0
-            var shown = []
-            for (var i = 0; i < entries.length; i += 1) {
-                var id = Number(entries[i].id || 0)
-                if (id > throughId) throughId = id
-                var dest = String(entries[i].destination || "")
-                if (dest !== "" && shown.indexOf(dest) < 0) shown.push(dest)
-            }
-            tray._showBlockNoticeBacklog(entries.length, shown)
-            if (throughId > 0) {
-                var ackCorr = rpc.rpcBlockNoticeJournalAck({ "through-id": throughId })
+            var summary = Pure.blockNoticeBacklog(p.entries)
+            if (!summary) return
+            tray._showBlockNoticeBacklog(summary)
+            if (summary.throughId > 0) {
+                var ackCorr = rpc.rpcBlockNoticeJournalAck({ "through-id": summary.throughId })
                 rpc.registerRpcCallback(ackCorr, function(ackOk, ackPayload, code, msg) {
                     if (!ackOk) console.warn("tray journal ack failed:", code, msg)
                 })
@@ -3841,20 +4145,18 @@ SystemTrayIcon {
         })
     }
 
-    function _showBlockNoticeBacklog(count, destinations) {
-        var names = hideBlockNoticeAddresses ? [] : destinations.slice(0, 5)
-        var rest = hideBlockNoticeAddresses
-            ? 0 : Math.max(0, destinations.length - names.length)
+    function _showBlockNoticeBacklog(summary) {
+        var names = hideBlockNoticeAddresses ? [] : summary.shown
+        var count = summary.count
         var body = tr("notifications.block-notice.backlog.body",
-                "The service blocked {count} connection(s) while neither this window nor "
-                + "the tray icon was running.")
+                "The service blocked {count} connection(s) while NetRuleRouter was not open.")
             .replace("{count}", "<b>" + String(count) + "</b>")
         if (names.length > 0) {
             var list = names.map(function(n) { return _escapeMarkup(n) }).join(", ")
-            if (rest > 0) {
+            if (summary.more > 0) {
                 list = list + ", "
                     + tr("notifications.block-notice.backlog.more", "and {count} more")
-                        .replace("{count}", String(rest))
+                        .replace("{count}", String(summary.more))
             }
             body = body + "<br>" + tr("notifications.block-notice.backlog.destinations",
                 "Destinations: {list}.").replace("{list}", list)

@@ -3,15 +3,18 @@
 //! service confirmed, and offered back when a service that was reinstalled or
 //! had its data reset answers without them.
 //!
-//! Nothing is sent unasked: a connect compares, the Status screen says what is
-//! missing, and only `r` sends the one write that brings it back. Under `sudo`
+//! Protection the record holds on and the service lost goes back on at once,
+//! unasked, and the feed says so. Everything else is offered: a connect
+//! compares, the Status screen says what is missing, and only `r` sends the one
+//! write that brings it back. Under `sudo`
 //! the rules edited are the administrator's baseline, so there is no settings
 //! file of the user's own and nothing is recorded or offered.
 
 use std::path::{Path, PathBuf};
 
 use nrr_client_logic::restore::{
-    mutes_to_restore, present_adapter_ids, restore_plan, route_policy_divergence,
+    mutes_to_restore, present_adapter_ids, protection_restore, protection_to_restore, restore_plan,
+    route_policy_divergence,
 };
 use nrr_ipc_client::{ipc_error_to_wire, ipc_operation_timeout, IpcClient};
 use nrr_shared::ipc::IpcOperationName as Op;
@@ -58,6 +61,14 @@ pub const ADAPTER_MISSING: Key = key(
     "status.settings-restore-adapter-missing",
     "Not restored: the adapter {name} is not on this computer now.",
 );
+pub const PROTECTION_TITLE: Key = key(
+    "notifications.protection-restored.title",
+    "Protection restored after a service failure",
+);
+pub const PROTECTION_BODY: Key = key(
+    "notifications.protection-restored.body",
+    "The service had lost these settings and they were switched back on: {settings}.",
+);
 pub const HELP: Key = key(
     "tui.help.status-restore",
     "r: restore your settings to a service that lost them",
@@ -81,6 +92,8 @@ pub const ALL: &[Key] = &[
     NOTHING,
     FAILED,
     ADAPTER_MISSING,
+    PROTECTION_TITLE,
+    PROTECTION_BODY,
     HELP,
     PLAIN_HELP,
 ];
@@ -112,6 +125,8 @@ pub struct RestoreState {
     /// Said on the feed by the next [`announce`], which has the texts.
     unannounced_offer: bool,
     unannounced_outcome: Option<Outcome>,
+    /// Protection switched back on unasked, said by the next [`announce`].
+    unannounced_protection: Vec<String>,
 }
 
 /// The service came (back): compare once the snapshot is read.
@@ -180,11 +195,28 @@ fn now_ms() -> i64 {
 
 fn check_job(file: PathBuf) -> Job {
     Box::new(move |client: &dyn IpcClient| {
+        let mut protected = Vec::new();
         let offer = read_settings(&file).and_then(|settings| {
             let service = read_service(client).ok()?;
             let policy = intent_object(&settings, INTENT_ROUTE_POLICY);
+            let automatic = protection_to_restore(&policy, &service.policy);
+            if let Some(request) = protection_restore(&policy, &service.policy) {
+                if call(
+                    client,
+                    Op::RoutePolicyUpdate,
+                    Value::Object(request.clone()),
+                )
+                .is_ok()
+                {
+                    record_route_policy_in(Some(&file), &request);
+                    protected.clone_from(&automatic);
+                }
+            }
             let recorded_mutes = settings.intent(INTENT_NOTICE_MUTES).cloned();
-            let keys = route_policy_divergence(&policy, &service.policy);
+            let keys: Vec<String> = route_policy_divergence(&policy, &service.policy)
+                .into_iter()
+                .filter(|key| !automatic.contains(key))
+                .collect();
             let mutes = recorded_mutes
                 .map(|recorded| mutes_to_restore(&recorded, &service.mutes, now_ms()).len())
                 .unwrap_or(0);
@@ -193,6 +225,7 @@ fn check_job(file: PathBuf) -> Job {
         Reply::new(move |app| {
             app.restore.unannounced_offer = offer.is_some();
             app.restore.offer = offer;
+            app.restore.unannounced_protection = protected;
         })
     })
 }
@@ -355,6 +388,14 @@ fn setting_name(setting: &str) -> Key {
             "settings.routing.doh-lockdown.label",
             "Block browser DoH/DoT",
         ),
+        "doh-lockdown-auto" => key(
+            "settings.routing.doh-lockdown.auto-label",
+            "Decide automatically (recommended)",
+        ),
+        "forwarded-outage" => key(
+            "settings.routing.forwarded-traffic.title",
+            "WSL, containers and virtual machines",
+        ),
         _ => OTHER,
     }
 }
@@ -391,6 +432,15 @@ fn with_missing(mut body: String, missing: &[String], texts: &Texts) -> String {
 /// Says on the feed what a reply found: an offer, or how a restore went.
 pub fn announce(app: &mut AppState, texts: &Texts, now: std::time::Instant) -> Vec<Effect> {
     let mut effects = Vec::new();
+    let protected = std::mem::take(&mut app.restore.unannounced_protection);
+    if !protected.is_empty() {
+        let restored = Offer {
+            keys: protected,
+            mutes: 0,
+        };
+        let body = texts.fill(PROTECTION_BODY, &[("settings", names(&restored, texts))]);
+        effects.extend(app.notify(NoticeLevel::Info, texts.get(PROTECTION_TITLE), body, now));
+    }
     if std::mem::take(&mut app.restore.unannounced_offer) {
         if let Some(offer) = app.restore.offer.clone() {
             let body = texts.fill(OFFER_BODY, &[("settings", names(&offer, texts))]);

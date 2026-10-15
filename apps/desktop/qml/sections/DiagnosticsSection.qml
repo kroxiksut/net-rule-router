@@ -187,7 +187,8 @@ ScrollView {
     // running) rather than a misleading "Service running".
     property string _realServiceState: ""
     property string _realActiveRevisionId: ""
-    property int _realPendingChanges: -1
+    // The service reports it could not hand the system DNS back.
+    property bool _dnsNotRestored: false
 
     function _refreshServiceHealth() {
         if (!root.bridgeAvailable
@@ -196,7 +197,7 @@ ScrollView {
                 || typeof nrrNativeBridge.rpcServiceHealthGet !== "function") {
             _realServiceState = "unavailable"
             _realActiveRevisionId = ""
-            _realPendingChanges = 0
+            _dnsNotRestored = false
             return
         }
         _refreshCacheTotal()
@@ -205,21 +206,16 @@ ScrollView {
             if (!ok) {
                 section._realServiceState = "unavailable"
                 section._realActiveRevisionId = ""
-                section._realPendingChanges = 0
+                section._dnsNotRestored = false
                 return
             }
+            section._dnsNotRestored = Pure.systemDnsNotRestored(payload)
             section._realServiceState = String(
                 (payload && payload["service-state"])
                 || (payload && payload.service_state) || "unavailable")
             section._realActiveRevisionId = String(
                 (payload && payload["active-revision-id"])
                 || (payload && payload.active_revision_id) || "")
-            // `pending_changes` is deprecated → derive from
-            // degraded_modes length so the existing "Pending changes"
-            // line surfaces a meaningful count when degraded.
-            var degraded = (payload && payload["degraded-modes"])
-                || (payload && payload.degraded_modes) || []
-            section._realPendingChanges = degraded.length
         })
     }
     // Refresh only the live cache total (cheap page_size=1 fetch)
@@ -260,11 +256,12 @@ ScrollView {
             return serviceHealth.activeRevisionId || ""
         return ""
     }
+    // Revisions the service holds unapplied: its diagnostics answer is the one
+    // source, and only a live one counts.
     function _effectivePendingChanges() {
-        if (_realServiceState !== "") return _realPendingChanges
-        if ((root.backendStatus || {}).kind === "connected")
-            return Number(serviceHealth.pendingChanges || 0)
-        return 0
+        if (_realServiceState === "unavailable" || !Pure.diagnosticsSnapshotIsLive(diag))
+            return 0
+        return Number(serviceHealth.pendingChanges || 0)
     }
 
     /// One line about where the service's start sits relative to the boot's
@@ -568,6 +565,14 @@ ScrollView {
                     text: root.tr("diag.service.pending-changes-label", "Pending changes")
                         + ": " + String(_pending)
                     color: root.mutedTextColor
+                }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    visible: section._dnsNotRestored
+                    text: root.tr("diag.service.dns-not-restored",
+                        "System DNS could not be restored. Use Settings -> Service management -> Restore network.")
+                    color: root.uiTheme.colorDanger
                 }
                 // "Did this slow my start-up" is what a background service gets
                 // blamed for, so the card answers with the measurement rather

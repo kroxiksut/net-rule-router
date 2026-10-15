@@ -56,6 +56,9 @@ pub fn uninstall_service() -> ExitCode {
                     eprintln!("could not give the machine's DNS back: {reason}");
                 }
             }
+            // The port swept the nft table; the per-user routing selectors and
+            // our routes live outside it and nothing else removes them.
+            sweep_routing_leftovers();
             println!("Uninstalled '{SYSTEMD_UNIT_NAME}'.");
             ExitCode::SUCCESS
         }
@@ -63,6 +66,21 @@ pub fn uninstall_service() -> ExitCode {
             eprintln!("uninstall failed: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Remove the `ip rule` selectors and the routes a dead or stopped daemon
+/// left; a failure is reported, never fatal to the removal.
+fn sweep_routing_leftovers() {
+    use crate::cleanup::CleanupHost;
+    let host = crate::cleanup::SystemHost {
+        data_dir: nrr_platform_api::paths::production_data_root(),
+    };
+    if let Err(reason) = host.sweep_rules() {
+        eprintln!("could not remove the per-user routing rules: {reason}");
+    }
+    if let Err(reason) = host.sweep_routes() {
+        eprintln!("could not remove the leftover routes: {reason}");
     }
 }
 

@@ -19,6 +19,8 @@ impl PerSidApplyOrchestrator {
     ) -> Self {
         Self {
             apply_locks: Mutex::new(std::collections::HashMap::new()),
+            membership_lock: Mutex::new(()),
+            enforced_sids: None,
             // The process-wide stop latch. Tests override it rather than flip a
             // static every other test in the binary would see.
             teardown_gate: Arc::new(crate::teardown_in_progress),
@@ -63,6 +65,7 @@ impl PerSidApplyOrchestrator {
             // Default: no on-disk ledger. Production wires one via
             // `with_filter_ledger` so hard-kill orphans self-heal.
             ledger: None,
+            pending_orphans: Mutex::new(None),
             // Default: no shared status → `AppUnresolved` diagnostics are
             // INFO-logged only. Production wires one via
             // `with_app_enforcement_status` so the GUI banner can list them.
@@ -114,6 +117,15 @@ impl PerSidApplyOrchestrator {
             service_account_owner: Mutex::new(Vec::new()),
             service_account_dns_log: crate::enforcement_planner::ServiceAccountDnsLog::default(),
         }
+    }
+
+    /// Wire the one decider of who holds a filter set (see
+    /// [`EnforcedSidsSource`]). With it, [`Self::settle`] is how membership
+    /// changes, and a recompile of a user it does not name installs nothing.
+    #[must_use]
+    pub fn with_enforced_sids(mut self, source: EnforcedSidsSource) -> Self {
+        self.enforced_sids = Some(source);
+        self
     }
 
     /// Give the machine's service accounts the route-table owners' address

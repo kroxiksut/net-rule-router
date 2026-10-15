@@ -26,7 +26,7 @@ ApplicationWindow {
     // emitted into the QML context by the launcher. Windows-all-supported
     // default so mock/preview (which emits no context) still renders every
     // section; the real profile loads from `context.platformProfile` below.
-    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, fakeIp: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, serviceStartOnAppLaunch: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
+    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, fakeIp: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, forwardedTrafficGuard: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, serviceStartOnAppLaunch: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
     // Capability query for declarative, OS-agnostic section gating: a
     // feature-keyed section renders only when the running OS supports it.
     // Unknown feature or missing profile → true (show it), which is why the
@@ -52,6 +52,11 @@ ApplicationWindow {
             platformProfile ? platformProfile.supports : null)
     }
     readonly property bool localNetworksSupported: supports("localNetworkExceptions")
+    /// A network the computer forwards for (WSL, a container or VM bridge) is
+    /// up, and its outage answer can be enforced.
+    readonly property bool forwardingPresent: supports("forwardedTrafficGuard")
+        && Pure.forwardingPresent(interfacesRowsAll)
+    onForwardingPresentChanged: _onForwardedReading()
     readonly property bool blockNoticesSupported: supports("blockNotices")
     /// Why a section keyed off one of the flags above renders inert. One
     /// wording for every such section — the reason is the same in all of them.
@@ -500,23 +505,6 @@ ApplicationWindow {
                     .replace("{current}", String(((window.context || {}).about || {}).version || "")),
                 "actionKey": "open-release-page",
                 "actionText": tr("notifications.update-available.action", "Open download page")
-            })
-        }
-        // The leak protection was re-armed from the
-        // user's saved settings after the service state was reset (e.g. a fresh
-        // build wiped the per-SID DB). Surface it so a restored kill-switch is never
-        // a silent surprise. Dismissible info notice; the user can turn it off.
-        if (notificationsController.killSwitchRestoredNoticeActive) {
-            out.push({
-                "id": "kill-switch-restored",
-                "severity": "info",
-                "dismissible": true,
-                "title": tr("notifications.kill-switch-restored.title",
-                    "Leak protection restored"),
-                "body": tr("notifications.kill-switch-restored.body",
-                    "Leak protection was turned back on from your saved settings (the background service had been reset). If you didn't expect this, you can turn it off in Settings → Routing behavior."),
-                "actionKey": "open-routing-settings",
-                "actionText": tr("action.open-settings", "Open settings")
             })
         }
         // `?` rules that work only on the other route. The service holds the
@@ -1354,14 +1342,25 @@ ApplicationWindow {
     }
 
     /// A failed service-control action: the refusal's own wording when its code
-    /// has one, else the launcher's detail, which names what went wrong.
+    /// has one. Codes whose detail is technical (exit code, the service's last
+    /// stderr line) keep it, since that is what a bug report needs; the others
+    /// carry English prose that only repeats the translated text.
+    readonly property var serviceErrorCodesWithDetail: [
+        "service-control-failed", "service-relocation-failed",
+        "autostart-local-error", "console-path-error", "sidecar-error"
+    ]
     function serviceOperationErrorText(code, message) {
         var slug = String(code || "")
+        var detail = String(message || "")
         if (slug !== "") {
             var localised = tr("errors." + slug, "")
-            if (localised && localised !== "errors." + slug) return localised
+            if (localised && localised !== "errors." + slug) {
+                if (detail === "" || serviceErrorCodesWithDetail.indexOf(slug) < 0)
+                    return localised
+                return localised + " " + tr("action.details", "Details") + ": " + detail
+            }
         }
-        return String(message || "")
+        return detail
     }
 
     /// The words for a `Pure.previewRefusal`: the refused values when the
@@ -1417,8 +1416,67 @@ ApplicationWindow {
     /// Focus id -> Settings category holding it.
     readonly property var _settingsFocusCategories: ({
         "doh-lockdown": "routing",
-        "leak-protection": "routing"
+        "leak-protection": "routing",
+        "forwarded-traffic": "routing",
+        "restore-network": "service"
     })
+
+    /// The system DNS left redirected: said when it appears, with the way out.
+    /// A dismissed notice stays down while the state lasts; once it clears,
+    /// the notice goes and the next occurrence is news again.
+    property bool _systemDnsNoticeRaised: false
+    property string _systemDnsNoticeId: ""
+    function _onSystemDnsReading(notRestored) {
+        var step = Pure.systemDnsNoticeStep(_systemDnsNoticeRaised, notRestored)
+        _systemDnsNoticeRaised = step.raised
+        if (!step.raised && _systemDnsNoticeId !== "") {
+            notificationsController._dropPushNotice(_systemDnsNoticeId)
+            _systemDnsNoticeId = ""
+        }
+        if (!step.raise) return
+        _systemDnsNoticeId = "system-dns-not-restored:" + String(Date.now())
+        notificationsController._addPushNotice({
+            "id": _systemDnsNoticeId,
+            "severity": "warning",
+            "dismissible": true,
+            "kind": "system-dns-not-restored",
+            "title": tr("notifications.system-dns-not-restored.title",
+                "Sites may not open by name"),
+            "body": tr("notifications.system-dns-not-restored.body",
+                "NetRuleRouter could not hand the system DNS settings back. Restore network removes what the service left behind."),
+            "actionKey": "open-restore-network",
+            "actionText": tr("settings.service.recovery.action", "Restore network")
+        })
+    }
+
+    /// A forwarded network up with no answer for the tunnel's outage: asked once per
+    /// appearance. Read only after the service answered for this user, so a
+    /// policy not read yet is never taken for "not answered".
+    property bool _forwardedNoticeRaised: false
+    property string _forwardedNoticeId: ""
+    function _onForwardedReading() {
+        if (!_servicePolicyRead) return
+        var step = Pure.forwardedNoticeStep(_forwardedNoticeRaised, forwardingPresent,
+            _servicePolicySecondaryBound, String(routingState.forwardedOutage || ""))
+        _forwardedNoticeRaised = step.raised
+        if (!step.raised && _forwardedNoticeId !== "") {
+            notificationsController._dropPushNotice(_forwardedNoticeId)
+            _forwardedNoticeId = ""
+        }
+        if (!step.raise) return
+        _forwardedNoticeId = "forwarded-traffic:" + String(Date.now())
+        notificationsController._addPushNotice({
+            "id": _forwardedNoticeId,
+            "severity": "info",
+            "dismissible": true,
+            "kind": "forwarded-traffic",
+            "title": tr("notifications.forwarded-traffic.title", "WSL or containers are running"),
+            "body": tr("notifications.forwarded-traffic.body",
+                "Choose what WSL, containers and virtual machines get when the additional route goes down. Until you choose, they are protected like this computer."),
+            "actionKey": "open-forwarded-traffic",
+            "actionText": tr("action.configure", "Configure")
+        })
+    }
 
     function openOutageBlocks() { requestSectionChange("outage-blocks") }
 
@@ -1470,6 +1528,7 @@ ApplicationWindow {
     property bool routingSharedStrictDetailsExpanded: false
     property bool routingSharedExemptAddressesExpanded: false
     property bool routingDohEditorExpanded: false
+    property bool routingLocalSuffixesExpanded: false
 
     function resolveThemeModeForPrefs(preferences) {
         var effective = String((preferences || {}).effectiveThemeMode || "")
@@ -1946,8 +2005,13 @@ ApplicationWindow {
     readonly property string localNetworkOfferText: {
         if (pendingLocalNetworks.length === 0) return ""
         var first = pendingLocalNetworks[0] || {}
-        var head = tr("status.local-network-offer",
-            "Found a local network on this computer: {cidr} ({adapter}). Keep it reachable while routed traffic is blocked?")
+        // A private segment is already reachable and the question is whether to
+        // keep it so; a public IPv6 prefix stays closed until the answer.
+        var head = (first.allowed === true
+            ? tr("status.local-network-offer",
+                "Found a local network on this computer: {cidr} ({adapter}). Keep it reachable while routed traffic is blocked?")
+            : tr("status.local-network-offer-open",
+                "Found your home network's IPv6 addresses: {cidr} ({adapter}). Open them to devices on this network while routed traffic is blocked?"))
             .replace("{cidr}", String(first.cidr || ""))
             .replace("{adapter}", String(first.adapter || ""))
         if (pendingLocalNetworks.length === 1) return head
@@ -2299,6 +2363,8 @@ ApplicationWindow {
         // fail-closed + secondary adapter unresolved). Drives the warning
         // banner; refreshed from the connect snapshot.
         killSwitchBlockAllArmed: false,
+        // What forwarded traffic gets while the tunnel is down ("" until answered).
+        forwardedOutage: "",
         // Where the applied rules are enforced differently from how they
         // read (a literal-IP block over a route, a block leaking a shared
         // address). Shown on the Overlaps screen; refreshed from the snapshot.
@@ -2334,6 +2400,9 @@ ApplicationWindow {
             // to the same "no secondary routes will be applied" outcome.
             window._servicePolicySecondaryBound = !!(rpRaw && rp.secondary)
             window._servicePolicyRead = true
+            // The standing twin of the push: a client that connected after
+            // the service asked still gets the question.
+            _offerPendingVpnClients(p["pending-vpn-clients"] || [])
             var patch = {
                 unenforcedAppRules: list,
                 // Keep the auto-seed checkbox in sync with the
@@ -2360,7 +2429,8 @@ ApplicationWindow {
                 killSwitchBlockAllArmed:
                     p["kill-switch-block-all-armed"] === true,
                 ruleConflicts: (p["rule-conflicts"] instanceof Array)
-                    ? p["rule-conflicts"] : []
+                    ? p["rule-conflicts"] : [],
+                forwardedOutage: window._routePolicyEffective(rp, "forwarded-outage")
             }
             // Autostart is the LAUNCHER's answer, not the service's: the
             // service runs as LocalSystem and its registry hive is not the
@@ -2376,6 +2446,7 @@ ApplicationWindow {
                 patch.autostartOverrideValue = String(au["overridden-value"] || "")
             }
             updateRoutingState(patch)
+            _onForwardedReading()
             _resyncLinkProvidersFromPrefs(p)
             // The push fires on change only; a window that connected later
             // learns the standing state here. Nothing may record these
@@ -2456,6 +2527,8 @@ ApplicationWindow {
         // Deferred: the refusal's own callback runs first.
         onSecurityAlertGateHit: Qt.callLater(window.refreshDiagnosticsSnapshot)
     }
+
+    ReadableToolTips {}
 
     // What the tray cannot work out for itself: whether this window exists and
     // has the user's attention, and which files back the current rules. The
@@ -2863,6 +2936,77 @@ ApplicationWindow {
     // service-write failure we append a short warning to the current status line
     // (the status already shows the "will keep working" confirmation). When the
     // bridge is unavailable the correlation id is empty and no callback fires.
+    // Programs named like a VPN client that sit outside the protected program
+    // folders, keyed by path: the service lists them, the notice asks, and a
+    // yes replaces the link provider set with everything confirmed so far
+    // plus the answer (the write is a full replacement).
+    property var _pendingVpnOffers: ({})
+    function _offerPendingVpnClients(clients) {
+        var offers = Pure.vpnClientTrustOffers(clients || [])
+        var keep = {}
+        for (var i = 0; i < offers.length; i += 1) {
+            var offer = offers[i]
+            var id = "vpn-client-trust:" + offer.exePath.toLowerCase()
+            keep[id] = true
+            _pendingVpnOffers[id] = offer
+            var bundled = offer.bundledExePaths.length > 0
+            notificationsController._addPushNotice({
+                "id": id,
+                "severity": "warning",
+                "dismissible": true,
+                "kind": "vpn-client-trust",
+                "title": tr("notifications.vpn-client-trust.title",
+                    "Is this your VPN?"),
+                "body": (bundled
+                    ? tr("notifications.vpn-client-trust.body-bundle",
+                        "{name} looks like a VPN client, but it is not installed in a protected program folder, so leak protection does not trust it on its own. It ships with {count} more program(s) that can be trusted with it.")
+                        .replace("{count}", String(offer.bundledExePaths.length))
+                    : tr("notifications.vpn-client-trust.body",
+                        "{name} looks like a VPN client, but it is not installed in a protected program folder, so leak protection does not trust it on its own. Confirm it and it will keep working while leak protection is on."))
+                    .replace("{name}", offer.name),
+                "actionKey": bundled ? "trust-vpn-client-bundle" : "trust-vpn-client",
+                "actionText": bundled
+                    ? tr("notifications.vpn-client-trust.action-bundle",
+                        "This is my VPN, with the programs it ships with")
+                    : tr("vpn-onboarding.confirm", "This is my VPN"),
+                "secondaryActionKey": bundled ? "trust-vpn-client" : "",
+                "secondaryActionText": bundled ? tr("vpn-onboarding.confirm", "This is my VPN") : "",
+                "actionArg": id
+            })
+        }
+        // Confirmed, moved or gone: its question goes with it.
+        for (var old in _pendingVpnOffers) {
+            if (keep[old]) continue
+            notificationsController._dropPushNotice(old)
+            delete _pendingVpnOffers[old]
+        }
+    }
+    function _trustVpnClient(noticeId, withBundle) {
+        var offer = _pendingVpnOffers[String(noticeId || "")]
+        if (!offer) return
+        var joined = (prefs && prefs.confirmedVpnExePaths)
+            ? String(prefs.confirmedVpnExePaths) : ""
+        var existing = []
+        var known = joined === "" ? [] : joined.split(";")
+        for (var i = 0; i < known.length; i += 1) {
+            var path = String(known[i] || "").trim()
+            if (path !== "") existing.push({ "exe-path": path, "display-name": "" })
+        }
+        var apps = Pure.vpnClientTrustConfirmedApps(existing, offer, withBundle)
+        var paths = []
+        for (var a = 0; a < apps.length; a += 1) paths.push(apps[a]["exe-path"])
+        updatePrefs({
+            confirmedVpnExePaths: paths.join(";"),
+            confirmedVpnExePath: paths.length > 0 ? paths[0] : ""
+        })
+        emitPrefs()
+        _writeLinkProviderSet(apps)
+        notificationsController._dropPushNotice(String(noticeId || ""))
+        delete _pendingVpnOffers[String(noticeId || "")]
+        statusLine = tr("vpn-onboarding.confirmed-status",
+            "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
+            .replace("{name}", offer.name)
+    }
     function _writeLinkProviderSet(apps) {
         var req = {
             "role": "secondary",
@@ -3024,6 +3168,7 @@ ApplicationWindow {
                 // so a real service is answering regardless of which facade the
                 // launcher handed us at cold start.
                 window.backendLiveServiceConfirmed = true
+                window._onSystemDnsReading(Pure.systemDnsNotRestored(payload))
                 var wasDisconnected =
                     (window.backendStatus || {}).kind !== "connected"
                 if (wasDisconnected) {
@@ -3555,6 +3700,12 @@ ApplicationWindow {
                         .replace("{apps}", String((event["apps"] || []).join(", ")))
                 })
                 break
+            case "vpn-client-awaiting-confirmation":
+                // Leak protection does not trust a VPN-named program by its
+                // place; the user's word is the way in. The whole list every
+                // time, so a confirmed client's question goes away.
+                _offerPendingVpnClients(event["clients"] || [])
+                break
             case "rule-duplicates-detected":
                 // The rules are valid; they simply claim the same traffic for
                 // two routes, and evaluation order — not the user — settles
@@ -3576,6 +3727,9 @@ ApplicationWindow {
                     "actionKey": "open-rules",
                     "actionText": tr("action.open-rules", "Open rules")
                 })
+                break
+            case "system-dns-not-restored":
+                _onSystemDnsReading(true)
                 break
             case "host-unreachable-on-both-routes":
                 // The offer was withheld: neither link reaches the host, so
@@ -3602,6 +3756,15 @@ ApplicationWindow {
                 break
             case "block-notice-mutes-changed":
                 notificationsController.onNoticeMutesChanged()
+                break
+            case "unassigned-tunnel-detected":
+                _onUnassignedTunnel(event)
+                break
+            case "local-network-too-wide":
+                _onLocalNetworkTooWide(event)
+                break
+            case "protection-coverage-changed":
+                _onProtectionCoverageChanged(event)
                 break
             case "verify-verdicts-changed":
                 verifyVerdicts.refresh()
@@ -3649,6 +3812,84 @@ ApplicationWindow {
             default:
                 console.log("push: unknown event type", type)
         }
+    }
+
+    /// A tunnel is up while nothing is assigned to the additional route. The
+    /// tray says so only while this window is not on screen, so the window
+    /// carries the card itself, under the same mute the tray honours.
+    function _onUnassignedTunnel(event) {
+        var adapter = String(event["adapter-name"] || "")
+        if (adapter === "") return
+        notificationsController._addPushNoticeUnlessMuted("unassigned-tunnel", {
+            "id": "unassigned-tunnel:" + adapter,
+            "severity": "warning",
+            "dismissible": true,
+            "kind": "unassigned-tunnel",
+            "noticeMuteKind": "unassigned-tunnel",
+            // Dismissed, the same tunnel is not raised again for a while; a
+            // later detection is news.
+            "refractoryMs": 600000,
+            "title": tr("notifications.unassigned-tunnel.title",
+                "The additional route is not assigned"),
+            "body": tr("notifications.unassigned-tunnel.body",
+                    "{adapter} is up, but no connection is assigned to the additional route — so the sites your rules send there will not open.")
+                .replace("{adapter}", adapter),
+            "actionKey": "open-interfaces",
+            "actionText": tr("notifications.unassigned-tunnel.action", "Assign it now")
+        })
+    }
+
+    /// The main link reported a "local" network far wider than any local
+    /// network can be. The service already refuses to treat it as local; the
+    /// card says which link and which number, so the user can tell a hostile
+    /// access point from their own router. Not mutable: it is rare and a
+    /// warning about the network the user is on right now.
+    function _onLocalNetworkTooWide(event) {
+        var adapter = String(event["adapter-name"] || "")
+        var network = String(event["network"] || "")
+        if (network === "") return
+        notificationsController._addPushNotice({
+            "id": "local-network-too-wide:" + adapter + ":" + network,
+            "severity": "warning",
+            "dismissible": true,
+            "kind": "local-network-too-wide",
+            "refractoryMs": 86400000,
+            "title": tr("notifications.local-network-too-wide.title",
+                "This network looks suspicious"),
+            "body": tr("notifications.local-network-too-wide.body",
+                    "{adapter} reports {network} as its local network — far wider than any local network can be. It is not treated as local: devices on it stay blocked while leak protection is on, and sites inside it still follow your rules.")
+                .replace("{adapter}", adapter)
+                .replace("{network}", network)
+        })
+    }
+
+    /// Leak protection is not what the settings ask for, or is in force
+    /// because of another user's. One card per reason; a reason this build
+    /// does not know has no sentence and is dropped rather than shown raw.
+    function _onProtectionCoverageChanged(event) {
+        var reason = String(event.reason || "")
+        var body = ""
+        if (reason === "blanket-block-not-armed") {
+            body = tr("status.protection.blanket-block-not-armed",
+                "Full blocking is not switched on: the address of the additional link is unknown, and blocking everything without it would cut the link itself. Traffic outside your rules is not blocked.")
+        } else if (reason === "machine-wide-cut-by-another-user") {
+            body = tr("status.protection.machine-wide-cut-by-another-user",
+                "Another user of this computer switched on leak protection. Part of it cannot be limited to one account, so IPv6 and ping are off for everyone until they switch it off.")
+        } else {
+            console.log("push: protection-coverage reason not known, ignored")
+            return
+        }
+        notificationsController._addPushNotice({
+            "id": "protection-coverage:" + reason,
+            "severity": "warning",
+            "dismissible": true,
+            "kind": "protection-coverage",
+            "title": tr("notifications.protection-coverage.title",
+                "Leak protection coverage changed"),
+            "body": body,
+            "actionKey": "open-routing-settings",
+            "actionText": tr("action.open-settings", "Open settings")
+        })
     }
 
     /// The service worked out which address the outside world sees behind the
@@ -3988,23 +4229,15 @@ ApplicationWindow {
         if (!corr || corr === "") return
         rpcTransport.registerRpcCallback(corr, function(ok, p) {
             if (!ok || !p) return
-            var entries = (p && p.entries) || []
-            if (entries.length === 0) return
-            var throughId = 0
-            var shown = []
-            for (var i = 0; i < entries.length; i += 1) {
-                var id = Number(entries[i].id || 0)
-                if (id > throughId) throughId = id
-                var dest = String(entries[i].destination || "")
-                if (dest !== "" && shown.indexOf(dest) < 0) shown.push(dest)
-            }
+            var summary = Pure.blockNoticeBacklog(p.entries)
+            if (!summary) return
             // Muted kind: still acknowledged. Keeping entries nobody will ever
             // be shown would just age out silently a week later.
             if (notificationsController.noticeKindEnabled("block-notice")) {
-                _addBlockNoticeBacklogCard(entries.length, shown, throughId)
+                _addBlockNoticeBacklogCard(summary)
             }
-            if (throughId > 0) {
-                var ackCorr = rpcTransport.rpcBlockNoticeJournalAck({ "through-id": throughId })
+            if (summary.throughId > 0) {
+                var ackCorr = rpcTransport.rpcBlockNoticeJournalAck({ "through-id": summary.throughId })
                 rpcTransport.registerRpcCallback(ackCorr, function(ackOk, ackPayload, code, msg) {
                     if (!ackOk) console.warn("block-notice journal ack failed:", code, msg)
                 })
@@ -4012,27 +4245,22 @@ ApplicationWindow {
         })
     }
 
-    function _addBlockNoticeBacklogCard(count, destinations, throughId) {
-        var names = prefs.hideBlockNoticeAddresses === true
-            ? []
-            : destinations.slice(0, 5)
-        var list = names.join(", ")
-        var rest = (prefs.hideBlockNoticeAddresses === true)
-            ? 0 : Math.max(0, destinations.length - names.length)
-        if (rest > 0) {
+    function _addBlockNoticeBacklogCard(summary) {
+        var hide = prefs.hideBlockNoticeAddresses === true
+        var list = hide ? "" : summary.shown.join(", ")
+        if (!hide && summary.more > 0) {
             list = list + ", " + tr("notifications.block-notice.backlog.more", "and {count} more")
-                .replace("{count}", String(rest))
+                .replace("{count}", String(summary.more))
         }
         var body = tr("notifications.block-notice.backlog.body",
-                "The service blocked {count} connection(s) while neither this window nor "
-                + "the tray icon was running.")
-            .replace("{count}", String(count))
+                "The service blocked {count} connection(s) while NetRuleRouter was not open.")
+            .replace("{count}", String(summary.count))
         if (list !== "") {
             body = body + " " + tr("notifications.block-notice.backlog.destinations",
                 "Destinations: {list}.").replace("{list}", list)
         }
         notificationsController._addPushNoticeUnlessMuted("block-notice-backlog", {
-            "id": "block-notice-backlog:" + String(throughId),
+            "id": "block-notice-backlog:" + String(summary.throughId),
             "severity": "warning",
             "dismissible": true,
             "kind": "block-notice",
@@ -4965,19 +5193,7 @@ ApplicationWindow {
         }
         partial = applicable
         var originText = String(origin || "")
-        // Every user-driven change to a service-owned setting funnels through
-        // here, so this is the one place that can record intent without having
-        // to trust each call site to remember. Non-user origins (read-back
-        // re-seeds, the replay itself) never record, or they would launder
-        // service defaults into "what the user wanted".
-        var userWrite = Pure.isUserWriteOrigin(originText)
-        if (userWrite) {
-            // A pending replay carries values recorded BEFORE this write, so
-            // letting it run now would undo what the user just chose.
-            serviceIntentController._serviceIntentSupersededByUser = true
-        }
-        _stabilityPatchQueue.push({ partial: partial, onDone: onDone, origin: originText,
-                                    recordsIntent: userWrite })
+        _stabilityPatchQueue.push({ partial: partial, onDone: onDone, origin: originText })
         _drainStabilityPatchQueue()
     }
 
@@ -5007,28 +5223,14 @@ ApplicationWindow {
             // an in-flight slot nobody releases stops every later patch from
             // every panel, and the only symptom is silence.
             try {
-                // The merge base is the live row plus the recorded decisions the
-                // GUI may replay unasked, so a full-row write cannot re-affirm a
-                // service default over one of them. A machine-wide value is never
-                // carried: a save about something else would overwrite another
-                // administrator's choice.
-                var carried = Pure.stabilityReplayableIntent(
-                    serviceIntentController._readServiceIntent())
-                var merged = Pure.mergeStabilityWrite(payload || {}, carried,
+                // The merge base is the live row and the user's parked changes.
+                // Nothing comes from the user's own file: these settings are the
+                // machine's, and only the service's backup brings them back.
+                var merged = Pure.mergeStabilityWrite(payload || {}, {},
                                                       window._readPendingOffline()["stability"] || {},
                                                       job.partial || {})
                 var setCorr = bridge.rpcServiceStabilityConfigSet(merged, job.origin || "")
                 rpcTransport.registerRpcCallback(setCorr, function(ok2, p2, code2, msg2) {
-                    // Recorded only once the service confirmed it. Recording
-                    // must never cost the write its answer.
-                    if (ok2 && job.recordsIntent) {
-                        try {
-                            serviceIntentController._recordServiceIntentAfterWrite(
-                                job.partial || {}, payload || {})
-                        } catch (e) {
-                            console.log("applyServiceStabilityPatch: recording the intent failed:", e)
-                        }
-                    }
                     finish(!!ok2, String(code2 || ""), p2)
                 })
             } catch (e) {
@@ -5678,7 +5880,9 @@ ApplicationWindow {
     // the context carries a URL only when the folder can actually be listed, and
     // an action that opens an empty window explains nothing. Diagnostics ->
     // export archive is the path that works without administrator rights.
-    Action { id: checkForUpdatesAction; text: tr("action.check-for-updates", "Check for updates"); shortcut: "Ctrl+U"; onTriggered: updateCheckController.checkNow() }
+    // The release check exists only in a build that has it (`updateCheckAvailable`).
+    readonly property bool updateCheckAvailable: context.updateCheckAvailable === true
+    Action { id: checkForUpdatesAction; text: tr("action.check-for-updates", "Check for updates"); shortcut: "Ctrl+U"; enabled: window.updateCheckAvailable; onTriggered: updateCheckController.checkNow() }
     Action { id: logsFolderAction; text: tr("action.open-logs-folder", "Open logs folder"); shortcut: "Ctrl+Shift+O"; icon.source: uiIconSource("open-file"); enabled: String(((context.about || {}).logsFolderUrl) || "") !== ""; onTriggered: Pure.openExternalUrl(((context.about || {}).logsFolderUrl || "")) }
     Action { id: interfacesAction; text: sectionTitle("interfaces-routes"); shortcut: "Ctrl+1"; icon.source: sectionIconSource("interfaces-routes"); onTriggered: requestSectionChange("interfaces-routes") }
     Action { id: rulesAction; text: sectionTitle("rules"); shortcut: "Ctrl+2"; icon.source: sectionIconSource("rules"); onTriggered: requestSectionChange("rules") }
@@ -5699,7 +5903,7 @@ ApplicationWindow {
     Shortcut { sequence: aboutAction.shortcut; context: Qt.ApplicationShortcut; onActivated: aboutAction.trigger() }
     Shortcut { sequence: licenseAction.shortcut; context: Qt.ApplicationShortcut; onActivated: licenseAction.trigger() }
     Shortcut { sequence: logsFolderAction.shortcut; context: Qt.ApplicationShortcut; onActivated: logsFolderAction.trigger() }
-    Shortcut { sequence: checkForUpdatesAction.shortcut; context: Qt.ApplicationShortcut; onActivated: checkForUpdatesAction.trigger() }
+    Shortcut { sequence: checkForUpdatesAction.shortcut; context: Qt.ApplicationShortcut; enabled: window.updateCheckAvailable; onActivated: checkForUpdatesAction.trigger() }
     Shortcut { sequence: StandardKey.Quit; context: Qt.ApplicationShortcut; onActivated: exitAction.trigger() }
     Shortcut { sequence: StandardKey.Close; context: Qt.ApplicationShortcut; onActivated: closeActiveOverlay() }
     Shortcut { sequence: "Escape"; context: Qt.ApplicationShortcut; onActivated: closeActiveOverlay() }
@@ -6608,13 +6812,15 @@ ApplicationWindow {
             implicitWidth: menuPopupWidth([
                 Pure.menuActionText(aboutAction.text, "F1"),
                 Pure.menuActionText(licenseAction.text, "Ctrl+Shift+L"),
-                Pure.menuActionText(logsFolderAction.text, "Ctrl+Shift+O"),
-                Pure.menuActionText(tr("action.check-for-updates", "Check for updates"), "Ctrl+U")
-            ])
+                Pure.menuActionText(logsFolderAction.text, "Ctrl+Shift+O")
+            ].concat(window.updateCheckAvailable
+                ? [Pure.menuActionText(tr("action.check-for-updates", "Check for updates"), "Ctrl+U")]
+                : []))
             ShortcutMenuItem { theme: uiTheme; labelText: aboutAction.text; shortcutText: "F1"; onTriggered: aboutAction.trigger() }
             ShortcutMenuItem { theme: uiTheme; labelText: licenseAction.text; shortcutText: "Ctrl+Shift+L"; onTriggered: licenseAction.trigger() }
             ShortcutMenuItem { theme: uiTheme; labelText: logsFolderAction.text; shortcutText: "Ctrl+Shift+O"; onTriggered: logsFolderAction.trigger() }
-            ShortcutMenuItem { theme: uiTheme; labelText: checkForUpdatesAction.text; shortcutText: "Ctrl+U"; onTriggered: checkForUpdatesAction.trigger() }
+            // A hidden menu row still takes its height unless told otherwise.
+            ShortcutMenuItem { theme: uiTheme; labelText: checkForUpdatesAction.text; shortcutText: "Ctrl+U"; visible: window.updateCheckAvailable; height: visible ? implicitHeight : 0; onTriggered: checkForUpdatesAction.trigger() }
         }
     }
 

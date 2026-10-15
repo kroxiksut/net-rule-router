@@ -309,7 +309,7 @@ mod tests {
     use nrr_domain::canonical::{
         CanonicalAddressMatch, CanonicalAppMatch, CanonicalRule, CanonicalRuleBook,
     };
-    use nrr_domain::{RouteBehaviorMode, RuleId};
+    use nrr_domain::RuleId;
     use std::collections::HashSet;
     use std::net::IpAddr;
     use std::sync::Mutex;
@@ -343,7 +343,6 @@ mod tests {
         fn active_rules_for(&self, _principal: &str) -> Option<ActiveRulesSnapshot> {
             Some(ActiveRulesSnapshot {
                 rule_book: self.book.clone(),
-                behavior_mode: RouteBehaviorMode::PreferPrimary,
             })
         }
     }

@@ -9,6 +9,9 @@ struct Link {
     dns: Vec<String>,
     domains: Vec<String>,
     addressed: bool,
+    /// `dnsovertls` / `dnssec` as set on the link; `None` when never set.
+    dot: Option<String>,
+    dnssec: Option<String>,
 }
 
 /// resolved and iproute2 as far as the redirect sees them.
@@ -23,6 +26,8 @@ struct FakeResolved {
     /// late step (stripping `~.` from another claimant) failing after our own
     /// link already claimed the catch-all.
     fail_domain_for: Arc<Mutex<Option<String>>>,
+    /// A resolved too old for per-link `dnsovertls` / `dnssec`.
+    no_link_privacy: Arc<Mutex<bool>>,
 }
 
 impl FakeResolved {
@@ -50,6 +55,8 @@ impl FakeResolved {
                 dns: dns.iter().map(|s| s.to_string()).collect(),
                 domains: domains.iter().map(|s| s.to_string()).collect(),
                 addressed: false,
+                dot: None,
+                dnssec: None,
             },
         );
     }
@@ -140,6 +147,23 @@ impl DnsCommands for FakeResolved {
                 drop(links);
                 ok(self.print(|l| &l.dns))
             }
+            ("resolvectl", [setting @ ("dnsovertls" | "dnssec"), name, value]) => {
+                if *self.no_link_privacy.lock().expect("lock") {
+                    return failed("Unknown command verb");
+                }
+                match links.get_mut(*name) {
+                    Some(link) => {
+                        let field = if *setting == "dnssec" {
+                            &mut link.dnssec
+                        } else {
+                            &mut link.dot
+                        };
+                        *field = Some((*value).into());
+                        ok("")
+                    }
+                    None => failed("Failed to resolve interface"),
+                }
+            }
             ("resolvectl", ["dns", name, server]) => {
                 if *self.fail_dns_claim.lock().expect("lock") {
                     return failed("Could not set per-interface DNS servers");
@@ -212,6 +236,33 @@ fn the_redirect_takes_every_name_and_leaves_narrow_domains_where_they_are() {
         RedirectState::Active
     );
     assert_eq!(read_taken(&redirect.taken_file), vec!["wg0".to_string()]);
+}
+
+/// A machine-wide strict DoT or DNSSEC would refuse every answer of the plain,
+/// unsigned listener; our link turns both off for itself, and a resolved that
+/// cannot does not stop the redirect.
+#[test]
+fn our_link_asks_for_plain_dns_without_validation() {
+    let fake = FakeResolved::machine();
+    let (_dir, current) = redirect(&fake, "plain");
+    current.redirect_to(LISTENER_ADDR).expect("redirects");
+    let ours = fake
+        .links
+        .lock()
+        .expect("lock")
+        .get(REDIRECT_LINK)
+        .cloned()
+        .expect("our link");
+    assert_eq!(ours.dot.as_deref(), Some("no"));
+    assert_eq!(ours.dnssec.as_deref(), Some("no"));
+
+    let old = FakeResolved::machine();
+    *old.no_link_privacy.lock().expect("lock") = true;
+    let (_old_dir, older) = redirect(&old, "plain-old");
+    older
+        .redirect_to(LISTENER_ADDR)
+        .expect("an old resolved still redirects");
+    assert_eq!(old.domains(REDIRECT_LINK), Some(vec!["~.".to_string()]));
 }
 
 #[test]
@@ -398,4 +449,44 @@ fn link_lines_parse_with_their_index_and_values() {
             .collect::<Vec<_>>(),
         vec![Ipv4Addr::new(198, 51, 100, 1), Ipv4Addr::new(192, 0, 2, 3)]
     );
+}
+
+/// The package's maintainer scripts and the tarball's uninstall give DNS back
+/// without the daemon; their copies of the marker, the file names, the
+/// drop-in, the resolvconf record and the link must be the daemon's.
+#[test]
+fn the_maintainer_scripts_mirror_the_dns_redirect() {
+    let script = include_str!("../../../../../packaging/linux/maintainer/functions.sh");
+    let files = DnsFiles::system(std::path::Path::new("/var/lib/example"));
+    let name = |path: std::path::PathBuf| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+            .unwrap_or_default()
+    };
+    let unix = nrr_shared::product_identity::PRODUCT_NAME_UNIX;
+    assert_eq!(
+        REDIRECT_LINK, unix,
+        "the script deletes the link by the product name"
+    );
+    assert_eq!(resolvconf::resolvconf_record(), format!("lo.{unix}"));
+    assert_eq!(name(files.nm_drop_in()), format!("99-{unix}-dns.conf"));
+    assert!(files.nm_conf_dir.starts_with("/run/NetworkManager/conf.d"));
+    for line in [
+        format!("  marker=\"{}\"", resolv_conf::OURS_MARKER),
+        format!("  copy=\"$NRR_STATE_DIR/{}\"", name(files.system_copy())),
+        format!(
+            "  link_note=\"$NRR_STATE_DIR/{}\"",
+            name(files.system_link())
+        ),
+        format!(
+            "  taken=\"$NRR_STATE_DIR/{}\"",
+            name(files.resolved_taken_file())
+        ),
+        "  drop_in=\"/run/NetworkManager/conf.d/99-$NRR_PRODUCT_NAME_UNIX-dns.conf\"".to_owned(),
+        "  record=\"lo.$NRR_PRODUCT_NAME_UNIX\"".to_owned(),
+        "    ip link del \"$NRR_PRODUCT_NAME_UNIX\" || failed=1".to_owned(),
+    ] {
+        assert!(script.lines().any(|l| l == line), "{line}");
+    }
 }

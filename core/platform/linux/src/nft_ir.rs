@@ -138,7 +138,14 @@ pub struct NftRuleset {
     pub table: String,
     pub chain: String,
     pub rules: Vec<NftRule>,
+    /// The [`NRR_FORWARD_CHAIN`] rules: what the machine forwards for
+    /// containers and guests never reaches the output hook. Plain drops only,
+    /// in order; empty means no such chain.
+    pub forward: Vec<NftRule>,
 }
+
+/// The forward-hook chain, at the output chain's priority.
+pub const NRR_FORWARD_CHAIN: &str = "forward";
 
 impl NftRuleset {
     /// Render as `nft` script lines — the form a human reads in a bug report,
@@ -159,20 +166,32 @@ impl NftRuleset {
             "  chain {} {{\n    type filter hook output priority {}; policy accept;\n",
             self.chain, NRR_CHAIN_PRIORITY
         ));
-        for rule in &self.rules {
-            out.push_str("    ");
-            for m in &rule.matches {
-                out.push_str(&render_match(m));
-                out.push(' ');
-            }
-            out.push_str(&rule.verdict.to_string());
-            if !rule.comment.is_empty() {
-                out.push_str(&format!(" comment \"{}\"", rule.comment.replace('"', "'")));
-            }
-            out.push('\n');
+        render_script_rules(&mut out, &self.rules);
+        out.push_str("  }\n");
+        if !self.forward.is_empty() {
+            out.push_str(&format!(
+                "  chain {NRR_FORWARD_CHAIN} {{\n    type filter hook forward priority {NRR_CHAIN_PRIORITY}; policy accept;\n"
+            ));
+            render_script_rules(&mut out, &self.forward);
+            out.push_str("  }\n");
         }
-        out.push_str("  }\n}\n");
+        out.push_str("}\n");
         out
+    }
+}
+
+fn render_script_rules(out: &mut String, rules: &[NftRule]) {
+    for rule in rules {
+        out.push_str("    ");
+        for m in &rule.matches {
+            out.push_str(&render_match(m));
+            out.push(' ');
+        }
+        out.push_str(&rule.verdict.to_string());
+        if !rule.comment.is_empty() {
+            out.push_str(&format!(" comment \"{}\"", rule.comment.replace('"', "'")));
+        }
+        out.push('\n');
     }
 }
 
@@ -294,6 +313,7 @@ mod tests {
             family: NftFamily::Inet,
             table: "nrr".into(),
             chain: "output".into(),
+            forward: Vec::new(),
             rules: Vec::new(),
         };
         let script = ruleset.to_nft_script();
@@ -308,6 +328,7 @@ mod tests {
             family: NftFamily::Inet,
             table: "nrr".into(),
             chain: "output".into(),
+            forward: Vec::new(),
             rules: vec![NftRule {
                 matches: vec![NftMatch::SkUid(1000)],
                 verdict: NftVerdict::DropReported(tag),
@@ -335,6 +356,7 @@ mod tests {
             family: NftFamily::Inet,
             table: "nrr".into(),
             chain: "output".into(),
+            forward: Vec::new(),
             rules: vec![NftRule {
                 matches: Vec::new(),
                 verdict: NftVerdict::Drop,
@@ -350,6 +372,7 @@ mod tests {
             family: NftFamily::Inet,
             table: "nrr".into(),
             chain: "output".into(),
+            forward: Vec::new(),
             rules: vec![NftRule {
                 matches: vec![
                     NftMatch::SkUid(1000),

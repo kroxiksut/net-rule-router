@@ -111,7 +111,7 @@ impl SecondaryRouteCoordinator {
         }
         let mut local_subnets = resolution
             .primary
-            .map(|p| primary_local_subnets(&routes, p.interface_index))
+            .map(|p| exemptible_local_subnets(&routes, p.interface_index).v4)
             .unwrap_or_default();
         self.apply_local_network_policy(
             sid,
@@ -120,22 +120,22 @@ impl SecondaryRouteCoordinator {
             Some(secondary.interface_index),
             &mut local_subnets,
         );
-        // Reactive VPN-endpoint learning — fold in any role-verified server IP
-        // learned from a kill-switch drop (deduped against the route-observed
-        // set above), so the catch-all pair (and the mirrored per-IP subtract
-        // in `per_sid_orchestrator`) exempt it exactly like an observed one.
-        if let Some(learned) = self.learned_vpn_endpoints.as_ref() {
-            for ip in learned.current(std::time::SystemTime::now()) {
-                if !server_ips.contains(&ip) {
-                    server_ips.push(ip);
-                }
-            }
-        }
+        // Endpoints learned from a client's own dropped connections are NOT
+        // folded in: a server exemption is machine-wide and address-keyed,
+        // and the address a VPN client was dropped on can be a CDN front it
+        // shares with the user's rule hosts. The client itself is exempted by
+        // process instead (`vpn_client_registry`), which no other program
+        // can ride.
         // The v6 halves come straight off the route table: an IPv6 endpoint
         // has no field in the model, and the `/128` bootstrap route the client
         // installs is what the machine itself states.
-        let (bootstrap_server_ips_v6, local_subnets_v6) =
+        let (bootstrap_server_ips_v6, mut local_subnets_v6) =
             v6_exemptions(&routes, resolution.primary, Some(secondary.interface_index));
+        local_subnets_v6.extend(self.opened_public_v6(
+            sid,
+            &routes,
+            resolution.primary.map(|p| p.interface_index),
+        ));
         Some(KillSwitchResolution {
             secondary_luid,
             bootstrap_server_ips: server_ips,
@@ -231,7 +231,7 @@ impl SecondaryRouteCoordinator {
         };
         let mut local_subnets = resolution
             .primary
-            .map(|p| primary_local_subnets(&routes, p.interface_index))
+            .map(|p| exemptible_local_subnets(&routes, p.interface_index).v4)
             .unwrap_or_default();
         if let Some(primary) = resolution.primary {
             let mut cache = self
@@ -283,18 +283,8 @@ impl SecondaryRouteCoordinator {
             if let Some(loader) = self.server_ip_loader.as_ref() {
                 ips.extend(loader().into_iter().filter(|ip| seen.insert(*ip)));
             }
-            // Reactive VPN-endpoint learning — fold in any role-verified
-            // server IP learned from a kill-switch drop, deduped against the
-            // cached/persisted set above (see `kill_switch_exemptions` for the
-            // twin merge on the secondary-resolved path).
-            if let Some(learned) = self.learned_vpn_endpoints.as_ref() {
-                ips.extend(
-                    learned
-                        .current(std::time::SystemTime::now())
-                        .into_iter()
-                        .filter(|ip| seen.insert(*ip)),
-                );
-            }
+            // Learned endpoints stay out here for the reason given in
+            // `kill_switch_exemptions`: an address is not a client.
             ips
         };
         // The liveness probe's ICMP target: the secondary's RAW next-hop,
@@ -322,11 +312,16 @@ impl SecondaryRouteCoordinator {
             .into_iter()
             .filter(|ip| !ip.is_unspecified())
             .collect();
-        let (bootstrap_server_ips_v6, local_subnets_v6) = v6_exemptions(
+        let (bootstrap_server_ips_v6, mut local_subnets_v6) = v6_exemptions(
             &routes,
             resolution.primary,
             resolution.secondary.map(|s| s.interface_index),
         );
+        local_subnets_v6.extend(self.opened_public_v6(
+            sid,
+            &routes,
+            resolution.primary.map(|p| p.interface_index),
+        ));
         FailClosedExemptions {
             bootstrap_server_ips,
             bootstrap_server_ips_v6,
@@ -344,6 +339,7 @@ impl SecondaryRouteCoordinator {
             // the resolver returns the strict default; the orchestrator
             // overrides this from the per-SID policy at the block-all call site.
             allow_dns_over_primary: false,
+            dns_servers: Vec::new(),
             // the orchestrator fills known-direct IPs at the block-all
             // call site (it owns the registry and the secondary-dest subtraction).
             known_direct_ips: Vec::new(),
@@ -413,7 +409,7 @@ pub(crate) fn foreign_tunnel_indexes(
 }
 
 /// The IPv6 exemptions both postures share: the tunnel's `/128` endpoints and
-/// the primary link's attached prefixes.
+/// the private part of the primary link's attached prefixes.
 ///
 /// `secondary_ifindex` is only the redirect-overlay hint — a bootstrap host
 /// route is recognised by its next hop, so an unresolved tunnel still yields
@@ -433,6 +429,6 @@ fn v6_exemptions(
             secondary_ifindex.unwrap_or(0),
             gateway,
         ),
-        crate::route_reconciler::primary_local_subnets_v6(routes, primary.interface_index),
+        exemptible_local_subnets(routes, primary.interface_index).v6,
     )
 }

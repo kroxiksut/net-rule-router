@@ -17,12 +17,9 @@
 //!    via [`nrr_domain::rules_json_codec::decode`] — applies the
 //!    canonical sort + checks the "≥1 match" invariant.
 //! 4. Wrap the resulting [`CanonicalRuleBook`] in an
-//!    [`ActiveRulesSnapshot`] with a placeholder
-//!    `behavior_mode = PreferPrimary`. The per-SID
-//!    `PerSidPolicySnapshot.mode` always wins inside
-//!    `behavior_mode_for_codegen`, so the snapshot-level value is
-//!    effectively cosmetic — nothing yet gives a revision its own
-//!    default mode.
+//!    [`ActiveRulesSnapshot`]. The behaviour mode is not part of it: every
+//!    planner takes it from the per-user policy
+//!    (`behavior_mode_for_codegen`).
 //!
 //! Steps 2–4 run once per source: each read checks only the source's identity
 //! (overlay blob or active revision id + hash), the subdomain flag and the
@@ -43,13 +40,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use nrr_domain::rules_json_codec;
 use nrr_shared::rules_json;
-use nrr_shared::RouteBehaviorMode;
 use nrr_storage::revisions::{RevisionRecord, RevisionsRepository};
 use nrr_storage::BASELINE_PRINCIPAL;
 use rusqlite::Connection;
 
 use crate::applying_revision_overlay;
-use crate::per_sid_orchestrator::{ActiveRulesSnapshot, RulesProvider};
+use crate::per_sid_orchestrator::{ActiveRulesSnapshot, RulesProvider, RulesRead};
 
 /// Production [`RulesProvider`] backed by `nrr_service_state.db`.
 ///
@@ -63,7 +59,16 @@ pub struct ProductionRulesProvider {
     // path, so the decoded book is kept per principal until its source changes.
     decoded: Mutex<HashMap<String, DecodedRead>>,
     decodes: AtomicU64,
+    /// Principals whose book could not be read, with the reason. A book that
+    /// does not decode is not "no rules": the last decoded one stays in force
+    /// and the health card says so until a read succeeds.
+    unreadable: Mutex<HashMap<String, String>>,
+    /// Where an unreadable book is reported. Set once, after construction.
+    health: std::sync::OnceLock<Arc<crate::health::HealthAggregator>>,
 }
+
+/// The health voice an unreadable book speaks with.
+pub const RULES_READ_SOURCE: &str = "rules-read";
 
 /// What a decoded book was built from; any change forces a fresh decode.
 #[derive(Clone)]
@@ -135,30 +140,94 @@ impl ProductionRulesProvider {
     /// `for_enforcement` widens the book (subdomain coverage) and uses the
     /// decode cache; a writer gets the book exactly as stored.
     fn read_rules(&self, principal: &str, for_enforcement: bool) -> Option<ActiveRulesSnapshot> {
+        match self.read_rules_outcome(principal, for_enforcement) {
+            RulesRead::Rules(snapshot) => Some(snapshot),
+            RulesRead::NoPolicy => None,
+            // A reader that only looks (seeding, observation) keeps working on
+            // the last decoded book; a writer gets nothing, since writing a
+            // widened book back would store rules the user never wrote.
+            RulesRead::Unreadable(_) if for_enforcement => self
+                .decoded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(principal)
+                .and_then(|d| d.snapshot.clone()),
+            RulesRead::Unreadable(_) => None,
+        }
+    }
+
+    /// Record that `principal`'s book could not be read, and say so once.
+    fn unreadable(&self, principal: &str, reason: String) -> RulesRead {
+        let first = self
+            .unreadable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(principal.to_owned(), reason.clone())
+            .is_none();
+        if first {
+            tracing::error!(
+                target: "nrr::rules-provider",
+                msg_key = "prod-rules-book-unreadable",
+                principal = %principal,
+                reason = %reason,
+                "the rule book could not be read — the last applied set stays in force until it can",
+            );
+        }
+        if let Some(health) = self.health.get() {
+            health.record_as(
+                RULES_READ_SOURCE,
+                crate::health::HealthComponent::Policy,
+                crate::state::ServiceHealthSeverity::Degraded,
+                format!("rule book unreadable for {principal}: {reason}"),
+            );
+        }
+        RulesRead::Unreadable(reason)
+    }
+
+    /// A read that reached a verdict clears the record a failed one left.
+    fn readable(&self, principal: &str) {
+        let was = self
+            .unreadable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(principal);
+        if was.is_some() {
+            tracing::info!(
+                target: "nrr::rules-provider",
+                msg_key = "prod-rules-book-readable-again",
+                principal = %principal,
+                "the rule book reads again",
+            );
+            let any_left = !self
+                .unreadable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty();
+            if let (Some(health), false) = (self.health.get(), any_left) {
+                health.clear_as(RULES_READ_SOURCE, crate::health::HealthComponent::Policy);
+            }
+        }
+    }
+
+    /// Where the health card hears about an unreadable book.
+    pub fn set_health(&self, health: Arc<crate::health::HealthAggregator>) {
+        let _ = self.health.set(health);
+    }
+
+    /// `for_enforcement` widens the book (subdomain coverage) and uses the
+    /// decode cache; a writer gets the book exactly as stored. Tells "no
+    /// policy" from "could not read": only the first may remove enforcement.
+    fn read_rules_outcome(&self, principal: &str, for_enforcement: bool) -> RulesRead {
         let guard = match self.conn.lock() {
             Ok(g) => g,
             Err(_) => {
-                tracing::warn!(
-                    target: "nrr::rules-provider",
-                    msg_key = "prod-rules-state-db-mutex-poisoned",
-                    "state DB mutex poisoned; treating as no active rules",
-                );
-                return None;
+                return self.unreadable(principal, "state DB mutex poisoned".to_owned());
             }
         };
         let repo = RevisionsRepository::new(&guard);
-        let warn = |p: &str, e: &dyn std::fmt::Display| {
-            tracing::warn!(
-                target: "nrr::rules-provider",
-                msg_key = "prod-rules-get-active-failed",
-                error = %e,
-                principal = %p,
-                "revisions.get_active_for failed; treating as no active rules",
-            );
-        };
         // A revision mid-activation wins over the stored pointer, which still
         // names the previous one until phase 3a commits.
-        let resolve = |p: &str| -> Result<Option<Source>, ()> {
+        let resolve = |p: &str| -> Result<Option<Source>, String> {
             if let Some(rules_json) = applying_revision_overlay::applying_for(&guard, p) {
                 return Ok(Some(Source::Applying {
                     principal: p.to_owned(),
@@ -171,10 +240,7 @@ impl ProductionRulesProvider {
                     revision_id,
                     content_hash,
                 })),
-                Err(e) => {
-                    warn(p, &e);
-                    Err(())
-                }
+                Err(e) => Err(format!("revisions.get_active_for({p}): {e}")),
             }
         };
         let source = match resolve(principal) {
@@ -182,9 +248,17 @@ impl ProductionRulesProvider {
             // No own revision → read through to the baseline principal.
             Ok(None) if principal != BASELINE_PRINCIPAL => match resolve(BASELINE_PRINCIPAL) {
                 Ok(Some(s)) => s,
-                _ => return None,
+                Ok(None) => {
+                    self.readable(principal);
+                    return RulesRead::NoPolicy;
+                }
+                Err(e) => return self.unreadable(principal, e),
             },
-            Ok(None) | Err(()) => return None,
+            Ok(None) => {
+                self.readable(principal);
+                return RulesRead::NoPolicy;
+            }
+            Err(e) => return self.unreadable(principal, e),
         };
         // Subdomain coverage and check verdicts are the CALLING principal's
         // even when the rules read through to the baseline.
@@ -200,7 +274,10 @@ impl ProductionRulesProvider {
             .get(principal)
             .filter(|d| for_enforcement && d.key == key)
         {
-            return hit.snapshot.clone();
+            return match hit.snapshot.clone() {
+                Some(snapshot) => RulesRead::Rules(snapshot),
+                None => RulesRead::NoPolicy,
+            };
         }
         self.decodes.fetch_add(1, Ordering::Relaxed);
         let (key, bare) = match key.source {
@@ -225,38 +302,47 @@ impl ProductionRulesProvider {
                     },
                     Self::snapshot_from_record(&record),
                 ),
-                Ok(None) => return None,
+                Ok(None) => {
+                    self.readable(principal);
+                    return RulesRead::NoPolicy;
+                }
                 Err(e) => {
-                    warn(p, &e);
-                    return None;
+                    return self
+                        .unreadable(principal, format!("revisions.get_active_for({p}): {e}"));
                 }
             },
         };
+        // A book that exists but does not decode: the detail is already in
+        // the log, the verdict is what matters here.
+        let Some(mut snapshot) = bare else {
+            return self.unreadable(
+                principal,
+                "the stored rule book did not decode (newer schema or damaged row)".to_owned(),
+            );
+        };
+        self.readable(principal);
         // Subdomain coverage (ON by default) widens only this enforcement read,
         // NEVER the stored/hashed rule book the drift detector hashes bare; a
         // storage error reads as OFF (the narrow book, never a guess).
-        let snapshot = bare.map(|mut s| {
-            // `?` rules are routes of their own set, or of the other one under
-            // a verdict; before the widening, so a twin lands with its rule.
-            if let Some((_, moved)) = verify.as_ref() {
-                s.rule_book = s.rule_book.with_verify_effective(moved);
-            }
-            if key.include_subdomains {
-                s.rule_book = s.rule_book.with_subdomain_coverage();
-            }
-            s
-        });
+        // `?` rules are routes of their own set, or of the other one under
+        // a verdict; before the widening, so a twin lands with its rule.
+        if let Some((_, moved)) = verify.as_ref() {
+            snapshot.rule_book = snapshot.rule_book.with_verify_effective(moved);
+        }
+        if key.include_subdomains {
+            snapshot.rule_book = snapshot.rule_book.with_subdomain_coverage();
+        }
         if !for_enforcement {
-            return snapshot;
+            return RulesRead::Rules(snapshot);
         }
         decoded.insert(
             principal.to_owned(),
             DecodedRead {
                 key,
-                snapshot: snapshot.clone(),
+                snapshot: Some(snapshot.clone()),
             },
         );
-        snapshot
+        RulesRead::Rules(snapshot)
     }
 
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
@@ -264,6 +350,8 @@ impl ProductionRulesProvider {
             conn,
             decoded: Mutex::new(HashMap::new()),
             decodes: AtomicU64::new(0),
+            unreadable: Mutex::new(HashMap::new()),
+            health: std::sync::OnceLock::new(),
         }
     }
 
@@ -326,11 +414,6 @@ pub fn decode_rules_snapshot(rules_json: &str, origin: &str) -> Option<ActiveRul
     );
     Some(ActiveRulesSnapshot {
         rule_book: content.rule_book,
-        // placeholder: the per-SID `PerSidBehaviorMode` wins inside
-        // `behavior_mode_for_codegen`, so this default is only used when
-        // a future caller ignores the per-SID override. `PreferPrimary` is
-        // the safe baseline (matches the default the GUI ships with).
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     })
 }
 
@@ -397,6 +480,10 @@ impl RulesProvider for ProductionRulesProvider {
     /// question — there is no separate seed step.
     fn active_rules_for(&self, principal: &str) -> Option<ActiveRulesSnapshot> {
         self.read_rules(principal, true)
+    }
+
+    fn rules_read_for(&self, principal: &str) -> RulesRead {
+        self.read_rules_outcome(principal, true)
     }
 
     fn stored_rules_for(&self, principal: &str) -> Option<ActiveRulesSnapshot> {
@@ -572,7 +659,6 @@ mod tests {
         let snap = provider.active_rules().expect("active rules present");
         assert_eq!(snap.rule_book.primary.rules().len(), 1);
         assert_eq!(snap.rule_book.secondary.rules().len(), 0);
-        assert_eq!(snap.behavior_mode, RouteBehaviorMode::PreferPrimary);
     }
 
     /// A book stored before the service refused bad rule values still loads:
@@ -886,10 +972,12 @@ mod tests {
     /// other one for enforcement only, and a writer reads it as stored.
     #[test]
     fn a_verify_rule_follows_its_verdict_for_enforcement_and_is_untouched_for_writers() {
-        use nrr_domain::{RuleAction, RuleId};
+        use nrr_domain::canonical::{CanonicalAddressMatch, VerifyKey};
+        use nrr_domain::RuleAction;
         use nrr_shared::rules_json::{
             AddressMatchDto, CanonicalRulesJsonV1, RuleDto, RULES_JSON_SCHEMA_VERSION,
         };
+        use nrr_shared::RouteRole;
         let dto = CanonicalRulesJsonV1 {
             schema_version: RULES_JSON_SCHEMA_VERSION,
             primary: vec![],
@@ -923,7 +1011,11 @@ mod tests {
             .all(|r| r.action == RuleAction::Route));
 
         // A verdict moves it; the cached decode does not hide the change.
-        crate::verify_overlay::set(sid, [RuleId("r-verify".into())].into_iter().collect());
+        let key = VerifyKey {
+            written: RouteRole::Secondary,
+            address: CanonicalAddressMatch::SuffixDomain("proton.example".into()),
+        };
+        crate::verify_overlay::set(sid, [key].into_iter().collect());
         let moved = provider.active_rules_for(sid).expect("rules present");
         assert!(moved.rule_book.secondary.is_empty());
         assert!(!moved.rule_book.primary.is_empty());
@@ -937,7 +1029,7 @@ mod tests {
         );
 
         // Dropped: back where it is written.
-        crate::verify_overlay::set(sid, std::collections::BTreeSet::new());
+        crate::verify_overlay::set(sid, std::collections::HashSet::new());
         let back = provider.active_rules_for(sid).expect("rules present");
         assert!(back.rule_book.primary.is_empty());
         assert!(!back.rule_book.secondary.is_empty());

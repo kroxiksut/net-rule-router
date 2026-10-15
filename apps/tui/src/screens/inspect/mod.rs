@@ -6,7 +6,7 @@
 
 pub mod cache;
 pub mod diagnostics;
-mod keys;
+pub(crate) mod keys;
 pub mod outage;
 #[cfg(test)]
 mod tests;

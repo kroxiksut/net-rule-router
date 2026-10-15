@@ -59,7 +59,6 @@ fn registry_marks_app_only_blocks_as_app_scoped_and_destination_blocks_as_not() 
             primary: CanonicalRuleSet::default(),
             secondary,
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     });
     source.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
     orch.install_for_sid("S-1-5-21-A").unwrap();
@@ -139,7 +138,6 @@ fn fixture_with_app_observation(
             primary: CanonicalRuleSet::default(),
             secondary,
         },
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
     });
     source.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
     (api, orch)

@@ -8,6 +8,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use nrr_shared::client_error_codes::{
+    MALFORMED_INPUT, USER_SETTINGS_READ_ONLY, USER_SETTINGS_UNAVAILABLE,
+};
 use nrr_shared::user_settings::{
     portable_path, UserSettings, UserSettingsError, UserSettingsStore, INTENT_NOTICE_MUTES,
     INTENT_ROUTE_POLICY,
@@ -173,9 +176,9 @@ pub(crate) enum IntentError {
 impl IntentError {
     pub(crate) fn wire_code(&self) -> &'static str {
         match self {
-            Self::ReadOnly => "user-settings-read-only",
-            Self::BadRequest(_) => "malformed-input",
-            Self::Settings(_) => "user-settings-unavailable",
+            Self::ReadOnly => USER_SETTINGS_READ_ONLY,
+            Self::BadRequest(_) => MALFORMED_INPUT,
+            Self::Settings(_) => USER_SETTINGS_UNAVAILABLE,
         }
     }
 }

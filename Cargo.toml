@@ -29,6 +29,9 @@ members = [
   "apps/desktop/launcher",
   "apps/desktop/broker",
 ]
+# The fuzz targets are their own nightly-only workspace (`scripts/fuzz.sh`), so
+# the stable gate, clippy and cargo-deny never see libfuzzer.
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

@@ -408,8 +408,12 @@ const FRA_PRIORITY: u16 = 6;
 const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
 const FRA_TABLE: u16 = 15;
 const FRA_UID_RANGE: u16 = 20;
+const FRA_IIFNAME: u16 = 3;
+/// The ingress device a locally originated packet's lookup carries; a
+/// forwarded one carries the device it came in on.
+const LOCAL_ORIGIN_IIF: &[u8] = b"lo\0";
 /// Attributes that narrow a rule beyond a uid (addresses, interfaces, marks,
-/// ports, a goto); ours carry none of them.
+/// ports, a goto); ours carry none of them but `iif lo`.
 const FRA_NARROWING: [u16; 14] = [1, 2, 3, 4, 10, 11, 12, 13, 16, 17, 19, 22, 23, 24];
 
 /// One policy-routing rule as the kernel holds it: in its family, traffic of
@@ -423,9 +427,16 @@ pub(crate) struct FibRule {
     /// `None` selects every user — never a rule we write.
     pub uid_range: Option<(u32, u32)>,
     pub suppress_prefixlen: Option<u8>,
+    /// Locally originated traffic only (`iif lo`): a packet the kernel
+    /// forwards for a container or a guest is looked up as uid 0 and would
+    /// otherwise take the service accounts' table.
+    pub iif_lo: bool,
     /// The rule also matches on something else (a mark, an interface, an
     /// address, an inversion), so it is somebody else's whatever its priority.
     pub narrowed: bool,
+    /// `not iif lo` and nothing else: what the machine forwards for containers
+    /// and guests. Carries no uid range.
+    pub forwarded: bool,
 }
 
 /// Encode `RTM_NEWRULE` / `RTM_DELRULE` for one rule.
@@ -453,6 +464,12 @@ fn encode_rule_mutation(message_type: u16, rule: &FibRule, sequence: u32) -> Vec
         range[..4].copy_from_slice(&first.to_ne_bytes());
         range[4..].copy_from_slice(&last.to_ne_bytes());
         push_attr(&mut body, FRA_UID_RANGE, &range);
+    }
+    if rule.iif_lo || rule.forwarded {
+        push_attr(&mut body, FRA_IIFNAME, LOCAL_ORIGIN_IIF);
+    }
+    if rule.forwarded {
+        body[8..12].copy_from_slice(&FIB_RULE_INVERT.to_ne_bytes());
     }
     let flags = match message_type {
         RTM_NEWRULE => NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
@@ -492,8 +509,11 @@ fn parse_rule_message(body: &[u8]) -> Option<FibRule> {
         table: u32::from(body[4]),
         uid_range: None,
         suppress_prefixlen: None,
-        narrowed: body[1..4].iter().any(|b| *b != 0) || flags & FIB_RULE_INVERT != 0,
+        iif_lo: false,
+        narrowed: body[1..4].iter().any(|b| *b != 0),
+        forwarded: false,
     };
+    let inverted = flags & FIB_RULE_INVERT != 0;
     let word = |p: &[u8]| <[u8; 4]>::try_from(p).ok().map(u32::from_ne_bytes);
     let mut offset = FIB_RULE_HDR_LEN;
     while offset + RTATTR_HEADER_LEN <= body.len() {
@@ -516,10 +536,25 @@ fn parse_rule_message(body: &[u8]) -> Option<FibRule> {
                     u32::from_ne_bytes([payload[4], payload[5], payload[6], payload[7]]),
                 ));
             }
+            // The kernel reports the name NUL-terminated; a trailing NUL is
+            // all that may follow it.
+            FRA_IIFNAME if payload.strip_suffix(b"\0").unwrap_or(payload) == b"lo" => {
+                rule.iif_lo = true;
+            }
             other if FRA_NARROWING.contains(&other) => rule.narrowed = true,
             _ => {}
         }
         offset += align(len);
+    }
+    // An inversion is somebody else's narrowing, unless it is ours: `not iif lo`
+    // alone.
+    if inverted {
+        if rule.iif_lo && !rule.narrowed && rule.uid_range.is_none() {
+            rule.iif_lo = false;
+            rule.forwarded = true;
+        } else {
+            rule.narrowed = true;
+        }
     }
     Some(rule)
 }
@@ -1159,7 +1194,9 @@ mod tests {
             table: 0x8000_03E8,
             uid_range: Some((1000, 1000)),
             suppress_prefixlen: suppress,
+            iif_lo: true,
             narrowed: false,
+            forwarded: false,
         }
     }
 
@@ -1178,6 +1215,10 @@ mod tests {
                 table: 254,
                 ..uid_rule(Some(1))
             },
+            FibRule {
+                iif_lo: false,
+                ..uid_rule(None)
+            },
         ] {
             let msg = encode_rule_mutation(RTM_NEWRULE, &rule, 1);
             let declared = u32::from_ne_bytes([msg[0], msg[1], msg[2], msg[3]]) as usize;
@@ -1188,8 +1229,8 @@ mod tests {
         }
     }
 
-    /// The bytes a kernel reads: the header, then priority, table, suppression
-    /// and the uid range in that order, each a padded `rtattr`.
+    /// The bytes a kernel reads: the header, then priority, table, suppression,
+    /// the uid range and the `lo` ingress in that order, each a padded `rtattr`.
     #[test]
     fn a_uid_rule_has_the_layout_the_kernel_reads() {
         let msg = encode_rule_mutation(RTM_NEWRULE, &uid_rule(Some(2)), 7);
@@ -1206,12 +1247,30 @@ mod tests {
             (FRA_TABLE, 0x8000_03E8u32.to_ne_bytes().to_vec()),
             (FRA_SUPPRESS_PREFIXLEN, 2u32.to_ne_bytes().to_vec()),
             (FRA_UID_RANGE, range),
+            (FRA_IIFNAME, b"lo\0".to_vec()),
         ] {
             want.extend_from_slice(&((RTATTR_HEADER_LEN + payload.len()) as u16).to_ne_bytes());
             want.extend_from_slice(&kind.to_ne_bytes());
             want.extend_from_slice(&payload);
+            want.resize(align(want.len()), 0);
         }
         assert_eq!(&body[FIB_RULE_HDR_LEN..], want.as_slice());
+    }
+
+    /// `iif lo` is what keeps forwarded packets out of our tables; another
+    /// ingress device is somebody else's selector.
+    #[test]
+    fn only_the_lo_ingress_reads_as_ours() {
+        let mut body = rule_body(&FibRule {
+            iif_lo: false,
+            ..uid_rule(None)
+        });
+        push_attr(&mut body, FRA_IIFNAME, b"docker0\0");
+        let parsed = parse_rule_message(&body).expect("parse");
+        assert!(parsed.narrowed && !parsed.iif_lo);
+
+        let parsed = parse_rule_message(&rule_body(&uid_rule(None))).expect("parse");
+        assert!(parsed.iif_lo && !parsed.narrowed);
     }
 
     /// A delete asks for nothing to be created.

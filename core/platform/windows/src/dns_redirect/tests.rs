@@ -565,6 +565,51 @@ fn a_namespace_that_is_no_longer_claimed_stops_being_exempt() {
     assert_eq!(redirect.store.keys(), [NRPT_RULE_KEY.to_string()]);
 }
 
+/// A rule host inside a namespace left to another resolver stays with us: its
+/// rule outranks the exemption, and the DNS client prefers the longer name.
+#[test]
+fn a_kept_rule_host_gets_its_own_rule_pointing_at_the_listener() {
+    let redirect = NrptDnsRedirect::new(
+        FakeRunner::new(ok("")),
+        FakeStore::with(&[(NRPT_RULE_KEY, ours("127.0.0.1"))]),
+    );
+    redirect
+        .exempt_namespaces(&[exemption("corp.example", &["10.0.0.1"])])
+        .expect("exempt");
+    let kept = redirect
+        .keep_names(&["git.corp.example".to_string()], listener())
+        .expect("keep");
+    assert_eq!(kept, 1);
+    let key = nrpt_keep_key("git.corp.example");
+    let rules = redirect
+        .store
+        .rules
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let values = rules.get(&key).expect("the keep rule");
+    assert!(has(
+        values,
+        &multi_sz_list(
+            "Name",
+            &[
+                "git.corp.example".to_string(),
+                ".git.corp.example".to_string()
+            ]
+        )
+    ));
+    assert!(has(values, &sz("GenericDNSServers", "127.0.0.1")));
+    assert!(has(values, &sz("Comment", NRPT_KEEP_MARKER)));
+    assert!(
+        rules.contains_key(&nrpt_exemption_key("corp.example")),
+        "the exemption stays beside it"
+    );
+    drop(rules);
+
+    // The next set replaces the last one; none takes them all out.
+    assert_eq!(redirect.keep_names(&[], listener()).expect("keep"), 0);
+    assert!(!redirect.store.keys().contains(&key));
+}
+
 /// Stopping must leave the machine as it was found. An exemption outliving
 /// the service would keep steering names at a resolver nobody watches.
 #[test]
@@ -576,6 +621,9 @@ fn restoring_takes_the_exemptions_out_with_the_catch_all() {
     redirect
         .exempt_namespaces(&[exemption("corp.example.com", &["10.0.0.1"])])
         .expect("exempt");
+    redirect
+        .keep_names(&["git.corp.example.com".to_string()], listener())
+        .expect("keep");
     redirect.restore(&handle()).expect("restore");
     assert_eq!(
         redirect.store.keys(),
@@ -776,16 +824,26 @@ fn a_sweep_with_nothing_left_behind_is_clean() {
     assert!(sweep.is_clean());
 }
 
-/// The emergency reset sweeps without the binary; its copy of the marker and
-/// of our rule's key must be the service's.
+/// The emergency reset and the uninstaller sweep without the binary; their
+/// shared copy of the markers and of our rule's key must be the service's.
 #[test]
-fn the_reset_script_mirrors_the_marker_and_the_rule_key() {
-    let script = include_str!("../../../../../scripts/reset-network.ps1");
+fn the_script_sweep_mirrors_the_markers_and_the_rule_key() {
+    let library = include_str!("../../../../../scripts/lib/service-paths.ps1");
     for (name, value) in [
-        ("$nrptMarker", NRPT_MARKER),
-        ("$nrptRuleKey", NRPT_RULE_KEY),
+        ("$NrrNrptMarker", NRPT_MARKER),
+        ("$NrrNrptExemptMarker", NRPT_EXEMPT_MARKER),
+        ("$NrrNrptKeepMarker", NRPT_KEEP_MARKER),
+        ("$NrrNrptRuleKey", NRPT_RULE_KEY),
     ] {
         let line = format!("{name} = '{value}'");
-        assert!(script.lines().any(|l| l == line), "{line}");
+        assert!(library.lines().any(|l| l == line), "{line}");
+    }
+    // Both callers go through that one sweep rather than carrying a copy.
+    for script in [
+        include_str!("../../../../../scripts/reset-network.ps1"),
+        include_str!("../../../../../packaging/windows/setup-actions.ps1"),
+    ] {
+        assert!(script.contains("Remove-NrrDnsRedirect"));
+        assert!(!script.contains("Get-DnsClientNrptRule"));
     }
 }

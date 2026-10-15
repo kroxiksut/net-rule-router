@@ -6,7 +6,7 @@
 //! `image`), so the address, hostname and process are redacted in the same
 //! modes as the `connobs-*` lines.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use nrr_platform_api::fake_ip::stale_flows::EstablishedFlow;
 
@@ -59,11 +59,11 @@ pub fn lines_for(total: usize) -> (usize, usize) {
 pub fn log_reset_flows<'a>(
     sid: Option<&str>,
     flows: &[EstablishedFlow],
-    host_and_cause: impl Fn(Ipv4Addr) -> (Option<&'a str>, ResetCause),
+    host_and_cause: impl Fn(IpAddr) -> (Option<&'a str>, ResetCause),
 ) {
     let (shown, omitted) = lines_for(flows.len());
     for flow in &flows[..shown] {
-        let (host, cause) = host_and_cause(*flow.remote.ip());
+        let (host, cause) = host_and_cause(flow.remote.ip());
         tracing::info!(
             target: "nrr::flow-reset",
             msg_key = "flowreset-connection",
@@ -109,9 +109,10 @@ mod tests {
     }
 
     fn flow(port: u16) -> EstablishedFlow {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
         EstablishedFlow {
-            local: std::net::SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), port),
-            remote: std::net::SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 3389),
+            local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), port)),
+            remote: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 3389)),
             owner: Some("S-1-5-21-1-2-3-1001".into()),
             pid: Some(4242),
             image: Some("client.example.exe".into()),

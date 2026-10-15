@@ -351,18 +351,30 @@ ColumnLayout {
                     }
                     popup.width: root.comboPopupWidth(behaviorCombo, root.behaviorModeModel, "id",
                         function(item) { return root.behaviorModeLabel(item.id) })
+                    /// Show `slug`, whether the user picked it or the service kept it.
+                    function _showMode(slug) {
+                        var idx = Pure.optionIndexById(
+                            ((root.context.interfaces || {}).supportedBehaviorModes) || [],
+                            String(slug || ""), currentIndex)
+                        if (idx < 0 || idx >= root.behaviorModeModel.count) return
+                        currentIndex = idx
+                        behaviorCombo.displayText = root.behaviorModeLabel(root.behaviorModeModel.get(idx).id)
+                    }
                     onActivated: {
                         var id = root.behaviorModeModel.get(currentIndex).id
-                        root.updatePrefs({ routeBehaviorMode: id })
-                        root.emitPrefs()
-                        // Also persist to the SERVICE
-                        // per-SID policy (the authoritative source for WFP). The
-                        // updatePrefs/emitPrefs above only touches the deprecated
-                        // UiPreferences mirror and never reaches enforcement.
+                        // The per-SID policy is what enforcement reads; the
+                        // preference mirror follows once the service confirms.
                         if (typeof root.routePolicyController.applyRouteBehaviorMode === "function") {
                             root.routePolicyController.applyRouteBehaviorMode(id)
                         }
                         behaviorCombo.displayText = root.behaviorModeLabel(id)
+                    }
+                    Connections {
+                        target: root ? root.routePolicyController : null
+                        function onPolicyWriteRefused(confirmed) {
+                            if (confirmed && confirmed.hasOwnProperty("mode"))
+                                behaviorCombo._showMode(confirmed.mode)
+                        }
                     }
                     Connections {
                         target: root

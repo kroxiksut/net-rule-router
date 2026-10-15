@@ -119,6 +119,7 @@
 //!   removed. Architectural-boundary notes stay as plain docs without the
 //!   marker; a real gap keeps a plain `TODO:` naming what would close it.
 
+use nrr_service_runtime::machine_scoped::MachineScopedSetting;
 use nrr_service_runtime::{
     decide_recovery, ApplyAttemptMarker, ApplyPhase, RecoveryDecision, StartupRecoveryState,
 };
@@ -138,7 +139,7 @@ use std::collections::HashSet;
 /// It replaced a pinned COUNT, which could not see an operation removed and
 /// another added in the same change — and a prose comment that tried to
 /// enumerate the catalog and had drifted to naming 33 of 70.
-const PINNED_OPERATION_SLUGS: [&str; 74] = [
+const PINNED_OPERATION_SLUGS: [&str; 76] = [
     "audit.list",
     "autorules.candidates.accept",
     "autorules.candidates.dismiss",
@@ -165,6 +166,8 @@ const PINNED_OPERATION_SLUGS: [&str; 74] = [
     "diagnostics.explain.get",
     "diagnostics.export-archive",
     "diagnostics.seed-from-browser-history",
+    "dns.local-suffixes.get",
+    "dns.local-suffixes.set",
     "doh.resolvers.get",
     "doh.resolvers.set",
     "interfaces.refresh.request",
@@ -293,18 +296,15 @@ fn mutation_submit_is_classified_as_command() {
 /// save the row back unchanged — which is what a settings page does on every
 /// save — and demands rights only for an actual change.
 ///
-/// Maintained by hand, and that is the point. A handler-level check is invisible
-/// from the catalog, so this list is the only thing that lets
-/// `requires_service_mutation_privilege` mean something: a new carrier with no
-/// gate at all breaks the test below instead of quietly shipping.
-const VALUE_GATED_OPERATIONS: &[IpcOperationName] = &[
-    IpcOperationName::DohResolversSet,
-    IpcOperationName::RetentionSettingsSet,
-    IpcOperationName::LogRetentionConfigSet,
-    IpcOperationName::ApplyFailurePolicySet,
-    IpcOperationName::ServiceStabilityConfigSet,
-    IpcOperationName::TrafficStatsSet,
-];
+/// Derived from `MachineScopedSetting::written_by`, an exhaustive match the
+/// handlers' refusals name their setting through. That a listed handler really
+/// refuses is proven by running it (`machine_scoped::gate_probes`), not here.
+fn value_gated_operations() -> Vec<IpcOperationName> {
+    IpcOperationName::ALL
+        .into_iter()
+        .filter(|op| MachineScopedSetting::written_by(*op).is_some())
+        .collect()
+}
 
 /// Every operation the catalog marks as needing service-mutation privilege must
 /// ACTUALLY be gated — one of the only two ways this codebase gates such a write.
@@ -317,15 +317,16 @@ const VALUE_GATED_OPERATIONS: &[IpcOperationName] = &[
 #[test]
 fn every_privileged_operation_is_actually_gated() {
     let empty = serde_json::Value::Null;
+    let value_gated_ops = value_gated_operations();
     for spec in ipc_operation_catalog().iter() {
         if !spec.requires_service_mutation_privilege {
             continue;
         }
         let class_gated = canonical_operation_class(spec.name, &empty).requires_elevation();
-        let value_gated = VALUE_GATED_OPERATIONS.contains(&spec.name);
+        let value_gated = value_gated_ops.contains(&spec.name);
         assert!(
             class_gated || value_gated,
-            "{} claims service-mutation privilege but nothing gates it. Its class does not require elevation and it is not in VALUE_GATED_OPERATIONS. Either gate the handler with `machine_scoped_write_allowed` and list it there, or give it a class that requires elevation.",
+            "{} claims service-mutation privilege but nothing gates it. Its class does not require elevation and `MachineScopedSetting::written_by` does not name it. Either gate the handler with `machine_scoped_write_allowed` and map it there (the gate probes will then run it), or give it a class that requires elevation.",
             spec.name.slug()
         );
         assert!(
@@ -336,24 +337,29 @@ fn every_privileged_operation_is_actually_gated() {
     }
 }
 
-/// The list above must not rot. An entry that lost the flag, or that has since
-/// been given an elevation-gated class, is stale and hides the next real gap.
+/// A value-gated operation that lost the flag, or that has since been given an
+/// elevation-gated class, is a stale mapping and hides the next real gap.
 #[test]
-fn the_value_gated_list_has_no_stale_entries() {
+fn the_value_gated_operations_have_no_stale_entries() {
     let empty = serde_json::Value::Null;
-    for op in VALUE_GATED_OPERATIONS {
+    let value_gated_ops = value_gated_operations();
+    assert!(
+        !value_gated_ops.is_empty(),
+        "no value-gated operation at all: the derivation is broken"
+    );
+    for op in value_gated_ops {
         let spec = ipc_operation_catalog()
             .iter()
-            .find(|s| s.name == *op)
+            .find(|s| s.name == op)
             .unwrap_or_else(|| panic!("{} is not in the catalog at all", op.slug()));
         assert!(
             spec.requires_service_mutation_privilege,
-            "{} no longer claims service-mutation privilege — drop it from the list",
+            "{} no longer claims service-mutation privilege — unmap it in `MachineScopedSetting::written_by`",
             op.slug()
         );
         assert!(
-            !canonical_operation_class(*op, &empty).requires_elevation(),
-            "{} is now gated by its class — drop it from the list, the value check is dead",
+            !canonical_operation_class(op, &empty).requires_elevation(),
+            "{} is now gated by its class — unmap it, the value check is dead",
             op.slug()
         );
     }

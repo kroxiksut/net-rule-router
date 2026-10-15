@@ -29,7 +29,7 @@
 //! [`flows_to_reset`]: crate::routed_host_flow_refresh::flows_to_reset
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use nrr_platform_api::enforcement::{
@@ -100,18 +100,19 @@ impl Steer {
     }
 }
 
-/// One steered IPv4 destination: a host, or a network a rule pins.
+/// One steered destination of either family: a host, or a network a rule pins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Dst {
-    Host(Ipv4Addr),
+    Host(IpAddr),
     Network(IpBlock),
 }
 
 type Steering = BTreeMap<Dst, Vec<Steer>>;
 
-fn subnet_v4(dst: &DstMatch) -> Option<IpBlock> {
+fn subnet_of(dst: &DstMatch) -> Option<IpBlock> {
     match *dst {
         DstMatch::SubnetV4 { net, prefix } => IpBlock::new(IpAddr::V4(net), prefix),
+        DstMatch::SubnetV6 { net, prefix } => IpBlock::new(IpAddr::V6(net), prefix),
         _ => None,
     }
 }
@@ -121,11 +122,12 @@ fn steering_of(plan: &EnforcementPlan) -> Steering {
         .flows
         .iter()
         .filter(|flow| matches!(flow.precedence.class, PrecedenceClass::RouteRule(_)))
-        .filter_map(|flow| subnet_v4(&flow.flow.dst))
+        .filter_map(|flow| subnet_of(&flow.flow.dst))
         .collect();
     let dst_of = |dst: &DstMatch| match *dst {
-        DstMatch::HostV4(ip) => Some(Dst::Host(ip)),
-        _ => subnet_v4(dst)
+        DstMatch::HostV4(ip) => Some(Dst::Host(IpAddr::V4(ip))),
+        DstMatch::HostV6(ip) => Some(Dst::Host(IpAddr::V6(ip))),
+        _ => subnet_of(dst)
             .filter(|net| rule_networks.contains(net))
             .map(Dst::Network),
     };
@@ -428,7 +430,7 @@ impl PlanFlowReset {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddrV4;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     use nrr_platform_api::enforcement::{
         AppScope, Coverage, FlowMatch, FlowRule, Precedence, PrincipalScope, RouteIntent,
@@ -500,8 +502,8 @@ mod tests {
 
     fn flow(remote: Ipv4Addr, port: u16, uid: u32) -> EstablishedFlow {
         EstablishedFlow {
-            local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), port),
-            remote: SocketAddrV4::new(remote, 443),
+            local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), port)),
+            remote: SocketAddr::V4(SocketAddrV4::new(remote, 443)),
             owner: Some(UserPrincipal::from_linux_uid(uid).as_stored().to_owned()),
             pid: Some(4242),
             image: Some("browser".into()),
@@ -874,7 +876,7 @@ mod tests {
             )
         };
         let via = |local: Ipv4Addr, remote: Ipv4Addr, port: u16| EstablishedFlow {
-            local: SocketAddrV4::new(local, port),
+            local: SocketAddr::V4(SocketAddrV4::new(local, port)),
             ..flow(remote, port, UID)
         };
         let (reset, mock) = refresher(&[]);
@@ -910,16 +912,47 @@ mod tests {
             vec![blocked],
             vec![route(ip(1), EgressRef::Secondary)],
         ));
-        assert_eq!(courses_of(&steering).of(ip(1)), None);
+        assert_eq!(courses_of(&steering).of(IpAddr::V4(ip(1))), None);
 
         let both_ways = steering_of(&plan(
             vec![pin(ip(2), RouteRole::Primary, 0)],
             vec![route(ip(2), EgressRef::Secondary)],
         ));
         assert_eq!(
-            courses_of(&both_ways).of(ip(2)),
+            courses_of(&both_ways).of(IpAddr::V4(ip(2))),
             None,
             "two links, no course"
         );
+    }
+
+    /// A v6 host a rule pins is a destination like a v4 one: the owner's v6
+    /// connection to it is torn down when the pin appears.
+    #[test]
+    fn a_v6_destination_a_change_adds_is_torn_down() {
+        let v6: std::net::Ipv6Addr = "2001:db8::7".parse().expect("literal");
+        let pin6 = FlowRule {
+            flow: FlowMatch {
+                dst: DstMatch::HostV6(v6),
+                dst_port: None,
+                protocol: None,
+            },
+            ..pin(ip(1), RouteRole::Secondary, 0)
+        };
+        let route6 = RouteIntent {
+            dst: DstMatch::HostV6(v6),
+            ..route(ip(1), EgressRef::Secondary)
+        };
+        let (reset, mock) = refresher(&[]);
+        reset.after_apply(&[plan(Vec::new(), Vec::new())], true, up, no_links);
+        let mine6 = EstablishedFlow {
+            remote: SocketAddr::new(IpAddr::V6(v6), 443),
+            ..flow(ip(1), 50_000, UID)
+        };
+        mock.set_flows(vec![mine6.clone(), flow(ip(1), 50_001, UID)]);
+
+        reset.after_apply(&[plan(vec![pin6], vec![route6])], true, up, no_links);
+
+        assert_eq!(mock.queried(), vec![IpAddr::V6(v6)]);
+        assert_eq!(mock.reset_flows(), vec![mine6]);
     }
 }

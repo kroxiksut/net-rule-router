@@ -150,6 +150,38 @@ fn programs_taking_all_their_traffic_is_a_routing_switch_off_by_default() {
     assert_eq!(sent[0]["app-rules-take-all-addresses"], json!(true));
 }
 
+/// The row is there whatever the adapters are called, says so when
+/// unanswered, and picking an answer writes that key alone.
+#[test]
+fn forwarded_traffic_is_answered_in_routing_with_no_guest_named() {
+    let fake = service();
+    let mut app = on_settings();
+    answer(&mut app, "c2");
+    drain(&mut app, &fake);
+    if !app.settings.supports.forwarded_traffic_guard {
+        return;
+    }
+    let id = ItemId::Policy("forwarded-outage");
+    let listed = |app: &AppState| {
+        items::items(app, Category::Routing)
+            .into_iter()
+            .find(|item| item.id == id)
+    };
+    let item = listed(&app).expect("the row, with no WSL adapter up");
+    assert_eq!(
+        item.value().map(|v| v.resolve(&texts_en())),
+        Some(texts_en().get(text::FWD_UNANSWERED))
+    );
+    let row = row_of(&app, Category::Routing, id);
+    answer(&mut app, &format!("i{row} 2"));
+    drain(&mut app, &fake);
+
+    let sent = fake.sent(IpcOperationName::RoutePolicyUpdate);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["apply-only"], json!(["forwarded-outage"]));
+    assert_eq!(sent[0]["forwarded-outage"], json!("unprotected"));
+}
+
 #[test]
 fn hiding_a_notice_kind_for_a_week_sends_its_deadline() {
     let fake = service();
@@ -301,4 +333,52 @@ fn fake_ip_is_not_offered_where_the_platform_lacks_it() {
             .any(|item| item.label.resolve(&texts).contains(&unsupported)),
         "the setting is not explained"
     );
+}
+
+/// The local networks list answers row by row, as the window does: a row that
+/// no answer can open stays a line of text with its reason.
+#[test]
+fn a_local_network_is_answered_by_its_row() {
+    let fake = service();
+    let networks = json!([
+        { "cidr": "192.168.1.0/24", "kind": "main-link", "adapter": "Ethernet",
+          "allowed": true, "decided-by-user": true },
+        { "cidr": "2001:db8:5:7::/64", "kind": "main-link", "adapter": "Ethernet",
+          "allowed": false, "decided-by-user": false },
+        { "cidr": "0.0.0.0/1", "kind": "main-link", "adapter": "Ethernet",
+          "allowed": false, "decided-by-user": true, "reason": "too-wide" }
+    ]);
+    fake.answer(
+        IpcOperationName::LocalNetworksGet,
+        json!({ "networks": networks.clone() }),
+    );
+    fake.answer(
+        IpcOperationName::LocalNetworksSet,
+        json!({ "networks": networks, "rejected": [] }),
+    );
+    let mut app = on_settings();
+    answer(&mut app, "c2");
+    drain(&mut app, &fake);
+    if !app.settings.supports.local_network_exceptions {
+        return;
+    }
+    let listed = items::items(&app, Category::Routing);
+    let wide = listed
+        .iter()
+        .find(|item| item.label.resolve(&texts_en()).starts_with("0.0.0.0/1"))
+        .expect("the too-wide segment is listed");
+    assert!(!wide.selectable());
+    assert!(wide.label.resolve(&texts_en()).contains("too wide"));
+
+    let row = row_of(&app, Category::Routing, ItemId::LocalNetwork(1));
+    answer(&mut app, &format!("i{row}"));
+    drain(&mut app, &fake);
+
+    let sent = fake.sent(IpcOperationName::LocalNetworksSet);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0]["decisions"],
+        json!([{ "cidr": "2001:db8:5:7::/64", "allowed": true }])
+    );
+    assert_eq!(said(&app), texts_en().get(text::SAVED));
 }

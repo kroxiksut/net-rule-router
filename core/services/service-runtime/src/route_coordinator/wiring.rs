@@ -16,6 +16,7 @@ impl SecondaryRouteCoordinator {
     ) -> Self {
         Self {
             reconciler: SecondaryRouteReconciler::new(Arc::clone(&api)),
+            pass_lock: Mutex::new(()),
             api,
             rules_provider,
             route_source,
@@ -31,6 +32,7 @@ impl SecondaryRouteCoordinator {
             anchor_persisted: Mutex::new(std::collections::HashSet::new()),
             enforcement_status: crate::app_enforcement_status::RouteEnforcementStatus::new(),
             unassigned_tunnel_notified: Mutex::new(HashMap::new()),
+            too_wide_local_network_notified: Default::default(),
             no_next_hop_logged: Mutex::new(std::collections::HashSet::new()),
             no_policy_logged: Mutex::new(std::collections::HashSet::new()),
             no_secondary_logged: Mutex::new(std::collections::HashSet::new()),
@@ -57,7 +59,6 @@ impl SecondaryRouteCoordinator {
             reachability_probe: None,
             app_observations: Arc::new(AppObservationStore::new()),
             dns_via_secondary: None,
-            learned_vpn_endpoints: None,
             network_support: crate::wfp_codegen::current_rule_shape_support(),
         }
     }
@@ -68,18 +69,6 @@ impl SecondaryRouteCoordinator {
     /// reads, or the socket and the route table disagree about the path.
     pub fn with_dns_via_secondary(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.dns_via_secondary = Some(flag);
-        self
-    }
-
-    /// Share the reactive VPN-endpoint learner's bounded, role-verified server
-    /// set so it is merged into the kill-switch/fail-closed exemption bands.
-    /// Chain before the coordinator is wrapped in `Arc`. Without it, only
-    /// route-observed bootstrap server IPs are exempted (today's behaviour).
-    pub fn with_learned_vpn_endpoints(
-        mut self,
-        learned: Arc<crate::vpn_endpoint_learning::LearnedVpnEndpoints>,
-    ) -> Self {
-        self.learned_vpn_endpoints = Some(learned);
         self
     }
 

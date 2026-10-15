@@ -2,8 +2,9 @@
 //! read over `NETLINK_SOCK_DIAG`, and `SOCK_DESTROY` to close a listed socket.
 //!
 //! One dump per family lists every established TCP socket with its endpoints,
-//! owning uid and inode. Both families, because a dual-stack socket reaches an
-//! IPv4 peer through a v4-mapped address and is invisible to an `AF_INET` dump.
+//! owning uid and inode. Both families: a real IPv6 connection is a candidate
+//! like an IPv4 one, and a dual-stack socket reaches an IPv4 peer through a
+//! v4-mapped address, invisible to an `AF_INET` dump.
 //! The inode names the process only through a `/proc/<pid>/fd` walk, which is
 //! limited to the uids that own a match.
 //!
@@ -20,7 +21,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Mutex;
 
 use nrr_platform_api::enforcement::UserPrincipal;
@@ -37,7 +38,7 @@ pub struct LinuxStaleFlowReset {
     listed: Mutex<Listings>,
 }
 
-type FourTuple = (SocketAddrV4, SocketAddrV4);
+type FourTuple = (SocketAddr, SocketAddr);
 
 /// The ids the two latest listings returned. Two, so a listing another caller
 /// makes between a caller's own listing and its reset does not take that
@@ -92,8 +93,10 @@ impl StaleFlowReset for LinuxStaleFlowReset {
         let ids: Vec<SockId> = sockets
             .iter()
             .filter(|s| {
-                s.v4_endpoints()
-                    .is_some_and(|(_, remote)| addr_in_range(*remote.ip(), base, prefix_len))
+                s.endpoints().is_some_and(|(_, remote)| match remote.ip() {
+                    IpAddr::V4(v4) => addr_in_range(v4, base, prefix_len),
+                    IpAddr::V6(_) => false,
+                })
             })
             .map(|s| s.id)
             .collect();
@@ -116,11 +119,11 @@ impl StaleFlowReset for LinuxStaleFlowReset {
         let Some(sockets) = self.established() else {
             return Vec::new();
         };
-        let matched: Vec<(SocketAddrV4, SocketAddrV4, &DiagSocket)> = sockets
+        let matched: Vec<(SocketAddr, SocketAddr, &DiagSocket)> = sockets
             .iter()
             .filter_map(|s| {
-                let (local, remote) = s.v4_endpoints()?;
-                wanted.matches(*remote.ip()).then_some((local, remote, s))
+                let (local, remote) = s.endpoints()?;
+                wanted.matches(remote.ip()).then_some((local, remote, s))
             })
             .collect();
         self.listed
@@ -175,7 +178,7 @@ fn ids_for(flows: &[EstablishedFlow], listed: &Listings) -> Vec<SockId> {
         .map(|f| {
             listed
                 .get(&(f.local, f.remote))
-                .unwrap_or_else(|| SockId::for_v4(f.local, f.remote))
+                .unwrap_or_else(|| SockId::for_endpoints(f.local, f.remote))
         })
         .collect()
 }
@@ -248,6 +251,30 @@ impl SockId {
         }
     }
 
+    /// An `AF_INET6` id from endpoints alone: no bound interface, no cookie.
+    fn for_v6(local: SocketAddrV6, remote: SocketAddrV6) -> Self {
+        let mut raw = [0u8; SOCKID_LEN];
+        raw[0..2].copy_from_slice(&local.port().to_be_bytes());
+        raw[2..4].copy_from_slice(&remote.port().to_be_bytes());
+        raw[4..20].copy_from_slice(&local.ip().octets());
+        raw[20..36].copy_from_slice(&remote.ip().octets());
+        raw[40..44].copy_from_slice(&NO_COOKIE.to_ne_bytes());
+        raw[44..48].copy_from_slice(&NO_COOKIE.to_ne_bytes());
+        Self {
+            family: AF_INET6,
+            raw,
+        }
+    }
+
+    /// The id for a connection never listed by this instance: its family's
+    /// plain form. A mixed pair (impossible for one socket) is read as v6.
+    fn for_endpoints(local: SocketAddr, remote: SocketAddr) -> Self {
+        match (local, remote) {
+            (SocketAddr::V4(l), SocketAddr::V4(r)) => Self::for_v4(l, r),
+            (l, r) => Self::for_v6(as_v6(l), as_v6(r)),
+        }
+    }
+
     fn sport(&self) -> u16 {
         u16::from_be_bytes([self.raw[0], self.raw[1]])
     }
@@ -256,17 +283,30 @@ impl SockId {
         u16::from_be_bytes([self.raw[2], self.raw[3]])
     }
 
-    fn address(&self, offset: usize) -> Option<Ipv4Addr> {
+    /// The address at `offset`; a v4-mapped one in an `AF_INET6` id comes
+    /// back as the IPv4 address it maps, which is what the peer is.
+    fn address(&self, offset: usize) -> Option<IpAddr> {
         let bytes = &self.raw[offset..offset + 16];
         match self.family {
-            AF_INET => Some(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])),
+            AF_INET => Some(IpAddr::V4(Ipv4Addr::new(
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ))),
             AF_INET6 => {
                 let mut v6 = [0u8; 16];
                 v6.copy_from_slice(bytes);
-                Ipv6Addr::from(v6).to_ipv4_mapped()
+                let v6 = Ipv6Addr::from(v6);
+                Some(v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4))
             }
             _ => None,
         }
+    }
+}
+
+/// A socket address in its `AF_INET6` form: v6 as is, v4 mapped.
+fn as_v6(addr: SocketAddr) -> SocketAddrV6 {
+    match addr {
+        SocketAddr::V6(v6) => v6,
+        SocketAddr::V4(v4) => SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0),
     }
 }
 
@@ -280,16 +320,25 @@ struct DiagSocket {
 }
 
 impl DiagSocket {
-    /// Local and remote endpoints as IPv4 — a dual-stack socket's v4-mapped
-    /// pair unmapped. `None` for a real IPv6 connection, which the port does
-    /// not cover.
-    fn v4_endpoints(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    /// Local and remote endpoints — a dual-stack socket's v4-mapped pair
+    /// unmapped, a real IPv6 connection as v6. `None` for a family the dump
+    /// was not asked for.
+    fn endpoints(&self) -> Option<(SocketAddr, SocketAddr)> {
         let local = self.id.address(4)?;
         let remote = self.id.address(20)?;
         Some((
-            SocketAddrV4::new(local, self.id.sport()),
-            SocketAddrV4::new(remote, self.id.dport()),
+            SocketAddr::new(local, self.id.sport()),
+            SocketAddr::new(remote, self.id.dport()),
         ))
+    }
+
+    /// [`Self::endpoints`] when both are IPv4.
+    #[cfg(test)]
+    fn v4_endpoints(&self) -> Option<(SocketAddrV4, SocketAddrV4)> {
+        match self.endpoints()? {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => Some((local, remote)),
+            _ => None,
+        }
     }
 }
 
@@ -907,13 +956,56 @@ mod tests {
     }
 
     #[test]
-    fn a_real_ipv6_connection_is_not_reported_as_ipv4() {
-        let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets();
-        let datagram = diag_frame(AF_INET6, TCP_ESTABLISHED, &v6_sockid(v6, 1, v6, 2), 0, 1);
+    fn a_real_ipv6_connection_is_reported_as_ipv6_not_ipv4() {
+        let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let datagram = diag_frame(
+            AF_INET6,
+            TCP_ESTABLISHED,
+            &v6_sockid(v6.octets(), 1, v6.octets(), 2),
+            0,
+            1,
+        );
         let mut out = Vec::new();
         parse_dump_datagram(&datagram, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].v4_endpoints(), None);
+        assert_eq!(
+            out[0].endpoints(),
+            Some((
+                SocketAddr::new(IpAddr::V6(v6), 1),
+                SocketAddr::new(IpAddr::V6(v6), 2)
+            ))
+        );
+    }
+
+    /// A v6 flow never listed by this instance gets a plain `AF_INET6` id,
+    /// and that id decodes back to the same endpoints.
+    #[test]
+    fn a_v6_id_built_from_endpoints_round_trips() {
+        let local = SocketAddrV6::new("2001:db8::2".parse().expect("literal"), 50_000, 0, 0);
+        let remote = SocketAddrV6::new("2001:db8::7".parse().expect("literal"), 443, 0, 0);
+        let id = SockId::for_endpoints(SocketAddr::V6(local), SocketAddr::V6(remote));
+        assert_eq!(id.family, AF_INET6);
+        let socket = DiagSocket {
+            id,
+            state: TCP_ESTABLISHED,
+            uid: 0,
+            inode: 0,
+        };
+        assert_eq!(
+            socket.endpoints(),
+            Some((SocketAddr::V6(local), SocketAddr::V6(remote)))
+        );
+        assert_eq!(read_u32(&id.raw, 40), NO_COOKIE);
+        assert_eq!(
+            SockId::for_endpoints(
+                SocketAddr::V4(SocketAddrV4::new(v4(192, 0, 2, 7), 50_000)),
+                SocketAddr::V4(SocketAddrV4::new(v4(203, 0, 113, 9), 443)),
+            )
+            .family,
+            AF_INET,
+            "a v4 pair keeps its own family"
+        );
     }
 
     #[test]
@@ -1013,15 +1105,16 @@ mod tests {
 
     #[test]
     fn a_listed_flow_is_reset_by_its_listed_id() {
-        let local = SocketAddrV4::new(v4(192, 0, 2, 7), 50_001);
-        let remote = SocketAddrV4::new(v4(203, 0, 113, 10), 443);
+        let local4 = SocketAddrV4::new(v4(192, 0, 2, 7), 50_001);
+        let remote4 = SocketAddrV4::new(v4(203, 0, 113, 10), 443);
+        let (local, remote) = (SocketAddr::V4(local4), SocketAddr::V4(remote4));
         let listed_id = SockId {
             family: AF_INET6,
             raw: v6_sockid(
-                mapped(*local.ip()),
-                local.port(),
-                mapped(*remote.ip()),
-                remote.port(),
+                mapped(*local4.ip()),
+                local4.port(),
+                mapped(*remote4.ip()),
+                remote4.port(),
             ),
         };
         let mut listed = Listings::default();
@@ -1033,19 +1126,20 @@ mod tests {
             pid: None,
             image: None,
         };
-        let other_local = SocketAddrV4::new(v4(192, 0, 2, 7), 50_002);
+        let other_local4 = SocketAddrV4::new(v4(192, 0, 2, 7), 50_002);
+        let other_local = SocketAddr::V4(other_local4);
         let ids = ids_for(&[flow(local, remote), flow(other_local, remote)], &listed);
         assert_eq!(ids[0], listed_id);
-        assert_eq!(ids[1], SockId::for_v4(other_local, remote));
+        assert_eq!(ids[1], SockId::for_v4(other_local4, remote4));
 
         // Another caller's listing in between keeps this one's id.
-        listed.record([((other_local, remote), SockId::for_v4(other_local, remote))]);
+        listed.record([((other_local, remote), SockId::for_v4(other_local4, remote4))]);
         assert_eq!(ids_for(&[flow(local, remote)], &listed), [listed_id]);
         listed.record([]);
         listed.record([]);
         assert_eq!(
             ids_for(&[flow(local, remote)], &listed),
-            [SockId::for_v4(local, remote)],
+            [SockId::for_v4(local4, remote4)],
             "two listings later the id is gone"
         );
     }
@@ -1068,13 +1162,10 @@ mod tests {
         let server = listener.local_addr().expect("addr");
         let client = std::net::TcpStream::connect(server).expect("connect");
         let (_accepted, _) = listener.accept().expect("accept");
-        let local = match client.local_addr().expect("local") {
-            std::net::SocketAddr::V4(v4) => v4,
-            std::net::SocketAddr::V6(_) => unreachable!("bound to IPv4"),
-        };
+        let local = client.local_addr().expect("local");
 
         let reset = LinuxStaleFlowReset::new();
-        let flows = reset.established_flows_to(&[Ipv4Addr::LOCALHOST]);
+        let flows = reset.established_flows_to(&[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
         let ours = flows
             .iter()
             .find(|f| f.local == local)
@@ -1093,7 +1184,9 @@ mod tests {
     #[test]
     fn listing_an_address_nothing_talks_to_finds_nothing() {
         let reset = LinuxStaleFlowReset::new();
-        assert!(reset.established_flows_to(&[v4(192, 0, 2, 254)]).is_empty());
+        assert!(reset
+            .established_flows_to(&[IpAddr::V4(v4(192, 0, 2, 254))])
+            .is_empty());
         assert!(reset.established_flows_to(&[]).is_empty());
     }
 
@@ -1112,9 +1205,7 @@ mod tests {
         let reset = LinuxStaleFlowReset::new();
         let inside =
             reset.established_flows_matching(&FlowTargets::new(Vec::new(), vec![loopback]));
-        assert!(inside
-            .iter()
-            .any(|f| std::net::SocketAddr::V4(f.local) == local));
+        assert!(inside.iter().any(|f| f.local == local));
         assert!(reset
             .established_flows_matching(&FlowTargets::new(Vec::new(), vec![outside]))
             .is_empty());
@@ -1138,9 +1229,9 @@ mod tests {
 
         let reset = LinuxStaleFlowReset::new();
         let ours: Vec<EstablishedFlow> = reset
-            .established_flows_to(&[Ipv4Addr::LOCALHOST])
+            .established_flows_to(&[IpAddr::V4(Ipv4Addr::LOCALHOST)])
             .into_iter()
-            .filter(|f| std::net::SocketAddr::V4(f.local) == local)
+            .filter(|f| f.local == local)
             .collect();
         assert_eq!(ours.len(), 1);
         let ids = ids_for(

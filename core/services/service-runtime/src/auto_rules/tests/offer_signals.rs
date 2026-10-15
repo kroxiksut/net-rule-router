@@ -110,6 +110,25 @@ fn a_host_that_keeps_failing_on_the_main_link_is_offered_the_other_route() {
     assert_eq!(c.primary_behavior, AUTO_RULE_PRIMARY_BEHAVIOR_STALLS);
 }
 
+/// The user's mode, not the rules snapshot's placeholder: when unmatched
+/// traffic already takes the additional route, moving the host there changes
+/// nothing, so no offer is made.
+#[test]
+fn a_user_whose_default_is_the_additional_route_is_not_offered_the_move() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    set_verdict(&verdicts, "forum.talk.example", PrimaryBehavior::Stalls);
+    f.set_behavior_mode(RouteBehaviorMode::PreferSecondaryWhenAvailable);
+
+    assert!(!f.engine.note_main_link_blocked_host(
+        SID,
+        "forum.talk.example",
+        HostCounts::default(),
+        wall_clock()
+    ));
+    assert!(f.engine.candidates(SID).is_empty());
+}
+
 /// `*.wikidesk` would be a rule for a whole top-level label: a bare name is
 /// offered only as the full name our resolver completed it to.
 #[test]

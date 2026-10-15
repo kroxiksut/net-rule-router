@@ -9,7 +9,8 @@ mod js_harness;
 
 use js_harness::{arg, check, check_cases, load_vectors, Case, JsLib};
 use nrr_client_logic::restore::{
-    mutes_to_restore, record_route_policy, restore_plan, route_policy_divergence, RestorePlan,
+    mutes_to_restore, protection_restore, protection_to_restore, record_route_policy, restore_plan,
+    route_policy_divergence, RestorePlan,
 };
 use serde_json::{json, Map, Value};
 
@@ -173,6 +174,56 @@ fn notice_mutes_to_restore_matches_js() {
         |input| {
             let now = input["now"].as_i64().expect("now");
             Value::from(mutes_to_restore(&input["intent"], &input["service"], now))
+        },
+    );
+}
+
+#[test]
+fn route_policy_protection_to_restore_matches_js() {
+    check(
+        "route_policy_protection_to_restore",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "routePolicyProtectionToRestore({}, {})",
+                arg(input, "intent"),
+                arg(input, "service")
+            )
+        },
+        |input| {
+            Value::from(protection_to_restore(
+                &object(input, "intent"),
+                &object(input, "service"),
+            ))
+        },
+    );
+}
+
+/// The write itself, field for field, on the same vectors.
+#[test]
+fn route_policy_protection_restore_request_matches_js_whole() {
+    let (_, cases) = load_vectors("route_policy_protection_to_restore");
+    let cases: Vec<Case> = cases
+        .into_iter()
+        .map(|case| Case {
+            expected: None,
+            ..case
+        })
+        .collect();
+    check_cases(
+        "route_policy_protection_to_restore",
+        &cases,
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "routePolicyProtectionRestore({}, {})",
+                arg(input, "intent"),
+                arg(input, "service")
+            )
+        },
+        |input| {
+            protection_restore(&object(input, "intent"), &object(input, "service"))
+                .map_or(Value::Null, Value::Object)
         },
     );
 }

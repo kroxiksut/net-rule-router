@@ -62,11 +62,16 @@ pub const LOCAL_NETWORK_KIND_MAIN_LINK: &str = "main-link";
 pub const LOCAL_NETWORK_KIND_VIRTUAL_MACHINE: &str = "virtual-machine";
 pub const LOCAL_NETWORK_KIND_MANUAL: &str = "manual";
 
+/// Why a listed network cannot be opened, whatever the answer: wider than a
+/// local network can be, or holding an address one of the user's rules names.
+pub const LOCAL_NETWORK_REASON_TOO_WIDE: &str = "too-wide";
+pub const LOCAL_NETWORK_REASON_NAMES_RULE: &str = "contains-rule-address";
+
 /// One local network the kill-switch may leave reachable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct LocalNetworkDto {
-    /// Canonical `a.b.c.d/len`.
+    /// Canonical `network/len`, IPv4 or IPv6.
     pub cidr: String,
     /// One of the `LOCAL_NETWORK_KIND_*` slugs.
     pub kind: String,
@@ -81,6 +86,10 @@ pub struct LocalNetworkDto {
     /// automatic answer, so the GUI can offer "back to automatic".
     #[serde(default)]
     pub decided_by_user: bool,
+    /// One of the `LOCAL_NETWORK_REASON_*` slugs when the network stays closed
+    /// whatever is answered; empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

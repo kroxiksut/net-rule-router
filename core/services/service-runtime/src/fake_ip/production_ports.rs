@@ -21,6 +21,8 @@ use nrr_storage::repository::CacheRepository;
 use crate::dns_observation_consumer::rule_covers;
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::per_sid_orchestrator::RulesProvider;
+use crate::service_tasks::ServiceTaskKind;
+use crate::task_liveness::{TaskLiveness, ThreadExit, ThreadLease, Watch};
 
 use super::dialer::RelayNameResolver;
 use super::relay::{RouteSelector, UpstreamAddressResolver};
@@ -148,6 +150,9 @@ impl RelayNameResolver for ConfirmedNameResolver {
 /// touches it, shallow enough that a stalled worker cannot grow without bound.
 const FLOW_NOTICE_QUEUE_DEPTH: usize = 256;
 
+/// One notice held longer than this is a worker stuck behind the ledger lock.
+const FLOW_NOTICE_WORK_DEADLINE: Duration = Duration::from_secs(60);
+
 /// Feeds relayed flows to companion discovery as activity.
 ///
 /// The learner opens a window when it is told a routed site is in use, and its
@@ -175,6 +180,7 @@ impl FlowActivityObserver {
     pub fn new(
         engine: Arc<crate::auto_rules::AutoRulesEngine>,
         active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+        liveness: Option<Arc<TaskLiveness>>,
     ) -> Self {
         let (notices, inbox) =
             std::sync::mpsc::sync_channel::<(String, SystemTime)>(FLOW_NOTICE_QUEUE_DEPTH);
@@ -183,10 +189,21 @@ impl FlowActivityObserver {
         let spawned = std::thread::Builder::new()
             .name("nrr-flow-observer".to_owned())
             .spawn(move || {
+                let lease = liveness.as_ref().map(|l| {
+                    l.lease(
+                        ServiceTaskKind::FakeIpFlowObserver,
+                        None,
+                        Watch::Work(FLOW_NOTICE_WORK_DEADLINE),
+                    )
+                });
                 while let Ok((hostname, at)) = inbox.recv() {
+                    let _notice = lease.as_ref().map(ThreadLease::work);
                     if let Some(sid) = active_sid() {
                         engine.note_flow(&sid, &hostname, at);
                     }
+                }
+                if let Some(lease) = lease {
+                    lease.finish(ThreadExit::Stopped);
                 }
             });
         if let Err(error) = spawned {
@@ -309,7 +326,7 @@ mod tests {
     use nrr_domain::canonical::{
         CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
     };
-    use nrr_domain::{RouteBehaviorMode, RuleId};
+    use nrr_domain::RuleId;
     use std::net::Ipv4Addr;
 
     /// `on_flow_opened` runs while a TCP connection is being established, so it
@@ -340,7 +357,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             Some("S-1-5-21-test".to_owned())
         });
-        let observer = FlowActivityObserver::new(engine, active_sid);
+        let observer = FlowActivityObserver::new(engine, active_sid, None);
 
         let addr: SocketAddr = "127.0.0.1:443".parse().expect("addr");
         let notices = FLOW_NOTICE_QUEUE_DEPTH * 2;
@@ -396,7 +413,6 @@ mod tests {
                     primary: self.primary.clone(),
                     secondary: self.secondary.clone(),
                 },
-                behavior_mode: RouteBehaviorMode::PreferPrimary,
             })
         }
     }

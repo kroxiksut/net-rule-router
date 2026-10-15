@@ -218,8 +218,7 @@ pub fn snapshot_json(f: &Fixture) -> Value {
         "health": {
             "service-state": "running",
             "worst-severity": "ok",
-            "components": [],
-            "degraded-modes": []
+            "components": []
         },
         "adapters": { "data-source": "windows-live", "adapters": [], "rows": rows },
         "diagnostics": serde_json::to_value(DiagnosticsStatusDto::unavailable())
@@ -281,6 +280,8 @@ pub fn app_at(link: crate::link::Link, fixture: Option<&Fixture>) -> crate::stat
             &texts,
             now,
         );
+        // The reads every connect starts are not what these tests look at.
+        app.outbox.take();
         app.apply(BackendEvent::Snapshot(Box::new(f.snapshot())), &texts, now);
     }
     app.apply(BackendEvent::Link(link), &texts, now);
