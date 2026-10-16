@@ -381,9 +381,10 @@ function Test-PanicStrategy {
 }
 
 # Nothing compiles QML, so a syntax error that keeps the main window from
-# loading passes every Rust gate. qmllint tags such an error `[syntax]` yet may
-# still exit 0, so the tag is the verdict; its ordinary warnings (unresolved
-# imports, unqualified access) are not.
+# loading passes every Rust gate. The verdict is a warning with id `syntax` in
+# qmllint's JSON: the text form is untagged before Qt 6.9 and, on a Windows
+# runner without a console, not printed at all. Its ordinary warnings
+# (unresolved imports, unqualified access) are not a verdict.
 function Find-QmlLint {
     $candidates = New-Object System.Collections.Generic.List[string]
     if ($env:CMAKE_PREFIX_PATH) {
@@ -410,19 +411,39 @@ function Find-QmlLint {
     $null
 }
 
-# Runs qmllint from $Dir; stdout and stderr come back as plain lines.
+# Runs qmllint from $Dir with its JSON report on stdout. Syntax holds one
+# "file:line:column: message" per syntax error; Lines is everything printed.
 function Invoke-QmlLint([string]$Tool, [string]$Dir, [string[]]$Files) {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    $consoleEncoding = [Console]::OutputEncoding
     Push-Location -LiteralPath $Dir
     try {
-        $lines = @(& $Tool @Files 2>&1 | ForEach-Object { "$_" })
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $lines = @(& $Tool --json - @Files 2>&1 | ForEach-Object { "$_" })
         $code = $LASTEXITCODE
     } finally {
         Pop-Location
+        [Console]::OutputEncoding = $consoleEncoding
         $ErrorActionPreference = $previous
     }
-    [pscustomobject]@{ Code = $code; Lines = $lines }
+    $report = $null
+    foreach ($line in $lines) {
+        if ($line.StartsWith('{"files"', [StringComparison]::Ordinal)) {
+            try { $report = $line | ConvertFrom-Json } catch { $report = $null }
+        }
+    }
+    $syntax = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $report) {
+        foreach ($file in @($report.files)) {
+            foreach ($warning in @($file.warnings)) {
+                if ($warning.id -eq 'syntax') {
+                    $syntax.Add("$($file.filename):$($warning.line):$($warning.column): $($warning.message)")
+                }
+            }
+        }
+    }
+    [pscustomobject]@{ Code = $code; Lines = $lines; Report = $report; Syntax = $syntax.ToArray() }
 }
 
 function Test-QmlLint {
@@ -435,12 +456,12 @@ function Test-QmlLint {
     }
 
     # The gate first proves it still sees a syntax error: a qmllint that stops
-    # tagging them would otherwise pass every file silently.
+    # reporting them would otherwise pass every file silently.
     $fixture = Join-Path $PSScriptRoot 'tests\qmllint'
     $probe = Invoke-QmlLint $tool $fixture @('broken.qml')
-    if (@($probe.Lines | Where-Object { $_.Contains('[syntax]') }).Count -eq 0) {
+    if ($probe.Syntax.Count -eq 0) {
         $probe.Lines | Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
-        throw "qmllint self-test failed: '$tool' reports no [syntax] line for $fixture\broken.qml."
+        throw "qmllint self-test failed: '$tool' reports no syntax error for $fixture\broken.qml."
     }
 
     # Every QML file git would publish, wherever it lives; the fixture is not one.
@@ -462,7 +483,11 @@ function Test-QmlLint {
 
     Write-Host "[check] qmllint: $tool over $($files.Count) file(s)" -ForegroundColor Cyan
     $run = Invoke-QmlLint $tool $repoRoot $files
-    $syntax = @($run.Lines | Where-Object { $_.Contains('[syntax]') })
+    if ($null -eq $run.Report) {
+        $run.Lines | Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+        throw "qmllint printed no JSON report (exit code $($run.Code))."
+    }
+    $syntax = $run.Syntax
     if ($syntax.Count -gt 0) {
         $syntax | Select-Object -First 20 | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
         if ($syntax.Count -gt 20) {

@@ -59,7 +59,9 @@ fn a_host_whose_accepted_rule_the_user_deleted_is_offered_again() {
     assert_eq!(f.engine.tick(SID, later()).parked, 0);
     // …but it is a race guard, not a verdict: once it lapses, the rule book is
     // the only authority, and it no longer covers the host.
-    f.engine.expire_authored_suppression();
+    if !f.engine.expire_authored_suppression() {
+        return;
+    }
     two_visits(&f.engine, &["cdn.example"]);
     assert_eq!(f.engine.tick(SID, later()).parked, 1);
 }

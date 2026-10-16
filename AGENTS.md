@@ -39,7 +39,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\purge-data.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
 ```
 
-The gate wraps the standard `cargo fmt --check` / `cargo clippy -D warnings` / `cargo test` / `cargo deny check` invocations, and runs `qmllint` over every `.qml`, failing on any `[syntax]` line (qmllint reports those as warnings with exit code 0). Without Qt the QML step is skipped with a warning; CI passes `-RequireQmlLint` / `--require-qmllint`, which turns that into a failure. It also fails when the workspace profiles, `.cargo/config*` or the environment set `panic = "abort"`: containing a panic on hostile input needs unwinding, and the service binaries refuse to compile without it. Run a single test: `cargo test -p <crate-name> <test_name>`.
+The gate wraps the standard `cargo fmt --check` / `cargo clippy -D warnings` / `cargo test` / `cargo deny check` invocations, and runs `qmllint` over every `.qml`, failing on any warning with id `syntax` in its JSON report (qmllint may still exit 0, and before Qt 6.9 its text output does not tag them). Without Qt the QML step is skipped with a warning; CI passes `-RequireQmlLint` / `--require-qmllint`, which turns that into a failure. It also fails when the workspace profiles, `.cargo/config*` or the environment set `panic = "abort"`: containing a panic on hostile input needs unwinding, and the service binaries refuse to compile without it. Run a single test: `cargo test -p <crate-name> <test_name>`.
 
 A `.ps1` holding any non-ASCII character is saved as UTF-8 with BOM: Windows PowerShell 5.1 reads a BOM-less file as ANSI, and nothing in the gate catches it.
 

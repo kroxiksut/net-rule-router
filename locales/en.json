@@ -4021,6 +4021,7 @@
       "storage-kill-switch-protocols-reset": "A stored leak protection protocol selection blocked nothing; every protocol is blocked instead.",
       "persid-plan-network-carving-over-cap": "{count} network rule(s) hold more narrower rules than can be carved out, so each applies to its whole network and the narrower rules inside it do not take effect ({rules}).",
       "linux-flow-reset-dump-capped": "The connection table holds more {family} sockets than one listing reads ({cap}); connections past that are not reset.",
+      "svc-scm-stop-unasked": "Stopped by something other than NetRuleRouter's own commands; the service will be started again. To keep it stopped, use \"nrr-cli stop\".",
       "svc-scm-stop-with-filtering-engine": "Stopping because the Windows Base Filtering Engine is going down; the service will be started again once the engine is back."
     },
     "outage-blocks": {

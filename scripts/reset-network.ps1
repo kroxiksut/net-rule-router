@@ -14,12 +14,11 @@
 #   1. the repo build (`target\{debug,release}\nrr-service.exe`),
 #   2. the INSTALLED service's binary, read from its registry `ImagePath` —
 #      the case that matters on a user's machine, where no repo exists,
-#   3. emergency mode, plain PowerShell only: drop our NRPT rule and our
-#      routes by the same signatures `cleanup` uses,
-#   4. restart the Base Filtering Engine, which drops every WFP filter of ours
-#      without a reboot — we never set `FWPM_FILTER_FLAG_PERSISTENT`, so our
-#      filters do not survive BFE. Emergency mode only: it is the one way to
-#      lift a lockout with no binary to talk to the engine,
+#   3. emergency mode, plain PowerShell only: drop our NRPT rule, our routes
+#      and our WFP filters by the same signatures `cleanup` uses,
+#   4. restart the Base Filtering Engine when our filters could not be deleted
+#      one by one — our filters do not survive it, but neither does anyone
+#      else's, and Windows 11 refuses it,
 #   5. reboot — never without an explicit yes, and the default answer is no.
 #
 # Self-elevates via UAC (WFP, NRPT and the route table all need Administrator).
@@ -99,6 +98,7 @@ if (-not $isAdmin) {
 }
 
 Write-Host "==> sc stop $NrrServiceName (best-effort)" -ForegroundColor Cyan
+Set-NrrDeliberateStop
 $null = Invoke-NativeCommand -FilePath (Get-SystemTool 'sc.exe') -ArgumentList @('stop', $NrrServiceName) -Quiet
 Start-Sleep -Seconds 2
 
@@ -132,6 +132,7 @@ else {
 }
 
 # ── Step 3-4: emergency mode ─────────────────────────────────────────────────
+$filtersGone = $false
 if (-not $cleanupOk) {
     Write-Host "==> emergency mode: PowerShell only" -ForegroundColor Yellow
 
@@ -153,13 +154,16 @@ if (-not $cleanupOk) {
         Write-Warning "Route sweep failed: $($_.Exception.Message)"
     }
 
-    # Our WFP filters need the engine, and without a binary the only lever left
-    # is the engine's own lifetime: we never set FWPM_FILTER_FLAG_PERSISTENT, so
-    # nothing of ours survives a BFE restart. Everyone else's filters go too for
-    # those seconds — acceptable here, this path only runs on a machine that is
-    # already locked out. `net stop bfe /y` takes the dependent services with
-    # it and starting BFE does NOT bring them back, so they are restarted by
-    # hand.
+    $filtersGone = Remove-NrrWfpFilters
+}
+
+# Only when our filters could not be deleted one by one: we never set
+# FWPM_FILTER_FLAG_PERSISTENT, so nothing of ours survives a BFE restart.
+# Everyone else's filters go too for those seconds, and Windows 11 refuses it
+# outright (the firewall service is protected). `net stop bfe /y` takes the
+# dependent services with it and starting BFE does NOT bring them back, so
+# they are restarted by hand.
+if (-not $cleanupOk -and -not $filtersGone) {
     Write-Host "--> restarting the Base Filtering Engine (drops our WFP filters)" -ForegroundColor Cyan
     Write-Warning "Filtering is off for a few seconds, including the Windows firewall."
     $dependents = @()

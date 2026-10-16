@@ -1182,6 +1182,30 @@ mod tests {
     use super::*;
     use crate::types::{WfpAction, WfpLayerKey};
 
+    /// The emergency reset deletes filters by this prefix and sub-layer with no
+    /// binary to ask; a drift would leave every filter of ours in place.
+    #[test]
+    fn the_emergency_script_recognises_our_filters_by_the_same_keys() {
+        let lib = include_str!("../../../../../scripts/lib/service-paths.ps1");
+        let prefix = format!(
+            "'{NRR_FILTER_KEY_DATA1:08x}-{NRR_FILTER_KEY_DATA2:04x}-{NRR_FILTER_KEY_DATA3:04x}-'"
+        );
+        let g = NRR_SUBLAYER_GUID;
+        let d = g.data4;
+        let sublayer = format!(
+            "'{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}'",
+            g.data1, g.data2, g.data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+        );
+        assert!(
+            lib.contains(&prefix),
+            "service-paths.ps1 must carry {prefix}"
+        );
+        assert!(
+            lib.contains(&sublayer),
+            "service-paths.ps1 must carry {sublayer}"
+        );
+    }
+
     #[test]
     fn id_to_guid_is_deterministic() {
         let a = filter_id_to_guid(WfpFilterId {

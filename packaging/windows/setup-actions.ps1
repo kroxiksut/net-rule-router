@@ -5,6 +5,8 @@
 # network or remove data.
 #
 #   Stop        before files are replaced: stop the service so its binary is free
+#   MarkStop    before the MSI's own stop: mark it as wanted, or the service
+#               restarts itself mid-removal
 #   Register    files in place: register the service from this folder and start it
 #   Unregister  removal: stop and unregister the service, restore the network,
 #               and remove the service copy a portable install left under
@@ -24,7 +26,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Stop', 'Register', 'Unregister', 'RemoveUserData', 'Rollback')]
+    [ValidateSet('Stop', 'MarkStop', 'Register', 'Unregister', 'RemoveUserData', 'Rollback')]
     [string] $Action,
 
     [Parameter()]
@@ -63,6 +65,7 @@ function Test-NrrServiceStopped {
 function Stop-NrrService {
     if (Test-NrrServiceStopped) { return $true }
     Write-Host "==> stopping $NrrServiceName"
+    Set-NrrDeliberateStop
     $null = Invoke-NativeCommand -FilePath (Get-SystemTool 'sc.exe') -ArgumentList @('stop', $NrrServiceName)
     # Teardown restores DNS and unwinds filters; give it more than SCM's usual wait.
     if (Wait-ServiceStatus -Name $NrrServiceName -Status Stopped -Seconds 60) { return $true }
@@ -167,6 +170,9 @@ switch ($Action) {
             Write-Host "    $NrrServiceName did not stop"
             $exitCode = 1
         }
+    }
+    'MarkStop' {
+        Set-NrrDeliberateStop
     }
     'Register' {
         if (-not (Test-Path -LiteralPath $console)) {

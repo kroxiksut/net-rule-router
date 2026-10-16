@@ -88,6 +88,7 @@ try {
     sc.exe query $NrrServiceName
 
     Write-Host "==> sc stop $NrrServiceName" -ForegroundColor Cyan
+    Set-NrrDeliberateStop
     sc.exe stop $NrrServiceName
     Start-Sleep -Seconds 2
 

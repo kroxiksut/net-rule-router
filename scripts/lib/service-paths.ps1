@@ -93,6 +93,18 @@ function Test-ServiceDeletePending {
     catch { return $false }
 }
 
+# Marks the next stop as wanted: the service restarts itself after any stop
+# without this file (DELIBERATE_STOP_MARKER in platform/windows
+# service_control.rs). Written only into an existing data root, never creating
+# one an ordinary user could then write to.
+function Set-NrrDeliberateStop {
+    if (-not $env:ProgramData) { return }
+    $root = Join-Path $env:ProgramData $NrrProductName
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return }
+    try { [System.IO.File]::WriteAllBytes((Join-Path $root 'deliberate-stop'), [byte[]]@()) }
+    catch { Write-Host "    could not mark the stop as wanted: $($_.Exception.Message)" }
+}
+
 # $true once the service reaches $Status, $false on timeout or when it is gone.
 function Wait-ServiceStatus {
     param([string] $Name, [string] $Status, [int] $Seconds = 30)
@@ -258,4 +270,96 @@ function Remove-NrrDnsRedirect {
     }
     Clear-DnsClientCache -ErrorAction SilentlyContinue
     return $ok
+}
+
+# Every WFP filter the service adds carries this key prefix and sits in this
+# sub-layer (NRR_FILTER_KEY_DATA1..3 in wfp_filter.rs, WFP_SUBLAYER_GUID in
+# platform-api types.rs); a test holds both to the code.
+$NrrWfpFilterKeyPrefix = '4e525246-0001-4e52-'
+$NrrWfpSubLayer = 'c1d2e3f4-5a6b-7c8d-9e0f-1a2b3c4d5e6f'
+
+$NrrWfpSweepSource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class NrrWfpSweep {
+    [DllImport("fwpuclnt.dll")] static extern uint FwpmEngineOpen0([MarshalAs(UnmanagedType.LPWStr)] string server, uint authn, IntPtr identity, IntPtr session, out IntPtr engine);
+    [DllImport("fwpuclnt.dll")] static extern uint FwpmEngineClose0(IntPtr engine);
+    [DllImport("fwpuclnt.dll")] static extern uint FwpmFilterCreateEnumHandle0(IntPtr engine, IntPtr template, out IntPtr enumHandle);
+    [DllImport("fwpuclnt.dll")] static extern uint FwpmFilterEnum0(IntPtr engine, IntPtr enumHandle, uint requested, out IntPtr entries, out uint returned);
+    [DllImport("fwpuclnt.dll")] static extern uint FwpmFilterDestroyEnumHandle0(IntPtr engine, IntPtr enumHandle);
+    [DllImport("fwpuclnt.dll")] static extern void FwpmFreeMemory0(ref IntPtr memory);
+    [DllImport("fwpuclnt.dll")] static extern uint FwpmFilterDeleteByKey0(IntPtr engine, ref Guid key);
+    const uint RpcAuthnWinNt = 10;
+    const uint FilterNotFound = 0x80320003;
+
+    // { ours found, removed, first error (0 = none) }.
+    public static uint[] Remove(string keyPrefix, Guid subLayer) {
+        IntPtr engine;
+        uint code = FwpmEngineOpen0(null, RpcAuthnWinNt, IntPtr.Zero, IntPtr.Zero, out engine);
+        if (code != 0) return new uint[] { 0, 0, code };
+        try {
+            IntPtr enumHandle;
+            code = FwpmFilterCreateEnumHandle0(engine, IntPtr.Zero, out enumHandle);
+            if (code != 0) return new uint[] { 0, 0, code };
+            var ours = new List<Guid>();
+            uint firstError = 0;
+            // FWPM_FILTER0: filterKey first; subLayerKey after displayData,
+            // flags, providerKey, providerData and layerKey.
+            int subLayerOffset = IntPtr.Size == 8 ? 80 : 56;
+            try {
+                for (int page = 0; page < 4096; page++) {
+                    IntPtr entries;
+                    uint returned;
+                    code = FwpmFilterEnum0(engine, enumHandle, 256, out entries, out returned);
+                    if (code != 0) { firstError = code; break; }
+                    if (entries == IntPtr.Zero) break;
+                    try {
+                        for (int i = 0; i < returned; i++) {
+                            IntPtr row = Marshal.ReadIntPtr(entries, i * IntPtr.Size);
+                            if (row == IntPtr.Zero) continue;
+                            Guid key = (Guid)Marshal.PtrToStructure(row, typeof(Guid));
+                            if (!key.ToString().StartsWith(keyPrefix, StringComparison.OrdinalIgnoreCase)) continue;
+                            Guid layer = (Guid)Marshal.PtrToStructure(new IntPtr(row.ToInt64() + subLayerOffset), typeof(Guid));
+                            if (layer == subLayer) ours.Add(key);
+                        }
+                    }
+                    finally { FwpmFreeMemory0(ref entries); }
+                    if (returned == 0) break;
+                }
+            }
+            finally { FwpmFilterDestroyEnumHandle0(engine, enumHandle); }
+            uint removed = 0;
+            foreach (Guid found in ours) {
+                Guid key = found;
+                uint deleted = FwpmFilterDeleteByKey0(engine, ref key);
+                if (deleted == 0 || deleted == FilterNotFound) removed++;
+                else if (firstError == 0) firstError = deleted;
+            }
+            return new uint[] { (uint)ours.Count, removed, firstError };
+        }
+        finally { FwpmEngineClose0(engine); }
+    }
+}
+'@
+
+# Remove our WFP filters without the binary, leaving everyone else's in place.
+# $true when none of ours is left; $false when the engine could not be asked
+# or a delete failed, and the caller falls back to restarting BFE.
+function Remove-NrrWfpFilters {
+    Write-Host "--> removing our WFP filters"
+    try {
+        if (-not ('NrrWfpSweep' -as [type])) { Add-Type -TypeDefinition $NrrWfpSweepSource -ErrorAction Stop }
+        $result = [NrrWfpSweep]::Remove($NrrWfpFilterKeyPrefix, [Guid]$NrrWfpSubLayer)
+    }
+    catch {
+        Write-Warning "WFP filter sweep could not run: $($_.Exception.Message)"
+        return $false
+    }
+    Write-Host "    WFP filters of ours: $($result[0]), removed: $($result[1])"
+    if ($result[2] -ne 0) {
+        Write-Warning ("WFP filter sweep failed: Win32 error 0x{0:X8}" -f $result[2])
+        return $false
+    }
+    return ($result[1] -eq $result[0])
 }

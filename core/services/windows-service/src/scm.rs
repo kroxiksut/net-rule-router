@@ -164,9 +164,9 @@ fn capture_stderr() {
     }
 }
 
-/// The service-specific exit code of a stop that followed the filtering engine
-/// down. Non-zero, so SCM's recovery actions run.
-const STOPPED_WITH_FILTERING_ENGINE: u32 = 2;
+/// The service-specific exit code of a stop none of our own verbs asked for.
+/// Non-zero, so SCM's recovery actions start the service again.
+const STOPPED_UNASKED: u32 = 2;
 
 /// Controls advertised while Running. Each entry is load-bearing, and an
 /// omission is silent: SCM simply never delivers that control. `SESSION_CHANGE`
@@ -185,11 +185,12 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
     let _ = nrr_platform_windows::service_control::take_deliberate_stop_marker();
     let stop = StopToken::new();
     let stop_for_handler = stop.clone();
-    // A stop that comes because the filtering engine is going down is no
-    // user's stop: ending with an error code lets SCM's recovery start us again
-    // once it is back, instead of leaving the machine unprotected until a reboot.
-    let engine_went_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let engine_went_down_for_handler = std::sync::Arc::clone(&engine_went_down);
+    // Only our own verbs mark a stop as wanted. Any other one — `net stop bfe /y`
+    // takes us down first while the engine keeps running — ends with an error
+    // code, so SCM's recovery starts us again instead of leaving the machine
+    // unprotected until a reboot.
+    let unasked_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let unasked_stop_for_handler = std::sync::Arc::clone(&unasked_stop);
 
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
@@ -197,20 +198,23 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
             // is indistinguishable from a process that died on its own.
             ServiceControl::Stop => {
                 tracing::info!(target: "nrr::lifecycle", msg_key = "svc-scm-control-received", control = "stop", "SCM control received");
-                // Our own verbs stop us on purpose, the filtering engine down
-                // being the very reason a network reset is run.
-                let deliberate =
-                    nrr_platform_windows::service_control::take_deliberate_stop_marker();
-                if !deliberate
-                    && nrr_platform_windows::service_control::filtering_engine_running()
+                if !nrr_platform_windows::service_control::take_deliberate_stop_marker() {
+                    unasked_stop_for_handler.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if nrr_platform_windows::service_control::filtering_engine_running()
                         == Some(false)
-                {
-                    engine_went_down_for_handler.store(true, std::sync::atomic::Ordering::SeqCst);
-                    tracing::warn!(
-                        target: "nrr::lifecycle",
-                        msg_key = "svc-scm-stop-with-filtering-engine",
-                        "stopping because the Windows Base Filtering Engine is going down; the service reports a failure so it is started again once the engine is back",
-                    );
+                    {
+                        tracing::warn!(
+                            target: "nrr::lifecycle",
+                            msg_key = "svc-scm-stop-with-filtering-engine",
+                            "stopping because the Windows Base Filtering Engine is going down; the service reports a failure so it is started again once the engine is back",
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "nrr::lifecycle",
+                            msg_key = "svc-scm-stop-unasked",
+                            "stopped by something other than NetRuleRouter's own commands; the service reports a failure so it is started again — `nrr-cli stop` keeps it stopped",
+                        );
+                    }
                 }
                 stop_for_handler.request_stop();
                 ServiceControlHandlerResult::NoError
@@ -280,8 +284,8 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
         /// or came up unable to enforce. SCM state alone cannot say the last one:
         /// `RecoveryRequired` reports as `Running`.
         journal: LifecycleJournal,
-        /// Set when the stop followed the filtering engine down.
-        engine_went_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Set when the stop came without our own verb's marker.
+        unasked_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
     impl ServiceController for ScmController {
         fn report(&self, state: ServiceRuntimeState) {
@@ -317,11 +321,9 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
                 current_state: scm_state,
                 controls_accepted,
                 exit_code: if scm_state == ServiceState::Stopped
-                    && self
-                        .engine_went_down
-                        .load(std::sync::atomic::Ordering::SeqCst)
+                    && self.unasked_stop.load(std::sync::atomic::Ordering::SeqCst)
                 {
-                    ServiceExitCode::ServiceSpecific(STOPPED_WITH_FILTERING_ENGINE)
+                    ServiceExitCode::ServiceSpecific(STOPPED_UNASKED)
                 } else {
                     ServiceExitCode::Win32(0)
                 },
@@ -342,7 +344,7 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
         handle: status_handle,
         checkpoint: std::sync::atomic::AtomicU32::new(0),
         journal: LifecycleJournal::new(std::sync::Arc::new(WindowsEventLog::new())),
-        engine_went_down,
+        unasked_stop,
     };
     // Production bootstrap profile (`%ProgramData%`-rooted service-owned
     // topology). The topology resolver itself is profile-agnostic.

@@ -11,8 +11,8 @@
 //! Pure and deterministic. The census counts are injected by the caller:
 //! service-runtime derives `rule_on_ip` / `total_rule` from the secondary rules
 //! × FQDN cache, and `direct_on_ip` from the observed shared-IP census. A
-//! separating solution (per-hostname routing on a shared IP) needs SNI/L7
-//! inspection and is not supported.
+//! separating solution (per-hostname routing on a shared IP) is fake-IP's job
+//! where it runs; without it, this trade-off is all there is.
 
 use std::fmt;
 

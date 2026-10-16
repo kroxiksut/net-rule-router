@@ -87,14 +87,14 @@ pub fn filtering_engine_running() -> Option<bool> {
     Some(status.current_state == ServiceState::Running)
 }
 
-/// The file a deliberate stop leaves in the service data root, so the service
-/// can tell it from a stop the filtering engine forced. Writable by
-/// administrators only: anyone else could switch off the restart that follows
-/// the engine coming back.
+/// The file a deliberate stop leaves in the service data root; a stop without
+/// it is restarted by SCM. Writable by administrators only: anyone else could
+/// switch that restart off. `scripts/lib/service-paths.ps1` writes the same
+/// file for the scripts and the installer.
 const DELIBERATE_STOP_MARKER: &str = "deliberate-stop";
 
 /// How long a marker speaks for a stop. A stop that never arrived must not
-/// silence a later one the engine forces.
+/// silence a later unasked one.
 const DELIBERATE_STOP_FRESHNESS: Duration = Duration::from_secs(120);
 
 fn deliberate_stop_marker() -> Option<PathBuf> {
@@ -103,7 +103,7 @@ fn deliberate_stop_marker() -> Option<PathBuf> {
         .map(|root| root.join(DELIBERATE_STOP_MARKER))
 }
 
-/// Say that the next stop is a person's, not the filtering engine's.
+/// Say that the next stop is wanted and must not be undone by a restart.
 fn mark_deliberate_stop() {
     if let Some(path) = deliberate_stop_marker() {
         let _ = std::fs::write(path, b"");
@@ -148,7 +148,7 @@ pub fn hold_recovery() -> Result<RecoveryHold, ServiceControlError> {
     let actions = service
         .get_failure_actions()
         .map_err(|e| ServiceControlError::Mechanism {
-            detail: format!("read failure actions: {e}"),
+            detail: format!("read failure actions: {}", winapi_detail(&e)),
         })?;
     let non_crash = service
         .get_failure_actions_on_non_crash_failures()
@@ -161,7 +161,7 @@ pub fn hold_recovery() -> Result<RecoveryHold, ServiceControlError> {
             actions: Some(Vec::new()),
         })
         .map_err(|e| ServiceControlError::Mechanism {
-            detail: format!("suspend failure actions: {e}"),
+            detail: format!("suspend failure actions: {}", winapi_detail(&e)),
         })?;
     let _ = service.set_failure_actions_on_non_crash_failures(false);
     Ok(RecoveryHold {
@@ -180,18 +180,25 @@ impl RecoveryHold {
             return Ok(());
         };
         let manager = open_manager(ServiceManagerAccess::CONNECT)?;
+        // Restart actions are refused on a handle without START access.
         let service = manager
-            .open_service(WINDOWS_SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+            .open_service(
+                WINDOWS_SERVICE_NAME,
+                ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
+            )
             .map_err(map_service_error)?;
         service
             .update_failure_actions(actions)
             .map_err(|e| ServiceControlError::Mechanism {
-                detail: format!("restore failure actions: {e}"),
+                detail: format!("restore failure actions: {}", winapi_detail(&e)),
             })?;
         service
             .set_failure_actions_on_non_crash_failures(non_crash)
             .map_err(|e| ServiceControlError::Mechanism {
-                detail: format!("restore failure actions on non-crash failures: {e}"),
+                detail: format!(
+                    "restore failure actions on non-crash failures: {}",
+                    winapi_detail(&e)
+                ),
             })
     }
 }
@@ -782,7 +789,7 @@ fn refresh_registration(
     let recovery_configured = manager
         .open_service(
             WINDOWS_SERVICE_NAME,
-            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG | ServiceAccess::START,
         )
         .is_ok_and(|service| {
             let _ = service.set_description(WINDOWS_SERVICE_DESCRIPTION);
@@ -851,7 +858,16 @@ fn map_service_error(err: windows_service::Error) -> ServiceControlError {
         }
     }
     ServiceControlError::Mechanism {
-        detail: err.to_string(),
+        detail: winapi_detail(&err),
+    }
+}
+
+/// The crate's own text for a Win32 failure is only "IO error in winapi call";
+/// the OS error behind it is what tells a report apart.
+fn winapi_detail(err: &windows_service::Error) -> String {
+    match err {
+        windows_service::Error::Winapi(io_err) => format!("{err}: {io_err}"),
+        _ => err.to_string(),
     }
 }
 
@@ -899,14 +915,17 @@ fn configure_recovery(
             actions: Some(actions),
         })
         .map_err(|e| ServiceControlError::Mechanism {
-            detail: format!("set failure actions: {e}"),
+            detail: format!("set failure actions: {}", winapi_detail(&e)),
         })?;
     // A stop that reports an error — the service going down with the filtering
     // engine — gets the same recovery as a crash.
     service
         .set_failure_actions_on_non_crash_failures(true)
         .map_err(|e| ServiceControlError::Mechanism {
-            detail: format!("set failure actions on non-crash failures: {e}"),
+            detail: format!(
+                "set failure actions on non-crash failures: {}",
+                winapi_detail(&e)
+            ),
         })
 }
 
@@ -1122,6 +1141,15 @@ fn sweep_enforcement_state() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scripts_write_the_same_deliberate_stop_marker() {
+        let lib = include_str!("../../../../scripts/lib/service-paths.ps1");
+        assert!(
+            lib.contains(&format!("'{DELIBERATE_STOP_MARKER}'")),
+            "service-paths.ps1 must name the marker file {DELIBERATE_STOP_MARKER}"
+        );
+    }
 
     #[test]
     fn a_start_slower_than_the_budget_is_waited_for_while_the_service_promised_it() {

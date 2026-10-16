@@ -50,10 +50,15 @@ impl AutoRulesEngine {
     }
 
     /// Ages every authored-suppression entry past its window. A test cannot wait
-    /// out [`AUTHORED_SUPPRESSION`].
+    /// out [`AUTHORED_SUPPRESSION`]. `false` on a machine up for less than the
+    /// window: `Instant` cannot predate boot, so no such moment exists.
     #[cfg(test)]
-    pub(super) fn expire_authored_suppression(&self) {
-        let stale = Instant::now() - AUTHORED_SUPPRESSION - Duration::from_secs(1);
+    #[must_use]
+    pub(super) fn expire_authored_suppression(&self) -> bool {
+        let Some(stale) = Instant::now().checked_sub(AUTHORED_SUPPRESSION + Duration::from_secs(1))
+        else {
+            return false;
+        };
         for entry in self
             .authored
             .lock()
@@ -64,6 +69,7 @@ impl AutoRulesEngine {
                 *at = stale;
             }
         }
+        true
     }
 
     /// Drops every trace of a principal that turned collection off.

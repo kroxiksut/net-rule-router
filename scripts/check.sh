@@ -95,9 +95,9 @@ check_comment_hygiene() {
 }
 
 # Nothing compiles QML, so a syntax error that keeps the main window from
-# loading passes every Rust gate. qmllint tags such an error `[syntax]` yet may
-# still exit 0, so the tag is the verdict; its ordinary warnings (unresolved
-# imports, unqualified access) are not.
+# loading passes every Rust gate. The verdict is a warning with id `syntax` in
+# qmllint's JSON: the text form is untagged before Qt 6.9. Its ordinary
+# warnings (unresolved imports, unqualified access) are not a verdict.
 qmllint_fixture="$script_dir/tests/qmllint"
 
 find_qmllint() {
@@ -126,16 +126,32 @@ find_qmllint() {
 }
 
 # Runs qmllint $2 from directory $1 over the remaining arguments; leaves its
-# combined output in qmllint_out and its exit code in qmllint_status.
+# combined output in qmllint_out, its exit code in qmllint_status, the number
+# of syntax errors in qmllint_syntax_count (empty without a JSON report) and
+# one "file:line:column: message" per error in qmllint_syntax.
 run_qmllint() {
-  local dir="$1" tool="$2"
+  local dir="$1" tool="$2" report
   shift 2
   qmllint_status=0
-  qmllint_out="$(cd "$dir" && "$tool" "$@" 2>&1)" || qmllint_status=$?
+  qmllint_out="$(cd "$dir" && "$tool" --json - "$@" 2>&1)" || qmllint_status=$?
+  qmllint_syntax_count=""
+  qmllint_syntax=""
+  report="$(grep -F '{"files"' <<<"$qmllint_out" | tail -n 1 || true)"
+  [ -n "$report" ] || return 0
+  qmllint_syntax_count="$( (grep -oF '"id":"syntax"' <<<"$report" || true) | wc -l | tr -d ' ')"
+  # QJsonObject sorts keys, so a warning reads column, id, length, line,
+  # message; the count above stays the verdict if a Qt adds a key in between.
+  qmllint_syntax="$(awk '{ gsub(/\{"filename":/, "\n&"); print }' <<<"$report" |
+    while IFS= read -r chunk; do
+      name="$(grep -oE '^\{"filename":"([^"\\]|\\.)*"' <<<"$chunk" | sed 's/^{"filename":"//; s/"$//' || true)"
+      grep -oE '"column":[0-9]+,"id":"syntax","length":[0-9]+,"line":[0-9]+,"message":"([^"\\]|\\.)*"' <<<"$chunk" |
+        sed -E 's/^"column":([0-9]+),"id":"syntax","length":[0-9]+,"line":([0-9]+),"message":"(.*)"$/\2:\1: \3/' |
+        while IFS= read -r where; do printf '%s:%s\n' "$name" "$where"; done
+    done || true)"
 }
 
 check_qmllint() {
-  local tool o total syntax path
+  local tool o total path
   if ! tool="$(find_qmllint)"; then
     local message='qmllint not found (CMAKE_PREFIX_PATH, ~/Qt/<version>/gcc_*/bin, /usr/lib/qt6/bin, PATH): QML is NOT checked by this run.'
     if [ "$require_qmllint" -eq 1 ]; then
@@ -147,13 +163,13 @@ check_qmllint() {
   fi
 
   # The gate first proves it still sees a syntax error: a qmllint that stops
-  # tagging them would otherwise pass every file silently.
+  # reporting them would otherwise pass every file silently.
   run_qmllint "$qmllint_fixture" "$tool" broken.qml
-  if ! grep -qF '[syntax]' <<<"$qmllint_out"; then
+  if [ "${qmllint_syntax_count:-0}" -eq 0 ]; then
     while IFS= read -r o; do
       yellow "  $o"
     done < <(printf '%s\n' "$qmllint_out" | tail -n 20)
-    echo "qmllint self-test failed: '$tool' reports no [syntax] line for $qmllint_fixture/broken.qml." >&2
+    echo "qmllint self-test failed: '$tool' reports no syntax error for $qmllint_fixture/broken.qml." >&2
     return 1
   fi
 
@@ -176,12 +192,18 @@ check_qmllint() {
 
   cyan "[check] qmllint: $tool over ${#files[@]} file(s)"
   run_qmllint "$repo_root" "$tool" "${files[@]}"
-  syntax="$(grep -F '[syntax]' <<<"$qmllint_out" || true)"
-  if [ -n "$syntax" ]; then
-    total="$(printf '%s\n' "$syntax" | wc -l)"
+  if [ -z "$qmllint_syntax_count" ]; then
     while IFS= read -r o; do
       yellow "  $o"
-    done < <(printf '%s\n' "$syntax" | head -n 20)
+    done < <(printf '%s\n' "$qmllint_out" | tail -n 20)
+    echo "qmllint printed no JSON report (exit code $qmllint_status)." >&2
+    return 1
+  fi
+  total="$qmllint_syntax_count"
+  if [ "$total" -gt 0 ]; then
+    while IFS= read -r o; do
+      yellow "  $o"
+    done < <(printf '%s\n' "$qmllint_syntax" | head -n 20)
     if [ "$total" -gt 20 ]; then
       yellow "  ... and $((total - 20)) more"
     fi

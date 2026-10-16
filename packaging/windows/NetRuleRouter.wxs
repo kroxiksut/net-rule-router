@@ -86,6 +86,12 @@
                  Condition="REMOVEALLDATA=&quot;1&quot; AND REMOVEAUDIT=&quot;1&quot;"
                  Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action Unregister -RemoveData -RemoveAudit" />
 
+    <!-- The MSI's own stop (ServiceControl below) must read as wanted, or the
+         service restarts itself mid-removal. Runs from the installed copy. -->
+    <SetProperty Id="NrrMarkStop" Sequence="execute" Before="NrrMarkStop"
+                 Condition="Installed"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action MarkStop" />
+
     <!-- The installing user's own data, as that user: the elevated half runs as
          SYSTEM, whose profile never held any. -->
     <SetProperty Id="NrrRemoveUserData" Sequence="execute" Before="NrrRemoveUserData"
@@ -100,10 +106,14 @@
     <CustomAction Id="NrrUnregister" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
 
+    <CustomAction Id="NrrMarkStop" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+
     <CustomAction Id="NrrRemoveUserData" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   DllEntry="WixQuietExec" Execute="deferred" Impersonate="yes" Return="ignore" />
 
     <InstallExecuteSequence>
+      <Custom Action="NrrMarkStop" Before="StopServices" Condition="Installed" />
       <Custom Action="NrrRegisterRollback" Before="NrrRegister"
               Condition="NOT (REMOVE~=&quot;ALL&quot;)" />
       <Custom Action="NrrRegister" After="InstallFiles"

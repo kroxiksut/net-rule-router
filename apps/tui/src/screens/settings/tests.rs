@@ -382,3 +382,30 @@ fn a_local_network_is_answered_by_its_row() {
     );
     assert_eq!(said(&app), texts_en().get(text::SAVED));
 }
+
+#[test]
+fn the_service_section_offers_network_recovery_in_both_states() {
+    use nrr_platform_api::service_control::{ServiceRunState, ServiceStatusReport};
+    let lines = |run_state| {
+        let mut app = on_settings();
+        app.settings.data.service = Loadable::Ready(ServiceInfo::Registered(ServiceStatusReport {
+            run_state,
+            start_mode: None,
+            binary_path: None,
+            running_since: None,
+        }));
+        items::items(&app, Category::Service)
+            .iter()
+            .map(|item| item.label.resolve(&texts_en()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let running = lines(ServiceRunState::Running);
+    assert!(
+        running.contains("reset-network --confirm --stop-service"),
+        "{running}"
+    );
+    let stopped = lines(ServiceRunState::Stopped);
+    assert!(stopped.contains("reset-network --confirm"), "{stopped}");
+    assert!(!stopped.contains("--stop-service"), "{stopped}");
+}

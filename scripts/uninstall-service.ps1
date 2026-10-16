@@ -77,6 +77,7 @@ $exePath = if ($Profile -ne 'auto' -and $repoBinary) { $repoBinary }
 $sc = Get-SystemTool 'sc.exe'
 
 Write-Host "==> sc stop $NrrServiceName (best-effort)" -ForegroundColor Cyan
+Set-NrrDeliberateStop
 $null = Invoke-NativeCommand -FilePath $sc -ArgumentList @('stop', $NrrServiceName) -Quiet
 # A running service is only marked for deletion, and stays registered.
 $null = Wait-ServiceStatus -Name $NrrServiceName -Status Stopped -Seconds 30

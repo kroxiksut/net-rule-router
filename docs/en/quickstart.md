@@ -313,11 +313,16 @@ you lost network access, proceed step by step:
    that moment may drop once, because its path changed; reconnecting fixes
    it, and new connections work right away. The service log names the
    programs that had connections open when it stopped. The same from
-   PowerShell as administrator:
+   a terminal as administrator:
 
    ```powershell
-   Stop-Service NetRuleRouter        # or: sc.exe stop NetRuleRouter
+   nrr-cli stop
    ```
+
+   Stop it with the app or `nrr-cli`: the service treats a stop from the
+   Services console, `Stop-Service` or `sc.exe stop` as a failure and
+   starts again a few seconds later, so the protection does not stay off
+   by accident.
 
 3. **Reboot your computer** — this guarantees a reset: the app's routes
    and filters do not persist between reboots. If the service is set to

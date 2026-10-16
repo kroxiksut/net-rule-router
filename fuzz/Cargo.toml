@@ -66,6 +66,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "dns_message"
+path = "fuzz_targets/dns_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fake_ip_packet"
 path = "fuzz_targets/fake_ip_packet.rs"
 test = false
