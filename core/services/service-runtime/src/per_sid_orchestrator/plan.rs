@@ -288,6 +288,11 @@ impl PerSidApplyOrchestrator {
                 } => {
                     over_capped.push(format!("{app} ({cap}/{resolved})"));
                 }
+                crate::wfp_codegen::CodegenDiagnostic::AppFolderOverCap {
+                    folder, covered, ..
+                } => {
+                    over_capped.push(format!("{folder} ({covered}/{covered}+)"));
+                }
                 crate::wfp_codegen::CodegenDiagnostic::AppDestinationClaimedByPrimary {
                     app,
                     ip,

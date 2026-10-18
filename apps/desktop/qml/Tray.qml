@@ -531,6 +531,11 @@ SystemTrayIcon {
                 _onPushGap()
                 break
             case "revision-status-changed":
+                // Any writer, not a list of them: with the window closed the
+                // linked files follow the rules in force from here.
+                boundFileWriter.mirrorServiceIntoFiles()
+                _refreshEnforcementState()
+                break
             case "health-changed":
                 // Both change the answer to "are rules being applied", which the
                 // tooltip states outright.

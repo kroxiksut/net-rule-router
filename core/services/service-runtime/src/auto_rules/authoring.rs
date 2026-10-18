@@ -873,6 +873,65 @@ mod tests {
         assert!(auto_rule_id(RouteRole::Secondary, &m).starts_with("auto-"));
     }
 
+    /// Rule ids are stored in users' books and dedupe the next offer, so the
+    /// digest prefix must not move with the crypto crate.
+    #[test]
+    fn rule_ids_are_pinned() {
+        let exact = |v: &str| CanonicalAddressMatch::ExactFqdn(v.into());
+        assert_eq!(
+            auto_rule_id(RouteRole::Secondary, &exact("cdn.example")),
+            "auto-cc513bbe5d26"
+        );
+        assert_eq!(
+            auto_rule_id(RouteRole::Primary, &exact("cdn.example")),
+            "auto-eed57a8902a6"
+        );
+        assert_eq!(
+            hashed_rule_id(RouteRole::Secondary, "app", "messenger.exe"),
+            "auto-16cee9e01eda"
+        );
+        // A leading zero nibble stays: the hex is fixed-width.
+        assert_eq!(
+            auto_rule_id(RouteRole::Secondary, &exact("h18.example")),
+            "auto-07d7e7d1c861"
+        );
+    }
+
+    /// The content hash the author sends is the fixed-width lowercase hex of
+    /// the rules it sends, like every other writer's.
+    #[test]
+    fn the_submitted_content_hash_spells_the_sent_bytes() {
+        let exec = Arc::new(crate::ipc_handlers::test_fakes::FakeMutationExecutor::default());
+        let author = ProductionAutoRuleAuthor::new(
+            Arc::new(FixedBook(empty_book())),
+            Arc::clone(&exec) as Arc<dyn MutationExecutor>,
+        );
+        author
+            .author(
+                "S-1-5-21-1-1",
+                &AutoRuleReason::UserConfirmed,
+                &[exact("fresh.example")],
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_785_456_000),
+                "c-1",
+            )
+            .expect("authored");
+        let written = exec
+            .last_executed
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("one write");
+        let json = written.payload["rules-json"].as_str().expect("rules-json");
+        let expected: String = Sha256::digest(json.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            written.payload["content-hash"].as_str(),
+            Some(expected.as_str())
+        );
+    }
+
     #[test]
     fn added_date_is_the_dashed_utc_calendar_day() {
         assert_eq!(added_date(SystemTime::UNIX_EPOCH), "1970-01-01");

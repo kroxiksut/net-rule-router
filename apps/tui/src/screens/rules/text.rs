@@ -230,6 +230,38 @@ pub const BUSY: Key = key(
     "tui.rules.busy",
     "Wait until the rules are applied; the list cannot change meanwhile.",
 );
+pub const CHANGED_ELSEWHERE_QUESTION: Key = key(
+    "tui.rules.changed-elsewhere.question",
+    "Your rules were changed elsewhere since this list was read. Nothing was applied.",
+);
+pub const CHANGED_ELSEWHERE_DETAIL: Key = key(
+    "tui.rules.changed-elsewhere.detail",
+    "Your edits can be put on top of the rules now in force; you review the result before it applies.",
+);
+pub const REBASE: Key = key(
+    "tui.rules.changed-elsewhere.rebase",
+    "Put my edits on top of the rules now in force",
+);
+pub const KEEP_LIST: Key = key("tui.rules.changed-elsewhere.keep", "Keep my list as it is");
+pub const REBASED: Key = key(
+    "tui.rules.changed-elsewhere.rebased",
+    "Your edits are on top of the rules now in force. Review them before they apply.",
+);
+pub const HAND_EDITED_TITLE: Key = key(
+    "dialog.rules-file-edited.title",
+    "A rules file was edited outside the app",
+);
+pub const HAND_EDITED_BODY: Key = key(
+    "dialog.rules-file-edited.body",
+    "Your rules changed elsewhere, and this file was edited by hand since the app last saved it, so it was left as it is. Take the file to compare it with the rules in force and apply what you keep, or replace the file with the rules in force.",
+);
+pub const HAND_EDITED_TAKE: Key = key("dialog.rules-file-edited.take", "Take the file");
+pub const HAND_EDITED_REPLACE: Key = key("dialog.rules-file-edited.overwrite", "Replace the file");
+pub const HAND_EDITED_LATER: Key = key("dialog.rules-file-edited.later", "Leave both for now");
+pub const NUMBER_GONE: Key = key(
+    "tui.rules.number-gone",
+    "Rule {n} as it was listed is no longer in the list. Here is the list as it is now.",
+);
 pub const APPLY_OFFLINE: Key = key(
     "tui.rules.apply-offline",
     "The service is not connected, so the rules cannot be applied now. Export them to files with x to keep them.",
@@ -938,6 +970,17 @@ pub const ALL: &[Key] = &[
     PHASE_COMPLETED,
     PHASE_FAILED,
     BUSY,
+    CHANGED_ELSEWHERE_QUESTION,
+    CHANGED_ELSEWHERE_DETAIL,
+    REBASE,
+    KEEP_LIST,
+    REBASED,
+    HAND_EDITED_TITLE,
+    HAND_EDITED_BODY,
+    HAND_EDITED_TAKE,
+    HAND_EDITED_REPLACE,
+    HAND_EDITED_LATER,
+    NUMBER_GONE,
     APPLY_OFFLINE,
     EXPIRED,
     ON,

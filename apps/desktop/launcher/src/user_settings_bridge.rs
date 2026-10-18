@@ -12,8 +12,8 @@ use nrr_shared::client_error_codes::{
     MALFORMED_INPUT, USER_SETTINGS_READ_ONLY, USER_SETTINGS_UNAVAILABLE,
 };
 use nrr_shared::user_settings::{
-    portable_path, UserSettings, UserSettingsError, UserSettingsStore, INTENT_NOTICE_MUTES,
-    INTENT_ROUTE_POLICY,
+    portable_path, read_rules_file_bytes, UserSettings, UserSettingsError, UserSettingsStore,
+    INTENT_NOTICE_MUTES, INTENT_ROUTE_POLICY,
 };
 use nrr_ui_support::ui_preferences::{is_storable_json_blob, UiPreferences};
 use serde_json::{Map, Value};
@@ -248,6 +248,82 @@ pub(crate) fn intent_record_in(
     Ok(serde_json::json!({ "recorded": true }))
 }
 
+/// A request names at most the two route files and a few more.
+const MAX_CHECKED_PATHS: usize = 8;
+
+/// SHA-256 of a rules file's bytes; `Ok(None)` when it is absent.
+fn rules_file_sha256(path: &str) -> std::io::Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let Some(bytes) = read_rules_file_bytes(std::path::Path::new(path))? else {
+        return Ok(None);
+    };
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(&bytes) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(Some(hex))
+}
+
+fn path_field(value: Option<&Value>) -> Result<&str, IntentError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty() && one_line(path))
+        .ok_or(IntentError::BadRequest("`path` is not a file path"))
+}
+
+/// `local.user-settings.rules-file-written`: the program has just written the
+/// rules file at `path`; what is there now is its version of it.
+pub(crate) fn rules_file_written(payload: &Value) -> Result<Value, IntentError> {
+    let may_write = SESSION_MAY_WRITE.load(Ordering::Relaxed);
+    rules_file_written_in(&UserSettingsStore::open()?, payload, may_write)
+}
+
+pub(crate) fn rules_file_written_in(
+    store: &UserSettingsStore,
+    payload: &Value,
+    may_write: bool,
+) -> Result<Value, IntentError> {
+    if !may_write {
+        return Err(IntentError::ReadOnly);
+    }
+    let path = path_field(payload.get("path"))?;
+    // Unreadable or gone right after the write: nothing to remember.
+    let Ok(Some(sha256)) = rules_file_sha256(path) else {
+        return Ok(serde_json::json!({ "recorded": false }));
+    };
+    store.update(|settings| settings.record_rules_file_written(path, &sha256))?;
+    Ok(serde_json::json!({ "recorded": true }))
+}
+
+/// `local.user-settings.rules-files-hand-edited`: which of `paths` changed
+/// since the program last wrote them. A file that cannot be read counts as
+/// changed when there is a record: overwriting it unasked is the loss to avoid.
+pub(crate) fn rules_files_hand_edited(payload: &Value) -> Result<Value, IntentError> {
+    rules_files_hand_edited_in(&UserSettingsStore::open()?, payload)
+}
+
+pub(crate) fn rules_files_hand_edited_in(
+    store: &UserSettingsStore,
+    payload: &Value,
+) -> Result<Value, IntentError> {
+    let paths = payload
+        .get("paths")
+        .and_then(Value::as_array)
+        .filter(|paths| paths.len() <= MAX_CHECKED_PATHS)
+        .ok_or(IntentError::BadRequest("`paths` is not a short list"))?;
+    let settings = store.load()?.unwrap_or_default();
+    let mut edited = Vec::new();
+    for path in paths {
+        let path = path_field(Some(path))?;
+        let on_disk = rules_file_sha256(path).unwrap_or_else(|_| Some(String::new()));
+        if settings.rules_file_hand_edited(path, on_disk.as_deref()) {
+            edited.push(Value::String(path.to_owned()));
+        }
+    }
+    Ok(serde_json::json!({ "hand-edited": edited }))
+}
+
 pub(crate) fn open_session_in(
     store: UserSettingsStore,
     preferences: &mut UiPreferences,
@@ -418,6 +494,32 @@ mod tests {
             intent_record_in(&store, &stability, true),
             Err(IntentError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn a_rules_file_changed_after_the_program_wrote_it_is_named() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store_in(&dir);
+        let file = dir.path().join("rules_primary.txt");
+        let path = file.to_string_lossy().into_owned();
+        std::fs::write(&file, "example.com\n").expect("write");
+        let written = serde_json::json!({ "path": path });
+        rules_file_written_in(&store, &written, true).expect("recorded");
+
+        let ask = serde_json::json!({ "paths": [path] });
+        let answer = rules_files_hand_edited_in(&store, &ask).expect("checked");
+        assert_eq!(answer["hand-edited"], serde_json::json!([]));
+
+        std::fs::write(&file, "example.com\nexample.org\n").expect("hand edit");
+        let answer = rules_files_hand_edited_in(&store, &ask).expect("checked");
+        assert_eq!(answer["hand-edited"], serde_json::json!([path]));
+
+        assert!(matches!(
+            rules_file_written_in(&store, &written, false),
+            Err(IntentError::ReadOnly)
+        ));
+        let bad = serde_json::json!({ "paths": "x" });
+        assert!(rules_files_hand_edited_in(&store, &bad).is_err());
     }
 
     #[test]

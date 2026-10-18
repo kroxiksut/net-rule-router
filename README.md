@@ -4,7 +4,7 @@
 
 # NetRuleRouter
 
-**Decide which traffic goes through which connection — by domain, IP, or app.**
+**Send each site, address, subnet, range or program over the connection you choose, deny what must not go out, and hold traffic back when the VPN drops instead of leaking it.**
 
 A desktop network policy manager that routes your traffic across the
 interfaces you *already have*: primary internet, a VPN, a second provider, Wi-Fi,

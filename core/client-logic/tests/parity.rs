@@ -594,7 +594,8 @@ fn rule_row_to_wire_dto_matches_js() {
         &mut JsLib::rules(),
         |input| {
             format!(
-                "ruleRowToWireDto({}, {} ? __aceEncode : null, {})",
+                "(function () {{ try {{ return ruleRowToWireDto({}, {} ? __aceEncode : null, {}) }} \
+                 catch (err) {{ return {{ refused: wireRefusalCode(err) }} }} }})()",
                 arg(input, "row"),
                 arg(input, "encode"),
                 arg(input, "opts")
@@ -608,8 +609,10 @@ fn rule_row_to_wire_dto_matches_js() {
             };
             let encode: &dyn Fn(&str) -> String = &ace_encode;
             let encode = input["encode"].as_bool().unwrap_or(false).then_some(encode);
-            let dto = rule_row_to_wire_dto(&row_from_js(&input["row"]), encode, options);
-            serde_json::to_value(dto).expect("RuleDto serialises")
+            match rule_row_to_wire_dto(&row_from_js(&input["row"]), encode, options) {
+                Ok(dto) => serde_json::to_value(dto).expect("RuleDto serialises"),
+                Err(refusal) => json!({ "refused": refusal.code() }),
+            }
         },
     );
 }

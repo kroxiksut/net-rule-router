@@ -224,6 +224,29 @@ fn an_undecodable_payload_is_left_alone_for_the_validator_to_reject() {
     );
 }
 
+/// Stored revisions dedupe on this hash and clients send it in the same
+/// spelling, so its format must not move with the crypto crate.
+#[test]
+fn the_content_hash_is_pinned() {
+    let mut p = RulesUpdatePayload {
+        rules_json: "not json at all".into(),
+        content_hash: String::new(),
+        correlation_id: None,
+    };
+    ProductionMutationExecutor::canonicalize_rules_payload(&mut p, HostPlatform::Windows);
+    assert_eq!(
+        p.content_hash,
+        "92628a747890d02d1459c6eb45fd13cfa63bbb6d346412cff190297cf9c33d39"
+    );
+    // A leading zero nibble stays: the hex is fixed-width.
+    p.rules_json = "not json 19".into();
+    ProductionMutationExecutor::canonicalize_rules_payload(&mut p, HostPlatform::Windows);
+    assert_eq!(
+        p.content_hash,
+        "0b4447295187b5a8357ab3aa6cb10dd0911a9bc45a613f7e40411b7626a3e0a4"
+    );
+}
+
 /// A canonical book under a wrong hash must not dedupe to the active revision
 /// and pass for "already active".
 #[test]
@@ -2521,6 +2544,54 @@ fn a_preset_import_keeps_the_rules_of_a_kind_this_build_cannot_read() {
     let active = active_rules_json(&conn);
     assert!(active.contains("imported.example"), "{active}");
     assert!(active.contains("r-future"), "{active}");
+}
+
+/// The hashes the import and the carry-forward re-spell are the same
+/// fixed-width lowercase hex of the stored bytes as every other writer's;
+/// `the_content_hash_is_pinned` pins the digest itself.
+#[test]
+fn every_rewriting_path_stores_the_same_hash_spelling() {
+    let per_byte_hex = |bytes: &[u8]| -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let active = |conn: &Arc<std::sync::Mutex<rusqlite::Connection>>| {
+        let g = conn.lock().unwrap();
+        let record = nrr_storage::revisions::RevisionsRepository::new(&g)
+            .get_active()
+            .unwrap()
+            .expect("an active revision");
+        (record.rules_json, record.content_hash)
+    };
+    let baseline = nrr_storage::BASELINE_PRINCIPAL;
+
+    let (exec, conn) = build_test_executor();
+    seed_from_a_newer_build(&exec, baseline, &book_with_unknown_kind("a.example"));
+    let carried = exec.execute(rules_update_of(&gui_book("b.example")), baseline);
+    assert!(
+        matches!(carried, MutationOutcome::Completed(_)),
+        "{carried:?}"
+    );
+    let (json, hash) = active(&conn);
+    assert!(json.contains("r-future"), "carried forward: {json}");
+    assert_eq!(hash, per_byte_hex(json.as_bytes()));
+
+    let imported = exec.execute_preset_import(
+        &serde_json::json!({
+            "primary-bytes-b64": b64("--- Domains\nimported.example\n"),
+            "include-child-processes": false,
+        }),
+        baseline,
+    );
+    assert!(
+        matches!(imported, MutationOutcome::Completed(_)),
+        "{imported:?}"
+    );
+    let (json, hash) = active(&conn);
+    assert!(json.contains("imported.example"), "{json}");
+    assert_eq!(hash, per_byte_hex(json.as_bytes()));
 }
 
 #[test]

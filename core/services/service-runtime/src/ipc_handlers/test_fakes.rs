@@ -523,6 +523,7 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
         dns_cache_control: None,
         local_networks: None,
         auto_rule_probe: None,
+        site_check: None,
         refusing_anchors: None,
         // No merge source in test deps; RulesMergePreview
         // resolves to the Unimplemented stub here (catalog-coverage sees it

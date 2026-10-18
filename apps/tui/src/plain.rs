@@ -78,7 +78,7 @@ impl<W: Write> PlainSession<W> {
         // picks an option, it does not open a screen.
         let current = screen(app.screen);
         if current.captures_keys(app) && current.on_line(app, answer) {
-            self.print_screen(app, texts)?;
+            self.show(app, texts)?;
             return self.prompt(app, texts);
         }
         let mut chars = answer.chars();
@@ -87,22 +87,22 @@ impl<W: Write> PlainSession<W> {
             _ => None,
         };
         match answer {
-            "" => self.print_screen(app, texts)?,
+            "" => self.show(app, texts)?,
             "q" => {
                 app.request_quit();
                 if app.quit {
                     return self.out.flush();
                 }
-                self.print_screen(app, texts)?;
+                self.show(app, texts)?;
             }
             "h" | "?" => self.print_help(app, texts)?,
             _ => match target {
                 Some(target) => {
                     app.open(target);
-                    self.print_screen(app, texts)?;
+                    self.show(app, texts)?;
                 }
                 None if screen(app.screen).on_line(app, answer) => {
-                    self.print_screen(app, texts)?;
+                    self.show(app, texts)?;
                 }
                 None => writeln!(
                     self.out,
@@ -112,6 +112,13 @@ impl<W: Write> PlainSession<W> {
             },
         }
         self.prompt(app, texts)
+    }
+
+    /// The screen printed in answer to the user: what its numbers mean now.
+    fn show(&mut self, app: &mut AppState, texts: &Texts) -> io::Result<()> {
+        self.print_screen(app, texts)?;
+        screen(app.screen).on_printed(app);
+        Ok(())
     }
 
     fn print_menu(&mut self, texts: &Texts) -> io::Result<()> {

@@ -355,10 +355,22 @@ pub enum IpcOperationName {
     /// [`crate::ipc_payloads::ConnHistorySettingsSetRequest`] →
     /// [`crate::ipc_payloads::ConnHistorySettingsSetResponse`].
     ConnHistorySettingsSet,
+    /// "Is it us or the site?": start checking the site's names — their
+    /// addresses and routes under the caller's own rules, and whether each
+    /// answers over its route. Runs only when asked, on its own thread,
+    /// bounded in names and time; changes nothing. The reply says it started.
+    /// [`crate::ipc_payloads::SiteCheckRequest`] →
+    /// [`crate::ipc_payloads::SiteCheckStatus`].
+    SiteCheckRun,
+    /// The caller's latest site check, running or done. In memory, the
+    /// caller's own only.
+    /// [`crate::ipc_payloads::SiteCheckResultRequest`] →
+    /// [`crate::ipc_payloads::SiteCheckStatus`].
+    SiteCheckResultGet,
 }
 
 impl IpcOperationName {
-    pub const ALL: [Self; 80] = [
+    pub const ALL: [Self; 82] = [
         Self::ContractNegotiate,
         Self::ServiceHealthGet,
         Self::SnapshotInitialGet,
@@ -439,6 +451,8 @@ impl IpcOperationName {
         Self::ConnHistoryList,
         Self::ConnHistoryClear,
         Self::ConnHistorySettingsSet,
+        Self::SiteCheckRun,
+        Self::SiteCheckResultGet,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -523,6 +537,8 @@ impl IpcOperationName {
             Self::ConnHistoryList => "conn-history.list",
             Self::ConnHistoryClear => "conn-history.clear",
             Self::ConnHistorySettingsSet => "conn-history.settings.set",
+            Self::SiteCheckRun => "diagnostics.site-check.run",
+            Self::SiteCheckResultGet => "diagnostics.site-check.result",
         }
     }
 

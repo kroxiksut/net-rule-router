@@ -43,6 +43,7 @@ Commands on this screen:
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
   c: check the addresses over the main connection
+  k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
 Type a screen number, h for help or q to quit, then press Enter.
@@ -76,6 +77,7 @@ Commands on this screen:
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
   c: check the addresses over the main connection
+  k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
 Type a screen number, h for help or q to quit, then press Enter.
@@ -109,6 +111,7 @@ Commands on this screen:
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
   c: check the addresses over the main connection
+  k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
 Type a screen number, h for help or q to quit, then press Enter.
@@ -144,6 +147,7 @@ Commands on this screen:
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
   c: check the addresses over the main connection
+  k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
 Type a screen number, h for help or q to quit, then press Enter.
@@ -180,6 +184,7 @@ Commands on this screen:
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
   c: check the addresses over the main connection
+  k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
 Type y to turn it on or n to cancel, then press Enter.
@@ -214,6 +219,7 @@ Commands on this screen:
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
   c: check the addresses over the main connection
+  k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
 Type a screen number, h for help or q to quit, then press Enter.
@@ -249,6 +255,7 @@ Commands on this screen:
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
   c: check the addresses over the main connection
+  k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
 Type a screen number, h for help or q to quit, then press Enter.

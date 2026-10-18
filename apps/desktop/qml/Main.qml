@@ -65,7 +65,7 @@ ApplicationWindow {
             "This is not available on your operating system yet, so the controls here stay off. "
             + "Nothing here is sent to the background service.")
         : ""
-    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, appGroupsOfferDismissed: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, updateCheckEnabled: true, updateCheckIntervalDays: 14, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
+    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, appGroupsOfferDismissed: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", connTraceGroupBy: "program", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, updateCheckEnabled: true, updateCheckIntervalDays: 14, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
     property string section: "interfaces-routes"
     // The section open at launch loads synchronously: an asynchronous first
     // load could stall with an empty pane until the user clicked something.
@@ -87,7 +87,22 @@ ApplicationWindow {
         statusLine = String(text || "")
     }
     property int selectedRule: -1
+    /// The selected rule itself (`Rules.mergeKey`), which `selectedRule` — a
+    /// row number — follows when the list changes under it.
+    property string selectedRuleKey: ""
+    onSelectedRuleChanged: selectedRuleKey = (selectedRule >= 0 && selectedRule < rulesModel.count)
+        ? Rules.mergeKey(rulesModel.get(selectedRule)) : ""
+    /// `indexByKey` maps each rule's key to its row: the selection moves with
+    /// its rule, or clears when the rule is gone.
+    function followSelectedRule(indexByKey) {
+        if (selectedRuleKey === "") return
+        var at = indexByKey[selectedRuleKey]
+        if (at === undefined) selectedRule = -1
+        else if (at !== selectedRule) selectedRule = at
+    }
     property int editingRule: -1
+    /// The rule the form edits (`Rules.mergeKey`), set when the form opens.
+    property string editingRuleKey: ""
     property int wizardStep: 0
     property int autoCloseMs: 0
     property int uiRevision: 0
@@ -1655,6 +1670,7 @@ ApplicationWindow {
         normalized.trafficExportUnit =
             (["bytes", "kb", "mb", "gb"].indexOf(String(normalized.trafficExportUnit)) >= 0)
                 ? String(normalized.trafficExportUnit) : "mb"
+        normalized.connTraceGroupBy = Pure.connTraceGroupingOrDefault(normalized.connTraceGroupBy)
         // Support-archive privacy tier. Coerce to a known slug so both export
         // surfaces can trust it; unknown / missing → "standard" (the default).
         normalized.diagnosticsArchiveRedactionLevel =
@@ -3587,6 +3603,9 @@ ApplicationWindow {
             case "revision-status-changed":
                 console.log("revision-status-changed:",
                     event["revision-id"], "->", event.status)
+                // Whoever wrote — the tray, the terminal UI, the service's own
+                // authors, a reset: a clean table follows the rules in force.
+                boundFilesController.handleRulesChangedInService()
                 break
             case "security-alerts-changed":
                 refreshDiagnosticsSnapshot()
@@ -5618,9 +5637,11 @@ ApplicationWindow {
             return
         }
         if (typeof reviewFlowController.applyWithoutReview !== "function") return
+        // One rule added and nothing else: a preview saying more means the
+        // table is not what the service holds.
         reviewFlowController.applyWithoutReview("tray-add-rule", function(ok) {
             if (!ok) console.log("tray add-rule: apply without review did not complete")
-        })
+        }, { added: 1, removed: 0, changed: 0 })
     }
 
     // Real two-phase safe-disable. Phase 1
@@ -5826,6 +5847,21 @@ ApplicationWindow {
     // is harmless — the 0 ms coalescing timer collapses it into one rebuild.)
     signal rulesModelEdited()
     function saveRule() {
+        // The form edits a rule, not a row: find it again, as the list may
+        // have been re-read since the form opened.
+        if (editingRule >= 0 && editingRuleKey !== "") {
+            var at = -1
+            for (var ri = 0; ri < rulesModel.count && at < 0; ri += 1) {
+                if (Rules.mergeKey(rulesModel.get(ri)) === editingRuleKey) at = ri
+            }
+            if (at < 0) {
+                statusLine = tr("status.rule-edit-target-gone",
+                    "The rule you were editing was changed elsewhere, so this edit was not saved.")
+                return
+            }
+            if (selectedRule === editingRule) selectedRule = at
+            editingRule = at
+        }
         if (editingRule < 0 && userRuleCount() >= freeRulesMaxCount) {
             statusLine = tr("status.rules-limit-reached",
                 "Up to {max} active rules are supported.")
@@ -5854,6 +5890,10 @@ ApplicationWindow {
             }
         }
         if (editingRule >= 0) rulesModel.set(editingRule, item); else rulesModel.append(item)
+        // The edit may change the rule's key; the selection and the form
+        // stay on it.
+        if (editingRule >= 0 && editingRule === selectedRule) selectedRuleKey = Rules.mergeKey(item)
+        if (editingRule >= 0) editingRuleKey = Rules.mergeKey(item)
         ruleOverlapsController.noteOwnEdit(item.id)
         // A `set()` edit does NOT change
         // rulesModel.count, so RulesSection's onCountChanged rebuild never
@@ -6332,6 +6372,9 @@ ApplicationWindow {
                 // state DB): the table would sit empty under a selected rule
                 // set, so hydrate from the file the way an offline start does.
                 if (_serviceRuleCount === 0) _runAutoOpenOnLaunch()
+                // A file the tray left alone because it was edited by hand is
+                // asked about now.
+                else boundFilesController.askAboutHandEditedFiles()
                 return
             }
             _coldStartRulesRetryTimer.restart()
@@ -6540,7 +6583,9 @@ ApplicationWindow {
     // (or the broker) just activated. `rules.list` is a read op, so it
     // works for non-elevated clients.
     //
-    // opts: { silent: bool, onComplete: function(ok) }
+    // opts: { silent: bool, ifStale: bool, onComplete: function(ok, reloaded) }
+    // `ifStale`: a re-read nobody asked for. It leaves the table alone when it
+    // already shows the rules in force, or when edits began while it was out.
     function _refreshRulesFromService(opts) {
         opts = opts || {}
         if (!bridgeAvailable
@@ -6560,6 +6605,17 @@ ApplicationWindow {
                 return
             }
             var rows = p.rows || []
+            if (opts.ifStale) {
+                var inForce = (p["base-revision"] !== undefined && p["base-revision"] !== null)
+                    ? String(p["base-revision"]) : null
+                var shown = (rulesBaseRevision !== null && rulesBaseRevision !== undefined)
+                    ? String(rulesBaseRevision) : null
+                if ((inForce !== null && inForce === shown)
+                        || unsavedChangesRegistry["rules"] || _offlineRulesPendingPush) {
+                    if (typeof opts.onComplete === "function") opts.onComplete(true, false)
+                    return
+                }
+            }
             // An explicit "Show the rules the service is applying"
             // that returns ZERO rules would silently WIPE every rule shown in the
             // GUI (clearModel below with nothing to re-append). Confirm first when
@@ -6648,7 +6704,7 @@ ApplicationWindow {
                         "Loaded {count} active rule(s) from the service.")
                         .replace("{count}", String(rows.length))
                 }
-                if (typeof opts.onComplete === "function") opts.onComplete(true)
+                if (typeof opts.onComplete === "function") opts.onComplete(true, true)
             })
         })
     }
@@ -7557,6 +7613,7 @@ ApplicationWindow {
     property alias driftDetectionDialog: dialogHost.driftDetectionDialog
     property alias driftClearAllConfirmDialog: dialogHost.driftClearAllConfirmDialog
     property alias mergeReviewDialog: dialogHost.mergeReviewDialog
+    property alias rulesFileEditedDialog: dialogHost.rulesFileEditedDialog
     property alias rulesOverlapCleanupDialog: dialogHost.rulesOverlapCleanupDialog
     property alias saveBeforeCloseDialog: dialogHost.saveBeforeCloseDialog
     property alias factoryPresetSaveDialog: dialogHost.factoryPresetSaveDialog
@@ -8082,8 +8139,10 @@ ApplicationWindow {
             // park flow that depends on the rules payload. Surface it and
             // return a falsy value so callers can bail out cleanly.
             console.error("_buildRulesJsonFromModel: rules serialization failed:", err)
-            statusLine = tr("status.rules-serialize-failed",
-                "Internal error while preparing rules — see logs")
+            var refusal = Rules.wireRefusalCode(err)
+            statusLine = refusal !== "" ? ipcErrorLabel(refusal)
+                : tr("status.rules-serialize-failed",
+                    "Internal error while preparing rules — see logs")
             return ""
         }
     }

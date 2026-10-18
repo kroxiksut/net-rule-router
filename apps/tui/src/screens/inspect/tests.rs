@@ -7,6 +7,7 @@
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use nrr_client_logic::conn_trace::TraceGrouping;
 use nrr_ipc_client::{ConnectionStatus, IpcClient};
 use nrr_shared::ipc::IpcOperationName;
 use ratatui::backend::TestBackend;
@@ -16,9 +17,10 @@ use serde_json::{json, Value};
 use crate::full::{draw, handle_key, RenderOptions};
 use crate::link::Link;
 use crate::plain::PlainSession;
+use crate::screens::settings::prefs;
 use crate::screens::ScreenId;
 use crate::state::AppState;
-use crate::testing::{app_at, assert_snapshot, texts_en, FakeService, Fixture};
+use crate::testing::{app_at, assert_snapshot, texts_en, FakeService, Fixture, Scratch};
 
 const PLAIN: RenderOptions = RenderOptions {
     colour: false,
@@ -262,8 +264,13 @@ fn service() -> FakeService {
     fake
 }
 
+/// The trace flat and its paths read as Windows ones, whatever the test
+/// machine; the grouping tests below choose their own.
 fn connected() -> AppState {
-    app_at(Link::Connected, Some(&Fixture::healthy()))
+    let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+    app.settings.prefs.trace_grouping = TraceGrouping::None;
+    app.inspect.trace.os = "windows";
+    app
 }
 
 /// Run what the screens queued, and what their answers queued in turn.
@@ -910,4 +917,189 @@ fn line_mode_reads_the_history_of_a_period() {
     assert!(text.contains("History: Last 7 days"), "{text}");
     assert!(text.contains("12 times"), "{text}");
     assert_eq!(fake.sent(IpcOperationName::ConnHistoryList).len(), 1);
+}
+
+fn path_row(process: &str, path: &str) -> Value {
+    let mut row = trace_row(process, "203.0.113.50:443", "primary", "permit", &[]);
+    row["process_path"] = json!(path);
+    row
+}
+
+fn folder_service() -> FakeService {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::ConnTraceEntriesList,
+        json!({
+            "page": {
+                "items": [
+                    path_row("avp.exe", r"C:\Program Files\AVP\avp.exe"),
+                    path_row("avp2.exe", r"C:\Program Files\AVP\sub\avp2.exe"),
+                    path_row("tool.exe", r"C:\Tools\tool.exe"),
+                    path_row("svc", ""),
+                ],
+                "next_cursor": null,
+                "total_count": 4,
+                "stale": false
+            },
+            "redacted": false,
+            "observer-active": true,
+            "gui-stream-enabled": true
+        }),
+    );
+    fake
+}
+
+#[test]
+fn g_groups_the_trace_by_folder_remembers_it_and_f_fills_the_rule_form() {
+    let dir = Scratch::new("trace-grouping");
+    let path = dir.path().join("tui.json");
+    let fake = folder_service();
+    let mut app = connected();
+    app.settings.prefs_path = Some(path.clone());
+    open(&mut app, &fake, ScreenId::Trace);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Char('g'));
+    assert_eq!(app.settings.prefs.trace_grouping, TraceGrouping::Program);
+    key(&mut app, KeyCode::Char('g'));
+    assert_eq!(app.settings.prefs.trace_grouping, TraceGrouping::Folder);
+    assert_eq!(prefs::load(&path).trace_grouping, TraceGrouping::Folder);
+
+    let picture = render(&app, 120, 40);
+    assert!(
+        picture.contains(r"C:\Program Files\AVP  ·  2 program(s)  ·  2 connection(s):"),
+        "a folder inside a listed folder joins its group:\n{picture}"
+    );
+    assert!(
+        picture.contains("Programs without a known path"),
+        "{picture}"
+    );
+    assert!(picture.contains("Group: By folder"), "{picture}");
+    assert!(picture.contains("Shown: 4 of 4."), "{picture}");
+    assert!(picture.contains("f: Rule for this folder…"), "{picture}");
+    assert_snapshot("trace-folders-120x40", &picture);
+
+    fake.answer(
+        IpcOperationName::RulesList,
+        json!({ "rows": [], "supported-rule-types": ["application"] }),
+    );
+    key(&mut app, KeyCode::Char('f'));
+    if !nrr_shared::platform_profile::PlatformProfile::current()
+        .supports
+        .app_routing
+    {
+        assert_eq!(app.screen, ScreenId::Trace);
+        return;
+    }
+    assert_eq!(app.screen, ScreenId::Rules);
+    // The form waits for the list, so reading it cannot drop the rule.
+    settle(&mut app, &fake);
+    let value = match &app.rules.mode {
+        crate::screens::rules::Mode::Form(form) => form.value.clone(),
+        other => panic!("the add form is open, not {other:?}"),
+    };
+    assert_eq!(value, r"C:\Program Files\AVP\*");
+}
+
+#[test]
+fn line_mode_names_a_grouping_and_f_takes_the_folder_of_a_numbered_row() {
+    let fake = folder_service();
+    let text = transcript_with(&fake, &["7", "g program", "g folder", "f 3"]);
+    assert!(text.contains("Group: By program"), "{text}");
+    assert!(text.contains("Group: By folder"), "{text}");
+    assert!(
+        text.contains(r"C:\Tools  ·  1 program(s)  ·  1 connection(s):"),
+        "{text}"
+    );
+    assert!(text.contains("g: the next grouping"), "{text}");
+    if nrr_shared::platform_profile::PlatformProfile::current()
+        .supports
+        .app_routing
+    {
+        assert!(text.contains("Screen: Rules"), "{text}");
+    }
+}
+
+#[test]
+fn a_program_seen_once_is_its_row_alone_and_a_header_is_never_explained() {
+    let fake = folder_service();
+    let mut app = connected();
+    app.settings.prefs.trace_grouping = TraceGrouping::Program;
+    open(&mut app, &fake, ScreenId::Trace);
+    let picture = render(&app, 120, 40);
+    assert!(!picture.contains("connection(s):"), "{picture}");
+    assert!(picture.contains("Rows 1–4 of 4."), "{picture}");
+
+    let fake = service();
+    let mut app = connected();
+    app.settings.prefs.trace_grouping = TraceGrouping::Program;
+    open(&mut app, &fake, ScreenId::Trace);
+    let picture = render(&app, 120, 40);
+    assert!(
+        picture.contains("browser.exe  ·  12 connection(s):"),
+        "{picture}"
+    );
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Enter);
+    settle(&mut app, &fake);
+    assert_eq!(app.screen, ScreenId::Trace, "a header names no connection");
+}
+
+#[test]
+fn check_site_from_the_trace_follows_the_check_to_its_verdict() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::SiteCheckRun,
+        json!({ "state": "running", "host": "site.example" }),
+    );
+    fake.answer(
+        IpcOperationName::SiteCheckResultGet,
+        json!({
+            "state": "done",
+            "host": "site.example",
+            "report": {
+                "site": "site.example",
+                "verdict": "sign-in-split",
+                "site-route": "secondary",
+                "names": [
+                    { "name": "site.example", "role": "site", "address": "203.0.113.1",
+                      "route": "secondary", "answer": "answered" },
+                    { "name": "login.site.example", "role": "sign-in", "address": "203.0.113.7",
+                      "route": "primary", "answer": "answered" }
+                ],
+                "move-names": ["login.site.example"]
+            }
+        }),
+    );
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Trace);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Char('c'));
+    settle(&mut app, &fake);
+    assert_eq!(app.screen, ScreenId::Diagnostics);
+    assert_eq!(
+        fake.sent(IpcOperationName::SiteCheckRun),
+        [json!({ "host": "site.example" })]
+    );
+    // The result is read after a pause, off the jobs thread's queue.
+    let later = app.outbox.take_delayed();
+    assert_eq!(later.len(), 1, "one read of the running check");
+    for (_, job) in later {
+        (job(&fake).0)(&mut app);
+    }
+    let text: Vec<String> = super::site_check::lines(&app, &texts_en(), None)
+        .iter()
+        .map(|l| l.plain_text())
+        .collect();
+    let text = text.join("\n");
+    assert!(
+        text.contains("The site's sign-in goes over a different route than the site"),
+        "{text}"
+    );
+    assert!(text.contains("login.site.example (sign-in)"), "{text}");
+    assert!(text.contains("m: move the sign-in names"), "{text}");
+    assert!(
+        app.outbox.take_delayed().is_empty(),
+        "a finished check is not read again"
+    );
 }

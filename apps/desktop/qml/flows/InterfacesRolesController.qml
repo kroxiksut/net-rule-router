@@ -534,6 +534,17 @@ QtObject {
         return null
     }
 
+    /// The adapter's row in `interfacesModel` now, by its id (by name when it
+    /// has none); -1 when it is gone.
+    function _modelIndexOf(id, name) {
+        for (var i = 0; i < root.interfacesModel.count; i += 1) {
+            var row = root.interfacesModel.get(i)
+            if (id !== "" ? String(row.persistentId || "") === id
+                          : (name !== "" && String(row.name || "") === name)) return i
+        }
+        return -1
+    }
+
     /// `unroutableConfirmed` is set by the confirm dialog's proceed callback so
     /// the second pass skips the guardrail. Every other caller omits it.
     function assignRole(index, role, unroutableConfirmed) {
@@ -550,7 +561,15 @@ QtObject {
                     && typeof root.confirmUnroutableSecondary === "function") {
                 root.confirmUnroutableSecondary(candidate,
                         role === "primary" ? "assign-primary" : "assign", function() {
-                    interfacesRolesController.assignRole(index, role, true)
+                    // The list is rebuilt on every adapter change, also while
+                    // the question is open: find the adapter asked about again.
+                    var now = interfacesRolesController._modelIndexOf(selectedId, selectedName)
+                    if (now < 0) {
+                        root.statusLine = root.tr("status.role-adapter-gone",
+                            "That adapter is no longer on this computer, so no role was assigned.")
+                        return
+                    }
+                    interfacesRolesController.assignRole(now, role, true)
                 })
                 return
             }

@@ -1,0 +1,189 @@
+{
+  "description": "pure.js connTraceGroups: the connection trace grouped by program or by program folder; a folder inside another listed folder joins its group, a root never takes in what is below it, rows without a readable path come last",
+  "cases": [
+    {
+      "name": "a nested folder joins the outer folder, case ignored on windows",
+      "input": {
+        "grouping": "folder",
+        "os": "windows",
+        "rows": [
+          { "process": "avp.exe", "process_path": "C:\\Program Files\\AVP\\avp.exe" },
+          { "process": "avp2.exe", "process_path": "C:\\Program Files\\AVP\\sub\\avp2.exe" },
+          { "process": "chrome.exe", "process_path": "C:\\Apps\\Chrome\\chrome.exe" },
+          { "process": "avp.exe", "process_path": "c:\\program files\\avp\\AVP.EXE" }
+        ]
+      },
+      "expected": [
+        { "kind": "folder", "key": "folder:c:\\apps\\chrome", "label": "C:\\Apps\\Chrome", "ruleValue": "C:\\Apps\\Chrome\\*", "rows": [2], "programs": 1, "header": true },
+        { "kind": "folder", "key": "folder:c:\\program files\\avp", "label": "C:\\Program Files\\AVP", "ruleValue": "C:\\Program Files\\AVP\\*", "rows": [0, 1, 3], "programs": 2, "header": true }
+      ]
+    },
+    {
+      "name": "sibling folders and a folder sharing a name prefix stay apart",
+      "input": {
+        "grouping": "folder",
+        "os": "windows",
+        "rows": [
+          { "process": "a.exe", "process_path": "C:\\Tools\\A\\a.exe" },
+          { "process": "b.exe", "process_path": "C:\\Tools\\B\\b.exe" },
+          { "process": "c.exe", "process_path": "C:\\ToolsX\\c.exe" }
+        ]
+      },
+      "expected": [
+        { "kind": "folder", "key": "folder:c:\\tools\\a", "label": "C:\\Tools\\A", "ruleValue": "C:\\Tools\\A\\*", "rows": [0], "programs": 1, "header": true },
+        { "kind": "folder", "key": "folder:c:\\tools\\b", "label": "C:\\Tools\\B", "ruleValue": "C:\\Tools\\B\\*", "rows": [1], "programs": 1, "header": true },
+        { "kind": "folder", "key": "folder:c:\\toolsx", "label": "C:\\ToolsX", "ruleValue": "C:\\ToolsX\\*", "rows": [2], "programs": 1, "header": true }
+      ]
+    },
+    {
+      "name": "linux keeps case apart and rows without a path come last",
+      "input": {
+        "grouping": "folder",
+        "os": "linux",
+        "rows": [
+          { "process": "App", "process_path": "/opt/App/bin/App" },
+          { "process": "app", "process_path": "/opt/app/app" },
+          { "process": "svc", "process_path": "" },
+          { "process": "", "process_path": "relative/x" },
+          { "process": "helper", "process_path": "/opt/App/helper" }
+        ]
+      },
+      "expected": [
+        { "kind": "folder", "key": "folder:/opt/App", "label": "/opt/App", "ruleValue": "/opt/App/*", "rows": [0, 4], "programs": 2, "header": true },
+        { "kind": "folder", "key": "folder:/opt/app", "label": "/opt/app", "ruleValue": "/opt/app/*", "rows": [1], "programs": 1, "header": true },
+        { "kind": "no-path", "key": "no-path", "label": "", "ruleValue": null, "rows": [2, 3], "programs": 2, "header": true }
+      ]
+    },
+    {
+      "name": "macos ignores case and the folder is spelled as its own row spells it",
+      "input": {
+        "grouping": "folder",
+        "os": "macos",
+        "rows": [
+          { "process": "Safari", "process_path": "/Applications/Safari.app/Contents/MacOS/Safari" },
+          { "process": "helper", "process_path": "/applications/safari.app/Contents/Helper" }
+        ]
+      },
+      "expected": [
+        { "kind": "folder", "key": "folder:/applications/safari.app/contents", "label": "/applications/safari.app/Contents", "ruleValue": "/applications/safari.app/Contents/*", "rows": [0, 1], "programs": 2, "header": true }
+      ]
+    },
+    {
+      "name": "a drive root never takes in the folders below it",
+      "input": {
+        "grouping": "folder",
+        "os": "windows",
+        "rows": [
+          { "process": "boot.exe", "process_path": "C:\\boot.exe" },
+          { "process": "t.exe", "process_path": "C:\\Tools\\t.exe" }
+        ]
+      },
+      "expected": [
+        { "kind": "folder", "key": "folder:c:\\", "label": "C:\\", "ruleValue": null, "rows": [0], "programs": 1, "header": true },
+        { "kind": "folder", "key": "folder:c:\\tools", "label": "C:\\Tools", "ruleValue": "C:\\Tools\\*", "rows": [1], "programs": 1, "header": true }
+      ]
+    },
+    {
+      "name": "the file-system root never takes in the folders below it",
+      "input": {
+        "grouping": "folder",
+        "os": "linux",
+        "rows": [
+          { "process": "init", "process_path": "/init" },
+          { "process": "x", "process_path": "/usr/bin/x" }
+        ]
+      },
+      "expected": [
+        { "kind": "folder", "key": "folder:/", "label": "/", "ruleValue": null, "rows": [0], "programs": 1, "header": true },
+        { "kind": "folder", "key": "folder:/usr/bin", "label": "/usr/bin", "ruleValue": "/usr/bin/*", "rows": [1], "programs": 1, "header": true }
+      ]
+    },
+    {
+      "name": "extended-length and UNC prefixes and forward slashes read as plain paths",
+      "input": {
+        "grouping": "folder",
+        "os": "windows",
+        "rows": [
+          { "process": "x.exe", "process_path": "\\\\?\\C:\\Games\\x.exe" },
+          { "process": "y.exe", "process_path": "C:/Games/Sub/y.exe" },
+          { "process": "z.exe", "process_path": "\\\\?\\UNC\\srv\\share\\app\\z.exe" },
+          { "process": "w.exe", "process_path": "\\\\srv\\share\\app\\w.exe" }
+        ]
+      },
+      "expected": [
+        { "kind": "folder", "key": "folder:\\\\srv\\share\\app", "label": "\\\\srv\\share\\app", "ruleValue": "\\\\srv\\share\\app\\*", "rows": [2, 3], "programs": 2, "header": true },
+        { "kind": "folder", "key": "folder:c:\\games", "label": "C:\\Games", "ruleValue": "C:\\Games\\*", "rows": [0, 1], "programs": 2, "header": true }
+      ]
+    },
+    {
+      "name": "paths that do not read join the rows without one",
+      "input": {
+        "grouping": "folder",
+        "os": "windows",
+        "rows": [
+          { "process": "a", "process_path": "C:\\a\\..\\x.exe" },
+          { "process": "b", "process_path": "C:\\a\\b\u0001\\x.exe" },
+          { "process": "c", "process_path": "D:" },
+          { "process": "d", "process_path": "\\\\server" },
+          { "process": "e", "process_path": "C:\\a:s\\x.exe" },
+          { "process": "f", "process_path": "relative\\f.exe" },
+          { "process": "g", "process_path": "  C:\\Ok\\g.exe  " }
+        ]
+      },
+      "expected": [
+        { "kind": "folder", "key": "folder:c:\\ok", "label": "C:\\Ok", "ruleValue": "C:\\Ok\\*", "rows": [6], "programs": 1, "header": true },
+        { "kind": "no-path", "key": "no-path", "label": "", "ruleValue": null, "rows": [0, 1, 2, 3, 4, 5], "programs": 6, "header": true }
+      ]
+    },
+    {
+      "name": "trailing dots and spaces of a windows folder are dropped",
+      "input": {
+        "grouping": "folder",
+        "os": "windows",
+        "rows": [
+          { "process": "x.exe", "process_path": "C:\\App. \\x.exe" },
+          { "process": "y.exe", "process_path": "C:\\App\\y.exe" }
+        ]
+      },
+      "expected": [
+        { "kind": "folder", "key": "folder:c:\\app", "label": "C:\\App", "ruleValue": "C:\\App\\*", "rows": [0, 1], "programs": 2, "header": true }
+      ]
+    },
+    {
+      "name": "by program: a repeated program gets a header, a program seen once does not",
+      "input": {
+        "grouping": "program",
+        "os": "windows",
+        "rows": [
+          { "process": "b.exe", "process_path": "C:\\B\\b.exe" },
+          { "process": "A.exe", "process_path": "C:\\A\\a.exe" },
+          { "process": "b.exe", "process_path": "D:\\Other\\b.exe" },
+          { "process": "", "process_path": "" }
+        ]
+      },
+      "expected": [
+        { "kind": "program", "key": "program:A.exe", "label": "A.exe", "ruleValue": null, "rows": [1], "programs": 1, "header": false },
+        { "kind": "program", "key": "program:b.exe", "label": "b.exe", "ruleValue": null, "rows": [0, 2], "programs": 2, "header": true },
+        { "kind": "program", "key": "program:—", "label": "—", "ruleValue": null, "rows": [3], "programs": 1, "header": false }
+      ]
+    },
+    {
+      "name": "no grouping has no groups",
+      "input": {
+        "grouping": "none",
+        "os": "windows",
+        "rows": [ { "process": "a.exe", "process_path": "C:\\A\\a.exe" } ]
+      },
+      "expected": []
+    },
+    {
+      "name": "an unknown grouping reads as no grouping",
+      "input": {
+        "grouping": "bogus",
+        "os": "linux",
+        "rows": [ { "process": "a", "process_path": "/opt/a" } ]
+      },
+      "expected": []
+    }
+  ]
+}

@@ -202,6 +202,11 @@ pub fn ipc_operation_timeout(op: IpcOperationName) -> Duration {
             Duration::from_secs(2)
         }
         IpcOperationName::VerifyVerdictsAccept => Duration::from_secs(30),
+        // Starting a site check only hands it to a thread, and its result is
+        // a read from memory; the check itself is bounded by the service.
+        IpcOperationName::SiteCheckRun | IpcOperationName::SiteCheckResultGet => {
+            Duration::from_secs(2)
+        }
     }
 }
 

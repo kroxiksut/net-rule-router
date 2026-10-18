@@ -147,6 +147,10 @@ mod tests {
         let (kept, withheld) = withhold_on(content.rule_book, true);
         assert_eq!(kept.primary.len(), 1);
         assert!(withheld.is_empty());
-        assert!(!EnforcementCapabilities::current().app_path_rules);
+        // Windows and Linux carry path rules out; macOS has no backend yet.
+        assert_eq!(
+            EnforcementCapabilities::current().app_path_rules,
+            !cfg!(target_os = "macos")
+        );
     }
 }

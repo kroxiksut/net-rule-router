@@ -1221,8 +1221,14 @@ fn capabilities() -> Vec<Capability> {
         },
         Capability {
             key: "appPathRules",
-            windows: NotOffered,
-            linux: NotOffered,
+            windows: Backed(vec![(
+                "core/platform/windows/src/app_path_resolver/windows_impl.rs",
+                "self.folders.programs(path, owner)",
+            )]),
+            linux: Backed(vec![(
+                "core/platform/linux/src/app_path_resolver.rs",
+                "self.folders.programs(path, owner)",
+            )]),
         },
         Capability {
             key: "perUserAllProtocolScoping",

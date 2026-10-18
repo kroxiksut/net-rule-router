@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleBook};
+use nrr_domain::protected_places::ProtectionReason;
 use nrr_domain::rule_shape::UnsupportedShapeReason;
 use nrr_domain::RuleAction;
 use nrr_shared::ipc_payloads::{RuleConflictDto, RuleConflictKind};
@@ -49,6 +50,15 @@ pub enum RuleConflict {
         pieces: usize,
         cap: usize,
     },
+    /// A rule by path whose place on disk is protected — a link into a system
+    /// folder, say — applies nothing.
+    PathProtected {
+        rule_id: String,
+        reason: ProtectionReason,
+    },
+    /// A rule by folder covers the first `covered` programs of a folder that
+    /// holds more.
+    FolderOverCap { rule_id: String, covered: usize },
 }
 
 /// One address rule's fan-out: decides per target whether the rule's filter
@@ -162,6 +172,12 @@ pub fn rule_conflict_dtos(
             .map(display_value)
             .unwrap_or_default()
     };
+    let app_of = |rule_id: &str| -> String {
+        rule_of(rule_id)
+            .and_then(|r| r.app_match.as_ref())
+            .map(|a| a.pattern.as_str().to_string())
+            .unwrap_or_default()
+    };
     conflicts
         .iter()
         .map(|c| match c {
@@ -210,10 +226,31 @@ pub fn rule_conflict_dtos(
                 other_rule_id: String::new(),
                 host: String::new(),
                 via_host: String::new(),
-                app: rule_of(rule_id)
-                    .and_then(|r| r.app_match.as_ref())
-                    .map(|a| a.pattern.as_str().to_string())
-                    .unwrap_or_default(),
+                app: app_of(rule_id),
+                reason: String::new(),
+            },
+            RuleConflict::PathProtected { rule_id, reason } => RuleConflictDto {
+                kind: RuleConflictKind::ProtectedTarget,
+                rule_id: rule_id.clone(),
+                rule_value: app_of(rule_id),
+                ip: String::new(),
+                count: 0,
+                other_rule_id: String::new(),
+                host: String::new(),
+                via_host: String::new(),
+                app: app_of(rule_id),
+                reason: reason.slug().to_string(),
+            },
+            RuleConflict::FolderOverCap { rule_id, covered } => RuleConflictDto {
+                kind: RuleConflictKind::FolderOverCap,
+                rule_id: rule_id.clone(),
+                rule_value: app_of(rule_id),
+                ip: String::new(),
+                count: u32::try_from(*covered).unwrap_or(u32::MAX),
+                other_rule_id: String::new(),
+                host: String::new(),
+                via_host: String::new(),
+                app: app_of(rule_id),
                 reason: String::new(),
             },
             RuleConflict::NetworkCarvingOverCap { rule_id, .. } => RuleConflictDto {

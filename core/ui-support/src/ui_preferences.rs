@@ -133,6 +133,11 @@ pub fn clamp_update_check_interval_days(days: u32) -> u32 {
         .unwrap_or(UPDATE_CHECK_INTERVAL_DAYS_CHOICES[0])
 }
 
+/// Accepted groupings of the connection trace list, and the default: the
+/// slugs of `nrr_client_logic::conn_trace::TraceGrouping`.
+pub const CONN_TRACE_GROUPINGS: [&str; 3] = ["none", "program", "folder"];
+pub const CONN_TRACE_GROUPING_DEFAULT: &str = "program";
+
 /// Accepted byte units for the traffic CSV export, and the default. Megabytes
 /// read best for a monthly report; the exporter still accepts every slug here.
 pub const TRAFFIC_EXPORT_UNITS: [&str; 4] = ["bytes", "kb", "mb", "gb"];
@@ -276,6 +281,9 @@ pub struct UiPreferences {
     /// one unit does not re-pick it on every export. Pure device-local UI
     /// state; the exporter re-validates the slug and falls back on its own.
     pub traffic_export_unit: String,
+    /// How the connection trace list is grouped, one of
+    /// [`CONN_TRACE_GROUPINGS`]. Pure device-local UI display state.
+    pub conn_trace_group_by: String,
     /// Privacy tier the diagnostics support archive is exported at:
     /// `"standard"` (default, redacted) or `"diagnostics"` (extra detail).
     /// Both export surfaces share this one choice; persisting it means a user

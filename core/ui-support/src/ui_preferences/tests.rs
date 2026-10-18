@@ -304,6 +304,8 @@ fn save_then_load_roundtrip_is_stable() {
         traffic_stats_period: "session".to_string(),
         // Non-default (default is "mb") — proves the field persists.
         traffic_export_unit: "gb".to_string(),
+        // Non-default (default is "program") — proves the field persists.
+        conn_trace_group_by: "folder".to_string(),
         // Non-default values (defaults: "standard" / true) — prove the
         // support-archive export options persist across save/load.
         diagnostics_archive_redaction_level: "diagnostics".to_string(),
@@ -1375,6 +1377,23 @@ fn policy_and_period_slugs_off_their_lists_keep_the_default() {
     }
     assert!(super::SHARED_IP_POLICIES.contains(&default.route_shared_ip_policy.as_str()));
     assert!(super::TRAFFIC_STATS_PERIODS.contains(&default.traffic_stats_period.as_str()));
+}
+
+#[test]
+fn a_trace_grouping_off_its_list_keeps_the_default() {
+    let default = UiPreferences::default();
+    for garbage in ["Folder", "by-folder", ""] {
+        let parsed = parse_preferences(&format!("conn_trace_group_by={garbage}\n"));
+        assert_eq!(parsed.conn_trace_group_by, default.conn_trace_group_by);
+    }
+    for slug in super::CONN_TRACE_GROUPINGS {
+        let parsed = parse_preferences(&format!("conn_trace_group_by={slug}\n"));
+        assert_eq!(parsed.conn_trace_group_by, slug);
+    }
+    assert_eq!(
+        default.conn_trace_group_by,
+        super::CONN_TRACE_GROUPING_DEFAULT
+    );
 }
 
 #[test]

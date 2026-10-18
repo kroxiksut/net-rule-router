@@ -871,6 +871,29 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 )),
             });
             deps = deps.with_auto_rule_probe(probe_runner);
+            // "Is it us or the site?": the same probe and links, the caller's
+            // own trace and ledger, and the routes the explain probe answers.
+            let routes =
+                nrr_service_runtime::site_check::ExplainRoutes::new(deps.diagnostics.clone());
+            let site_check = nrr_service_runtime::site_check::SiteCheckWiring {
+                probe: Arc::new(nrr_service_runtime::path_probe::SystemPathProbe),
+                egress: Arc::clone(coord)
+                    as Arc<dyn nrr_service_runtime::production_auto_rule_probe::EgressSources>,
+                cache: Arc::new(SqliteFqdnCacheLookup::new(
+                    Arc::clone(cache_arc),
+                    FreshnessThresholds::default_production(),
+                )),
+                routes: Arc::new(routes),
+                engine: Some(Arc::clone(engine)),
+                trace: conn_trace_ring.clone(),
+                https: nrr_service_runtime::site_check::https_head::RustlsHttpsHead::new(Arc::new(
+                    nrr_service_runtime::path_probe::SystemPathProbe,
+                ))
+                .map(|h| Arc::new(h) as Arc<dyn nrr_service_runtime::site_check::HttpsHead>),
+            };
+            deps = deps.with_site_check(Arc::new(
+                nrr_service_runtime::site_check::SiteChecker::new(site_check),
+            ));
         }
         // The one fact about a routed site nothing here can measure: the user
         // says it, and it only ever un-quietens that site's companions.

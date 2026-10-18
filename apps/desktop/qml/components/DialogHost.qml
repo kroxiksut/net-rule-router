@@ -47,6 +47,7 @@ Item {
     property alias driftDetectionDialog: driftDetectionDialog
     property alias driftClearAllConfirmDialog: driftClearAllConfirmDialog
     property alias mergeReviewDialog: mergeReviewDialog
+    property alias rulesFileEditedDialog: rulesFileEditedDialog
     property alias rulesOverlapCleanupDialog: rulesOverlapCleanupDialog
     property alias saveBeforeCloseDialog: saveBeforeCloseDialog
     property alias factoryPresetSaveDialog: factoryPresetSaveDialog
@@ -199,6 +200,14 @@ Item {
     UacRequiredDialog {
         id: uacRequiredDialog
         ownerRoot: dialogHost.ownerRoot
+    }
+
+    RulesFileEditedDialog {
+        id: rulesFileEditedDialog
+        ownerRoot: dialogHost.ownerRoot
+        onTakeFiles: ownerRoot.boundFilesController.takeHandEditedFiles()
+        onOverwriteFiles: ownerRoot.boundFilesController.overwriteHandEditedFiles(
+            rulesFileEditedDialog.targets)
     }
 
     ReloadFromServiceConfirmDialog {

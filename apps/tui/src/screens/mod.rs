@@ -204,6 +204,42 @@ pub trait Screen {
     fn plain_prompt(&self, _app: &AppState) -> Option<Key> {
         None
     }
+
+    /// Line mode printed the screen: a number typed next means an item as
+    /// printed now, whatever the list has become by then.
+    fn on_printed(&self, _app: &mut AppState) {}
+}
+
+/// Where line mode's item `n` (from 1) stands now. `printed` is the list as
+/// it was printed, `now` as it is, both by an identity of the item; nothing
+/// printed yet means the list as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Numbered {
+    At(usize),
+    /// The item printed under that number has left the list.
+    Gone,
+    /// No item was printed under that number.
+    NoSuch,
+}
+
+pub fn numbered_now(printed: &[String], now: &[String], n: usize) -> Numbered {
+    let Some(at) = n.checked_sub(1) else {
+        return Numbered::NoSuch;
+    };
+    if printed.is_empty() {
+        return if at < now.len() {
+            Numbered::At(at)
+        } else {
+            Numbered::NoSuch
+        };
+    }
+    match printed.get(at) {
+        None => Numbered::NoSuch,
+        Some(item) => now
+            .iter()
+            .position(|x| x == item)
+            .map_or(Numbered::Gone, Numbered::At),
+    }
 }
 
 pub fn screen(id: ScreenId) -> &'static dyn Screen {
@@ -236,6 +272,26 @@ pub const COMMON_HELP: &[Key] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn list(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// A number names what was printed under it, wherever that item went.
+    #[test]
+    fn a_typed_number_follows_the_printed_item() {
+        let printed = list(&["a", "b", "c"]);
+        let now = list(&["new", "a", "c", "b"]);
+        assert_eq!(numbered_now(&printed, &now, 2), Numbered::At(3));
+        assert_eq!(
+            numbered_now(&printed, &list(&["a", "c"]), 2),
+            Numbered::Gone
+        );
+        assert_eq!(numbered_now(&printed, &now, 4), Numbered::NoSuch);
+        assert_eq!(numbered_now(&printed, &now, 0), Numbered::NoSuch);
+        assert_eq!(numbered_now(&[], &now, 4), Numbered::At(3));
+        assert_eq!(numbered_now(&[], &now, 5), Numbered::NoSuch);
+    }
 
     #[test]
     fn hotkeys_run_one_to_nine_then_zero_and_back() {

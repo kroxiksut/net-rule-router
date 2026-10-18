@@ -11,7 +11,7 @@ use nrr_client_logic::review::{
     operation_outcome, preview_outcome, preview_refusal, refusal_detail, review_summary_is_empty,
     Outcome,
 };
-use nrr_client_logic::rules_table::{rule_row_to_wire_dto, RuleRow, WireDtoOptions};
+use nrr_client_logic::rules_table::{rule_row_to_wire_dto, RuleRow, WireDtoOptions, WireRefusal};
 use nrr_client_logic::Route;
 use nrr_ipc_client::{ipc_error_to_wire, ipc_operation_timeout, IpcClient, IpcClientError};
 use nrr_shared::ipc::IpcOperationName;
@@ -101,7 +101,9 @@ pub struct Pending {
 
 /// Rules as the canonical rules-json (`_buildRulesJsonFromModel`): a rule
 /// rides in its route's bucket, a pseudo-route in the secondary one.
-pub fn book_of<'a>(rules: impl IntoIterator<Item = &'a RuleRow>) -> CanonicalRulesJsonV1 {
+pub fn book_of<'a>(
+    rules: impl IntoIterator<Item = &'a RuleRow>,
+) -> Result<CanonicalRulesJsonV1, WireRefusal> {
     let encode: &dyn Fn(&str) -> String = &ace::encode;
     let mut book = CanonicalRulesJsonV1 {
         schema_version: RULES_JSON_SCHEMA_VERSION,
@@ -109,25 +111,27 @@ pub fn book_of<'a>(rules: impl IntoIterator<Item = &'a RuleRow>) -> CanonicalRul
         secondary: Vec::new(),
     };
     for rule in rules {
-        let dto = rule_row_to_wire_dto(rule, Some(encode), WireDtoOptions::FULL);
+        let dto = rule_row_to_wire_dto(rule, Some(encode), WireDtoOptions::FULL)?;
         if rule.target_route.bucket() == Some(Route::Secondary) {
             book.secondary.push(dto);
         } else {
             book.primary.push(dto);
         }
     }
-    book
+    Ok(book)
 }
 
-/// The rows on screen as one rules payload, built on the rules named `base`.
+/// The rows on screen as one rules payload, built on the rules named `base`;
+/// the refusal names the client error code that says why there is none.
 pub fn pending_from(
     table: &Table,
     admin_baseline: bool,
     base_revision: Option<&str>,
-) -> Option<Pending> {
-    let rules_json = to_canonical_string(&book_of(table.rules())).ok()?;
+) -> Result<Pending, Failure> {
+    let book = book_of(table.rules()).map_err(|refusal| Failure::code(refusal.code()))?;
+    let rules_json = to_canonical_string(&book).map_err(|_| Failure::code("gui-internal"))?;
     let content_hash = format!("{:x}", Sha256::digest(rules_json.as_bytes()));
-    Some(Pending {
+    Ok(Pending {
         rules_json,
         content_hash,
         correlation_id: correlation_id("tui-apply"),

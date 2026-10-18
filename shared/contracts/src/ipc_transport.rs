@@ -771,6 +771,11 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         IpcOperationName::ConnHistoryClear | IpcOperationName::ConnHistorySettingsSet => {
             IpcOperationClass::UserScopedConfiguration
         }
+        // Connections made on the caller's behalf: audited like the suggestion
+        // probe, which is the same kind of act. The reply comes at once, so
+        // the mutation slot is held only while the check is handed over.
+        IpcOperationName::SiteCheckRun => IpcOperationClass::UserScopedConfiguration,
+        IpcOperationName::SiteCheckResultGet => IpcOperationClass::ReadSnapshot,
     }
 }
 

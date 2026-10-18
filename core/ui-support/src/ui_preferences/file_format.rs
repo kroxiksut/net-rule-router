@@ -256,6 +256,13 @@ pub(super) fn parse_preferences_with(
                     preferences.traffic_export_unit = value.to_string();
                 }
             }
+            "conn_trace_group_by" => {
+                preferences.conn_trace_group_by = allowed_slug_or(
+                    value,
+                    &CONN_TRACE_GROUPINGS,
+                    &preferences.conn_trace_group_by,
+                );
+            }
             // Remembered support-archive privacy tier. Only a known slug is
             // accepted, so a hand-edited or older file cannot leave the export
             // pointing at a tier the archive writer does not implement.
@@ -724,6 +731,7 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
             "missing_secondary_banner_acknowledged={}\n",
             "traffic_stats_period={}\n",
             "traffic_export_unit={}\n",
+            "conn_trace_group_by={}\n",
             "diagnostics_archive_redaction_level={}\n",
             "diagnostics_archive_session_only={}\n",
             "archive_log_budget_mib={}\n",
@@ -820,6 +828,7 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
         one_line(&preferences.missing_secondary_banner_acknowledged),
         one_line(&preferences.traffic_stats_period),
         one_line(&preferences.traffic_export_unit),
+        one_line(&preferences.conn_trace_group_by),
         one_line(&preferences.diagnostics_archive_redaction_level),
         one_line(&preferences.diagnostics_archive_session_only),
         one_line(&preferences.archive_log_budget_mib),

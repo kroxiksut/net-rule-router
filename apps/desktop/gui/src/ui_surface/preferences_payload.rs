@@ -238,6 +238,13 @@ impl QtPreferencesPayload {
         }) {
             current.traffic_export_unit = unit;
         }
+        if let Some(grouping) = self.conn_trace_group_by {
+            current.conn_trace_group_by = allowed_slug_or(
+                &grouping,
+                &nrr_ui_support::ui_preferences::CONN_TRACE_GROUPINGS,
+                &current.conn_trace_group_by,
+            );
+        }
         // Same allow-list gate: no tier the archive writer does not implement.
         if let Some(level) = self.diagnostics_archive_redaction_level.filter(|level| {
             nrr_ui_support::ui_preferences::DIAGNOSTICS_ARCHIVE_REDACTION_LEVELS

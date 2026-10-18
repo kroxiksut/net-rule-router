@@ -469,7 +469,11 @@ fn overlaps_with(
         Some(i) => rules[i] = candidate,
         None => rules.push(candidate),
     }
-    let pairs = find_route_overlaps(&book_of(&rules), include_subdomains);
+    // A value the wire refuses has no overlaps to show; the form says why.
+    let Ok(book) = book_of(&rules) else {
+        return Vec::new();
+    };
+    let pairs = find_route_overlaps(&book, include_subdomains);
     // Ids are unique across both routes; a block rule rides in the secondary
     // bucket but is not a route.
     let route_of = |side: &OverlapRule| -> String {

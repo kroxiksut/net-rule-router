@@ -538,6 +538,7 @@ fn conflict_text(conflict: &RuleConflictDto, texts: &Texts) -> String {
         RuleConflictKind::BlockLeaksSharedAddress => keys::CONFLICT_LEAK,
         RuleConflictKind::NetworkCarvingOverCap => keys::CONFLICT_CARVING_OVER_CAP,
         RuleConflictKind::ProtectedTarget => keys::CONFLICT_PROTECTED,
+        RuleConflictKind::FolderOverCap => keys::CONFLICT_FOLDER_OVER_CAP,
     };
     // The protection says why in the rules table's own words.
     let reason = nrr_domain::protected_places::ProtectionReason::from_slug(&conflict.reason)
@@ -567,8 +568,13 @@ fn conflict_text(conflict: &RuleConflictDto, texts: &Texts) -> String {
             ("via", display_text(&conflict.via_host)),
             ("ip", conflict.ip.as_str().into()),
             ("reason", reason.into()),
+            ("count", conflict.count.to_string().into()),
         ],
     );
+    // A folder's count is the programs it covers, not more addresses.
+    if conflict.kind == RuleConflictKind::FolderOverCap {
+        return text;
+    }
     let more = conflict.count.saturating_sub(1);
     if more > 0 {
         text.push(' ');

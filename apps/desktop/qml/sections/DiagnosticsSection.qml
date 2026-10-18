@@ -295,6 +295,7 @@ ScrollView {
     onVisibleChanged: {
         if (visible) {
             section._consumePendingExplainHost()
+            section._consumePendingSiteCheck()
             root.refreshDiagnosticsOnPageOpen()
         }
     }
@@ -305,6 +306,10 @@ ScrollView {
         function onPendingExplainHostChanged() {
             if (section.visible)
                 Qt.callLater(section._consumePendingExplainHost)
+        }
+        function onPendingSiteCheckHostChanged() {
+            if (section.visible)
+                Qt.callLater(section._consumePendingSiteCheck)
         }
     }
     function serviceStateLabel(state) {
@@ -338,6 +343,18 @@ ScrollView {
             flick.contentY = Math.max(0,
                 Math.min(explainPanel.y, flick.contentHeight - flick.height))
             explainPanel.focusInput()
+        })
+    }
+    function _consumePendingSiteCheck() {
+        var nc = root.notificationsController
+        var host = String(nc.pendingSiteCheckHost || "").trim()
+        if (host === "") return
+        nc.pendingSiteCheckHost = ""
+        siteCheckPanel.check(host)
+        Qt.callLater(function() {
+            var flick = section.contentItem
+            flick.contentY = Math.max(0,
+                Math.min(siteCheckPanel.y, flick.contentHeight - flick.height))
         })
     }
     Connections {
@@ -1052,6 +1069,13 @@ ScrollView {
         // connection trace land here with the destination already filled in.
         RuleDiagnosticsPanel {
             id: explainPanel
+            root: section.root
+        }
+
+        // "Is it us or the site?" The trace and the site notices land here
+        // with the site already filled in.
+        SiteCheckPanel {
+            id: siteCheckPanel
             root: section.root
         }
 

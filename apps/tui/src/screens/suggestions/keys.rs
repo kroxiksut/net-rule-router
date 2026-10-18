@@ -202,6 +202,10 @@ pub const NO_ITEM: Key = key(
     "tui.suggestions.no-item",
     "There is no item {n} in the list. Use the number shown before an item.",
 );
+pub const ITEM_GONE: Key = key(
+    "tui.suggestions.item-gone",
+    "Item {n} as it was listed is no longer offered. Here is the list as it is now.",
+);
 pub const NOTHING_TO_DO: Key = key(
     "tui.suggestions.nothing-to-do",
     "Item {n} has nothing this command can act on.",
@@ -246,6 +250,10 @@ pub const HELP_KEYS: &[Key] = &[
         "c: check the addresses over the main connection",
     ),
     key(
+        "tui.suggestions.help.check-site",
+        "k: for a site you opened that keeps failing, check whether the network or the site is at fault (opens Diagnostics)",
+    ),
+    key(
         "tui.suggestions.help.toggles",
         "s: show or hide answered addresses; v: show or hide addresses the main connection handles",
     ),
@@ -279,6 +287,10 @@ pub const PLAIN_KEYS: &[Key] = &[
     key(
         "tui.suggestions.plain.check",
         "c: check the addresses over the main connection",
+    ),
+    key(
+        "tui.suggestions.plain.check-site",
+        "k and an item number: check that site, whether the network or the site is at fault",
     ),
     key(
         "tui.suggestions.plain.toggles",
@@ -346,6 +358,7 @@ pub fn all() -> Vec<Key> {
         AUTO_ON,
         FAILED,
         NO_ITEM,
+        ITEM_GONE,
         NOTHING_TO_DO,
         CONFIRM,
         CONFIRM_PROMPT,

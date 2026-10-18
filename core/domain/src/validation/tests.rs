@@ -1405,3 +1405,53 @@ fn a_path_is_bounded_by_its_own_limit_and_a_name_by_the_shorter_one() {
         Err(ValidationError::AppNameInvalid { .. })
     ));
 }
+
+/// A program written in an address section is refused with one section on
+/// every host: the value says which platform it is spelled for, the host
+/// reading the file does not.
+#[test]
+fn a_program_in_an_address_section_names_the_same_section_on_any_host() {
+    let rule_id = RuleId("r-1".to_string());
+    for (value, belongs_in) in [
+        ("chrome.exe", RulesFileSection::Windows),
+        (r"C:\Apps\tool.exe", RulesFileSection::Windows),
+        ("nord*", RulesFileSection::Windows),
+        ("/usr/bin/firefox", RulesFileSection::Linux),
+    ] {
+        let mut warnings = Vec::new();
+        let refusals = [
+            canonical_ip_address(value, &rule_id, &mut warnings).map(drop),
+            canonical_subnet(value, &rule_id, &mut warnings).map(drop),
+            canonical_ip_range(value, &rule_id, &mut warnings).map(drop),
+        ];
+        for refusal in refusals {
+            assert!(
+                matches!(
+                    &refusal,
+                    Err(ValidationError::WrongSection { belongs_in: b, .. }) if *b == belongs_in
+                ),
+                "{value}: {refusal:?}"
+            );
+        }
+        for platform in [
+            HostPlatform::Windows,
+            HostPlatform::Linux,
+            HostPlatform::MacOS,
+        ] {
+            for section in [
+                ParsedRuleType::ExactIp,
+                ParsedRuleType::Subnet,
+                ParsedRuleType::IpRange,
+            ] {
+                let refusal = misplaced_value(section, value, &rule_id, platform);
+                assert!(
+                    matches!(
+                        &refusal,
+                        Some(ValidationError::WrongSection { belongs_in: b, .. }) if *b == belongs_in
+                    ),
+                    "{value} in {section:?} read on {platform:?}: {refusal:?}"
+                );
+            }
+        }
+    }
+}

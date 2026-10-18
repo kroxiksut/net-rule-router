@@ -1,7 +1,9 @@
 ﻿name: windows-quality
 
 on:
+  # Other branches are checked through their pull request, not twice.
   push:
+    branches: [main]
   pull_request:
 
 permissions:

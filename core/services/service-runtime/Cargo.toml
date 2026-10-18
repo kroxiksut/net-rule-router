@@ -66,7 +66,7 @@ base64 = "0.22"
 # flows addressed to the fake pool. Minimal feature set — IP medium only
 # (the TUN adapter is L3), v4+v6, TCP sockets; UDP replies are hand-built
 # with the `wire` types, so no UDP socket machinery is pulled in.
-smoltcp = { version = "0.13", default-features = false, features = [
+smoltcp = { version = "0.14", default-features = false, features = [
     "std",
     "medium-ip",
     "proto-ipv4",
@@ -74,6 +74,12 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "socket-tcp",
     "socket-udp",
 ] }
+# The site check reads a site's HTTPS status and `Location` over the route's
+# own socket. The versions and features the launcher's `ureq` already locks:
+# no new crate enters the build, and `ring` keeps `aws-lc-rs` out. The
+# Mozilla roots verify the certificate; an untrusted one is itself a finding.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 # Fake-IP relay dialer: `std` cannot bind a TCP socket's source address before
 # connecting; `socket2` can, and that bind is how a relayed flow is steered
 # onto the adapter its route policy chose.

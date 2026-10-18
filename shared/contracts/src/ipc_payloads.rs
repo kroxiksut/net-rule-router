@@ -581,6 +581,10 @@ pub struct StatusUpdatesSubscribeResponse {
     pub gap_detected: bool,
 }
 
+/// `RevisionStatusChanged::status` of a reset to the baseline. It names no
+/// revision: the user's own are gone and the baseline is in force again.
+pub const REVISION_STATUS_RESET_TO_BASELINE: &str = "reset-to-baseline";
+
 /// Status events the service pushes to subscribers — to every one, or only to
 /// the principal [`StatusUpdateEvent::addressee`] names. New variants append;
 /// clients that don't recognise a kind drop it.
@@ -628,7 +632,8 @@ pub enum StatusUpdateEvent {
     SecurityAlertsChanged,
     // ── Settings push events ──────────────────────────────────────
     /// A revision row's status changed (candidate → active → superseded
-    /// / rolled-back / rejected). GUI may refresh its pending list.
+    /// / rolled-back / rejected), or the user was reset to the baseline
+    /// ([`REVISION_STATUS_RESET_TO_BASELINE`]). Clients re-read the rules.
     RevisionStatusChanged {
         revision_id: String,
         status: String,
@@ -1199,6 +1204,9 @@ pub enum RuleConflictKind {
     /// additional route, so it is not applied; `reason` says which protection.
     /// `ip` is empty and `count` zero.
     ProtectedTarget,
+    /// A rule by folder covers the first `count` programs of a folder that
+    /// holds more; the rest are not covered. `ip` is empty.
+    FolderOverCap,
 }
 
 /// Compact summary of a revision row surfaced in
@@ -1244,6 +1252,8 @@ mod recent_changes;
 pub use recent_changes::*;
 mod conn_history;
 pub use conn_history::*;
+mod site_check;
+pub use site_check::*;
 // ── Serde defaults shared by more than one payload group ─────────────────
 //
 // A default named by two groups belongs to neither: a child module cannot

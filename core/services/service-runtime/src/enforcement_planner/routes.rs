@@ -257,11 +257,10 @@ fn plan_host_routes(
         }
         let mut per_rule = 0usize;
         if let Some(app) = rule.app_match.as_ref() {
+            // A rule by path is observed under its canonical spelling.
             let pattern = match &app.pattern {
                 CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.as_str(),
-                // TODO: a path rule is enforced once the platform can list the
-                // programs of a folder; until then it routes nothing.
-                CanonicalAppPattern::Path(_) => continue,
+                CanonicalAppPattern::Path(path) => path.as_str(),
             };
             for ip in gate.admit(pattern, link).admitted {
                 if !push_host_route(IpAddr::V4(ip), &egress, seen, out, &mut per_rule) {

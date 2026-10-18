@@ -266,6 +266,27 @@ fn conflicts_in_the_applied_rules_are_worded() {
     );
 }
 
+/// A folder's count is how many programs the rule covers, never "more
+/// addresses".
+#[test]
+fn a_folder_larger_than_the_cap_says_how_much_it_covers() {
+    let conflict: RuleConflictDto = serde_json::from_value(json!({
+        "kind": "folder-over-cap",
+        "rule-id": "R-10",
+        "rule-value": "/opt/tools/*",
+        "ip": "",
+        "count": 64,
+        "app": "/opt/tools/*"
+    }))
+    .expect("conflict");
+    let text = conflict_text(&conflict, &texts_en());
+    assert!(
+        text.starts_with("/opt/tools/* covers the first 64 programs of its folder."),
+        "{text}"
+    );
+    assert!(!text.contains("Addresses affected"), "{text}");
+}
+
 #[test]
 fn line_mode_offers_the_same_answers_by_number() {
     let fake = service();

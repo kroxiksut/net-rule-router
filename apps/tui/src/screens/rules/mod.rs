@@ -18,12 +18,14 @@ mod table;
 mod text;
 pub mod verdicts;
 
+pub use bulk::start_moving;
+
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nrr_client_logic::rule_value_class::misplaced_target_type;
 use nrr_client_logic::rules_table::{search_box_text, RuleRow, RuleType, TargetRoute};
-use nrr_shared::ipc_payloads::RulesListResponse;
+use nrr_shared::ipc_payloads::{RulesListResponse, RULES_CHANGED_ELSEWHERE};
 use nrr_shared::rules_json::FREE_MAX_RULES;
 use nrr_shared::rules_overlap::{find_route_overlaps, RouteOverlap};
 use nrr_shared::user_settings::UserSettingsError;
@@ -74,11 +76,21 @@ pub enum ChoicePurpose {
     Delete(usize),
     Reload,
     Quit,
-    ImportMode { set: Box<RuleSet>, path: String },
+    ImportMode {
+        set: Box<RuleSet>,
+        path: String,
+    },
     Preset(SetList),
     Overwrite(PathBuf),
     Recent,
     Restore(usize),
+    /// Bound files edited by hand since this program wrote them, which a
+    /// write of the rules in force would have replaced: take them or replace
+    /// them.
+    HandEdited(Vec<(nrr_client_logic::Route, PathBuf)>),
+    /// The apply was refused as built on rules no longer in force: put the
+    /// edits on top of the rules now in force, or keep the list as it is.
+    ChangedElsewhere,
 }
 
 /// The rule sets offered, and where they came from.
@@ -217,6 +229,17 @@ pub struct RulesState {
     /// The `base-revision` of the rules on screen: what the next apply is
     /// built on. `None` until a read names it.
     pub base_revision: Option<String>,
+    /// An add form another screen asked for while the list was being read;
+    /// it opens once the list is in, so the read cannot replace the rule.
+    prefilled: Option<Box<Form>>,
+    /// The rules changed elsewhere while the list was not free to be re-read;
+    /// it is re-read once it is ([`settle`]).
+    reread_due: bool,
+    /// Line mode: the visible rules as last printed (`merge_key`), so `t 3`
+    /// switches the rule the user read as the third.
+    printed: Vec<String>,
+    /// Edits waiting for the re-read they are laid over, then reviewed.
+    rebase: Option<table::Edits>,
 }
 
 impl RulesState {
@@ -305,7 +328,7 @@ impl Screen for RulesScreen {
     }
 
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
-        match std::mem::take(&mut app.rules.mode) {
+        let handled = match std::mem::take(&mut app.rules.mode) {
             Mode::List => list_key(app, key),
             Mode::Input(input) => input_key(app, input, key),
             Mode::Form(form) => form_key(app, form, key),
@@ -313,95 +336,24 @@ impl Screen for RulesScreen {
             Mode::Review(review) => review_key(app, review, key),
             Mode::Gateway(stage) => gateway::on_key(app, *stage, key),
             Mode::Bulk(form) => bulk::on_key(app, form, key),
-        }
+        };
+        settle(app);
+        handled
     }
 
     fn on_line(&self, app: &mut AppState, line: &str) -> bool {
-        match std::mem::take(&mut app.rules.mode) {
-            Mode::List => list_line(app, line),
-            Mode::Input(input) => {
-                if line == "!" {
-                    if input.purpose == InputPurpose::VerdictFolder {
-                        verdicts::not_now(app);
-                    }
-                    return true;
-                }
-                let mut input = input;
-                if !line.is_empty() {
-                    input.text = line.to_owned();
-                }
-                commit_input(app, input);
-                true
-            }
-            Mode::Form(mut form) => {
-                if line == "!" {
-                    return true;
-                }
-                if line == "!t" {
-                    form.switch_type();
-                    refresh_form(app, &mut form);
-                    app.rules.mode = Mode::Form(form);
-                    return true;
-                }
-                // The number past the last type: several rules instead.
-                let several = (offered_types().len() + 1).to_string();
-                if form.editing.is_none() && form.field == Field::Type && line == several {
-                    return bulk::start(app, form.route.clone(), form.value.clone(), true);
-                }
-                if form.answer(line) {
-                    save_form(app, form);
-                } else {
-                    refresh_form(app, &mut form);
-                    app.rules.mode = Mode::Form(form);
-                }
-                true
-            }
-            Mode::Choice(mut choice) => {
-                if line == "!" {
-                    cancel_choice(app, choice);
-                    return true;
-                }
-                let count = render::choice_len(&choice.purpose);
-                match line.parse::<usize>() {
-                    Ok(n) if (1..=count).contains(&n) => {
-                        choice.cursor = n - 1;
-                        pick(app, choice);
-                    }
-                    _ => app.rules.mode = Mode::Choice(choice),
-                }
-                true
-            }
-            Mode::Review(mut review) => {
-                match line {
-                    "y" | "Y" => confirm(app, review),
-                    "n" | "N" => {}
-                    "c" | "C" if review.is_critical() => {
-                        review.understood = !review.understood;
-                        app.rules.mode = Mode::Review(review);
-                    }
-                    ">" => {
-                        review.scroll = review.scroll.saturating_add(render::REVIEW_PAGE);
-                        app.rules.mode = Mode::Review(review);
-                    }
-                    "<" => {
-                        review.scroll = review.scroll.saturating_sub(render::REVIEW_PAGE);
-                        app.rules.mode = Mode::Review(review);
-                    }
-                    _ => app.rules.mode = Mode::Review(review),
-                }
-                true
-            }
-            Mode::Gateway(stage) => {
-                gateway::on_line(app, *stage, line);
-                true
-            }
-            Mode::Bulk(form) => {
-                if line != "!" {
-                    bulk::on_line(app, form, line);
-                }
-                true
-            }
-        }
+        let handled = line_in_mode(app, line);
+        settle(app);
+        handled
+    }
+
+    fn on_printed(&self, app: &mut AppState) {
+        let table = &app.rules.table;
+        app.rules.printed = table
+            .visible()
+            .iter()
+            .map(|&i| table.rows[i].rule.merge_key())
+            .collect();
     }
 
     fn plain_prompt(&self, app: &AppState) -> Option<Key> {
@@ -415,6 +367,95 @@ impl Screen for RulesScreen {
             Mode::Review(_) => Some(text::PLAIN_REVIEW_PROMPT),
             Mode::Gateway(stage) => gateway::plain_prompt(stage),
             Mode::Bulk(form) => Some(bulk::plain_prompt(form)),
+        }
+    }
+}
+
+/// A line typed in `--plain`, by what the screen is doing.
+fn line_in_mode(app: &mut AppState, line: &str) -> bool {
+    match std::mem::take(&mut app.rules.mode) {
+        Mode::List => list_line(app, line),
+        Mode::Input(input) => {
+            if line == "!" {
+                if input.purpose == InputPurpose::VerdictFolder {
+                    verdicts::not_now(app);
+                }
+                return true;
+            }
+            let mut input = input;
+            if !line.is_empty() {
+                input.text = line.to_owned();
+            }
+            commit_input(app, input);
+            true
+        }
+        Mode::Form(mut form) => {
+            if line == "!" {
+                return true;
+            }
+            if line == "!t" {
+                form.switch_type();
+                refresh_form(app, &mut form);
+                app.rules.mode = Mode::Form(form);
+                return true;
+            }
+            // The number past the last type: several rules instead.
+            let several = (offered_types().len() + 1).to_string();
+            if form.editing.is_none() && form.field == Field::Type && line == several {
+                return bulk::start(app, form.route.clone(), form.value.clone(), true);
+            }
+            if form.answer(line) {
+                save_form(app, form);
+            } else {
+                refresh_form(app, &mut form);
+                app.rules.mode = Mode::Form(form);
+            }
+            true
+        }
+        Mode::Choice(mut choice) => {
+            if line == "!" {
+                cancel_choice(app, choice);
+                return true;
+            }
+            let count = render::choice_len(&choice.purpose);
+            match line.parse::<usize>() {
+                Ok(n) if (1..=count).contains(&n) => {
+                    choice.cursor = n - 1;
+                    pick(app, choice);
+                }
+                _ => app.rules.mode = Mode::Choice(choice),
+            }
+            true
+        }
+        Mode::Review(mut review) => {
+            match line {
+                "y" | "Y" => confirm(app, review),
+                "n" | "N" => {}
+                "c" | "C" if review.is_critical() => {
+                    review.understood = !review.understood;
+                    app.rules.mode = Mode::Review(review);
+                }
+                ">" => {
+                    review.scroll = review.scroll.saturating_add(render::REVIEW_PAGE);
+                    app.rules.mode = Mode::Review(review);
+                }
+                "<" => {
+                    review.scroll = review.scroll.saturating_sub(render::REVIEW_PAGE);
+                    app.rules.mode = Mode::Review(review);
+                }
+                _ => app.rules.mode = Mode::Review(review),
+            }
+            true
+        }
+        Mode::Gateway(stage) => {
+            gateway::on_line(app, *stage, line);
+            true
+        }
+        Mode::Bulk(form) => {
+            if line != "!" {
+                bulk::on_line(app, form, line);
+            }
+            true
         }
     }
 }
@@ -456,10 +497,10 @@ pub fn edits_locked(app: &AppState) -> bool {
 /// Rules of the two routes that cover the same sites, over the rules on
 /// screen rather than the applied ones.
 pub fn route_overlaps(app: &AppState) -> Vec<RouteOverlap> {
-    find_route_overlaps(
-        &apply::book_of(app.rules.table.rules()),
-        include_subdomains(app),
-    )
+    // A rule set the wire refuses has nothing to compare; the row says why.
+    apply::book_of(app.rules.table.rules())
+        .map(|book| find_route_overlaps(&book, include_subdomains(app)))
+        .unwrap_or_default()
 }
 
 /// The reader's subdomain setting; absent means on, the product default.
@@ -509,15 +550,36 @@ pub fn on_progress(
 }
 
 /// Somebody's rules revision changed (another window, the tray, the
-/// service's own additions): reread, unless that would drop edits.
+/// service's own additions, a reset): reread once the list is free.
 pub fn on_revision_changed(app: &mut AppState) {
+    reread_when_free(app);
+}
+
+/// Nothing on screen holds a row number into the list or edits it: no
+/// edits, no service call, no form or question open.
+fn list_is_free(app: &AppState) -> bool {
     let rules = &app.rules;
-    if rules.table.is_loaded()
+    rules.table.is_loaded()
         && !rules.table.is_dirty()
         && rules.busy.is_none()
         && matches!(rules.mode, Mode::List)
         && app.link.is_connected()
-    {
+}
+
+/// Re-read now, or as soon as the list is free: a form open over a row, or
+/// a delete question, would otherwise land on whatever rule the re-read put
+/// at that row.
+fn reread_when_free(app: &mut AppState) {
+    if list_is_free(app) {
+        load(app);
+    } else {
+        app.rules.reread_due = true;
+    }
+}
+
+/// The re-read that waited for the list, once nothing holds it.
+fn settle(app: &mut AppState) {
+    if app.rules.reread_due && list_is_free(app) {
         load(app);
     }
 }
@@ -532,12 +594,19 @@ fn load(app: &mut AppState) {
 fn loaded(app: &mut AppState, result: Result<RulesListResponse, Failure>) {
     let rules = &mut app.rules;
     rules.busy = None;
+    rules.reread_due = false;
+    let mut rebased = false;
     match result {
         Ok(list) => {
             rules.load_error = None;
             rules.unrecognized = list.unrecognized;
             rules.base_revision = list.base_revision.clone();
             rules.table.load(&list.rows);
+            if let Some(edits) = rules.rebase.take() {
+                rules.table.apply_edits(edits);
+                rules.note = Some(Note::new(text::REBASED));
+                rebased = true;
+            }
             overlaps::refresh(app);
             verdicts::write_bound_files(app);
             // The set the service holds was read again: an apply may be in it.
@@ -546,8 +615,36 @@ fn loaded(app: &mut AppState, result: Result<RulesListResponse, Failure>) {
         Err(failure) => {
             rules.load_error = Some(failure);
             rules.verdicts.rewrite_files = false;
+            // The edits are still on screen, the table was not replaced.
+            rules.rebase = None;
         }
     }
+    if let Some(form) = app.rules.prefilled.take() {
+        if app.rules.load_error.is_none() && matches!(app.rules.mode, Mode::List) {
+            open_form(app, *form);
+        }
+    }
+    // The edits now stand on the rules in force; the review shows the result.
+    if rebased {
+        start_apply(app);
+    }
+}
+
+/// The rules changed elsewhere since the list was read: the refusal is a
+/// question, not only a sentence.
+fn changed_elsewhere(failure: &Failure) -> bool {
+    matches!(failure, Failure::Code { code, .. } if code == RULES_CHANGED_ELSEWHERE)
+}
+
+/// "Put my edits on top": the edits are kept aside, the rules in force read,
+/// and the edits laid over them in [`loaded`].
+fn rebase_edits(app: &mut AppState) {
+    if !app.link.is_connected() {
+        app.rules.note = Some(Note::new(text::APPLY_OFFLINE));
+        return;
+    }
+    app.rules.rebase = Some(app.rules.table.edits());
+    load(app);
 }
 
 fn previewed(app: &mut AppState, previewed: Previewed) {
@@ -565,6 +662,10 @@ fn previewed(app: &mut AppState, previewed: Previewed) {
         }
         Previewed::Refused(failure) => {
             rules.quit_after_apply = false;
+            if changed_elsewhere(&failure) {
+                ask(app, ChoicePurpose::ChangedElsewhere);
+                return;
+            }
             rules.note = Some(Note::failed(text::ACTIVATE_FAILED, failure));
         }
     }
@@ -587,8 +688,17 @@ fn finished(app: &mut AppState, finished: Finished) {
         // The edits stay on screen: nothing was applied.
         Finished::Expired => Note::new(text::EXPIRED),
         Finished::UacDeclined => Note::new(text::UAC_DECLINED),
-        Finished::Failed(failure) => Note::failed(text::ACTIVATE_FAILED, failure),
+        Finished::Failed(failure) => {
+            if changed_elsewhere(&failure) {
+                rules.mode = Mode::Choice(Choice {
+                    purpose: ChoicePurpose::ChangedElsewhere,
+                    cursor: 0,
+                });
+            }
+            Note::failed(text::ACTIVATE_FAILED, failure)
+        }
     });
+    settle(app);
 }
 
 // ── Actions ─────────────────────────────────────────────────────────────────
@@ -611,16 +721,16 @@ fn start_apply(app: &mut AppState) {
         app.rules.note = Some(Note::new(text::APPLY_OFFLINE));
         return;
     }
-    let Some(pending) = apply::pending_from(
+    let pending = match apply::pending_from(
         &app.rules.table,
         app.rules.baseline,
         app.rules.base_revision.as_deref(),
-    ) else {
-        app.rules.note = Some(Note::failed(
-            text::ACTIVATE_FAILED,
-            Failure::code("gui-internal"),
-        ));
-        return;
+    ) {
+        Ok(pending) => pending,
+        Err(failure) => {
+            app.rules.note = Some(Note::failed(text::ACTIVATE_FAILED, failure));
+            return;
+        }
     };
     app.rules.note = None;
     app.rules.busy = Some(Busy::Previewing);
@@ -678,6 +788,9 @@ fn move_to_type(app: &mut AppState, master: Option<usize>) -> bool {
         return false;
     }
     if !locked(app) && master.is_some_and(|i| refile_row(&mut app.rules.table.rows[i])) {
+        if let Some(i) = master {
+            app.rules.table.keep_chosen(i);
+        }
         app.rules.note = Some(Note::new(text::RULE_UPDATED));
     }
     true
@@ -735,6 +848,42 @@ fn ask(app: &mut AppState, purpose: ChoicePurpose) {
         _ => 0,
     };
     app.rules.mode = Mode::Choice(Choice { purpose, cursor });
+}
+
+/// The question a bound file edited by hand raises instead of being replaced.
+fn ask_about_hand_edited(app: &mut AppState, held: Vec<(nrr_client_logic::Route, PathBuf)>) {
+    ask(app, ChoicePurpose::HandEdited(held));
+}
+
+/// "Take the file": its folder is read like any rule set, and the import
+/// question decides how it meets the list; the apply then reviews it.
+fn take_hand_edited(app: &mut AppState, held: &[(nrr_client_logic::Route, PathBuf)]) {
+    let Some(dir) = held.first().and_then(|(_, path)| path.parent()) else {
+        return;
+    };
+    match files::read_set(dir) {
+        Err((file, error)) => app.rules.note = Some(read_failed(&file, error)),
+        Ok(set) => offer_import(app, set, dir.display().to_string()),
+    }
+}
+
+/// "Replace the file": the rows on screen, the rules in force, are written.
+fn replace_hand_edited(app: &mut AppState, held: &[(nrr_client_logic::Route, PathBuf)]) {
+    let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut written = Vec::new();
+    for (route, path) in held {
+        let (table, hint) = (&app.rules.table, &app.rules.file_hint);
+        if let Err((path, error)) = files::write_route(path, *route, table, hint, &exported_at) {
+            let path = path.display().to_string();
+            let note = Note::with(text::WRITE_FAILED, vec![("path", path), ("error", error)]);
+            app.rules.note = Some(note);
+            break;
+        }
+        written.push(path.clone());
+    }
+    if let Some(file) = app.rules.settings_file.as_deref() {
+        let _ = own_settings::note_written(file, &written);
+    }
 }
 
 fn ask_delete(app: &mut AppState, master: Option<usize>) {
@@ -883,7 +1032,7 @@ fn commit_input(app: &mut AppState, input: Input) {
         InputPurpose::Search => {
             let table = &mut app.rules.table;
             table.search = search_box_text(&input.text);
-            table.cursor = 0;
+            table.set_cursor(0);
         }
         InputPurpose::Import => {
             let path = path_of(&input.text);
@@ -955,7 +1104,7 @@ fn import(app: &mut AppState, set: RuleSet, path: String, replace: bool) {
     table.passthrough = set.passthrough;
     table.filter = RouteFilter::All;
     table.search.clear();
-    table.cursor = 0;
+    table.set_cursor(0);
     let mut note = Note::with(
         text::IMPORTED,
         vec![("count", added.to_string()), ("path", path)],
@@ -1029,7 +1178,7 @@ fn pick(app: &mut AppState, choice: Choice) {
         ChoicePurpose::Filter => {
             let table = &mut app.rules.table;
             table.filter = RouteFilter::ALL.get(at).copied().unwrap_or_default();
-            table.cursor = 0;
+            table.set_cursor(0);
         }
         ChoicePurpose::Delete(i) if at == 0 => {
             let table = &mut app.rules.table;
@@ -1061,6 +1210,12 @@ fn pick(app: &mut AppState, choice: Choice) {
             }
         }
         ChoicePurpose::Overwrite(path) if at == 0 => export(app, &path),
+        ChoicePurpose::ChangedElsewhere if at == 0 => rebase_edits(app),
+        ChoicePurpose::HandEdited(held) => match at {
+            0 => take_hand_edited(app, &held),
+            1 => replace_hand_edited(app, &held),
+            _ => {}
+        },
         ChoicePurpose::Recent => recent::picked(app, at),
         ChoicePurpose::Restore(_) => recent::restore(app, at),
         _ => {}
@@ -1078,7 +1233,7 @@ fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
         KeyCode::Down => table.move_cursor(1),
         KeyCode::PageUp => table.move_cursor(-page),
         KeyCode::PageDown => table.move_cursor(page),
-        KeyCode::Home => table.cursor = 0,
+        KeyCode::Home => table.set_cursor(0),
         KeyCode::End => table.move_cursor(isize::MAX),
         KeyCode::Enter => edit_selected(app, selected),
         KeyCode::Delete => ask_delete(app, selected),
@@ -1087,6 +1242,11 @@ fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
             'a' => open_form(app, Form::add()),
             'e' => edit_selected(app, selected),
             'd' => ask_delete(app, selected),
+            // From the menu the row marker is not drawn: the first press
+            // only shows which rule the next one switches.
+            ' ' | 't' if app.focus != crate::state::Focus::Feed => {
+                app.focus = crate::state::Focus::Feed;
+            }
             ' ' | 't' => toggle(app, selected),
             'f' => ask(app, ChoicePurpose::Filter),
             '/' => start_input(app, InputPurpose::Search),
@@ -1149,11 +1309,34 @@ pub fn own_rules_on_screen(app: &mut AppState) -> bool {
     true
 }
 
+/// The Rules screen with the add form already holding a rule, as the GUI's
+/// rule window opens from another screen; the user still checks and saves
+/// it. A dialog already open there is left as it was. `false` when this
+/// system offers no such rule type.
+pub fn add_prefilled(app: &mut AppState, rule_type: RuleType, value: String) -> bool {
+    if !offered_types().contains(&rule_type) {
+        return false;
+    }
+    app.open(ScreenId::Rules);
+    if !matches!(app.rules.mode, Mode::List) {
+        return true;
+    }
+    let mut form = Form::add();
+    form.set_type(rule_type);
+    form.value = value;
+    if matches!(app.rules.busy, Some(Busy::Loading)) {
+        app.rules.prefilled = Some(Box::new(form));
+    } else {
+        open_form(app, form);
+    }
+    true
+}
+
 /// The other order; the cursor goes back to the top, as a new filter does.
 fn change_order(app: &mut AppState) {
     let table = &mut app.rules.table;
     table.sort = table.sort.next();
-    table.cursor = 0;
+    table.set_cursor(0);
 }
 
 /// Text keys; `false` for F1 so the help still opens.
@@ -1283,10 +1466,24 @@ fn review_key(app: &mut AppState, mut review: Box<Review>, key: KeyEvent) -> boo
 
 // ── Line mode ────────────────────────────────────────────────────────────────
 
-/// A number in the list as shown: `e 3` names the third visible rule.
-fn numbered(app: &AppState, arg: &str) -> Option<usize> {
+/// A number in the list as last printed: `e 3` names the rule printed third,
+/// wherever a re-read or a re-sort has put it since.
+fn numbered(app: &mut AppState, arg: &str) -> Option<usize> {
     let n: usize = arg.trim().parse().ok()?;
-    app.rules.table.visible().get(n.checked_sub(1)?).copied()
+    let table = &app.rules.table;
+    let shown = table.visible();
+    let now: Vec<String> = shown
+        .iter()
+        .map(|&i| table.rows[i].rule.merge_key())
+        .collect();
+    match crate::screens::numbered_now(&app.rules.printed, &now, n) {
+        crate::screens::Numbered::At(at) => shown.get(at).copied(),
+        crate::screens::Numbered::Gone => {
+            app.rules.note = Some(Note::with(text::NUMBER_GONE, vec![("n", n.to_string())]));
+            None
+        }
+        crate::screens::Numbered::NoSuch => None,
+    }
 }
 
 fn list_line(app: &mut AppState, line: &str) -> bool {

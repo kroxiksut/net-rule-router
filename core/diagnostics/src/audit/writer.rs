@@ -1036,6 +1036,22 @@ mod tests {
         );
     }
 
+    /// The bytes are pinned above; this pins the hash over them, so a
+    /// crypto-crate upgrade cannot re-spell `event_hash` either.
+    #[test]
+    fn the_chain_hash_is_pinned() {
+        let (canonical, event) =
+            build_event(&sample_input("evt-golden"), 7, AUDIT_CHAIN_GENESIS).expect("event");
+        let golden = "f0dc1c00e1b54164bf34170805ec33ca2be225383cab1461f083df8473487304";
+        assert_eq!(compute_chain_hash(AUDIT_CHAIN_GENESIS, &canonical), golden);
+        assert_eq!(event.event_hash, golden);
+        // A leading zero nibble stays: the hex is fixed-width.
+        assert_eq!(
+            compute_chain_hash(AUDIT_CHAIN_GENESIS, r#"{"seq":1}"#),
+            "0a00898550374c41186879d92f30325cd0a550ce8c5da4d9aeef34a95c0b85ea"
+        );
+    }
+
     fn no_wait(dir: &Path) -> AuditWriterConfig {
         let mut config = AuditWriterConfig::new(dir);
         config.chain_lock_wait = Duration::ZERO;

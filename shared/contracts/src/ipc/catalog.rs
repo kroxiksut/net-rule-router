@@ -53,7 +53,7 @@ const CLIENTS_POLICY_SURFACES: [IpcClientProfile; 3] = [
     IpcClientProfile::Tui,
 ];
 
-const IPC_OPERATION_CATALOG: [IpcOperationSpec; 80] = [
+const IPC_OPERATION_CATALOG: [IpcOperationSpec; 82] = [
     IpcOperationSpec {
         name: IpcOperationName::ContractNegotiate,
         class: IpcInteractionClass::HealthCheck,
@@ -725,6 +725,23 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 80] = [
         name: IpcOperationName::ConnHistorySettingsSet,
         // The caller's OWN on/off and period — user-scoped, no elevation.
         class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::SiteCheckRun,
+        // Connects out on the caller's behalf over their own routes; changes
+        // no state. The tray's notice opens it in the window.
+        class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::SiteCheckResultGet,
+        // The caller's own latest check, read from memory.
+        class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,

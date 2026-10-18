@@ -1959,3 +1959,222 @@ fn no_capability_set_unlocks_an_unimplemented_shape() {
     }
     assert_eq!(current_rule_shape_support(), implemented);
 }
+
+// ── Rules by path ────────────────────────────────────────────────────────
+
+/// A folder rule, a program inside it and one beside it, spelled for the
+/// host: the protection judges a path in the host's own spelling.
+fn host_paths() -> (&'static str, PathBuf, PathBuf, &'static str) {
+    if cfg!(windows) {
+        (
+            r"C:\Apps\Tool\*",
+            PathBuf::from(r"C:\Apps\Tool\tool.exe"),
+            PathBuf::from(r"C:\Apps\Tool\v2\helper.exe"),
+            r"C:\Windows\System32",
+        )
+    } else {
+        (
+            "/opt/tool/*",
+            PathBuf::from("/opt/tool/tool"),
+            PathBuf::from("/opt/tool/v2/helper"),
+            "/usr/bin",
+        )
+    }
+}
+
+fn host_path(text: &str) -> nrr_platform_api::app_folders::AppPath {
+    nrr_platform_api::app_folders::AppPath::parse(
+        text,
+        nrr_domain::rules_file::HostPlatform::compiled().path_style(),
+    )
+    .expect("a path")
+}
+
+fn path_rule(id: &str, text: &str, action: nrr_domain::RuleAction) -> CanonicalRule {
+    CanonicalRule {
+        id: RuleId(id.into()),
+        enabled: true,
+        address_match: None,
+        app_match: Some(CanonicalAppMatch {
+            pattern: CanonicalAppPattern::Path(Box::new(host_path(text))),
+            include_child_processes: false,
+        }),
+        comment: String::new(),
+        action,
+        origin: None,
+    }
+}
+
+fn found_at(
+    place: nrr_platform_api::app_folders::AppPath,
+    programs: Vec<PathBuf>,
+    over_cap: bool,
+) -> nrr_platform_api::app_folders::PathPrograms {
+    nrr_platform_api::app_folders::PathPrograms {
+        outcome: nrr_platform_api::app_folders::PathOutcome::Found,
+        place: Some(place),
+        programs,
+        over_cap,
+    }
+}
+
+fn path_codegen(
+    sid: &str,
+    rule_book: &CanonicalRuleBook,
+    resolver: &dyn AppPathResolver,
+) -> CodegenOutput {
+    let cache = MockFqdnCacheLookup::new();
+    let app_obs = MockAppObservationLookup::new();
+    generate_filters(CodegenInput {
+        sid,
+        rule_book,
+        behavior_mode: RouteBehaviorMode::PreferPrimary,
+        fqdn_cache: &cache,
+        app_observations: &app_obs,
+        app_resolver: resolver,
+        secondary_ip_denylist: &std::collections::HashSet::new(),
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: false,
+    })
+}
+
+/// One filter per program the owner's folder holds, each scoped to the
+/// owner, all at one weight; another user's pass over the same rule text
+/// gets nothing from this owner's folder.
+#[test]
+fn a_folder_rule_emits_one_owner_scoped_filter_per_program() {
+    let (rule_text, inside, deeper, _) = host_paths();
+    let rule = host_path(rule_text);
+    let resolver = MockAppPathResolver::new().with_path_programs(
+        rule.as_str(),
+        "S-1-5-21-A",
+        found_at(rule.clone(), vec![inside.clone(), deeper.clone()], false),
+    );
+    let rule_book = book(
+        vec![],
+        vec![path_rule("r-dir", rule_text, nrr_domain::RuleAction::Route)],
+    );
+    let out = path_codegen("S-1-5-21-A", &rule_book, &resolver);
+    let app_filters: Vec<&WfpFilterSpec> = out
+        .filters
+        .iter()
+        .filter(|f| f.app_pattern.is_some())
+        .collect();
+    assert_eq!(app_filters.len(), 2, "{:?}", out.filters);
+    assert!(app_filters
+        .iter()
+        .all(|f| f.user_sid.as_deref() == Some("S-1-5-21-A")));
+    assert!(app_filters.windows(2).all(|w| w[0].weight == w[1].weight));
+    assert_eq!(
+        out.secondary_app_patterns,
+        vec![
+            inside.to_string_lossy().into_owned(),
+            deeper.to_string_lossy().into_owned()
+        ]
+    );
+
+    let other = path_codegen("S-1-5-21-B", &rule_book, &resolver);
+    assert!(other.filters.iter().all(|f| f.app_pattern.is_none()));
+    assert!(other
+        .diagnostics
+        .contains(&CodegenDiagnostic::AppUnresolved {
+            rule_id: "r-dir".into(),
+            app: rule.as_str().into(),
+        }));
+}
+
+/// A folder larger than one rule covers says so on the Overlaps screen
+/// instead of reading as complete.
+#[test]
+fn a_folder_larger_than_the_cap_is_reported_as_a_conflict() {
+    let (rule_text, inside, _, _) = host_paths();
+    let rule = host_path(rule_text);
+    let resolver = MockAppPathResolver::new().with_path_programs(
+        rule.as_str(),
+        "*",
+        found_at(rule.clone(), vec![inside], true),
+    );
+    let rule_book = book(
+        vec![path_rule("r-big", rule_text, nrr_domain::RuleAction::Route)],
+        vec![],
+    );
+    let out = path_codegen("S-1-5-21-A", &rule_book, &resolver);
+    let over = out
+        .diagnostics
+        .iter()
+        .find(|d| matches!(d, CodegenDiagnostic::AppFolderOverCap { .. }))
+        .expect("over cap");
+    assert_eq!(
+        over.rule_conflict(),
+        Some(crate::rule_conflicts::RuleConflict::FolderOverCap {
+            rule_id: "r-big".into(),
+            covered: 1,
+        })
+    );
+    let dtos = crate::app_enforcement_status::rule_conflicts_from(&out.diagnostics, &rule_book);
+    assert_eq!(
+        dtos.iter().map(|d| d.kind).collect::<Vec<_>>(),
+        [nrr_shared::ipc_payloads::RuleConflictKind::FolderOverCap]
+    );
+    assert_eq!(dtos[0].count, 1);
+    assert_eq!(dtos[0].rule_value, rule.as_str());
+}
+
+/// The rules file names a harmless folder; the disk says it leads into a
+/// system one. The deny applies nothing and the Overlaps screen says why.
+#[test]
+fn a_deny_of_a_folder_that_really_is_a_system_folder_emits_nothing() {
+    let (rule_text, _, _, system) = host_paths();
+    let rule = host_path(rule_text);
+    let real = rule.on_disk(system, true).expect("real");
+    let resolver = MockAppPathResolver::new().with_path_programs(
+        rule.as_str(),
+        "*",
+        found_at(real, vec![PathBuf::from(system).join("curl")], false),
+    );
+    let rule_book = book(
+        vec![path_rule(
+            "r-deny",
+            rule_text,
+            nrr_domain::RuleAction::Block,
+        )],
+        vec![],
+    );
+    let out = path_codegen("S-1-5-21-A", &rule_book, &resolver);
+    assert!(out.filters.iter().all(|f| f.app_pattern.is_none()));
+    assert!(out.diagnostics.iter().any(|d| matches!(
+        d,
+        CodegenDiagnostic::PathRuleProtected { rule_id, .. } if rule_id == "r-deny"
+    )));
+    let dtos = crate::app_enforcement_status::rule_conflicts_from(&out.diagnostics, &rule_book);
+    assert_eq!(
+        dtos[0].kind,
+        nrr_shared::ipc_payloads::RuleConflictKind::ProtectedTarget
+    );
+    assert_eq!(dtos[0].reason, "system-folder");
+}
+
+/// A name rule keeps its own fan-out and weights: the path branch changes
+/// nothing for it.
+#[test]
+fn a_name_rule_still_fans_out_one_weight_per_path() {
+    let resolver = MockAppPathResolver::new().with(
+        "tool.exe",
+        vec![
+            PathBuf::from(r"C:\A\tool.exe"),
+            PathBuf::from(r"C:\B\tool.exe"),
+        ],
+    );
+    let rule_book = book(vec![], vec![app_rule("r-name", "tool.exe", false)]);
+    let out = path_codegen("S-1-5-21-A", &rule_book, &resolver);
+    let weights: Vec<u64> = out
+        .filters
+        .iter()
+        .filter(|f| f.app_pattern.is_some())
+        .map(|f| f.weight)
+        .collect();
+    assert_eq!(weights.len(), 2);
+    assert_ne!(weights[0], weights[1]);
+}

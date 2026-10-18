@@ -98,6 +98,16 @@ QString NrrNativeBridge::rpcConnHistorySettingsSet(const QVariantMap &payload) {
                           QJsonObject::fromVariantMap(payload));
 }
 
+QString NrrNativeBridge::rpcSiteCheckRun(const QString &host) {
+    QJsonObject obj;
+    obj.insert(QStringLiteral("host"), host);
+    return emitRpcRequest(QStringLiteral("diagnostics.site-check.run"), obj);
+}
+
+QString NrrNativeBridge::rpcSiteCheckResult() {
+    return emitRpcRequest(QStringLiteral("diagnostics.site-check.result"), QJsonObject());
+}
+
 QString NrrNativeBridge::rpcVpnGatewayCandidatesList(const QString &program) {
     QJsonObject obj;
     obj.insert(QStringLiteral("program"), program);

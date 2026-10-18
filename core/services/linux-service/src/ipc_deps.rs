@@ -685,6 +685,14 @@ pub(crate) fn build_ipc_surface(
             engine.attach_author(Arc::clone(&author));
             // A `?` verdict takes effect now rather than at the next tick.
             let verify_cycle = Arc::clone(&cycle);
+            let site_check = site_check(
+                Arc::clone(&engine),
+                Arc::clone(&probe_cache),
+                Arc::clone(&stats_state_conn),
+                Arc::clone(&probe_route_table),
+                Arc::clone(&conn_trace_ring),
+                deps.diagnostics.clone(),
+            );
             let runner = main_link_probe(
                 Arc::clone(&engine),
                 probe_cache,
@@ -702,6 +710,7 @@ pub(crate) fn build_ipc_surface(
                 )),
             });
             deps.with_auto_rule_probe(runner)
+                .with_site_check(site_check)
                 .with_auto_rules(engine)
                 .with_block_notice_author(author)
         }
@@ -887,6 +896,40 @@ fn main_link_probe(
     )
 }
 
+/// "Is it us or the site?" over the same link-bound probe and stored bindings,
+/// with the caller's own trace and ledger, and the explain probe's routes.
+fn site_check(
+    engine: Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>,
+    cache: Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>,
+    state_conn: Arc<Mutex<rusqlite::Connection>>,
+    route_table: Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+    trace: Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>,
+    diagnostics: Arc<dyn nrr_diagnostics::facade::service::DiagnosticsFacade>,
+) -> Arc<nrr_service_runtime::site_check::SiteChecker> {
+    use nrr_service_runtime::site_check::{ExplainRoutes, SiteCheckWiring, SiteChecker};
+
+    let egress = nrr_service_runtime::production_auto_rule_probe::StoredBindingEgress::new(
+        Arc::new(
+            nrr_service_runtime::production_handlers_misc::ProductionRoutePolicySource::new(
+                state_conn,
+            ),
+        ),
+        route_table,
+    );
+    Arc::new(SiteChecker::new(SiteCheckWiring {
+        probe: Arc::new(LinkBoundPathProbe),
+        egress: Arc::new(egress),
+        cache: nrr_service_runtime::production_principal_plan::cache_lookup_over(cache),
+        routes: Arc::new(ExplainRoutes::new(diagnostics)),
+        engine: Some(engine),
+        trace: Some(trace),
+        https: nrr_service_runtime::site_check::https_head::RustlsHttpsHead::new(Arc::new(
+            LinkBoundPathProbe,
+        ))
+        .map(|h| Arc::new(h) as Arc<dyn nrr_service_runtime::site_check::HttpsHead>),
+    }))
+}
+
 /// The neutral probe over a socket pinned to the link that carries the source
 /// address.
 struct LinkBoundPathProbe;
@@ -931,6 +974,23 @@ impl nrr_service_runtime::path_probe::PathProbe for LinkBoundPathProbe {
             Ok(socket) => tls_exchange(&mut socket.into(), server_name, timeout),
             Err(LinkProbeOutcome::NoAnswer) => PathVerdict::Silent,
             Err(_) => PathVerdict::Indeterminate,
+        }
+    }
+
+    fn connect_stream(
+        &self,
+        target: std::net::Ipv4Addr,
+        port: u16,
+        source: std::net::Ipv4Addr,
+        timeout: std::time::Duration,
+    ) -> Result<std::net::TcpStream, nrr_service_runtime::path_probe::PathVerdict> {
+        use nrr_platform_linux::link_probe::{socket_over_link, LinkProbeOutcome};
+        use nrr_service_runtime::path_probe::PathVerdict;
+
+        match socket_over_link(target, port, source, timeout) {
+            Ok(socket) => Ok(socket.into()),
+            Err(LinkProbeOutcome::NoAnswer) => Err(PathVerdict::Silent),
+            Err(_) => Err(PathVerdict::Indeterminate),
         }
     }
 }

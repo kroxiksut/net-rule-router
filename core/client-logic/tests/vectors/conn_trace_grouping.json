@@ -1,0 +1,13 @@
+{
+  "description": "pure.js connTraceGroupingOrDefault: a stored trace grouping read back; anything unknown is the default, by program",
+  "cases": [
+    { "name": "none", "input": { "slug": "none" }, "expected": "none" },
+    { "name": "program", "input": { "slug": "program" }, "expected": "program" },
+    { "name": "folder", "input": { "slug": "folder" }, "expected": "folder" },
+    { "name": "empty", "input": { "slug": "" }, "expected": "program" },
+    { "name": "absent", "input": {}, "expected": "program" },
+    { "name": "other case", "input": { "slug": "Folder" }, "expected": "program" },
+    { "name": "padded", "input": { "slug": " folder " }, "expected": "program" },
+    { "name": "unknown", "input": { "slug": "by-folder" }, "expected": "program" }
+  ]
+}

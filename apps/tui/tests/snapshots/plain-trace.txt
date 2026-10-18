@@ -31,17 +31,20 @@ Service: OK
 Connection trace:
   Loading connections...
   Show blocked: No · Show local connections: No · IPv6 only: No
+  Group: No grouping
 Connections:
 Selected connection:
 Commands on this screen:
   n: next page (more)   p: previous page (back)
   d and a row number: show that connection, for example d 3
   e and a row number: why that connection took its route, for example e 3
+  c and a row number: check that connection's site, for example c 3
   / and text: search all fields, for example /example; / on its own clears the search
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
   o: what was blocked while the additional route was down
   h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
+  g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3
 Type a screen number, h for help or q to quit, then press Enter.
 Connection trace: Shown: 12 of 14.
 Connections: > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
@@ -68,6 +71,7 @@ Service: OK
 Connection trace:
   Shown: 12 of 14.
   Show blocked: No · Show local connections: No · IPv6 only: No
+  Group: No grouping
 Connections:
   > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
     2. browser.exe → 203.0.113.2:443 · site.example — Additional (VPN) · Allowed
@@ -92,11 +96,13 @@ Commands on this screen:
   n: next page (more)   p: previous page (back)
   d and a row number: show that connection, for example d 3
   e and a row number: why that connection took its route, for example e 3
+  c and a row number: check that connection's site, for example c 3
   / and text: search all fields, for example /example; / on its own clears the search
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
   o: what was blocked while the additional route was down
   h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
+  g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -104,6 +110,7 @@ Service: OK
 Connection trace:
   Shown: 12 of 14.
   Show blocked: No · Show local connections: No · IPv6 only: No
+  Group: No grouping
 Connections:
   > 11. browser.exe → 203.0.113.11:443 · site.example — Primary · Allowed
     12. browser.exe → 203.0.113.12:443 · site.example — Additional (VPN) · Allowed
@@ -120,11 +127,13 @@ Commands on this screen:
   n: next page (more)   p: previous page (back)
   d and a row number: show that connection, for example d 3
   e and a row number: why that connection took its route, for example e 3
+  c and a row number: check that connection's site, for example c 3
   / and text: search all fields, for example /example; / on its own clears the search
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
   o: what was blocked while the additional route was down
   h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
+  g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -132,6 +141,7 @@ Service: OK
 Connection trace:
   Shown: 12 of 14.
   Show blocked: No · Show local connections: No · IPv6 only: No
+  Group: No grouping
 Connections:
   > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
     2. browser.exe → 203.0.113.2:443 · site.example — Additional (VPN) · Allowed
@@ -156,11 +166,13 @@ Commands on this screen:
   n: next page (more)   p: previous page (back)
   d and a row number: show that connection, for example d 3
   e and a row number: why that connection took its route, for example e 3
+  c and a row number: check that connection's site, for example c 3
   / and text: search all fields, for example /example; / on its own clears the search
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
   o: what was blocked while the additional route was down
   h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
+  g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -168,6 +180,7 @@ Service: OK
 Connection trace:
   Shown: 12 of 14.
   Show blocked: No · Show local connections: No · IPv6 only: No
+  Group: No grouping
 Connections:
     1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
   > 2. browser.exe → 203.0.113.2:443 · site.example — Additional (VPN) · Allowed
@@ -192,11 +205,13 @@ Commands on this screen:
   n: next page (more)   p: previous page (back)
   d and a row number: show that connection, for example d 3
   e and a row number: why that connection took its route, for example e 3
+  c and a row number: check that connection's site, for example c 3
   / and text: search all fields, for example /example; / on its own clears the search
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
   o: what was blocked while the additional route was down
   h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
+  g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Diagnostics and logs
@@ -212,6 +227,8 @@ Explain sample:
   hostname or IP: site.example
   Probing...
   e: Enter a hostname or IP to simulate the routing decision against the active rule set.
+Check a site:
+  Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.
 Diagnostic archive export:
   The archive is saved in the service archives directory (per-user).
   Ready
@@ -220,6 +237,7 @@ Commands on this screen:
   l: switch between diagnostics and the log
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
   x: export a diagnostic archive
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
   n: next page (more)   p: previous page (back)

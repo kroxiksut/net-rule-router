@@ -682,6 +682,26 @@ mod tests {
         Arc::new(Mutex::new(runner.into_connection()))
     }
 
+    /// Clients hold this name across calls and send it back; its spelling
+    /// must not move with the crypto crate.
+    #[test]
+    fn the_base_revision_name_is_pinned() {
+        assert_eq!(base_revision_of(None), "");
+        let book = |json: &str| BookInForce {
+            revision_id: Some("rev-1".into()),
+            rules_json: json.into(),
+        };
+        assert_eq!(
+            base_revision_of(Some(&book("not json at all"))),
+            "92628a747890d02d1459c6eb45fd13cfa63bbb6d346412cff190297cf9c33d39"
+        );
+        // A leading zero nibble stays: the hex is fixed-width.
+        assert_eq!(
+            base_revision_of(Some(&book("not json 19"))),
+            "0b4447295187b5a8357ab3aa6cb10dd0911a9bc45a613f7e40411b7626a3e0a4"
+        );
+    }
+
     /// Insert a single `status='active'` row into `revisions` with the
     /// given canonical rules-json blob. Mirrors what the activation
     /// coordinator would do in production but skipping the LKG /

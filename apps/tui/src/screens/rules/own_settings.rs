@@ -8,8 +8,9 @@ use std::path::{Component, Path, PathBuf};
 use nrr_client_logic::rule_sets::is_path_under_dir;
 use nrr_client_logic::Route;
 use nrr_shared::user_settings::{
-    portable_path, UserSettings, UserSettingsError, UserSettingsStore,
+    portable_path, read_rules_file_bytes, UserSettings, UserSettingsError, UserSettingsStore,
 };
+use sha2::{Digest, Sha256};
 
 use super::files;
 
@@ -102,6 +103,11 @@ pub fn bind_written_set(
 ) -> Result<(), UserSettingsError> {
     let dir = absolute(dir);
     let dir_text = path_text(&dir);
+    // Best effort: a version not on record only means no question later.
+    let _ = note_written(
+        file,
+        &Route::ALL.map(|route| dir.join(files::file_name(route))),
+    );
     UserSettingsStore::at(file.to_path_buf())
         .update(|settings| {
             if is_factory(&dir_text, &settings.rules_folder, shipped_root) {
@@ -141,6 +147,53 @@ pub fn bind_imported(
         .map(drop)
 }
 
+/// SHA-256 of a rules file's bytes, as the GUI records it; `Ok(None)` when
+/// the file is absent.
+fn rules_file_sha256(path: &Path) -> std::io::Result<Option<String>> {
+    use std::fmt::Write as _;
+    let Some(bytes) = read_rules_file_bytes(path)? else {
+        return Ok(None);
+    };
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(&bytes) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(Some(hex))
+}
+
+/// This program just wrote `paths`: what they hold now is its version, so a
+/// later change there is the user's hand.
+pub fn note_written(file: &Path, paths: &[PathBuf]) -> Result<(), UserSettingsError> {
+    let versions: Vec<(String, String)> = paths
+        .iter()
+        .filter_map(|path| {
+            let sha256 = rules_file_sha256(path).ok()??;
+            Some((path_text(&absolute(path)), sha256))
+        })
+        .collect();
+    if versions.is_empty() {
+        return Ok(());
+    }
+    UserSettingsStore::at(file.to_path_buf())
+        .update(|settings| {
+            for (path, sha256) in &versions {
+                settings.record_rules_file_written(path, sha256);
+            }
+        })
+        .map(drop)
+}
+
+/// Whether `path` was edited by hand since a client of this program last
+/// wrote it. A file that cannot be read counts as edited when there is a
+/// record: overwriting it unasked is the loss to avoid.
+pub fn hand_edited(file: &Path, path: &Path) -> bool {
+    let Ok(settings) = read(file) else {
+        return false;
+    };
+    let on_disk = rules_file_sha256(path).unwrap_or_else(|_| Some(String::new()));
+    settings.rules_file_hand_edited(&path_text(&absolute(path)), on_disk.as_deref())
+}
+
 /// The files a set was read from, as the settings file spells them.
 pub fn imported_texts(paths: &[Option<PathBuf>; 2]) -> [Option<String>; 2] {
     paths
@@ -172,6 +225,21 @@ mod tests {
         fn settings_file(&self) -> PathBuf {
             self.path().join(USER_SETTINGS_FILE_NAME)
         }
+    }
+
+    #[test]
+    fn a_file_changed_after_this_program_wrote_it_is_edited_by_hand() {
+        let dir = Scratch::new("hand-edited");
+        let file = dir.settings_file();
+        let rules = dir.path().join("rules_primary.txt");
+        std::fs::write(&rules, "example.com\n").expect("write");
+        assert!(!hand_edited(&file, &rules), "nothing on record yet");
+        note_written(&file, std::slice::from_ref(&rules)).expect("record");
+        assert!(!hand_edited(&file, &rules));
+        std::fs::write(&rules, "example.org\n").expect("hand edit");
+        assert!(hand_edited(&file, &rules));
+        std::fs::remove_file(&rules).expect("remove");
+        assert!(!hand_edited(&file, &rules), "nothing left to lose");
     }
 
     #[test]

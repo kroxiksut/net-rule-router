@@ -145,6 +145,16 @@ QString NrrNativeBridge::rpcUserSettingsIntentRecord(const QVariantMap &payload)
                           QJsonObject::fromVariantMap(payload));
 }
 
+QString NrrNativeBridge::rpcUserSettingsRulesFileWritten(const QVariantMap &payload) {
+    return emitRpcRequest(QStringLiteral("local.user-settings.rules-file-written"),
+                          QJsonObject::fromVariantMap(payload));
+}
+
+QString NrrNativeBridge::rpcUserSettingsRulesFilesHandEdited(const QVariantMap &payload) {
+    return emitRpcRequest(QStringLiteral("local.user-settings.rules-files-hand-edited"),
+                          QJsonObject::fromVariantMap(payload));
+}
+
 QString NrrNativeBridge::rpcUpdateCheckRun() {
     return emitRpcRequest(QStringLiteral("local.update-check.run"),
                           QJsonObject());

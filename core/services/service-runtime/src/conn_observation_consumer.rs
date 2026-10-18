@@ -336,6 +336,48 @@ impl ConnectionTraceRing {
             .collect()
     }
 
+    /// Names `sid`'s own recent connections were answered for that `wanted`
+    /// admits, newest first, each with the IPv4 address it was reached at
+    /// (`None` for a virtual one), at most `limit`.
+    pub fn names_for(
+        &self,
+        sid: &str,
+        wanted: impl Fn(&str) -> bool,
+        limit: usize,
+    ) -> Vec<(String, Option<std::net::Ipv4Addr>)> {
+        let mut out: Vec<(String, Option<std::net::Ipv4Addr>)> = Vec::new();
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        for rec in g.iter().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            if rec.user_sid.as_deref() != Some(sid) {
+                continue;
+            }
+            let Some(names) = rec.remote_names.as_ref() else {
+                continue;
+            };
+            let address = match rec.remote.ip() {
+                IpAddr::V4(v4) if !names.fake_ip => Some(v4),
+                _ => None,
+            };
+            for name in names.names.iter().filter(|n| wanted(n)) {
+                match out.iter().position(|(n, _)| n == name) {
+                    // An IPv6 or virtual row named it first; a later IPv4 one
+                    // still gives it an address to check.
+                    Some(i) => {
+                        if out[i].1.is_none() {
+                            out[i].1 = address;
+                        }
+                    }
+                    None if out.len() < limit => out.push((name.clone(), address)),
+                    None => {}
+                }
+            }
+        }
+        out
+    }
+
     /// Total records currently retained.
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
@@ -708,19 +750,20 @@ fn collateral_pin_owners(
 ) -> Vec<String> {
     use crate::app_observation_lookup::{app_key, pattern_matches};
     // Both sides through the same key: the census holds keys, callers may hold
-    // a rule spelling, and a raw compare would silently disagree.
-    let this_app = app_key(this_app);
-    if role != EgressRole::Secondary || this_app.is_empty() || this_app == app_key(own_process_key)
+    // a rule spelling, and a raw compare would silently disagree. The image
+    // itself answers a rule by path.
+    let this_key = app_key(this_app);
+    if role != EgressRole::Secondary || this_key.is_empty() || this_key == app_key(own_process_key)
     {
         return Vec::new();
     }
-    if routed.iter().any(|p| pattern_matches(p, &this_app)) {
+    if routed.iter().any(|p| store.names_process(p, this_app)) {
         return Vec::new();
     }
     store
         .apps_for_ip(ip)
         .into_iter()
-        .filter(|owner| owner != &this_app)
+        .filter(|owner| owner != &this_key)
         .filter(|owner| routed.iter().any(|p| pattern_matches(p, owner)))
         .collect()
 }

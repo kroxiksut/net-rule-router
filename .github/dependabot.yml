@@ -18,6 +18,11 @@ updates:
     cooldown:
       default-days: 14
     open-pull-requests-limit: 5
+    # A major version is an API migration and is planned by hand; security
+    # updates still arrive for it.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       cargo-minor-and-patch:
         update-types: [minor, patch]

@@ -2181,3 +2181,85 @@ fn a_network_carved_past_the_cap_is_a_conflict_in_both_planners() {
         ("p-net", "10.0.0.0/8")
     );
 }
+
+/// A rule by folder plans one flow over every program the owner's folder
+/// holds, and routes what those programs were seen connecting to — the whole
+/// of a path rule where the filter engine has no program context.
+#[test]
+fn a_folder_rule_plans_one_flow_and_routes_what_its_programs_used() {
+    use nrr_platform_api::app_folders::{AppPath, PathOutcome, PathPrograms};
+    let (rule_text, program) = if cfg!(windows) {
+        (r"C:\Apps\Tool\*", r"C:\Apps\Tool\v2\tool.exe")
+    } else {
+        ("/opt/tool/*", "/opt/tool/v2/tool")
+    };
+    let rule = AppPath::parse(
+        rule_text,
+        nrr_domain::rules_file::HostPlatform::compiled().path_style(),
+    )
+    .expect("rule");
+    let resolver = nrr_platform_api::MockAppPathResolver::new().with_path_programs(
+        rule.as_str(),
+        "*",
+        PathPrograms {
+            outcome: PathOutcome::Found,
+            place: Some(rule.clone()),
+            programs: vec![PathBuf::from(program)],
+            over_cap: false,
+        },
+    );
+    let store = crate::app_observation_lookup::AppObservationStore::new();
+    let cache = MapCache::default();
+    let input = PlannerInput {
+        ipv6: Ipv6Guard::Off,
+        secondary_ip_denylist: NO_DENYLIST.get_or_init(HashSet::new),
+        fqdn_cache: &cache,
+        app_resolver: &resolver,
+        app_observations: &store,
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        packet_blocks: true,
+    };
+    let rule_book = book(
+        Vec::new(),
+        vec![CanonicalRule {
+            id: RuleId("r-dir".into()),
+            enabled: true,
+            address_match: None,
+            app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
+                pattern: CanonicalAppPattern::Path(Box::new(rule.clone())),
+                include_child_processes: false,
+            }),
+            comment: String::new(),
+            action: RuleAction::Route,
+            origin: None,
+        }],
+    );
+    let plan = || {
+        plan_route_rules(
+            &rule_book,
+            "unix:uid:1000",
+            RouteBehaviorMode::PreferPrimary,
+            &input,
+        )
+        .0
+    };
+    let flows = plan();
+    let programs: Vec<&FlowRule> = flows
+        .iter()
+        .filter(|f| matches!(f.app, AppScope::Program { .. }))
+        .collect();
+    assert_eq!(programs.len(), 1, "{flows:?}");
+    let AppScope::Program { key, exe_paths } = &programs[0].app else {
+        panic!("a program flow");
+    };
+    assert_eq!(key, rule.as_str());
+    assert_eq!(exe_paths, &vec![PathBuf::from(program)]);
+
+    let seen = Ipv4Addr::new(203, 0, 113, 50);
+    store.record(program, seen);
+    assert!(
+        plan().iter().any(|f| f.flow.dst == DstMatch::HostV4(seen)),
+        "the next plan routes what the folder's program used"
+    );
+}

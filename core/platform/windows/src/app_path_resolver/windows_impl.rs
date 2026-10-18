@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
+use nrr_platform_api::app_folders::{AppPath, PathPrograms, ProgramFolderIndex};
+
 use super::{
     dedup_paths, glob_match, matching_images, BackgroundWalks, ProcessImages, ResolveCache,
 };
@@ -64,6 +66,8 @@ pub struct WindowsAppPathResolver {
     /// recompute is cheap, but the recompute runs every few seconds.
     ownership: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, bool)>>,
     ownership_ttl: Duration,
+    /// What rules by path cover, remembered and watched off the traffic path.
+    folders: Arc<ProgramFolderIndex>,
 }
 
 impl WindowsAppPathResolver {
@@ -124,6 +128,9 @@ impl WindowsAppPathResolver {
             walk_listener,
             ownership: std::sync::Mutex::new(std::collections::HashMap::new()),
             ownership_ttl: resolve_ttl,
+            folders: Arc::new(ProgramFolderIndex::new(Arc::new(
+                crate::app_folders::WindowsProgramFolders::new(),
+            ))),
         }
     }
 
@@ -146,9 +153,11 @@ impl WindowsAppPathResolver {
     }
 
     /// Called when a background walk answers a name differently than
-    /// before, so policy built without that answer can be built again.
+    /// before, or a watched rule folder gained or lost a program, so policy
+    /// built without that answer can be built again.
     #[must_use]
     pub fn with_walk_listener(self, listener: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.folders.set_listener(Arc::clone(&listener));
         let _ = self.walk_listener.set(listener);
         self
     }
@@ -237,6 +246,10 @@ impl AppPathResolver for WindowsAppPathResolver {
     fn is_protected_install(&self, exe: &Path) -> bool {
         let key = exe.to_string_lossy().to_ascii_lowercase();
         self.protected_install_cached(exe, &key)
+    }
+
+    fn path_programs(&self, path: &AppPath, owner: &str) -> PathPrograms {
+        self.folders.programs(path, owner)
     }
 }
 
@@ -411,7 +424,7 @@ fn push_registry_path(out: &mut Vec<PathBuf>, raw: &str) {
 /// Expand `%VAR%` tokens against the process environment. Unknown variables
 /// and unterminated `%` are left verbatim; `%%` collapses to a literal `%`.
 /// Handles the `REG_EXPAND_SZ` `App Paths` values (e.g. `%ProgramFiles%\…`).
-fn expand_env(input: &str) -> String {
+pub(crate) fn expand_env(input: &str) -> String {
     if !input.contains('%') {
         return input.to_string();
     }

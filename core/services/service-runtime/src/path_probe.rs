@@ -64,6 +64,20 @@ pub trait PathProbe: Send + Sync {
     ) -> PathVerdict {
         PathVerdict::Indeterminate
     }
+
+    /// A TCP connection to `target:port` leaving from `source`, the same way
+    /// [`Self::probe`] connects, for a caller that speaks over it itself. The
+    /// error is the verdict that ended the attempt. A mechanism without it
+    /// cannot hand one out.
+    fn connect_stream(
+        &self,
+        _target: Ipv4Addr,
+        _port: u16,
+        _source: Ipv4Addr,
+        _timeout: Duration,
+    ) -> Result<std::net::TcpStream, PathVerdict> {
+        Err(PathVerdict::Indeterminate)
+    }
 }
 
 /// The ClientHello exchange over an already connected `stream`, each read and
@@ -199,6 +213,16 @@ impl PathProbe for SystemPathProbe {
             Ok(socket) => tls_exchange(&mut socket.into(), server_name, timeout),
             Err(verdict) => verdict,
         }
+    }
+
+    fn connect_stream(
+        &self,
+        target: Ipv4Addr,
+        port: u16,
+        source: Ipv4Addr,
+        timeout: Duration,
+    ) -> Result<std::net::TcpStream, PathVerdict> {
+        Self::connect(target, port, Some(source), timeout).map(Into::into)
     }
 }
 

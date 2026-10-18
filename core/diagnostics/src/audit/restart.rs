@@ -276,6 +276,40 @@ mod tests {
         assert!(!key.verifies("event", "not hex"));
     }
 
+    /// Seals and break digests already written must keep verifying after a
+    /// crypto-crate upgrade.
+    #[test]
+    fn seals_and_break_digests_are_pinned() {
+        let key = AuditRestartKey::derive(b"service key").expect("key");
+        assert_eq!(
+            key.0.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "4187edcd1be221e3e5db46130bdcfe8cc16899b4a4f188719c31c30d6569c3f9"
+        );
+        assert_eq!(
+            key.seal("event").as_deref(),
+            Some("29fe7e7148a1bfe4a4d7b6fb26d8afc65eb0f771dbfed14a3a2fe58f371c0a7c")
+        );
+
+        let found = AuditChainBreak::corrupt_line("f", 0, "x");
+        assert_eq!(
+            found.actual_hash.as_deref(),
+            Some("2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881")
+        );
+        let mut inner = BreakLog::default();
+        inner.push(found);
+        // A leading zero nibble stays: the hex is fixed-width.
+        assert_eq!(
+            inner.fingerprint(),
+            "0494ce7c4dd08c6e295e8ea873d31dc1f3a6b7b0fa59847a0948a2c21535418f"
+        );
+        let mut outer = BreakLog::default();
+        outer.absorb(&inner);
+        assert_eq!(
+            outer.fingerprint(),
+            "ac65c5029958163722ea4f80f63994766cd4228a3b1b6d18a7d3f47b363920bb"
+        );
+    }
+
     #[test]
     fn no_key_is_derived_from_an_empty_one() {
         assert!(AuditRestartKey::derive(&[]).is_none());

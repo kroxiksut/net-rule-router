@@ -114,6 +114,11 @@ pub fn write_route(
     hint: &[String],
     exported_at: &str,
 ) -> Result<(), (PathBuf, String)> {
+    std::fs::write(path, route_text(route, table, hint, exported_at))
+        .map_err(|e| (path.to_path_buf(), e.to_string()))
+}
+
+fn route_text(route: Route, table: &Table, hint: &[String], exported_at: &str) -> String {
     let rows: Vec<RuleRow> = table.rows.iter().map(|r| r.rule.clone()).collect();
     let options = RulesFileOptions {
         include_comments: true,
@@ -122,8 +127,35 @@ pub fn write_route(
         os: PlatformProfile::current().os,
         syntax_hint: hint,
     };
-    std::fs::write(path, build_rules_file_text(&rows, route, &options))
-        .map_err(|e| (path.to_path_buf(), e.to_string()))
+    build_rules_file_text(&rows, route, &options)
+}
+
+/// Whether the file at `path` says something else than the rows on screen
+/// would write there. The leading `#` block is not compared: it carries the
+/// time of writing (the GUI's `canonicalRulesBody`). An unreadable file
+/// differs.
+pub fn route_differs(path: &Path, route: Route, table: &Table, hint: &[String]) -> bool {
+    match read_text(path) {
+        Ok(Some(on_disk)) => {
+            rules_body(&on_disk) != rules_body(&route_text(route, table, hint, ""))
+        }
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+/// Past the leading blank and `#` lines, trailing blank lines dropped.
+fn rules_body(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+    let start = lines
+        .iter()
+        .position(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or(lines.len());
+    let end = lines
+        .iter()
+        .rposition(|line| !line.is_empty())
+        .map_or(start, |last| (last + 1).max(start));
+    lines[start..end].join("\n")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,6 +281,27 @@ mod tests {
     use super::*;
     use crate::testing::Scratch;
     use nrr_client_logic::rules_table::{TargetRoute, RULES_FILE_HINT_KEYS};
+
+    /// Only what routes counts: a new time of writing in the header is the
+    /// same file, a line added below it is not.
+    #[test]
+    fn a_file_differs_only_by_its_rules() {
+        let dir = Scratch::new("files-differ");
+        let app = crate::state::AppState::new(crate::screens::ScreenId::Rules, false);
+        let (table, hint) = (&app.rules.table, &app.rules.file_hint);
+        write_set(dir.path(), table, hint, "2026-01-01T00:00:00Z").expect("write");
+        let path = dir.path().join(file_name(Route::Primary));
+        assert!(!route_differs(&path, Route::Primary, table, hint));
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        std::fs::write(&path, format!("# another header line\n{text}")).expect("write");
+        assert!(!route_differs(&path, Route::Primary, table, hint));
+
+        std::fs::write(&path, format!("{text}example.org\n")).expect("write");
+        assert!(route_differs(&path, Route::Primary, table, hint));
+        let gone = dir.path().join("absent.txt");
+        assert!(!route_differs(&gone, Route::Primary, table, hint));
+    }
 
     /// The terminal writes the syntax hint the GUI writes, in the reader's
     /// language, and reads it back as nothing.

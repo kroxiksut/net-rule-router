@@ -860,6 +860,29 @@ fn policy_and_period_slugs_off_their_lists_keep_the_stored_value() {
     assert_eq!(reloaded.traffic_stats_period, "all-time");
 }
 
+#[test]
+fn the_trace_grouping_round_trips_and_an_unknown_one_keeps_the_stored_value() {
+    let baseline = UiPreferences {
+        conn_trace_group_by: "none".into(),
+        ..Default::default()
+    };
+    let refused = apply_qt_preferences_payload(
+        &baseline,
+        &payload_with(&[("connTraceGroupBy", "by-folder".into())]),
+    )
+    .expect("payload must parse");
+    assert_eq!(refused.conn_trace_group_by, "none");
+    let taken = apply_qt_preferences_payload(
+        &baseline,
+        &payload_with(&[("connTraceGroupBy", "folder".into())]),
+    )
+    .expect("payload must parse");
+    assert_eq!(through_the_file(&taken).conn_trace_group_by, "folder");
+    let untouched =
+        apply_qt_preferences_payload(&baseline, &payload_with(&[])).expect("payload must parse");
+    assert_eq!(untouched.conn_trace_group_by, "none");
+}
+
 /// A setting whose default is ON used to read an absent key as that default,
 /// so a payload that simply did not mention it switched the user's OFF back ON.
 #[test]

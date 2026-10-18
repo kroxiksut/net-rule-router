@@ -224,6 +224,16 @@ pub fn route_label(route: &TargetRoute) -> Option<Key> {
     }
 }
 
+/// What the rows on screen changed against the rules last read, each rule
+/// named by its `merge_key`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Edits {
+    /// Rules read that are no longer on screen.
+    pub removed: Vec<String>,
+    /// Rows added, or changed in anything but their key.
+    pub rows: Vec<RuleRow>,
+}
+
 /// The routing part of a row, and its note: what "unchanged" compares.
 fn content(rule: &RuleRow) -> RuleRow {
     RuleRow {
@@ -240,8 +250,13 @@ pub struct Table {
     pub filter: RouteFilter,
     pub search: String,
     pub sort: SortMode,
-    /// Position of the chosen row among the visible ones.
-    pub cursor: usize,
+    /// Position of the chosen row among the visible ones, as last put; read
+    /// through [`Table::cursor`].
+    cursor: usize,
+    /// The chosen rule (`merge_key`). The list re-sorts while a main-route
+    /// check runs and is re-read on every revision, so a position alone would
+    /// soon name another rule.
+    anchor: Option<String>,
     /// Sections of the last imported files this build does not apply, per
     /// route file, written back on export.
     pub passthrough: [BTreeMap<String, String>; 2],
@@ -284,22 +299,55 @@ impl Table {
     }
 
     pub fn selected(&self) -> Option<usize> {
-        self.visible().get(self.cursor).copied()
+        let shown = self.visible();
+        shown.get(self.cursor_in(&shown)).copied()
+    }
+
+    /// Where the chosen rule stands among the visible rows.
+    pub fn cursor(&self) -> usize {
+        self.cursor_in(&self.visible())
+    }
+
+    /// [`Table::cursor`] over `shown`, as [`Table::visible`] gave it. A rule
+    /// that has left the list leaves the cursor where it was.
+    pub fn cursor_in(&self, shown: &[usize]) -> usize {
+        if let Some(key) = &self.anchor {
+            if let Some(at) = shown
+                .iter()
+                .position(|&i| self.rows[i].rule.merge_key() == *key)
+            {
+                return at;
+            }
+        }
+        self.cursor.min(shown.len().saturating_sub(1))
+    }
+
+    /// Put the cursor at visible position `at`, on the rule that stands there.
+    pub fn set_cursor(&mut self, at: usize) {
+        let shown = self.visible();
+        self.cursor = at.min(shown.len().saturating_sub(1));
+        self.anchor = shown
+            .get(self.cursor)
+            .map(|&i| self.rows[i].rule.merge_key());
+    }
+
+    /// The rule at `master` is the chosen one again after an edit changed its
+    /// type, value or route.
+    pub fn keep_chosen(&mut self, master: usize) {
+        if let Some(row) = self.rows.get(master) {
+            self.anchor = Some(row.rule.merge_key());
+            self.cursor = self.cursor();
+        }
     }
 
     pub fn clamp_cursor(&mut self) {
-        let shown = self.visible().len();
-        self.cursor = self.cursor.min(shown.saturating_sub(1));
+        let at = self.cursor();
+        self.set_cursor(at);
     }
 
     pub fn move_cursor(&mut self, by: isize) {
-        let shown = self.visible().len();
-        if shown == 0 {
-            self.cursor = 0;
-            return;
-        }
-        let target = self.cursor.saturating_add_signed(by);
-        self.cursor = target.min(shown - 1);
+        let from = self.cursor();
+        self.set_cursor(from.saturating_add_signed(by));
     }
 
     /// Put the cursor on the row at `master`, clearing the filter and the
@@ -311,7 +359,7 @@ impl Table {
             self.recent = None;
         }
         if let Some(at) = self.visible().iter().position(|&i| i == master) {
-            self.cursor = at;
+            self.set_cursor(at);
         }
     }
 
@@ -374,6 +422,60 @@ impl Table {
                 .iter()
                 .map(|r| (&r.rule, Some(r.ace_lower.as_str()))),
         )
+    }
+
+    /// What the rows on screen changed against the rules last read.
+    pub fn edits(&self) -> Edits {
+        let base: HashMap<String, &RuleRow> = self
+            .baseline
+            .iter()
+            .flatten()
+            .map(|rule| (rule.merge_key(), rule))
+            .collect();
+        let on_screen: std::collections::HashSet<String> =
+            self.rows.iter().map(|r| r.rule.merge_key()).collect();
+        let mut removed: Vec<String> = base
+            .keys()
+            .filter(|key| !on_screen.contains(*key))
+            .cloned()
+            .collect();
+        removed.sort();
+        let rows = self
+            .rows
+            .iter()
+            .map(|r| content(&r.rule))
+            .filter(|rule| base.get(&rule.merge_key()) != Some(&rule))
+            .collect();
+        Edits { removed, rows }
+    }
+
+    /// `edits` laid over the rows just read: a rule removed goes, a row of
+    /// the same rule is replaced, a new one is added.
+    pub fn apply_edits(&mut self, edits: Edits) {
+        self.rows
+            .retain(|row| !edits.removed.contains(&row.rule.merge_key()));
+        for rule in edits.rows {
+            let key = rule.merge_key();
+            match self.rows.iter().position(|r| r.rule.merge_key() == key) {
+                Some(at) => {
+                    let old = &self.rows[at];
+                    let mut row = Row {
+                        service_id: old.service_id.clone(),
+                        ..Row::new(RuleRow {
+                            id: old.rule.id.clone(),
+                            ..rule
+                        })
+                    };
+                    row.inherit_main_route(old);
+                    self.rows[at] = row;
+                }
+                None => {
+                    let id = self.next_free_id();
+                    self.rows.push(Row::new(RuleRow { id, ..rule }));
+                }
+            }
+        }
+        self.clamp_cursor();
     }
 
     /// The rows on screen are what the service now applies.

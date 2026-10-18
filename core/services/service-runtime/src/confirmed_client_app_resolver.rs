@@ -89,6 +89,14 @@ impl AppPathResolver for ConfirmedClientAppPathResolver {
     fn is_protected_install(&self, exe: &Path) -> bool {
         self.inner.is_protected_install(exe)
     }
+
+    fn path_programs(
+        &self,
+        path: &nrr_platform_api::app_folders::AppPath,
+        owner: &str,
+    ) -> nrr_platform_api::app_folders::PathPrograms {
+        self.inner.path_programs(path, owner)
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +165,31 @@ mod tests {
             ConfirmedClientAppPathResolver::new(Arc::new(ScriptedInner::default()), confirmed);
         // A process the user never confirmed gains nothing from this decorator.
         assert!(resolver.resolve("chrome.exe").is_empty());
+    }
+
+    /// What a rule by path covers is read from the disk by the inner resolver;
+    /// a decorator answering the port's default would make every path rule
+    /// behind it "unsupported".
+    #[test]
+    fn path_rules_pass_straight_through() {
+        use nrr_platform_api::app_folders::{AppPath, PathOutcome, PathPrograms, PathStyle};
+        let rule = AppPath::parse("/opt/app/*", PathStyle::Linux).expect("rule");
+        let answer = PathPrograms {
+            outcome: PathOutcome::Found,
+            place: Some(rule.clone()),
+            programs: vec![PathBuf::from("/opt/app/run")],
+            over_cap: false,
+        };
+        let inner = nrr_platform_api::MockAppPathResolver::new().with_path_programs(
+            rule.as_str(),
+            "*",
+            answer.clone(),
+        );
+        let resolver = ConfirmedClientAppPathResolver::new(
+            Arc::new(inner),
+            Arc::new(ConfirmedVpnClients::new()),
+        );
+        assert_eq!(resolver.path_programs(&rule, "uid:1000"), answer);
     }
 
     #[test]

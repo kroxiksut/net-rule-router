@@ -96,5 +96,7 @@ fuzz_target!(|data: &[u8]| {
         ConnHistoryListRequest,
         ConnHistoryClearRequest,
         ConnHistorySettingsSetRequest,
+        SiteCheckRequest,
+        SiteCheckResultRequest,
     );
 });

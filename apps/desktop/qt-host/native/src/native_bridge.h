@@ -575,6 +575,13 @@ public:
     Q_INVOKABLE QString rpcUserSettingsIntentGet();
     Q_INVOKABLE QString rpcUserSettingsIntentRecord(const QVariantMap &payload);
 
+    /// Async wrappers over `local.user-settings.rules-file-written` (`{path}`:
+    /// the program just wrote that rules file) and
+    /// `local.user-settings.rules-files-hand-edited` (`{paths}`: answers
+    /// `{"hand-edited": [...]}`, the files changed by hand since).
+    Q_INVOKABLE QString rpcUserSettingsRulesFileWritten(const QVariantMap &payload);
+    Q_INVOKABLE QString rpcUserSettingsRulesFilesHandEdited(const QVariantMap &payload);
+
     /// Async wrapper over the launcher-local `local.update-check.run` RPC: the
     /// Help menu's "Check for updates". Answers `{status: "update-available",
     /// latestVersion, url}` or `{status: "up-to-date", currentVersion}`; a
@@ -797,6 +804,11 @@ public:
     Q_INVOKABLE QString rpcConnHistoryClear();
     // `enabled` and/or `retention-days` for the caller's history.
     Q_INVOKABLE QString rpcConnHistorySettingsSet(const QVariantMap &payload);
+
+    // "Is it us or the site?": start checking `host` over the caller's own
+    // routes, then read the caller's latest check until it is done.
+    Q_INVOKABLE QString rpcSiteCheckRun(const QString &host);
+    Q_INVOKABLE QString rpcSiteCheckResult();
 
     // The remote addresses one program connected to recently, most likely
     // VPN gateway first. `program` is its file name; a path is reduced to it.

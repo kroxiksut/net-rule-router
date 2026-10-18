@@ -178,3 +178,31 @@ path = "fuzz_targets/log_free_text_paths.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "conn_trace_groups"
+path = "fuzz_targets/conn_trace_groups.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "folder_notify_records"
+path = "fuzz_targets/folder_notify_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inotify_events"
+path = "fuzz_targets/inotify_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "site_check_http"
+path = "fuzz_targets/site_check_http.rs"
+test = false
+doc = false
+bench = false

@@ -158,7 +158,7 @@ pub fn ask(app: &mut AppState) -> bool {
 /// The option `at` of the question was chosen.
 pub fn picked(app: &mut AppState, at: usize) {
     let table = &mut app.rules.table;
-    table.cursor = 0;
+    table.set_cursor(0);
     match choice_period(at) {
         None => table.recent = None,
         Some(period) => {

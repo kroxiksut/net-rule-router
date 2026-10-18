@@ -102,8 +102,10 @@ QtObject {
     /// user already confirmed elsewhere (added from the tray). Same one-cycle
     /// guard as `_guardApplyRules`, and a success runs the same completion as
     /// a reviewed apply. A failure leaves the table dirty, so the ordinary
-    /// Apply can retry it. `onDone(ok)`.
-    function applyWithoutReview(origin, onDone) {
+    /// Apply can retry it. `expect` is the diff the caller made (see
+    /// `RulesSubmitter.applyNow`); anything else goes to review instead.
+    /// `onDone(ok)`.
+    function applyWithoutReview(origin, onDone, expect) {
         var resume = (typeof onDone === "function") ? onDone : null
         if (root._guardRulesInFlight || root.rpc.longCallInFlight) {
             console.log("review-flow: an apply cycle is already in flight, ignoring start from",
@@ -118,11 +120,21 @@ QtObject {
         }
         root._guardRulesInFlight = true
         root._guardRulesResume = resume
-        submitter.applyNow(rulesJson, "apply-direct:" + String(origin || "unnamed"), null,
+        submitter.applyNow(rulesJson, "apply-direct:" + String(origin || "unnamed"),
+            expect || null,
             function(ok, r) {
                 if (!ok) {
                     console.log("review-flow: direct apply failed:", r.reason, r.code, r.failure)
-                    root.statusLine = submitter.describeFailure(r, root.tr)
+                    var moved = r.refusal ? r.refusal.code : r.failure
+                    if (_offerMergeIfChangedElsewhere(moved)) {
+                        _resolveGuardRulesApply(false)
+                        return
+                    }
+                    // The tray's wording sends the user here; this is here.
+                    root.statusLine = String(r.reason || "") === "unexpected-diff"
+                        ? root.tr("status.rules-apply-unexpected-diff-here",
+                            "Not applied: the change would also affect other rules. Press Apply to review it.")
+                        : submitter.describeFailure(r, root.tr)
                     _resolveGuardRulesApply(false)
                     return
                 }
@@ -145,7 +157,9 @@ QtObject {
     /// Entry point for sections (RulesSection's Save button). Kicks
     /// off the dry-run pass; the rpcResponse callback opens
     /// ReviewDiffDialog.
-    function startRulesReviewFlow(rulesJson, contentHash, adminBaseline, origin) {
+    /// `baseRevision`, when given, is what `rulesJson` was built on instead of
+    /// the table's own base (a merge onto the rules now in force).
+    function startRulesReviewFlow(rulesJson, contentHash, adminBaseline, origin, baseRevision) {
         if (!root.bridgeAvailable) {
             console.log("review-flow: bridge unavailable, aborting")
             _resolveGuardRulesApply(false)
@@ -166,11 +180,9 @@ QtObject {
         // The origin travels on the wire (`correlation_id` in the service log),
         // so the next duplicate names its own caller instead of leaving us to
         // guess which of six paths fired it.
-        var sent = submitter.dryRun(rulesJson, {
-            origin: origin,
-            adminBaseline: adminBaseline,
-            contentHash: contentHash
-        }, function(ok, r) {
+        var opts = { origin: origin, adminBaseline: adminBaseline, contentHash: contentHash }
+        if (baseRevision !== undefined) opts.baseRevision = baseRevision
+        var sent = submitter.dryRun(rulesJson, opts, function(ok, r) {
             if (!ok) {
                 console.log("review-flow: dry-run failed:", r.code, r.message)
                 // Release the guard without navigating.
@@ -189,8 +201,9 @@ QtObject {
             // A refused preview has an empty diff; say why, or it reads as
             // "nothing to apply".
             if (r.refusal) {
-                root.statusLine = submitter.describeFailure(r, root.tr)
                 _resolveGuardRulesApply(false)
+                if (!_offerMergeIfChangedElsewhere(r.refusal.code))
+                    root.statusLine = submitter.describeFailure(r, root.tr)
                 return
             }
             // Nothing changed vs the active
@@ -323,8 +336,9 @@ QtObject {
                 console.log("review-flow: activation refused:", failure)
                 // Nothing was activated: the edits stay unsaved and the
                 // bound files keep what is in force.
-                _announceRulesActivationFailed(failure, failureArgs)
                 _resolveGuardRulesApply(false)
+                if (!_offerMergeIfChangedElsewhere(failure))
+                    _announceRulesActivationFailed(failure, failureArgs)
                 return
             }
             var code = r.code
@@ -369,6 +383,17 @@ QtObject {
             console.log("review-flow: activate could not be sent, aborting")
             _resolveGuardRulesApply(false)
         }
+    }
+
+    /// The apply was built on rules that have changed since: rather than only
+    /// saying so, the merge review puts the edits on top of the rules now in
+    /// force. `false` for any other refusal.
+    function _offerMergeIfChangedElsewhere(code) {
+        if (String(code || "") !== "rules-changed-elsewhere" || !root.driftController) return false
+        root.statusLine = root.tr("status.rules-changed-elsewhere-merge",
+            "Your rules were changed elsewhere meanwhile. Review how your edits combine with them.")
+        root.driftController.openMergeWithPendingEdits()
+        return true
     }
 
     // `args` are this refusal's own values; null words it by its code alone.

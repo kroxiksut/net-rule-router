@@ -722,6 +722,21 @@ mod tests {
         assert!(!is_pinned_wintun(""));
     }
 
+    /// The gate compares this against fixed-width hex constants, so its
+    /// spelling must not move with the crypto crate.
+    #[test]
+    fn the_file_hash_is_fixed_width_hex() {
+        assert_eq!(
+            sha256_hex(b"not the driver"),
+            "2a677aeec951eac37cf328d948ae745466ee7bc1fc098bac0ce294ff66e26437"
+        );
+        // A leading zero nibble stays.
+        assert_eq!(
+            sha256_hex(b"not json 19"),
+            "0b4447295187b5a8357ab3aa6cb10dd0911a9bc45a613f7e40411b7626a3e0a4"
+        );
+    }
+
     #[test]
     fn installed_layout_wins_over_the_staged_and_repository_layouts() {
         let exe_dir = Path::new("install-dir");

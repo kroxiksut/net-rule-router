@@ -60,6 +60,7 @@ impl UiPreferences {
             missing_secondary_banner_acknowledged: false,
             traffic_stats_period: TRAFFIC_STATS_PERIOD_DEFAULT.to_string(),
             traffic_export_unit: TRAFFIC_EXPORT_UNIT_DEFAULT.to_string(),
+            conn_trace_group_by: CONN_TRACE_GROUPING_DEFAULT.to_string(),
             diagnostics_archive_redaction_level: DIAGNOSTICS_ARCHIVE_REDACTION_LEVEL_DEFAULT
                 .to_string(),
             diagnostics_archive_session_only: true,

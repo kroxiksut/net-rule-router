@@ -19,16 +19,37 @@
 //! empty vector, same as on Windows.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use nrr_platform_api::app_folders::{AppPath, PathPrograms, ProgramFolderIndex};
 use nrr_platform_api::app_path_resolver::{dedup_paths, glob_match, AppPathResolver};
 
 /// Production resolver over `$PATH` and the package-manager export dirs.
 ///
-/// No cache: this runs while an apply is being planned, not on the traffic
-/// path, and a directory listing per candidate is cheap next to the filter
-/// codegen that follows.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LinuxAppPathResolver;
+/// No cache for names: this runs while an apply is being planned, not on the
+/// traffic path, and a directory listing per candidate is cheap next to the
+/// filter codegen that follows. Rules by path go through a watched index.
+#[derive(Clone)]
+pub struct LinuxAppPathResolver {
+    folders: Arc<ProgramFolderIndex>,
+}
+
+impl Default for LinuxAppPathResolver {
+    fn default() -> Self {
+        Self::with_program_folders(Arc::new(ProgramFolderIndex::new(Arc::new(
+            crate::app_folders::LinuxProgramFolders::new(),
+        ))))
+    }
+}
+
+impl LinuxAppPathResolver {
+    /// A resolver answering rules by path from `folders`, which the service
+    /// shares to read its change number and hear of a changed folder.
+    #[must_use]
+    pub fn with_program_folders(folders: Arc<ProgramFolderIndex>) -> Self {
+        Self { folders }
+    }
+}
 
 impl AppPathResolver for LinuxAppPathResolver {
     fn resolve(&self, name_or_glob: &str) -> Vec<PathBuf> {
@@ -73,6 +94,10 @@ impl AppPathResolver for LinuxAppPathResolver {
 
     fn is_protected_install(&self, exe: &std::path::Path) -> bool {
         root_owned(exe)
+    }
+
+    fn path_programs(&self, path: &AppPath, owner: &str) -> PathPrograms {
+        self.folders.programs(path, owner)
     }
 }
 
@@ -241,7 +266,7 @@ mod tests {
         assert!(candidate_patterns("   ").is_empty());
         // `.exe` alone leaves no name behind, so only the original stands.
         assert_eq!(candidate_patterns(".exe"), vec![".exe".to_string()]);
-        assert!(LinuxAppPathResolver.resolve("").is_empty());
+        assert!(LinuxAppPathResolver::default().resolve("").is_empty());
     }
 
     #[test]
@@ -261,7 +286,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_real_executable_resolves_through_the_neutral_spelling() {
-        let paths = LinuxAppPathResolver.resolve("sh.exe");
+        let paths = LinuxAppPathResolver::default().resolve("sh.exe");
         assert!(
             paths.iter().any(|p| p.file_name() == Some("sh".as_ref())),
             "expected a shell among {paths:?}",
@@ -272,7 +297,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn an_application_nobody_installed_resolves_to_nothing() {
-        assert!(LinuxAppPathResolver
+        assert!(LinuxAppPathResolver::default()
             .resolve("nrr-no-such-application.exe")
             .is_empty());
     }

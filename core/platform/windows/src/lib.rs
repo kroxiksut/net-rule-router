@@ -38,6 +38,8 @@
 //! | `interface_manager` | Adapter enumeration |
 
 pub mod adapters;
+// Rules by program path: real places, folder listings, ReadDirectoryChangesW.
+pub mod app_folders;
 // IfType / medium / hardware flag -> the neutral facts the kind is decided from.
 mod adapter_kind;
 #[cfg(test)]
@@ -249,7 +251,7 @@ pub use vpn_discovery::WindowsVpnDiscovery;
 // learned-VPN-client sink re-enters the enforcement layer, whose
 // `ALE_APP_ID` builder needs the drive-letter form.
 #[cfg(target_os = "windows")]
-pub use win32_ffi::app_id::win32_path_from_nt_path;
+pub use win32_ffi::app_id::{win32_path_from_nt_path, win32_path_from_nt_path_cached};
 // `RouteTablePort` is the neutral half of the old single port; re-exported
 // here so Windows code names one crate, exactly as before the split.
 pub use windows_api::{

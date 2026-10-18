@@ -38,6 +38,8 @@ Audit trail:
 Explain sample:
   No probe has been run yet. Enter a query above and click Probe.
   e: Enter a hostname or IP to simulate the routing decision against the active rule set.
+Check a site:
+  Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.
 Diagnostic archive export:
   The archive is saved in the service archives directory (per-user).
   Ready
@@ -46,6 +48,7 @@ Commands on this screen:
   l: switch between diagnostics and the log
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
   x: export a diagnostic archive
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
   n: next page (more)   p: previous page (back)
@@ -83,6 +86,8 @@ Audit trail:
 Explain sample:
   No probe has been run yet. Enter a query above and click Probe.
   e: Enter a hostname or IP to simulate the routing decision against the active rule set.
+Check a site:
+  Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.
 Diagnostic archive export:
   The archive is saved in the service archives directory (per-user).
   Ready
@@ -91,6 +96,7 @@ Commands on this screen:
   l: switch between diagnostics and the log
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
   x: export a diagnostic archive
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
   n: next page (more)   p: previous page (back)
@@ -121,6 +127,8 @@ Audit trail:
 Explain sample:
   No probe has been run yet. Enter a query above and click Probe.
   e: Enter a hostname or IP to simulate the routing decision against the active rule set.
+Check a site:
+  Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.
 Diagnostic archive export:
   The archive is saved in the service archives directory (per-user).
   Ready
@@ -129,6 +137,7 @@ Commands on this screen:
   l: switch between diagnostics and the log
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
   x: export a diagnostic archive
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
   n: next page (more)   p: previous page (back)
@@ -157,6 +166,8 @@ Explain sample:
   hostname or IP: example.com
   Probing...
   e: Enter a hostname or IP to simulate the routing decision against the active rule set.
+Check a site:
+  Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.
 Diagnostic archive export:
   The archive is saved in the service archives directory (per-user).
   Ready
@@ -165,6 +176,7 @@ Commands on this screen:
   l: switch between diagnostics and the log
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
   x: export a diagnostic archive
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
   n: next page (more)   p: previous page (back)
@@ -183,6 +195,7 @@ Commands on this screen:
   l: switch between diagnostics and the log
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
   x: export a diagnostic archive
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
   n: next page (more)   p: previous page (back)
@@ -202,6 +215,7 @@ Commands on this screen:
   l: switch between diagnostics and the log
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
   x: export a diagnostic archive
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
   n: next page (more)   p: previous page (back)

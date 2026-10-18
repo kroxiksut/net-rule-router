@@ -62,8 +62,10 @@ QtObject {
     /// Generate `route`'s rules from `rows` (`{count, get(i)}`, a ListModel
     /// works) and write them to `path`. `os` is `PlatformProfile.os`: it picks
     /// the application section. `done(ok, changed)` — `changed` is false when
-    /// the file already held these rules and was left alone.
-    function writeRoute(route, path, rows, includeComments, os, done) {
+    /// the file already held these rules and was left alone. `keep`: the file
+    /// was edited by hand since the program wrote it, so it is never
+    /// overwritten here, only recognised when it already holds these rules.
+    function writeRoute(route, path, rows, includeComments, os, done, keep) {
         var finish = function(ok, changed) {
             if (typeof done === "function") done(!!ok, !!changed)
         }
@@ -75,6 +77,12 @@ QtObject {
             var text = Rules.buildCanonicalRulesText(
                 rows, route, sections, !!includeComments, os, writer.hintLines())
             if (writer.fileHoldsText(path, text)) {
+                writer.noteWritten(path)
+                finish(true, false)
+                return
+            }
+            if (keep === true) {
+                console.log("[bound-file] left as edited by hand:", route, path)
                 finish(true, false)
                 return
             }
@@ -83,7 +91,49 @@ QtObject {
                 finish(false, false)
                 return
             }
+            writer.noteWritten(path)
             finish(true, true)
+        })
+    }
+
+    /// `path` now holds the program's version of its rules: a later change
+    /// there is the user's hand, which a write from elsewhere must not erase
+    /// unasked (`handEdited`).
+    function noteWritten(path) {
+        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.rpcUserSettingsRulesFileWritten !== "function"
+                || !rpc || typeof rpc.registerRpcCallback !== "function") return
+        var corr = nrrNativeBridge.rpcUserSettingsRulesFileWritten({ "path": String(path) })
+        if (!corr || String(corr) === "") return
+        rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
+            if (!ok) console.log("[bound-file] written version not recorded:", code, msg)
+        })
+    }
+
+    /// Which of `paths` were edited by hand since the program last wrote them.
+    /// `onAnswer(list)`; a failed check answers every path, so nothing is
+    /// overwritten on a guess.
+    function handEdited(paths, onAnswer) {
+        var asked = []
+        for (var i = 0; i < paths.length; i += 1) {
+            if (String(paths[i] || "") !== "") asked.push(String(paths[i]))
+        }
+        if (asked.length === 0) { onAnswer([]); return }
+        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.rpcUserSettingsRulesFilesHandEdited !== "function"
+                || !rpc || typeof rpc.registerRpcCallback !== "function") {
+            onAnswer([])
+            return
+        }
+        var corr = nrrNativeBridge.rpcUserSettingsRulesFilesHandEdited({ "paths": asked })
+        if (!corr || String(corr) === "") { onAnswer(asked); return }
+        rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
+            if (!ok) {
+                console.log("[bound-file] hand-edit check failed:", code, msg)
+                onAnswer(asked)
+                return
+            }
+            onAnswer((payload && payload["hand-edited"]) || [])
         })
     }
 }

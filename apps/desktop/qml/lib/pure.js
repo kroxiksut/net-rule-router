@@ -704,6 +704,244 @@ function isNonInternetAddress(remote) {
     return false
 }
 
+// ---- connection trace grouping ----
+//
+// Twin of `nrr_client_logic::conn_trace::group_trace_rows`;
+// `core/client-logic/tests/vectors/conn_trace_groups.json` holds the two
+// together. Paths are what the OS reports for other users' processes too: the
+// read is bounded, and a path that does not read joins the rows without one.
+
+// `nrr_shared::app_path::MAX_PATH_BYTES` and `MAX_PATH_SEGMENTS`.
+var CONN_TRACE_PATH_MAX_BYTES = 32768
+var CONN_TRACE_PATH_MAX_SEGMENTS = 256
+
+// The grouping slugs in the order they are offered; "program" is the default.
+var CONN_TRACE_GROUPINGS = ["none", "program", "folder"]
+
+function connTraceGroupingOrDefault(slug) {
+    var s = String(slug || "")
+    return CONN_TRACE_GROUPINGS.indexOf(s) >= 0 ? s : "program"
+}
+
+// Whether `s` holds more than `limit` bytes as UTF-8.
+function _ctUtf8Over(s, limit) {
+    var n = 0
+    for (var i = 0; i < s.length; i += 1) {
+        var u = s.charCodeAt(i)
+        if (u < 0x80) n += 1
+        else if (u < 0x800) n += 2
+        else if (u >= 0xD800 && u <= 0xDBFF && i + 1 < s.length
+                 && s.charCodeAt(i + 1) >= 0xDC00 && s.charCodeAt(i + 1) <= 0xDFFF) {
+            n += 4
+            i += 1
+        } else n += 3
+        if (n > limit) return true
+    }
+    return false
+}
+
+function _ctHasControl(s) {
+    for (var i = 0; i < s.length; i += 1) {
+        var u = s.charCodeAt(i)
+        if (u <= 0x1F || (u >= 0x7F && u <= 0x9F)) return true
+    }
+    return false
+}
+
+// { root, folders, file } as spelled, or null when the path names no file.
+function _ctProgramPath(raw, windows) {
+    var path = String(raw === undefined || raw === null ? "" : raw)
+    if (_ctUtf8Over(path, CONN_TRACE_PATH_MAX_BYTES) || _ctHasControl(path)) return null
+    path = path.trim()
+    var root = ""
+    var rest
+    if (windows) {
+        var u = path.replace(/\//g, "\\")
+        if (/^\\\\\?\\unc\\/i.test(u)) u = "\\\\" + u.substring(8)
+        else if (u.indexOf("\\\\?\\") === 0 || u.indexOf("\\\\.\\") === 0) u = u.substring(4)
+        if (u.indexOf("\\\\") === 0) {
+            var parts = u.substring(2).split("\\").filter(function (p) { return p !== "" })
+            if (parts.length < 2) return null
+            if (parts[0] === "." || parts[0] === ".." || parts[1] === "." || parts[1] === "..") {
+                return null
+            }
+            root = "\\\\" + parts[0] + "\\" + parts[1]
+            rest = parts.slice(2).join("\\")
+        } else {
+            if (!/^[A-Za-z]:(\\|$)/.test(u)) return null
+            root = u.charAt(0) + ":"
+            rest = u.substring(2)
+        }
+    } else {
+        if (path.charAt(0) !== "/") return null
+        rest = path.substring(1)
+    }
+    var segments = []
+    var raws = rest.split(windows ? "\\" : "/")
+    for (var i = 0; i < raws.length; i += 1) {
+        var seg = raws[i]
+        if (seg === "" || seg === ".") continue
+        if (seg === "..") return null
+        if (windows) {
+            // A colon past the drive is a stream name; Windows drops trailing
+            // dots and spaces.
+            if (seg.indexOf(":") >= 0) return null
+            seg = seg.replace(/[. ]+$/, "")
+            if (seg === "") return null
+        }
+        segments.push(seg)
+        if (segments.length > CONN_TRACE_PATH_MAX_SEGMENTS) return null
+    }
+    if (segments.length === 0) return null
+    var file = segments.pop()
+    return { "root": root, "folders": segments, "file": file }
+}
+
+function _ctFolderText(root, folders, sep) {
+    if (folders.length === 0)
+        return (root === "" || root.charAt(root.length - 1) === ":") ? root + sep : root
+    return root + sep + folders.join(sep)
+}
+
+function _ctCompareSegments(a, b) {
+    var n = Math.min(a.length, b.length)
+    for (var i = 0; i < n; i += 1) {
+        if (a[i] < b[i]) return -1
+        if (a[i] > b[i]) return 1
+    }
+    return a.length - b.length
+}
+
+function _ctStartsWith(folder, top) {
+    if (top.length > folder.length) return false
+    for (var i = 0; i < top.length; i += 1) {
+        if (folder[i] !== top[i]) return false
+    }
+    return true
+}
+
+// The trace rows (`process`, `process_path`) grouped as `grouping` asks, on a
+// trace observed on `os` (`PlatformProfile.os`), which decides the separator
+// and whether case matters. Each group: kind ("program" | "folder" |
+// "no-path"), key, label, ruleValue (null unless a folder below a root), rows
+// (indices into `rows`), programs, header. "none" gives no groups.
+function connTraceGroups(rows, grouping, os) {
+    var g = String(grouping || "")
+    if (g !== "program" && g !== "folder") return []
+    var list = rows || []
+    var o = String(os || "")
+    var windows = o !== "linux" && o !== "macos"
+    var foldCase = o !== "linux"
+    var sep = windows ? "\\" : "/"
+    var rootLen = windows ? 1 : 0
+    var fold = function (s) { return foldCase ? s.toLowerCase() : s }
+    var paths = []
+    for (var i = 0; i < list.length; i += 1) {
+        var r = list[i] || {}
+        paths.push(_ctProgramPath(r.process_path, windows))
+    }
+    var processOf = function (k) {
+        var r = list[k] || {}
+        return String(r.process || "")
+    }
+    var identity = function (k) {
+        var p = paths[k]
+        if (p === null) return "n" + processOf(k)
+        return fold("p" + _ctFolderText(p.root, p.folders, sep) + sep + p.file)
+    }
+    var programs = function (members) {
+        var seen = {}
+        var n = 0
+        for (var m = 0; m < members.length; m += 1) {
+            var id = "k" + identity(members[m])
+            if (seen[id] !== true) { seen[id] = true; n += 1 }
+        }
+        return n
+    }
+    var byLabel = function (a, b) {
+        var la = a.label.toLowerCase(), lb = b.label.toLowerCase()
+        return la < lb ? -1 : (la > lb ? 1 : 0)
+    }
+    var groups = []
+    var at = {}
+    if (g === "program") {
+        for (var p = 0; p < list.length; p += 1) {
+            var name = processOf(p) || "—"
+            var slot = at["k" + name]
+            if (slot === undefined) {
+                slot = groups.length
+                at["k" + name] = slot
+                groups.push({ "kind": "program", "key": "program:" + name, "label": name,
+                              "ruleValue": null, "rows": [], "programs": 0, "header": false })
+            }
+            groups[slot].rows.push(p)
+        }
+        for (var q = 0; q < groups.length; q += 1) {
+            groups[q].programs = programs(groups[q].rows)
+            groups[q].header = groups[q].rows.length > 1
+        }
+        groups.sort(byLabel)
+        return groups
+    }
+
+    var keyOf = function (path) {
+        var key = path.root === "" ? [] : [fold(path.root)]
+        for (var f = 0; f < path.folders.length; f += 1) key.push(fold(path.folders[f]))
+        return key
+    }
+    // Distinct folders, each with the row that first spelled it.
+    var firstRow = {}
+    var folders = []
+    var keys = []
+    for (var a = 0; a < paths.length; a += 1) {
+        if (paths[a] === null) { keys.push(null); continue }
+        var key = keyOf(paths[a])
+        keys.push(key)
+        var id = "k" + key.join("\n")
+        if (firstRow[id] === undefined) {
+            firstRow[id] = a
+            folders.push(key)
+        }
+    }
+    // Sorted by segments, a folder's descendants follow it in one run; a root
+    // never takes in the folders below it.
+    folders.sort(_ctCompareSegments)
+    var groupOf = {}
+    var current = null
+    for (var b = 0; b < folders.length; b += 1) {
+        var folder = folders[b]
+        var top = (current !== null && _ctStartsWith(folder, current)) ? current : folder
+        current = folder.length > rootLen ? top : null
+        groupOf["k" + folder.join("\n")] = top
+    }
+    var withoutPath = []
+    for (var c = 0; c < paths.length; c += 1) {
+        if (keys[c] === null) { withoutPath.push(c); continue }
+        var t = groupOf["k" + keys[c].join("\n")]
+        var tid = "k" + t.join("\n")
+        var at2 = at[tid]
+        if (at2 === undefined) {
+            at2 = groups.length
+            at[tid] = at2
+            var first = paths[firstRow[tid]]
+            var below = t.length - rootLen
+            var label = _ctFolderText(first.root, first.folders.slice(0, below), sep)
+            groups.push({ "kind": "folder", "key": "folder:" + fold(label), "label": label,
+                          "ruleValue": below > 0 ? label + sep + "*" : null,
+                          "rows": [], "programs": 0, "header": true })
+        }
+        groups[at2].rows.push(c)
+    }
+    for (var d = 0; d < groups.length; d += 1)
+        groups[d].programs = programs(groups[d].rows)
+    groups.sort(byLabel)
+    if (withoutPath.length > 0) {
+        groups.push({ "kind": "no-path", "key": "no-path", "label": "", "ruleValue": null,
+                      "rows": withoutPath, "programs": programs(withoutPath), "header": true })
+    }
+    return groups
+}
+
 // ---- interface-role secondary-name matching ----
 
 // Mirror of the service's `description_matches_display_name`: tokens split on

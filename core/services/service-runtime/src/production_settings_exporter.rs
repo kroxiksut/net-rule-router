@@ -317,7 +317,12 @@ mod tests {
         assert!(yaml.contains("exported_at: \"2026-05-20T12:00:00Z\"\n"));
         assert!(yaml.contains("primary:\n      system_id: \"\"\n"));
         assert!(yaml.contains("route_mode: \"prefer-primary\"\n"));
-        assert_eq!(out.content_hash_hex.len(), 64);
+        // The hash crosses IPC: fixed-width lowercase hex of the YAML bytes.
+        let expected: String = Sha256::digest(yaml.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(out.content_hash_hex, expected);
     }
 
     #[test]

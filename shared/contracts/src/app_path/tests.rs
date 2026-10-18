@@ -211,6 +211,67 @@ fn an_undecided_unix_path_matches_as_a_file_or_as_a_folder() {
 }
 
 #[test]
+fn the_disk_decides_an_undecided_path_and_moves_a_rule_to_its_real_place() {
+    let undecided = AppPath::parse("/opt/app", LINUX).expect("parses");
+    let folder = undecided.on_disk("/data/app", true).expect("real folder");
+    assert_eq!(folder.kind(), AppPathKind::Folder);
+    assert_eq!(folder.as_str(), "/data/app/");
+    assert_eq!(
+        folder.match_image("/data/app/run"),
+        Some(AppPathKind::Folder)
+    );
+    assert_eq!(folder.match_image("/opt/app/run"), None);
+    let file = undecided.on_disk("/opt/app", false).expect("a file");
+    assert_eq!(file.kind(), AppPathKind::File);
+    assert_eq!(file.match_image("/opt/app"), Some(AppPathKind::File));
+    assert_eq!(file.match_image("/opt/app/run"), None);
+
+    // A decided form is kept; only the place moves, behind a junction too.
+    let tree = AppPath::parse(r"C:\Tools\*", WIN).expect("parses");
+    let real = tree.on_disk(r"\\?\D:\Real Tools", true).expect("real");
+    assert_eq!(real.kind(), AppPathKind::FolderTree);
+    assert_eq!(real.as_str(), r"d:\real tools\*");
+    assert_eq!(
+        real.match_image(r"D:\Real Tools\v2\tool.exe"),
+        Some(AppPathKind::FolderTree)
+    );
+    assert!(tree.on_disk("relative", true).is_err());
+    assert!(tree.on_disk("", true).is_err());
+}
+
+/// The vectors the macOS port keeps from the start: a bundle folder with its
+/// subfolders, compared without case as the default volume does.
+#[test]
+fn a_mac_bundle_rule_covers_every_program_inside_the_bundle() {
+    let bundle = AppPath::parse("/Applications/X.app/*", MAC).expect("parses");
+    assert_eq!(bundle.kind(), AppPathKind::FolderTree);
+    assert_eq!(bundle.as_str(), "/applications/x.app/*");
+    for image in [
+        "/Applications/X.app/Contents/MacOS/X",
+        "/applications/x.app/Contents/Frameworks/Helper.app/Contents/MacOS/Helper",
+    ] {
+        assert_eq!(
+            bundle.match_image(image),
+            Some(AppPathKind::FolderTree),
+            "{image}"
+        );
+    }
+    for image in [
+        "/Applications/Y.app/Contents/MacOS/Y",
+        "/Applications/X.app",
+        "/Applications/X.application/Contents/MacOS/X",
+    ] {
+        assert_eq!(bundle.match_image(image), None, "{image}");
+    }
+    // The same spelling on Linux compares case exactly.
+    let linux = AppPath::parse("/Applications/X.app/*", LINUX).expect("parses");
+    assert_eq!(
+        linux.match_image("/applications/x.app/Contents/MacOS/X"),
+        None
+    );
+}
+
+#[test]
 fn depth_counts_below_the_root() {
     let depth = |raw: &str, style| AppPath::parse(raw, style).expect("parses").depth();
     assert_eq!(depth(r"C:\", WIN), 0);

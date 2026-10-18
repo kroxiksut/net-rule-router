@@ -3,11 +3,18 @@
 //! screen first opens and again on `r`; it never refreshes by itself, so a
 //! line is not pulled from under someone reading it. `h` swaps in the user's
 //! kept history (`conn-history.list`) for a period, as the GUI's switch does.
+//! `g` groups the list by program or by program folder, as the GUI's choice
+//! does, and remembers it in the terminal's own settings.
 
 use std::cell::RefCell;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use nrr_client_logic::conn_trace::{is_ipv6_endpoint, is_non_internet_address};
+use nrr_client_logic::conn_trace::{
+    group_trace_rows, is_ipv6_endpoint, is_non_internet_address, TraceGroup, TraceGroupKind,
+    TraceGrouping, TraceRowRef,
+};
+use nrr_client_logic::rule_value_class::path_style_for_os;
+use nrr_client_logic::rules_table::RuleType;
 use nrr_ipc_client::IpcClient;
 use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
@@ -16,6 +23,7 @@ use nrr_shared::ipc_payloads::{
     ConnTraceEntriesListRequest, ConnTraceEntriesListResponse, ConnTraceEntryDto,
 };
 use nrr_shared::pagination::{PaginationParams, MAX_PAGE_SIZE};
+use nrr_shared::platform_profile::PlatformProfile;
 
 use super::{
     bad_response, call, command, edit, error_text, fill_numbered, keys, page_lines, queue,
@@ -23,7 +31,7 @@ use super::{
 };
 use crate::backend::Reply;
 use crate::i18n::{Key, Texts};
-use crate::screens::settings::Clock;
+use crate::screens::settings::{prefs, Clock};
 use crate::screens::{Screen, ScreenId};
 use crate::state::AppState;
 use crate::view::{Panel, ScreenView, Segment, ViewLine};
@@ -106,9 +114,16 @@ pub struct TraceState {
     only_ipv6: bool,
     pager: Pager,
     generation: u64,
-    /// The entries the last picture listed, in order. The search matches the
-    /// words on screen, which only the renderer has; keys act on what was seen.
-    visible: RefCell<Vec<usize>>,
+    /// What the last picture listed, in order: rows and group headers. The
+    /// search matches the words on screen, which only the renderer has; keys
+    /// act on what was seen.
+    visible: RefCell<Vec<Item>>,
+    /// The OS that observed the trace (`PlatformProfile.os`), which decides how
+    /// its program paths are spelled and compared.
+    pub(super) os: &'static str,
+    /// Why the grouping chosen last was not saved; it still applies until the
+    /// program ends.
+    grouping_unsaved: Option<String>,
     /// Reading the kept history rather than the latest connections.
     history: bool,
     period: Period,
@@ -137,6 +152,9 @@ impl Default for TraceState {
             pager: Pager::default(),
             generation: 0,
             visible: RefCell::new(Vec::new()),
+            // The service on the other end of the pipe runs on this machine.
+            os: PlatformProfile::current().os,
+            grouping_unsaved: None,
             history: false,
             period: Period::default(),
             kept: Vec::new(),
@@ -164,13 +182,50 @@ impl TraceState {
             .collect()
     }
 
+    /// The rows to list grouped as `grouping` asks (`connTraceGroups`): each
+    /// group's header, where it has one, then its rows.
+    fn items(&self, texts: &Texts, grouping: TraceGrouping) -> Vec<Item> {
+        let shown = self.shown(texts);
+        let rows: Vec<TraceRowRef<'_>> = shown
+            .iter()
+            .filter_map(|&i| self.entries.get(i))
+            .map(|e| TraceRowRef {
+                process: &e.process,
+                process_path: &e.process_path,
+            })
+            .collect();
+        let groups = group_trace_rows(&rows, grouping, path_style_for_os(self.os));
+        if groups.is_empty() {
+            return shown.into_iter().map(Item::Row).collect();
+        }
+        let mut items = Vec::with_capacity(shown.len() + groups.len());
+        for group in groups {
+            let members: Vec<Item> = group
+                .rows
+                .iter()
+                .filter_map(|&r| shown.get(r).copied().map(Item::Row))
+                .collect();
+            if group.header {
+                items.push(Item::Header(group));
+            }
+            items.extend(members);
+        }
+        items
+    }
+
     fn visible_len(&self) -> usize {
         self.visible.borrow().len()
     }
 
     fn selected_entry(&self) -> Option<ConnTraceEntryDto> {
-        let index = *self.visible.borrow().get(self.pager.selected)?;
-        self.entries.get(index).cloned()
+        match self.visible.borrow().get(self.pager.selected)? {
+            Item::Row(index) => self.entries.get(*index).cloned(),
+            Item::Header(_) => None,
+        }
+    }
+
+    fn selected_folder_rule(&self) -> Option<String> {
+        folder_rule_at(&self.visible.borrow(), self.pager.selected)
     }
 
     fn set_query(&mut self, query: String) {
@@ -195,6 +250,102 @@ impl TraceState {
         }
         self.pager = Pager::default();
     }
+}
+
+/// One line of the list: a connection, by its index in the entries, or the
+/// header of a group.
+#[derive(Clone, Debug)]
+enum Item {
+    Row(usize),
+    Header(TraceGroup),
+}
+
+/// The folder rule of the group the line at `at` belongs to: its header, or
+/// the nearest header above a row. A program seen once has no header, but no
+/// program group carries a folder rule either.
+fn folder_rule_at(items: &[Item], at: usize) -> Option<String> {
+    items.get(..=at)?.iter().rev().find_map(|item| match item {
+        Item::Header(group) => Some(group.rule_value.clone()),
+        Item::Row(_) => None,
+    })?
+}
+
+/// "C:\Apps  ·  2 program(s)  ·  5 connection(s):" — a heading, by its colon.
+fn header_text(texts: &Texts, group: &TraceGroup) -> String {
+    format!(
+        "{}  ·  {}:",
+        group_label(texts, group),
+        group_counts(texts, group)
+    )
+}
+
+fn group_label(texts: &Texts, group: &TraceGroup) -> String {
+    match group.kind {
+        TraceGroupKind::NoPath => texts.get(keys::TRACE_GROUP_NO_PATH),
+        TraceGroupKind::Program | TraceGroupKind::Folder => display_text(&group.label).into_owned(),
+    }
+}
+
+fn group_counts(texts: &Texts, group: &TraceGroup) -> String {
+    let rows = group.rows.len().to_string();
+    match group.kind {
+        TraceGroupKind::Program => format!("{rows} {}", texts.get(keys::TRACE_GROUP_COUNT)),
+        TraceGroupKind::Folder | TraceGroupKind::NoPath => {
+            let programs = group.programs.to_string();
+            fill_numbered(
+                &texts.get(keys::TRACE_GROUP_FOLDER_COUNTS),
+                &[&programs, &rows],
+            )
+        }
+    }
+}
+
+fn header_detail(texts: &Texts, group: &TraceGroup) -> Vec<ViewLine> {
+    let first = match group.kind {
+        TraceGroupKind::Program => format!(
+            "{}: {}",
+            texts.get(keys::COL_PROCESS),
+            group_label(texts, group)
+        ),
+        TraceGroupKind::Folder => {
+            texts.fill(keys::TRACE_PATH, &[("path", group_label(texts, group))])
+        }
+        TraceGroupKind::NoPath => group_label(texts, group),
+    };
+    vec![
+        ViewLine::text(first),
+        ViewLine::text(group_counts(texts, group)),
+    ]
+}
+
+/// The grouping after `current`, in the order the GUI offers them.
+fn next_grouping(current: TraceGrouping) -> TraceGrouping {
+    let all = TraceGrouping::ALL;
+    let at = all.iter().position(|g| *g == current).unwrap_or(0);
+    all[(at + 1) % all.len()]
+}
+
+/// The list grouped as asked, the choice remembered in the terminal's own
+/// settings file.
+fn set_grouping(app: &mut AppState, grouping: TraceGrouping) {
+    app.settings.prefs.trace_grouping = grouping;
+    app.inspect.trace.pager = Pager::default();
+    app.inspect.trace.grouping_unsaved = match app.settings.prefs_path.as_deref() {
+        Some(path) => prefs::save(path, app.settings.prefs)
+            .err()
+            .map(|error| error.to_string()),
+        // Without a configuration folder there is nowhere to remember it.
+        None => None,
+    };
+}
+
+/// "Rule for this folder…": the Rules screen's add form holding the folder
+/// and every folder below it.
+fn rule_for_selected_folder(app: &mut AppState) -> bool {
+    let Some(value) = app.inspect.trace.selected_folder_rule() else {
+        return false;
+    };
+    crate::screens::rules::add_prefilled(app, RuleType::Application, value)
 }
 
 struct Drained {
@@ -473,24 +624,55 @@ fn explain_selected(app: &mut AppState) {
     super::diagnostics::probe(app, &subject, &address, process);
 }
 
+/// "Is it us or the site?" for the name the chosen connection was for, else
+/// its rule host; checked in Diagnostics. `false` when the row names none.
+fn check_selected(app: &mut AppState) -> bool {
+    let Some(e) = app.inspect.trace.selected_entry() else {
+        return false;
+    };
+    let site = e
+        .remote_hosts
+        .first()
+        .cloned()
+        .filter(|h| !h.is_empty())
+        .unwrap_or(e.rule_host);
+    if site.is_empty() {
+        return false;
+    }
+    app.open(ScreenId::Diagnostics);
+    super::diagnostics::check_site(app, &site);
+    true
+}
+
 pub struct TraceScreen;
 
 impl Screen for TraceScreen {
     fn view(&self, app: &AppState, texts: &Texts) -> ScreenView {
         let state = &app.inspect.trace;
-        let shown = state.shown(texts);
+        let items = state.items(texts, app.settings.prefs.trace_grouping);
+        let rows = items
+            .iter()
+            .filter(|item| matches!(item, Item::Row(_)))
+            .count();
         let mut pager = state.pager;
-        pager.clamp(shown.len());
-        let detail = shown
-            .get(pager.selected)
-            .map(|&i| detail_lines(texts, &state.entries[i], state.kept.get(i)))
-            .unwrap_or_default();
-        let list = page_lines(texts, pager, shown.len(), false, |row| {
-            let i = shown[row];
-            row_text(texts, &state.entries[i], state.kept.get(i))
+        pager.clamp(items.len());
+        let mut detail = match items.get(pager.selected) {
+            Some(Item::Row(i)) => detail_lines(texts, &state.entries[*i], state.kept.get(*i)),
+            Some(Item::Header(group)) => header_detail(texts, group),
+            None => Vec::new(),
+        };
+        if folder_rule_at(&items, pager.selected).is_some() {
+            detail.push(ViewLine::text(format!(
+                "f: {}",
+                texts.get(keys::TRACE_RULE_FOR_FOLDER)
+            )));
+        }
+        let list = page_lines(texts, pager, items.len(), false, |row| match &items[row] {
+            Item::Row(i) => row_text(texts, &state.entries[*i], state.kept.get(*i)),
+            Item::Header(group) => header_text(texts, group),
         });
-        let summary = summary_lines(app, texts, shown.len());
-        *state.visible.borrow_mut() = shown;
+        let summary = summary_lines(app, texts, rows);
+        *state.visible.borrow_mut() = items;
         let title = texts.get(crate::keys::SCREEN_TRACE);
         ScreenView {
             title: title.clone(),
@@ -517,12 +699,14 @@ impl Screen for TraceScreen {
     fn help(&self) -> &'static [Key] {
         &[
             keys::TRACE_HELP_EXPLAIN,
+            keys::TRACE_HELP_CHECK,
             keys::TRACE_HELP_SEARCH,
             keys::TRACE_HELP_FILTERS,
             keys::HELP_PAGES,
             keys::HELP_REFRESH,
             keys::TRACE_HELP_OUTAGE,
             keys::TRACE_HELP_HISTORY,
+            keys::TRACE_HELP_GROUPING,
             keys::TRACE_SUBTITLE,
             keys::TRACE_VERDICT_NOTE,
         ]
@@ -533,11 +717,13 @@ impl Screen for TraceScreen {
             keys::PLAIN_PAGES,
             keys::TRACE_PLAIN_DETAILS,
             keys::TRACE_PLAIN_EXPLAIN,
+            keys::TRACE_PLAIN_CHECK,
             keys::TRACE_PLAIN_SEARCH,
             keys::TRACE_HELP_FILTERS,
             keys::HELP_REFRESH,
             keys::TRACE_HELP_OUTAGE,
             keys::TRACE_PLAIN_HISTORY,
+            keys::TRACE_PLAIN_GROUPING,
         ]
     }
 
@@ -582,6 +768,16 @@ impl Screen for TraceScreen {
                 show(app, true, period);
             }
             KeyCode::Char(c @ ('b' | 'l' | 'v')) => state.toggle(c),
+            KeyCode::Char('g') => {
+                let next = next_grouping(app.settings.prefs.trace_grouping);
+                set_grouping(app, next);
+            }
+            KeyCode::Char('f') => {
+                rule_for_selected_folder(app);
+            }
+            KeyCode::Char('c') => {
+                check_selected(app);
+            }
             KeyCode::Enter => explain_selected(app),
             code => {
                 let len = state.visible_len();
@@ -621,7 +817,28 @@ impl Screen for TraceScreen {
             ("b", "") => state.toggle('b'),
             ("l", "") => state.toggle('l'),
             ("v", "") => state.toggle('v'),
+            ("g", "") => {
+                let next = next_grouping(app.settings.prefs.trace_grouping);
+                set_grouping(app, next);
+            }
+            ("g", word) => match TraceGrouping::from_slug(word.trim()) {
+                Some(grouping) => set_grouping(app, grouping),
+                None => return false,
+            },
+            ("f", "") => return rule_for_selected_folder(app),
+            ("f", number) => {
+                if !state.pager.pick(number, len) {
+                    return false;
+                }
+                return rule_for_selected_folder(app);
+            }
             ("d", number) => return state.pager.pick(number, len),
+            ("c", number) => {
+                if !state.pager.pick(number, len) {
+                    return false;
+                }
+                return check_selected(app);
+            }
             ("e", number) => {
                 if !state.pager.pick(number, len) {
                     return false;
@@ -723,6 +940,21 @@ fn summary_lines(app: &AppState, texts: &Texts, shown: usize) -> Vec<ViewLine> {
         texts.get(keys::TRACE_ONLY_IPV6),
         yes_no(texts, state.only_ipv6),
     )));
+    let grouping = match app.settings.prefs.trace_grouping {
+        TraceGrouping::None => keys::TRACE_GROUP_NONE,
+        TraceGrouping::Program => keys::TRACE_GROUP_PROGRAM,
+        TraceGrouping::Folder => keys::TRACE_GROUP_FOLDER,
+    };
+    lines.push(ViewLine::text(format!(
+        "{}: {}",
+        texts.get(keys::TRACE_GROUP_BY),
+        texts.get(grouping)
+    )));
+    if let Some(error) = &state.grouping_unsaved {
+        lines.push(ViewLine::text(
+            texts.fill(keys::TRACE_GROUPING_NOT_SAVED, &[("error", error)]),
+        ));
+    }
     match &state.typing {
         Some(buffer) => {
             let label = texts.get(keys::TRACE_SEARCH_LABEL);

@@ -241,13 +241,44 @@ pub fn win32_path_from_nt_path(path: &str) -> Option<std::path::PathBuf> {
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return Some(std::path::PathBuf::from(path));
     }
-    let mut mappings: Vec<(String, u8)> = Vec::new();
-    for letter in b'A'..=b'Z' {
-        if let Some(device) = nt_device_for_drive(letter) {
-            mappings.push((device, letter));
-        }
+    map_device_prefix(path, &drive_mappings()).map(std::path::PathBuf::from)
+}
+
+/// [`win32_path_from_nt_path`] with the drive mappings remembered for a
+/// minute: an observation pass asks it for every connection a rule by path
+/// may own, and 26 device queries each time would put real work there.
+pub fn win32_path_from_nt_path_cached(path: &str) -> Option<std::path::PathBuf> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    type Cached = Mutex<Option<(Instant, Vec<(String, u8)>)>>;
+    static MAPPINGS: OnceLock<Cached> = OnceLock::new();
+    const TTL: Duration = Duration::from_secs(60);
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Some(std::path::PathBuf::from(path));
     }
+    let mappings = {
+        let mut cached = MAPPINGS
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match cached.as_ref() {
+            Some((at, mappings)) if at.elapsed() < TTL => mappings.clone(),
+            _ => {
+                let mappings = drive_mappings();
+                *cached = Some((Instant::now(), mappings.clone()));
+                mappings
+            }
+        }
+    };
     map_device_prefix(path, &mappings).map(std::path::PathBuf::from)
+}
+
+/// `(nt device prefix, drive letter)` for every mounted drive.
+fn drive_mappings() -> Vec<(String, u8)> {
+    (b'A'..=b'Z')
+        .filter_map(|letter| nt_device_for_drive(letter).map(|device| (device, letter)))
+        .collect()
 }
 
 /// Pure half of [`win32_path_from_nt_path`]: substitute the longest matching

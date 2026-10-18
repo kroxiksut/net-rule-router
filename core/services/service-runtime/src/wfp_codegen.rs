@@ -16,7 +16,7 @@
 //! | [`SuffixDomain(suffix)`] | Σ | for the apex and each cached subdomain × its cached IPv4 set. Cold cache → 0 + diagnostic. |
 //! | [`Zone(zone)`] | Σ | same fan-out as `SuffixDomain` minus the apex — the bare zone label is not a member of its zone. |
 //! | [`Subnet`] / [`IpRange`] | P | one `remote_subnet` filter per piece: the rule's blocks minus the narrower rules inside them (see `enforcement_planner::NetworkCarving`). Never per address. |
-//! | App match (no address) | N | one per resolved exe path — the name/glob is resolved to concrete on-disk paths (`app_pattern` = absolute Win32 path). Unresolved name/glob → 0 + `AppUnresolved` diagnostic. |
+//! | App match (no address) | N | one per resolved exe path — the name/glob is resolved to concrete on-disk paths (`app_pattern` = absolute Win32 path). Unresolved name/glob → 0 + `AppUnresolved` diagnostic. A rule by path: one per program its real place holds for the owner, capped (`AppFolderOverCap`). |
 //! | App match + address | 0 | not enforceable as written: skipped with an `UnsupportedRuleShape` diagnostic, never widened to every application. |
 //! | Default (`StrictSecondaryFailClosed`) | 1 | catch-all `Block` filter at the lowest weight. |
 //! | Default (other modes) | 0 | the OS routing table is the catch-all. |
@@ -479,6 +479,19 @@ pub enum CodegenDiagnostic {
         pieces: usize,
         cap: usize,
     },
+    /// A rule by path whose place on disk is protected — a link into a system
+    /// folder, say — emitted nothing.
+    PathRuleProtected {
+        rule_id: String,
+        reason: nrr_domain::protected_places::ProtectionReason,
+    },
+    /// A rule by folder covers the first `covered` programs of a folder that
+    /// holds more.
+    AppFolderOverCap {
+        rule_id: String,
+        folder: String,
+        covered: usize,
+    },
     /// Fail-closed catch-all `Block` filter was emitted. Exactly
     /// one of these appears per codegen output when
     /// `behavior_mode == StrictSecondaryFailClosed`. Useful for
@@ -534,6 +547,16 @@ impl CodegenDiagnostic {
                 pieces: *pieces,
                 cap: *cap,
             }),
+            Self::PathRuleProtected { rule_id, reason } => Some(RuleConflict::PathProtected {
+                rule_id: rule_id.clone(),
+                reason: *reason,
+            }),
+            Self::AppFolderOverCap {
+                rule_id, covered, ..
+            } => Some(RuleConflict::FolderOverCap {
+                rule_id: rule_id.clone(),
+                covered: *covered,
+            }),
             _ => None,
         }
     }
@@ -580,6 +603,14 @@ impl From<crate::rule_conflicts::RuleConflict> for CodegenDiagnostic {
                 rule_id,
                 pieces,
                 cap,
+            },
+            RuleConflict::PathProtected { rule_id, reason } => {
+                Self::PathRuleProtected { rule_id, reason }
+            }
+            RuleConflict::FolderOverCap { rule_id, covered } => Self::AppFolderOverCap {
+                rule_id,
+                folder: String::new(),
+                covered,
             },
         }
     }
@@ -1166,11 +1197,49 @@ fn emit_for_app_match(
     link: crate::address_ownership::Link,
     out: &mut CodegenOutput,
 ) {
-    let pattern_str = match &app.pattern {
-        CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.clone(),
-        // TODO: a path rule is enforced once the platform can list the
-        // programs of a folder; until then it emits nothing.
-        CanonicalAppPattern::Path(_) => return,
+    // A rule by path covers the programs its place holds for this owner,
+    // listed by the platform; it never widens to programs of the same name
+    // elsewhere.
+    let (pattern_str, paths, by_path) = match &app.pattern {
+        // TODO: an exact name could be one app-id filter matching the END of
+        // the image path (`\name.exe`), found wherever it is installed and
+        // without a search; needs a live check that the end match behaves so,
+        // and a match kind the filter spec and its lowering can carry.
+        CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => {
+            (s.clone(), app_resolver.resolve(s), false)
+        }
+        CanonicalAppPattern::Path(path) => {
+            let effect = if ctx.is_block() {
+                nrr_domain::protected_places::RuleEffect::Deny
+            } else if link == crate::address_ownership::Link::Main {
+                nrr_domain::protected_places::RuleEffect::PrimaryRoute
+            } else {
+                nrr_domain::protected_places::RuleEffect::SecondaryRoute
+            };
+            let targets = crate::app_path_rules::path_rule_targets(
+                path,
+                sid,
+                effect,
+                app_resolver,
+                gate,
+                crate::protected_rules::places(),
+            );
+            if let Some(reason) = targets.refused {
+                out.diagnostics.push(CodegenDiagnostic::PathRuleProtected {
+                    rule_id: rule.id.as_str().to_string(),
+                    reason,
+                });
+                return;
+            }
+            if targets.over_cap {
+                out.diagnostics.push(CodegenDiagnostic::AppFolderOverCap {
+                    rule_id: rule.id.as_str().to_string(),
+                    folder: targets.key.clone(),
+                    covered: targets.programs.len(),
+                });
+            }
+            (targets.key, targets.programs, true)
+        }
     };
     // The per-process filter (app-id condition). For a route rule this is a
     // Permit (the app is explicitly allowed and the kill-switch's
@@ -1190,7 +1259,6 @@ fn emit_for_app_match(
     // `secondary_app_patterns` for the per-app kill-switch, so it too pins real
     // paths.
     let app_kind = format!("{}app", ctx.kind_prefix);
-    let paths = app_resolver.resolve(&pattern_str);
     if paths.is_empty() {
         out.diagnostics.push(CodegenDiagnostic::AppUnresolved {
             rule_id: rule.id.as_str().to_string(),
@@ -1200,7 +1268,7 @@ fn emit_for_app_match(
         // a glob resolving to more paths than
         // the fan-out cap enforces only the first `cap`; record it so the partial
         // coverage is not silent (the apply layer / audit surfaces the diagnostic).
-        if paths.len() > APP_PATH_FANOUT_CAP as usize {
+        if !by_path && paths.len() > APP_PATH_FANOUT_CAP as usize {
             out.diagnostics.push(CodegenDiagnostic::AppOverCapped {
                 rule_id: rule.id.as_str().to_string(),
                 app: pattern_str.clone(),
@@ -1208,7 +1276,15 @@ fn emit_for_app_match(
                 cap: APP_PATH_FANOUT_CAP,
             });
         }
-        for (k, path) in paths.iter().take(APP_PATH_FANOUT_CAP as usize).enumerate() {
+        // A path rule's programs share slot 0: one action, so their order
+        // decides nothing, and the slots past the cap stay the observed ones.
+        let take = if by_path {
+            paths.len()
+        } else {
+            APP_PATH_FANOUT_CAP as usize
+        };
+        for (k, path) in paths.iter().take(take).enumerate() {
+            let slot = if by_path { 0 } else { k as u64 };
             let path_str = path.to_string_lossy();
             let id = filter_id_for(sid, role_slug, rule.id.as_str(), &app_kind, &path_str);
             out.filters.push(WfpFilterSpec {
@@ -1218,7 +1294,7 @@ fn emit_for_app_match(
                 remote_ip_set: Vec::new(),
                 remote_ip_set_v6: Vec::new(),
                 remote_port: None,
-                weight: rule_weight(ctx.base_weight, pos, k as u64),
+                weight: rule_weight(ctx.base_weight, pos, slot),
                 id,
                 user_sid: Some(sid.to_string()),
                 app_pattern: Some(path_str.into_owned()),

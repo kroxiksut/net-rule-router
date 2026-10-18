@@ -485,6 +485,49 @@ mod tests {
         assert_ne!(pointer_fingerprint(&pointer), pointer_fingerprint(&moved));
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Stored tags and acknowledged fingerprints must survive a crypto-crate
+    /// upgrade bit for bit, or every existing row reads as tampered.
+    #[test]
+    fn tags_and_fingerprints_are_pinned() {
+        let key = [0x42u8; 32];
+        assert_eq!(
+            hex(&compute_hmac(&sample_row(), &key)),
+            "b688411a2310a7d14d2ecaa925688089ec302e6739614034159d32f3ba91399d"
+        );
+        assert_eq!(
+            row_fingerprint(&sample_row()),
+            "b8f042597b92073f366accc3eb8f85812a4190e45679d86aa4d849ab1284aa15"
+        );
+        let pointer = PointerFields {
+            principal: "__baseline__",
+            revision_id: "rev-001",
+            activated_at: 1,
+            apply_attempt_id: None,
+        };
+        assert_eq!(
+            hex(&compute_pointer_hmac(&pointer, &key)),
+            "3e5c49bb3e86a53e102aee00f00e79af4c2f9d52962344ad4843267bf3b946c5"
+        );
+        assert_eq!(
+            pointer_fingerprint(&pointer),
+            "783d53cbda5c913cc134803c24d104481ba682c1b3a5cf1891d5a16d85d6eac3"
+        );
+        // A leading zero nibble stays: the hex is fixed-width.
+        let padded = PointerFields {
+            activated_at: 42,
+            apply_attempt_id: Some("apply-1"),
+            ..pointer
+        };
+        assert_eq!(
+            pointer_fingerprint(&padded),
+            "09312ec08f818b948c317feab79ec7a24e34b1b73ade77595552f198ba3ca4f1"
+        );
+    }
+
     #[test]
     fn verify_with_wrong_key_is_tampered() {
         let key_signed = [0x42u8; 32];

@@ -99,12 +99,19 @@ impl<'a> AppTarget<'a> {
         match pattern {
             CanonicalAppPattern::Exact(name) => Self::Name(name),
             CanonicalAppPattern::Glob(glob) => Self::NameGlob(glob),
-            CanonicalAppPattern::Path(path) => match path.kind() {
-                AppPathKind::File => Self::File(path.place()),
-                AppPathKind::Folder => Self::Folder(path.place()),
-                AppPathKind::FolderTree => Self::FolderTree(path.place()),
-                AppPathKind::FileOrFolder => Self::FileOrFolder(path.place()),
-            },
+            CanonicalAppPattern::Path(path) => Self::of_path(path),
+        }
+    }
+
+    /// The target a path names, in the form it has: as written, or as the
+    /// disk decided it.
+    #[must_use]
+    pub fn of_path(path: &'a nrr_shared::app_path::AppPath) -> Self {
+        match path.kind() {
+            AppPathKind::File => Self::File(path.place()),
+            AppPathKind::Folder => Self::Folder(path.place()),
+            AppPathKind::FolderTree => Self::FolderTree(path.place()),
+            AppPathKind::FileOrFolder => Self::FileOrFolder(path.place()),
         }
     }
 }
@@ -720,8 +727,8 @@ pub fn protection_verdict(
 /// A path that is a file or a folder by what is on disk (`/opt/app` on Linux
 /// or macOS): judged as the folder when it names a protected folder itself or
 /// one above it, and as a file deeper inside a system folder, where programs
-/// sit (`/usr/bin/curl`).
-// TODO: judge the kind the service finds on disk once enforcement reads it.
+/// sit (`/usr/bin/curl`). Enforcement judges the rule again once the disk has
+/// decided its kind and its real place.
 fn undecided_verdict(path: &[String], places: &ProtectedPlaces) -> ProtectionVerdict {
     let as_file = file_verdict(path, places);
     let as_folder = folder_verdict(path, false, places);

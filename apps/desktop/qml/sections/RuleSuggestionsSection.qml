@@ -1013,6 +1013,24 @@ ColumnLayout {
                                     Accessible.description: ToolTip.text
                                     onClicked: section._acceptIds(modelData.pendingIds, true)
                                 }
+                                // A site the user opened that kept failing: before
+                                // moving it, "is it us or the site?"
+                                ThemedButton {
+                                    theme: root.uiTheme
+                                    visible: !modelData.isApp && (modelData.hosts || []).some(
+                                        function (h) { return String(h.signal || "") === "main-link-blocked" })
+                                    text: root.tr("diag.conn-trace.check-site", "Check site…")
+                                    Accessible.role: Accessible.Button
+                                    Accessible.name: text
+                                    onClicked: {
+                                        var failing = (modelData.hosts || []).filter(function (h) {
+                                            return String(h.signal || "") === "main-link-blocked"
+                                        })
+                                        root.notificationsController.checkSiteInDiagnostics(
+                                            failing.length > 0 ? String(failing[0].match || "")
+                                                : String(modelData.domain || ""))
+                                    }
+                                }
                                 ThemedButton {
                                     theme: root.uiTheme
                                     visible: modelData.pendingIds.length > 0

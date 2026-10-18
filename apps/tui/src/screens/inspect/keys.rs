@@ -140,6 +140,36 @@ pub const TRACE_PLAIN_HISTORY: Key = key(
     "tui.trace.plain-history",
     "h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period",
 );
+pub const TRACE_HELP_GROUPING: Key = key(
+    "tui.trace.help-grouping",
+    "g: group the list — no grouping, by program, by folder   f: a rule for the folder of the chosen group (opens Rules)",
+);
+pub const TRACE_PLAIN_GROUPING: Key = key(
+    "tui.trace.plain-grouping",
+    "g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3",
+);
+
+// ── Grouping ─────────────────────────────────────────────────────────────────
+
+pub const TRACE_GROUP_BY: Key = key("diag.conn-trace.group-by", "Group");
+pub const TRACE_GROUP_NONE: Key = key("diag.conn-trace.group-none", "No grouping");
+pub const TRACE_GROUP_PROGRAM: Key = key("diag.conn-trace.group-program", "By program");
+pub const TRACE_GROUP_FOLDER: Key = key("diag.conn-trace.group-folder", "By folder");
+pub const TRACE_GROUP_COUNT: Key = key("diag.conn-trace.group-count", "connection(s)");
+pub const TRACE_GROUP_FOLDER_COUNTS: Key = key(
+    "diag.conn-trace.group-folder-counts",
+    "%1 program(s)  ·  %2 connection(s)",
+);
+pub const TRACE_GROUP_NO_PATH: Key = key(
+    "diag.conn-trace.group-no-path",
+    "Programs without a known path",
+);
+pub const TRACE_RULE_FOR_FOLDER: Key =
+    key("diag.conn-trace.rule-for-folder", "Rule for this folder…");
+pub const TRACE_GROUPING_NOT_SAVED: Key = key(
+    "tui.settings.terminal.save-failed",
+    "Could not save the setting: {error}",
+);
 
 // ── The kept connection history ──────────────────────────────────────────────
 
@@ -395,6 +425,57 @@ pub const ROUTE_SECONDARY: Key = key("diag.explain.route.secondary", "additional
 pub const VERDICT_BLOCK: Key = key("diag.conn-trace.verdict.block", "Blocked");
 pub const VERDICT_PERMIT: Key = key("diag.conn-trace.verdict.permit", "Allowed");
 
+pub const SITE_CHECK: Key = key("diag.site-check.title", "Check a site");
+pub const SITE_SUBTITLE: Key = key(
+    "diag.site-check.subtitle",
+    "Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.",
+);
+pub const SITE_INPUT: Key = key("diag.site-check.placeholder", "site name, e.g. example.com");
+pub const SITE_RUNNING: Key = key("diag.site-check.running", "Checking {host}…");
+pub const SITE_REQUIRED: Key = key(
+    "diag.site-check.input-required",
+    "Enter a site name to check",
+);
+pub const SITE_FAILED: Key = key("diag.site-check.failed", "Could not check the site: ");
+pub const SITE_NO_ADDRESS: Key = key(
+    "diag.site-check.no-address",
+    "address not known: not opened lately",
+);
+pub const SITE_STATUS: Key = key("diag.site-check.status", "answer {code}");
+pub const SITE_REDIRECTS: Key = key("diag.site-check.redirects", "sends on to {hosts}");
+pub const SITE_COOKIES: Key = key(
+    "diag.site-check.cookies.title",
+    "If the site still loops or will not let you sign in, delete its cookies in the browser:",
+);
+pub const SITE_COOKIES_CHROME: Key = key("diag.site-check.cookies.chrome", "Chrome");
+pub const SITE_COOKIES_EDGE: Key = key("diag.site-check.cookies.edge", "Edge");
+pub const SITE_COOKIES_FIREFOX: Key = key("diag.site-check.cookies.firefox", "Firefox");
+pub const SITE_COOKIES_NOTE: Key = key(
+    "diag.site-check.cookies.note",
+    "NetRuleRouter never reads or changes browser data.",
+);
+pub const SITE_MOVE: Key = key(
+    "tui.diagnostics.site-move",
+    "m: move the sign-in names to the site's route (Rules opens with them, and you confirm)",
+);
+pub const ROUTE_DENIED: Key = key("label.block", "Denied");
+pub const DIAG_HELP_SITE: Key = key(
+    "tui.diagnostics.help-site-check",
+    "c: type a site name and check whether the network or the site is at fault",
+);
+pub const DIAG_PLAIN_SITE: Key = key(
+    "tui.diagnostics.plain-site-check",
+    "c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route",
+);
+pub const TRACE_HELP_CHECK: Key = key(
+    "tui.trace.help-check-site",
+    "c: check the chosen connection's site, to tell whether the network or the site is at fault (opens Diagnostics)",
+);
+pub const TRACE_PLAIN_CHECK: Key = key(
+    "tui.trace.plain-check-site",
+    "c and a row number: check that connection's site, for example c 3",
+);
+
 pub const ARCHIVE: Key = key("diag.archive.title", "Diagnostic archive export");
 pub const ARCHIVE_NOTE: Key = key(
     "diag.archive.service-owned-note",
@@ -515,6 +596,17 @@ pub const ALL: &[Key] = &[
     TRACE_HELP_OUTAGE,
     TRACE_HELP_HISTORY,
     TRACE_PLAIN_HISTORY,
+    TRACE_HELP_GROUPING,
+    TRACE_PLAIN_GROUPING,
+    TRACE_GROUP_BY,
+    TRACE_GROUP_NONE,
+    TRACE_GROUP_PROGRAM,
+    TRACE_GROUP_FOLDER,
+    TRACE_GROUP_COUNT,
+    TRACE_GROUP_FOLDER_COUNTS,
+    TRACE_GROUP_NO_PATH,
+    TRACE_RULE_FOR_FOLDER,
+    TRACE_GROUPING_NOT_SAVED,
     HISTORY_MODE,
     HISTORY_HOUR,
     HISTORY_TODAY,
@@ -651,6 +743,26 @@ pub const ALL: &[Key] = &[
     DIAG_PLAIN_EXPLAIN,
     DIAG_PLAIN_EXPORT,
     DIAG_PLAIN_LOG_FILTERS,
+    SITE_CHECK,
+    SITE_SUBTITLE,
+    SITE_INPUT,
+    SITE_RUNNING,
+    SITE_REQUIRED,
+    SITE_FAILED,
+    SITE_NO_ADDRESS,
+    SITE_STATUS,
+    SITE_REDIRECTS,
+    SITE_COOKIES,
+    SITE_COOKIES_CHROME,
+    SITE_COOKIES_EDGE,
+    SITE_COOKIES_FIREFOX,
+    SITE_COOKIES_NOTE,
+    SITE_MOVE,
+    ROUTE_DENIED,
+    DIAG_HELP_SITE,
+    DIAG_PLAIN_SITE,
+    TRACE_HELP_CHECK,
+    TRACE_PLAIN_CHECK,
 ];
 
 #[cfg(test)]

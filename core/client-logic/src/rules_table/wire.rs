@@ -2,7 +2,7 @@
 
 use nrr_shared::auto_rule::{AutoRuleReason, RuleOrigin};
 use nrr_shared::ipc_payloads::RuleRowEntry;
-use nrr_shared::preset_parser::{without_children_flag, ParsedRule};
+use nrr_shared::preset_parser::{first_forbidden_field_char, without_children_flag, ParsedRule};
 use nrr_shared::rules_json::{AddressMatchDto, AppMatchDto, AppPatternDto, RuleDto};
 
 use super::{RowOrigin, RuleRow, RuleType, TargetRoute};
@@ -38,18 +38,40 @@ impl Default for WireDtoOptions {
     }
 }
 
+/// Why a row cannot go to the service as it stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireRefusal {
+    /// A line break or another control character in the value. Taking it out
+    /// would send a rule the user never wrote: `+children` comes off by
+    /// words, which glues the two sides of a line break together.
+    ControlCharacter,
+}
+
+impl WireRefusal {
+    /// The client error code whose `errors.<code>` tells the user.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ControlCharacter => "control-character",
+        }
+    }
+}
+
 /// THE row-to-wire mapper (`ruleRowToWireDto`): one serializer for apply,
 /// review and drift, so no two callers disagree on a field.
 ///
 /// `ace_encode` turns a host value into its ACE form; an empty answer keeps
 /// the value. Only host-like types go through it. A `domain` row carries both
 /// host kinds and is decoded by its `*.` prefix; a type this build does not
-/// know is read the same way.
+/// know is read the same way. A value with a control character is refused,
+/// never cleaned.
 pub fn rule_row_to_wire_dto(
     row: &RuleRow,
     ace_encode: Option<&dyn Fn(&str) -> String>,
     options: WireDtoOptions,
-) -> RuleDto {
+) -> Result<RuleDto, WireRefusal> {
+    if first_forbidden_field_char(&row.match_value).is_some() {
+        return Err(WireRefusal::ControlCharacter);
+    }
     let value = ace_encode
         .filter(|_| row.rule_type.is_hostlike())
         .map(|encode| encode(row.match_value.as_str()))
@@ -109,7 +131,7 @@ pub fn rule_row_to_wire_dto(
             )
         });
 
-    RuleDto {
+    Ok(RuleDto {
         id: if options.keep_id {
             row.id.clone()
         } else {
@@ -125,7 +147,7 @@ pub fn rule_row_to_wire_dto(
         },
         action: row.action(),
         origin,
-    }
+    })
 }
 
 /// A `domain` value: `x.*` (or `*.x.*`) is the site in every zone, `*.`

@@ -26,6 +26,7 @@ pub use search::{normalize_host_input, row_matches_search, search_box_text};
 pub use wire::{
     drift_row_from_parsed_rule, drift_row_from_service_wire, file_row_from_service_wire,
     parsed_rule_target_route, parsed_rule_verify, rule_row_to_wire_dto, WireDtoOptions,
+    WireRefusal,
 };
 
 /// Where a row sends its traffic.

@@ -363,7 +363,7 @@ fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         lines.extend(recent::extra_lines(app, texts));
         return lines;
     }
-    let cursor = table.cursor.min(visible.len() - 1);
+    let cursor = table.cursor_in(&visible);
     let first = cursor / PAGE * PAGE;
     let last = (first + PAGE).min(visible.len());
     let mut lines = vec![ViewLine::text(texts.fill(
@@ -659,6 +659,8 @@ pub fn choice_len(purpose: &ChoicePurpose) -> usize {
         ChoicePurpose::Recent => 4,
         ChoicePurpose::Restore(count) => *count,
         ChoicePurpose::Delete(_) | ChoicePurpose::Reload | ChoicePurpose::Overwrite(_) => 2,
+        ChoicePurpose::HandEdited(_) => 3,
+        ChoicePurpose::ChangedElsewhere => 2,
     }
 }
 
@@ -716,6 +718,22 @@ fn choice_lines(app: &AppState, choice: &Choice, texts: &Texts) -> Vec<ViewLine>
             get(text::OVERWRITE_QUESTION),
             vec![path.display().to_string()],
             vec![get(text::OVERWRITE), get(text::CANCEL)],
+        ),
+        ChoicePurpose::ChangedElsewhere => (
+            get(text::CHANGED_ELSEWHERE_QUESTION),
+            vec![get(text::CHANGED_ELSEWHERE_DETAIL)],
+            vec![get(text::REBASE), get(text::KEEP_LIST)],
+        ),
+        ChoicePurpose::HandEdited(held) => (
+            get(text::HAND_EDITED_TITLE),
+            std::iter::once(get(text::HAND_EDITED_BODY))
+                .chain(held.iter().map(|(_, path)| path.display().to_string()))
+                .collect(),
+            vec![
+                get(text::HAND_EDITED_TAKE),
+                get(text::HAND_EDITED_REPLACE),
+                get(text::HAND_EDITED_LATER),
+            ],
         ),
         ChoicePurpose::Recent => (
             get(text::RECENT_QUESTION),

@@ -1226,14 +1226,15 @@ fn address_refusal(value: &str, rule_id: &RuleId) -> ValidationError {
 }
 
 /// The section a value of another type belongs in, when it is written under
-/// `section`'s heading. An application named here is this build's platform's:
-/// a caller that knows the file's platform asks [`misplaced_value`] first.
+/// an address `section`'s heading.
 fn wrong_section(
     value: &str,
     rule_id: &RuleId,
     section: ParsedRuleType,
 ) -> Option<ValidationError> {
-    misplaced_value(section, value, rule_id, HostPlatform::compiled())
+    // An address section holds the same values on every platform: the naming
+    // passed only decides what an application section holds, so any will do.
+    misplaced_value(section, value, rule_id, HostPlatform::Windows)
 }
 
 /// The refusal of a value whose spelling is another rule type's than
@@ -1250,19 +1251,41 @@ pub(crate) fn misplaced_value(
         .map(|kind| ValidationError::WrongSection {
             rule_id: rule_id.clone(),
             value: value.trim().to_string(),
-            belongs_in: section_of(kind, platform),
+            belongs_in: section_of(kind, value),
         })
 }
 
-/// The section of `platform`'s file a `kind` rule is written in.
-pub(crate) const fn section_of(kind: ParsedRuleType, platform: HostPlatform) -> RulesFileSection {
+/// The section a `kind` rule spelled `value` is written in. Only an
+/// application section is a platform's, and a value misplaced into one comes
+/// from a section that names none, so its spelling decides, never the host.
+fn section_of(kind: ParsedRuleType, value: &str) -> RulesFileSection {
     match kind {
         ParsedRuleType::Zone => RulesFileSection::Zones,
         ParsedRuleType::Domain => RulesFileSection::Domains,
         ParsedRuleType::ExactIp => RulesFileSection::Ip,
         ParsedRuleType::Subnet => RulesFileSection::Cidr,
         ParsedRuleType::IpRange => RulesFileSection::Ranges,
-        ParsedRuleType::Application => platform.app_section(),
+        ParsedRuleType::Application => app_section_spelled_by(value),
+    }
+}
+
+/// The application section a program value is spelled for: a POSIX path is
+/// Linux's, anything else (`.exe`, a drive or a backslash, a bare pattern)
+/// the Windows section, the product's first platform.
+fn app_section_spelled_by(value: &str) -> RulesFileSection {
+    let v = value.trim();
+    let exe = v
+        .len()
+        .checked_sub(4)
+        .and_then(|start| v.get(start..))
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(".exe"));
+    let drive = matches!(v.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic());
+    let windows = exe || drive || v.contains('\\');
+    let posix_path = ["/", "./", "../", "~/"].iter().any(|p| v.starts_with(p));
+    if posix_path && !windows {
+        RulesFileSection::Linux
+    } else {
+        RulesFileSection::Windows
     }
 }
 

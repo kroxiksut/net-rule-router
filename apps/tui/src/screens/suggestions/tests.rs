@@ -222,6 +222,67 @@ fn the_rows_counted_for_scrolling_are_the_rows_drawn() {
     }
 }
 
+/// The offers as they are after the stalling site was answered elsewhere:
+/// only `example.com` is left.
+fn without_the_stalling_site(fake: &FakeService) {
+    fake.answer(
+        IpcOperationName::AutoRuleCandidatesList,
+        json!({
+            "candidates": [
+                candidate("c1", "cdn.example.com", json!({ "primary-behavior": "responds", "third-party": true })),
+                candidate("c2", "img.example.com", json!({})),
+            ],
+            "pending-count": 2,
+            "inert-dropped": 0,
+            "inert-sample": []
+        }),
+    );
+}
+
+/// `--plain` does not print the list again when it changes: a number names
+/// the site printed under it, and one that has gone is said, not replaced.
+#[test]
+fn a_typed_number_names_the_site_as_printed() {
+    let fake = service();
+    let mut app = on_screen(&fake);
+    let screen = crate::screens::screen(ScreenId::Suggestions);
+    screen.on_printed(&mut app);
+    without_the_stalling_site(&fake);
+    load(&mut app);
+    drain(&mut app, &fake);
+
+    assert!(screen.on_line(&mut app, "a 1"));
+    drain(&mut app, &fake);
+    assert!(fake
+        .sent(IpcOperationName::AutoRuleCandidatesAccept)
+        .is_empty());
+    assert_eq!(app.suggestions.note, Some(Note::Gone(1)));
+
+    assert!(screen.on_line(&mut app, "a 2"));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::AutoRuleCandidatesAccept);
+    assert_eq!(sent.len(), 1);
+    let mut ids: Vec<String> = serde_json::from_value(sent[0]["ids"].clone()).expect("ids");
+    ids.sort();
+    assert_eq!(ids, ["c1", "c2"]);
+}
+
+/// A re-read that drops the group above keeps the cursor on its group.
+#[test]
+fn the_chosen_group_survives_a_re_read() {
+    let fake = service();
+    let mut app = on_screen(&fake);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down);
+    let shown = app.suggestions.shown();
+    assert_eq!(shown[app.suggestions.chosen(&shown)].domain, "example.com");
+    without_the_stalling_site(&fake);
+    load(&mut app);
+    drain(&mut app, &fake);
+    let shown = app.suggestions.shown();
+    assert_eq!(shown[app.suggestions.chosen(&shown)].domain, "example.com");
+}
+
 #[test]
 fn keys_answer_the_chosen_group() {
     let fake = service();

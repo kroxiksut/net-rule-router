@@ -231,6 +231,7 @@ QtObject {
     /// for instance. Optional: every older action ignores it.
     function runNotificationAction(actionKey, actionArg) {
         if (actionKey === "explain-host") explainHostInDiagnostics(String(actionArg || ""))
+        else if (actionKey === "check-site") checkSiteInDiagnostics(String(actionArg || ""))
         else if (actionKey === "open-auto-rule-suggestions") root.autoRuleSuggestionsController.openAutoRuleSuggestions()
         else if (actionKey === "open-interfaces") root.section = "interfaces-routes"
         else if (actionKey === "open-rules") root.section = "rules"
@@ -272,6 +273,17 @@ QtObject {
         pendingExplainProcess = String(process || "")
         root.section = "diagnostics"
     }
+
+    /// "Is it us or the site?" for `host`, run in Diagnostics where the answer
+    /// is shown.
+    function checkSiteInDiagnostics(host) {
+        var subject = String(host || "").trim()
+        if (subject === "") return
+        pendingSiteCheckHost = subject
+        root.section = "diagnostics"
+    }
+    /// Consumed by the Diagnostics page on its next load, like the sample below.
+    property string pendingSiteCheckHost: ""
 
     /// Sample handed to the Diagnostics probe on its next load. Cleared once
     /// consumed, so re-opening the page does not re-probe.

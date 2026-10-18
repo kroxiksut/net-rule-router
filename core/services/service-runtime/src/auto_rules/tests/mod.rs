@@ -443,6 +443,21 @@ fn wall_clock() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_millis(1_786_000_000_000)
 }
 
+/// Persisted refusals name offers by this id; a new spelling would bring back
+/// every suggestion a user already turned down.
+#[test]
+fn candidate_ids_are_pinned() {
+    assert_eq!(
+        candidate_id(SID, AUTO_RULE_MATCH_KIND_SUFFIX, "cdn.example"),
+        "arc-445acc7162d3"
+    );
+    // A leading zero nibble stays: the hex is fixed-width.
+    assert_eq!(
+        candidate_id(SID, AUTO_RULE_MATCH_KIND_SUFFIX, "h22.example"),
+        "arc-0710000ad4de"
+    );
+}
+
 mod accept_dismiss;
 mod consumers;
 mod durability;

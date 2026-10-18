@@ -257,6 +257,31 @@ pub fn start(app: &mut AppState, route: TargetRoute, text: String, from_form: bo
     true
 }
 
+/// The Rules screen with "several rules" holding `names` on `route`, each line
+/// set to move a rule that stands on another route: the site check's offer.
+/// The user still reviews the plan and adds it.
+pub fn start_moving(app: &mut AppState, route: TargetRoute, names: &[String]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    app.open(crate::screens::ScreenId::Rules);
+    if super::locked(app) || !matches!(app.rules.mode, Mode::List) {
+        return true;
+    }
+    let mut form = BulkForm::open(&app.rules.table, route, names.join("\n"), false);
+    for (at, name) in names.iter().enumerate() {
+        let choice = LineChoice {
+            rule_type: None,
+            move_elsewhere: true,
+        };
+        form.choices.insert(at + 1, (name.clone(), choice));
+    }
+    form.field = BulkField::Rows;
+    form.replan();
+    app.rules.mode = Mode::Bulk(Box::new(form));
+    true
+}
+
 /// Every new rule and every move the plan settles, into the list on screen at
 /// once. The form stays up with whatever was not taken.
 pub fn add(app: &mut AppState, mut form: Box<BulkForm>) {

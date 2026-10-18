@@ -45,8 +45,8 @@
 //! The Windows transport (`cfg(target_os = "windows")`) is production;
 //! cross-platform unit tests use `InMemoryNamedPipeTransport`
 //! (`named_pipe_inmem.rs`), which implements the same accept/read/write
-//! contract over `mpsc` channels. Real-pipe smoke tests live in
-//! `tests/named_pipe_server_smoke.rs`.
+//! contract over `mpsc` channels. Real-pipe smoke tests below bind a private
+//! pipe name per server, never [`PIPE_NAME`].
 
 #![cfg(target_os = "windows")]
 #![allow(unsafe_code)]
@@ -122,6 +122,12 @@ struct SendableHandle(HANDLE);
 // it spawns the worker; the worker is the sole owner thereafter.
 unsafe impl Send for SendableHandle {}
 
+/// Null-terminated UTF-16 form of a pipe path, built once per server rather
+/// than on every accept tick.
+fn wide_pipe_name(name: &str) -> Arc<[u16]> {
+    name.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 /// Production named-pipe IPC server. Holds router + audit references,
 /// constructs an acceptor on demand via `bind()`. Cheap to construct —
 /// real Win32 work happens in `bind()` and per-tick in `accept_one()`.
@@ -139,6 +145,9 @@ pub struct WindowsNamedPipeServer {
     /// Connections per SID. Owned by the server, not the acceptor, so a rebind
     /// does not hand a caller a fresh allowance while its old workers live.
     per_sid: Arc<PerPrincipalSlots<String>>,
+    /// [`PIPE_NAME`] in production; a private name per server in tests, so a
+    /// test never reaches a live service or a neighbour test's instance.
+    pipe_name: Arc<[u16]>,
 }
 
 impl WindowsNamedPipeServer {
@@ -155,7 +164,24 @@ impl WindowsNamedPipeServer {
             active_sids: None,
             event_bus: None,
             per_sid: Arc::default(),
+            pipe_name: wide_pipe_name(&Self::unique_test_pipe_name()),
         }
+    }
+
+    #[cfg(test)]
+    fn unique_test_pipe_name() -> String {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!(
+            r"\\.\pipe\NetRuleRouter\test-server-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// The pipe path this server binds, without the terminating NUL.
+    #[cfg(test)]
+    fn pipe_name(&self) -> String {
+        String::from_utf16_lossy(&self.pipe_name[..self.pipe_name.len() - 1])
     }
 
     /// Attach the shared `EventBus` so worker threads can flush push
@@ -180,6 +206,7 @@ impl WindowsNamedPipeServer {
             active_sids: Some(active_sids),
             event_bus: None,
             per_sid: Arc::default(),
+            pipe_name: wide_pipe_name(PIPE_NAME),
         }
     }
 }
@@ -199,6 +226,7 @@ impl IpcServer for WindowsNamedPipeServer {
             worker_handles: Arc::new(Mutex::new(Vec::new())),
             event_bus: self.event_bus.clone(),
             per_sid: Arc::clone(&self.per_sid),
+            pipe_name: Arc::clone(&self.pipe_name),
         }))
     }
 }
@@ -239,6 +267,8 @@ pub struct WindowsNamedPipeAcceptor {
     /// Shared `EventBus`. Per-connection workers use it to flush push
     /// frames after their `StatusUpdatesSubscribe` request.
     event_bus: Option<Arc<EventBus>>,
+    /// Null-terminated UTF-16 pipe path, shared with the server.
+    pipe_name: Arc<[u16]>,
 }
 
 impl IpcAcceptor for WindowsNamedPipeAcceptor {
@@ -252,8 +282,6 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
             "accept tick"
         );
 
-        let pipe_name_wide: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-
         // Create a pending pipe instance with FILE_FLAG_OVERLAPPED. The
         // handle_connection worker uses TWO threads on the same pipe
         // handle (reader sub-thread for ReadFile + main thread for
@@ -266,7 +294,7 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
         // and the kernel does not serialise. See `PipeIo::read` / `write`
         // below for the overlapped wait pattern.
         //
-        // SAFETY: pipe_name_wide is null-terminated UTF-16; security pointer
+        // SAFETY: self.pipe_name is null-terminated UTF-16; security pointer
         // is valid for the duration of CreateNamedPipeW (held by Arc<self>).
         let holds_no_instance = self.active_count.load(Ordering::SeqCst) == 0;
         let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
@@ -275,7 +303,7 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
         }
         let pipe = unsafe {
             CreateNamedPipeW(
-                PCWSTR(pipe_name_wide.as_ptr()),
+                PCWSTR(self.pipe_name.as_ptr()),
                 open_mode,
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES,
@@ -441,7 +469,7 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
         self.shutdown_requested.store(true, Ordering::SeqCst);
         self.worker_shutdown.store(true, Ordering::SeqCst);
 
-        wake_pending_accept();
+        wake_pending_accept(&self.pipe_name);
     }
 
     fn join_workers(&self) {
@@ -465,15 +493,14 @@ impl Drop for WindowsNamedPipeAcceptor {
         // must call join_workers() explicitly.
         self.shutdown_requested.store(true, Ordering::SeqCst);
         self.worker_shutdown.store(true, Ordering::SeqCst);
-        wake_pending_accept();
+        wake_pending_accept(&self.pipe_name);
     }
 }
 
 /// Unblock a pending `ConnectNamedPipe` by connecting to it ourselves; the
 /// woken tick sees the shutdown flag. Best-effort: with no instance up the
 /// open fails and the next tick's flag check does the job.
-fn wake_pending_accept() {
-    let pipe_name_wide: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+fn wake_pending_accept(pipe_name_wide: &[u16]) {
     // SAFETY: `pipe_name_wide` is null-terminated UTF-16; the handle is
     // closed right away.
     unsafe {
@@ -1107,107 +1134,33 @@ mod tests {
 
     // ── Real-pipe smoke tests ────────────────────────────────────────────
     //
-    // These tests exercise the full Win32 transport — CreateNamedPipeW,
-    // ConnectNamedPipe, real client via CreateFileW, identity check,
-    // wire codec — using the canonical PIPE_NAME. Multiple tests cannot
-    // safely run in parallel against the same PIPE_NAME, so we serialise
-    // them through a process-wide mutex. Each test also sets a generous
-    // timeout so a hang in one tick cannot stall the whole runner.
+    // These exercise the full Win32 transport — CreateNamedPipeW,
+    // ConnectNamedPipe, real client via CreateFileW, identity check, wire
+    // codec. Each server binds its own pipe name, so the tests run in parallel
+    // and neither a neighbour's shutdown wake nor a live service on the machine
+    // can reach the instance a test is waiting on.
 
-    use std::sync::OnceLock;
     use std::time::{Duration, Instant};
-    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
-
-    fn pipe_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        let m = LOCK.get_or_init(|| std::sync::Mutex::new(()));
-        let guard = m.lock().unwrap_or_else(|p| p.into_inner());
-        // An installed service owns the same canonical pipe name, so the test
-        // client below connects to IT while this test's acceptor waits for a
-        // connection that never arrives — the run hangs instead of failing.
-        // Fail loudly with the one instruction that fixes it.
-        if service_pipe_is_live() {
-            panic!(
-                "a NetRuleRouter service instance already owns {PIPE_NAME} — \
-                 stop the service before running the pipe tests"
-            );
-        }
-        guard
-    }
-
-    /// Is somebody already serving the canonical pipe?
-    ///
-    /// A successful open is the obvious yes. So is a REFUSED one: a pipe whose
-    /// instances are all taken answers `ERROR_PIPE_BUSY`, and one whose DACL
-    /// keeps this process out answers `ERROR_ACCESS_DENIED` — in both cases the
-    /// name IS served, which is exactly what must stop the tests. Only "no such
-    /// file / path" means it is free. The first version of this probe took
-    /// `CreateFileW(..).ok()` for the whole answer, so a live service read as an
-    /// absent one and the tests this exists to stop still hung forever.
-    fn service_pipe_is_live() -> bool {
-        pipe_is_live(PIPE_NAME)
-    }
-
-    /// The question above, asked of any pipe name — so the classification can
-    /// be tested against pipes whose state is known.
-    fn pipe_is_live(name: &str) -> bool {
-        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: `wide` is null-terminated UTF-16 and outlives the call.
-        let opened = unsafe {
-            CreateFileW(
-                PCWSTR(wide.as_ptr()),
-                nrr_shared::ipc_transport::SERVICE_PIPE_CLIENT_ACCESS,
-                FILE_SHARE_NONE,
-                None,
-                OPEN_EXISTING,
-                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
-                None,
-            )
-        };
-        match opened {
-            Ok(handle) => {
-                // SAFETY: the handle came from the successful open above and is
-                // closed exactly once here.
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
-                true
-            }
-            Err(e) => !pipe_absent(e.code()),
-        }
-    }
-
-    /// Does this failure mean "there is no such pipe" rather than "you cannot
-    /// have it right now"?
-    fn pipe_absent(code: windows::core::HRESULT) -> bool {
-        [ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND]
-            .into_iter()
-            .any(|win32| code == windows::core::HRESULT::from_win32(win32.0))
-    }
 
     #[test]
-    fn a_pipe_that_refuses_the_open_still_counts_as_served() {
-        // `\\.\pipe\lsass` exists on every Windows install and refuses a
-        // non-privileged open. That is the shape of a live NetRuleRouter
-        // service too, and the shape the first version of this probe read as
-        // "nobody there" — which is why a full test run used to hang against a
-        // running service instead of stopping with the message above.
-        assert!(
-            pipe_is_live(r"\\.\pipe\lsass"),
-            "a present-but-refused pipe must read as served"
-        );
-        assert!(
-            !pipe_is_live(r"\\.\pipe\nrr-name-that-nobody-serves"),
-            "an absent pipe must read as free"
+    fn test_servers_never_bind_the_service_pipe() {
+        let a = WindowsNamedPipeServer::new(empty_router(), empty_audit());
+        let b = WindowsNamedPipeServer::new(empty_router(), empty_audit());
+        assert_ne!(a.pipe_name(), PIPE_NAME);
+        assert_ne!(b.pipe_name(), PIPE_NAME);
+        assert_ne!(
+            a.pipe_name(),
+            b.pipe_name(),
+            "every test server gets its own pipe"
         );
     }
 
-    /// Open a client side of `PIPE_NAME` from the test process. Used to
-    /// exercise the server's accept path — the test exe is not on the
-    /// identity whitelist, so the server replies with `Forbidden`, which
-    /// is precisely the round-trip we want to assert.
-    fn connect_test_client() -> windows::core::Result<HANDLE> {
-        let wide: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    /// Open a client side of `name` from the test process. Used to exercise the
+    /// server's accept path — the test exe is not on the identity whitelist, so
+    /// the server replies with `Forbidden`, which is precisely the round-trip
+    /// we want to assert.
+    fn connect_test_client(name: &str) -> windows::core::Result<HANDLE> {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         // Retry: if the test thread races ahead of the server's
         // CreateNamedPipeW, CreateFileW returns ERROR_FILE_NOT_FOUND. A loaded
         // gate machine took longer than 2 s; only a failure waits this long.
@@ -1228,9 +1181,8 @@ mod tests {
             };
             match result {
                 Ok(h) => return Ok(h),
-                Err(e) if Instant::now() < deadline => {
+                Err(_) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
-                    let _ = e;
                 }
                 Err(e) => return Err(e),
             }
@@ -1341,9 +1293,8 @@ mod tests {
     /// per-connection worker spawn, identity rejection, and wire codec.
     #[test]
     fn real_pipe_roundtrip_returns_forbidden_for_test_process() {
-        let _guard = pipe_test_lock();
-
         let server = WindowsNamedPipeServer::new(empty_router(), empty_audit());
+        let pipe_name = server.pipe_name();
         let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
 
         let acc_for_thread = Arc::clone(&acceptor);
@@ -1352,7 +1303,7 @@ mod tests {
         // Give the supervisor a moment to call CreateNamedPipeW + ConnectNamedPipe.
         thread::sleep(Duration::from_millis(50));
 
-        let client = connect_test_client().expect("client connects to pipe");
+        let client = connect_test_client(&pipe_name).expect("client connects to pipe");
         let mut io = PipeIo::new(client).expect("test PipeIo::new");
 
         // Server's identity check writes Forbidden frame on its own — the
@@ -1380,8 +1331,6 @@ mod tests {
     /// even when the tick is mid-`ConnectNamedPipe`.
     #[test]
     fn request_shutdown_unblocks_pending_accept_one() {
-        let _guard = pipe_test_lock();
-
         let server = WindowsNamedPipeServer::new(empty_router(), empty_audit());
         let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
 
@@ -1428,9 +1377,8 @@ mod tests {
     /// produce independent worker threads.
     #[test]
     fn multiple_sequential_clients_each_receive_response() {
-        let _guard = pipe_test_lock();
-
         let server = WindowsNamedPipeServer::new(empty_router(), empty_audit());
+        let pipe_name = server.pipe_name();
         let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
 
         for round in 0..2 {
@@ -1439,7 +1387,7 @@ mod tests {
 
             thread::sleep(Duration::from_millis(50));
 
-            let client = connect_test_client().expect("client connects");
+            let client = connect_test_client(&pipe_name).expect("client connects");
             let mut io = PipeIo::new(client).expect("test PipeIo::new");
             let response: IpcResponseEnvelope =
                 read_frame(&mut io).unwrap_or_else(|_| panic!("round {round} read"));

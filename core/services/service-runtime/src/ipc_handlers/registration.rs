@@ -588,6 +588,22 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
+            IpcOperationName::SiteCheckRun => match deps.site_check.clone() {
+                Some(checker) => {
+                    registry.register_checked(op, SiteCheckRunHandler::new(checker));
+                }
+                None => {
+                    registry.register_checked(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::SiteCheckResultGet => match deps.site_check.clone() {
+                Some(checker) => {
+                    registry.register(op, SiteCheckResultHandler::new(checker));
+                }
+                None => {
+                    registry.register_checked(op, UnimplementedHandler::new(op));
+                }
+            },
             IpcOperationName::AutoRuleCandidatesProbe => match deps.auto_rule_probe.clone() {
                 Some(runner) => {
                     registry.register_checked(op, AutoRuleCandidatesProbeHandler::new(runner));

@@ -102,6 +102,10 @@ pub const CONFLICT_PROTECTED: Key = key(
     "rules.overlaps.conflicts.protected",
     "The rule {rule} is not applied. {reason}",
 );
+pub const CONFLICT_FOLDER_OVER_CAP: Key = key(
+    "rules.overlaps.conflicts.folder-over-cap",
+    "{rule} covers the first {count} programs of its folder. The folder holds more, and those are not covered: name the folder of the program you mean instead.",
+);
 pub const CONFLICT_MORE: Key = key(
     "rules.overlaps.conflicts.more",
     "Addresses affected besides this one: {count}.",
@@ -227,6 +231,7 @@ pub fn all() -> Vec<Key> {
         CONFLICT_CARVING_OVER_CAP,
         CONFLICT_UNSUPPORTED,
         CONFLICT_PROTECTED,
+        CONFLICT_FOLDER_OVER_CAP,
         CONFLICT_MORE,
         ROUTE_PRIMARY,
         ROUTE_SECONDARY,

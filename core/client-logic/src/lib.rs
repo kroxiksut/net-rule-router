@@ -24,7 +24,8 @@
 //!   line.
 //! - [`block_notices`] — the summary of blocks kept while no surface was
 //!   open.
-//! - [`conn_trace`] — the connection trace's view filters.
+//! - [`conn_trace`] — the connection trace's view filters and its grouping
+//!   by program or folder.
 //! - [`diagnostics`] — security alert lists and whether an acknowledgement took.
 //! - [`forwarded`] — whether WSL runs, and asking what it gets when the
 //!   tunnel is down.

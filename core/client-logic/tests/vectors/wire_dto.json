@@ -1,5 +1,5 @@
 {
-  "description": "rules.js ruleRowToWireDto: a table row as a canonical wire RuleDto. `encode` passes the harness IDN stand-in (non-ASCII gains `ace:`, `ace-fails.example` encodes to nothing).",
+  "description": "rules.js ruleRowToWireDto: a table row as a canonical wire RuleDto. `encode` passes the harness IDN stand-in (non-ASCII gains `ace:`, `ace-fails.example` encodes to nothing). A row the wire refuses answers `{ refused: <client error code> }`.",
   "cases": [
     { "name": "exact-fqdn", "input": { "row": { "id": "R-0001", "enabled": true, "ruleType": "exact-fqdn", "matchValue": "api.example", "targetRoute": "primary", "comment": "" } } },
     { "name": "suffix-domain strips the star prefix", "input": { "row": { "id": "R-0002", "enabled": true, "ruleType": "suffix-domain", "matchValue": "*.video.example", "targetRoute": "secondary", "comment": "media" } } },
@@ -35,6 +35,12 @@
     { "name": "keepId false only", "input": { "row": { "id": "R-0019", "enabled": true, "ruleType": "zone", "matchValue": "example", "targetRoute": "primary", "comment": "kept" }, "opts": { "keepId": false } } },
     { "name": "empty reason is no origin", "input": { "row": { "id": "R-0020", "enabled": true, "ruleType": "domain", "matchValue": "x.example", "targetRoute": "secondary", "originReason": "", "originAnchor": "site.example" } } },
     { "name": "unknown type reads as a host", "input": { "row": { "id": "R-0021", "enabled": true, "ruleType": "linux-application", "matchValue": "*.odd.example", "targetRoute": "secondary" }, "encode": true } },
+    { "name": "line break inside an application value is refused, not glued", "input": { "row": { "id": "R-0040", "enabled": true, "ruleType": "application", "matchValue": "my\napp.exe +children", "targetRoute": "secondary" } }, "expected": { "refused": "control-character" } },
+    { "name": "control character in a bare program is refused", "input": { "row": { "id": "R-0041", "enabled": true, "ruleType": "application", "matchValue": "app\u0001.exe", "targetRoute": "primary" } }, "expected": { "refused": "control-character" } },
+    { "name": "line break in a host value is refused", "input": { "row": { "id": "R-0042", "enabled": true, "ruleType": "domain", "matchValue": "exa\nmple.com", "targetRoute": "primary" }, "encode": true }, "expected": { "refused": "control-character" } },
+    { "name": "DEL and C1 controls are refused too", "input": { "row": { "id": "R-0043", "enabled": true, "ruleType": "exact-ip", "matchValue": "192.0.2.7\u007f\u0085", "targetRoute": "secondary" } }, "expected": { "refused": "control-character" } },
+    { "name": "routing-only form refuses as well", "input": { "row": { "id": "R-0044", "enabled": true, "ruleType": "subnet", "matchValue": "198.51.100.0/24\r", "targetRoute": "secondary" }, "opts": { "keepId": false, "keepComment": false } }, "expected": { "refused": "control-character" } },
+    { "name": "a tab is whitespace, not a control character", "input": { "row": { "id": "R-0045", "enabled": true, "ruleType": "application", "matchValue": "my\tapp.exe", "targetRoute": "secondary" } }, "expected": { "id": "R-0045", "enabled": true, "app-match": { "pattern": { "kind": "exact", "value": "my\tapp.exe" }, "include-child-processes": false } } },
     { "name": "empty row", "input": { "row": {} } }
   ]
 }

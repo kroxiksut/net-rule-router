@@ -7,6 +7,18 @@
 use super::*;
 
 impl AutoRulesEngine {
+    /// Hosts `sid`'s own observation saw together with `site` or a name under
+    /// it, most shared windows first. Reads the ledger, learns nothing.
+    pub fn seen_with(&self, sid: &str, site: &str, limit: usize) -> Vec<String> {
+        let ledgers = self.ledgers.lock().unwrap_or_else(|p| p.into_inner());
+        ledgers.get(sid).map_or_else(Vec::new, |entry| {
+            entry.ledger.seen_with(
+                |anchor| nrr_domain::decision_matching::match_suffix_domain(anchor, site),
+                limit,
+            )
+        })
+    }
+
     pub fn candidates(&self, sid: &str) -> Vec<AutoRuleCandidateDto> {
         self.candidates_under(sid, self.rules.active_rules_for(sid).as_ref())
     }

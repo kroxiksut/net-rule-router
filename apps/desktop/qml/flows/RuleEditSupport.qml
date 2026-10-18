@@ -80,6 +80,9 @@ QtObject {
             rulesJson = Rules.buildRulesJson(Rules.rowsWithCandidate(rows, index, row),
                 aceCodec.encode)
         } catch (err) {
+            // A value the wire refuses has no overlaps to show; the dialog's
+            // verdict already says why.
+            if (Rules.wireRefusalCode(err) !== "") return
             console.error("rule overlap preview: rules serialization failed:", err)
             serializeFailed()
             return

@@ -64,8 +64,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 libc = "0.2"
 
 [features]
-# Opens the crate-private NFLOG datagram walk to the fuzz targets under
-# `fuzz/`; never set by a shipped build.
+# Opens the crate-private NFLOG datagram walk and the inotify event walk to the
+# fuzz targets under `fuzz/`; never set by a shipped build.
 fuzzing = []
 
 [lints]

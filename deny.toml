@@ -29,8 +29,8 @@ allow = [
   "BSD-2-Clause",
   "BSD-3-Clause",
   "CC0-1.0",
-  # Mozilla's CA root-store data shipped by `webpki-roots` (transitive of
-  # `ureq`, the launcher's daily release check). Permissive data license, no
+  # Mozilla's CA root-store data shipped by `webpki-roots` (the launcher's
+  # release check through `ureq`, and the service's site check). Permissive data license, no
   # copyleft, explicitly allows commercial redistribution of the
   # certificate data.
   "CDLA-Permissive-2.0",

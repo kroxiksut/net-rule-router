@@ -111,7 +111,7 @@ Core configuration files:
 - `LICENSE` — MPL-2.0 license
 - `STRUCTURE.md` — This file
 
-Working documents that stay out of the published repository (architecture and technical baselines, task lists, lessons learned, design notes under `notes/`) are gitignored; see `.gitignore` for the current set.
+Working documents that stay out of the published repository (architecture and technical baselines, task lists, lessons learned) are gitignored; see `.gitignore` for the current set.
 
 ## Crate Organization
 

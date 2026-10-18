@@ -471,8 +471,10 @@ pub struct EnforcementCapabilities {
     /// How per-app matching is realised on this platform.
     pub app_match: AppMatchMechanism,
     /// An application rule by path (a file, a folder, a folder with its
-    /// subfolders) is carried out. Until a platform can, such a rule stays in
-    /// the book and is reported as not applied.
+    /// subfolders) is carried out: Windows by an app-id filter per program
+    /// the folder holds, Linux by the destinations of the programs observed
+    /// there. Where it is `false`, such a rule stays in the book and is
+    /// reported as not applied.
     pub app_path_rules: bool,
 }
 
@@ -488,7 +490,7 @@ impl EnforcementCapabilities {
             per_app_block_leakproof: true,
             per_user_all_protocol_scoping: false,
             app_match: AppMatchMechanism::WfpAppId,
-            app_path_rules: false,
+            app_path_rules: true,
         }
     }
 
@@ -502,7 +504,7 @@ impl EnforcementCapabilities {
             per_app_block_leakproof: false,
             per_user_all_protocol_scoping: true,
             app_match: AppMatchMechanism::ObservedDestOnly,
-            app_path_rules: false,
+            app_path_rules: true,
         }
     }
 

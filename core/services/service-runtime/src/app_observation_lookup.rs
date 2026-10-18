@@ -24,12 +24,20 @@
 //! (`C:\Program Files\…\chrome.exe` → `chrome.exe`). The rule's app pattern
 //! (`chrome.exe`) is matched the same way. Glob patterns (`*vpn*.exe`) match
 //! against every observed process name and union their IPs.
+//!
+//! A rule by path (`c:\apps\tool\*`, `/opt/app/`) keeps its own bucket under
+//! its canonical spelling: a connection is recorded there too when its full
+//! image path lies where the rule names, at the rule's own place or at the
+//! real one behind a link ([`AppObservationLookup::note_path_places`]). Only
+//! paths a plan has asked about are matched, so a book without path rules pays
+//! nothing for them.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::bounded_set::BoundedRecentSet;
 use nrr_platform_api::conn_observe::live::LiveConnection;
+use nrr_shared::app_path::{AppPath, PathStyle};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -63,10 +71,19 @@ pub const APP_KEY_CAP: usize = 1024;
 /// the whole point of the census is to answer for exactly such a process.
 pub const CENSUS_IP_CAP: usize = 8192;
 
-/// Distinct process names kept per destination. The census only ever answers
+/// Distinct processes kept per destination. The census only ever answers
 /// "is anybody here who is not one of these rules?", so a handful is enough and
 /// an unbounded list would be a leak with no reader.
 pub const CENSUS_KEYS_PER_IP: usize = 4;
+
+/// Longest image path the census keeps whole, so a rule by path can tell its
+/// own programs from a namesake elsewhere. A longer one is kept by name, which
+/// no path rule claims.
+pub const CENSUS_IMAGE_MAX_BYTES: usize = nrr_shared::app_path::MAX_PATH_VALUE_BYTES;
+
+/// Rules by path whose places are remembered at once; past it the memory
+/// starts over and each is relearnt from its spelling on the next ask.
+pub const PATH_PATTERN_CAP: usize = 256;
 
 /// How many withdrawn `(app, ip)` pairs are remembered. Bounded for the same
 /// reason as everything else learned from traffic: a machine that runs for
@@ -106,6 +123,12 @@ pub trait AppObservationLookup: Send + Sync {
     fn for_principal(&self, _principal: &str) -> Option<Arc<dyn AppObservationLookup>> {
         None
     }
+
+    /// Where the rule by path spelled `key` really is: `places` (its own and
+    /// the real one behind links) are where the programs whose connections
+    /// its bucket collects live. The default keeps nothing; a path rule then
+    /// matches only where it is spelled.
+    fn note_path_places(&self, _key: &str, _places: &[AppPath]) {}
 }
 
 /// File name of the running executable, lower-cased.
@@ -128,6 +151,33 @@ pub fn own_process_key() -> &'static str {
 /// are compared on — see [`nrr_shared::app_identity::app_match_key`].
 pub fn app_key(raw: &str) -> String {
     nrr_shared::app_identity::app_match_key(raw)
+}
+
+/// Whether a rule pattern names programs by path: it starts at a drive, a
+/// share or `/`. A name never does — a program's canonical name is a file
+/// name.
+#[must_use]
+pub fn is_path_pattern(pattern: &str) -> bool {
+    let bytes = pattern.trim().as_bytes();
+    matches!(bytes, [b'/', ..] | [b'\\', b'\\', ..])
+        || matches!(bytes, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
+}
+
+/// Turns an image path the OS reported in another spelling (on Windows the
+/// kernel's `\device\...` form a dropped connection is named in) into the one
+/// rules by path are written in; `None` when it cannot.
+pub type ImageNormalizer = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// The key a rule pattern's observations are kept under: a name reduces to
+/// [`app_key`], a path stays as the rule spells it, so `c:\apps\*` never
+/// collapses onto the name `*`. For a process image use [`app_key`].
+#[must_use]
+pub fn observation_key(pattern: &str) -> String {
+    if is_path_pattern(pattern) {
+        pattern.trim().to_string()
+    } else {
+        app_key(pattern)
+    }
 }
 
 /// In-memory app→IP observation store. Shared via `Arc`: the observation
@@ -172,6 +222,12 @@ pub struct AppObservationStore {
     /// Set where each user's traffic follows their own routes: observations
     /// then live in one store per user, and this one holds none itself.
     per_principal: Option<PrincipalAppObservations>,
+    /// How this platform spells the paths rules and images use.
+    path_style: PathStyle,
+    /// Rules by path a plan has asked about, each with the places its programs
+    /// live at. Never held while another lock of this store is taken.
+    path_places: Mutex<HashMap<String, Vec<AppPath>>>,
+    image_normalizer: OnceLock<ImageNormalizer>,
 }
 
 /// Sighting order of applications as a counter, so a sighting costs one map
@@ -231,7 +287,39 @@ impl AppObservationStore {
             generation: AtomicU64::new(0),
             watched: Mutex::new(Vec::new()),
             per_principal: None,
+            path_style: nrr_domain::rules_file::HostPlatform::compiled().path_style(),
+            path_places: Mutex::new(HashMap::new()),
+            image_normalizer: OnceLock::new(),
         }
+    }
+
+    /// How images reported in another spelling are read for rules by path.
+    /// Only the first call counts.
+    pub fn set_image_normalizer(&self, normalize: ImageNormalizer) {
+        let _ = self.image_normalizer.set(normalize);
+    }
+
+    /// `image` in the spelling rules by path are written in.
+    fn path_image<'a>(&self, image: &'a str) -> std::borrow::Cow<'a, str> {
+        if is_path_pattern(image) {
+            return std::borrow::Cow::Borrowed(image);
+        }
+        match self
+            .image_normalizer
+            .get()
+            .and_then(|normalize| normalize(image))
+        {
+            Some(normal) => std::borrow::Cow::Owned(normal),
+            None => std::borrow::Cow::Borrowed(image),
+        }
+    }
+
+    /// Read paths as `style` spells them instead of as this platform does, so
+    /// a test of another platform's paths runs on any host.
+    #[must_use]
+    pub fn with_path_style(mut self, style: PathStyle) -> Self {
+        self.path_style = style;
+        self
     }
 
     /// A store that keeps each user's observations apart (see
@@ -293,7 +381,7 @@ impl AppObservationStore {
     /// Draining is the point: a destination reported once must not be reported
     /// as freshly confirmed on every later pass.
     pub fn take_seen_since_flush(&self, app_pattern: &str) -> std::collections::HashSet<Ipv4Addr> {
-        if app_key(app_pattern).is_empty() {
+        if observation_key(app_pattern).is_empty() {
             return std::collections::HashSet::new();
         }
         let mut ledger = self
@@ -322,6 +410,16 @@ impl AppObservationStore {
         if key.is_empty() {
             return false;
         }
+        let buckets = self.path_buckets_of(process_path);
+        let mut is_new = self.record_key(key, ip);
+        for bucket in buckets {
+            is_new |= self.record_key(bucket, ip);
+        }
+        is_new
+    }
+
+    /// Record `ip` under the bucket `key`: a program's name, or a rule path.
+    fn record_key(&self, key: String, ip: Ipv4Addr) -> bool {
         if self
             .retracted
             .lock()
@@ -414,7 +512,14 @@ impl AppObservationStore {
         }
         pairs
             .iter()
-            .filter(|(app, ip)| self.record(app, *ip))
+            .filter(|(app, ip)| {
+                // A remembered path rule's key is its bucket, not a process.
+                if is_path_pattern(app) {
+                    !is_unroutable(*ip) && self.record_key(observation_key(app), *ip)
+                } else {
+                    self.record(app, *ip)
+                }
+            })
             .count()
     }
 
@@ -432,16 +537,26 @@ impl AppObservationStore {
         }
         let now = (self.clock)();
         let mut refreshed: HashSet<(String, Ipv4Addr)> = HashSet::new();
+        // Asked before `inner` is taken: the path memory is never held under it.
+        let buckets: Vec<Vec<String>> = live
+            .iter()
+            .map(|connection| self.path_buckets_of(&connection.process_path))
+            .collect();
         {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let mut stamps = self.last_seen.lock().unwrap_or_else(|p| p.into_inner());
-            for connection in live {
+            for (connection, paths) in live.iter().zip(&buckets) {
                 let key = app_key(&connection.process_path);
                 if key.is_empty() {
                     continue;
                 }
                 for (name, set) in g.iter_mut() {
-                    if pattern_matches(name, &key) && set.contains(&connection.remote) {
+                    let covers = if is_path_pattern(name) {
+                        paths.contains(name)
+                    } else {
+                        pattern_matches(name, &key)
+                    };
+                    if covers && set.contains(&connection.remote) {
                         set.observe(connection.remote);
                         stamps.insert((name.clone(), connection.remote), now);
                         refreshed.insert((name.clone(), connection.remote));
@@ -491,7 +606,7 @@ impl AppObservationStore {
     /// there falls back to the main link — which is the lesser cost: an
     /// application rule may not quietly overrule where everything else goes.
     pub fn retract(&self, app: &str, ip: Ipv4Addr) -> bool {
-        let key = app_key(app);
+        let key = observation_key(app);
         if key.is_empty() {
             return false;
         }
@@ -525,10 +640,16 @@ impl AppObservationStore {
         if is_unroutable(ip) {
             return;
         }
-        let key = app_key(process_path);
-        if key.is_empty() || key == own_process_key() {
+        let name = app_key(process_path);
+        if name.is_empty() || name == own_process_key() {
             return;
         }
+        // The image itself, so a rule by path can claim its own programs.
+        let key = if process_path.len() <= CENSUS_IMAGE_MAX_BYTES {
+            process_path.trim().to_string()
+        } else {
+            name
+        };
         // The census only matters to a plan for an address a planned
         // application's set holds; asked before the census lock, never under it.
         let pinned = self
@@ -581,8 +702,88 @@ impl AppObservationStore {
         keys.iter().any(|seen| {
             !friendly
                 .iter()
-                .any(|pattern| pattern_matches(pattern, seen))
+                .any(|pattern| self.names_process(pattern, seen))
         })
+    }
+
+    /// Whether the rule `pattern` names the process whose image is
+    /// `process_path`: by name, or by where the image lies.
+    #[must_use]
+    pub fn names_process(&self, pattern: &str, process_path: &str) -> bool {
+        if is_path_pattern(pattern) {
+            let image = self.path_image(process_path);
+            self.places_of(pattern.trim())
+                .iter()
+                .any(|place| place.match_image(&image).is_some())
+        } else {
+            pattern_matches(pattern, &app_key(process_path))
+        }
+    }
+
+    /// The places the rule path spelled `key` collects from: the ones a plan
+    /// noted, else the spelling itself.
+    fn places_of(&self, key: &str) -> Vec<AppPath> {
+        let known = self
+            .path_places
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(key)
+            .cloned();
+        known.unwrap_or_else(|| AppPath::parse(key, self.path_style).into_iter().collect())
+    }
+
+    /// The rule paths a plan asked about whose places hold `image`.
+    fn path_buckets_of(&self, image: &str) -> Vec<String> {
+        if self
+            .path_places
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+        {
+            return Vec::new();
+        }
+        let image = self.path_image(image);
+        let image = image.as_ref();
+        let places = self.path_places.lock().unwrap_or_else(|p| p.into_inner());
+        places
+            .iter()
+            .filter(|(_, at)| at.iter().any(|place| place.match_image(image).is_some()))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Start matching images for the rule path `key`, at its own spelling
+    /// until a plan says where it really is.
+    fn watch_path(&self, key: &str) {
+        let mut places = self.path_places.lock().unwrap_or_else(|p| p.into_inner());
+        if places.contains_key(key) {
+            return;
+        }
+        if places.len() >= PATH_PATTERN_CAP {
+            places.clear();
+        }
+        let literal: Vec<AppPath> = AppPath::parse(key, self.path_style).into_iter().collect();
+        places.insert(key.to_string(), literal);
+    }
+
+    /// Where the rule path `key` collects from: its own spelling and the
+    /// places a plan found for it (a handful at most).
+    fn set_path_places(&self, key: &str, noted: &[AppPath]) {
+        let key = key.trim();
+        if !is_path_pattern(key) {
+            return;
+        }
+        let mut at: Vec<AppPath> = AppPath::parse(key, self.path_style).into_iter().collect();
+        for place in noted.iter().take(4) {
+            if place.style() == self.path_style && !at.contains(place) {
+                at.push(place.clone());
+            }
+        }
+        let mut places = self.path_places.lock().unwrap_or_else(|p| p.into_inner());
+        if !places.contains_key(key) && places.len() >= PATH_PATTERN_CAP {
+            places.clear();
+        }
+        places.insert(key.to_string(), at);
     }
 
     /// Moves whenever something a plan has read from here changes, so a pass can
@@ -667,6 +868,19 @@ struct CensusIndex {
 
 impl AppObservationLookup for AppObservationStore {
     fn ips_for_app(&self, app: &str) -> Vec<Ipv4Addr> {
+        if is_path_pattern(app) {
+            let key = observation_key(app);
+            self.watch(&key);
+            self.watch_path(&key);
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            self.prune_stale(&mut g, &key);
+            let mut v: Vec<Ipv4Addr> = g
+                .get(&key)
+                .map(|set| set.iter().copied().collect())
+                .unwrap_or_default();
+            v.sort();
+            return v;
+        }
         let key = app_key(app);
         if key.is_empty() {
             return Vec::new();
@@ -680,7 +894,9 @@ impl AppObservationLookup for AppObservationStore {
         let mut v: Vec<Ipv4Addr> = if key.contains('*') {
             let names: Vec<String> = g
                 .keys()
-                .filter(|name| glob_match(&key, name))
+                // A rule path's bucket repeats its programs' own; a mask over
+                // names must not reach programs through a folder's spelling.
+                .filter(|name| !is_path_pattern(name) && glob_match(&key, name))
                 .cloned()
                 .collect();
             let mut set: HashSet<Ipv4Addr> = HashSet::new();
@@ -712,6 +928,10 @@ impl AppObservationLookup for AppObservationStore {
         let stores = self.per_principal.as_ref()?;
         Some(stores.for_principal(principal) as Arc<dyn AppObservationLookup>)
     }
+
+    fn note_path_places(&self, key: &str, places: &[AppPath]) {
+        self.set_path_places(key, places);
+    }
 }
 
 /// Does the rule pattern `pattern` name the observed process `key`?
@@ -720,6 +940,13 @@ impl AppObservationLookup for AppObservationStore {
 /// and the codegen cannot drift into disagreeing about what a rule covers.
 #[must_use]
 pub fn pattern_matches(pattern: &str, key: &str) -> bool {
+    // A rule path names its own bucket only; its last segment is no name.
+    if is_path_pattern(pattern) {
+        return pattern.trim() == key;
+    }
+    if is_path_pattern(key) {
+        return false;
+    }
     let p = app_key(pattern);
     if p.contains('*') {
         glob_match(&p, key)
@@ -858,7 +1085,7 @@ impl MockAppObservationLookup {
 
     /// Register `ips` as the observed set for `app`. Last write wins.
     pub fn set_ips(&self, app: &str, ips: Vec<Ipv4Addr>) {
-        self.inner.lock().unwrap().insert(app_key(app), ips);
+        self.inner.lock().unwrap().insert(observation_key(app), ips);
     }
 
     /// Declare `ip` to be in use by a process no application rule names.
@@ -873,7 +1100,7 @@ impl AppObservationLookup for MockAppObservationLookup {
         self.inner
             .lock()
             .unwrap()
-            .get(&app_key(app))
+            .get(&observation_key(app))
             .cloned()
             .unwrap_or_default()
     }
@@ -1432,10 +1659,108 @@ mod tests {
     fn mock_round_trips() {
         let m = MockAppObservationLookup::new();
         m.set_ips("chrome.exe", vec![ip(192, 0, 2, 4)]);
-        assert_eq!(
-            m.ips_for_app("C:\\path\\Chrome.exe"),
-            vec![ip(192, 0, 2, 4)]
-        );
+        assert_eq!(m.ips_for_app("Chrome.EXE"), vec![ip(192, 0, 2, 4)]);
         assert!(m.ips_for_app("other.exe").is_empty());
+        // A rule by path keeps its own key: a folder is not the name of its
+        // last part.
+        m.set_ips(r"c:\apps\tool\*", vec![ip(192, 0, 2, 5)]);
+        assert_eq!(m.ips_for_app(r"c:\apps\tool\*"), vec![ip(192, 0, 2, 5)]);
+        assert!(m.ips_for_app("*").is_empty());
+    }
+
+    fn windows_store() -> AppObservationStore {
+        AppObservationStore::new().with_path_style(nrr_shared::app_path::PathStyle::Windows)
+    }
+
+    /// A rule by folder learns from the programs in that folder only; a
+    /// program of the same name elsewhere teaches its name rule, not the
+    /// folder's.
+    #[test]
+    fn a_folder_rule_learns_from_the_programs_inside_it_only() {
+        let store = windows_store();
+        let folder = r"c:\apps\tool\*";
+        assert!(store.ips_for_app(folder).is_empty(), "the plan asks first");
+        assert!(store.record(r"C:\Apps\Tool\v2\tool.exe", ip(203, 0, 113, 1)));
+        store.record(r"C:\Other\tool.exe", ip(203, 0, 113, 2));
+        assert_eq!(store.ips_for_app(folder), vec![ip(203, 0, 113, 1)]);
+        assert_eq!(
+            store.ips_for_app("tool.exe"),
+            vec![ip(203, 0, 113, 1), ip(203, 0, 113, 2)]
+        );
+        // "This folder only" leaves the version folder below it out.
+        let flat = r"c:\apps\tool\";
+        assert!(store.ips_for_app(flat).is_empty());
+        store.record(r"C:\Apps\Tool\v2\tool.exe", ip(203, 0, 113, 3));
+        assert!(store.ips_for_app(flat).is_empty());
+    }
+
+    /// A mask over names never reaches programs through a folder's spelling:
+    /// `*tool*` names programs called like that, not those of `c:\tools\`.
+    #[test]
+    fn a_name_mask_does_not_match_a_folders_bucket() {
+        let store = windows_store();
+        let _ = store.ips_for_app(r"c:\tools\*");
+        store.record(r"C:\Tools\a.exe", ip(203, 0, 113, 9));
+        assert_eq!(store.ips_for_app(r"c:\tools\*"), vec![ip(203, 0, 113, 9)]);
+        assert!(store.ips_for_app("*tool*").is_empty());
+        assert!(!pattern_matches("*", r"c:\tools\*"));
+    }
+
+    /// The census asks where a program lives: the folder rule's own programs
+    /// are friends, a namesake elsewhere is somebody else.
+    #[test]
+    fn the_census_tells_a_folders_program_from_its_namesake() {
+        let store = windows_store();
+        let folder = r"c:\apps\tool\*".to_string();
+        let _ = store.ips_for_app(&folder);
+        let shared = ip(203, 0, 113, 20);
+        store.note_process_destination(r"C:\Apps\Tool\tool.exe", shared);
+        assert!(!store.destination_used_outside(std::slice::from_ref(&folder), shared));
+        store.note_process_destination(r"C:\Elsewhere\tool.exe", shared);
+        assert!(store.destination_used_outside(std::slice::from_ref(&folder), shared));
+        assert!(
+            !store.destination_used_outside(&["tool.exe".to_string()], shared),
+            "a name rule covers both"
+        );
+    }
+
+    /// A dropped connection names its program in the kernel's spelling; the
+    /// platform's reading of it is what a folder rule matches.
+    #[test]
+    fn an_image_in_another_spelling_is_read_for_folder_rules() {
+        let store = windows_store();
+        store.set_image_normalizer(std::sync::Arc::new(|image: &str| {
+            image
+                .strip_prefix(r"\device\harddiskvolume3\")
+                .map(|rest| format!(r"C:\{rest}"))
+        }));
+        let folder = r"c:\apps\tool\*";
+        let _ = store.ips_for_app(folder);
+        store.record(
+            r"\device\harddiskvolume3\apps\tool\tool.exe",
+            ip(203, 0, 113, 30),
+        );
+        assert_eq!(store.ips_for_app(folder), vec![ip(203, 0, 113, 30)]);
+    }
+
+    /// Remembered destinations of a rule by path go back into its own bucket.
+    #[test]
+    fn a_remembered_folder_rule_destination_is_seeded_into_its_bucket() {
+        let store = windows_store();
+        let folder = r"c:\apps\tool\*".to_string();
+        assert_eq!(store.seed_many(&[(folder.clone(), ip(203, 0, 113, 40))]), 1);
+        assert_eq!(store.ips_for_app(&folder), vec![ip(203, 0, 113, 40)]);
+        assert!(store.ips_for_app("*").is_empty());
+    }
+
+    #[test]
+    fn a_rule_path_is_told_from_a_name() {
+        for path in [r"c:\apps\*", r"\\server\share\x.exe", "/opt/app/", "D:/x"] {
+            assert!(is_path_pattern(path), "{path}");
+            assert_eq!(observation_key(path), path);
+        }
+        for name in ["chrome.exe", "*vpn*", "", r"\device\x.exe", "C:x"] {
+            assert!(!is_path_pattern(name), "{name}");
+        }
     }
 }

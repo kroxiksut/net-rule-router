@@ -1355,6 +1355,14 @@
       "body": "You have unsaved changes to the rules. Loading the active rules from the service will discard them. Continue?",
       "confirm": "Discard and load"
     },
+    "rules-file-edited": {
+      "title": "A rules file was edited outside the app",
+      "body": "Your rules changed elsewhere, and this file was edited by hand since the app last saved it, so it was left as it is. Take the file to compare it with the rules in force and apply what you keep, or replace the file with the rules in force.",
+      "files": "Files edited by hand",
+      "later": "Leave both for now",
+      "overwrite": "Replace the file",
+      "take": "Take the file"
+    },
     "unroutable-secondary": {
       "title": "This adapter cannot carry traffic out",
       "adapter-line": "Adapter: {name}",
@@ -1449,6 +1457,14 @@
     "merge": {
       "duplicates-hint": "Each of these was enabled on both routes, so the merge kept the main route's copy and switched the other one off. Pick a different route if that is not what you meant — the other copy stays in your list, switched off.",
       "title": "Merge file and app rules",
+      "edits-title": "Your edits and the rules now in force",
+      "edits-body": "Your rules were changed elsewhere while you were editing them. Combine your edits with the rules now in force: a rule on only one side is kept, and where both sides changed the same rule you pick the version that stays. A rule you deleted that is still in force is kept; delete it again after the merge.",
+      "edits-loading": "Comparing your edits with the rules in force…",
+      "edits-no-op": "Your edits already match the rules in force — nothing to merge.",
+      "bucket-edits-only": "Only in your edits",
+      "bucket-in-force-only": "Only in the rules in force",
+      "pick-edits": "Your edit",
+      "pick-in-force": "In force",
       "body": "Combine your linked rules file with the rules the service is currently enforcing. Rules on only one side are always kept; rules that exist on both but differ are shown as conflicts.",
       "bucket-file-only": "Only in the file",
       "bucket-service-only": "Only in the app",
@@ -1865,6 +1881,8 @@
     "rules-activate-completed": "Rules activated.",
     "rules-activate-failed": "Failed to activate rules: ",
     "rules-apply-unexpected-diff": "Not applied: the change would also affect other rules. Open the rules in the main window to review it.",
+    "rules-apply-unexpected-diff-here": "Not applied: the change would also affect other rules. Press Apply to review it.",
+    "rules-changed-elsewhere-merge": "Your rules were changed elsewhere meanwhile. Review how your edits combine with them.",
     "reset-baseline-completed": "Reset to baseline rules. Reloading the active rules...",
     "reset-baseline-failed": "Could not reset to baseline: ",
     "baseline-needs-service": "Connect to the service to edit the baseline rules.",
@@ -1882,6 +1900,7 @@
     },
     "changes-cancelled": "Changes reverted.",
     "rule-updated": "Rule updated",
+    "rule-edit-target-gone": "The rule you were editing was changed elsewhere, so this edit was not saved.",
     "rule-added": "Rule added",
     "rule-added-disabled": "Rule added but disabled — it will not affect routing until you enable it.",
     "tray-add-rule-apply-with-edits": "The rule is in the list. Apply it together with your other unsaved rule changes.",
@@ -1893,6 +1912,7 @@
     "rules-limit-reached": "Up to {max} active rules are supported.",
     "rules-serialize-failed": "Internal error while preparing rules — see logs",
     "role-unassigned": "{role} unassigned from this adapter.",
+    "role-adapter-gone": "That adapter is no longer on this computer, so no role was assigned.",
     "setup-completed": "Setup completed",
     "manual-refresh": "Manual refresh",
     "interfaces-refreshed": "Interfaces list refreshed.",
@@ -2797,7 +2817,8 @@
         "more": "Addresses affected besides this one: {count}.",
         "unsupported-shape": "{rule} for {app} is not enforced: a rule that limits an address to one application cannot be carried out yet, so it is skipped rather than applied to every application.",
         "carving-over-cap": "{rule} holds more narrower rules than can be carved out of it, so it applies to its whole network and the narrower rules inside it do not take effect. Split it into smaller networks.",
-        "protected": "The rule {rule} is not applied. {reason}"
+        "protected": "The rule {rule} is not applied. {reason}",
+        "folder-over-cap": "{rule} covers the first {count} programs of its folder. The folder holds more, and those are not covered: name the folder of the program you mean instead."
       },
       "intersecting": "{winner} and {loser} on {loser-route} share some addresses. Each shared address takes the narrower rule; most of them go over {winner-route}.",
       "send-over-whole": "This moves the whole rule, including addresses the other rule does not cover."
@@ -3360,8 +3381,16 @@
       "show-blocked": "Show blocked",
       "show-local": "Show local connections",
       "show-local-tip": "Connections to your own machine or your local network (loopback, link-local, private LAN addresses). They never leave your network, so they say nothing about routing.",
-      "group-by-process": "Group by process",
+      "group-by": "Group",
+      "group-by-a11y": "How to group the connections",
+      "group-by-tip": "By folder: programs of one folder and of the folders inside it form one group, and the group offers a rule for the whole folder.",
+      "group-none": "No grouping",
+      "group-program": "By program",
+      "group-folder": "By folder",
       "group-count": "connection(s)",
+      "group-folder-counts": "%1 program(s)  ·  %2 connection(s)",
+      "group-no-path": "Programs without a known path",
+      "rule-for-folder": "Rule for this folder…",
       "leak-mismatch-tip": "Mismatch: this address belongs to a rule routed to the additional adapter, but the connection was allowed out over the PRIMARY link — a leak indicator.",
       "verdict-note": "\"Blocked\" means the connection was dropped by a filter in the system — this can be the system firewall or your antivirus, not necessarily NetRuleRouter. NetRuleRouter never blocks traffic on your primary route.",
       "egress": {
@@ -3390,12 +3419,77 @@
       "rule-for-address": "Rule for this address…",
       "rule-for-app": "Rule for this application…",
       "why-this-route": "Why this route?",
+      "check-site": "Check site…",
       "auto-paused": "Paused — scroll to the top or clear the selection to resume",
       "gui-stream-off": "Showing the connection trace is switched off in Settings → Diagnostics and logs. Observation itself keeps running.",
       "open-window": "Open connection trace",
       "card-summary": "Which interface each outgoing connection actually left through.",
       "only-ipv6": "IPv6 only",
       "only-ipv6-tip": "Show only connections made over IPv6. They are observed, but routing rules do not apply to that family yet — so these are the connections currently travelling outside your policy. Link-local IPv6 counts as local, so tick \"Show local connections\" as well to see it."
+    },
+    "site-check": {
+      "title": "Check a site",
+      "subtitle": "Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.",
+      "placeholder": "site name, e.g. example.com",
+      "run": "Check site",
+      "running": "Checking {host}…",
+      "input-required": "Enter a site name to check",
+      "failed": "Could not check the site: ",
+      "no-address": "address not known: not opened lately",
+      "status": "answer {code}",
+      "redirects": "sends on to {hosts}",
+      "move": "Move the sign-in names to the site's route…",
+      "role": {
+        "site": "the site",
+        "sign-in": "sign-in",
+        "seen-with": "seen with the site"
+      },
+      "answer": {
+        "answered": "answers",
+        "certificate-untrusted": "certificate not trusted on this route",
+        "silent": "does not answer",
+        "unclear": "could not be checked",
+        "no-address": "not checked",
+        "route-down": "route not working",
+        "blocked": "denied by your rule"
+      },
+      "verdict": {
+        "fine": {
+          "title": "The network is fine: the site answers over your route",
+          "body": "Its names answer over the routes your rules give them. A page that keeps reloading or a sign-in that goes in circles is then usually caused by the site's cookies in the browser."
+        },
+        "sign-in-split": {
+          "title": "The site's sign-in goes over a different route than the site",
+          "body": "When the address changes in the middle of signing in, the site sees a different visitor and starts over, so signing in breaks. Put the sign-in names on the same route as the site."
+        },
+        "certificate-untrusted": {
+          "title": "The site's certificate is not trusted on this route",
+          "body": "The site answers, but with a certificate the public certificate authorities do not vouch for: something between this computer and the site answers in its place, often an antivirus that scans encrypted traffic or a network filter. Sites can refuse to sign you in through it. Check the HTTPS scanning settings of your antivirus, or open the site over the other route."
+        },
+        "not-answering": {
+          "title": "The site does not answer over its route",
+          "body": "Connections over this route do not get through to the site. The connection trace shows what its connections did; if the main route keeps failing for it, Suggested addresses may offer to send it over the other route."
+        },
+        "route-down": {
+          "title": "The route the site uses is not working",
+          "body": "The connection the site is routed over is down or not connected, so nothing reaches the site that way. Reconnect it, or check Interfaces and routes."
+        },
+        "blocked": {
+          "title": "Your rule denies this site",
+          "body": "A deny rule in your rules holds the site, so nothing is sent to it. Change or remove that rule in Rules if the site should open."
+        },
+        "unclear": {
+          "title": "Nothing could be checked",
+          "body": "No address is known for the site yet. Open it in the browser once, then check again."
+        }
+      },
+      "cookies": {
+        "title": "If the site still loops or will not let you sign in, delete its cookies in the browser:",
+        "chrome": "Chrome: click the icon left of the address, open \"Cookies and site data\", then \"Manage on-device site data\", and delete the site's entries.",
+        "edge": "Edge: click the icon left of the address, open \"Cookies and site data\", and delete the site's cookies.",
+        "firefox": "Firefox: click the padlock left of the address and choose \"Clear cookies and site data…\".",
+        "note": "NetRuleRouter never reads or changes browser data."
+      }
     },
     "explain": {
       "title": "Explain sample",
@@ -3473,6 +3567,7 @@
     },
     "event": {
       "auto-rules-verify-accepted": "Rules with ? moved to the route that works for them: {count}.",
+      "site-check-done": "Site check of {host} finished: {verdict}.",
       "auto-rules-verify-verdict": "{host} does not open on the route its ? rule is written for but opens on the other one; the rule uses the other route until restart, and moving it is offered.",
       "conn-observation-tick": "Connections observed: {total} (Main {primary}, Additional {secondary}, blocked {blocked_nrr})",
       "dns-refresh-tick": "DNS refresh: {succeeded} of {attempted} names resolved",
@@ -4650,6 +4745,7 @@
       "auto-on": "Suggested addresses are now added automatically.",
       "failed": "Not done: {error}",
       "no-item": "There is no item {n} in the list. Use the number shown before an item.",
+      "item-gone": "Item {n} as it was listed is no longer offered. Here is the list as it is now.",
       "nothing-to-do": "Item {n} has nothing this command can act on.",
       "confirm": "y: turn it on and add item {n}. n: cancel.",
       "confirm-prompt": "Type y to turn it on or n to cancel, then press Enter.",
@@ -4662,6 +4758,7 @@
         "restore": "r: allow the chosen item to be suggested again",
         "always": "m: add the chosen item and add suggestions automatically from now on (asks first)",
         "check": "c: check the addresses over the main connection",
+        "check-site": "k: for a site you opened that keeps failing, check whether the network or the site is at fault (opens Diagnostics)",
         "toggles": "s: show or hide answered addresses; v: show or hide addresses the main connection handles",
         "order": "o: change the order of the list"
       },
@@ -4672,6 +4769,7 @@
         "restore": "r and an item number: allow that item to be suggested again",
         "always": "m and an item number: add that item and add suggestions automatically from now on (asks first)",
         "check": "c: check the addresses over the main connection",
+        "check-site": "k and an item number: check that site, whether the network or the site is at fault",
         "toggles": "s: show or hide answered addresses; v: show or hide addresses the main connection handles",
         "order": "o: change the order of the list"
       }
@@ -4727,10 +4825,14 @@
       "help-filters": "b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off",
       "plain-details": "d and a row number: show that connection, for example d 3",
       "plain-explain": "e and a row number: why that connection took its route, for example e 3",
+      "help-check-site": "c: check the chosen connection's site, to tell whether the network or the site is at fault (opens Diagnostics)",
+      "plain-check-site": "c and a row number: check that connection's site, for example c 3",
       "plain-search": "/ and text: search all fields, for example /example; / on its own clears the search",
       "help-outage": "o: what was blocked while the additional route was down",
       "help-history": "h: the latest connections or your kept history   t: the history's period — last hour, today, last 7 days",
-      "plain-history": "h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period"
+      "plain-history": "h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period",
+      "help-grouping": "g: group the list — no grouping, by program, by folder   f: a rule for the folder of the chosen group (opens Rules)",
+      "plain-grouping": "g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3"
     },
     "outage-blocks": {
       "where": "The list of what was blocked: {screen}"
@@ -4758,6 +4860,9 @@
       "help-log-filters": "In the log: v changes the lowest level shown, / filters by event type, s switches between this session and all history",
       "plain-ack": "a and an alert number: acknowledge it, for example a 1",
       "plain-explain": "e and a host or address: which rule decides it, for example e example.com",
+      "help-site-check": "c: type a site name and check whether the network or the site is at fault",
+      "plain-site-check": "c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route",
+      "site-move": "m: move the sign-in names to the site's route (Rules opens with them, and you confirm)",
       "plain-export": "x: export a diagnostic archive",
       "plain-log-filters": "In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history"
     },
@@ -4859,6 +4964,14 @@
       "phase-completed": "The service has finished applying the rules.",
       "phase-failed": "The service could not apply the rules: {error}",
       "busy": "Wait until the rules are applied; the list cannot change meanwhile.",
+      "number-gone": "Rule {n} as it was listed is no longer in the list. Here is the list as it is now.",
+      "changed-elsewhere": {
+        "question": "Your rules were changed elsewhere since this list was read. Nothing was applied.",
+        "detail": "Your edits can be put on top of the rules now in force; you review the result before it applies.",
+        "rebase": "Put my edits on top of the rules now in force",
+        "keep": "Keep my list as it is",
+        "rebased": "Your edits are on top of the rules now in force. Review them before they apply."
+      },
       "apply-offline": "The service is not connected, so the rules cannot be applied now. Export them to files with x to keep them.",
       "expired": "The review is out of date — the rules in force changed meanwhile. Press s to compare again.",
       "on": "on",

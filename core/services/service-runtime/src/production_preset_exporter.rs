@@ -513,9 +513,12 @@ mod tests {
             "unexpected preset header; got:\n{}",
             out.file_bytes_utf8
         );
-        // Deterministic content_hash: 64 hex chars.
-        assert_eq!(out.content_hash_hex.len(), 64);
-        assert!(out.content_hash_hex.chars().all(|c| c.is_ascii_hexdigit()));
+        // The hash crosses IPC: fixed-width lowercase hex of the file bytes.
+        let expected: String = Sha256::digest(out.file_bytes_utf8.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(out.content_hash_hex, expected);
     }
 
     /// A Linux export writes the name the process has under `--- Linux`; the

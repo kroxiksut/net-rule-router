@@ -45,6 +45,21 @@ mod tests {
         assert_eq!(actor_id_hash(""), None);
     }
 
+    /// Events already on disk carry these hashes; a read scoped by a hash in
+    /// another format would no longer find the caller's own events.
+    #[test]
+    fn the_hash_is_pinned() {
+        assert_eq!(
+            actor_id_hash("S-1-5-21-1").as_deref(),
+            Some("d7dc06764bd183e25c83a3d362e68cf65e8bd9816dc75d80bc1ff215b83439ee")
+        );
+        // A leading zero nibble stays: the hex is fixed-width.
+        assert_eq!(
+            actor_id_hash("unix:uid:1016").as_deref(),
+            Some("04209ca125e8d802b570affc82370abf7e38b1b551cca2ac36ef0c22a7e39678")
+        );
+    }
+
     #[test]
     fn the_hash_is_lowercase_hex_of_the_full_digest() {
         let h = actor_id_hash("unix:uid:1000").expect("hashable");

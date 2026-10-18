@@ -121,6 +121,8 @@ const DIAGNOSTIC_FIELDS: &[&str] = &[
     // Both carry `ip_set=[…]` inside a filter-plan summary.
     "only_live",
     "only_neutral",
+    // Names a check examined, or how many: either way about a person's sites.
+    "names",
     "namespaces",
     "network",
     "next_hop",

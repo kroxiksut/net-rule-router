@@ -11,11 +11,11 @@
 //! A file that is there but cannot be read is never overwritten: the caller
 //! gets [`UserSettingsError::Damaged`] and decides what to tell the user.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -52,6 +52,15 @@ const KEY_SELECTED_SET: &str = "selected-set";
 const KEY_SERVICE_INTENT: &str = "service-intent";
 const KEY_PRIMARY: &str = "primary";
 const KEY_SECONDARY: &str = "secondary";
+const KEY_WRITTEN: &str = "written";
+
+/// Files whose last written version is remembered: the two bound ones and a
+/// few the user moved away from, so going back does not ask needlessly.
+const MAX_WRITTEN: usize = 8;
+
+/// The largest rules file whose content is compared; the clients read rules
+/// files up to this size.
+pub const MAX_RULES_FILE_BYTES: u64 = 1024 * 1024;
 
 static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -60,6 +69,10 @@ static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct RulesFiles {
     pub primary: String,
     pub secondary: String,
+    /// What the program itself last wrote to each rules file: portable path
+    /// to the SHA-256 (lower-case hex) of the bytes. A file that no longer
+    /// matches was edited by hand since.
+    pub written: BTreeMap<String, String>,
     /// Keys a newer build added here, written back unchanged.
     pub other: Map<String, Value>,
 }
@@ -128,6 +141,39 @@ impl UserSettings {
 
     pub fn set_secondary_file(&mut self, path: &str) {
         self.rules_files.secondary = portable_path(path);
+    }
+
+    /// The program wrote `path`, and its bytes now hash to `sha256`. Past the
+    /// cap, records of files no longer bound are dropped first.
+    pub fn record_rules_file_written(&mut self, path: &str, sha256: &str) {
+        let path = portable_path(path);
+        let written = &mut self.rules_files.written;
+        written.insert(path.clone(), sha256.to_ascii_lowercase());
+        let keep = [
+            path,
+            self.rules_files.primary.clone(),
+            self.rules_files.secondary.clone(),
+        ];
+        while written.len() > MAX_WRITTEN {
+            let Some(stale) = written.keys().find(|key| !keep.contains(*key)).cloned() else {
+                break;
+            };
+            written.remove(&stale);
+        }
+    }
+
+    /// Whether `path` was edited by hand since the program last wrote it:
+    /// its bytes (`on_disk`, their SHA-256; `None` when the file is absent)
+    /// differ from the version on record. A file never written by the program
+    /// has no record to differ from, and an absent one has nothing to lose.
+    pub fn rules_file_hand_edited(&self, path: &str, on_disk: Option<&str>) -> bool {
+        let Some(on_disk) = on_disk else {
+            return false;
+        };
+        self.rules_files
+            .written
+            .get(&portable_path(path))
+            .is_some_and(|recorded| !recorded.eq_ignore_ascii_case(on_disk))
     }
 
     /// Takes into `self` — the file as it is now — every known key `mine`
@@ -277,6 +323,7 @@ pub fn parse_user_settings(text: &str) -> Result<UserSettings, String> {
             RulesFiles {
                 primary: take_string(&mut files, KEY_PRIMARY).map_err(nested)?,
                 secondary: take_string(&mut files, KEY_SECONDARY).map_err(nested)?,
+                written: take_written(&mut files).map_err(nested)?,
                 other: files,
             }
         }
@@ -317,6 +364,15 @@ pub fn format_user_settings(settings: &UserSettings) -> serde_json::Result<Strin
         KEY_SECONDARY.to_string(),
         Value::String(settings.rules_files.secondary.clone()),
     );
+    if !settings.rules_files.written.is_empty() {
+        let written = settings
+            .rules_files
+            .written
+            .iter()
+            .map(|(path, sha256)| (path.clone(), Value::String(sha256.clone())))
+            .collect();
+        files.insert(KEY_WRITTEN.to_string(), Value::Object(written));
+    }
     for (key, value) in &settings.rules_files.other {
         files.entry(key.clone()).or_insert_with(|| value.clone());
     }
@@ -344,6 +400,43 @@ fn take_string(object: &mut Map<String, Value>, key: &str) -> Result<String, Str
         Some(Value::String(value)) => Ok(value),
         Some(_) => Err(wrong_type(key, "a string")),
     }
+}
+
+/// `written`: an object of path to hash text. Anything else is a damaged
+/// file, as for every known key.
+fn take_written(object: &mut Map<String, Value>) -> Result<BTreeMap<String, String>, String> {
+    match object.remove(KEY_WRITTEN) {
+        None | Some(Value::Null) => Ok(BTreeMap::new()),
+        Some(Value::Object(entries)) => entries
+            .into_iter()
+            .map(|(path, sha256)| match sha256 {
+                Value::String(sha256) => Ok((path, sha256)),
+                _ => Err(wrong_type(KEY_WRITTEN, "an object of strings")),
+            })
+            .collect(),
+        Some(_) => Err(wrong_type(KEY_WRITTEN, "an object")),
+    }
+}
+
+/// The bytes of a rules file, to compare with what the program wrote there:
+/// `None` when it is absent. A file over [`MAX_RULES_FILE_BYTES`] is an error;
+/// the program never writes one that large.
+pub fn read_rules_file_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_RULES_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RULES_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "larger than a rules file can be",
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 fn wrong_type(key: &str, expected: &str) -> String {
@@ -715,6 +808,10 @@ mod tests {
             rules_files: RulesFiles {
                 primary: "/home/user/rule-sets/home/rules_primary.txt".to_string(),
                 secondary: "/home/user/rule-sets/home/rules_secondary.txt".to_string(),
+                written: BTreeMap::from([(
+                    "/home/user/rule-sets/home/rules_primary.txt".to_string(),
+                    "ab".repeat(32),
+                )]),
                 other: Map::new(),
             },
             selected_set: "user:home".to_string(),
@@ -920,6 +1017,62 @@ mod tests {
         settings.set_intent(INTENT_NOTICE_MUTES, json!([]));
         settings.set_intent(INTENT_NOTICE_MUTES, Value::Null);
         assert!(settings.service_intent.is_empty());
+    }
+
+    #[test]
+    fn a_rules_file_changed_since_the_program_wrote_it_was_edited_by_hand() {
+        let mut settings = sample();
+        let path = r"C:\Sets\home\rules_primary.txt";
+        assert!(
+            !settings.rules_file_hand_edited(path, Some("00")),
+            "never written by the program: nothing to differ from"
+        );
+        settings.record_rules_file_written(path, "AB12");
+        let spelled = "C:/Sets/home/rules_primary.txt";
+        assert!(!settings.rules_file_hand_edited(spelled, Some("ab12")));
+        assert!(settings.rules_file_hand_edited(path, Some("cd34")));
+        assert!(
+            !settings.rules_file_hand_edited(path, None),
+            "an absent file has nothing to lose"
+        );
+    }
+
+    #[test]
+    fn the_written_record_round_trips_and_stays_bounded() {
+        let mut settings = sample();
+        for i in 0..20 {
+            settings.record_rules_file_written(&format!("/old/{i}.txt"), "11");
+        }
+        let secondary = settings.rules_files.secondary.clone();
+        settings.record_rules_file_written(&secondary, "22");
+        assert_eq!(settings.rules_files.written.len(), MAX_WRITTEN);
+        for bound in [
+            settings.rules_files.primary.clone(),
+            settings.rules_files.secondary.clone(),
+        ] {
+            assert!(settings.rules_files.written.contains_key(&bound), "{bound}");
+        }
+        let text = format_user_settings(&settings).expect("format");
+        assert_eq!(parse_user_settings(&text), Ok(settings));
+        for damaged in [
+            r#"{"rules-files": {"written": {"/a": 1}}}"#,
+            r#"{"rules-files": {"written": []}}"#,
+        ] {
+            assert!(parse_user_settings(damaged).is_err(), "{damaged}");
+        }
+    }
+
+    #[test]
+    fn a_rules_file_too_large_to_be_ours_is_not_read() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("rules_primary.txt");
+        assert_eq!(read_rules_file_bytes(&path).expect("absent"), None);
+        fs::write(&path, b"x").expect("write");
+        let read = read_rules_file_bytes(&path).expect("read");
+        assert_eq!(read, Some(b"x".to_vec()));
+        let too_large = usize::try_from(MAX_RULES_FILE_BYTES).expect("fits") + 1;
+        fs::write(&path, vec![b'x'; too_large]).expect("write");
+        assert!(read_rules_file_bytes(&path).is_err());
     }
 
     #[test]

@@ -189,6 +189,43 @@ impl CompanionAffinityLedger {
         self.candidates.contains_key(hostname)
     }
 
+    /// Candidates seen together with any anchor `of_site` admits, most windows
+    /// shared first, at most `limit`. Read-only: what the ledger already holds.
+    #[must_use]
+    pub fn seen_with<F>(&self, of_site: F, limit: usize) -> Vec<String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let ids: Vec<u32> = self
+            .anchors
+            .iter()
+            .filter(|(name, _)| of_site(name))
+            .map(|(_, state)| state.id)
+            .collect();
+        if ids.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let mut found: Vec<(u32, &str)> = self
+            .candidates
+            .iter()
+            .filter_map(|(name, state)| {
+                let windows: u32 = state
+                    .pairs
+                    .iter()
+                    .filter(|p| ids.contains(&p.anchor_id))
+                    .map(|p| p.distinct_windows)
+                    .fold(0, u32::saturating_add);
+                (windows > 0).then_some((windows, name.as_str()))
+            })
+            .collect();
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        found
+            .into_iter()
+            .take(limit)
+            .map(|(_, name)| name.to_owned())
+            .collect()
+    }
+
     /// Records one observation. Cheap and never panics: bounded by the anchor
     /// cap per call, allocation only when a new hostname enters the tracked
     /// set. `at_ms` is caller-supplied monotonic-ish milliseconds; an

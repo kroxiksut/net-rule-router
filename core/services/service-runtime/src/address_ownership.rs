@@ -1160,6 +1160,12 @@ impl<'a> AppDestinationGate<'a> {
         }
     }
 
+    /// Tell the observations where the rule by path spelled `key` really is,
+    /// so its programs are recognised there too.
+    pub fn note_path_places(&self, key: &str, places: &[nrr_shared::app_path::AppPath]) {
+        self.observations.note_path_places(key, places);
+    }
+
     /// Destinations `pattern`'s rule on `for_link` may take, in observation
     /// order, with a reason recorded for every one held back.
     ///

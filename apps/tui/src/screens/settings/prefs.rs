@@ -5,6 +5,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use nrr_client_logic::conn_trace::TraceGrouping;
 use serde_json::{json, Value};
 
 const FILE_NAME: &str = "tui.json";
@@ -16,6 +17,8 @@ pub struct TuiPrefs {
     pub no_color: bool,
     /// Plain characters instead of frame lines.
     pub ascii: bool,
+    /// How the connection trace is grouped, as the GUI keeps its own choice.
+    pub trace_grouping: TraceGrouping,
 }
 
 /// Where the file lives for this user; `None` when the OS names no
@@ -38,6 +41,11 @@ pub fn load(path: &Path) -> TuiPrefs {
         plain: flag("plain"),
         no_color: flag("no-color"),
         ascii: flag("ascii"),
+        trace_grouping: value
+            .get("trace-grouping")
+            .and_then(Value::as_str)
+            .and_then(TraceGrouping::from_slug)
+            .unwrap_or_default(),
     }
 }
 
@@ -51,6 +59,7 @@ pub fn save(path: &Path, prefs: TuiPrefs) -> io::Result<()> {
         "plain": prefs.plain,
         "no-color": prefs.no_color,
         "ascii": prefs.ascii,
+        "trace-grouping": prefs.trace_grouping.slug(),
     });
     let text = serde_json::to_string_pretty(&body).map_err(io::Error::other)?;
     let temporary = path.with_extension("json.tmp");
@@ -70,6 +79,7 @@ mod tests {
             plain: true,
             no_color: false,
             ascii: true,
+            trace_grouping: TraceGrouping::Folder,
         };
         save(&path, prefs).unwrap_or_else(|e| panic!("save: {e}"));
         assert_eq!(load(&path), prefs);

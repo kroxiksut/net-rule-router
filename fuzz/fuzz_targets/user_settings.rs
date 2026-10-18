@@ -17,6 +17,9 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let _ = settings.is_newer_format();
+    let mut recorded = settings.clone();
+    recorded.record_rules_file_written("/fuzz/rules_primary.txt", "00");
+    let _ = recorded.rules_file_hand_edited("/fuzz/rules_primary.txt", Some("11"));
     if let Ok(formatted) = format_user_settings(&settings) {
         let _ = parse_user_settings(&formatted);
     }

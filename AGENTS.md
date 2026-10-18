@@ -200,7 +200,7 @@ Required baseline, not optional:
 ### Persistence
 
 - UI preferences: `APPDATA`/`LOCALAPPDATA` (QSettings/Windows Registry with managed local fallback).
-- Per-user settings both clients read without the service: `user-settings.json` in the same per-user root (`nrr_shared::user_settings`) — the rule-set folder, the bound rules files, the picked set and the user's own choices on service-owned settings. Written by merge under a lock file, atomically; a damaged file is reported and never overwritten. The GUI reaches it through the launcher, which overlays these fields onto its preferences; the service never reads it.
+- Per-user settings both clients read without the service: `user-settings.json` in the same per-user root (`nrr_shared::user_settings`) — the rule-set folder, the bound rules files (with the hash of what the program last wrote to each, so a hand edit is asked about rather than overwritten), the picked set and the user's own choices on service-owned settings. Written by merge under a lock file, atomically; a damaged file is reported and never overwritten. The GUI reaches it through the launcher, which overlays these fields onto its preferences; the service never reads it.
 - Persisted fields: theme, language, accessibility settings, last opened section, route labels, role confirmation flags. *(Policy-affecting fields — selected primary/secondary, behavior mode — are migrating from `UiPreferences` to per-SID service storage.)*
 - Active config: one per OS user. Local SQLite cache for FQDN/IP mapping.
 - Presets: two plain-text files `rules_primary.txt` / `rules_secondary.txt`, format per docs/en/rules-file-format.md Rules File Format; metadata as header comments.

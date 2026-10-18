@@ -555,6 +555,20 @@ mod tests {
         vec![0x11u8; 32]
     }
 
+    /// The marker sits on disk across an upgrade; if its bytes moved, a key
+    /// reset pending at the upgrade would no longer be recognised.
+    #[test]
+    fn the_resign_marker_is_pinned() {
+        let marker: String = resign_marker_for(&[0x42u8; 32])
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            marker,
+            "ede900a143d383f5f251eebd0c224a39912a745dfccf6d6726708ad6fbe89502"
+        );
+    }
+
     fn open_state() -> (tempfile::TempDir, Arc<Mutex<Connection>>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let conn = open_connection(&dir.path().join("state.db")).expect("open");

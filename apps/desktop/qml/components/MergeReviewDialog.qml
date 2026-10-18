@@ -22,7 +22,7 @@ import QtQuick.Layouts 1.15
 
 Dialog {
     id: dialog
-    title: tr("dialog.merge.title", "Merge file and app rules")
+    title: _t("dialog.merge.title", "Merge file and app rules")
 
     modal: true
     // Render inside the main window overlay (themed), not a separate OS
@@ -64,6 +64,32 @@ Dialog {
     /// `picks` because it answers a different question: `picks` is "file or
     /// service", this is "which route inside one book".
     property var keepSecondary: ({})
+
+    /// The "file" side is the user's unapplied edits, not a linked file: an
+    /// apply refused because the rules changed elsewhere meanwhile.
+    property bool fromEdits: false
+
+    /// The wording of the edits merge, by the file merge's key.
+    readonly property var _editsTexts: ({
+        "dialog.merge.title": ["dialog.merge.edits-title",
+            "Your edits and the rules now in force"],
+        "dialog.merge.body": ["dialog.merge.edits-body",
+            "Your rules were changed elsewhere while you were editing them. Combine your edits with the rules now in force: a rule on only one side is kept, and where both sides changed the same rule you pick the version that stays. A rule you deleted that is still in force is kept; delete it again after the merge."],
+        "dialog.merge.loading": ["dialog.merge.edits-loading",
+            "Comparing your edits with the rules in force…"],
+        "dialog.merge.no-op": ["dialog.merge.edits-no-op",
+            "Your edits already match the rules in force — nothing to merge."],
+        "dialog.merge.bucket-file-only": ["dialog.merge.bucket-edits-only", "Only in your edits"],
+        "dialog.merge.bucket-service-only": ["dialog.merge.bucket-in-force-only",
+            "Only in the rules in force"],
+        "dialog.merge.pick-file": ["dialog.merge.pick-edits", "Your edit"],
+        "dialog.merge.pick-service": ["dialog.merge.pick-in-force", "In force"]
+    })
+
+    function _t(key, fallback) {
+        var edits = fromEdits ? _editsTexts[key] : null
+        return edits ? tr(edits[0], edits[1]) : tr(key, fallback)
+    }
 
     signal cancelled()
     /// Emitted on confirm with the per-conflict resolutions
@@ -186,7 +212,7 @@ Dialog {
 
         Label {
             Layout.fillWidth: true
-            text: dialog.tr("dialog.merge.body",
+            text: dialog._t("dialog.merge.body",
                 "Combine your linked rules file with the rules the service is currently enforcing. Rules on only one side are always kept; rules that exist on both but differ are shown as conflicts.")
             wrapMode: Text.Wrap
             font.pixelSize: 13
@@ -199,7 +225,7 @@ Dialog {
         Label {
             Layout.fillWidth: true
             visible: dialog.loading
-            text: dialog.tr("dialog.merge.loading", "Comparing file and app rules…")
+            text: dialog._t("dialog.merge.loading", "Comparing file and app rules…")
             font.pixelSize: 13
             color: dialog._mutedColor()
         }
@@ -214,7 +240,7 @@ Dialog {
         Label {
             Layout.fillWidth: true
             visible: !dialog.loading && dialog.errorText === "" && dialog._isNoop()
-            text: dialog.tr("dialog.merge.no-op",
+            text: dialog._t("dialog.merge.no-op",
                 "The file and the app rules already match — nothing to merge.")
             wrapMode: Text.Wrap
             font.pixelSize: 13
@@ -295,7 +321,7 @@ Dialog {
                 Label {
                     Layout.fillWidth: true
                     visible: dialog._fileOnly().length > 0
-                    text: dialog.tr("dialog.merge.bucket-file-only", "Only in the file")
+                    text: dialog._t("dialog.merge.bucket-file-only", "Only in the file")
                         + " (" + dialog._fileOnly().length + ")"
                     font.bold: true
                     color: dialog._textColor()
@@ -348,7 +374,7 @@ Dialog {
                     Layout.fillWidth: true
                     Layout.topMargin: 6
                     visible: dialog._serviceOnly().length > 0
-                    text: dialog.tr("dialog.merge.bucket-service-only", "Only in the app")
+                    text: dialog._t("dialog.merge.bucket-service-only", "Only in the app")
                         + " (" + dialog._serviceOnly().length + ")"
                     font.bold: true
                     color: dialog._textColor()
@@ -437,14 +463,14 @@ Dialog {
                                 model: [ "file", "service" ]
                                 labelResolver: function(item) {
                                     return item === "service"
-                                        ? dialog.tr("dialog.merge.pick-service", "App")
-                                        : dialog.tr("dialog.merge.pick-file", "File")
+                                        ? dialog._t("dialog.merge.pick-service", "App")
+                                        : dialog._t("dialog.merge.pick-file", "File")
                                 }
                                 currentIndex:
                                     dialog.picks[modelData["identity-key"]] === "service" ? 1 : 0
                                 displayText: currentIndex === 1
-                                    ? dialog.tr("dialog.merge.pick-service", "App")
-                                    : dialog.tr("dialog.merge.pick-file", "File")
+                                    ? dialog._t("dialog.merge.pick-service", "App")
+                                    : dialog._t("dialog.merge.pick-file", "File")
                                 onActivated: dialog._setPick(modelData["identity-key"],
                                     model[currentIndex])
                             }
@@ -454,13 +480,13 @@ Dialog {
                             Layout.leftMargin: 96
                             spacing: 12
                             Label {
-                                text: dialog.tr("dialog.merge.pick-file", "File") + ": "
+                                text: dialog._t("dialog.merge.pick-file", "File") + ": "
                                     + dialog._sideSummary(modelData.file)
                                 font.pixelSize: 11
                                 color: dialog._mutedColor()
                             }
                             Label {
-                                text: dialog.tr("dialog.merge.pick-service", "App") + ": "
+                                text: dialog._t("dialog.merge.pick-service", "App") + ": "
                                     + dialog._sideSummary(modelData.service)
                                 font.pixelSize: 11
                                 color: dialog._mutedColor()

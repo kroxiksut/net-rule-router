@@ -7,8 +7,12 @@
 mod js_harness;
 
 use js_harness::{arg, check, text, JsLib};
-use nrr_client_logic::conn_trace::{is_ipv6_endpoint, is_non_internet_address};
+use nrr_client_logic::conn_trace::{
+    group_trace_rows, is_ipv6_endpoint, is_non_internet_address, TraceGroup, TraceGrouping,
+    TraceRowRef,
+};
 use nrr_client_logic::diagnostics::{alert_ack_outcome, security_alert_items, AlertItem};
+use nrr_client_logic::rule_value_class::path_style_for_os;
 use serde_json::{json, Value};
 
 fn member(input: &Value, key: &str) -> Value {
@@ -43,6 +47,64 @@ fn is_non_internet_address_matches_js() {
         &mut JsLib::pure(),
         |input| format!("isNonInternetAddress({})", arg(input, "remote")),
         |input| Value::from(is_non_internet_address(text(input, "remote"))),
+    );
+}
+
+fn group_json(group: &TraceGroup) -> Value {
+    json!({
+        "kind": group.kind.slug(),
+        "key": group.key,
+        "label": group.label,
+        "ruleValue": group.rule_value,
+        "rows": group.rows,
+        "programs": group.programs,
+        "header": group.header,
+    })
+}
+
+#[test]
+fn conn_trace_groups_match_js() {
+    check(
+        "conn_trace_groups",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "connTraceGroups({}, {}, {})",
+                arg(input, "rows"),
+                arg(input, "grouping"),
+                arg(input, "os")
+            )
+        },
+        |input| {
+            let rows: Vec<TraceRowRef<'_>> = input["rows"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .map(|row| TraceRowRef {
+                    process: text(row, "process"),
+                    process_path: text(row, "process_path"),
+                })
+                .collect();
+            let grouping =
+                TraceGrouping::from_slug(text(input, "grouping")).unwrap_or(TraceGrouping::None);
+            let style = path_style_for_os(text(input, "os"));
+            let groups = group_trace_rows(&rows, grouping, style);
+            Value::from(groups.iter().map(group_json).collect::<Vec<_>>())
+        },
+    );
+}
+
+#[test]
+fn conn_trace_grouping_default_matches_js() {
+    check(
+        "conn_trace_grouping",
+        &mut JsLib::pure(),
+        |input| format!("connTraceGroupingOrDefault({})", arg(input, "slug")),
+        |input| {
+            let grouping = TraceGrouping::from_slug(text(input, "slug")).unwrap_or_default();
+            Value::from(grouping.slug())
+        },
     );
 }
 

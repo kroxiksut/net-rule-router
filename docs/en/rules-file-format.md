@@ -526,9 +526,17 @@ Paths:
   in both files is an error, like the same network on both routes.
 - `!` before a path denies the programs it names; `+children` after it
   extends the rule to the programs they start.
-- Where this system does not apply rules by path yet, such a rule stays in
-  the file and in the rules list, and the Overlaps tab shows it as not
-  applied, with the reason.
+- On Windows and Linux a folder rule also covers a program that appears in
+  the folder later, such as a new version folder after an update, without a
+  restart. A folder that holds more programs than one rule covers is covered
+  in part, and the Overlaps tab says so.
+- A folder reached through a link or junction is judged where it really is:
+  a link into a system folder is not applied, as the system folder itself is
+  not.
+- One user's rule never covers the programs in another user's profile.
+- macOS does not apply rules by path yet: such a rule stays in the file and
+  in the rules list, and the Overlaps tab shows it as not applied, with the
+  reason.
 
 Precedence within the Application tier, narrowest first: a full path, an
 exact name, a folder (the deeper folder first; at the same depth "this folder

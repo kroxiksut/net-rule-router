@@ -20,15 +20,15 @@ Service: OK
                            e: Enter a hostname or IP to simulate the routing decision against the
                            active rule set.
 
+                           Check a site
+                           Is it the network or the site? The site's names are checked over your
+                           routes: their address, the route your rules give them, and whether they
+                           answer there. Runs only when you ask.
+
                            Diagnostic archive export
                            The archive is saved in the service archives directory (per-user).
                            Ready
                            x: Diagnostic archive export
-
-
-
-
-
 
 
 

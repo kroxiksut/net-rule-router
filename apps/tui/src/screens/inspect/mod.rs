@@ -8,6 +8,7 @@ pub mod cache;
 pub mod diagnostics;
 pub(crate) mod keys;
 pub mod outage;
+pub mod site_check;
 #[cfg(test)]
 mod tests;
 pub mod trace;
@@ -32,6 +33,7 @@ pub struct Inspect {
     pub outage: outage::OutageState,
     pub cache: cache::CacheState,
     pub diag: diagnostics::DiagState,
+    pub site: site_check::SiteCheckState,
 }
 
 /// Rows on one page, in both renderers.

@@ -182,8 +182,27 @@ Dialog {
             ruleTypeCombo.currentIndex = idx
         }
     }
+    // "Several rules" holding `names` on `route`, each line set to move a rule
+    // that stands on another route (the site check's offer). The user still
+    // reviews the plan and confirms it.
+    function resetForMoving(names, route) {
+        resetForNew("domain", "")
+        localRoute = String(route || "primary")
+        _syncRouteCombo()
+        var list = names || []
+        var choices = {}
+        for (var i = 0; i < list.length; i += 1)
+            choices[String(i + 1)] = { text: String(list[i]), type: "", move: true }
+        resumeBulk(list.join("\n"))
+        bulkChoices = choices
+        _replanBulk()
+    }
     function resetForEdit() {
-        if (root.editingRule >= 0 && root.editingRule < root.rulesModel.count) {
+        var editing = root.editingRule >= 0 && root.editingRule < root.rulesModel.count
+        // The rule itself, which the save looks up again: the list may be
+        // re-read while the form is open.
+        root.editingRuleKey = editing ? Rules.mergeKey(root.rulesModel.get(root.editingRule)) : ""
+        if (editing) {
             var r = root.rulesModel.get(root.editingRule)
             localRuleType = String(r.ruleType || (root.ruleTypesModel.count > 0 ? root.ruleTypesModel.get(0).id : "application"))
             localValue = String(r.matchValue || "")

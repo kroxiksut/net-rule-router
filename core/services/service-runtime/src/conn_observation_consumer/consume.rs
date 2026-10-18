@@ -354,7 +354,7 @@ impl ConnectionObservationConsumer {
                     };
                     for owner in collateral_pin_owners(
                         &store,
-                        &this_app,
+                        path,
                         crate::app_observation_lookup::own_process_key(),
                         &routed_apps,
                         rec.egress.role,

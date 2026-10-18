@@ -175,6 +175,9 @@ pub struct IpcHandlerDeps {
     /// pending suggestions. `None` keeps `autorules.candidates.probe`
     /// unimplemented, exactly like every other unwired capability here.
     pub auto_rule_probe: Option<Arc<dyn crate::ipc_handlers::providers::AutoRuleProbeRunner>>,
+    /// "Is it us or the site?" for the caller. `None` keeps both
+    /// `diagnostics.site-check.*` operations unimplemented.
+    pub site_check: Option<Arc<crate::site_check::SiteChecker>>,
     /// Records the sites the caller says refuse main-link addresses. `None`
     /// keeps `autorules.refusing-anchor.set` unimplemented.
     pub refusing_anchors: Option<Arc<dyn crate::ipc_handlers::providers::RefusingAnchorsWriter>>,
@@ -312,6 +315,7 @@ impl IpcHandlerDeps {
             dns_cache_control: None,
             local_networks: None,
             auto_rule_probe: None,
+            site_check: None,
             refusing_anchors: None,
             merge_preview_source: None,
             traffic_stats: None,
@@ -620,6 +624,12 @@ impl IpcHandlerDeps {
         runner: Arc<dyn crate::ipc_handlers::providers::AutoRuleProbeRunner>,
     ) -> Self {
         self.auto_rule_probe = Some(runner);
+        self
+    }
+
+    /// Attach the site check (see [`Self::site_check`]).
+    pub fn with_site_check(mut self, checker: Arc<crate::site_check::SiteChecker>) -> Self {
+        self.site_check = Some(checker);
         self
     }
 

@@ -454,6 +454,14 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 // rollback kind with a reset-specific payload. No target
                 // revision id — the user falls through to baseline via the
                 // provider read-through, not to a specific revision.
+                // The rules in force changed, so the user's clients re-read them.
+                if deleted_revisions > 0 {
+                    self.publish_status_change(
+                        &principal,
+                        "",
+                        nrr_shared::ipc_payloads::REVISION_STATUS_RESET_TO_BASELINE,
+                    );
+                }
                 let payload = json!({
                     "event": "reset_to_baseline",
                     "principal": principal,
@@ -1421,6 +1429,48 @@ mod tests {
                 }
             ));
         }
+    }
+
+    /// A reset changes the rules in force as much as an activation does; a
+    /// window left on the old table would put them back on its next apply.
+    #[test]
+    fn a_reset_to_baseline_tells_that_users_clients_to_reread() {
+        let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+        let alice = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), Some(0));
+        let bob = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), Some(0));
+        let (emitter, _dir) = emitter_on(&bus);
+
+        emitter.emit(ActivationAuditEvent::ResetToBaseline {
+            principal: "S-1-A".into(),
+            deleted_revisions: 2,
+            correlation_id: "c-1".into(),
+        });
+
+        let pending = bus.peek_pending_for(&alice.subscription_id, 16);
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            &pending[0].event,
+            nrr_shared::ipc_payloads::StatusUpdateEvent::RevisionStatusChanged { status, sid, .. }
+                if status == nrr_shared::ipc_payloads::REVISION_STATUS_RESET_TO_BASELINE
+                    && sid.as_deref() == Some("S-1-A")
+        ));
+        assert!(bus.peek_pending_for(&bob.subscription_id, 16).is_empty());
+    }
+
+    /// A user already on the baseline lost nothing; nobody has to re-read.
+    #[test]
+    fn a_reset_that_deleted_nothing_announces_nothing() {
+        let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+        let alice = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), Some(0));
+        let (emitter, _dir) = emitter_on(&bus);
+
+        emitter.emit(ActivationAuditEvent::ResetToBaseline {
+            principal: "S-1-A".into(),
+            deleted_revisions: 0,
+            correlation_id: "c-1".into(),
+        });
+
+        assert!(bus.peek_pending_for(&alice.subscription_id, 16).is_empty());
     }
 
     // ── Audit payloads ───────────────────────────────────────────────────────

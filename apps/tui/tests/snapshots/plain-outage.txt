@@ -31,17 +31,20 @@ Service: OK
 Connection trace:
   Loading connections...
   Show blocked: No · Show local connections: No · IPv6 only: No
+  Group: No grouping
 Connections:
 Selected connection:
 Commands on this screen:
   n: next page (more)   p: previous page (back)
   d and a row number: show that connection, for example d 3
   e and a row number: why that connection took its route, for example e 3
+  c and a row number: check that connection's site, for example c 3
   / and text: search all fields, for example /example; / on its own clears the search
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
   o: what was blocked while the additional route was down
   h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
+  g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3
 Type a screen number, h for help or q to quit, then press Enter.
 Connection trace: Shown: 12 of 14.
 Connections: > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed

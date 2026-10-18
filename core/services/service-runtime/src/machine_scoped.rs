@@ -121,7 +121,9 @@ impl MachineScopedSetting {
             | Op::RulesRecentChangesList
             | Op::ConnHistoryList
             | Op::ConnHistoryClear
-            | Op::ConnHistorySettingsSet => None,
+            | Op::ConnHistorySettingsSet
+            | Op::SiteCheckRun
+            | Op::SiteCheckResultGet => None,
         }
     }
 

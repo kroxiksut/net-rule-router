@@ -185,6 +185,16 @@ impl AppPathResolver for PersistentAppPathResolver {
     fn is_protected_install(&self, exe: &std::path::Path) -> bool {
         self.inner.is_protected_install(exe)
     }
+
+    /// Straight through, and never remembered: what a folder holds is read
+    /// from the disk on every pass and from no table.
+    fn path_programs(
+        &self,
+        path: &nrr_platform_api::app_folders::AppPath,
+        owner: &str,
+    ) -> nrr_platform_api::app_folders::PathPrograms {
+        self.inner.path_programs(path, owner)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -221,6 +231,29 @@ mod tests {
         let runner = SqliteMigrationRunner::for_state_db(conn);
         runner.run_pending_migrations().expect("migrate");
         (dir, Arc::new(Mutex::new(runner.into_connection())))
+    }
+
+    /// What a rule by path covers is read from the disk by the inner resolver;
+    /// a decorator answering the port's default would make every path rule
+    /// behind it "unsupported".
+    #[test]
+    fn path_rules_pass_straight_through() {
+        use nrr_platform_api::app_folders::{AppPath, PathOutcome, PathPrograms, PathStyle};
+        let rule = AppPath::parse("/opt/app/*", PathStyle::Linux).expect("rule");
+        let answer = PathPrograms {
+            outcome: PathOutcome::Found,
+            place: Some(rule.clone()),
+            programs: vec![PathBuf::from("/opt/app/run")],
+            over_cap: false,
+        };
+        let inner = nrr_platform_api::MockAppPathResolver::new().with_path_programs(
+            rule.as_str(),
+            "*",
+            answer.clone(),
+        );
+        let (_dir, conn) = state_conn();
+        let resolver = PersistentAppPathResolver::new(Arc::new(inner), conn);
+        assert_eq!(resolver.path_programs(&rule, "uid:1000"), answer);
     }
 
     /// `resolve` runs once per application rule on every filter recompute. The

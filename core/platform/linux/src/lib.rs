@@ -278,6 +278,13 @@ pub mod interface_traffic;
 /// neutral layer guarantees — the one place that key meets a real filesystem.
 pub mod app_path_resolver;
 
+/// What a rule by program path covers: real paths, executables, other users'
+/// homes, and inotify watches on the rule's folders. Parsing is pure and
+/// tested on every host.
+pub mod app_folders;
+/// The `struct inotify_event` walk both inotify watches share, fuzzed.
+pub mod inotify_events;
+
 /// DNS settings changes no rtnetlink message carries: inotify on the files the
 /// DNS managers rewrite. Event parsing is pure and tested on every host.
 pub mod dns_config_change;

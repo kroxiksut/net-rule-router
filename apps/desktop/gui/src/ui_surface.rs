@@ -639,6 +639,8 @@ pub fn write_qt_context_file_at(
             "trafficStatsPeriod": preferences.traffic_stats_period.clone(),
             // Remembered byte unit for the traffic CSV export.
             "trafficExportUnit": preferences.traffic_export_unit.clone(),
+            // How the connection trace list is grouped.
+            "connTraceGroupBy": preferences.conn_trace_group_by.clone(),
             // Remembered support-archive privacy tier ("standard" / "diagnostics")
             // and the "current session only" log scope. Both export surfaces read
             // these, so the choice survives a restart instead of resetting.
@@ -1059,6 +1061,8 @@ struct QtPreferencesPayload {
     traffic_stats_period: Option<String>,
     #[serde(default)]
     traffic_export_unit: Option<String>,
+    #[serde(default)]
+    conn_trace_group_by: Option<String>,
     #[serde(default)]
     diagnostics_archive_redaction_level: Option<String>,
     #[serde(default)]

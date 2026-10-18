@@ -59,6 +59,45 @@ fn under_root_the_rules_go_to_the_baseline_and_the_title_says_so() {
     assert_eq!(view.title, texts.get(text::TITLE_BASELINE));
 }
 
+/// The service and the GUI spell the content hash as fixed-width lowercase hex
+/// of the rules sent; the terminal must not drift from them on a crypto-crate
+/// upgrade.
+#[test]
+fn the_content_hash_spells_the_sent_bytes() {
+    use sha2::{Digest, Sha256};
+    let pending =
+        apply::pending_from(&super::table::Table::default(), false, None).expect("pending");
+    let expected: String = Sha256::digest(pending.rules_json.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(pending.content_hash, expected);
+}
+
+/// A value with a line break is never sent cleaned into another rule: the
+/// apply stops with the error the GUI shows for it.
+#[test]
+fn a_rule_with_a_control_character_is_refused_before_it_is_sent() {
+    let mut table = super::table::Table::default();
+    table.import(
+        vec![RuleRow {
+            id: String::new(),
+            enabled: true,
+            rule_type: RuleType::Application,
+            match_value: "my\napp.exe +children".into(),
+            target_route: TargetRoute::Secondary,
+            verify: false,
+            comment: String::new(),
+            origin: None,
+        }],
+        true,
+    );
+    assert_eq!(
+        apply::pending_from(&table, false, None).err(),
+        Some(apply::Failure::code("control-character"))
+    );
+}
+
 /// The set the screen shows is the set every writer of the terminal writes:
 /// `b` switches between the caller's own rules and the baseline, the list is
 /// read from the one chosen, and a writer of the caller's own rules is refused
@@ -377,6 +416,162 @@ fn discarding_edits_brings_back_the_rules_in_force() {
     assert!(!super::holds_unapplied(&app));
     let kept = app.rules.table.rules().next().expect("the rule");
     assert!(kept.enabled, "the service's rule is back as it is applied");
+}
+
+// ── The chosen rule ──────────────────────────────────────────────────────────
+
+fn chosen_value(app: &AppState) -> String {
+    let master = app.rules.table.selected().expect("a chosen row");
+    app.rules.table.rows[master].rule.match_value.clone()
+}
+
+fn press_key(app: &mut AppState, code: crossterm::event::KeyCode) {
+    screen(ScreenId::Rules).on_key(
+        app,
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+    );
+}
+
+/// A rule added elsewhere lands ahead of the chosen one: the cursor follows
+/// its rule, not its row number, so the next toggle switches what was chosen.
+#[test]
+fn the_cursor_stays_on_its_rule_when_the_list_is_read_again() {
+    let fake = service(vec![
+        rule("1", "domain", "a.example", "secondary"),
+        rule("2", "domain", "b.example", "secondary"),
+        rule("3", "domain", "c.example", "secondary"),
+    ]);
+    let mut app = on_rules(&fake);
+    app.focus = crate::state::Focus::Feed;
+    press_key(&mut app, crossterm::event::KeyCode::Down);
+    assert_eq!(chosen_value(&app), "b.example");
+
+    fake.answer(
+        IpcOperationName::RulesList,
+        json!({
+            "rows": [
+                rule("1", "domain", "new.example", "secondary"),
+                rule("2", "domain", "a.example", "secondary"),
+                rule("3", "domain", "b.example", "secondary"),
+                rule("4", "domain", "c.example", "secondary"),
+            ],
+            "supported-rule-types": ["zone", "domain", "exact-ip", "application"]
+        }),
+    );
+    super::on_revision_changed(&mut app);
+    drain(&mut app, &fake);
+    assert_eq!(app.rules.table.rows.len(), 4, "the list was read again");
+    assert_eq!(chosen_value(&app), "b.example");
+    assert_eq!(app.rules.table.cursor(), 2);
+
+    press_key(&mut app, crossterm::event::KeyCode::Char(' '));
+    let switched: Vec<&str> = app
+        .rules
+        .table
+        .rules()
+        .filter(|r| !r.enabled)
+        .map(|r| r.match_value.as_str())
+        .collect();
+    assert_eq!(switched, ["b.example"]);
+}
+
+/// From the menu no row is marked, so a toggle there switches nothing yet.
+#[test]
+fn a_toggle_from_the_menu_first_shows_the_rule_it_would_switch() {
+    let fake = service(vec![rule("1", "domain", "a.example", "secondary")]);
+    let mut app = on_rules(&fake);
+    app.focus = crate::state::Focus::Menu;
+    press_key(&mut app, crossterm::event::KeyCode::Char('t'));
+    assert!(
+        app.rules.table.rules().all(|r| r.enabled),
+        "nothing switched"
+    );
+    assert_eq!(app.focus, crate::state::Focus::Feed);
+    press_key(&mut app, crossterm::event::KeyCode::Char('t'));
+    assert!(app.rules.table.rules().all(|r| !r.enabled));
+}
+
+/// An open form keeps the row it edits: the re-read a revision asks for waits
+/// until the form is closed, then happens.
+#[test]
+fn a_revision_while_a_form_is_open_is_read_once_it_closes() {
+    let fake = service(vec![rule("1", "domain", "a.example", "secondary")]);
+    let mut app = on_rules(&fake);
+    answer(&mut app, &["e 1"]);
+    assert!(matches!(app.rules.mode, Mode::Form(_)));
+
+    fake.answer(
+        IpcOperationName::RulesList,
+        json!({
+            "rows": [
+                rule("1", "domain", "new.example", "secondary"),
+                rule("2", "domain", "a.example", "secondary"),
+            ],
+            "supported-rule-types": ["zone", "domain", "exact-ip", "application"]
+        }),
+    );
+    super::on_revision_changed(&mut app);
+    drain(&mut app, &fake);
+    assert_eq!(app.rules.table.rows.len(), 1, "not under the open form");
+
+    answer(&mut app, &["!"]);
+    drain(&mut app, &fake);
+    assert_eq!(app.rules.table.rows.len(), 2, "read once the form closed");
+}
+
+/// An apply refused because the rules changed elsewhere: the edits made here
+/// go on top of the rules now in force — a switch, an addition and a removal
+/// alike — and a rule added elsewhere stays.
+#[test]
+fn edits_go_on_top_of_the_rules_changed_elsewhere() {
+    let fake = service(vec![
+        rule("1", "domain", "a.example", "secondary"),
+        rule("2", "domain", "b.example", "secondary"),
+    ]);
+    let mut app = on_rules(&fake);
+    answer(&mut app, &["t 1"]);
+    app.rules.table.rows.remove(1);
+    let added = RuleRow {
+        id: String::new(),
+        enabled: true,
+        rule_type: RuleType::from_slug("domain"),
+        match_value: "mine.example".into(),
+        target_route: TargetRoute::Secondary,
+        verify: false,
+        comment: String::new(),
+        origin: None,
+    };
+    app.rules.table.import(vec![added], false);
+
+    fake.answer(
+        IpcOperationName::RulesList,
+        json!({
+            "rows": [
+                rule("1", "domain", "a.example", "secondary"),
+                rule("2", "domain", "b.example", "secondary"),
+                rule("3", "domain", "theirs.example", "secondary"),
+            ],
+            "supported-rule-types": ["zone", "domain", "exact-ip", "application"]
+        }),
+    );
+    super::rebase_edits(&mut app);
+    drain(&mut app, &fake);
+
+    let rules: Vec<(String, bool)> = app
+        .rules
+        .table
+        .rules()
+        .map(|r| (r.match_value.clone(), r.enabled))
+        .collect();
+    assert_eq!(
+        rules,
+        [
+            ("a.example".to_owned(), false),
+            ("theirs.example".to_owned(), true),
+            ("mine.example".to_owned(), true),
+        ]
+    );
+    assert!(super::holds_unapplied(&app));
 }
 
 // ── The main-route check ─────────────────────────────────────────────────────

@@ -20,6 +20,9 @@
 
 pub mod active_principals;
 pub mod adapters;
+// Which programs a rule by path covers: places, real paths, bounded listings
+// and folder watches.
+pub mod app_folders;
 pub mod app_group_discovery;
 pub mod app_path_resolver;
 /// Asking whether a caller may perform a privileged operation — the neutral

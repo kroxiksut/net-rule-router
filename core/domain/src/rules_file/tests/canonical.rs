@@ -325,6 +325,9 @@ fn a_value_under_the_wrong_heading_is_refused_with_the_right_one() {
         ("--- Domains\n10.0.0.0/24\n", S::Cidr),
         ("--- Zones\nexample.*\n", S::Domains),
         ("--- IP\n*.ru\n", S::Zones),
+        ("--- IP\nchrome.exe\n", S::Windows),
+        // The value's spelling names the platform, not the one reading it.
+        ("--- CIDR\n/usr/bin/firefox\n", S::Linux),
     ] {
         let errors = canonical_errors(input);
         assert!(

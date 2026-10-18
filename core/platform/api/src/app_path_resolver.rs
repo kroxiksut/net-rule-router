@@ -18,6 +18,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+pub use crate::app_folders::{AppPath, PathOutcome, PathPrograms};
+
 /// Resolve an executable NAME or filename-GLOB to the concrete exe paths present
 /// on this machine.
 ///
@@ -57,6 +59,14 @@ pub trait AppPathResolver: Send + Sync {
     /// name, and the user's own confirmation is the way in.
     fn is_protected_install(&self, _exe: &std::path::Path) -> bool {
         false
+    }
+
+    /// The programs a rule by path covers for `owner` (a stored principal),
+    /// as the disk has them now. The default answers "unsupported": a
+    /// platform without a mechanism applies no path rule rather than a
+    /// guess.
+    fn path_programs(&self, _path: &AppPath, _owner: &str) -> PathPrograms {
+        PathPrograms::unsupported()
     }
 }
 
@@ -173,6 +183,9 @@ pub struct MockAppPathResolver {
     /// Lowercased directory prefixes standing in for the machine's protected
     /// program folders.
     protected_roots: Vec<String>,
+    /// `(rule path as canonically spelled, owner) -> what it covers`; an owner
+    /// of `*` answers for everyone.
+    path_programs: HashMap<(String, String), PathPrograms>,
 }
 
 impl MockAppPathResolver {
@@ -198,6 +211,7 @@ impl MockAppPathResolver {
             map,
             siblings: HashMap::new(),
             protected_roots: Vec::new(),
+            path_programs: HashMap::new(),
         }
     }
 
@@ -218,6 +232,15 @@ impl MockAppPathResolver {
             root.push('\\');
         }
         self.protected_roots.push(root);
+        self
+    }
+
+    /// Seed what the rule spelled `rule` covers for `owner` (`*`: anyone),
+    /// chainable. An unseeded rule finds nothing on disk.
+    #[must_use]
+    pub fn with_path_programs(mut self, rule: &str, owner: &str, answer: PathPrograms) -> Self {
+        self.path_programs
+            .insert((rule.to_string(), owner.to_string()), answer);
         self
     }
 }
@@ -249,6 +272,15 @@ impl AppPathResolver for MockAppPathResolver {
         self.protected_roots
             .iter()
             .any(|root| path.starts_with(root.as_str()))
+    }
+
+    fn path_programs(&self, path: &AppPath, owner: &str) -> PathPrograms {
+        let rule = path.as_str().to_string();
+        self.path_programs
+            .get(&(rule.clone(), owner.to_string()))
+            .or_else(|| self.path_programs.get(&(rule, "*".to_string())))
+            .cloned()
+            .unwrap_or_else(PathPrograms::missing)
     }
 }
 

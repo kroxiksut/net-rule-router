@@ -384,6 +384,7 @@ ColumnLayout {
         var invalid = 0
         var misplaced = []
         var marked = false
+        var indexByKey = ({})
         for (var i = 0; i < root.rulesModel.count; i += 1) {
             var entry = root.rulesModel.get(i)
             // Before the filter, deliberately: the count answers "how much of
@@ -395,6 +396,8 @@ ColumnLayout {
                     + root.ruleTypeLabel(entry.ruleType) + " \u2192 " + root.ruleTypeLabel(movesTo))
             }
             if (String(entry.mainRoute || "") !== "") marked = true
+            var ruleKey = Rules.mergeKey(entry)
+            if (indexByKey[ruleKey] === undefined) indexByKey[ruleKey] = i
             if (!section.passesFilter(entry)) continue
             var snapshot = {}
             var keys = Object.keys(entry)
@@ -413,10 +416,11 @@ ColumnLayout {
             // masterId (rule id) is NOT unique — primary/secondary routes are
             // numbered independently by the service, so R-NNNN can collide
             // across routes. `masterIndex` (position in the master model) IS
-            // unique and is what selection / edit / toggle key on. Keeping
+            // unique and is what edit / toggle key on. Keeping
             // masterId too only for display/debug.
             snapshot.masterId = String(entry.id || "")
             snapshot.masterIndex = i
+            snapshot.ruleKey = ruleKey
             // Every row carries the roles, so the model types them once.
             var recent = section.filterRecent ? section.recentByKey[Rules.ruleValueKey(entry)] : null
             snapshot.recentMark = recent ? recent.kind : ""
@@ -424,6 +428,7 @@ ColumnLayout {
             snapshot.recentTip = recent ? recent.tip : ""
             arr.push(snapshot)
         }
+        section._followSelection(indexByKey)
         section.invalidRuleCount = invalid
         section.misplacedRules = misplaced
         section.mainRouteColumnVisible = marked || section.mainRouteCheckRan
@@ -462,7 +467,7 @@ ColumnLayout {
         rebuildTimer.restart()
     }
 
-    // Per-row select / edit / toggle key on the MASTER INDEX (unique), not the
+    // Per-row edit / toggle key on the MASTER INDEX (unique), not the
     // rule id (which collides across routes). The delegate passes
     // `model.masterIndex`, captured in `rebuildDisplay`.
     function _setRuleEnabledAt(masterIndex, enabled) {
@@ -606,26 +611,39 @@ ColumnLayout {
         return cells + commentMinWidth + gaps + pad
     }
 
-    // Multi-row selection model for bulk
-    // operations (delete / enable / disable / move-to-route). Stored as
-    // a JS object keyed by rule id (R-NNNN string). Rule ids stay stable
-    // across model edits — rebuilding the entire model would reset
-    // selection unintentionally, but the per-row CheckBox toggle path
-    // never rebuilds, so selection survives normal edits. Tracking the
-    // count separately lets bindings observe it cheaply.
+    // Multi-row selection for bulk operations (delete / enable / disable /
+    // move-to-route), keyed by the rule itself (`Rules.mergeKey`: type, value,
+    // route). A row number or an `R-NNNN` id is not the rule: a removal, a
+    // re-read or a rule added from elsewhere shifts both, and the checks would
+    // land on other rules. A rule that is gone leaves the selection
+    // (`_followSelection`). The count is kept apart so bindings observe it
+    // cheaply.
     property var selectedRowIds: ({})
     property int selectedCount: 0
 
-    // Bulk-selection keys on the MASTER INDEX (unique), not the
-    // rule id (which collides across routes — two R-0006 rows would otherwise
-    // select/highlight together). The index is stable across sort/filter
-    // rebuilds (the master model is never reordered).
-    function _isRowSelected(masterIndex) {
-        return masterIndex >= 0 && !!section.selectedRowIds[String(masterIndex)]
+    function _ruleKeyAt(masterIndex) {
+        if (masterIndex < 0 || !root.rulesModel || masterIndex >= root.rulesModel.count) return ""
+        return Rules.mergeKey(root.rulesModel.get(masterIndex))
+    }
+    /// After every change of the list: drop the rules that left it, and keep
+    /// the single selection on its rule wherever that rule now stands.
+    function _followSelection(indexByKey) {
+        var kept = ({})
+        var count = 0
+        for (var key in section.selectedRowIds) {
+            if (indexByKey[key] === undefined) continue
+            kept[key] = true
+            count += 1
+        }
+        if (count !== section.selectedCount) {
+            section.selectedRowIds = kept
+            section.selectedCount = count
+        }
+        root.followSelectedRule(indexByKey)
     }
     function _setRowSelected(masterIndex, selected) {
-        if (masterIndex < 0) return
-        var key = String(masterIndex)
+        var key = _ruleKeyAt(masterIndex)
+        if (key === "") return
         var copy = Object.assign({}, section.selectedRowIds)
         if (selected) {
             if (!copy[key]) section.selectedCount += 1
@@ -661,7 +679,7 @@ ColumnLayout {
             var vis = displayModel.get(i)
             if (!vis) continue
             sawAnyVisible = true
-            if (section.selectedRowIds[String(vis.masterIndex)]) anySelected = true
+            if (section.selectedRowIds[String(vis.ruleKey || "")]) anySelected = true
             else anyUnselected = true
             if (anySelected && anyUnselected) return 2
         }
@@ -680,7 +698,8 @@ ColumnLayout {
         for (var i = 0; i < displayModel.count; i += 1) {
             var vis = displayModel.get(i)
             if (!vis) continue
-            var key = String(vis.masterIndex)
+            var key = String(vis.ruleKey || "")
+            if (key === "") continue
             if (state === 0) {
                 if (!copy[key]) count += 1
                 copy[key] = true
@@ -696,7 +715,7 @@ ColumnLayout {
         if (!root.rulesModel) return []
         var indices = []
         for (var i = 0; i < root.rulesModel.count; i += 1) {
-            if (section.selectedRowIds[String(i)]) indices.push(i)
+            if (section.selectedRowIds[_ruleKeyAt(i)]) indices.push(i)
         }
         indices.sort(function(a, b) { return b - a })
         return indices
@@ -732,6 +751,14 @@ ColumnLayout {
                 root.rulesModel.setProperty(indices[i], "verify", false)
             root.rejudgeRowRoute(indices[i])
         }
+        // The route is part of a rule's key: the moved rules stay selected
+        // under their new one.
+        var moved = ({})
+        for (var m = 0; m < indices.length; m += 1) moved[_ruleKeyAt(indices[m])] = true
+        section.selectedRowIds = moved
+        section.selectedCount = Object.keys(moved).length
+        if (indices.indexOf(root.selectedRule) >= 0)
+            root.selectedRuleKey = _ruleKeyAt(root.selectedRule)
         section.scheduleRebuild()
         if (typeof root.setUnsavedChanges === "function") {
             root._recomputeRulesDirty()
@@ -1720,7 +1747,10 @@ ColumnLayout {
                     text: root.tr("rules.action.delete-confirm", "Delete")
                     onClicked: {
                         singleDeleteConfirm.close()
-                        if (root.selectedRule >= 0) {
+                        // Only the rule the question named, never whatever
+                        // row now stands at its old place.
+                        if (root.selectedRule >= 0
+                                && section._ruleKeyAt(root.selectedRule) === root.selectedRuleKey) {
                             root.rulesModel.remove(root.selectedRule)
                             root.selectedRule = -1
                             root.statusLine = root.tr(
@@ -1929,14 +1959,10 @@ ColumnLayout {
     // dedup just won't fire — semantically harmless for review,
     // production-correct canonicalization waits for a bridge
     // method (separate B.x slice).
+    // The window's builder: it owns the ACE encoder (the C++ bridge), and it
+    // reports a row the serializer refuses and answers "".
     function _buildRulesJson() {
-        var rows = []
-        if (root.rulesModel) {
-            for (var i = 0; i < root.rulesModel.count; i += 1) rows.push(root.rulesModel.get(i))
-        }
-        // The window owns the ACE encoder (it needs the C++ bridge); the
-        // shared serializer takes it as an argument.
-        return Rules.buildRulesJson(rows, root._aceEncodeHost)
+        return root._buildRulesJsonFromModel()
     }
 
     // Toggle one rule's enabled flag. Called from the
@@ -2028,6 +2054,7 @@ ColumnLayout {
     function _triggerReviewFlow() {
         if (section._refuseWhenLocked()) return
         var rulesJson = _buildRulesJson()
+        if (!rulesJson) return
         // Real SHA-256 of the rules-json bytes via
         // bridge primitive (replaces the legacy `client-stub-…`
         // placeholder). Deterministic for our build path because
@@ -2071,6 +2098,7 @@ ColumnLayout {
     // is service-global, not a per-user parked changeset).
     function _triggerBaselineReviewFlow() {
         var rulesJson = _buildRulesJson()
+        if (!rulesJson) return
         var contentHash
         if (typeof nrrNativeBridge !== "undefined"
                 && nrrNativeBridge
@@ -2941,7 +2969,7 @@ ColumnLayout {
             // toggles selection on any row.
             readonly property bool isSelectedForBulk: {
                 var _refresh = section.selectedCount + root.uiRevision
-                return !!section.selectedRowIds[String(model.masterIndex)]
+                return !!section.selectedRowIds[String(model.ruleKey || "")]
             }
             // Single-selection highlight keyed on the UNIQUE master index, not
             // the rule id (ids collide across routes → two rows would light up).

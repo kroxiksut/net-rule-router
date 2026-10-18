@@ -96,3 +96,30 @@ fn the_traffic_period_reader_reads_the_literals() {
     let got = qml_traffic_period_slugs(source);
     assert_eq!(got.into_iter().collect::<Vec<_>>(), ["a", "b", "c"]);
 }
+
+/// The quoted slugs of the `var CONN_TRACE_GROUPINGS = [...]` line, in order.
+fn js_trace_groupings(source: &str) -> Vec<String> {
+    let line = source
+        .lines()
+        .find(|l| l.starts_with("var CONN_TRACE_GROUPINGS ="))
+        .unwrap_or_else(|| panic!("no `var CONN_TRACE_GROUPINGS` in pure.js"));
+    line.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn the_trace_groupings_the_gui_offers_are_the_ones_it_can_store() {
+    let pure = qml("apps/desktop/qml/lib/pure.js");
+    let offered = js_trace_groupings(&pure);
+    assert_eq!(
+        offered,
+        nrr_ui_support::ui_preferences::CONN_TRACE_GROUPINGS,
+        "a grouping the store refuses reverts at the next start"
+    );
+    assert!(offered
+        .iter()
+        .any(|g| g == nrr_ui_support::ui_preferences::CONN_TRACE_GROUPING_DEFAULT));
+}

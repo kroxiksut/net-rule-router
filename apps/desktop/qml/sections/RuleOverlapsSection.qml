@@ -82,6 +82,9 @@ ColumnLayout {
                 "{rule} for {app} is not enforced: a rule that limits an address to one application cannot be carried out yet, so it is skipped rather than applied to every application.")
             : kind === "protected-target"
             ? root.tr("rules.overlaps.conflicts.protected", "The rule {rule} is not applied. {reason}")
+            : kind === "folder-over-cap"
+            ? root.tr("rules.overlaps.conflicts.folder-over-cap",
+                "{rule} covers the first {count} programs of its folder. The folder holds more, and those are not covered: name the folder of the program you mean instead.")
             : root.tr("rules.overlaps.conflicts.leak",
                 "{rule} does not deny {host}: it shares {ip} with {via}, which a narrower rule routes, so the address stays open.")
         // The protection says why in the rules table's own words.
@@ -96,6 +99,9 @@ ColumnLayout {
             .split("{host}").join(Pure.displayText(c.host || c["rule-value"] || ""))
             .split("{via}").join(Pure.displayText(c["via-host"]))
             .split("{ip}").join(ip)
+        // A folder's count is the programs it covers, not more addresses.
+        if (kind === "folder-over-cap")
+            return text.split("{count}").join(String(Number(c.count || 0)))
         var more = Number(c.count || 0) - 1
         if (more > 0)
             text += " " + root.tr("rules.overlaps.conflicts.more", "Addresses affected besides this one: {count}.")

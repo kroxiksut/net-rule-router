@@ -70,6 +70,7 @@ pub mod seed_browser_history;
 pub mod service_health;
 pub mod service_stability_handlers;
 pub mod settings_handlers;
+pub mod site_check_handlers;
 pub mod snapshot_diagnostics;
 pub mod snapshot_initial;
 pub mod snapshot_interfaces;
@@ -156,6 +157,7 @@ pub use settings_handlers::{
     RoutingPauseToggleHandler, StorageUsageGetHandler, TrafficHistoryMergeSetHandler,
     TrafficStatsClearHandler, TrafficStatsGetHandler, TrafficStatsSetHandler,
 };
+pub use site_check_handlers::{SiteCheckResultHandler, SiteCheckRunHandler};
 pub use snapshot_diagnostics::SnapshotDiagnosticsHandler;
 pub use snapshot_initial::SnapshotInitialHandler;
 pub use snapshot_interfaces::SnapshotInterfacesHandler;

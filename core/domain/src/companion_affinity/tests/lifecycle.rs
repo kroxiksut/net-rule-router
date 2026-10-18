@@ -319,3 +319,33 @@ fn a_replayed_companion_counts_once_however_many_times_it_was_seen() {
 
     assert_eq!(ledger.candidate_count(), 1);
 }
+
+// ── What the site check reads ────────────────────────────────────────────
+
+#[test]
+fn seen_with_lists_the_companions_of_the_sites_anchors_only() {
+    let mut ledger = CompanionAffinityLedger::with_defaults();
+    two_visits(
+        &mut ledger,
+        "site.example",
+        &["login.site.example", "cdn.other.example"],
+    );
+    page_load(
+        &mut ledger,
+        200_000,
+        "unrelated.example",
+        SECONDARY,
+        &["tracker.example"],
+    );
+
+    let seen = ledger.seen_with(|anchor| anchor == "site.example", 8);
+
+    assert_eq!(seen, ["cdn.other.example", "login.site.example"]);
+    assert!(ledger
+        .seen_with(|anchor| anchor == "nobody.example", 8)
+        .is_empty());
+    assert_eq!(
+        ledger.seen_with(|anchor| anchor == "site.example", 1).len(),
+        1
+    );
+}

@@ -415,11 +415,10 @@ pub fn generate_secondary_routes(
         // same trade-off address rules already make, bounded by the observation
         // store's own per-app cap and the shared-address policy below.
         if let Some(app) = rule.app_match.as_ref() {
+            // A rule by path is observed under its canonical spelling.
             let pattern = match &app.pattern {
                 CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.as_str(),
-                // TODO: a path rule is enforced once the platform can list the
-                // programs of a folder; until then it routes nothing.
-                CanonicalAppPattern::Path(_) => continue,
+                CanonicalAppPattern::Path(path) => path.as_str(),
             };
             let destinations = gate.admit(pattern, link);
             if destinations.admitted.is_empty() && destinations.refused.is_empty() {

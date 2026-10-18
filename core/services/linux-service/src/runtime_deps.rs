@@ -1240,12 +1240,21 @@ pub(crate) fn build_policy_stack(
     let app_enforcement = nrr_service_runtime::app_enforcement_status::AppEnforcementStatus::new();
     let shared_ip_exemptions =
         nrr_service_runtime::app_enforcement_status::SharedIpExemptionStatus::new();
+    // What rules by path cover, listed and watched off the traffic path. A
+    // watched folder that gains or loses a program asks for a pass below.
+    let app_folders = Arc::new(nrr_platform_api::app_folders::ProgramFolderIndex::new(
+        Arc::new(nrr_platform_linux::app_folders::LinuxProgramFolders::new()),
+    ));
     let plan_source = Arc::new(
         ProductionPrincipalPlanSource::new(
             rules,
             Arc::clone(&policy),
             fqdn_cache,
-            Arc::new(nrr_platform_linux::app_path_resolver::LinuxAppPathResolver),
+            Arc::new(
+                nrr_platform_linux::app_path_resolver::LinuxAppPathResolver::with_program_folders(
+                    Arc::clone(&app_folders),
+                ),
+            ),
             Arc::clone(&app_observations) as Arc<dyn AppObservationLookup>,
         )
         // The blanket block's exemptions: the tunnel-server host routes and the
@@ -1402,6 +1411,10 @@ pub(crate) fn build_policy_stack(
                 Arc::new(move || cache.lock().ok()?.change_generation()),
             )
             .with_source("apps", Arc::new(move || Some(observations.generation())))
+            .with_source("app-folders", {
+                let folders = Arc::clone(&app_folders);
+                Arc::new(move || Some(folders.generation()))
+            })
             .with_source(
                 "adapters",
                 hashed(move || adapter_port_for_inputs.enumerate_all()),
@@ -1526,6 +1539,32 @@ pub(crate) fn build_policy_stack(
         )),
     };
 
+    let cycle = Arc::new(
+        PrincipalEnforcementCycle::new(Arc::new(LogindActivePrincipals), plans, enforcer)
+            .with_routes(routes)
+            .with_route_table_owner(route_owner)
+            .with_events(events)
+            .with_enforcement_status(enforcement_status)
+            .with_primary_suggestion(Arc::new(|| {
+                nrr_service_runtime::routing_setup::suggest_primary(&nrr_platform_linux::LinuxApi)
+            }))
+            .with_fail_closed_posture_status(fail_closed_posture.clone())
+            .with_dns_cache_control(dns_cache_control)
+            .with_pass_inputs(pass_inputs)
+            .with_flow_reset(flow_reset)
+            .with_paused_principals(paused_principals),
+    );
+    // A program that appeared in a rule's folder is covered without a restart:
+    // the index's worker asks for one pass, after the folder went quiet.
+    app_folders.set_listener({
+        let cycle = Arc::downgrade(&cycle);
+        Arc::new(move || {
+            if let Some(cycle) = cycle.upgrade() {
+                cycle.tick_if_changed_logged("app-folders");
+            }
+        })
+    });
+
     Some(PolicyStack {
         app_enforcement,
         shared_ip_exemptions,
@@ -1556,23 +1595,7 @@ pub(crate) fn build_policy_stack(
             .with_log_ndjson_flag(conn_trace_log.flag()),
         ),
         conn_trace_log,
-        cycle: Arc::new(
-            PrincipalEnforcementCycle::new(Arc::new(LogindActivePrincipals), plans, enforcer)
-                .with_routes(routes)
-                .with_route_table_owner(route_owner)
-                .with_events(events)
-                .with_enforcement_status(enforcement_status)
-                .with_primary_suggestion(Arc::new(|| {
-                    nrr_service_runtime::routing_setup::suggest_primary(
-                        &nrr_platform_linux::LinuxApi,
-                    )
-                }))
-                .with_fail_closed_posture_status(fail_closed_posture.clone())
-                .with_dns_cache_control(dns_cache_control)
-                .with_pass_inputs(pass_inputs)
-                .with_flow_reset(flow_reset)
-                .with_paused_principals(paused_principals),
-        ),
+        cycle,
         traffic_sampler: open_traffic_sampler(&artifacts.topology.traffic_db_path),
     })
 }

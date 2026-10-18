@@ -9,7 +9,7 @@
 //! terminal, so a move made here reads the rules back and writes the bound
 //! files itself.
 
-use std::path::Path;
+use std::path::PathBuf;
 
 use nrr_client_logic::verify_verdicts::{verdict_notice, VerdictNotice};
 use nrr_client_logic::Route;
@@ -192,11 +192,12 @@ fn accepted(app: &mut AppState, answer: Result<VerifyVerdictsAcceptResponse, Cal
         Ok(_) => {
             app.rules.note = Some(Note::new(text::VERDICTS_MOVED));
             // Edits on screen are not dropped for it; the files then wait for
-            // the next read, as in the window.
+            // the next read, as in the window. An open form or question keeps
+            // its row: the read waits for it.
             let rules = &app.rules;
             if !rules.table.is_dirty() && rules.busy.is_none() {
                 app.rules.verdicts.rewrite_files = true;
-                super::load(app);
+                super::reread_when_free(app);
             }
         }
     }
@@ -256,13 +257,21 @@ pub fn write_bound_files(app: &mut AppState) {
     };
     let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let bound = [settings.rules_files.primary, settings.rules_files.secondary];
+    let mut written = Vec::new();
+    let mut held = Vec::new();
     for (route, path) in Route::ALL.into_iter().zip(bound) {
         if path.is_empty() {
             continue;
         }
+        let path = PathBuf::from(path);
         let (table, hint) = (&app.rules.table, &app.rules.file_hint);
-        let written = files::write_route(Path::new(&path), route, table, hint, &exported_at);
-        if let Err((path, error)) = written {
+        // Edited by hand since this program wrote it: asked about, not lost.
+        if own_settings::hand_edited(file, &path) && files::route_differs(&path, route, table, hint)
+        {
+            held.push((route, path));
+            continue;
+        }
+        if let Err((path, error)) = files::write_route(&path, route, table, hint, &exported_at) {
             let path = path.display().to_string();
             app.rules.note = Some(Note::with(
                 text::WRITE_FAILED,
@@ -270,5 +279,10 @@ pub fn write_bound_files(app: &mut AppState) {
             ));
             return;
         }
+        written.push(path);
+    }
+    let _ = own_settings::note_written(file, &written);
+    if !held.is_empty() {
+        super::ask_about_hand_edited(app, held);
     }
 }

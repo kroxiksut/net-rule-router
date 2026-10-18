@@ -344,49 +344,82 @@ pub fn plan_route_rules_with_shapes(
                 );
                 report.conflicts.extend(walk.finish(rule.id.as_str()));
             } else if let Some(app) = rule.app_match.as_ref() {
-                let pattern = match &app.pattern {
-                    CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.as_str(),
-                    // TODO: a path rule is enforced once the platform can list
-                    // the programs of a folder; until then it applies nothing.
-                    CanonicalAppPattern::Path(_) => continue,
-                };
                 // Per-exe-path ALE_APP_ID filters (slots 0..APP_PATH_FANOUT_CAP).
                 // No remote IP → DstMatch::Any; no packet mirror (the packet
-                // layer has no app context), so ConnectOnly.
-                let resolved = input.app_resolver.resolve(pattern);
+                // layer has no app context), so ConnectOnly. A rule by path is
+                // one flow over every program its place holds for the owner,
+                // at one ordinal: one action, so their order decides nothing.
+                let (pattern, resolved, by_path) = match &app.pattern {
+                    CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => {
+                        (s.clone(), input.app_resolver.resolve(s), false)
+                    }
+                    CanonicalAppPattern::Path(path) => {
+                        let targets = crate::app_path_rules::path_rule_targets(
+                            path,
+                            sid,
+                            nrr_domain::protected_places::RuleEffect::of(rule.action, role),
+                            input.app_resolver,
+                            &gate,
+                            crate::protected_rules::places(),
+                        );
+                        if let Some(reason) = targets.refused {
+                            report.conflicts.push(
+                                crate::rule_conflicts::RuleConflict::PathProtected {
+                                    rule_id: rule.id.as_str().to_string(),
+                                    reason,
+                                },
+                            );
+                            continue;
+                        }
+                        if targets.over_cap {
+                            report.conflicts.push(
+                                crate::rule_conflicts::RuleConflict::FolderOverCap {
+                                    rule_id: rule.id.as_str().to_string(),
+                                    covered: targets.programs.len(),
+                                },
+                            );
+                        }
+                        (targets.key, targets.programs, true)
+                    }
+                };
+                let pattern = pattern.as_str();
                 if resolved.is_empty() {
                     report.unresolved_apps.push(pattern.to_string());
-                } else if resolved.len() > APP_PATH_FANOUT_CAP as usize {
+                } else if !by_path && resolved.len() > APP_PATH_FANOUT_CAP as usize {
                     report.over_capped_apps.push((
                         pattern.to_string(),
                         APP_PATH_FANOUT_CAP as usize,
                         resolved.len(),
                     ));
                 }
-                for (k, path) in resolved
-                    .into_iter()
-                    .take(APP_PATH_FANOUT_CAP as usize)
-                    .enumerate()
-                {
-                    flows.push(FlowRule {
-                        verdict,
-                        precedence: Precedence {
-                            class,
-                            ordinal: base_ordinal + k as u32,
-                        },
-                        flow: FlowMatch {
-                            dst: DstMatch::Any,
-                            dst_port: None,
-                            protocol: None,
-                        },
-                        principal: principal.clone(),
-                        app: AppScope::Program {
-                            key: pattern.to_string(),
-                            exe_paths: vec![path],
-                        },
-                        egress: EgressConstraint::Any,
-                        coverage: Coverage::ConnectOnly,
-                    });
+                let program_flow = |ordinal: u32, exe_paths: Vec<std::path::PathBuf>| FlowRule {
+                    verdict,
+                    precedence: Precedence { class, ordinal },
+                    flow: FlowMatch {
+                        dst: DstMatch::Any,
+                        dst_port: None,
+                        protocol: None,
+                    },
+                    principal: principal.clone(),
+                    app: AppScope::Program {
+                        key: pattern.to_string(),
+                        exe_paths,
+                    },
+                    egress: EgressConstraint::Any,
+                    coverage: Coverage::ConnectOnly,
+                };
+                if by_path {
+                    if !resolved.is_empty() {
+                        flows.push(program_flow(base_ordinal, resolved));
+                    }
+                } else {
+                    for (k, path) in resolved
+                        .into_iter()
+                        .take(APP_PATH_FANOUT_CAP as usize)
+                        .enumerate()
+                    {
+                        flows.push(program_flow(base_ordinal + k as u32, vec![path]));
+                    }
                 }
                 // Observed-destination /32s (slots APP_PATH_FANOUT_CAP+1+i) —
                 // ordinary host flows, so `coverage` (mirror for Block) applies.

@@ -790,6 +790,25 @@ mod tests {
         assert!(reader.list_files().is_empty());
     }
 
+    /// The streamed digest and the one taken while verifying must stay equal,
+    /// or a cached verdict is never reused.
+    #[test]
+    fn both_file_digests_agree_and_are_pinned() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("digest.ndjson");
+        std::fs::write(&path, b"x").expect("write");
+        let streamed = file_digest(&path).expect("readable");
+        let (verified, _) = read_and_verify(&path, None);
+        assert_eq!(Some(streamed), verified);
+        assert_eq!(
+            streamed
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+        );
+    }
+
     #[test]
     fn list_files_after_writes() {
         let dir = tempfile::tempdir().expect("temp");

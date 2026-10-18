@@ -47,6 +47,35 @@ QtObject {
             root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
             return
         }
+        mergeFromEdits = false
+        _openMergeDialogOnTexts()
+    }
+
+    /// The merge's "file" side is the table's unapplied edits, not the linked
+    /// files: an apply refused because the rules changed elsewhere puts those
+    /// edits on top of the rules now in force, through the same dialog.
+    property bool mergeFromEdits: false
+
+    /// The apply was refused as built on rules no longer in force
+    /// (`rules-changed-elsewhere`). Nothing was lost: the edits are still in
+    /// the table, and the merge review shows them against the fresh rules.
+    function openMergeWithPendingEdits() {
+        if (!_mergeBridgeReady()) {
+            root.statusLine = root.tr("errors.rules-changed-elsewhere",
+                "Your rules were changed elsewhere since you opened them. Nothing was applied.")
+            return
+        }
+        var os = root.platformProfile ? root.platformProfile.os : ""
+        root._mergePrimaryText = Rules.buildCanonicalRulesText(
+            root.rulesModel, "primary", {}, true, os, [])
+        root._mergeSecondaryText = Rules.buildCanonicalRulesText(
+            root.rulesModel, "secondary", {}, true, os, [])
+        mergeFromEdits = true
+        _openMergeDialogOnTexts()
+    }
+
+    function _openMergeDialogOnTexts() {
+        root.mergeReviewDialog.fromEdits = mergeFromEdits
         root.mergeReviewDialog.policy = _mergePolicy()
         root.mergeReviewDialog.mergeResult = null
         root.mergeReviewDialog.picks = ({})
@@ -94,14 +123,17 @@ QtObject {
     /// null on failure. Split out of `_openMergeDialog` so the same pass can
     /// answer "does merging change anything at all" before any dialog opens.
     function _fetchMergePreview(resolutions, done, keepSecondaryKeys) {
-        var primaryPath = _rememberedRulesPath("primary")
-        var secondaryPath = _rememberedRulesPath("secondary")
-        var primB64 = primaryPath
-            ? String(nrrNativeBridge.readFileBytes(primaryPath) || "") : ""
-        var secB64 = secondaryPath
-            ? String(nrrNativeBridge.readFileBytes(secondaryPath) || "") : ""
-        root._mergePrimaryText = primB64 ? nrrNativeBridge.decodeBase64Utf8(primB64) : ""
-        root._mergeSecondaryText = secB64 ? nrrNativeBridge.decodeBase64Utf8(secB64) : ""
+        // The edits' texts were taken when the merge opened.
+        if (!mergeFromEdits) {
+            var primaryPath = _rememberedRulesPath("primary")
+            var secondaryPath = _rememberedRulesPath("secondary")
+            var primB64 = primaryPath
+                ? String(nrrNativeBridge.readFileBytes(primaryPath) || "") : ""
+            var secB64 = secondaryPath
+                ? String(nrrNativeBridge.readFileBytes(secondaryPath) || "") : ""
+            root._mergePrimaryText = primB64 ? nrrNativeBridge.decodeBase64Utf8(primB64) : ""
+            root._mergeSecondaryText = secB64 ? nrrNativeBridge.decodeBase64Utf8(secB64) : ""
+        }
         var corr = nrrNativeBridge.rpcRulesMergePreview(
             root._mergePrimaryText, root._mergeSecondaryText,
             _mergePolicy(), resolutions || [], keepSecondaryKeys || [])
@@ -132,6 +164,30 @@ QtObject {
             root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
             return
         }
+        if (mergeFromEdits) {
+            // Read before the merge is built: a write landing in between then
+            // makes the apply refused again, never undone.
+            _readBaseRevision(function(base) {
+                _buildAndApplyMerge(resolutions, keepSecondaryKeys, base)
+            })
+            return
+        }
+        _buildAndApplyMerge(resolutions, keepSecondaryKeys, undefined)
+    }
+
+    /// The `base-revision` of the rules in force now, `null` when unknown.
+    function _readBaseRevision(onBase) {
+        if (typeof nrrNativeBridge.rpcRulesList !== "function") { onBase(null); return }
+        var corr = nrrNativeBridge.rpcRulesList()
+        root.rpc.registerRpcCallback(corr, function(ok, p) {
+            var base = (ok && p && p["base-revision"] !== undefined && p["base-revision"] !== null)
+                ? String(p["base-revision"]) : null
+            onBase(base)
+        })
+    }
+
+    /// `base`: what the apply is built on; undefined keeps the table's own.
+    function _buildAndApplyMerge(resolutions, keepSecondaryKeys, base) {
         var policy = String((root.prefs && root.prefs.mergeConflictPolicy) || "union")
         var corr = nrrNativeBridge.rpcRulesMergePreview(
             root._mergePrimaryText, root._mergeSecondaryText, policy, resolutions || [],
@@ -165,7 +221,8 @@ QtObject {
             }
             root._mergeApplyPendingWrite = true
             root.reviewFlowController.startRulesReviewFlow(
-                mergedRulesJson, contentHash, false, "drift-merge")
+                mergedRulesJson, contentHash, false,
+                mergeFromEdits ? "edits-merge" : "drift-merge", base)
         })
     }
 
@@ -756,6 +813,7 @@ QtObject {
             root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
             return
         }
+        mergeFromEdits = false
         _fetchMergePreview([], function(res, code) {
             if (!res) {
                 // Cannot tell — show the screen rather than swallow a real
@@ -870,6 +928,7 @@ QtObject {
     }
 
     function _showMergeDialogWith(res) {
+        root.mergeReviewDialog.fromEdits = mergeFromEdits
         root.mergeReviewDialog.errorText = ""
         root.mergeReviewDialog.loading = false
         _fillMergeDialog(res)

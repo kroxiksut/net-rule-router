@@ -1,0 +1,5 @@
+App	/opt/App/bin/App
+app	/opt/app/app
+init	/init
+Safari	/Applications/Safari.app/Contents/MacOS/Safari
+x	relative/x

@@ -149,7 +149,7 @@ pub struct PlatformSupports {
     pub per_user_all_protocol_scoping: bool,
     /// An application rule by path (a file, a folder, a folder with its
     /// subfolders) is carried out. Mirrors `EnforcementCapabilities::
-    /// app_path_rules`; `false` everywhere until a platform walks folders.
+    /// app_path_rules`; macOS waits for its backend.
     pub app_path_rules: bool,
 }
 
@@ -205,7 +205,7 @@ impl PlatformProfile {
                 per_user_routing: false,
                 per_app_block_leakproof: true,
                 per_user_all_protocol_scoping: false,
-                app_path_rules: false,
+                app_path_rules: true,
             },
         }
     }
@@ -260,7 +260,7 @@ impl PlatformProfile {
                 per_user_routing: true,
                 per_app_block_leakproof: false,
                 per_user_all_protocol_scoping: true,
-                app_path_rules: false,
+                app_path_rules: true,
             },
         }
     }

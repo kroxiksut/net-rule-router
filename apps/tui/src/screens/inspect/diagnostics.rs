@@ -58,6 +58,7 @@ enum Part {
 enum Field {
     Explain,
     LogKind,
+    Site,
 }
 
 #[derive(Debug, Default)]
@@ -492,6 +493,15 @@ fn verdict_label(texts: &Texts, probe: &Probe) -> String {
     format!("{route} — {status}")
 }
 
+/// "Is it us or the site?" for `host`, from another screen: the overview
+/// shows the check and its answer.
+pub fn check_site(app: &mut AppState, host: &str) {
+    let state = &mut app.inspect.diag;
+    state.part = Part::Overview;
+    state.typing = None;
+    super::site_check::start(app, host);
+}
+
 // ── Archive ──────────────────────────────────────────────────────────────────
 
 fn export(app: &mut AppState) {
@@ -684,6 +694,18 @@ impl Screen for DiagnosticsScreen {
                     feed: false,
                 },
                 Panel {
+                    title: texts.get(keys::SITE_CHECK),
+                    lines: super::site_check::lines(
+                        app,
+                        texts,
+                        match &state.typing {
+                            Some((Field::Site, buffer)) => Some(buffer.as_str()),
+                            _ => None,
+                        },
+                    ),
+                    feed: false,
+                },
+                Panel {
                     title: texts.get(keys::ARCHIVE),
                     lines: archive_lines(state, texts),
                     feed: false,
@@ -706,6 +728,7 @@ impl Screen for DiagnosticsScreen {
             keys::DIAG_HELP_SWITCH,
             keys::DIAG_HELP_ACK,
             keys::DIAG_HELP_EXPLAIN,
+            keys::DIAG_HELP_SITE,
             keys::DIAG_HELP_EXPORT,
             keys::DIAG_HELP_LOG_FILTERS,
             keys::HELP_PAGES,
@@ -719,6 +742,7 @@ impl Screen for DiagnosticsScreen {
             keys::DIAG_HELP_SWITCH,
             keys::DIAG_PLAIN_ACK,
             keys::DIAG_PLAIN_EXPLAIN,
+            keys::DIAG_PLAIN_SITE,
             keys::DIAG_PLAIN_EXPORT,
             keys::DIAG_PLAIN_LOG_FILTERS,
             keys::PLAIN_PAGES,
@@ -767,6 +791,7 @@ impl Screen for DiagnosticsScreen {
                     app.inspect.diag.typing = None;
                     match field {
                         Field::Explain => probe(app, &text, "", ""),
+                        Field::Site => super::site_check::start(app, &text),
                         Field::LogKind => {
                             app.inspect.diag.log.kind = text.trim().to_owned();
                             load_log(app, true);
@@ -812,6 +837,11 @@ fn overview_key(app: &mut AppState, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('a') => acknowledge_selected(app),
         KeyCode::Char('e') => state.typing = Some((Field::Explain, state.explain.input.clone())),
+        KeyCode::Char('c') => {
+            let host = app.inspect.site.host().to_owned();
+            app.inspect.diag.typing = Some((Field::Site, host));
+        }
+        KeyCode::Char('m') => return super::site_check::move_sign_in(app),
         KeyCode::Char('x') => export(app),
         KeyCode::Char('r') => load_status(app),
         code => {
@@ -833,6 +863,8 @@ fn overview_line(app: &mut AppState, line: &str) -> bool {
             acknowledge_selected(app);
         }
         ("e", host) => probe(app, host, "", ""),
+        ("c", host) => super::site_check::start(app, host),
+        ("m", "") => return super::site_check::move_sign_in(app),
         ("x", "") => export(app),
         ("r", "") => load_status(app),
         _ => return false,

@@ -238,6 +238,12 @@ impl IpcHandler for ExplainGetHandler {
     }
 }
 
+/// The route an explain answer settles on — `primary`, `secondary`, `blocked`
+/// or `none` — as the explain widget shows it.
+pub fn explained_route(response: &ExplainResponse) -> String {
+    compact_view(response).route
+}
+
 fn parse_detail_level(slug: Option<&str>) -> ExplainDetailLevel {
     match slug {
         Some("diagnostics") => ExplainDetailLevel::Diagnostics,

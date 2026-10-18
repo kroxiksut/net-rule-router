@@ -434,8 +434,42 @@ function ipRangeAddressMatchDto(value) {
 // Field order matches the Rust `RuleDto` declaration order
 // (id, enabled, comment, address-match | app-match, action) — the canonical
 // JSON is order-sensitive.
+//
+// A value with a control character is refused, never cleaned: the throw
+// carries `wireRefusal` (see `wireRefusalCode`).
 function ruleRowToWireDto(row, aceEncodeHost, opts) {
-    var options = opts || {}
+    var refusal = wireRefusal(row)
+    if (refusal !== "") {
+        var err = new Error("rule value refused on the wire: " + refusal)
+        err.wireRefusal = refusal
+        throw err
+    }
+    return _rowWireDto(row, aceEncodeHost, opts || {}, false)
+}
+
+// `WireRefusal::code`: why `row` cannot go to the service as it stands, "" when
+// it can. `+children` comes off by words, so cleaning a line break away would
+// glue its two sides into a name the user never wrote.
+function wireRefusal(row) {
+    return _bulkHasControl(String((row && row.matchValue) || "")) ? "control-character" : ""
+}
+
+// The client error code (`errors.<code>`) of a serializer throw, "" for any
+// other error.
+function wireRefusalCode(err) {
+    return (err && typeof err.wireRefusal === "string") ? err.wireRefusal : ""
+}
+
+// Drift and routing keys compare rows and send nothing: a row the wire refuses
+// compares as typed, a difference no stored rule shares, rather than throwing
+// out of a watcher.
+function _comparableWireDto(row, aceEncodeHost) {
+    return _rowWireDto(row, aceEncodeHost, { keepId: false, keepComment: false },
+        wireRefusal(row) !== "")
+}
+
+// `asTyped` keeps an application value whole, `+children` included.
+function _rowWireDto(row, aceEncodeHost, options, asTyped) {
     var dto = {
         id: (options.keepId === false) ? "" : String(row.id || ""),
         enabled: !!row.enabled
@@ -483,7 +517,7 @@ function ruleRowToWireDto(row, aceEncodeHost, opts) {
             // in the file, not in the name the service matches.
             // A separator makes it a path, which the service reads in its
             // platform's spelling.
-            value = withoutChildrenFlag(value)
+            if (!asTyped) value = withoutChildrenFlag(value)
             dto["app-match"] = {
                 pattern: {
                     kind: /[\\\/]/.test(value) ? "path"
@@ -568,8 +602,7 @@ function buildDriftRulesJsonForRoute(rows, route, aceEncodeHost) {
         // A block belongs to the secondary bucket (the service's canonical
         // placement), so drift and dirty signatures see it.
         if (routeBucket(r.targetRoute) !== String(route)) continue
-        var dto = ruleRowToWireDto(r, aceEncodeHost,
-            { keepId: false, keepComment: false })
+        var dto = _comparableWireDto(r, aceEncodeHost)
         if (route === "secondary") secondary.push(dto)
         else primary.push(dto)
     }
@@ -622,8 +655,7 @@ function ruleRoutingKeys(rows, aceEncodeHost) {
         if (!r) continue
         var bucket = routeBucket(r.targetRoute)
         if (bucket !== "primary" && bucket !== "secondary") continue
-        var dto = ruleRowToWireDto(r, aceEncodeHost,
-            { keepId: false, keepComment: false })
+        var dto = _comparableWireDto(r, aceEncodeHost)
         keys.push(bucket + sep + driftSortKey(dto))
     }
     return keys

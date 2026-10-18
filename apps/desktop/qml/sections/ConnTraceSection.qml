@@ -313,14 +313,42 @@ ScrollView {
     // Copy-all-shown and the counts still use the FULL filtered list.
     property var _connRendered: (_connFiltered.length > _renderCap)
         ? _connFiltered.slice(0, _renderCap) : _connFiltered
-    // Grouping of the trace by process, ON by default. The flat render list is
-    // replaced by a list where each process's rows are preceded by a synthetic
-    // header item (`_isGroupHeader: true`). Groups are keyed on the displayed
-    // process (basename), sorted case-insensitively; the whole flattened output is
-    // still capped at `_renderCap` so a huge trace can't freeze the view.
-    // Session-scoped like the two view filters above.
-    property bool _connGroupByProcess: true
-    // Per-process expansion state, mirroring the cache table's per-host
+    // Grouping of the trace: none, by program (the default) or by program
+    // folder, remembered in the preferences. Each group's rows follow a
+    // synthetic header item (`_isGroupHeader: true`); which rows form a group
+    // and in what order is `Pure.connTraceGroups`, the terminal's grouping too.
+    // The flattened output is still capped at `_renderCap`. A string binding
+    // over the wholesale-replaced `prefs` notifies only on a real change.
+    readonly property string _connGroupBy:
+        Pure.connTraceGroupingOrDefault(root.prefs.connTraceGroupBy)
+    function _setConnGroupBy(slug) {
+        if (slug === section._connGroupBy) return
+        section._clearConnSelection()
+        root.commitPrefs({ connTraceGroupBy: slug })
+    }
+    function _connGroupByLabel(slug) {
+        if (slug === "none") return root.tr("diag.conn-trace.group-none", "No grouping")
+        if (slug === "folder") return root.tr("diag.conn-trace.group-folder", "By folder")
+        return root.tr("diag.conn-trace.group-program", "By program")
+    }
+    // Header text of a group: the program or the folder, and its counts.
+    function _connGroupHeaderText(h) {
+        var count = Number((h && h._count) || 0)
+        if (h && h._groupKind === "program")
+            return Pure.displayText(h._groupLabel || "—") + "  ·  " + count + " "
+                + root.tr("diag.conn-trace.group-count", "connection(s)")
+        var label = (h && h._groupKind === "folder")
+            ? Pure.displayText(h._groupLabel)
+            : root.tr("diag.conn-trace.group-no-path", "Programs without a known path")
+        return label + "  ·  " + root.tr("diag.conn-trace.group-folder-counts",
+            "%1 program(s)  ·  %2 connection(s)")
+            .arg(Number((h && h._programs) || 0)).arg(count)
+    }
+    // The existing rule window, filled with the folder and every folder below it.
+    function _ruleForConnFolder(value) {
+        section._ruleFromConnRow("application", value)
+    }
+    // Per-group expansion state, mirroring the cache table's per-host
     // expansion (`root.diagCacheExpanded`). Multi-row groups start COLLAPSED: a
     // raw trace is hundreds of rows across a handful of processes, and the
     // header row alone answers "who is talking, and how much". Lives on `root`
@@ -349,7 +377,10 @@ ScrollView {
     // three can never disagree and the grouping runs once per change.
     property var _connGroupedBuild: {
         var lineH = section._listLineHeight
-        if (!_connGroupByProcess) {
+        var groups = _connGroupBy === "none" ? []
+            : Pure.connTraceGroups(_connFiltered, _connGroupBy,
+                String((root.platformProfile && root.platformProfile.os) || ""))
+        if (groups.length === 0) {
             var flatHeight = 0
             for (var f = 0; f < _connRendered.length; f++)
                 flatHeight += section._connRowHeight(_connRendered[f], lineH)
@@ -359,37 +390,29 @@ ScrollView {
                 "height": flatHeight
             }
         }
-        var groups = ({})
-        var order = []
-        for (var i = 0; i < _connFiltered.length; i++) {
-            var e = _connFiltered[i] || {}
-            var key = String(e.process || "—")
-            if (groups[key] === undefined) { groups[key] = []; order.push(key) }
-            groups[key].push(e)
-        }
-        order.sort(function(a, b) {
-            var la = a.toLowerCase(), lb = b.toLowerCase()
-            return la < lb ? -1 : (la > lb ? 1 : 0)
-        })
         var out = []
         var dropped = 0
         var height = 0
-        for (var g = 0; g < order.length; g++) {
-            var k = order[g]
-            var rows = groups[k]
+        for (var g = 0; g < groups.length; g++) {
+            var group = groups[g]
+            var rows = group.rows.map(function(i) { return _connFiltered[i] })
             // Past the cap nothing further can be shown, but keep walking so the
             // truncation notice reports the real total instead of stopping short.
             if (out.length >= _renderCap) { dropped += rows.length; continue }
-            // A one-connection group has nothing to collapse: render the row
-            // itself, with no header, no chevron and no count.
-            if (rows.length === 1) {
+            // A program seen once has nothing to collapse: the row alone.
+            if (!group.header) {
                 out.push(rows[0])
                 height += section._connRowHeight(rows[0], lineH)
                 continue
             }
-            out.push({ "_isGroupHeader": true, "process": k, "_count": rows.length })
-            height += lineH + root.uiTheme.spacingXs
-            if (!section._isConnGroupExpanded(k)) continue
+            out.push({ "_isGroupHeader": true, "_groupKey": group.key,
+                       "_groupKind": group.kind, "_groupLabel": group.label,
+                       "_groupRule": group.ruleValue || "", "_count": rows.length,
+                       "_programs": group.programs })
+            // A folder header carries its rule button, taller than the line.
+            height += group.ruleValue ? Math.max(lineH, 28) + root.uiTheme.spacingXs * 2
+                : lineH + root.uiTheme.spacingXs
+            if (!section._isConnGroupExpanded(group.key)) continue
             var r = 0
             for (; r < rows.length && out.length < _renderCap; r++) {
                 out.push(rows[r])
@@ -965,23 +988,29 @@ ScrollView {
                             section._clearConnSelection()
                         }
                     }
-                    // Group the trace rows by process.
-                    CheckBox {
-                        id: connGroupByProcessCheck
-                        checked: section._connGroupByProcess
-                        text: root.tr("diag.conn-trace.group-by-process", "Group by process")
-                        contentItem: Label {
-                            text: connGroupByProcessCheck.text
-                            leftPadding: connGroupByProcessCheck.indicator.width
-                                + connGroupByProcessCheck.spacing
-                            color: root.textColor
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        Accessible.name: connGroupByProcessCheck.text
-                        onToggled: {
-                            section._connGroupByProcess = checked
-                            section._clearConnSelection()
-                        }
+                    // How the rows are grouped; remembered in the preferences.
+                    Label {
+                        text: root.tr("diag.conn-trace.group-by", "Group")
+                        color: root.textColor
+                    }
+                    ThemedComboBox {
+                        id: connGroupByCombo
+                        theme: root.uiTheme
+                        Layout.preferredWidth: 180
+                        model: Pure.CONN_TRACE_GROUPINGS
+                        labelResolver: function(item) { return section._connGroupByLabel(item) }
+                        displayText: root.uiRevision >= 0 && currentIndex >= 0
+                            ? section._connGroupByLabel(model[currentIndex]) : ""
+                        currentIndex: Pure.optionIndexByValue(model, section._connGroupBy, 1)
+                        popup.width: root.comboPopupWidth(connGroupByCombo, model, "",
+                            function(item) { return section._connGroupByLabel(item) })
+                        Accessible.name: root.tr("diag.conn-trace.group-by-a11y",
+                            "How to group the connections") + ": " + displayText
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 400
+                        ToolTip.text: root.tr("diag.conn-trace.group-by-tip",
+                            "By folder: programs of one folder and of the folders inside it form one group, and the group offers a rule for the whole folder.")
+                        onActivated: section._setConnGroupBy(model[currentIndex])
                     }
                     Item { Layout.fillWidth: true }
                 }
@@ -1258,41 +1287,62 @@ ScrollView {
                             opacity: 0.08
                             z: -1
                         }
-                        // Process key of a synthetic header row; "" for data rows.
+                        // Group key of a synthetic header row; "" for data rows.
                         readonly property string _groupKey: connRowItem._isHeader
-                            ? String((modelData && modelData.process) || "") : ""
+                            ? String((modelData && modelData._groupKey) || "") : ""
+                        // The folder rule a folder header offers; "" otherwise.
+                        readonly property string _groupRule: connRowItem._isHeader
+                            ? String((modelData && modelData._groupRule) || "") : ""
                         // Reads `root.diagConnGroupExpandRev` through the helper so a
                         // toggle re-evaluates this binding (mirrors the cache table).
                         readonly property bool _groupExpanded: connRowItem._isHeader
                             && section._isConnGroupExpanded(connRowItem._groupKey)
                         // Group header (shown only for synthetic header items).
-                        // Collapsed by default; the whole header row is the click
-                        // target, and the leading chevron states which way it goes.
-                        Label {
+                        // Collapsed by default; the title is the click target, and
+                        // the leading chevron states which way it goes. The header
+                        // and the data-row handlers below are gated on `_isHeader`,
+                        // so the two never compete for the same delegate.
+                        RowLayout {
                             id: connGroupHeader
                             visible: connRowItem._isHeader
                             width: parent.width
-                            topPadding: root.uiTheme.spacingXs
-                            text: (connRowItem._groupExpanded ? "▾ " : "▸ ")
-                                + Pure.displayText((modelData && modelData.process) || "—")
-                                + "  ·  " + String((modelData && modelData._count) || 0) + " "
-                                + root.tr("diag.conn-trace.group-count", "connection(s)")
-                            color: root.uiTheme.colorAccent
-                            font.bold: true
-                            textFormat: Text.PlainText
-                            elide: Text.ElideRight
-                            Accessible.role: Accessible.Button
-                            Accessible.name: connGroupHeader.text
-                        }
-                        // Header click → expand/collapse. Declared before the data-row
-                        // handlers below and gated on `_isHeader`, so the two never
-                        // compete for the same delegate.
-                        MouseArea {
-                            anchors.fill: parent
-                            enabled: connRowItem._isHeader
-                            acceptedButtons: Qt.LeftButton
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: section._toggleConnGroupExpand(connRowItem._groupKey)
+                            spacing: root.uiTheme.spacingSm
+                            Label {
+                                id: connGroupHeaderLabel
+                                Layout.fillWidth: true
+                                topPadding: root.uiTheme.spacingXs
+                                text: connRowItem._isHeader
+                                    ? (connRowItem._groupExpanded ? "▾ " : "▸ ")
+                                        + section._connGroupHeaderText(modelData)
+                                    : ""
+                                color: root.uiTheme.colorAccent
+                                font.bold: true
+                                textFormat: Text.PlainText
+                                elide: Text.ElideRight
+                                Accessible.role: Accessible.Button
+                                Accessible.name: connGroupHeaderLabel.text
+                                MouseArea {
+                                    anchors.fill: parent
+                                    enabled: connRowItem._isHeader
+                                    acceptedButtons: Qt.LeftButton
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: section._toggleConnGroupExpand(connRowItem._groupKey)
+                                }
+                            }
+                            ThemedButton {
+                                theme: root.uiTheme
+                                // Where programs or their folders cannot be
+                                // routed there is no rule to offer.
+                                visible: connRowItem._groupRule !== ""
+                                    && root.supports("appRouting")
+                                    && root.supports("appPathRules")
+                                text: root.tr("diag.conn-trace.rule-for-folder",
+                                    "Rule for this folder…")
+                                ToolTip.visible: hovered
+                                ToolTip.delay: 400
+                                ToolTip.text: Pure.displayText(connRowItem._groupRule)
+                                onClicked: section._ruleForConnFolder(connRowItem._groupRule)
+                            }
                         }
                         // Selection state (never for synthetic headers).
                         readonly property bool _selected:
@@ -1407,6 +1457,16 @@ ScrollView {
                                 onTriggered: section._explainConnRow(
                                     connRowItem._vRuleHost, connRowItem._vRemoteHostFirst,
                                     connRowItem._vRemoteAddr, connRowItem._vProcess)
+                            }
+                            // "Is it us or the site?" for the name this
+                            // connection was for.
+                            MenuItem {
+                                visible: connRowItem._vRemoteHostFirst !== ""
+                                    || connRowItem._vRuleHost !== ""
+                                text: root.tr("diag.conn-trace.check-site", "Check site…")
+                                onTriggered: root.notificationsController.checkSiteInDiagnostics(
+                                    connRowItem._vRemoteHostFirst !== ""
+                                        ? connRowItem._vRemoteHostFirst : connRowItem._vRuleHost)
                             }
                             MenuSeparator { }
                             MenuItem {

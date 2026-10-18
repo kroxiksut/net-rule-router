@@ -332,6 +332,34 @@ impl AppPath {
         self.text.strip_suffix('*').unwrap_or(&self.text)
     }
 
+    /// This rule as the disk has it: the same form at `place`, the real path
+    /// of its file or folder (behind junctions and links), with a path that
+    /// waits for the disk decided by `is_folder`. Enforcement-only: a decided
+    /// Unix file is spelled as written and reads back undecided, which
+    /// matches the same images.
+    ///
+    /// # Errors
+    ///
+    /// [`AppPathError::Malformed`] when `place` is no absolute path.
+    pub fn on_disk(&self, place: &str, is_folder: bool) -> Result<Self, AppPathError> {
+        let segments = path_segments(place, self.style, false).ok_or(AppPathError::Malformed)?;
+        if !starts_absolute(place.trim(), self.style) {
+            return Err(AppPathError::Malformed);
+        }
+        let kind = match self.kind {
+            AppPathKind::FileOrFolder if is_folder => AppPathKind::Folder,
+            AppPathKind::FileOrFolder => AppPathKind::File,
+            kind => kind,
+        };
+        let text = render(self.style, kind, &segments);
+        Ok(Self {
+            style: self.style,
+            kind,
+            segments,
+            text,
+        })
+    }
+
     /// Whether the program whose image is `image` — a full path as the OS
     /// reports it — is one this path names, and how: as the file itself or
     /// as a program of the folder.
@@ -350,8 +378,8 @@ impl AppPath {
             AppPathKind::FolderTree => folder
                 .starts_with(&self.segments)
                 .then_some(AppPathKind::FolderTree),
-            // TODO: the service decides file or folder by what is on disk when
-            // it applies the rule; until enforcement reads it, either matches.
+            // Either matches only what the disk allows: a file has no
+            // programs below it, and a folder is no program itself.
             AppPathKind::FileOrFolder => {
                 if file {
                     Some(AppPathKind::File)

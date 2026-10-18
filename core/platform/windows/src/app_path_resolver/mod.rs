@@ -388,6 +388,9 @@ mod windows_impl;
 #[cfg(target_os = "windows")]
 pub use windows_impl::WindowsAppPathResolver;
 
+#[cfg(target_os = "windows")]
+pub(crate) use windows_impl::expand_env;
+
 // Only the Windows-only cache TTL logic is tested here; the pure glob / dedup /
 // Noop / Mock tests live in `nrr-platform-api` with their code.
 #[cfg(all(test, target_os = "windows"))]

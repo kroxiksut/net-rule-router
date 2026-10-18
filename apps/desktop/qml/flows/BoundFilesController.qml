@@ -489,13 +489,152 @@ QtObject {
                     "The rule you added from the tray is in your rules. Save or discard your edits, then reload the rules to see it."))
             return
         }
+        // A form open over a row waits: the re-read would move the row.
+        if (root.ruleDialog && root.ruleDialog.visible) {
+            handleRulesChangedInService()
+            return
+        }
         // The window owns the linked files while it runs, hidden or not.
         root._refreshRulesFromService({
             silent: true,
             onComplete: function(ok) {
                 if (!ok) return
                 _reconcileBoundFileDirty()
-                _persistBoundFilesAfterApply()
+                _followServiceIntoFiles(false)
+            }
+        })
+    }
+
+    /// The rules in force changed, whoever wrote them. A clean table is
+    /// re-read and the linked files follow it; a table with edits is left
+    /// alone, and the service refuses its apply as built on old rules.
+    /// Settled for a moment first: one write announces itself more than once.
+    function handleRulesChangedInService() {
+        _serviceWriteSettle.restart()
+    }
+
+    property Timer _serviceWriteSettle: Timer {
+        interval: 400
+        repeat: false
+        onTriggered: boundFilesController._rereadAfterServiceWrite()
+    }
+
+    function _rereadAfterServiceWrite() {
+        if (!root || !root.bridgeAvailable) return
+        if (root.unsavedChangesRegistry && root.unsavedChangesRegistry["rules"]) return
+        // An apply of this window's own is still landing, or a form is open
+        // over a row the re-read would move.
+        if (root._guardRulesInFlight || root._offlineRulesPendingPush) return
+        if (root.ruleDialog && root.ruleDialog.visible) {
+            _serviceWriteSettle.restart()
+            return
+        }
+        root._refreshRulesFromService({
+            silent: true,
+            ifStale: true,
+            onComplete: function(ok, reloaded) {
+                if (!ok || !reloaded) return
+                _reconcileBoundFileDirty()
+                _followServiceIntoFiles(false)
+            }
+        })
+    }
+
+    // ── files edited by hand ─────────────────────────────────────────────
+
+    /// The bound routes as `[{ route, path }]`.
+    function _boundTargets() {
+        var targets = []
+        var primary = String(root.prefs.lastSavedPathPrimary || "")
+        var secondary = String(root.prefs.lastSavedPathSecondary || "")
+        if (primary !== "") targets.push({ route: "primary", path: primary })
+        if (secondary !== "") targets.push({ route: "secondary", path: secondary })
+        return targets
+    }
+
+    /// Splits the bound routes into the ones the table may write and the ones
+    /// whose file was edited by hand since the program wrote it AND says
+    /// something else than the table: `onSplit(free, held)`.
+    function _splitHandEdited(onSplit) {
+        var targets = _boundTargets()
+        if (targets.length === 0) { onSplit([], []); return }
+        var paths = []
+        for (var i = 0; i < targets.length; i += 1) paths.push(targets[i].path)
+        writer.handEdited(paths, function(edited) {
+            var free = []
+            var held = []
+            var pending = targets.length
+            var settle = function() { if (--pending === 0) onSplit(free, held) }
+            targets.forEach(function(t) {
+                if (edited.indexOf(t.path) < 0) { free.push(t); settle(); return }
+                // The same rules in other words lose nothing when rewritten.
+                writeRouteDiffers(t.route, t.path, function(differs) {
+                    if (differs) held.push(t); else free.push(t)
+                    settle()
+                })
+            })
+        })
+    }
+
+    /// The rules in force changed elsewhere and the table follows them: so do
+    /// the linked files, except one edited by hand since the program wrote
+    /// it. That one is kept and the user is asked (`rulesFileEditedDialog`).
+    function _followServiceIntoFiles(toast) {
+        if (String(root.prefs.lastSavedPathPrimary || "") === "")
+            root._filesSyncDirtyPrimary = false
+        if (String(root.prefs.lastSavedPathSecondary || "") === "")
+            root._filesSyncDirtySecondary = false
+        _splitHandEdited(function(free, held) {
+            _writeTargets(free, false, function(ok, written) {
+                if (toast && ok && written.length > 0) {
+                    root.statusLine = root.tr("status.bound-file-saved", "Bound rules file saved.")
+                        + " → " + written.join("\n")
+                }
+            })
+            for (var i = 0; i < held.length; i += 1) {
+                if (held[i].route === "primary") root._filesSyncDirtyPrimary = true
+                else root._filesSyncDirtySecondary = true
+            }
+            if (held.length > 0) _askAboutHandEdited(held)
+        })
+    }
+
+    /// The window opened: a file the tray left alone because it was edited by
+    /// hand is asked about now.
+    function askAboutHandEditedFiles() {
+        _splitHandEdited(function(free, held) {
+            if (held.length > 0) _askAboutHandEdited(held)
+        })
+    }
+
+    function _askAboutHandEdited(held) {
+        var dialog = root.rulesFileEditedDialog
+        if (!dialog) return
+        // A second write while the question is up adds its files to it.
+        var targets = dialog.opened ? dialog.targets.slice() : []
+        for (var i = 0; i < held.length; i += 1) {
+            var known = false
+            for (var j = 0; j < targets.length; j += 1) {
+                if (targets[j].path === held[i].path) known = true
+            }
+            if (!known) targets.push(held[i])
+        }
+        dialog.targets = targets
+        if (!dialog.opened) dialog.open()
+    }
+
+    /// "Take the file": the files go into the merge review against the rules
+    /// in force, and what the user keeps is applied there.
+    function takeHandEditedFiles() {
+        if (root.driftController) root.driftController._openMergeDialog()
+    }
+
+    /// "Replace the file": the rules in force overwrite the hand edit.
+    function overwriteHandEditedFiles(targets) {
+        _writeTargets(targets || [], false, function(ok, written) {
+            if (ok && written.length > 0) {
+                root.statusLine = root.tr("status.bound-file-saved", "Bound rules file saved.")
+                    + " → " + written.join("\n")
             }
         })
     }
@@ -527,6 +666,10 @@ QtObject {
                     "Addresses a routed site needs were added to your rules. Save or discard your edits, then reload the rules to see them."))
             return
         }
+        if (root.ruleDialog && root.ruleDialog.visible) {
+            handleRulesChangedInService()
+            return
+        }
         root._refreshRulesFromService({
             silent: true,
             onComplete: function(ok) {
@@ -544,7 +687,7 @@ QtObject {
         if (hasPrimary) root._filesSyncDirtyPrimary = true
         if (hasSecondary) root._filesSyncDirtySecondary = true
         if (hasPrimary || hasSecondary) {
-            _writeBoundFiles(true, null, true)
+            _followServiceIntoFiles(true)
             return
         }
         root.statusLine = moved

@@ -98,6 +98,8 @@ enum Note {
     CheckNothing,
     Failed(CallError),
     NoItem(usize),
+    /// Line mode: the item printed under that number is no longer offered.
+    Gone(usize),
     NothingToDo(usize),
     Cancelled,
     Offline,
@@ -128,8 +130,15 @@ pub struct Suggestions {
     loading: bool,
     /// A re-read asked for while one was in flight.
     reload_owed: bool,
-    /// Index into the shown groups.
+    /// Index into the shown groups, as last put; read through
+    /// [`Suggestions::chosen`].
     selected: usize,
+    /// The chosen group ([`group_key`]): the list is re-read on every change,
+    /// so a position alone would soon name another site.
+    selected_key: Option<String>,
+    /// Line mode: the groups as last printed, so a typed number names the
+    /// site the user read under it.
+    printed: Vec<String>,
     show_dismissed: bool,
     show_served: bool,
     sort: SortMode,
@@ -151,9 +160,26 @@ impl Suggestions {
         )
     }
 
-    fn select(&mut self, index: usize, count: usize) {
-        self.selected = index.min(count.saturating_sub(1));
+    /// Where the chosen group stands in `shown`; a group that has left the
+    /// list leaves the position as it was.
+    fn chosen(&self, shown: &[SuggestionGroup]) -> usize {
+        if let Some(key) = &self.selected_key {
+            if let Some(at) = shown.iter().position(|g| group_key(g) == *key) {
+                return at;
+            }
+        }
+        self.selected.min(shown.len().saturating_sub(1))
     }
+
+    fn select(&mut self, index: usize, shown: &[SuggestionGroup]) {
+        self.selected = index.min(shown.len().saturating_sub(1));
+        self.selected_key = shown.get(self.selected).map(group_key);
+    }
+}
+
+/// A group's identity across re-reads: its site, or its program.
+fn group_key(group: &SuggestionGroup) -> String {
+    format!("{}|{}", u8::from(group.is_app), group.domain)
 }
 
 pub struct SuggestionsScreen;
@@ -213,13 +239,14 @@ impl Screen for SuggestionsScreen {
                 _ => false,
             };
         }
-        let count = app.suggestions.shown().len();
-        let selected = app.suggestions.selected;
+        let shown = app.suggestions.shown();
+        let count = shown.len();
+        let selected = app.suggestions.chosen(&shown);
         match key.code {
-            KeyCode::Up => move_to(app, selected.saturating_sub(1), count),
-            KeyCode::Down => move_to(app, selected + 1, count),
-            KeyCode::Home => move_to(app, 0, count),
-            KeyCode::End => move_to(app, count.saturating_sub(1), count),
+            KeyCode::Up => move_to(app, selected.saturating_sub(1), &shown),
+            KeyCode::Down => move_to(app, selected + 1, &shown),
+            KeyCode::Home => move_to(app, 0, &shown),
+            KeyCode::End => move_to(app, count.saturating_sub(1), &shown),
             KeyCode::Char(c) => return command(app, c, selected),
             _ => return false,
         }
@@ -243,19 +270,28 @@ impl Screen for SuggestionsScreen {
         if rest.is_empty() {
             return matches!(letter, 'c' | 's' | 'v' | 'o') && command(app, letter, 0);
         }
-        if !matches!(letter, 'a' | 'z' | 'n' | 'r' | 'm') {
+        if !matches!(letter, 'a' | 'z' | 'n' | 'r' | 'm' | 'k') {
             return false;
         }
         let Ok(number) = rest.parse::<usize>() else {
             return false;
         };
-        let count = app.suggestions.shown().len();
-        if number == 0 || number > count {
-            app.suggestions.note = Some(Note::NoItem(number));
-            return true;
+        let shown = app.suggestions.shown();
+        let now: Vec<String> = shown.iter().map(group_key).collect();
+        match super::numbered_now(&app.suggestions.printed, &now, number) {
+            super::Numbered::At(at) => {
+                app.suggestions.select(at, &shown);
+                command(app, letter, at)
+            }
+            super::Numbered::Gone => {
+                app.suggestions.note = Some(Note::Gone(number));
+                true
+            }
+            super::Numbered::NoSuch => {
+                app.suggestions.note = Some(Note::NoItem(number));
+                true
+            }
         }
-        app.suggestions.select(number - 1, count);
-        command(app, letter, number - 1)
     }
 
     fn plain_prompt(&self, app: &AppState) -> Option<Key> {
@@ -264,19 +300,23 @@ impl Screen for SuggestionsScreen {
             .as_ref()
             .map(|_| keys::CONFIRM_PROMPT)
     }
+
+    fn on_printed(&self, app: &mut AppState) {
+        app.suggestions.printed = app.suggestions.shown().iter().map(group_key).collect();
+    }
 }
 
-fn move_to(app: &mut AppState, index: usize, count: usize) {
-    app.suggestions.select(index, count);
+fn move_to(app: &mut AppState, index: usize, shown: &[SuggestionGroup]) {
+    app.suggestions.select(index, shown);
     app.scroll = scroll_for(&app.suggestions);
 }
 
 /// The list's first row of the chosen item, so moving keeps it in view.
 fn scroll_for(state: &Suggestions) -> u16 {
-    let rows: usize = state
-        .shown()
+    let shown = state.shown();
+    let rows: usize = shown
         .iter()
-        .take(state.selected)
+        .take(state.chosen(&shown))
         .map(group_line_count)
         .sum();
     u16::try_from(rows).unwrap_or(u16::MAX)
@@ -295,6 +335,7 @@ fn command(app: &mut AppState, letter: char, index: usize) -> bool {
             probe(app);
             return true;
         }
+        'k' => return check_site(app, index),
         's' => {
             app.suggestions.show_dismissed = !app.suggestions.show_dismissed;
             reselect(app);
@@ -316,9 +357,28 @@ fn command(app: &mut AppState, letter: char, index: usize) -> bool {
     true
 }
 
+/// "Is it us or the site?" for a site the user opened that kept failing on
+/// the main route; checked in Diagnostics. `false` for any other item.
+fn check_site(app: &mut AppState, index: usize) -> bool {
+    let shown = app.suggestions.shown();
+    let Some(site) = shown.get(index).and_then(|group| {
+        group
+            .hosts
+            .iter()
+            .find(|h| h.signal == nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED)
+            .map(|h| h.match_value.clone())
+    }) else {
+        return false;
+    };
+    app.open(crate::screens::ScreenId::Diagnostics);
+    crate::screens::inspect::diagnostics::check_site(app, &site);
+    true
+}
+
 /// After the list changed shape: the first item, at the top.
 fn reselect(app: &mut AppState) {
-    app.suggestions.selected = 0;
+    let shown = app.suggestions.shown();
+    app.suggestions.select(0, &shown);
     app.scroll = 0;
 }
 
@@ -418,8 +478,9 @@ fn loaded(
             state.inert_sample = pending.inert_sample;
             state.dismissed = answered.dismissed;
             state.loaded = true;
-            let count = state.shown().len();
-            state.select(state.selected, count);
+            let shown = state.shown();
+            let at = state.chosen(&shown);
+            state.select(at, &shown);
         }
         (Err(error), _) | (_, Err(error)) => state.note = Some(Note::Failed(error)),
     }
@@ -698,6 +759,7 @@ fn note_text(note: &Note, texts: &Texts) -> String {
         Note::CheckNothing => texts.get(keys::CHECK_NOTHING),
         Note::Failed(error) => texts.fill(keys::FAILED, &[("error", error.text(texts))]),
         Note::NoItem(n) => item(keys::NO_ITEM, *n),
+        Note::Gone(n) => item(keys::ITEM_GONE, *n),
         Note::NothingToDo(n) => item(keys::NOTHING_TO_DO, *n),
         Note::Cancelled => texts.get(keys::CANCELLED),
         Note::Offline => texts.get(common::ROUTING_DISCONNECTED),
@@ -715,10 +777,11 @@ fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         return vec![ViewLine::text(empty_text(state, texts))];
     }
     let focused = app.focus == Focus::Feed;
+    let chosen = state.chosen(&shown);
     shown
         .iter()
         .enumerate()
-        .flat_map(|(i, group)| group_lines(group, i, focused && i == state.selected, texts))
+        .flat_map(|(i, group)| group_lines(group, i, focused && i == chosen, texts))
         .collect()
 }
 

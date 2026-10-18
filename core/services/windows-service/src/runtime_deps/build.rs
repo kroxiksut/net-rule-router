@@ -251,6 +251,14 @@ pub(crate) fn build_supervised_runtime_deps(
             }
         })
     };
+    // A dropped connection names its program in the kernel's device spelling;
+    // rules by path are written with drive letters.
+    nrr_service_runtime::app_observation_lookup::global_app_observations().set_image_normalizer(
+        Arc::new(|image: &str| {
+            nrr_platform_windows::win32_path_from_nt_path_cached(image)
+                .map(|path| path.to_string_lossy().into_owned())
+        }),
+    );
     // A finished disk walk changes what app rules resolve to, and nothing it
     // finds is stored anywhere a pass's inputs can see, so it is an input of
     // its own.

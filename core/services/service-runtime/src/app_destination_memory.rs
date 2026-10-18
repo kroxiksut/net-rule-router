@@ -280,7 +280,7 @@ impl AppDestinationMemory {
             // The column is `app_key` and the observation store answers on
             // keys; persisting the rule spelling instead left rows nothing
             // could later withdraw.
-            let key = crate::app_observation_lookup::app_key(&pattern);
+            let key = crate::app_observation_lookup::observation_key(&pattern);
             // Shared observations are written once; a user's own, once each.
             let written_as = match owner {
                 Some(owner) => format!("{owner}/{key}"),
@@ -323,10 +323,10 @@ impl AppDestinationMemory {
 /// Whether `book` would let `flush` write `ip` for the application keyed `key`.
 /// Keys are compared normalised: earlier builds stored the rule spelling.
 fn admits(book: &CanonicalRuleBook, key: &str, ip: Ipv4Addr) -> bool {
-    let key = crate::app_observation_lookup::app_key(key);
+    let key = crate::app_observation_lookup::observation_key(key);
     routed_app_patterns(&book.secondary)
         .iter()
-        .any(|pattern| crate::app_observation_lookup::app_key(pattern) == key)
+        .any(|pattern| crate::app_observation_lookup::observation_key(pattern) == key)
         && !named_by_address_rule(book, ip)
 }
 
@@ -361,11 +361,10 @@ pub fn routed_app_patterns(set: &CanonicalRuleSet) -> BTreeSet<String> {
         .filter(|r| r.enabled && matches!(r.action, RuleAction::Route))
         .filter(|r| r.address_match.is_none())
         .filter_map(|r| r.app_match.as_ref())
-        .filter_map(|app| match &app.pattern {
-            CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => Some(s.clone()),
-            // TODO: a path rule learns destinations once its programs can be
-            // listed; until then it names none.
-            CanonicalAppPattern::Path(_) => None,
+        .map(|app| match &app.pattern {
+            CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.clone(),
+            // Its observations are kept under its canonical spelling.
+            CanonicalAppPattern::Path(path) => path.as_str().to_string(),
         })
         .collect()
 }

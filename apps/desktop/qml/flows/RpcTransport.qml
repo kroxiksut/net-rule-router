@@ -242,6 +242,18 @@ QtObject {
             ? bridge.rpcConnHistorySettingsSet(payload || {})
             : ""
     }
+    // Start checking a site over the caller's own routes; the answer is read
+    // with `rpcSiteCheckResult` until its state is "done".
+    function rpcSiteCheckRun(host) {
+        return (bridgeAvailable && typeof bridge.rpcSiteCheckRun === "function")
+            ? bridge.rpcSiteCheckRun(String(host || ""))
+            : ""
+    }
+    function rpcSiteCheckResult() {
+        return (bridgeAvailable && typeof bridge.rpcSiteCheckResult === "function")
+            ? bridge.rpcSiteCheckResult()
+            : ""
+    }
     // Where one program connected lately, for the VPN-gateway helper.
     function rpcVpnGatewayCandidatesList(program) {
         return (bridgeAvailable && typeof bridge.rpcVpnGatewayCandidatesList === "function")

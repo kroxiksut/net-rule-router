@@ -30,6 +30,9 @@ ApplicationWindow {
     property var prefs: ({ routeIncludeSubdomains: true })
     /// Always a new rule here.
     property int editingRule: -1
+    /// The rule the form edits, as the main window keeps it; the tray's form
+    /// only ever adds, so nothing reads it here.
+    property string editingRuleKey: ""
     readonly property color textColor: uiTheme.colorText
     readonly property color mutedTextColor: uiTheme.colorTextMuted
     property alias ruleTypesModel: ruleTypesModel
@@ -457,15 +460,18 @@ ApplicationWindow {
 
     function _send(plan) {
         var json = ""
+        var refusal = ""
         try {
             json = Rules.buildRulesJson(plan.rows, support.aceCodec.encode)
         } catch (err) {
             console.error("tray add-rule: rules serialization failed:", err)
+            refusal = Rules.wireRefusalCode(err)
         }
         var submitter = trayHost.rulesSubmitter
         if (!json || !submitter || typeof submitter.applyNow !== "function") {
-            _fail("error", tr("status.rules-serialize-failed",
-                "Internal error while preparing rules — see logs"))
+            _fail("error", refusal !== "" ? Pure.ipcErrorLabel(refusal, null, tr)
+                : tr("status.rules-serialize-failed",
+                    "Internal error while preparing rules — see logs"))
             return
         }
         submitter.applyNow(json, "tray-add-rule",
@@ -592,15 +598,19 @@ ApplicationWindow {
                 return
             }
             var json = ""
+            var refusal = ""
             try {
                 json = Rules.buildRulesJson(plan.rows, support.aceCodec.encode)
             } catch (err) {
                 console.error("tray add-rule undo: rules serialization failed:", err)
+                refusal = Rules.wireRefusalCode(err)
             }
             var submitter = trayRuleWindow.trayHost.rulesSubmitter
             if (!json || !submitter || typeof submitter.applyNow !== "function") {
-                trayRuleWindow._undoDone(tr("status.rules-serialize-failed",
-                    "Internal error while preparing rules \u2014 see logs"))
+                trayRuleWindow._undoDone(refusal !== ""
+                    ? Pure.ipcErrorLabel(refusal, null, trayRuleWindow.tr)
+                    : tr("status.rules-serialize-failed",
+                        "Internal error while preparing rules \u2014 see logs"))
                 return
             }
             submitter.applyNow(json, "tray-add-rule-undo",

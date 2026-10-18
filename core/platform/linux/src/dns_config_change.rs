@@ -21,6 +21,12 @@ use nrr_platform_api::dns_config_change::DnsConfigChangeObserver;
 use nrr_platform_api::error::PlatformError;
 use nrr_platform_api::network_change::{NetworkChangeCallback, NetworkChangeSubscription};
 
+#[cfg(any(target_os = "linux", test))]
+use crate::inotify_events::events;
+#[cfg(target_os = "linux")]
+use crate::inotify_events::fd::{close_fd, open_wake_pipe};
+use crate::inotify_events::{InotifyEvent, IN_Q_OVERFLOW};
+
 /// A directory to watch, and which of its entries matter (`None`: any).
 #[derive(Clone, Debug)]
 pub struct WatchedDir {
@@ -94,48 +100,7 @@ impl DnsConfigChangeObserver for LinuxDnsConfigChangeObserver {
     }
 }
 
-// ── Event parsing (pure; tested on every host) ───────────────────────────────
-
-/// `struct inotify_event` without its name: wd, mask, cookie, len.
-const EVENT_HEADER_LEN: usize = 16;
-/// The kernel dropped events; something changed, we do not know what.
-const IN_Q_OVERFLOW: u32 = 0x4000;
-
-/// One event: the watch it came from, its mask and the entry name.
-#[derive(Debug, PartialEq, Eq)]
-struct InotifyEvent<'a> {
-    wd: i32,
-    mask: u32,
-    name: &'a str,
-}
-
-/// Walk a read buffer. A length running past the buffer ends the walk rather
-/// than reading garbage as the next header.
-fn events(buffer: &[u8]) -> Vec<InotifyEvent<'_>> {
-    let mut out = Vec::new();
-    let mut offset = 0usize;
-    while offset + EVENT_HEADER_LEN <= buffer.len() {
-        let word = |at: usize| {
-            let b = &buffer[offset + at..offset + at + 4];
-            [b[0], b[1], b[2], b[3]]
-        };
-        let wd = i32::from_ne_bytes(word(0));
-        let mask = u32::from_ne_bytes(word(4));
-        let len = u32::from_ne_bytes(word(12)) as usize;
-        let start = offset + EVENT_HEADER_LEN;
-        let Some(raw) = buffer.get(start..start + len) else {
-            break;
-        };
-        let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-        out.push(InotifyEvent {
-            wd,
-            mask,
-            name: std::str::from_utf8(&raw[..end]).unwrap_or(""),
-        });
-        offset = start + len;
-    }
-    out
-}
+// ── Event filtering (pure; tested on every host) ─────────────────────────────
 
 /// Does any event touch an entry the watch cares about?
 fn is_relevant(events: &[InotifyEvent<'_>], filter_of: impl Fn(i32) -> Option<Filter>) -> bool {
@@ -241,35 +206,12 @@ impl InotifyWatcher {
 #[cfg(target_os = "linux")]
 impl Drop for InotifyWatcher {
     fn drop(&mut self) {
-        let byte = 1u8;
-        // SAFETY: `wake_writer` is owned by this value and still open; the
-        // buffer is live for the call.
-        unsafe {
-            libc::write(
-                self.wake_writer,
-                std::ptr::addr_of!(byte).cast::<libc::c_void>(),
-                1,
-            );
-        }
+        crate::inotify_events::fd::wake(self.wake_writer);
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
         close_fd(self.wake_writer);
     }
-}
-
-#[cfg(target_os = "linux")]
-fn open_wake_pipe() -> Result<(libc::c_int, libc::c_int), PlatformError> {
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `fds` is a live two-element array, which is what `pipe2` writes.
-    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    if rc < 0 {
-        return Err(PlatformError::Transient {
-            operation: "open inotify wake pipe",
-            detail: std::io::Error::last_os_error().to_string(),
-        });
-    }
-    Ok((fds[0], fds[1]))
 }
 
 #[cfg(target_os = "linux")]
@@ -326,14 +268,6 @@ fn read_until_woken(
         if is_relevant(&events(&buffer[..read as usize]), filter_of) {
             on_change();
         }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn close_fd(fd: libc::c_int) {
-    // SAFETY: every caller passes a descriptor it owns and does not reuse.
-    unsafe {
-        libc::close(fd);
     }
 }
 

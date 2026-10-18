@@ -128,6 +128,12 @@ pub fn handle_local_request(
         "local.user-settings.intent-record" => {
             Ok(crate::user_settings_bridge::intent_record(payload)?)
         }
+        "local.user-settings.rules-file-written" => {
+            Ok(crate::user_settings_bridge::rules_file_written(payload)?)
+        }
+        "local.user-settings.rules-files-hand-edited" => Ok(
+            crate::user_settings_bridge::rules_files_hand_edited(payload)?,
+        ),
         other => Err(LocalHandlerError::UnknownOperation(other.to_string())),
     }
 }
@@ -861,6 +867,20 @@ mod tests {
         let h2 = hash_of(&p);
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64); // SHA-256 hex
+    }
+
+    /// Compared with the service's content hash, so its spelling must not
+    /// move with the crypto crate: fixed-width lowercase hex of the canonical
+    /// bytes (an empty book folds to schema version 1).
+    #[test]
+    fn the_hash_is_pinned() {
+        let p = json!({
+            "rules-json": r#"{"secondary":[],"primary":[],"schema-version":5}"#,
+        });
+        assert_eq!(
+            hash_of(&p),
+            "7ac5fe4ff283a206304016996b76858c16d63b9d1079b9434244700b15390152"
+        );
     }
 
     #[test]
