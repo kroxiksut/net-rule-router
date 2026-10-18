@@ -41,7 +41,7 @@ nrr-domain = { path = "../../core/domain" }
 # Already linked through nrr-domain.
 idna = "1"
 # The rules apply's `content-hash`, the SHA-256 the GUI's bridge computes.
-sha2 = "0.10"
+sha2 = "0.11"
 # Rule-set bytes for the preset import, which the service takes base64-encoded.
 # The version the service already links.
 base64 = "0.22"

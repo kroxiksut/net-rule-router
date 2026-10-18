@@ -31,7 +31,7 @@ nrr-storage = { path = "../../storage" }
 nrr-sqlite-support = { path = "../../sqlite-support" }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
-sha2        = "0.10"
+sha2        = "0.11"
 # OS CSPRNG for the DB-MAC signing key. Used by
 # the platform-agnostic `key_store::generate_signing_key` so the
 # service-runtime bootstrap never hand-rolls randomness.

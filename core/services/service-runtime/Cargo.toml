@@ -57,7 +57,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # unwrapped canonical txt bytes (`PresetExportGetResponse::content_hash`).
 # `sha2` is already a transitive dep via nrr-diagnostics and
 # nrr-storage; named here so the boundary check stays explicit.
-sha2 = "0.10"
+sha2 = "0.11"
 # PresetExportGet and SettingsExportFull responses wrap
 # file bytes in base64 (RFC 4648 standard alphabet, padded) so the
 # wire framing stays text-safe.

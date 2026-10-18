@@ -18,7 +18,7 @@ nrr-platform-api = { path = "../platform/api" }
 nrr-sqlite-support = { path = "../sqlite-support" }
 rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 bitflags = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 # HMAC-SHA256 over canonical revision row content
 # for tamper detection. Key lives in DPAPI-protected per-user storage
 # (LocalSystem profile); the algorithm itself stays in this crate

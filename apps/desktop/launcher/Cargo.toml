@@ -52,7 +52,7 @@ serde_json = "1.0"
 # drift-compare against the service's wire `content_hash` without dragging a
 # crypto dep through every consumer of the contracts crate (see
 # `shared/contracts/src/rules_json.rs` rationale).
-sha2 = "0.10"
+sha2 = "0.11"
 # Typed error envelope for preset.* RPC ops. Kept narrow to the launcher's
 # local handlers; the parser itself in `nrr-shared::preset_parser` is total
 # and doesn't surface errors.

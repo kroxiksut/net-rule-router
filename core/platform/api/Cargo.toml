@@ -29,7 +29,7 @@ serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 # `snapshot` computes SHA-256 hashes of the platform state for
 # idempotency/rollback; sha2 is pure-Rust and OS-neutral.
-sha2 = "0.10"
+sha2 = "0.11"
 # `interface_rows` neutral types + `from_wire_dto` reference the wire
 # DTOs and route-role enums in nrr-shared (contracts crate, fully OS-neutral).
 nrr-shared = { path = "../../../shared/contracts" }
