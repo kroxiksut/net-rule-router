@@ -66,7 +66,7 @@ base64 = "0.22"
 # flows addressed to the fake pool. Minimal feature set — IP medium only
 # (the TUN adapter is L3), v4+v6, TCP sockets; UDP replies are hand-built
 # with the `wire` types, so no UDP socket machinery is pulled in.
-smoltcp = { version = "0.13", default-features = false, features = [
+smoltcp = { version = "0.14", default-features = false, features = [
     "std",
     "medium-ip",
     "proto-ipv4",
