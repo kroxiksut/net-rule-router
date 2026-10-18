@@ -372,6 +372,9 @@ impl ActivationCoordinator {
         if let Some(network) = network_on_both_routes(&submission.rules_json, carried.as_deref()) {
             return Err(PolicyError::NetworkOnBothRoutes { network });
         }
+        if let Some(folder) = folder_on_both_routes(&submission.rules_json, carried.as_deref()) {
+            return Err(PolicyError::FolderOnBothRoutes { folder });
+        }
         let conn = self.conn.lock().expect("connection mutex poisoned");
         let repo = self.revisions_repo(&conn);
         let principal = submission.principal.as_str();
@@ -528,13 +531,28 @@ impl ActivationCoordinator {
 
     // ── activate ─────────────────────────────────────────────────────────────
 
-    /// `pub(crate)` for single-channel enforcement,
-    /// see [`Self::submit_candidate`].
+    /// Activation with no base revision; production goes through
+    /// [`Self::activate_over`].
+    #[cfg(test)]
     pub(crate) fn activate(
         &self,
         revision_id: &RevisionId,
         token: &ConfirmationToken,
         correlation_id: &str,
+    ) -> Result<ActivationOutcome, PolicyError> {
+        self.activate_over(revision_id, token, correlation_id, None)
+    }
+
+    /// Activation of a write built from the rules named `base`
+    /// ([`crate::production_rules_provider::base_revision_of`]): refused with
+    /// [`PolicyError::RulesChangedElsewhere`] when they are no longer in force.
+    /// Checked inside the gate, so a write that waited for another one sees it.
+    pub(crate) fn activate_over(
+        &self,
+        revision_id: &RevisionId,
+        token: &ConfirmationToken,
+        correlation_id: &str,
+        base: Option<&str>,
     ) -> Result<ActivationOutcome, PolicyError> {
         // Taken before the status check, so a second confirm of the same
         // revision waits and then finds it already active.
@@ -554,6 +572,9 @@ impl ActivationCoordinator {
         // Derive the owning principal once; every storage
         // transition below is scoped to it.
         let principal = self.principal_of(revision_id)?;
+        if let Some(base) = base {
+            self.refuse_if_rules_moved(&principal, revision_id, base)?;
+        }
 
         // Phase 1.
         let now = self.clock.now_secs();
@@ -662,7 +683,7 @@ impl ActivationCoordinator {
     /// so the caller can:
     ///
     /// 1. Call [`Self::issue_confirmation_token`] against the returned id.
-    /// 2. Call [`Self::activate`] with that token.
+    /// 2. Call [`Self::activate_over`] with that token.
     ///
     /// The split exists because [`Self::issue_confirmation_token`]
     /// validates the token against an existing candidate row — issuing
@@ -716,7 +737,7 @@ impl ActivationCoordinator {
 
     /// Convenience wrapper combining [`Self::prepare_rollback_candidate`],
     /// auto-issued [`ConfirmationToken`] (5-minute TTL), and
-    /// [`Self::activate`]. Suitable for service-internal callers (e.g.
+    /// [`Self::activate_over`]. Suitable for service-internal callers (e.g.
     /// crash recovery, automated rollback paths) that do not need to
     /// surface the candidate to a user before activation.
     ///
@@ -731,10 +752,22 @@ impl ActivationCoordinator {
         target: RollbackTarget,
         correlation_id: &str,
     ) -> Result<ActivationOutcome, PolicyError> {
+        self.rollback_to_over(principal, target, correlation_id, None)
+    }
+
+    /// [`Self::rollback_to`] for a write built from the rules named `base`
+    /// (see [`Self::activate_over`]).
+    pub(crate) fn rollback_to_over(
+        &self,
+        principal: &str,
+        target: RollbackTarget,
+        correlation_id: &str,
+        base: Option<&str>,
+    ) -> Result<ActivationOutcome, PolicyError> {
         let new_id = self.prepare_rollback_candidate(principal, target, correlation_id)?;
         let token = self.issue_confirmation_token(&new_id, 300)?;
 
-        let outcome = self.activate(&new_id, &token, correlation_id)?;
+        let outcome = self.activate_over(&new_id, &token, correlation_id, base)?;
         if let ActivationOutcome::Activated { .. } | ActivationOutcome::AppliedWithDrift { .. } =
             &outcome
         {
@@ -789,6 +822,12 @@ impl ActivationCoordinator {
         principal: &str,
         correlation_id: &str,
     ) -> Result<usize, PolicyError> {
+        // An activation of the same user mid-flight would otherwise commit its
+        // pointer over a store already back on the baseline.
+        let _pass = self
+            .activation_gate
+            .enter(self.activation_wait)
+            .ok_or(PolicyError::ActivationBusy)?;
         let deleted = {
             let conn = self.conn.lock().expect("connection mutex poisoned");
             self.revisions_repo(&conn)
@@ -859,6 +898,60 @@ impl ActivationCoordinator {
             }
             found => found.ok().flatten(),
         }
+    }
+
+    /// The base a write by `principal` must name to be applied.
+    pub(crate) fn base_revision_for(&self, principal: &str) -> Result<String, PolicyError> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        crate::production_rules_provider::base_revision_for(&conn, principal).map_err(|message| {
+            PolicyError::StorageFailure {
+                operation: "base_revision",
+                message,
+            }
+        })
+    }
+
+    /// Refuse `revision_id` when the rules in force for `principal` are no
+    /// longer `base`. The candidate is rejected, so it never reads as an edit
+    /// still pending.
+    fn refuse_if_rules_moved(
+        &self,
+        principal: &str,
+        revision_id: &RevisionId,
+        base: &str,
+    ) -> Result<(), PolicyError> {
+        if self.base_revision_for(principal)? == base {
+            return Ok(());
+        }
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        if let Err(e) = self.revisions_repo(&conn).mark_apply_failed_for(
+            principal,
+            revision_id.as_str(),
+            nrr_shared::ipc_payloads::RULES_CHANGED_ELSEWHERE,
+            self.clock.now_secs(),
+        ) {
+            tracing::warn!(
+                target: "nrr::activation",
+                revision_id = %revision_id,
+                error = %e,
+                "a write over moved rules could not be marked rejected",
+            );
+        }
+        Err(PolicyError::RulesChangedElsewhere)
+    }
+
+    /// Whether `principal` runs the baseline: no revision of its own, active
+    /// or mid-activation. `false` on a storage error.
+    pub(crate) fn inherits_baseline(&self, principal: &str) -> bool {
+        if principal == nrr_storage::BASELINE_PRINCIPAL {
+            return false;
+        }
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        crate::applying_revision_overlay::applying_for(&conn, principal).is_none()
+            && matches!(
+                self.revisions_repo(&conn).get_active_for(principal),
+                Ok(None)
+            )
     }
 
     pub fn last_known_good(&self) -> Result<Option<RevisionId>, PolicyError> {
@@ -932,6 +1025,33 @@ pub(crate) fn network_on_both_routes(
     rules_json: &str,
     carried_rules_json: Option<&str>,
 ) -> Option<String> {
+    tie_on_both_routes(
+        rules_json,
+        carried_rules_json,
+        nrr_domain::validation::networks_on_both_routes,
+    )
+}
+
+/// A program folder both routes name in the same form, unless the book in
+/// force already did: the same tie as a network, spared the same way.
+pub(crate) fn folder_on_both_routes(
+    rules_json: &str,
+    carried_rules_json: Option<&str>,
+) -> Option<String> {
+    tie_on_both_routes(
+        rules_json,
+        carried_rules_json,
+        nrr_domain::validation::folders_on_both_routes,
+    )
+}
+
+/// The first value `ties` finds on both routes of `rules_json` that the book
+/// in force did not already hold.
+fn tie_on_both_routes(
+    rules_json: &str,
+    carried_rules_json: Option<&str>,
+    ties: fn(&nrr_domain::canonical::CanonicalRuleBook) -> Vec<String>,
+) -> Option<String> {
     let decode = |dto| {
         nrr_domain::rules_json_codec::decode(dto, nrr_domain::rules_file::HostPlatform::compiled())
             .ok()
@@ -945,11 +1065,9 @@ pub(crate) fn network_on_both_routes(
             crate::production_rules_provider::read_stored_rules(json, "rules-in-force").ok()
         })
         .and_then(decode)
-        .map(|carried| nrr_domain::validation::networks_on_both_routes(&carried))
+        .map(|carried| ties(&carried))
         .unwrap_or_default();
-    nrr_domain::validation::networks_on_both_routes(&book)
-        .into_iter()
-        .find(|network| !held.contains(network))
+    ties(&book).into_iter().find(|tie| !held.contains(tie))
 }
 
 /// The first rule whose text would break the rules file on export. `None` for
@@ -963,8 +1081,10 @@ pub(crate) fn control_character_in_rules(
 
 /// The rules `rules_json` carries with a value the rules table marks as an
 /// error, sparing a value the book in force (`carried_rules_json`) already
-/// holds. Like the shape gate it is not the decoder's: a stored revision must
-/// keep decoding. Empty for an undecodable payload, which the codec refuses.
+/// holds. A protected program or folder is not refused here: the rule is
+/// accepted and withheld from enforcement (`protected_rules`). Like the shape
+/// gate it is not the decoder's: a stored revision must keep decoding. Empty
+/// for an undecodable payload, which the codec refuses.
 pub(crate) fn rules_with_refused_values(
     rules_json: &str,
     carried_rules_json: Option<&str>,

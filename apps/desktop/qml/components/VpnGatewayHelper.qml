@@ -199,8 +199,9 @@ ColumnLayout {
         Layout.maximumWidth: 460
         model: helper._detected
         currentIndex: -1
+        labelResolver: function(item) { return Pure.displayText(item) }
         displayText: root.uiRevision >= 0 && currentIndex >= 0
-            ? String(helper._detected[currentIndex] || "")
+            ? Pure.displayText(helper._detected[currentIndex])
             : root.tr("settings.routing.vpn-gateway.detected", "Pick a found program")
         onActivated: function(index) { programField.text = String(helper._detected[index] || "") }
     }
@@ -258,7 +259,7 @@ ColumnLayout {
             if (helper._candidates.length === 0)
                 return root.tr("settings.routing.vpn-gateway.empty",
                     "{program} has not connected anywhere on the internet recently. Start the VPN and let it try to connect, then search again.")
-                    .replace("{program}", Rules.vpnProgramFileName(programField.text))
+                    .replace("{program}", Pure.displayText(Rules.vpnProgramFileName(programField.text)))
             return ""
         }
     }
@@ -293,10 +294,11 @@ ColumnLayout {
                 checked: helper._isSelected(String(modelData.hostname || ""))
                 text: root.uiRevision >= 0
                     ? root.tr("settings.routing.vpn-gateway.by-name", "By name: {host}")
-                        .replace("{host}", String(modelData.hostname || ""))
+                        .replace("{host}", Pure.displayText(modelData.hostname))
                     : ""
                 contentItem: Label {
                     text: nameCheck.text
+                    textFormat: Text.PlainText
                     leftPadding: nameCheck.indicator.width + nameCheck.spacing
                     color: root.textColor
                     wrapMode: Text.WordWrap

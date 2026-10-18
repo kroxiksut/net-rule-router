@@ -10,6 +10,9 @@
     { "name": "zone", "input": { "row": { "ruleType": "zone", "targetRoute": "primary", "verify": true } }, "expected": false },
     { "name": "subnet", "input": { "row": { "ruleType": "subnet", "targetRoute": "secondary", "verify": true } }, "expected": false },
     { "name": "application", "input": { "row": { "ruleType": "application", "targetRoute": "secondary", "verify": true } }, "expected": false },
-    { "name": "unknown route", "input": { "row": { "ruleType": "domain", "targetRoute": "verify", "verify": true } }, "expected": false }
+    { "name": "unknown route", "input": { "row": { "ruleType": "domain", "targetRoute": "verify", "verify": true } }, "expected": false },
+    { "name": "site in every zone", "input": { "row": { "ruleType": "domain", "targetRoute": "secondary", "verify": true, "matchValue": "example.*" } }, "expected": false },
+    { "name": "site in every zone with subdomains", "input": { "row": { "ruleType": "suffix-domain", "targetRoute": "primary", "verify": true, "matchValue": " *.example.* " } }, "expected": false },
+    { "name": "exact host keeps it", "input": { "row": { "ruleType": "domain", "targetRoute": "secondary", "verify": true, "matchValue": "example.com" } }, "expected": true }
   ]
 }

@@ -176,6 +176,7 @@ pub fn write_qt_context_file_at(
     backend_status: &BackendConnectionStatus,
     service_started_on_launch: bool,
     answer_deadlines: &HostAnswerDeadlines,
+    machine_files: &dyn nrr_platform_api::admin_authored::AdminAuthoredFiles,
 ) -> Result<(), String> {
     // One pass over the locale files, not three: each of the old calls loaded,
     // parsed and validated both files in full, and this emitter needs all three
@@ -485,7 +486,7 @@ pub fn write_qt_context_file_at(
     // `Qt.platform.os` branch in QML.
     // First-run answers handed over before launch. Absent on an ordinary
     // install, which is the case the wizard exists for.
-    let provisioning_payload = match crate::provisioning::load() {
+    let provisioning_payload = match crate::provisioning::load(machine_files) {
         Some(loaded) => json!({
             "present": true,
             "sourcePath": loaded.source_path.display().to_string(),

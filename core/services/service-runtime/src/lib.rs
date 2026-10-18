@@ -58,6 +58,7 @@ pub mod activation_coordinator;
 pub mod active_sid_registry;
 pub mod address_ownership;
 pub mod alert_audience;
+pub mod any_zone_sites;
 pub mod app_destination_memory;
 pub mod app_enforcement_status;
 pub mod app_main_link_reach;
@@ -76,6 +77,7 @@ pub mod browser_history_seeder;
 pub mod catch_all_exemptions;
 pub mod channel_status;
 pub mod confirmed_client_app_resolver;
+pub mod conn_history;
 pub mod conn_observation_consumer;
 pub mod conn_trace_names;
 pub mod connection_slot;
@@ -155,7 +157,10 @@ pub mod production_security_alerts;
 pub mod production_settings;
 pub mod production_settings_exporter;
 pub mod production_traffic;
+pub mod protected_rules;
+pub mod provisioning;
 pub mod recent_rule_addresses;
+pub mod recent_rule_changes;
 pub mod recompute_coalescer;
 pub mod recovery_audit;
 pub mod revision_signing;
@@ -167,6 +172,7 @@ pub mod route_reconciler;
 pub mod route_table_owner;
 pub mod routed_host_flow_refresh;
 pub mod routing_pause;
+pub mod routing_setup;
 pub mod rule_book_facts;
 pub mod rule_conflicts;
 pub mod rule_hostname_seeder;
@@ -181,6 +187,7 @@ pub mod service_stability;
 pub mod service_tasks;
 pub mod short_name_completions;
 pub mod short_name_suffixes;
+pub mod startup_quiet;
 pub mod state;
 pub mod supervised_runtime;
 pub mod tamper_bootstrap;
@@ -240,10 +247,10 @@ pub use routing_pause::{
 pub use health::{HealthAggregator, HealthComponent, HealthComponentSnapshot, ServiceSnapshot};
 
 pub use ipc::{
-    HandlerOutcome, IpcAuditEmitter, IpcError, IpcErrorCode, IpcHandler, IpcHandlerRegistry,
-    IpcOperationClass, IpcRequestContext, IpcRequestEnvelope, IpcResponseEnvelope, IpcRouter,
-    MutationQueue, NoopAuditEmitter as NoopIpcAuditEmitter, IPC_MAX_MESSAGE_BYTES,
-    IPC_PROTOCOL_VERSION,
+    CallerProcess, CheckedIpcHandler, HandlerOutcome, IpcAuditEmitter, IpcError, IpcErrorCode,
+    IpcHandler, IpcHandlerRegistry, IpcOperationClass, IpcRequestContext, IpcRequestEnvelope,
+    IpcResponseEnvelope, IpcRouter, MutationQueue, NoopAuditEmitter as NoopIpcAuditEmitter,
+    PrecheckCoverage, Prechecked, IPC_MAX_MESSAGE_BYTES, IPC_PROTOCOL_VERSION,
 };
 pub use ipc_handlers::{
     register_production_handlers, service_binary_version, set_service_binary_version,

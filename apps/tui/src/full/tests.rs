@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
-use ratatui::style::Color;
+use ratatui::buffer::Buffer;
+use ratatui::style::{Color, Modifier};
 use ratatui::text::Line;
 use ratatui::Terminal;
 
@@ -18,13 +19,23 @@ const COLOUR: RenderOptions = RenderOptions {
     ascii: false,
 };
 
-fn render(app: &AppState, options: RenderOptions, width: u16, height: u16, now: Instant) -> String {
+fn draw_buffer(
+    app: &AppState,
+    options: RenderOptions,
+    width: u16,
+    height: u16,
+    now: Instant,
+) -> Buffer {
     let texts = texts_en();
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
     terminal
         .draw(|frame| draw(frame, app, &texts, options, now))
         .expect("draw");
-    let buffer = terminal.backend().buffer();
+    terminal.backend().buffer().clone()
+}
+
+fn render(app: &AppState, options: RenderOptions, width: u16, height: u16, now: Instant) -> String {
+    let buffer = draw_buffer(app, options, width, height, now);
     let mut out = String::new();
     for y in 0..height {
         let row: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
@@ -187,14 +198,34 @@ fn coloured(span: &ratatui::text::Span<'_>) -> bool {
     set(span.style.fg) || set(span.style.bg)
 }
 
-/// Meaning is never in colour alone: a coloured span sits on a line that says the
-/// state in words, and is itself that word. Returns the offending lines.
+/// Whether a span is drawn in a colour that says something: a state's, as
+/// text or as a badge on a bar, or a route's. Other colours (bars, headings,
+/// the selection) only set text apart, and each keeps a mark of its own.
+fn meaningful(span: &ratatui::text::Span<'_>) -> bool {
+    let palette = Palette::new(COLOUR);
+    let states = [Tone::Good, Tone::Caution, Tone::Bad];
+    let routes = [Tone::RoutePrimary, Tone::RouteSecondary];
+    let text: Vec<Color> = states
+        .iter()
+        .chain(&routes)
+        .filter_map(|t| palette.tone(*t).fg)
+        .collect();
+    let badge: Vec<Color> = states
+        .iter()
+        .filter_map(|t| palette.on_bar(*t).bg)
+        .collect();
+    span.style.fg.is_some_and(|c| text.contains(&c))
+        || span.style.bg.is_some_and(|c| badge.contains(&c))
+}
+
+/// Meaning is never in colour alone: a span in a meaning colour sits on a line
+/// that says it in words, and is itself that word. Returns the offending lines.
 fn colour_without_words(lines: &[Line<'_>], words: &[String]) -> Vec<String> {
     lines
         .iter()
         .filter(|line| {
             let text = line_text(line);
-            line.spans.iter().filter(|s| coloured(s)).any(|s| {
+            line.spans.iter().filter(|s| meaningful(s)).any(|s| {
                 let span = s.content.trim();
                 !words.iter().any(|w| text.contains(w.as_str())) || !words.iter().any(|w| w == span)
             })
@@ -216,7 +247,11 @@ fn all_lines(app: &AppState, texts: &Texts, options: RenderOptions) -> Vec<Line<
 #[test]
 fn colour_never_carries_meaning_alone() {
     let texts = texts_en();
-    let words: Vec<String> = state_word_keys().iter().map(|k| texts.get(*k)).collect();
+    let words: Vec<String> = state_word_keys()
+        .iter()
+        .chain(&[keys::ROLE_PRIMARY, keys::ROLE_SECONDARY])
+        .map(|k| texts.get(*k))
+        .collect();
     let mut checked = 0;
     for (name, mut app) in every_state() {
         app.apply(
@@ -228,7 +263,7 @@ fn colour_never_carries_meaning_alone() {
         checked += lines
             .iter()
             .flat_map(|l| &l.spans)
-            .filter(|s| coloured(s))
+            .filter(|s| meaningful(s))
             .count();
         let bad = colour_without_words(&lines, &words);
         assert!(
@@ -250,6 +285,88 @@ fn the_colour_check_can_fire() {
     assert_eq!(colour_without_words(&[wordless], &words).len(), 1);
     let worded = Line::from(vec![Span::raw("Main: "), Span::styled("Available", red)]);
     assert!(colour_without_words(&[worded], &words).is_empty());
+    let route = style_for(Tone::RoutePrimary, COLOUR);
+    let routed = Line::from(vec![Span::raw("Main: "), Span::styled("Ethernet", route)]);
+    assert_eq!(colour_without_words(&[routed], &words).len(), 1);
+    let badge = Palette::new(COLOUR).on_bar(Tone::Bad);
+    let badged = Line::from(vec![Span::styled("Ethernet", badge)]);
+    assert_eq!(colour_without_words(&[badged], &words).len(), 1);
+}
+
+/// Screens with every kind of marking: state words, the bars, routes, the
+/// selection and a focused panel.
+fn representative() -> Vec<(&'static str, AppState)> {
+    let mut screens = every_state();
+    let mut interfaces = app_at(Link::Connected, Some(&Fixture::healthy()));
+    interfaces.open(ScreenId::Interfaces);
+    screens.push(("interfaces", interfaces));
+    let mut focused = limited();
+    press(&mut focused, KeyCode::Tab);
+    screens.push(("feed-focused", focused));
+    let mut settings = app_at(Link::Connected, Some(&Fixture::healthy()));
+    press(&mut settings, KeyCode::Char('0'));
+    press(&mut settings, KeyCode::Down);
+    screens.push(("settings", settings));
+    screens
+}
+
+#[test]
+fn no_color_leaves_no_colour_in_any_cell() {
+    let options = RenderOptions {
+        colour: false,
+        ascii: false,
+    };
+    for (name, app) in representative() {
+        let buffer = draw_buffer(&app, options, 100, 40, Instant::now());
+        for cell in buffer.content() {
+            assert!(
+                cell.fg == Color::Reset && cell.bg == Color::Reset,
+                "{name}: {:?} drew colour with --no-color: {:?}",
+                cell.symbol(),
+                cell.style()
+            );
+        }
+    }
+}
+
+#[test]
+fn with_colour_the_bars_routes_and_rounded_frames_are_drawn() {
+    let app = app_at(Link::Connected, Some(&Fixture::healthy()));
+    let palette = Palette::new(COLOUR);
+    let bar = palette.bar().bg.expect("the bars have a background");
+    let buffer = draw_buffer(&app, COLOUR, 100, 40, Instant::now());
+    assert_eq!(buffer[(99_u16, 0_u16)].bg, bar, "title bar");
+    assert_eq!(buffer[(99_u16, 39_u16)].bg, bar, "status bar");
+    let primary = palette.tone(Tone::RoutePrimary).fg;
+    assert!(
+        buffer
+            .content()
+            .iter()
+            .any(|c| Some(c.fg) == primary && c.symbol().chars().any(char::is_alphabetic)),
+        "the main route's name is marked"
+    );
+    let picture = render(&app, COLOUR, 100, 40, Instant::now());
+    assert!(picture.contains('\u{256d}'), "rounded corners:\n{picture}");
+}
+
+/// The cursor row stays findable without colour: its `>` and its bold.
+#[test]
+fn the_selected_row_keeps_its_marker_and_bold_without_colour() {
+    let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+    app.open(ScreenId::Interfaces);
+    let options = RenderOptions {
+        colour: false,
+        ascii: false,
+    };
+    let texts = texts_en();
+    let selected: Vec<Line<'static>> = content_panels(&app, &texts)
+        .iter()
+        .flat_map(|p| p.lines.iter().map(|l| to_line(l, options)))
+        .filter(|l| line_text(l).trim_start().starts_with("> "))
+        .collect();
+    assert_eq!(selected.len(), 1, "one cursor row");
+    let style = selected[0].spans[0].style;
+    assert!(style.add_modifier.contains(Modifier::BOLD), "{style:?}");
 }
 
 #[test]

@@ -23,9 +23,19 @@ fn main() {
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
     println!("cargo:rustc-env=NRR_BUILD_TARGET={target}");
 
-    // Re-run when HEAD moves so the embedded commit stays current.
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/index");
+    // Re-run when HEAD moves so the embedded commit stays current. A path
+    // that does not exist reruns the script on every build, so a copy
+    // without `.git` watches only this file.
+    let watched: Vec<&str> = ["../../.git/HEAD", "../../.git/index"]
+        .into_iter()
+        .filter(|path| std::path::Path::new(path).exists())
+        .collect();
+    if watched.is_empty() {
+        println!("cargo:rerun-if-changed=build.rs");
+    }
+    for path in watched {
+        println!("cargo:rerun-if-changed={path}");
+    }
 }
 
 /// `git rev-parse --short HEAD`, plus a `-dirty` marker when the working tree

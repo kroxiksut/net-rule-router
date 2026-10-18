@@ -53,7 +53,7 @@ impl VpnGatewayCandidatesListHandler {
 /// Whether `owner` is an account services run under: LocalSystem,
 /// LocalService, NetworkService or a per-service account on Windows; a system
 /// uid or `nobody` on Unix.
-fn is_service_account(owner: &str, unix_sys_uid_max: u32) -> bool {
+pub(crate) fn is_service_account(owner: &str, unix_sys_uid_max: u32) -> bool {
     if SERVICE_ACCOUNT_SIDS
         .iter()
         .any(|sid| owner.eq_ignore_ascii_case(sid))

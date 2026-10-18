@@ -17,7 +17,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
-nrr-shared = { path = "../shared/contracts" }
+nrr-shared = { path = "../shared/contracts", features = ["fuzzing"] }
+nrr-client-logic = { path = "../core/client-logic" }
+nrr-diagnostics = { path = "../core/diagnostics" }
 nrr-domain = { path = "../core/domain" }
 nrr-platform-api = { path = "../core/platform/api", features = ["fuzzing"] }
 nrr-platform-linux = { path = "../core/platform/linux", features = ["fuzzing"] }
@@ -117,6 +119,62 @@ bench = false
 [[bin]]
 name = "user_settings"
 path = "fuzz_targets/user_settings.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "display_text"
+path = "fuzz_targets/display_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rule_value_class"
+path = "fuzz_targets/rule_value_class.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bulk_rules"
+path = "fuzz_targets/bulk_rules.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rules_file_readers"
+path = "fuzz_targets/rules_file_readers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "locale_file"
+path = "fuzz_targets/locale_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provisioning_bundle"
+path = "fuzz_targets/provisioning_bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protected_places"
+path = "fuzz_targets/protected_places.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_free_text_paths"
+path = "fuzz_targets/log_free_text_paths.rs"
 test = false
 doc = false
 bench = false

@@ -237,6 +237,7 @@ fn canonical_to_rules_file_full_round_trip_via_writer() {
                 r.address_match.as_ref().map(|a| match a {
                     crate::AddressMatch::ExactFqdn(s)
                     | crate::AddressMatch::SuffixDomain(s)
+                    | crate::AddressMatch::AnyZoneDomain(s)
                     | crate::AddressMatch::Zone(s)
                     | crate::AddressMatch::ExactIp(s)
                     | crate::AddressMatch::Subnet(s)
@@ -261,9 +262,9 @@ fn canonical_to_rules_file_full_round_trip_via_writer() {
                     | CanonicalAddressMatch::Zone(s) => s.clone(),
                     other => other.to_display_string(),
                 }),
-                r.app_match.as_ref().map(|app| match &app.pattern {
-                    CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.clone(),
-                }),
+                r.app_match
+                    .as_ref()
+                    .map(|app| app.pattern.as_str().to_string()),
                 r.comment.clone(),
             )
         })
@@ -298,27 +299,112 @@ fn network_sections_round_trip_through_the_canonical_set() {
     assert_eq!(canonical_set(&written), set);
 }
 
-/// Section is type: a network under `--- IP` is a line error naming the
-/// section it belongs in, never silently re-filed.
+/// Section is type: a value spelled as another type's is a line error naming
+/// the section it belongs in, never silently re-filed or kept as a rule that
+/// cannot match.
 #[test]
-fn a_value_under_the_wrong_network_heading_is_refused_with_the_right_one() {
-    use crate::ip_network_policy::IpValueKind;
+fn a_value_under_the_wrong_heading_is_refused_with_the_right_one() {
     use crate::validation::ValidationError;
+    use RulesFileSection as S;
     for (input, belongs_in) in [
-        ("--- IP\n10.0.0.0/8\n", IpValueKind::Subnet),
-        ("--- IP\n10.0.0.1-10.0.0.9\n", IpValueKind::Range),
-        ("--- CIDR\n10.0.0.1\n", IpValueKind::Address),
-        ("--- Ranges\n10.0.0.0/24\n", IpValueKind::Subnet),
+        ("--- IP\n10.0.0.0/8\n", S::Cidr),
+        ("--- IP\n10.0.0.1-10.0.0.9\n", S::Ranges),
+        ("--- CIDR\n10.0.0.1\n", S::Ip),
+        ("--- Ranges\n10.0.0.0/24\n", S::Cidr),
+        ("--- Domains\nchrome.exe\n", S::Windows),
+        ("--- Zones\nchrome.exe\n", S::Windows),
+        ("--- Windows\n192.0.2.7\n", S::Ip),
+        ("--- Windows\nexample.com\n", S::Domains),
+        ("--- Windows\n10.0.0.0/24\n", S::Cidr),
+        ("--- Windows\n*.example.com\n", S::Domains),
+        ("--- IP\nexample.com\n", S::Domains),
+        ("--- CIDR\nexample.com\n", S::Domains),
+        ("--- Ranges\nexample.com\n", S::Domains),
+        ("--- Domains\n192.0.2.7\n", S::Ip),
+        ("--- Zones\n192.0.2.7\n", S::Ip),
+        ("--- Domains\n10.0.0.0/24\n", S::Cidr),
+        ("--- Zones\nexample.*\n", S::Domains),
+        ("--- IP\n*.ru\n", S::Zones),
     ] {
         let errors = canonical_errors(input);
         assert!(
             matches!(
                 errors.as_slice(),
-                [ValidationError::WrongAddressSection { belongs_in: b, .. }] if *b == belongs_in
+                [ValidationError::WrongSection { belongs_in: b, .. }] if *b == belongs_in
             ),
             "{input:?}: {errors:?}"
         );
     }
+}
+
+/// `.exe` is never appended to an address, a network or a host name, and a
+/// subnet's `/n` is never read as the last part of a path.
+#[test]
+fn no_value_of_another_type_becomes_a_program() {
+    for value in ["192.0.2.7", "example.com", "10.0.0.0/24", "10.0.0.0/33"] {
+        assert!(
+            !canonical_errors(&format!("--- Windows\n{value}\n")).is_empty(),
+            "{value}"
+        );
+    }
+}
+
+/// What the spelling does not settle stays with the section it is written in.
+#[test]
+fn a_value_its_section_can_hold_is_kept() {
+    for input in [
+        "--- Zones\ncorp.internal\n",
+        "--- Zones\ntelegram\n",
+        "--- Domains\n*.ru\n",
+        "--- Domains\ntelegram\n",
+        "--- Windows\ntelegram\n",
+        "--- Windows\nscript.ps1\n",
+        "--- Windows\nC:\\Apps\\tool\n",
+        "--- Windows\ncodex.exe +children\n",
+    ] {
+        assert!(canonicalized(input).is_accepted(), "{input:?}");
+    }
+}
+
+/// Every path form is written back in its own form and reads back the same,
+/// disabled and denied lines included; a folder keeps its trailing separator.
+#[test]
+fn path_rules_round_trip_through_the_file_in_their_form() {
+    // In canonical order, so the ids a re-read assigns are the same.
+    let input = "--- Windows\n\
+                 C:\\Apps\\Tool  # the folder only\n\
+                 C:\\Apps\\Tool\\tool.exe\n\
+                 !C:\\Program Files\\Example App\\*\n\
+                 # C:\\Program Files\\Other App\\\n\
+                 chrome.exe\n";
+    let set = canonical_set(input);
+    let written = write_rules_file(
+        &canonical_rule_set_to_rules_file_parsed(&set, RulesFileSection::Windows),
+        &[],
+        None,
+    );
+    for line in [
+        "c:\\apps\\tool\\tool.exe\n",
+        "c:\\apps\\tool\\",
+        "!c:\\program files\\example app\\*\n",
+        "# c:\\program files\\other app\\\n",
+        "chrome.exe\n",
+    ] {
+        assert!(written.contains(line), "{line:?} missing from:\n{written}");
+    }
+    assert_eq!(canonical_set(&written), set);
+}
+
+/// A path that names no program is a line error: the rest of the file loads.
+#[test]
+fn a_broken_path_line_drops_only_itself() {
+    let set = canonical_set("--- Windows\nC:\\Apps\\*.exe\nTool\\tool.exe\nchrome.exe\n");
+    let values: Vec<&str> = set
+        .rules()
+        .iter()
+        .filter_map(|r| r.app_match.as_ref().map(|a| a.pattern.as_str()))
+        .collect();
+    assert_eq!(values, vec!["chrome.exe"]);
 }
 
 fn canonicalized(input: &str) -> crate::preset_canonicalize::PresetRulesCanonicalizeOutcome {
@@ -342,4 +428,49 @@ fn canonical_errors(input: &str) -> Vec<crate::validation::ValidationError> {
         crate::preset_canonicalize::PresetRulesCanonicalizeOutcome::Rejected { errors } => errors,
         other => panic!("{input:?} accepted as {other:?}"),
     }
+}
+
+/// A stored deny goes out as `!value` in every section and comes back a deny.
+#[test]
+fn a_canonical_deny_is_written_with_the_mark_and_read_back_as_one() {
+    let deny = |rule: CanonicalRule| CanonicalRule {
+        action: crate::canonical::RuleAction::Block,
+        ..rule
+    };
+    let set = CanonicalRuleSet::from_rules(vec![
+        deny(rule_with_address(
+            "r-1",
+            true,
+            CanonicalAddressMatch::SuffixDomain("metrics.example".to_string()),
+            "telemetry",
+        )),
+        deny(rule_with_address(
+            "r-2",
+            false,
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))),
+            "",
+        )),
+        deny(rule_with_app(
+            "r-3",
+            true,
+            CanonicalAppPattern::Exact("telemetry.exe".to_string()),
+            "",
+        )),
+    ]);
+    let parsed = canonical_rule_set_to_rules_file_parsed(&set, RulesFileSection::Windows);
+    let text = write_rules_file(&parsed, &[], None);
+    for line in [
+        "\n!*.metrics.example  # telemetry\n",
+        "\n# !192.0.2.7\n",
+        "\n!telemetry.exe\n",
+    ] {
+        assert!(text.contains(line), "{line:?} missing from:\n{text}");
+    }
+    let back = parse_rules_file(&text).parsed;
+    assert_eq!(back, parsed);
+    let rules = rules_file_to_route_rule_set(&back, HostPlatform::Windows, false).rules;
+    assert_eq!(rules.len(), 3);
+    assert!(rules
+        .iter()
+        .all(|r| r.action == crate::canonical::RuleAction::Block));
 }

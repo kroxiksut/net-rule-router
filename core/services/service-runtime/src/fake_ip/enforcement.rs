@@ -111,6 +111,8 @@ pub fn plan_fake_ip_enforcement(
             // Literal IPs (and app rules, carried on a separate field) have no
             // name to hand a fake address, so fake-IP does not apply.
             CanonicalAddressMatch::ExactIp(_) => Vec::new(),
+            // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
+            CanonicalAddressMatch::AnyZoneDomain(_) => continue,
         };
         for host in hosts {
             if !scope.decide(&host, None).is_fake_ip() {

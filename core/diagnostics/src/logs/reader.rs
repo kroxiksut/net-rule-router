@@ -144,7 +144,7 @@ fn raw_line_is_visible(line: &str, owner: Option<&str>, from_ms: Option<i64>) ->
         return true;
     };
     match value.get("principal").and_then(serde_json::Value::as_str) {
-        None => true,
+        None => !crate::logs::privacy::discloses(value.get("payload")),
         Some(line_owner) => line_owner == owner,
     }
 }
@@ -278,6 +278,8 @@ impl LogReader {
     /// The log is one machine-wide stream: a principal-scoped reader keeps the
     /// lines that belong to nobody (boot, adapters, service lifecycle) and its
     /// own. The audience is required so an unscoped read cannot be written.
+    /// A principal also gets free text with its file paths masked; only the
+    /// machine audience reads them.
     pub fn page_newest_first(
         &self,
         filter: &LogQueryFilter,
@@ -319,6 +321,12 @@ impl LogReader {
         }
         let has_more = kept.len() > limit;
         kept.truncate(limit);
+        // After the cut, so only what is shown pays for the scan.
+        if owner.is_some() {
+            for payload in kept.iter_mut().filter_map(|event| event.payload.as_mut()) {
+                crate::logs::privacy::mask_paths_in_free_text(payload);
+            }
+        }
         LogPage {
             events: kept,
             has_more,
@@ -331,7 +339,8 @@ impl LogReader {
     /// The archive ships these VERBATIM: the DTO listing drops payloads, and a
     /// support bundle without them describes symptoms with the evidence
     /// removed. A principal-scoped audience keeps the lines that belong to
-    /// nobody (boot, adapters, service lifecycle) and its own. `from_ms` trims
+    /// nobody (boot, adapters, service lifecycle) and its own, with the file
+    /// paths in their free text masked. `from_ms` trims
     /// to a session window the same way the wire filter does.
     ///
     /// Walks files newest-first and stops as soon as the budget is met, so
@@ -389,6 +398,14 @@ impl LogReader {
                 if !raw_line_is_visible(line, owner, from_ms) {
                     continue;
                 }
+                let line = if owner.is_some() {
+                    match crate::logs::privacy::mask_paths_in_stored_line(line) {
+                        Some(line) => line,
+                        None => continue,
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(line)
+                };
                 let cost = line.len() + 1;
                 // The newest kept line always fits, however long: a caller
                 // asking for the tail must not get an empty answer.
@@ -405,7 +422,7 @@ impl LogReader {
                     break 'files;
                 }
                 used += cost;
-                lines.push(line.to_string());
+                lines.push(line.into_owned());
             }
             if !lines.is_empty() {
                 lines.reverse();
@@ -431,11 +448,14 @@ impl LogReader {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// A line with no `principal` is about the machine and belongs to everyone.
+/// A line with no `principal` is about the machine and belongs to everyone —
+/// unless it names a host, an address or a path: nothing says whose lookup or
+/// connection that was, so only the machine audience reads it.
 fn visible_to(owner: Option<&str>, event: &LogEvent) -> bool {
     match (owner, event.principal.as_deref()) {
         (Some(owner), Some(line_owner)) => owner == line_owner,
-        _ => true,
+        (Some(_), None) => !crate::logs::privacy::discloses(event.payload.as_ref()),
+        (None, _) => true,
     }
 }
 
@@ -829,6 +849,80 @@ mod tests {
         );
         assert_eq!(by_revision.len(), 1);
         assert_eq!(by_revision[0].event_id, "evt-2");
+    }
+
+    /// A line about a host with no owner could be anybody's lookup: a user
+    /// does not read it, the machine audience does. Once its host is redacted
+    /// it names nothing and stays on everyone's timeline.
+    #[test]
+    fn an_unowned_line_naming_a_host_is_for_the_machine_audience_only() {
+        let dir = tempfile::tempdir().expect("temp");
+        for (id, host) in [("named", "site.example"), ("redacted", "<redacted>")] {
+            let mut event = crate::event::LogEvent::new(
+                id,
+                1_745_000_000_000,
+                EventLevel::Info,
+                reason::service::STARTED,
+            );
+            event.payload = Some(serde_json::json!({ "host": host }));
+            append_event_raw(dir.path(), event);
+        }
+        let reader = LogReader::new(dir.path());
+        let user = DiagnosticsAudience::Principal("S-1-5-21-mine".into());
+        let seen: Vec<_> = read_all(&reader, &LogQueryFilter::new(), &user)
+            .into_iter()
+            .map(|e| e.event_id)
+            .collect();
+        assert_eq!(seen, ["redacted"]);
+        assert_eq!(
+            ids_of(&reader.recent_raw_lines_for(usize::MAX, &user, None)),
+            ["redacted"]
+        );
+        let machine = DiagnosticsAudience::Machine;
+        assert_eq!(read_all(&reader, &LogQueryFilter::new(), &machine).len(), 2);
+    }
+
+    /// An error string is public by name, but the path formatted into it is
+    /// not: a user reads the line without it on both read paths, the machine
+    /// audience reads it as written.
+    #[test]
+    fn a_principal_reads_free_text_without_file_paths() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut event = crate::event::LogEvent::new(
+            "failed",
+            1_745_000_000_000,
+            EventLevel::Info,
+            reason::service::STARTED,
+        );
+        event.payload = Some(serde_json::json!({
+            "message": r"cannot open C:\Users\alice\rules.txt: denied",
+            "error": "open /home/alice/.config/x: No such file (os error 2)",
+        }));
+        append_event_raw(dir.path(), event);
+        let reader = LogReader::new(dir.path());
+
+        let user = DiagnosticsAudience::Principal("S-1-5-21-mine".into());
+        let page = read_all(&reader, &LogQueryFilter::new(), &user);
+        let payload = page[0].payload.as_ref().expect("payload");
+        assert_eq!(payload["message"], "cannot open <masked-path>: denied");
+        assert_eq!(
+            payload["error"],
+            "open <masked-path>: No such file (os error 2)"
+        );
+        let raw = reader.recent_raw_lines_for(usize::MAX, &user, None);
+        assert_eq!(ids_of(&raw), ["failed"]);
+        assert!(!raw[0].contains("alice"), "{}", raw[0]);
+        assert!(raw[0].contains("<masked-path>"), "{}", raw[0]);
+
+        let machine = DiagnosticsAudience::Machine;
+        let page = read_all(&reader, &LogQueryFilter::new(), &machine);
+        let payload = page[0].payload.as_ref().expect("payload");
+        assert_eq!(
+            payload["message"],
+            r"cannot open C:\Users\alice\rules.txt: denied"
+        );
+        let raw = reader.recent_raw_lines_for(usize::MAX, &machine, None);
+        assert!(raw[0].contains("alice"), "{}", raw[0]);
     }
 
     /// Both read paths are scoped by the reader itself: a principal sees the

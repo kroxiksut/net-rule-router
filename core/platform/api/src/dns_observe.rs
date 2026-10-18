@@ -33,6 +33,9 @@ pub struct DnsObservation {
     /// IPv4 addresses the query resolved to. Never empty (an empty answer
     /// is not surfaced as an observation).
     pub ipv4s: Vec<Ipv4Addr>,
+    /// The account whose program asked, when the platform can tell (stored
+    /// principal form). What a lookup teaches belongs to that user alone.
+    pub owner: Option<String>,
 }
 
 /// A source of passively-observed DNS resolutions. The consumer polls
@@ -63,6 +66,7 @@ impl MockDnsObservationSource {
         self.buffered.lock().unwrap().push(DnsObservation {
             hostname: hostname.to_string(),
             ipv4s,
+            owner: None,
         });
     }
 }

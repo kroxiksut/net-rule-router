@@ -10,6 +10,7 @@ use nrr_client_logic::vpn_client_trust::{
     confirmed_apps, trust_offers, LinkProviderApp, TrustOffer,
 };
 use nrr_ipc_client::IpcClient;
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     LinkProviderAppDto, PendingVpnClientDto, RouteLinkProviderSetRequest,
@@ -46,9 +47,12 @@ pub fn offers(pending: &[PendingVpnClientDto]) -> Vec<TrustOffer> {
     trust_offers(&pairs)
 }
 
-/// The names the Status screen lists.
+/// The names the Status screen lists, ready to show.
 pub fn names(pending: &[PendingVpnClientDto]) -> Vec<String> {
-    offers(pending).into_iter().map(|o| o.name).collect()
+    offers(pending)
+        .into_iter()
+        .map(|o| display_text(&o.name).into_owned())
+        .collect()
 }
 
 /// Confirm every pending program, bundles included. `false` when there is

@@ -41,7 +41,7 @@
 //! - No raw `HANDLE`/`HFWPENGINE` escapes into business logic.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{
     error::{ErrorClass, MutationIntent, PlatformError},
@@ -125,10 +125,11 @@ pub enum RetireHeld {
 
 /// RAII guard for a per-service-instance WFP engine session.
 ///
-/// Opened once at service start; closed on graceful stop or drop.
-/// All filter mutations go through `execute_wfp_plan()`.
+/// Opened once at service start, or later when the engine is slow to answer
+/// (see [`WfpSession::unopened`]); closed on graceful stop or drop. All filter
+/// mutations go through `execute_wfp_plan()`.
 pub struct WfpSession {
-    token: Option<WfpEngineToken>,
+    token: OnceLock<WfpEngineToken>,
     api: Arc<dyn WindowsApiPort>,
     /// Serializes every filter-mutation transaction on this session. A WFP
     /// transaction is session-wide (one per engine handle); concurrent
@@ -157,13 +158,39 @@ impl WfpSession {
     /// explicit delete or a reboot — closing the handle does NOT remove them
     /// (cleanup is explicit; see `cleanup_all` / `cleanup_blocks_only`).
     pub fn open(api: Arc<dyn WindowsApiPort>) -> Result<Self, PlatformError> {
-        let token = api.wfp_engine_open()?;
-        Ok(Self {
-            token: Some(token),
+        let session = Self::unopened(api);
+        session.ensure_open()?;
+        Ok(session)
+    }
+
+    /// A session whose engine handle comes later, through
+    /// [`Self::ensure_open`]. Until then every engine call fails as
+    /// `Transient`, so the owner can be built while the engine is not
+    /// answering yet.
+    pub fn unopened(api: Arc<dyn WindowsApiPort>) -> Self {
+        Self {
+            token: OnceLock::new(),
             api,
             apply_lock: Mutex::new(()),
             warned_skips: Mutex::new(HashSet::new()),
-        })
+        }
+    }
+
+    /// Open the engine handle unless it is open already. A handle that lost a
+    /// race with another opener is closed again.
+    pub fn ensure_open(&self) -> Result<(), PlatformError> {
+        if self.is_open() {
+            return Ok(());
+        }
+        let token = self.api.wfp_engine_open()?;
+        if let Err(extra) = self.token.set(token) {
+            let _ = self.api.wfp_engine_close(extra);
+        }
+        Ok(())
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.token.get().is_some()
     }
 
     /// Execute a slice of WFP filter actions in batches of at most
@@ -501,8 +528,7 @@ impl WfpSession {
     // ── Low-level accessors ───────────────────────────────────────────────────
 
     pub fn begin_transaction(&self) -> Result<WfpTransactionGuard<'_>, PlatformError> {
-        let token = self.token();
-        self.api.wfp_transaction_begin(token)?;
+        self.api.wfp_transaction_begin(self.token()?)?;
         Ok(WfpTransactionGuard {
             session: self,
             committed: false,
@@ -510,24 +536,22 @@ impl WfpSession {
     }
 
     pub fn add_filter(&self, spec: &WfpFilterSpec) -> Result<WfpFilterId, PlatformError> {
-        self.api.wfp_filter_add(self.token(), spec)
+        self.api.wfp_filter_add(self.token()?, spec)
     }
 
     pub fn delete_filter(&self, id: WfpFilterId) -> Result<(), PlatformError> {
-        self.api.wfp_filter_delete(self.token(), id)
+        self.api.wfp_filter_delete(self.token()?, id)
     }
 
     pub fn enumerate_our_filters(&self) -> Result<Vec<WfpFilterRecord>, PlatformError> {
-        self.api.wfp_enumerate_our_filters(self.token())
+        self.api.wfp_enumerate_our_filters(self.token()?)
     }
 
-    // The token is present for the whole session lifetime (cleared only on
-    // close, after which the session is not used), so this is an invariant.
-    #[allow(clippy::expect_used)]
-    fn token(&self) -> &WfpEngineToken {
-        self.token
-            .as_ref()
-            .expect("WfpSession token already closed")
+    fn token(&self) -> Result<&WfpEngineToken, PlatformError> {
+        self.token.get().ok_or_else(|| PlatformError::Transient {
+            operation: "wfp session",
+            detail: "the filtering engine has not handed out a session yet".to_string(),
+        })
     }
 }
 
@@ -554,7 +578,7 @@ impl<'a> WfpTransactionGuard<'a> {
         let result = self
             .session
             .api
-            .wfp_transaction_commit(self.session.token());
+            .wfp_transaction_commit(self.session.token()?);
         if result.is_ok() {
             self.committed = true;
         }
@@ -565,7 +589,7 @@ impl<'a> WfpTransactionGuard<'a> {
 impl<'a> Drop for WfpTransactionGuard<'a> {
     fn drop(&mut self) {
         if !self.committed {
-            if let Some(token) = &self.session.token {
+            if let Some(token) = self.session.token.get() {
                 self.session.api.wfp_transaction_abort(token);
             }
         }
@@ -646,6 +670,31 @@ mod tests {
             operation: "wfp_engine_open",
         }));
         assert!(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).is_err());
+    }
+
+    #[test]
+    fn unopened_session_refuses_engine_calls_until_it_opens() {
+        let api = mock_api();
+        api.set_force_error(Some(PlatformError::Transient {
+            operation: "wfp_engine_open",
+            detail: "engine busy".to_string(),
+        }));
+        let s = WfpSession::unopened(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        assert!(s.ensure_open().is_err());
+        assert!(!s.is_open());
+        assert!(matches!(
+            s.execute_wfp_plan(&[WfpFilterAction::AddFilter(spec(1))]),
+            Err(PlatformError::Transient { .. })
+        ));
+        assert!(api.wfp_filters.lock().unwrap().is_empty());
+
+        api.set_force_error(None);
+        s.ensure_open().unwrap();
+        s.ensure_open().unwrap();
+        assert!(s.is_open());
+        s.execute_wfp_plan(&[WfpFilterAction::AddFilter(spec(1))])
+            .unwrap();
+        assert_eq!(api.wfp_filters.lock().unwrap().len(), 1);
     }
 
     // ── execute_wfp_plan ──────────────────────────────────────────────────────
@@ -1137,5 +1186,34 @@ mod tests {
         let removed = s.cleanup_all().unwrap();
         assert_eq!(removed, 3);
         assert!(api.wfp_filters.lock().unwrap().is_empty());
+    }
+
+    /// One destination lowered per protocol becomes one forwarding filter: the
+    /// forwarding layers carry no protocol, so the copies would share an id.
+    #[test]
+    fn the_forwarding_path_keeps_one_filter_per_id_and_drops_packet_layers() {
+        let tcp = WfpFilterSpec {
+            ip_protocol: Some(6),
+            user_sid: Some("S-1-5-21-1".to_owned()),
+            remote_port: Some(443),
+            ..spec(7)
+        };
+        let udp = WfpFilterSpec {
+            ip_protocol: Some(17),
+            ..tcp.clone()
+        };
+        let packet = WfpFilterSpec {
+            layer: WfpLayerKey::OutboundIpPacketV4,
+            ..spec(8)
+        };
+        let moved = WfpFilterSpec::onto_forwarding_path(vec![tcp, udp, packet]);
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        let only = &moved[0];
+        assert_eq!(only.id, WfpFilterId { raw: 7 });
+        assert_eq!(only.layer, WfpLayerKey::IpForwardV4);
+        assert_eq!(
+            (only.ip_protocol, only.user_sid.as_deref(), only.remote_port),
+            (None, None, None)
+        );
     }
 }

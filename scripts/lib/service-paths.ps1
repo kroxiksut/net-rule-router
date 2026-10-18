@@ -93,16 +93,49 @@ function Test-ServiceDeletePending {
     catch { return $false }
 }
 
+# The deliberate-stop marker, or $null unless the data root is a real directory
+# owned by SYSTEM or Administrators: anyone may create folders in ProgramData,
+# and a planted root or a link in it would steer this elevated write onto
+# another file. ProgramData comes from Windows, not from the environment.
+function Get-NrrDeliberateStopMarker {
+    $programData = [Environment]::GetFolderPath('CommonApplicationData')
+    if (-not $programData) { return $null }
+    $root = Join-Path $programData $NrrProductName
+    $item = Get-Item -LiteralPath $root -Force -ErrorAction SilentlyContinue
+    if (-not $item -or -not $item.PSIsContainer) { return $null }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $null }
+    try { $owner = (Get-Acl -LiteralPath $root).GetOwner([Security.Principal.SecurityIdentifier]).Value }
+    catch { return $null }
+    if ($owner -notin @('S-1-5-18', 'S-1-5-32-544')) { return $null }
+    return Join-Path $root 'deliberate-stop'
+}
+
 # Marks the next stop as wanted: the service restarts itself after any stop
 # without this file (DELIBERATE_STOP_MARKER in platform/windows
-# service_control.rs). Written only into an existing data root, never creating
-# one an ordinary user could then write to.
+# service_control.rs). Never creates the data root, and creates the file anew
+# rather than writing through whatever already has its name.
 function Set-NrrDeliberateStop {
-    if (-not $env:ProgramData) { return }
-    $root = Join-Path $env:ProgramData $NrrProductName
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return }
-    try { [System.IO.File]::WriteAllBytes((Join-Path $root 'deliberate-stop'), [byte[]]@()) }
+    $mark = Get-NrrDeliberateStopMarker
+    if (-not $mark) { return }
+    try {
+        Remove-Item -LiteralPath $mark -Force -ErrorAction SilentlyContinue
+        [System.IO.File]::Open($mark, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write).Dispose()
+    }
     catch { Write-Host "    could not mark the stop as wanted: $($_.Exception.Message)" }
+}
+
+# Stops the service as a wanted stop; returns sc's exit code. A refused stop (a
+# service still starting accepts no control) takes its mark back: left behind,
+# it would excuse the next stop nobody asked for and keep the service down.
+function Stop-NrrServiceDeliberately {
+    param([string] $Name = $NrrServiceName)
+    Set-NrrDeliberateStop
+    $code = Invoke-NativeCommand -FilePath (Get-SystemTool 'sc.exe') -ArgumentList @('stop', $Name) -Quiet
+    if ($code -ne 0) {
+        $mark = Get-NrrDeliberateStopMarker
+        if ($mark) { Remove-Item -LiteralPath $mark -Force -ErrorAction SilentlyContinue }
+    }
+    return $code
 }
 
 # $true once the service reaches $Status, $false on timeout or when it is gone.

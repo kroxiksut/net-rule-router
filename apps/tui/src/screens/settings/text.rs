@@ -652,6 +652,22 @@ pub const LOGS_CLEARED: Key = key(
     "status.logs-cleared",
     "Operational logs cleared: {count} file(s), {size}",
 );
+pub const HISTORY_TITLE: Key = key("settings.conn-history.title", "Connection history");
+pub const HISTORY_NOTE: Key = key(
+    "settings.conn-history.help",
+    "Which of your programs connected where, and over which route, kept on this computer for the days you choose. Only you can read your history; it is never part of the diagnostic archive.",
+);
+pub const HISTORY_KEEP: Key = key("settings.conn-history.keep", "Keep connection history");
+pub const HISTORY_DAYS: Key = key("settings.conn-history.retention-label", "Keep for");
+pub const HISTORY_CLEAR: Key = key("settings.conn-history.clear", "Clear my history");
+pub const HISTORY_CLEARED: Key = key(
+    "tui.settings.conn-history.cleared",
+    "Your connection history was erased ({count} entries).",
+);
+pub const HISTORY_UNAVAILABLE: Key = key(
+    "diag.conn-history.unavailable",
+    "The connection history cannot be kept right now. The service log says why.",
+);
 pub const STORAGE_TITLE: Key = key("settings.storage.title", "Storage usage");
 pub const STORAGE_STATE: Key = key("settings.storage.state-db", "Service state database");
 pub const STORAGE_CACHE: Key = key("settings.storage.cache-db", "FQDN/IP cache");
@@ -795,6 +811,27 @@ pub const ERRORS: &[(&str, Key)] = &[
     ("bad-response", key("errors.bad-response", "Service returned a malformed response")),
     ("serialization-failed", key("errors.serialization-failed", "Request could not be encoded")),
     ("client-shutdown", key("errors.client-shutdown", "IPC client is shutting down")),
+    (
+        "uac-declined",
+        key(
+            "errors.uac-declined",
+            "Administrator approval is required to apply this change. The change was not applied.",
+        ),
+    ),
+    (
+        "elevation-agent-missing",
+        key(
+            "errors.elevation-agent-missing",
+            "Administrator approval could not be asked for: nothing in this session can show the password prompt. The change was not made.",
+        ),
+    ),
+    (
+        "elevation-unavailable",
+        key(
+            "errors.elevation-unavailable",
+            "Administrator approval could not be checked: the system's authorization service did not answer. The change was not made.",
+        ),
+    ),
 ];
 pub const ERROR_UNKNOWN: Key = key("errors.unknown", "Unknown error");
 pub const NEEDS_ELEVATION_WINDOWS: Key = key(
@@ -1039,6 +1076,13 @@ pub fn all() -> Vec<Key> {
         WINDOW_UNTIL,
         CLEAR_LOGS,
         LOGS_CLEARED,
+        HISTORY_TITLE,
+        HISTORY_NOTE,
+        HISTORY_KEEP,
+        HISTORY_DAYS,
+        HISTORY_CLEAR,
+        HISTORY_CLEARED,
+        HISTORY_UNAVAILABLE,
         STORAGE_TITLE,
         STORAGE_STATE,
         STORAGE_CACHE,

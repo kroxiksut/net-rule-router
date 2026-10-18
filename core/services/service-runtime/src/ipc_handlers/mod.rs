@@ -64,6 +64,7 @@ pub mod rollback;
 pub mod route_link_provider_set;
 pub mod route_policy_update;
 pub mod rules_list;
+pub mod rules_recent_changes;
 pub mod security_alerts;
 pub mod seed_browser_history;
 pub mod service_health;
@@ -137,6 +138,7 @@ pub use rollback::RollbackHandler;
 pub use route_link_provider_set::RouteLinkProviderSetHandler;
 pub use route_policy_update::RoutePolicyUpdateHandler;
 pub use rules_list::RulesListHandler;
+pub use rules_recent_changes::RulesRecentChangesHandler;
 pub use security_alerts::SecurityAlertsHandler;
 pub use seed_browser_history::SeedFromBrowserHistoryHandler;
 pub use service_health::{

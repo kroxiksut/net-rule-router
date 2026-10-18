@@ -1,0 +1,17 @@
+# NetRuleRouter rules file — version 10
+--- Linux
+/opt/tool/bin/tool
+/opt/tool/
+/opt/tool/* +children
+!/opt/Example App/*
+# /opt/Other App/
+/
+/*
+/opt/*/bin
+/opt/../etc/
+bin/tool
+~/bin/tool
+odd\name
+--- MacOS
+/Applications/Example.app/*
+/Applications/Example.app

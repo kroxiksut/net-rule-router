@@ -320,7 +320,14 @@ mod tests {
         let copied = fs::File::open(new_path).expect("open copy");
         let mut archive = zip::ZipArchive::new(copied).expect("valid zip");
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).expect("entry").name().to_string())
+            .map(|i| {
+                archive
+                    .by_index(i)
+                    .expect("entry")
+                    .name()
+                    .expect("entry name")
+                    .to_string()
+            })
             .collect();
         assert!(names.contains(&"manifest.json".to_string()));
         assert!(names.contains(&"launcher-main.log".to_string()));
@@ -356,7 +363,14 @@ mod tests {
         let copied = fs::File::open(new_path).expect("open copy");
         let mut archive = zip::ZipArchive::new(copied).expect("valid zip");
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).expect("entry").name().to_string())
+            .map(|i| {
+                archive
+                    .by_index(i)
+                    .expect("entry")
+                    .name()
+                    .expect("entry name")
+                    .to_string()
+            })
             .collect();
         assert!(names.contains(&"launcher-main.log".to_string()));
         assert!(
@@ -400,7 +414,10 @@ mod tests {
         let new_path = out["archive-path"].as_str().expect("path");
         let copied = fs::File::open(new_path).expect("open copy");
         let archive = zip::ZipArchive::new(copied).expect("valid zip");
-        let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+        let names: Vec<String> = archive
+            .file_names()
+            .map(|name| name.expect("entry name").into_owned())
+            .collect();
         assert!(
             names.contains(&"launcher-main.log".to_string()),
             "the current session's launcher log stays, got {names:?}"

@@ -1,0 +1,42 @@
+# What every Linux package must carry. scripts/package-linux.sh lists each
+# .deb (dpkg-deb), .rpm (rpm -qlp) and .tar.gz it builds and fails when a path
+# below is missing.
+#
+# The script adds on its own what lib/service-paths.sh, lib/desktop-paths.sh
+# and the checkout already name: the service, nrr-cli, nrr-tui and their links
+# in /usr/bin, every tracked file of locales/ and presets/ (base); the unit,
+# the service alias, the logrotate and polkit files (service); the window, the
+# tray, their links, desktop entries and icons, every tracked QML file (gui);
+# the licence of each package. List here what nothing else names.
+#
+# Line: <set> <path>. Sets: base (service, console, terminal interface),
+# service (what only a .deb or .rpm of the base adds), gui (window and tray),
+# archive (paths inside each .tar.gz, relative to its top folder; the base and
+# gui files sit under root/ there). @libexec@ is the install directory,
+# @unitdir@ where the package format puts systemd units.
+
+base     @libexec@/build-info.json
+base     @libexec@/scripts/reset-network.sh
+base     @libexec@/scripts/lib/service-paths.sh
+
+service  @unitdir@/netrulerouter-after-crash.service
+
+gui      @libexec@/nrr_qt_native_host
+gui      @libexec@/apps/desktop/qml/Main.qml
+gui      @libexec@/apps/desktop/qml/Tray.qml
+gui      @libexec@/assets/icons/ui/apply.svg
+gui      @libexec@/assets/images/logo/logo-lockup-stacked.png
+gui      @libexec@/configs/presets/builtin-demo/rules_primary.txt
+gui      /usr/share/icons/hicolor/scalable/apps/netrulerouter.svg
+
+archive  install.sh
+archive  uninstall.sh
+archive  lib/service-paths.sh
+archive  lib/desktop-paths.sh
+archive  lib/package-functions.sh
+archive  LICENSE
+archive  README.txt
+archive  README.ru.txt
+archive  root@libexec@/scripts/uninstall.sh
+archive  root@libexec@/scripts/lib/desktop-paths.sh
+archive  root@libexec@/scripts/lib/package-functions.sh

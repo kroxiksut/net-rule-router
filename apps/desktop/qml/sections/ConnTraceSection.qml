@@ -94,6 +94,111 @@ ScrollView {
     // False when the user switched the GUI trace off in Settings: the page is
     // empty by request, and the panel says so instead of blaming the service.
     property bool _connGuiStreamEnabled: true
+    // "now" reads the live ring; "history" what the service kept for the
+    // chosen period, one row per program and destination. Session-scoped,
+    // like the view filters below.
+    property string _connMode: "now"
+    readonly property bool _connIsHistory: _connMode === "history"
+    property string _connHistoryPeriod: "hour"
+    property bool _connHistoryEnabled: true
+    property bool _connHistoryAvailable: true
+    property double _connHistoryRemoved: 0
+    property double _connHistorySkipped: 0
+    function _connHistoryFromMs(period) {
+        var now = new Date()
+        if (period === "today")
+            return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+        if (period === "week")
+            return now.getTime() - 7 * 86400000
+        return now.getTime() - 3600000
+    }
+    // A kept row in the live row's shape, so search, sort, grouping and the
+    // row menu read it the way they read a live one.
+    function _connRowFromHistory(h) {
+        var host = String((h && h.host) || "")
+        return {
+            "process": String((h && h.process) || "?"),
+            "process_path": String((h && h["process-path"]) || ""),
+            "remote": String((h && h["remote-ip"]) || ""),
+            "remote_hosts": host !== "" ? [host] : [],
+            "egress_role": String((h && h.route) || ""),
+            "verdict": String((h && h.verdict) || ""),
+            "blocked_by": String((h && h["blocked-by"]) || ""),
+            "block_reason": String((h && h["block-reason"]) || ""),
+            "observed_at_ms": Number((h && h["last-seen-ms"]) || 0),
+            "_first_seen_ms": Number((h && h["first-seen-ms"]) || 0),
+            "_attempts": Number((h && h.attempts) || 0),
+            "_history": true
+        }
+    }
+    function _setConnMode(mode, period) {
+        if (mode === section._connMode && period === section._connHistoryPeriod)
+            return
+        section._connMode = mode
+        section._connHistoryPeriod = period
+        section._clearConnSelection()
+        section._loadConnTraceEntries(true)
+    }
+    function _loadConnHistory(reset) {
+        if (!root.rpc || typeof root.rpc.rpcConnHistoryList !== "function") {
+            section._connTraceError = root.tr("diag.conn-trace.entries-bridge-unavailable",
+                "Service bridge not connected — connection trace unavailable")
+            section._connTraceShown = true
+            return
+        }
+        if (reset) {
+            section._connTraceEntries = []
+            section._connTraceCursor = ""
+        }
+        var pagination = { "page_size": 200 }
+        if (!reset && section._connTraceCursor !== "")
+            pagination["cursor"] = section._connTraceCursor
+        var corr = root.rpc.rpcConnHistoryList({
+            "from-unix-ms": Math.floor(section._connHistoryFromMs(section._connHistoryPeriod)),
+            "pagination": pagination
+        })
+        section._connTraceShown = true
+        if (corr === "") {
+            section._connTraceError = root.tr("diag.conn-trace.entries-bridge-unavailable",
+                "Service bridge not connected — connection trace unavailable")
+            return
+        }
+        section._connTraceLoading = true
+        section._connTraceError = ""
+        var mode = section._connMode
+        var period = section._connHistoryPeriod
+        root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
+            // A switch made while this page travelled owns the list now.
+            if (mode !== section._connMode || period !== section._connHistoryPeriod)
+                return
+            section._connTraceLoading = false
+            if (!ok) {
+                section._connTraceError = root.tr("diag.conn-history.load-failed",
+                    "Failed to load the connection history: ")
+                    + ((typeof root.ipcErrorLabel === "function")
+                        ? root.ipcErrorLabel(String(errorCode || "unknown"))
+                        : String(errorCode || "unknown"))
+                return
+            }
+            section._connHistoryEnabled = (payload && payload.enabled) !== false
+            section._connHistoryAvailable = (payload && payload.available) !== false
+            section._connHistoryRemoved = Number((payload && payload.removed) || 0)
+            section._connHistorySkipped = Number((payload && payload.skipped) || 0)
+            section._connLastRefreshMs = Date.now()
+            var page = (payload && payload.page) || {}
+            var items = page.items || []
+            var merged = section._connTraceEntries.slice()
+            for (var i = 0; i < items.length; i++)
+                merged.push(section._connRowFromHistory(items[i]))
+            section._connTraceEntries = merged
+            var nc = page.next_cursor
+            section._connTraceCursor =
+                (nc === undefined || nc === null) ? "" : String(nc)
+            if (section._connTraceCursor !== ""
+                    && section._connTraceEntries.length < section._connTraceDrainCap)
+                section._loadConnHistory(false)
+        })
+    }
     // Client-side retention of the merged list, matching the service ring.
     readonly property int _connTraceRingCap: 1000
     // Direct row selection for the table (mirror of the cache twin). Selection holds the row objects by reference; synthetic group
@@ -337,7 +442,7 @@ ScrollView {
                     .arg(name).arg(others)
                 : name)
         }
-        var name = String(hosts[0])
+        var name = Pure.displayText(hosts[0])
         var text = compose(name)
         if (!fm || width <= 0 || fm.advanceWidth(text) <= width)
             return text
@@ -367,7 +472,7 @@ ScrollView {
             + root.tr("diag.conn-trace.remote-hosts-tip",
                 "Names this address was answered for (%1):")
                 .arg(section._connRemoteHostCount(e))
-            + "\n" + hosts.join("\n")
+            + "\n" + hosts.map(function (h) { return Pure.displayText(h) }).join("\n")
     }
     // Address and name share one line, so every data row is two lines.
     function _connRowHeight(e, lineH) {
@@ -432,6 +537,10 @@ ScrollView {
     }
 
     function _loadConnTraceEntries(reset) {
+        if (section._connIsHistory) {
+            section._loadConnHistory(reset)
+            return
+        }
         if (!root.bridgeAvailable
                 || typeof nrrNativeBridge === "undefined"
                 || nrrNativeBridge === null
@@ -454,6 +563,8 @@ ScrollView {
         // that rebuilt the render model on every append and froze the view.
         var corr = nrrNativeBridge.rpcConnTraceEntriesList(cursor, 200)
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
+            if (section._connIsHistory)
+                return
             section._connTraceLoading = false
             if (!ok) {
                 section._connTraceError = root.tr("diag.conn-trace.entries-failed",
@@ -543,7 +654,7 @@ ScrollView {
     // real money on a diagnostic view. Existing row objects are kept by
     // reference so an active selection survives the merge.
     function _refreshConnTraceHead() {
-        if (!section._connTraceShown || section._connTraceLoading)
+        if (!section._connTraceShown || section._connTraceLoading || section._connIsHistory)
             return
         if (!root.bridgeAvailable
                 || typeof nrrNativeBridge === "undefined"
@@ -554,7 +665,7 @@ ScrollView {
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
             // Silent on failure: this is a background poll, and the manual
             // Refresh button is what reports an error the user asked for.
-            if (!ok)
+            if (!ok || section._connIsHistory)
                 return
             var page = (payload && payload.page) || {}
             var items = page.items || []
@@ -607,6 +718,7 @@ ScrollView {
         repeat: true
         running: section._connTraceShown && section._connAutoRefresh
             && section._connGuiStreamEnabled
+            && !section._connIsHistory
             && section._connSel.length === 0
             && connTraceList.contentY <= 1
             && section.visible
@@ -641,11 +753,77 @@ ScrollView {
                 }
                 Label {
                     Layout.fillWidth: true
+                    visible: section._connIsHistory
+                    text: root.tr("diag.conn-history.subtitle",
+                        "Connections your programs made over the chosen period, kept by the service on this computer: one line per program and destination, with how many times it connected. Only you can see your history, and it is never part of the diagnostic archive. Switch it off or clear it in Settings → Diagnostics and logs.")
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                }
+                Label {
+                    Layout.fillWidth: true
+                    visible: !section._connIsHistory
                     text: root.tr("diag.conn-trace.subtitle",
                         "Recently-observed outbound connections and which interface they actually left through (primary, or the additional adapter). Observation only — it never changes routing. The list refreshes on its own while it is open and is kept in memory only. (Writing connections to the on-disk log stays an opt-in in Settings.) Shows TCP/UDP connections — a ping (ICMP) leaves no connection to observe, so a pinged address will not appear here.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                     font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                }
+
+                // Now / History, and the period the history covers.
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+                    ThemedComboBox {
+                        id: connModeCombo
+                        theme: root.uiTheme
+                        Layout.preferredWidth: 180
+                        model: [ "now", "history" ]
+                        function modeLabel(id) {
+                            return id === "history"
+                                ? root.tr("diag.conn-history.mode-history", "History")
+                                : root.tr("diag.conn-history.mode-now", "Now")
+                        }
+                        labelResolver: function(item) { return connModeCombo.modeLabel(item) }
+                        displayText: root.uiRevision >= 0 && currentIndex >= 0
+                            ? modeLabel(model[currentIndex]) : ""
+                        currentIndex: section._connIsHistory ? 1 : 0
+                        popup.width: root.comboPopupWidth(connModeCombo, model, "",
+                            function(item) { return connModeCombo.modeLabel(item) })
+                        Accessible.name: root.tr("diag.conn-history.mode-a11y",
+                            "Which connections to show") + ": " + displayText
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 400
+                        ToolTip.text: root.tr("diag.conn-history.mode-tip",
+                            "Now: the latest connections, as they happen. History: what your programs connected to over a period, kept by the service.")
+                        onActivated: section._setConnMode(model[currentIndex],
+                            section._connHistoryPeriod)
+                    }
+                    ThemedComboBox {
+                        id: connPeriodCombo
+                        theme: root.uiTheme
+                        visible: section._connIsHistory
+                        Layout.preferredWidth: 200
+                        model: [ "hour", "today", "week" ]
+                        function periodLabel(id) {
+                            if (id === "today")
+                                return root.tr("diag.conn-history.period-today", "Today")
+                            if (id === "week")
+                                return root.tr("diag.conn-history.period-week", "Last 7 days")
+                            return root.tr("diag.conn-history.period-hour", "Last hour")
+                        }
+                        labelResolver: function(item) { return connPeriodCombo.periodLabel(item) }
+                        displayText: root.uiRevision >= 0 && currentIndex >= 0
+                            ? periodLabel(model[currentIndex]) : ""
+                        currentIndex: Pure.optionIndexByValue(model,
+                            section._connHistoryPeriod, 0)
+                        popup.width: root.comboPopupWidth(connPeriodCombo, model, "",
+                            function(item) { return connPeriodCombo.periodLabel(item) })
+                        Accessible.name: root.tr("diag.conn-history.period-a11y",
+                            "Period of the history") + ": " + displayText
+                        onActivated: section._setConnMode("history", model[currentIndex])
+                    }
+                    Item { Layout.fillWidth: true }
                 }
 
                 // Open / search / refresh / hide controls.
@@ -675,7 +853,7 @@ ScrollView {
                     // wedged between two buttons reads as a third button.
                     CheckBox {
                         id: connAutoRefreshCheck
-                        visible: section._connTraceShown
+                        visible: section._connTraceShown && !section._connIsHistory
                         checked: section._connAutoRefresh
                         text: root.tr("diag.conn-trace.auto-refresh", "Refresh automatically")
                         contentItem: Label {
@@ -693,7 +871,7 @@ ScrollView {
                         }
                     }
                     Label {
-                        visible: section._connTraceShown
+                        visible: section._connTraceShown && !section._connIsHistory
                             && section._connRefreshStatusLabel() !== ""
                         text: section._connRefreshStatusLabel()
                         color: root.mutedTextColor
@@ -844,7 +1022,16 @@ ScrollView {
                     visible: section._connTraceShown && !section._connTraceLoading
                         && section._connTraceError === ""
                         && section._connTraceEntries.length === 0
-                    text: !section._connGuiStreamEnabled
+                    text: section._connIsHistory
+                        ? (!section._connHistoryAvailable
+                            ? root.tr("diag.conn-history.unavailable",
+                                "The connection history cannot be kept right now. The service log says why.")
+                            : !section._connHistoryEnabled
+                                ? root.tr("diag.conn-history.off",
+                                    "Your connection history is switched off in Settings → Diagnostics and logs.")
+                                : root.tr("diag.conn-history.empty",
+                                    "No connections in this period"))
+                        : !section._connGuiStreamEnabled
                         ? root.tr("diag.conn-trace.gui-stream-off",
                             "Showing the connection trace is switched off in Settings → Diagnostics and logs. Observation itself keeps running.")
                         : section._connObserverActive
@@ -854,6 +1041,29 @@ ScrollView {
                                 "The service is not observing connections right now, so this list stays empty. The service log says why.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
+                }
+                // The history is honest about what it could not keep.
+                Label {
+                    Layout.fillWidth: true
+                    visible: section._connIsHistory && section._connTraceShown
+                        && section._connHistoryRemoved > 0
+                    text: root.tr("diag.conn-history.removed",
+                        "%1 older entries were removed to keep the history within its size limit, so it may cover less than the period you chose.")
+                        .arg(section._connHistoryRemoved)
+                    color: root.uiTheme.colorWarning
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                }
+                Label {
+                    Layout.fillWidth: true
+                    visible: section._connIsHistory && section._connTraceShown
+                        && section._connHistorySkipped > 0
+                    text: root.tr("diag.conn-history.skipped",
+                        "%1 connections came too fast to be recorded and are missing from the history.")
+                        .arg(section._connHistorySkipped)
+                    color: root.uiTheme.colorWarning
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                 }
                 // No-match state. Covers the search field AND the two view
                 // filters — with "Show blocked" off, an all-blocked trace would
@@ -1064,11 +1274,12 @@ ScrollView {
                             width: parent.width
                             topPadding: root.uiTheme.spacingXs
                             text: (connRowItem._groupExpanded ? "▾ " : "▸ ")
-                                + String((modelData && modelData.process) || "—")
+                                + Pure.displayText((modelData && modelData.process) || "—")
                                 + "  ·  " + String((modelData && modelData._count) || 0) + " "
                                 + root.tr("diag.conn-trace.group-count", "connection(s)")
                             color: root.uiTheme.colorAccent
                             font.bold: true
+                            textFormat: Text.PlainText
                             elide: Text.ElideRight
                             Accessible.role: Accessible.Button
                             Accessible.name: connGroupHeader.text
@@ -1135,6 +1346,9 @@ ScrollView {
                         // service always appends ":port".
                         readonly property string _vRemoteAddr: {
                             var raw = connRowItem._vRemote
+                            // A kept row carries the address alone.
+                            if (modelData && modelData._history)
+                                return raw
                             var at = raw.lastIndexOf(":")
                             return at > 0 ? raw.substring(0, at) : raw
                         }
@@ -1276,12 +1490,13 @@ ScrollView {
                             Label {
                                 id: connProcLabel
                                 Layout.fillWidth: true
-                                text: String((modelData && modelData.process) || "—")
+                                text: Pure.displayText((modelData && modelData.process) || "—")
                                 color: root.textColor
+                                textFormat: Text.PlainText
                                 elide: Text.ElideRight
                                 // Full exe path on hover.
                                 readonly property string procPath:
-                                    String((modelData && modelData.process_path) || "")
+                                    Pure.displayText((modelData && modelData.process_path) || "")
                                 HoverHandler { id: connProcHover }
                                 ToolTip.visible: connProcHover.hovered
                                     && connProcLabel.procPath !== ""
@@ -1374,7 +1589,13 @@ ScrollView {
                             Layout.fillWidth: true
                             // The relay note is what keeps a fake-IP flow from
                             // reading as the service going out on its own account.
-                            text: section._connProtoLabel(modelData && modelData.proto)
+                            text: (modelData && modelData._history)
+                                ? root.tr("diag.conn-history.row-detail",
+                                    "%1 times  ·  %2 – %3")
+                                    .arg(Number(modelData._attempts || 0))
+                                    .arg(Pure.formatTimestamp(modelData._first_seen_ms))
+                                    .arg(Pure.formatTimestamp(modelData.observed_at_ms))
+                                : section._connProtoLabel(modelData && modelData.proto)
                                 + "  ·  " + root.tr("diag.conn-trace.entries-from", "from") + " "
                                 + String((modelData && modelData.local) || "—")
                                 + "  ·  "

@@ -10,24 +10,20 @@ fn err_for(value: &str) -> ValidationError {
 /// name and travelled into storage and codegen; it is refused and named.
 #[test]
 fn an_address_shaped_value_is_refused_and_named() {
-    assert!(matches!(
-        err_for("192.168.1.0/24"),
-        ValidationError::WrongAddressSection {
-            belongs_in: IpValueKind::Subnet,
-            ..
-        }
-    ));
-    assert!(matches!(
-        err_for("10.0.0.1-10.0.0.9"),
-        ValidationError::WrongAddressSection {
-            belongs_in: IpValueKind::Range,
-            ..
-        }
-    ));
-    assert!(matches!(
-        err_for("2001:db8::1"),
-        ValidationError::DomainInvalidValue { .. }
-    ));
+    for (value, section) in [
+        ("192.168.1.0/24", RulesFileSection::Cidr),
+        ("10.0.0.1-10.0.0.9", RulesFileSection::Ranges),
+        ("2001:db8::1", RulesFileSection::Ip),
+        ("192.0.2.7", RulesFileSection::Ip),
+    ] {
+        assert!(
+            matches!(
+                err_for(value),
+                ValidationError::WrongSection { belongs_in, .. } if belongs_in == section
+            ),
+            "{value}"
+        );
+    }
     assert!(matches!(
         err_for("192.168.1"),
         ValidationError::InvalidIpAddress { .. }

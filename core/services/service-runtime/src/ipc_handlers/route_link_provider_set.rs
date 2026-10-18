@@ -15,7 +15,8 @@
 use std::sync::Arc;
 
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 use crate::ipc_handlers::payloads::{RouteLinkProviderSetRequest, RouteLinkProviderSetResponse};
 use crate::ipc_handlers::providers::{
@@ -47,8 +48,14 @@ impl RouteLinkProviderSetHandler {
     }
 }
 
-impl IpcHandler for RouteLinkProviderSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for RouteLinkProviderSetHandler {
+    type Checked = RouteLinkProviderSetRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
         if ctx.caller_stored().is_empty() {
             return Err(IpcError {
                 code: IpcErrorCode::Internal,
@@ -76,7 +83,16 @@ impl IpcHandler for RouteLinkProviderSetHandler {
                 diagnostics_id: None,
             });
         }
+        Ok(req)
+    }
 
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        let req = req.into_inner();
         match self
             .writer
             .set_for_sid(ctx.caller_stored(), &req.role, &req.link_provider_apps)
@@ -121,7 +137,7 @@ fn map_write_error(err: RoutePolicyWriteError) -> IpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{IpcOperationClass, IPC_PROTOCOL_VERSION};
+    use crate::ipc::{IpcHandler, IpcOperationClass, IPC_PROTOCOL_VERSION};
     use crate::ipc_handlers::payloads::LinkProviderAppDto;
     use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
     use std::sync::Mutex;

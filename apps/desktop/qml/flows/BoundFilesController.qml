@@ -37,6 +37,7 @@ QtObject {
     /// The window-independent writer (also used by the tray).
     property var writer: RulesFileWriter {
         rpc: boundFilesController.root ? boundFilesController.root.rpc : null
+        textSource: boundFilesController.root
     }
 
     /// Generate `route`'s rules from the local table and write them to `path`.
@@ -702,7 +703,8 @@ QtObject {
     function writeRouteDiffers(route, path, onResult) {
         writer.readPassthroughSections(route, function(sections) {
             var text = Rules.buildCanonicalRulesText(
-                root.rulesModel, route, sections, _emitComments(), root.platformProfile.os)
+                root.rulesModel, route, sections, _emitComments(), root.platformProfile.os,
+                writer.hintLines())
             onResult(!writer.fileHoldsText(path, text))
         })
     }

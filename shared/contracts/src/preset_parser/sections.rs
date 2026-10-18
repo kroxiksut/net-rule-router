@@ -25,6 +25,10 @@ pub fn parse_canonical_rules(text: &str) -> PresetParseResult {
         // Strip the trailing \r on CRLF lines without allocating
         // when the input is already LF-only.
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        // Skipped in a passthrough section too, so the hint never rides along.
+        if is_syntax_hint_line(line) {
+            continue;
+        }
         if let Some(section_name) = parse_section_header(line) {
             state.start_section(section_name);
             continue;

@@ -55,9 +55,11 @@ impl LiveConnectionSource for WindowsLiveConnections {
                     .entry(pid)
                     .or_insert_with(|| crate::app_path_resolver::image_name_for_pid(pid))
                     .clone()?;
+                // Windows routes are machine-wide: one store serves everyone.
                 Some(LiveConnection {
                     process_path: name,
                     remote,
+                    owner: None,
                 })
             })
             .collect()

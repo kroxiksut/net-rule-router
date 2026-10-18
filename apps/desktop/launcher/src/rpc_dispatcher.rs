@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use nrr_broker::protocol::client_answer_timeout;
 use nrr_broker::BrokerHandle;
-use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
+use nrr_ipc_client::{ipc_operation_bound, ipc_operation_timeout, ipc_request_timeout, IpcClient};
 use nrr_shared::client_error_codes::{
     AUTOSTART_LOCAL_ERROR, BROKER_UNAVAILABLE, CONSOLE_PATH_ERROR, ELEVATED_OPERATION_RUNNING,
     SIDECAR_ERROR, UNKNOWN_OPERATION,
@@ -226,7 +226,7 @@ const LOCAL_ANSWER_DEADLINE: Duration = Duration::from_secs(30);
 /// live elevated broker after a `Forbidden`. A UAC prompt is the user's time
 /// and is not counted; an answer that outlives it reaches the host late.
 fn dispatcher_answer_bound(op: IpcOperationName) -> Duration {
-    let call = ipc_operation_timeout(op);
+    let call = ipc_operation_bound(op);
     CONNECT_BUDGET
         + call
         + client_answer_timeout(nrr_broker::protocol::BROKER_PING, Duration::ZERO)
@@ -758,7 +758,9 @@ fn handle_request(req: &LauncherRpcRequest, client: &dyn IpcClient) -> LauncherR
     // `DiagnosticsExportArchive` on slow disks. The matrix matches the
     // IPC-handler-side budget so the launcher and the service agree on
     // what "too slow" means.
-    let timeout = ipc_operation_timeout(op);
+    // Where the service may stop to ask for an administrator's password, the
+    // wait includes the prompt.
+    let timeout = ipc_request_timeout(op, &req.payload);
     // The raw service-log section is built by the SERVICE now (it reads its own
     // files and returns only what this caller may see), so the user's byte cap
     // has to travel with the request instead of being applied here after the

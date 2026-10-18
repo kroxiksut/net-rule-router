@@ -76,7 +76,8 @@ pub type ConnTraceExpectation = (
 
 use crate::ipc::DiagnosticsAudience;
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 
 fn malformed(op: &'static str, e: serde_json::Error) -> IpcError {
@@ -122,14 +123,19 @@ fn system_time_to_ms(t: SystemTime) -> i64 {
 
 mod archive;
 mod cache;
+mod conn_history;
 mod conn_trace;
 mod explain;
 mod vpn_gateways;
 
 pub use archive::*;
 pub use cache::*;
+pub use conn_history::{
+    ConnHistoryClearHandler, ConnHistoryListHandler, ConnHistorySettingsSetHandler,
+};
 pub use conn_trace::*;
 pub use explain::*;
+pub(crate) use vpn_gateways::is_service_account;
 pub use vpn_gateways::{
     VpnGatewayCandidatesListHandler, DEFAULT_UNIX_SYS_UID_MAX, MAX_GATEWAY_CANDIDATES,
 };

@@ -4,6 +4,8 @@ use super::bundles::*;
 use super::validation::*;
 use super::*;
 
+use std::io::Read;
+
 pub(super) fn sorted_unique_descriptors(
     mut descriptors: Vec<LocaleDescriptor>,
 ) -> Vec<LocaleDescriptor> {
@@ -46,6 +48,7 @@ pub(super) fn load_locale_candidates_from_dir(
         .into_iter()
         .flat_map(|entries| entries.filter_map(Result::ok))
         .filter_map(|entry| read_locale_candidate(&entry.path(), source))
+        .take(MAX_LOCALE_FILES_PER_DIR)
         .collect::<Vec<_>>()
 }
 
@@ -54,14 +57,28 @@ pub(super) fn read_locale_candidate(path: &Path, source: LocaleSource) -> Option
         return None;
     }
 
-    let id = normalize_locale_id(path.file_stem()?.to_str()?);
+    let stem = path.file_stem()?.to_str()?;
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_string();
+    let mut candidate = new_candidate(stem, file_name, source);
+    match read_bounded(path) {
+        Ok(bytes) => fill_candidate(&mut candidate, bytes),
+        Err(error) => candidate.errors.push(error),
+    }
+    Some(candidate)
+}
 
-    let mut candidate = LocaleCandidate {
+/// A candidate for the file named `stem`, nothing read into it yet.
+pub(super) fn new_candidate(
+    stem: &str,
+    file_name: String,
+    source: LocaleSource,
+) -> LocaleCandidate {
+    let id = normalize_locale_id(stem);
+    LocaleCandidate {
         id: id.clone(),
         file_name,
         source,
@@ -74,18 +91,39 @@ pub(super) fn read_locale_candidate(path: &Path, source: LocaleSource) -> Option
         entries: BTreeMap::new(),
         warnings: Vec::new(),
         errors: Vec::new(),
-    };
+    }
+}
 
-    let raw_bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            candidate
-                .errors
-                .push(format!("failed to read locale file: {error}"));
-            return Some(candidate);
-        }
-    };
+/// At most one byte past [`MAX_LOCALE_FILE_BYTES`], so an oversized file is
+/// told apart without being read whole. Only a regular file: a pipe or a
+/// device planted under a `.json` name would never end.
+fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
+    let failed = |error: std::io::Error| format!("failed to read locale file: {error}");
+    let metadata = fs::metadata(path).map_err(failed)?;
+    if !metadata.is_file() {
+        return Err("locale path is not a regular file".to_string());
+    }
+    let limit = u64::try_from(MAX_LOCALE_FILE_BYTES).unwrap_or(u64::MAX);
+    if metadata.len() > limit {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(limit.saturating_add(1)).read_to_end(&mut bytes))
+        .map_err(failed)?;
+    Ok(bytes)
+}
 
+fn too_large() -> String {
+    format!("locale file is larger than {MAX_LOCALE_FILE_BYTES} bytes and is not read")
+}
+
+/// Decodes, parses and validates one file's bytes into `candidate`.
+pub(super) fn fill_candidate(candidate: &mut LocaleCandidate, raw_bytes: Vec<u8>) {
+    if raw_bytes.len() > MAX_LOCALE_FILE_BYTES {
+        candidate.errors.push(too_large());
+        return;
+    }
     let bom_present = raw_bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
     let raw = match String::from_utf8(raw_bytes) {
         Ok(text) => text,
@@ -93,7 +131,7 @@ pub(super) fn read_locale_candidate(path: &Path, source: LocaleSource) -> Option
             candidate
                 .errors
                 .push(format!("invalid UTF-8 in locale file: {error}"));
-            return Some(candidate);
+            return;
         }
     };
 
@@ -103,14 +141,14 @@ pub(super) fn read_locale_candidate(path: &Path, source: LocaleSource) -> Option
             .push("UTF-8 BOM was detected and ignored".to_string());
     }
 
+    // serde_json stops at 128 levels of nesting, so the walk below is as deep.
     let parsed = match serde_json::from_str::<serde_json::Value>(strip_utf8_bom(&raw)) {
         Ok(value) => value,
         Err(error) => {
             candidate.errors.push(format!("invalid JSON: {error}"));
-            return Some(candidate);
+            return;
         }
     };
 
-    validate_candidate_root(&parsed, &mut candidate);
-    Some(candidate)
+    validate_candidate_root(&parsed, candidate);
 }

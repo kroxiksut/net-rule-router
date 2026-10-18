@@ -1,6 +1,7 @@
 #![no_main]
 //! A rules file from a user-writable folder: the parse, the canonicalisation
-//! into a rule set for either host platform, and the stored JSON form.
+//! into a rule set for every host platform, the stored JSON form, and a path
+//! rule matched against an image path another process could report.
 
 use libfuzzer_sys::fuzz_target;
 use nrr_domain::preset_canonicalize::canonicalize_preset_rules;
@@ -16,9 +17,17 @@ fuzz_target!(|data: &[u8]| {
     }
     let text = String::from_utf8_lossy(data);
     let outcome = parse_rules_file(&text);
-    for platform in [HostPlatform::Windows, HostPlatform::Linux] {
+    for platform in [HostPlatform::Windows, HostPlatform::Linux, HostPlatform::MacOS] {
         let _ = canonicalize_preset_rules(&outcome, RouteRole::Primary, platform, false);
-        let _ = canonicalize_preset_rules(&outcome, RouteRole::Secondary, platform, true);
+        let routed = canonicalize_preset_rules(&outcome, RouteRole::Secondary, platform, true);
+        let paths = routed
+            .rule_set()
+            .into_iter()
+            .flat_map(|set| set.rules())
+            .filter_map(|rule| rule.app_match.as_ref()?.pattern.path());
+        for path in paths {
+            let _ = path.match_image(&text);
+        }
     }
     let _ = nrr_shared::rules_json::from_canonical_string(&text);
 });

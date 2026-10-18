@@ -275,6 +275,8 @@ impl DnsResolverService {
     }
 
     /// Hand the current set to the port, and say so only when it changed.
+    /// `true` when a changed set was written: the caller owes the OS cache a
+    /// flush, or a name asked before the change keeps its old answer.
     ///
     /// Runs on every read of the claims, so an unconditional line would write
     /// one entry per read for a machine that never changes. No source wired
@@ -284,9 +286,9 @@ impl DnsResolverService {
         claims: &NamespaceClaims,
         current: &[DnsNamespaceExemption],
         last: &mut Vec<DnsNamespaceExemption>,
-    ) {
+    ) -> bool {
         if claims.source.is_none() || current == last.as_slice() {
-            return;
+            return false;
         }
         match redirect.exempt_namespaces(current) {
             Ok(_) => {
@@ -298,15 +300,19 @@ impl DnsResolverService {
                     "Mode B: these namespaces are answered by the connections that claim them",
                 );
                 *last = current.to_vec();
+                true
             }
             // Keep the previous set as the last-known state so the next tick
             // retries instead of believing the failed write took effect.
-            Err(error) => tracing::warn!(
-                target: "nrr::dns-resolver",
-                msg_key = "dns-resolver-exempt-namespaces-failed",
-                error = %error,
-                "Mode B: could not step out of the claimed namespaces; names inside them keep resolving through us",
-            ),
+            Err(error) => {
+                tracing::warn!(
+                    target: "nrr::dns-resolver",
+                    msg_key = "dns-resolver-exempt-namespaces-failed",
+                    error = %error,
+                    "Mode B: could not step out of the claimed namespaces; names inside them keep resolving through us",
+                );
+                false
+            }
         }
     }
 
@@ -424,8 +430,13 @@ impl DnsResolverService {
                 continue;
             }
             // Unchanged claims cost a comparison; a write that failed is
-            // retried with what was read, without reading again.
-            Self::apply_exemptions(&redirect, &claims, &current, &mut applied);
+            // retried with what was read, without reading again. A changed set
+            // flushes the OS cache: a "no such name" asked through us before a
+            // namespace was handed back is otherwise kept for the upstream's
+            // negative TTL, minutes on Windows.
+            if Self::apply_exemptions(&redirect, &claims, &current, &mut applied) {
+                let _ = redirect.flush_cache();
+            }
             if due || short_names.failing() {
                 short_names.keep(&redirect, &current);
             }
@@ -2040,6 +2051,110 @@ mod tests {
             vec![vec!["branch.corp.example".to_string()]],
             "the wake must not wait out the guard interval"
         );
+    }
+
+    /// Every change of the exempted set flushes the OS cache, and only a change
+    /// does. A corporate name asked through us before its namespace was handed
+    /// back would otherwise keep our "no such name" for the upstream's negative
+    /// TTL — up to fifteen minutes on Windows.
+    #[test]
+    fn each_change_of_the_exempted_set_flushes_the_cache_and_a_quiet_read_does_not() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirect = Arc::new(RecordingRedirect::default());
+        let recheck: NamespaceRecheck = Arc::new(AtomicBool::new(false));
+        let claimed = Arc::new(AtomicBool::new(false));
+        let source: DnsNamespaceExemptionsFn = {
+            let claimed = Arc::clone(&claimed);
+            Arc::new(move || {
+                if claimed.load(Ordering::SeqCst) {
+                    vec![exemption("branch.corp.example")]
+                } else {
+                    Vec::new()
+                }
+            })
+        };
+        let guard = std::thread::spawn({
+            let redirect: Arc<dyn SystemDnsRedirectPort> = redirect.clone();
+            let stop = Arc::clone(&stop);
+            let raised = Arc::clone(&recheck);
+            move || {
+                DnsResolverService::guard(
+                    redirect,
+                    RedirectHandle {
+                        marker: "test".to_string(),
+                        listener: "127.0.0.1:0".parse().expect("addr"),
+                    },
+                    Duration::from_secs(3600),
+                    stop,
+                    NamespaceClaims {
+                        source: Some(source),
+                        published: ClaimsSnapshot::default(),
+                        feed: Some(ChangeFeed {
+                            raised,
+                            safety_interval: Duration::from_secs(3600),
+                        }),
+                    },
+                    Vec::new(),
+                    ShortNameUpkeep::default(),
+                    None,
+                    GuardLinks::default(),
+                );
+            }
+        });
+        let count = |what: &str| {
+            redirect
+                .calls
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|c| **c == what)
+                .count()
+        };
+        let wait_for = |what: &str, n: usize| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline && count(what) < n {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        claimed.store(true, Ordering::SeqCst);
+        recheck.store(true, Ordering::SeqCst);
+        wait_for("flush", 1);
+        assert_eq!(
+            (count("exempt"), count("flush")),
+            (1, 1),
+            "the namespace appeared"
+        );
+
+        // Raised with nothing changed: read, compared, nothing written.
+        recheck.store(true, Ordering::SeqCst);
+        wait_for("inspect", 2);
+        assert_eq!((count("exempt"), count("flush")), (1, 1), "a quiet read");
+
+        claimed.store(false, Ordering::SeqCst);
+        recheck.store(true, Ordering::SeqCst);
+        wait_for("flush", 2);
+        stop.store(true, Ordering::SeqCst);
+        let _ = guard.join();
+        assert_eq!(
+            (count("exempt"), count("flush")),
+            (2, 2),
+            "the namespace went away"
+        );
+        let calls = redirect.calls.lock().expect("lock").clone();
+        let exempts: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c == "exempt")
+            .map(|(i, _)| i)
+            .collect();
+        for at in exempts {
+            assert_eq!(
+                calls.get(at + 1),
+                Some(&"flush"),
+                "a write is followed by its flush: {calls:?}"
+            );
+        }
     }
 
     /// Nothing claimed is the ordinary machine, and it must cost nothing: no

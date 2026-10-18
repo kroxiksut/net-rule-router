@@ -32,6 +32,13 @@ impl ProductionMutationExecutor {
         if let Some(e) = self.network_refusal(&parsed.rules_json, principal) {
             return MutationOutcome::Failed(e);
         }
+        if let Some(noop) = self.baseline_already_in_force(&parsed.rules_json, principal) {
+            return noop;
+        }
+        let base = base_revision_in(payload);
+        if let Some(e) = self.moved_rules_refusal(&parsed.rules_json, base, principal) {
+            return MutationOutcome::Failed(e);
+        }
         let correlation = parsed
             .correlation_id
             .clone()
@@ -41,25 +48,88 @@ impl ProductionMutationExecutor {
             Ok(id) => id,
             Err(e) => return policy_error_outcome(&e),
         };
+        let outcome = self.activate_submitted(&revision_id, &correlation, principal, base);
+        self.with_new_base(outcome, principal)
+    }
+
+    /// Drive a submitted revision to active: a deduped one by its status, a
+    /// fresh candidate through the coordinator. `base` is what the write says
+    /// it was built from.
+    pub(super) fn activate_submitted(
+        &self,
+        revision_id: &RevisionId,
+        correlation: &str,
+        principal: &str,
+        base: Option<&str>,
+    ) -> MutationOutcome {
         if let Some(outcome) =
-            self.drive_deduped_revision_active(&revision_id, &correlation, principal)
+            self.drive_deduped_revision_active(revision_id, correlation, principal, base)
         {
             return outcome;
         }
         let token = match self
             .coordinator
-            .issue_confirmation_token(&revision_id, COORDINATOR_TOKEN_TTL_SECS)
+            .issue_confirmation_token(revision_id, COORDINATOR_TOKEN_TTL_SECS)
         {
             Ok(t) => t,
             Err(e) => return policy_error_outcome(&e),
         };
         match self
             .coordinator
-            .activate(&revision_id, &token, &correlation)
+            .activate_over(revision_id, &token, correlation, base)
         {
             Ok(outcome) => activation_to_outcome(outcome),
             Err(e) => policy_error_outcome(&e),
         }
+    }
+
+    /// A write built from rules no longer in force is refused before anything
+    /// is stored — unless it asks for exactly the rules in force, which
+    /// changes nothing (and is how a client settles an apply by previewing it
+    /// again).
+    pub(super) fn moved_rules_refusal(
+        &self,
+        rules_json: &str,
+        base: Option<&str>,
+        principal: &str,
+    ) -> Option<OperationError> {
+        let base = base?;
+        match self.coordinator.base_revision_for(principal) {
+            Ok(now) if now == base => None,
+            Ok(_)
+                if self
+                    .coordinator
+                    .rules_json_in_force_for(principal)
+                    .as_deref()
+                    == Some(rules_json) =>
+            {
+                None
+            }
+            Ok(_) => Some(policy_error(&PolicyError::RulesChangedElsewhere)),
+            Err(e) => Some(policy_error(&e)),
+        }
+    }
+
+    /// A completed write names the rules now in force, so the writer can build
+    /// its next one on them without reading the list again.
+    pub(super) fn with_new_base(
+        &self,
+        outcome: MutationOutcome,
+        principal: &str,
+    ) -> MutationOutcome {
+        let MutationOutcome::Completed(mut result) = outcome else {
+            return outcome;
+        };
+        if let (Some(fields), Ok(base)) = (
+            result.as_object_mut(),
+            self.coordinator.base_revision_for(principal),
+        ) {
+            fields.insert(
+                nrr_shared::ipc_payloads::BASE_REVISION_KEY.to_owned(),
+                serde_json::Value::String(base),
+            );
+        }
+        MutationOutcome::Completed(result)
     }
 
     /// Emits a `MutationProgress` push event when both
@@ -127,6 +197,26 @@ impl ProductionMutationExecutor {
         }
     }
 
+    /// A user still on the baseline who submits exactly the baseline stays on
+    /// it: storing their own copy would cut them off from the administrator's
+    /// later edits while changing nothing they can see.
+    pub(super) fn baseline_already_in_force(
+        &self,
+        rules_json: &str,
+        principal: &str,
+    ) -> Option<MutationOutcome> {
+        if !self.coordinator.inherits_baseline(principal) {
+            return None;
+        }
+        let in_force = self.coordinator.rules_json_in_force_for(principal)?;
+        (in_force == rules_json).then(|| {
+            MutationOutcome::Completed(serde_json::json!({
+                "outcome": "already-active",
+                "baseline": true,
+            }))
+        })
+    }
+
     /// `submit_candidate` dedups by content hash and can hand back a
     /// revision in ANY lifecycle status. This drives that deduped
     /// revision to `Active`, branching on its status:
@@ -155,6 +245,7 @@ impl ProductionMutationExecutor {
         revision_id: &RevisionId,
         correlation: &str,
         principal: &str,
+        base: Option<&str>,
     ) -> Option<MutationOutcome> {
         if let Some(noop) = self.already_active_noop(revision_id, principal) {
             return Some(noop);
@@ -173,13 +264,14 @@ impl ProductionMutationExecutor {
                     "submitted content deduped to a historical revision — \
                      re-activating it via rollback_to(Specific)"
                 );
-                match self.coordinator.rollback_to(
+                match self.coordinator.rollback_to_over(
                     // Re-activate the deduped revision under
                     // the SAME principal as the originating rules/preset
                     // mutation (own SID or baseline).
                     principal,
                     RollbackTarget::Specific(revision_id.clone()),
                     correlation,
+                    base,
                 ) {
                     Ok(outcome) => Some(activation_to_outcome(outcome)),
                     Err(e) => Some(policy_error_outcome(&e)),
@@ -243,4 +335,11 @@ impl ProductionMutationExecutor {
             "deleted-revisions": deleted,
         }))
     }
+}
+
+/// The rules a write says it was built from (`base-revision`), when it says.
+pub(super) fn base_revision_in(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get(nrr_shared::ipc_payloads::BASE_REVISION_KEY)
+        .and_then(serde_json::Value::as_str)
 }

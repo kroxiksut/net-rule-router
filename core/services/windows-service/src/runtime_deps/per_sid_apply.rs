@@ -60,6 +60,48 @@ pub(super) struct PerSidApplyStack {
     pub route_path: RoutePathBundle,
 }
 
+/// The apply layer's own verdict on `Apply`, cleared once the engine answers.
+const WFP_ENGINE_HEALTH_SOURCE: &str = "wfp-engine";
+
+/// The first pass once the engine answered late. The health verdict comes off
+/// only when a pass has really run; until then it is retried here, on the
+/// opener's thread, and a stop ends the retries.
+fn first_pass_after_late_engine(orch: &PerSidApplyOrchestrator, health: &HealthAggregator) {
+    let mut pause = std::time::Duration::from_secs(5);
+    let mut reported = false;
+    loop {
+        if nrr_service_runtime::teardown_in_progress() {
+            return;
+        }
+        match orch.settle_and_recompile() {
+            Ok(()) => {
+                health.clear_as(WFP_ENGINE_HEALTH_SOURCE, HealthComponent::Apply);
+                return;
+            }
+            Err(e) => {
+                if !reported {
+                    reported = true;
+                    tracing::error!(
+                        target: "nrr::per_sid_orchestrator",
+                        msg_key = "svc-persid-late-engine-settle-failed",
+                        error = %e,
+                        "first pass after the filtering engine answered failed — retrying",
+                    );
+                    health.record_as(
+                        WFP_ENGINE_HEALTH_SOURCE,
+                        HealthComponent::Apply,
+                        nrr_service_runtime::state::ServiceHealthSeverity::Degraded,
+                        "the filtering engine answered, but rules could not be applied yet; \
+                         the service keeps trying",
+                    );
+                }
+            }
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_secs(60));
+    }
+}
+
 pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
     // Destructured rather than read through `inputs.x`, so the body below is
     // the same text it was inline and the diff shows a move, not a rewrite.
@@ -205,58 +247,61 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
         auto_rules_engine,
         app_destination_memory,
     ): RoutePathBundle = match (settings_conn.as_ref(), cache_store.as_ref()) {
-        (Some(state_conn), Some(cache_arc)) => match open_wfp_session_budgeted(Arc::clone(&api)) {
-            Ok(session) => {
-                let fqdn_cache: Arc<dyn FqdnCacheLookup> = Arc::new(SqliteFqdnCacheLookup::new(
-                    Arc::clone(cache_arc),
-                    FreshnessThresholds {
-                        // Same refresh-cadence floor as the store.
-                        fallback_ttl_secs: nrr_domain::decision_lookup::clamp_cache_refresh_secs(
-                            cache_refresh_secs,
-                        ),
-                        ..FreshnessThresholds::default_production()
-                    },
+        (Some(state_conn), Some(cache_arc)) => {
+            // Opened once everything that holds it exists: routes, the DNS
+            // path and the seeders never wait on the filtering engine.
+            let session = Arc::new(WfpSession::unopened(Arc::clone(&api)));
+            let fqdn_cache: Arc<dyn FqdnCacheLookup> = Arc::new(SqliteFqdnCacheLookup::new(
+                Arc::clone(cache_arc),
+                FreshnessThresholds {
+                    // Same refresh-cadence floor as the store.
+                    fallback_ttl_secs: nrr_domain::decision_lookup::clamp_cache_refresh_secs(
+                        cache_refresh_secs,
+                    ),
+                    ..FreshnessThresholds::default_production()
+                },
+            ));
+            nrr_service_runtime::doh_seed::seed_shared_baseline(state_conn);
+            // The policy source resolves DoH-resolver HOST entries
+            // through the FQDN cache (IP entries need no cache).
+            let route_source: Arc<dyn RoutePolicySource> = Arc::new(
+                ProductionRoutePolicySource::new(Arc::clone(state_conn))
+                    .with_fqdn_cache(Arc::clone(&fqdn_cache)),
+            );
+            nrr_service_runtime::any_zone_sites::install(Arc::clone(&fqdn_cache));
+            let production_rules = ProductionRulesProvider::new(Arc::clone(state_conn));
+            // A book that stops reading is a health verdict, not a log line.
+            production_rules.set_health(Arc::clone(&health_agg));
+            let rules_provider: Arc<dyn RulesProvider> = Arc::new(production_rules);
+            // Swap Noop → Production audit
+            // sink when the audit writer is available. Without
+            // an audit writer (boot before audit init or
+            // missing dir ACLs) the orchestrator silently
+            // drops records, same as before.
+            let audit: Arc<dyn PerSidApplyAudit> = match artifacts.audit_writer.as_ref() {
+                Some(writer) => Arc::new(ProductionPerSidApplyAudit::new(
+                    Arc::clone(writer),
+                    Arc::clone(&id_generator),
+                )),
+                None => Arc::new(NoopPerSidApplyAudit),
+            };
+            // A refused install is a verdict on `Apply`, not only an
+            // audit line.
+            let audit: Arc<dyn PerSidApplyAudit> =
+                Arc::new(nrr_service_runtime::apply_health::ApplyHealthAudit::new(
+                    audit,
+                    Arc::clone(&health_agg),
                 ));
-                nrr_service_runtime::doh_seed::seed_shared_baseline(state_conn);
-                // The policy source resolves DoH-resolver HOST entries
-                // through the FQDN cache (IP entries need no cache).
-                let route_source: Arc<dyn RoutePolicySource> = Arc::new(
-                    ProductionRoutePolicySource::new(Arc::clone(state_conn))
-                        .with_fqdn_cache(Arc::clone(&fqdn_cache)),
-                );
-                let production_rules = ProductionRulesProvider::new(Arc::clone(state_conn));
-                // A book that stops reading is a health verdict, not a log line.
-                production_rules.set_health(Arc::clone(&health_agg));
-                let rules_provider: Arc<dyn RulesProvider> = Arc::new(production_rules);
-                // Swap Noop → Production audit
-                // sink when the audit writer is available. Without
-                // an audit writer (boot before audit init or
-                // missing dir ACLs) the orchestrator silently
-                // drops records, same as before.
-                let audit: Arc<dyn PerSidApplyAudit> = match artifacts.audit_writer.as_ref() {
-                    Some(writer) => Arc::new(ProductionPerSidApplyAudit::new(
-                        Arc::clone(writer),
-                        Arc::clone(&id_generator),
-                    )),
-                    None => Arc::new(NoopPerSidApplyAudit),
-                };
-                // A refused install is a verdict on `Apply`, not only an
-                // audit line.
-                let audit: Arc<dyn PerSidApplyAudit> =
-                    Arc::new(nrr_service_runtime::apply_health::ApplyHealthAudit::new(
-                        audit,
-                        Arc::clone(&health_agg),
-                    ));
-                // Build the route coordinator with cloned providers BEFORE
-                // the orchestrator moves them.
-                // Live routing-scope read for the
-                // coordinator: service-driven (default) vs app-driven. Reads
-                // the SAME settings connection the rules provider uses, so it
-                // is only ever locked outside a recompute (no re-entrancy).
-                let rule_scope_provider: nrr_service_runtime::route_coordinator::RuleScopeProvider = {
-                    let scope_conn = Arc::clone(state_conn);
-                    Arc::new(move || {
-                        scope_conn
+            // Build the route coordinator with cloned providers BEFORE
+            // the orchestrator moves them.
+            // Live routing-scope read for the
+            // coordinator: service-driven (default) vs app-driven. Reads
+            // the SAME settings connection the rules provider uses, so it
+            // is only ever locked outside a recompute (no re-entrancy).
+            let rule_scope_provider: nrr_service_runtime::route_coordinator::RuleScopeProvider = {
+                let scope_conn = Arc::clone(state_conn);
+                Arc::new(move || {
+                    scope_conn
                                 .lock()
                                 .ok()
                                 .and_then(|g| {
@@ -266,41 +311,48 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                                 })
                                 .map(|r| r.rule_scope_service_driven)
                                 .unwrap_or(true)
-                    })
-                };
-                // Persist an auto-healed secondary/primary binding
-                // (autosave the healed binding + banner).
-                // When the coordinator matches a stale stored id to exactly
-                // one live adapter by saved name, it calls this to rewrite the
-                // stored id + name, ending the per-restart NOT-FOUND churn and
-                // making the GUI show the real adapter. Same settings
-                // connection; invoked OUTSIDE any recompute lock (the binding
-                // was loaded and released before the heal), so no re-entrancy.
-                let binding_heal_persist: nrr_service_runtime::route_coordinator::BindingHealPersistFn = {
-                        let conn = Arc::clone(state_conn);
-                        Arc::new(move |sid: &str, role: &str, healed_id: &str, healed_name: &str| {
-                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                            let repo = nrr_storage::route_bindings::RouteBindingsRepository::new(&guard);
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs() as i64)
-                                .unwrap_or(0);
-                            // Fold the healed id into the binding,
-                            // KEEPING the prior GUID in known_stable_ids so either
-                            // adapter identity is recognised directly next session
-                            // (no dependence on the friendly-name heal re-firing).
-                            // Idempotent + no-op when the binding row is absent.
-                            match repo.heal_binding_identity(sid, role, healed_id, healed_name, now) {
-                                Ok(()) => tracing::info!(target: "nrr::route-coordinator", msg_key = "svc-persid-binding-healed", sid = %sid, role = role, healed_id = %healed_id, "persisted auto-healed binding (stale id folded into known-id set)"),
-                                Err(e) => tracing::warn!(target: "nrr::route-coordinator", msg_key = "svc-persid-binding-heal-persist-failed", sid = %sid, error = %e, "auto-heal persist: heal_binding_identity failed"),
+                })
+            };
+            // Persist an auto-healed secondary/primary binding
+            // (autosave the healed binding + banner).
+            // When the coordinator matches a stale stored id to exactly
+            // one live adapter by saved name, it calls this to rewrite the
+            // stored id + name, ending the per-restart NOT-FOUND churn and
+            // making the GUI show the real adapter. Same settings
+            // connection; invoked OUTSIDE any recompute lock (the binding
+            // was loaded and released before the heal), so no re-entrancy.
+            let binding_heal_persist: nrr_service_runtime::route_coordinator::BindingHealPersistFn = {
+                let conn = Arc::clone(state_conn);
+                Arc::new(
+                    move |sid: &str, role: &str, healed_id: &str, healed_name: &str| {
+                        let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                        let repo =
+                            nrr_storage::route_bindings::RouteBindingsRepository::new(&guard);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        // Fold the healed id into the binding,
+                        // KEEPING the prior GUID in known_stable_ids so either
+                        // adapter identity is recognised directly next session
+                        // (no dependence on the friendly-name heal re-firing).
+                        // Idempotent + no-op when the binding row is absent.
+                        match repo.heal_binding_identity(sid, role, healed_id, healed_name, now) {
+                            Ok(()) => {
+                                tracing::info!(target: "nrr::route-coordinator", msg_key = "svc-persid-binding-healed", sid = %sid, role = role, healed_id = %healed_id, "persisted auto-healed binding (stale id folded into known-id set)")
                             }
-                        })
-                    };
-                // Remember the MAC of an adapter a binding resolved to, so the
-                // binding survives a GUID + ifindex change (Wi-Fi or Bluetooth
-                // after sleep). Widens the identity set only — never moves the
-                // binding — hence a callback of its own.
-                let binding_anchor_persist: nrr_service_runtime::route_coordinator::BindingAnchorPersistFn = {
+                            Err(e) => {
+                                tracing::warn!(target: "nrr::route-coordinator", msg_key = "svc-persid-binding-heal-persist-failed", sid = %sid, error = %e, "auto-heal persist: heal_binding_identity failed")
+                            }
+                        }
+                    },
+                )
+            };
+            // Remember the MAC of an adapter a binding resolved to, so the
+            // binding survives a GUID + ifindex change (Wi-Fi or Bluetooth
+            // after sleep). Widens the identity set only — never moves the
+            // binding — hence a callback of its own.
+            let binding_anchor_persist: nrr_service_runtime::route_coordinator::BindingAnchorPersistFn = {
                         let conn = Arc::clone(state_conn);
                         Arc::new(move |sid: &str, role: &str, anchor_id: &str| {
                             let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -314,426 +366,431 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             }
                         })
                     };
-                // The user's own answers about local networks: which segments
-                // stay reachable while the kill-switch blocks everything else.
-                // Read per resolve so a change in Settings lands on the next
-                // reconcile; unreadable rows degrade to "no stored decisions",
-                // never to a wider exemption.
-                let local_network_policy: nrr_service_runtime::route_coordinator::LocalNetworkPolicyFn = {
-                        let conn = Arc::clone(state_conn);
-                        Arc::new(move |sid: &str| {
-                            use nrr_domain::ipv4_network::Ipv4Network;
-                            let mut policy = nrr_service_runtime::route_coordinator::LocalNetworkPolicy::default();
-                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                            let repo = nrr_storage::local_network_rules::LocalNetworkRulesRepository::new(&guard);
-                            let Ok(rules) = repo.list_for_sid(sid) else {
-                                return policy;
-                            };
-                            for rule in rules {
-                                // The adapter half is what survives a
-                                // hypervisor switch renumbering its segment;
-                                // the coordinator resolves it against the
-                                // adapters that exist at reconcile time.
-                                if !rule.adapter.is_empty() {
-                                    policy
-                                        .adapter_answers
-                                        .push((rule.adapter.clone(), rule.allow));
-                                }
-                                let Some(network) = Ipv4Network::parse(&rule.cidr) else {
-                                    // A public IPv6 prefix, answered by itself.
-                                    if let Some(block) = nrr_shared::ip_block::IpBlock::parse(&rule.cidr)
-                                        .filter(|b| !b.is_ipv4())
-                                    {
-                                        policy.answers_v6.push((block, rule.allow));
-                                    }
-                                    continue;
-                                };
-                                if rule.allow {
-                                    policy.allowed.push(network);
-                                } else {
-                                    policy.refused.push(network);
-                                }
-                            }
-                            policy
-                        })
+            // The user's own answers about local networks: which segments
+            // stay reachable while the kill-switch blocks everything else.
+            // Read per resolve so a change in Settings lands on the next
+            // reconcile; unreadable rows degrade to "no stored decisions",
+            // never to a wider exemption.
+            let local_network_policy: nrr_service_runtime::route_coordinator::LocalNetworkPolicyFn = {
+                let conn = Arc::clone(state_conn);
+                Arc::new(move |sid: &str| {
+                    use nrr_domain::ipv4_network::Ipv4Network;
+                    let mut policy =
+                        nrr_service_runtime::route_coordinator::LocalNetworkPolicy::default();
+                    let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                    let repo =
+                        nrr_storage::local_network_rules::LocalNetworkRulesRepository::new(&guard);
+                    let Ok(rules) = repo.list_for_sid(sid) else {
+                        return policy;
                     };
-                // Safe-disable (ROUTE-half) — the route coordinator gates
-                // EVERY recompute on the persistent pause flag, so a paused
-                // user's routes are never (re)installed by any re-drive path
-                // (active-user listener, 30 s tick, apply-trigger, boot).
-                // Reads the SAME settings DB the rules/scope providers use, so
-                // it is only ever locked outside a recompute (no re-entrancy).
-                let pause_reader: nrr_service_runtime::route_coordinator::PausedCheckFn = {
-                    use nrr_service_runtime::route_coordinator::PausedRouteDisposition;
-                    let conn = Arc::clone(state_conn);
-                    Arc::new(move |sid: &str| {
-                        // Poisoned lock → treat as not-paused (Active), matching
-                        // the prior forgiving behaviour (never lock a user out).
-                        let Ok(g) = conn.lock() else {
-                            return PausedRouteDisposition::Active;
-                        };
-                        let paused = nrr_storage::pause_state::RoutingPauseStateRepository::new(&g)
-                            .is_paused(sid)
-                            .unwrap_or(false);
-                        if !paused {
-                            return PausedRouteDisposition::Active;
+                    for rule in rules {
+                        // The adapter half is what survives a
+                        // hypervisor switch renumbering its segment;
+                        // the coordinator resolves it against the
+                        // adapters that exist at reconcile time.
+                        if !rule.adapter.is_empty() {
+                            policy
+                                .adapter_answers
+                                .push((rule.adapter.clone(), rule.allow));
                         }
-                        // Honour the stop-policy
-                        // read FRESH under the same lock: Persist keeps the /32
-                        // rule-routes (work/corp adapter keeps carrying matched
-                        // traffic), Teardown (default) full-clears. Read from the
-                        // SAME settings DB `teardown_routes` uses so the safety
-                        // tick and the pause action agree.
-                        let persist = matches!(
+                        let Some(network) = Ipv4Network::parse(&rule.cidr) else {
+                            // A public IPv6 prefix, answered by itself.
+                            if let Some(block) = nrr_shared::ip_block::IpBlock::parse(&rule.cidr)
+                                .filter(|b| !b.is_ipv4())
+                            {
+                                policy.answers_v6.push((block, rule.allow));
+                            }
+                            continue;
+                        };
+                        if rule.allow {
+                            policy.allowed.push(network);
+                        } else {
+                            policy.refused.push(network);
+                        }
+                    }
+                    policy
+                })
+            };
+            // Safe-disable (ROUTE-half) — the route coordinator gates
+            // EVERY recompute on the persistent pause flag, so a paused
+            // user's routes are never (re)installed by any re-drive path
+            // (active-user listener, 30 s tick, apply-trigger, boot).
+            // Reads the SAME settings DB the rules/scope providers use, so
+            // it is only ever locked outside a recompute (no re-entrancy).
+            let pause_reader: nrr_service_runtime::route_coordinator::PausedCheckFn = {
+                use nrr_service_runtime::route_coordinator::PausedRouteDisposition;
+                let conn = Arc::clone(state_conn);
+                Arc::new(move |sid: &str| {
+                    // Poisoned lock → treat as not-paused (Active), matching
+                    // the prior forgiving behaviour (never lock a user out).
+                    let Ok(g) = conn.lock() else {
+                        return PausedRouteDisposition::Active;
+                    };
+                    let paused = nrr_storage::pause_state::RoutingPauseStateRepository::new(&g)
+                        .is_paused(sid)
+                        .unwrap_or(false);
+                    if !paused {
+                        return PausedRouteDisposition::Active;
+                    }
+                    // Honour the stop-policy
+                    // read FRESH under the same lock: Persist keeps the /32
+                    // rule-routes (work/corp adapter keeps carrying matched
+                    // traffic), Teardown (default) full-clears. Read from the
+                    // SAME settings DB `teardown_routes` uses so the safety
+                    // tick and the pause action agree.
+                    let persist = matches!(
                                 nrr_storage::service_stability_config::ServiceStabilityConfigRepository::new(&g)
                                     .get_or_default()
                                     .map(|r| r.routing_stop_policy),
                                 Ok(nrr_storage::service_stability_config::RoutingStopPolicy::Persist)
                             );
-                        if persist {
-                            PausedRouteDisposition::KeepSecondaryHosts
-                        } else {
-                            PausedRouteDisposition::ClearAll
-                        }
-                    })
-                };
-                // The observed tunnel servers survive a restart: the catch-all refuses
-                // to arm without a server hole. Same connection as the other callbacks.
-                let (server_ip_persist, server_ip_loader) = {
-                    use nrr_service_runtime::tunnel_server_memory::persistence_over;
-                    persistence_over(Arc::clone(state_conn))
-                };
-                // Alongside the per-SID WFP orchestrator, the
-                // `SecondaryRouteCoordinator` drives the system route table for the
-                // active console user (real interface routing of IP/FQDN/
-                // domain-suffix/zone rules out the secondary adapter); it shares the
-                // orchestrator's providers, cloned before the orchestrator consumes
-                // them.
-                let route_coord = Arc::new(
-                    nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator::new(
-                        Arc::clone(&api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
-                        Arc::clone(&rules_provider),
-                        Arc::clone(&route_source),
-                        Arc::clone(&fqdn_cache),
-                        rule_scope_provider,
-                    )
-                    .with_binding_heal_persist(binding_heal_persist)
-                    .with_binding_anchor_persist(binding_anchor_persist)
-                    // Tells "the adapter was removed" apart from "the adapter
-                    // is here and its driver will not start" — the enumeration
-                    // reports both as nothing, and they need opposite advice.
-                    .with_device_status(Arc::new(
-                        nrr_platform_windows::device_status::WindowsNetworkDeviceStatus,
-                    ))
-                    .with_local_network_policy(local_network_policy)
-                    .with_bootstrap_server_persistence(server_ip_persist, server_ip_loader)
-                    .with_pause_state(pause_reader)
-                    .with_liveness_probe(
-                        Arc::clone(&liveness_tracker),
-                        Arc::clone(&reachability_probe),
-                    )
-                    // Same store the connection observer fills and the per-SID
-                    // filter codegen reads: an application rule's route and its
-                    // permit must be derived from one set of destinations.
-                    .with_app_observations(
-                        nrr_service_runtime::app_observation_lookup::global_app_observations(),
-                    )
-                    // DNS-over-secondary — the SAME flag the egress policy
-                    // reads, so the resolver /32 routes and the source-bound
-                    // query sockets can never disagree about the path.
-                    .with_dns_via_secondary(
-                        nrr_service_runtime::dns_egress::global_dns_via_secondary(),
-                    )
-                    // So "your rules are not in force, and here is why" reaches
-                    // the GUI banner and the tray instead of only the log.
-                    .with_event_bus(Arc::clone(&event_bus)),
-                );
-                // The rule-hostname seeder resolves the active user's
-                // `ExactFqdn` rule hostnames into the FQDN cache so domain
-                // rules actually produce routes/filters. Shares the cache +
-                // rules provider + FQDN lookup. The resolver is the
-                // hosts-bypass decorator, so a hosts/adblock loopback pin no
-                // longer starves rule seeding.
-                let seeder_active_sid: nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn = {
-                    let reg = Arc::clone(&sid_registry);
-                    let coord = Arc::clone(&route_coord);
-                    Arc::new(move || coord.effective_routing_sid(&reg.active_sids()))
-                };
-                let route_seeder = Arc::new(
-                    nrr_service_runtime::rule_hostname_seeder::RuleHostnameSeeder::new(
-                        build_hosts_bypass_resolver(
-                            Some(Arc::clone(state_conn)),
-                            Some(Arc::clone(&seeder_active_sid)),
-                            Some(build_dns_egress_policy(
-                                &route_coord,
-                                Arc::clone(&seeder_active_sid),
-                            )),
-                        ),
-                        Arc::clone(cache_arc),
-                        Arc::clone(&fqdn_cache),
-                        Arc::clone(&rules_provider),
-                    )
-                    // While the guard blocks an unresolved link, a rule host
-                    // with no cached address is an unprotected one — retry in
-                    // seconds instead of minutes until it has one.
-                    .with_leak_guard_posture(Arc::clone(&seed_leak_guard)),
-                );
-                // Carry the destinations of applications routed over the
-                // additional link across restarts. An application rule is
-                // pinned to that link for every destination, but only a host
-                // route derived from an already-known address can put a flow
-                // there — so without this every session refuses each of the
-                // app's addresses once before learning it. The same
-                // observation store the conn-trace consumer writes and the
-                // codegen reads, so a
-                // remembered destination is indistinguishable from a live one.
-                let app_destination_memory =
-                    Arc::new(
-                        nrr_service_runtime::app_destination_memory::AppDestinationMemory::new(
-                            nrr_service_runtime::app_observation_lookup::global_app_observations(),
-                            Arc::clone(&rules_provider),
-                            {
-                                // One console user here; the neutral type takes
-                                // a list because other platforms have several.
-                                let active = Arc::clone(&seeder_active_sid);
-                                Arc::new(move || active().into_iter().collect())
-                            },
-                            {
-                                let conn = Arc::clone(state_conn);
-                                Arc::new(move |app: &str, ips: &[std::net::Ipv4Addr], now| {
-                                    let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                                    if let Err(e) =
-                                    nrr_storage::app_destinations::AppDestinationsRepository::new(
-                                        &guard,
-                                    )
-                                    .upsert(app, ips, unix_millis(now))
-                                {
-                                    tracing::warn!(
-                                        target: "nrr::app-routing",
-                                        msg_key = "svc-persid-app-destination-persist-failed",
-                                        error = %e,
-                                        "failed to persist application destinations — continuing",
-                                    );
-                                }
-                                })
-                            },
-                            {
-                                let conn = Arc::clone(state_conn);
-                                Arc::new(move |cutoff| {
-                                    let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                                    let repo =
-                                    nrr_storage::app_destinations::AppDestinationsRepository::new(
-                                        &guard,
-                                    );
-                                    let cutoff = unix_millis(cutoff);
-                                    // Rows past the window can never be enforced
-                                    // again, so the read is also where they go: one
-                                    // statement, on a path that already holds the
-                                    // lock, instead of a retention task of its own.
-                                    let _ = repo.prune_before(cutoff);
-                                    repo.load_confirmed_since(cutoff).unwrap_or_default()
-                                })
-                            },
-                        ),
-                    );
-                // Before the first apply: the routes must exist ahead of the
-                // applications' first connections, which is the whole point.
-                app_destination_memory.warm_load(std::time::SystemTime::now());
-                // DNS-observation consumer: matches observed resolutions
-                // against the active user's suffix/zone/exact rules and
-                // caches the matches. Console-SID-aware: route through the
-                // coordinator's effective-routing-SID gate so suffix/zone
-                // rules get cached for the active CONSOLE user under
-                // service-driven scope with no tray (otherwise only ExactIp
-                // enforces from boot).
-                // OS resolver-cache reader for the seed path
-                // (`seed_from_os_cache`). Windows reads the real cache;
-                // other targets get the no-op (empty) reader — the
-                // policy/mechanism seam: neutral port, per-OS mechanism.
-                let dns_cache_read: Arc<dyn nrr_platform_windows::DnsCacheReadPort> = {
-                    #[cfg(target_os = "windows")]
-                    {
-                        Arc::new(nrr_platform_windows::WindowsDnsCacheRead::new())
+                    if persist {
+                        PausedRouteDisposition::KeepSecondaryHosts
+                    } else {
+                        PausedRouteDisposition::ClearAll
                     }
-                    #[cfg(not(target_os = "windows"))]
+                })
+            };
+            // The observed tunnel servers survive a restart: the catch-all refuses
+            // to arm without a server hole. Same connection as the other callbacks.
+            let (server_ip_persist, server_ip_loader) = {
+                use nrr_service_runtime::tunnel_server_memory::persistence_over;
+                persistence_over(Arc::clone(state_conn))
+            };
+            // Alongside the per-SID WFP orchestrator, the
+            // `SecondaryRouteCoordinator` drives the system route table for the
+            // active console user (real interface routing of IP/FQDN/
+            // domain-suffix/zone rules out the secondary adapter); it shares the
+            // orchestrator's providers, cloned before the orchestrator consumes
+            // them.
+            let route_coord = Arc::new(
+                nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator::new(
+                    Arc::clone(&api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                    Arc::clone(&rules_provider),
+                    Arc::clone(&route_source),
+                    Arc::clone(&fqdn_cache),
+                    rule_scope_provider,
+                )
+                .with_binding_heal_persist(binding_heal_persist)
+                .with_binding_anchor_persist(binding_anchor_persist)
+                // Tells "the adapter was removed" apart from "the adapter
+                // is here and its driver will not start" — the enumeration
+                // reports both as nothing, and they need opposite advice.
+                .with_device_status(Arc::new(
+                    nrr_platform_windows::device_status::WindowsNetworkDeviceStatus,
+                ))
+                .with_local_network_policy(local_network_policy)
+                .with_bootstrap_server_persistence(server_ip_persist, server_ip_loader)
+                .with_pause_state(pause_reader)
+                .with_liveness_probe(
+                    Arc::clone(&liveness_tracker),
+                    Arc::clone(&reachability_probe),
+                )
+                // Same store the connection observer fills and the per-SID
+                // filter codegen reads: an application rule's route and its
+                // permit must be derived from one set of destinations.
+                .with_app_observations(
+                    nrr_service_runtime::app_observation_lookup::global_app_observations(),
+                )
+                // DNS-over-secondary — the SAME flag the egress policy
+                // reads, so the resolver /32 routes and the source-bound
+                // query sockets can never disagree about the path.
+                .with_dns_via_secondary(nrr_service_runtime::dns_egress::global_dns_via_secondary())
+                // So "your rules are not in force, and here is why" reaches
+                // the GUI banner and the tray instead of only the log.
+                .with_event_bus(Arc::clone(&event_bus)),
+            );
+            // The rule-hostname seeder resolves the active user's
+            // `ExactFqdn` rule hostnames into the FQDN cache so domain
+            // rules actually produce routes/filters. Shares the cache +
+            // rules provider + FQDN lookup. The resolver is the
+            // hosts-bypass decorator, so a hosts/adblock loopback pin no
+            // longer starves rule seeding.
+            let seeder_active_sid: nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn = {
+                let reg = Arc::clone(&sid_registry);
+                let coord = Arc::clone(&route_coord);
+                Arc::new(move || coord.effective_routing_sid(&reg.active_sids()))
+            };
+            let route_seeder = Arc::new(
+                nrr_service_runtime::rule_hostname_seeder::RuleHostnameSeeder::new(
+                    build_hosts_bypass_resolver(
+                        Some(Arc::clone(state_conn)),
+                        Some(Arc::clone(&seeder_active_sid)),
+                        Some(build_dns_egress_policy(
+                            &route_coord,
+                            Arc::clone(&seeder_active_sid),
+                        )),
+                    ),
+                    Arc::clone(cache_arc),
+                    Arc::clone(&fqdn_cache),
+                    Arc::clone(&rules_provider),
+                )
+                // While the guard blocks an unresolved link, a rule host
+                // with no cached address is an unprotected one — retry in
+                // seconds instead of minutes until it has one.
+                .with_leak_guard_posture(Arc::clone(&seed_leak_guard)),
+            );
+            // Carry the destinations of applications routed over the
+            // additional link across restarts. An application rule is
+            // pinned to that link for every destination, but only a host
+            // route derived from an already-known address can put a flow
+            // there — so without this every session refuses each of the
+            // app's addresses once before learning it. The same
+            // observation store the conn-trace consumer writes and the
+            // codegen reads, so a
+            // remembered destination is indistinguishable from a live one.
+            let app_destination_memory = Arc::new(
+                nrr_service_runtime::app_destination_memory::AppDestinationMemory::new(
+                    nrr_service_runtime::app_observation_lookup::global_app_observations(),
+                    Arc::clone(&rules_provider),
                     {
-                        Arc::new(nrr_platform_windows::NoopDnsCacheRead)
-                    }
-                };
-                // Session registry of positively-direct destinations,
-                // shared by the orchestrator (block-all exemptions), the FCrDNS
-                // direct-learning sink, and the Mode-B direct-answer gate.
-                let known_direct =
-                    Arc::new(nrr_service_runtime::known_direct::KnownDirectRegistry::default());
-                // Companion-domain discovery. Built here because
-                // the DNS-observation consumer below is its feed; the rule
-                // AUTHOR is attached later, once the activation coordinator
-                // exists. The mode comes straight from the caller's own per-SID
-                // `secondary_block_policy` row, so a user who turned discovery
-                // off pays nothing at all.
-                let auto_rules_engine = Arc::new(
-                    nrr_service_runtime::auto_rules::AutoRulesEngine::new(
-                        Arc::clone(&rules_provider),
-                        {
-                            let conn = Arc::clone(state_conn);
-                            Arc::new(move |sid: &str| {
-                                let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                                nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
-                                    .load_for_sid(sid)
-                                    .map(|record| record.auto_rules_mode)
-                                    // A read failure must not silently widen
-                                    // what the service may do on the user's
-                                    // behalf, so fall back to the default
-                                    // (`suggest`, which applies nothing).
-                                    .unwrap_or_default()
-                            })
-                        },
-                        Arc::new(nrr_service_runtime::auto_rules::SqliteDismissalStore::new(
-                            Arc::clone(state_conn),
-                        )),
-                        Arc::new(nrr_service_runtime::auto_rules::SqlitePendingStore::new(
-                            Arc::clone(state_conn),
-                        )),
-                        std::time::SystemTime::now(),
-                    )
-                    // Same per-SID row as the mode: whether the user asked for
-                    // delivery-named hosts to be offered without waiting for the
-                    // evidence. A read failure leaves them not opted in.
-                    .with_eager_delivery_names({
-                        let conn = Arc::clone(state_conn);
-                        Arc::new(move |sid: &str| {
-                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                            nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
-                                .load_for_sid(sid)
-                                .map(|record| record.auto_rules_eager_delivery_names)
-                                .unwrap_or(false)
-                        })
-                    })
-                    // The user's mode decides which offers change anything.
-                    .with_behavior_mode_source({
-                        let policy = Arc::clone(&route_source);
-                        Arc::new(move |sid: &str| {
-                            nrr_service_runtime::per_sid_orchestrator::behavior_mode_of(
-                                policy.as_ref(),
-                                sid,
-                            )
-                        })
-                    })
-                    .with_event_bus(Arc::clone(&event_bus))
-                    // Evidence across restarts: without it a machine that
-                    // restarts a few times a day never reaches the second
-                    // window a proposal needs.
-                    .with_evidence_store(Arc::new(
-                        nrr_service_runtime::auto_rules::SqliteEvidenceStore::new(Arc::clone(
-                            state_conn,
-                        )),
-                    ))
-                    // Suggestions wait for the additional route: with it down
-                    // every address already travels the main link, so there is
-                    // no half-loaded page to offer a fix for. Same resolve the
-                    // reconcile does, once per 10 s tick.
-                    .with_refusing_anchors(
-                        nrr_service_runtime::production_local_networks::refusing_anchors_reader(
-                            Arc::clone(state_conn),
-                        ),
-                    )
-                    // A third-party host is only worth a question once the
-                    // main link has answered for it, so the offer waits while
-                    // an answer can still arrive. Read live: switching the pass
-                    // off releases the held questions on the next tick.
-                    .with_main_link_pass_enabled({
-                        let conn = Arc::clone(state_conn);
-                        Arc::new(move |sid: &str| {
-                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                            nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
-                                .load_for_sid(sid)
-                                .map(|record| record.primary_probe_auto)
-                                .unwrap_or(false)
-                        })
-                    })
-                    .with_secondary_ready({
-                        let coord = Arc::clone(&route_coord);
-                        Arc::new(move |sid: &str| coord.resolve_egress_ifindexes(sid).1.is_some())
-                    })
-                    // What the main link currently does with a host, by
-                    // name. An offer a host made about ITSELF is parked
-                    // once and never rebuilt from the ledger, so this is
-                    // its only way to learn that the site started working
-                    // — and the offer is withdrawn when it does.
-                    .with_primary_behavior_source({
-                        let stalls =
-                            nrr_service_runtime::primary_stall_registry::global_primary_stalls();
-                        Arc::new(move |hostname: &str| stalls.behavior_of_subtree(hostname))
-                    }),
-                );
-                let observe_consumer = Arc::new(
-                    nrr_service_runtime::dns_observation_consumer::DnsObservationConsumer::new(
-                        Arc::clone(&rules_provider),
-                        Arc::clone(cache_arc),
-                        Arc::clone(&fqdn_cache),
-                        {
-                            let reg = Arc::clone(&sid_registry);
-                            let coord = Arc::clone(&route_coord);
-                            Arc::new(move || coord.effective_routing_sid(&reg.active_sids()))
-                        },
-                    )
-                    // Every signed-in user's suffix and zone hosts reach the
-                    // cache their routes are built from, not only the first's.
-                    .with_present_principals({
+                        // Every served user: each one's application rules
+                        // start warm, not only the routing user's.
                         let reg = Arc::clone(&sid_registry);
                         let coord = Arc::clone(&route_coord);
                         Arc::new(move || coord.served_sids(&reg.active_sids()))
+                    },
+                    {
+                        let conn = Arc::clone(state_conn);
+                        Arc::new(move |owner: Option<&str>, app: &str, ips: &[_], now| {
+                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                            if let Err(e) =
+                                nrr_storage::app_destinations::AppDestinationsRepository::new(
+                                    &guard,
+                                )
+                                .upsert(
+                                    owner,
+                                    app,
+                                    ips,
+                                    unix_millis(now),
+                                )
+                            {
+                                tracing::warn!(
+                                    target: "nrr::app-routing",
+                                    msg_key = "svc-persid-app-destination-persist-failed",
+                                    error = %e,
+                                    "failed to persist application destinations — continuing",
+                                );
+                            }
+                        })
+                    },
+                    {
+                        let conn = Arc::clone(state_conn);
+                        Arc::new(move |cutoff| {
+                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                            let repo =
+                                nrr_storage::app_destinations::AppDestinationsRepository::new(
+                                    &guard,
+                                );
+                            let cutoff = unix_millis(cutoff);
+                            // Rows past the window can never be enforced
+                            // again, so the read is also where they go: one
+                            // statement, on a path that already holds the
+                            // lock, instead of a retention task of its own.
+                            let _ = repo.prune_before(cutoff);
+                            repo.load_confirmed_since(cutoff).unwrap_or_default()
+                        })
+                    },
+                ),
+            );
+            // Before the first apply: the routes must exist ahead of the
+            // applications' first connections, which is the whole point.
+            app_destination_memory.warm_load(std::time::SystemTime::now());
+            // DNS-observation consumer: matches observed resolutions
+            // against the active user's suffix/zone/exact rules and
+            // caches the matches. Console-SID-aware: route through the
+            // coordinator's effective-routing-SID gate so suffix/zone
+            // rules get cached for the active CONSOLE user under
+            // service-driven scope with no tray (otherwise only ExactIp
+            // enforces from boot).
+            // OS resolver-cache reader for the seed path
+            // (`seed_from_os_cache`). Windows reads the real cache;
+            // other targets get the no-op (empty) reader — the
+            // policy/mechanism seam: neutral port, per-OS mechanism.
+            let dns_cache_read: Arc<dyn nrr_platform_windows::DnsCacheReadPort> = {
+                #[cfg(target_os = "windows")]
+                {
+                    Arc::new(nrr_platform_windows::WindowsDnsCacheRead::new())
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    Arc::new(nrr_platform_windows::NoopDnsCacheRead)
+                }
+            };
+            // Session registry of positively-direct destinations,
+            // shared by the orchestrator (block-all exemptions), the FCrDNS
+            // direct-learning sink, and the Mode-B direct-answer gate.
+            let known_direct =
+                Arc::new(nrr_service_runtime::known_direct::KnownDirectRegistry::default());
+            // Companion-domain discovery. Built here because
+            // the DNS-observation consumer below is its feed; the rule
+            // AUTHOR is attached later, once the activation coordinator
+            // exists. The mode comes straight from the caller's own per-SID
+            // `secondary_block_policy` row, so a user who turned discovery
+            // off pays nothing at all.
+            let auto_rules_engine = Arc::new(
+                nrr_service_runtime::auto_rules::AutoRulesEngine::new(
+                    Arc::clone(&rules_provider),
+                    {
+                        let conn = Arc::clone(state_conn);
+                        Arc::new(move |sid: &str| {
+                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                            nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
+                                .load_for_sid(sid)
+                                .map(|record| record.auto_rules_mode)
+                                // A read failure must not silently widen
+                                // what the service may do on the user's
+                                // behalf, so fall back to the default
+                                // (`suggest`, which applies nothing).
+                                .unwrap_or_default()
+                        })
+                    },
+                    Arc::new(nrr_service_runtime::auto_rules::SqliteDismissalStore::new(
+                        Arc::clone(state_conn),
+                    )),
+                    Arc::new(nrr_service_runtime::auto_rules::SqlitePendingStore::new(
+                        Arc::clone(state_conn),
+                    )),
+                    std::time::SystemTime::now(),
+                )
+                // Same per-SID row as the mode: whether the user asked for
+                // delivery-named hosts to be offered without waiting for the
+                // evidence. A read failure leaves them not opted in.
+                .with_eager_delivery_names({
+                    let conn = Arc::clone(state_conn);
+                    Arc::new(move |sid: &str| {
+                        let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                        nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
+                            .load_for_sid(sid)
+                            .map(|record| record.auto_rules_eager_delivery_names)
+                            .unwrap_or(false)
                     })
-                    .with_dns_cache_read(dns_cache_read)
-                    // FCrDNS direct-learning target.
-                    .with_known_direct_registry(Arc::clone(&known_direct))
-                    // Silence the collateral WARN while fake-IP is live: the
-                    // relay steers those hosts onto the primary by name, so the
-                    // shared IP is no longer forcing them out the secondary.
-                    .with_fake_ip_gate({
-                        let controller = Arc::clone(&fake_ip_controller);
-                        Arc::new(move || controller.is_running())
+                })
+                // The user's mode decides which offers change anything.
+                .with_behavior_mode_source({
+                    let policy = Arc::clone(&route_source);
+                    Arc::new(move |sid: &str| {
+                        nrr_service_runtime::per_sid_orchestrator::behavior_mode_of(
+                            policy.as_ref(),
+                            sid,
+                        )
                     })
-                    // Collateral pin gate: while the secondary is
-                    // unusable (the gated resolve yields no secondary interface,
-                    // or a fail-closed block-all is armed) a shared-IP collateral
-                    // is logged as "pin skipped" instead of "egresses the
-                    // secondary". Same usability source of truth the conn-observe
-                    // live-secondary drop counter reads.
-                    // Judged for the lead user, whose collateral this consumer
-                    // reports.
-                    .with_secondary_usable_gate({
+                })
+                .with_event_bus(Arc::clone(&event_bus))
+                // Evidence across restarts: without it a machine that
+                // restarts a few times a day never reaches the second
+                // window a proposal needs.
+                .with_evidence_store(Arc::new(
+                    nrr_service_runtime::auto_rules::SqliteEvidenceStore::new(Arc::clone(
+                        state_conn,
+                    )),
+                ))
+                // Suggestions wait for the additional route: with it down
+                // every address already travels the main link, so there is
+                // no half-loaded page to offer a fix for. Same resolve the
+                // reconcile does, once per 10 s tick.
+                .with_refusing_anchors(
+                    nrr_service_runtime::production_local_networks::refusing_anchors_reader(
+                        Arc::clone(state_conn),
+                    ),
+                )
+                // A third-party host is only worth a question once the
+                // main link has answered for it, so the offer waits while
+                // an answer can still arrive. Read live: switching the pass
+                // off releases the held questions on the next tick.
+                .with_main_link_pass_enabled({
+                    let conn = Arc::clone(state_conn);
+                    Arc::new(move |sid: &str| {
+                        let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                        nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
+                            .load_for_sid(sid)
+                            .map(|record| record.primary_probe_auto)
+                            .unwrap_or(false)
+                    })
+                })
+                .with_secondary_ready({
+                    let coord = Arc::clone(&route_coord);
+                    Arc::new(move |sid: &str| coord.resolve_egress_ifindexes(sid).1.is_some())
+                })
+                // What the main link currently does with a host, by
+                // name. An offer a host made about ITSELF is parked
+                // once and never rebuilt from the ledger, so this is
+                // its only way to learn that the site started working
+                // — and the offer is withdrawn when it does.
+                .with_primary_behavior_source({
+                    let stalls =
+                        nrr_service_runtime::primary_stall_registry::global_primary_stalls();
+                    Arc::new(move |hostname: &str| stalls.behavior_of_subtree(hostname))
+                }),
+            );
+            let observe_consumer = Arc::new(
+                nrr_service_runtime::dns_observation_consumer::DnsObservationConsumer::new(
+                    Arc::clone(&rules_provider),
+                    Arc::clone(cache_arc),
+                    Arc::clone(&fqdn_cache),
+                    {
                         let reg = Arc::clone(&sid_registry);
                         let coord = Arc::clone(&route_coord);
-                        let posture = block_all_posture.clone();
-                        Arc::new(move || {
-                            if posture.armed() {
-                                return false;
-                            }
-                            coord
-                                .effective_routing_sid(&reg.active_sids())
-                                .map(|sid| coord.resolve_egress_ifindexes(&sid).1.is_some())
-                                .unwrap_or(false)
-                        })
+                        Arc::new(move || coord.effective_routing_sid(&reg.active_sids()))
+                    },
+                )
+                // Every signed-in user's suffix and zone hosts reach the
+                // cache their routes are built from, not only the first's.
+                .with_present_principals({
+                    let reg = Arc::clone(&sid_registry);
+                    let coord = Arc::clone(&route_coord);
+                    Arc::new(move || coord.served_sids(&reg.active_sids()))
+                })
+                .with_dns_cache_read(dns_cache_read)
+                // FCrDNS direct-learning target.
+                .with_known_direct_registry(Arc::clone(&known_direct))
+                // Silence the collateral WARN while fake-IP is live: the
+                // relay steers those hosts onto the primary by name, so the
+                // shared IP is no longer forcing them out the secondary.
+                .with_fake_ip_gate({
+                    let controller = Arc::clone(&fake_ip_controller);
+                    Arc::new(move || controller.is_running())
+                })
+                // Collateral pin gate: while the secondary is
+                // unusable (the gated resolve yields no secondary interface,
+                // or a fail-closed block-all is armed) a shared-IP collateral
+                // is logged as "pin skipped" instead of "egresses the
+                // secondary". Same usability source of truth the conn-observe
+                // live-secondary drop counter reads.
+                // Judged for the lead user, whose collateral this consumer
+                // reports.
+                .with_secondary_usable_gate({
+                    let reg = Arc::clone(&sid_registry);
+                    let coord = Arc::clone(&route_coord);
+                    let posture = block_all_posture.clone();
+                    Arc::new(move || {
+                        if posture.armed() {
+                            return false;
+                        }
+                        coord
+                            .effective_routing_sid(&reg.active_sids())
+                            .map(|sid| coord.resolve_egress_ifindexes(&sid).1.is_some())
+                            .unwrap_or(false)
                     })
-                    // The observations this consumer discards are
-                    // the companion candidates. Feeding them costs one hash
-                    // insert per observation on a drain that already runs.
-                    .with_auto_rules(Arc::clone(&auto_rules_engine))
-                    // The same discarded observations, kept as names so
-                    // the connection observer can say WHICH host is
-                    // failing on the main link. Diagnostic only.
-                    .with_observed_host_names(
-                        nrr_service_runtime::observed_host_names::global_observed_host_names(),
-                    ),
-                );
-                // Per-filter apply-failure mode tracks the admin's stored
-                // `ApplyFailurePolicy` (Settings → Routing behavior). Read
-                // fresh on every apply so a mid-session change takes effect
-                // on the next reconcile/recompile. Map: best-effort → skip
-                // un-materializable filters; all-or-nothing / pre-flight →
-                // strict (one bad filter aborts the whole revision).
-                let failure_mode_source: nrr_service_runtime::per_sid_orchestrator::FilterFailureModeSource = {
+                })
+                // The observations this consumer discards are
+                // the companion candidates. Feeding them costs one hash
+                // insert per observation on a drain that already runs.
+                .with_auto_rules(Arc::clone(&auto_rules_engine))
+                // The same discarded observations, kept as names so
+                // the connection observer can say WHICH host is
+                // failing on the main link. Diagnostic only.
+                .with_observed_host_names(
+                    nrr_service_runtime::observed_host_names::global_observed_host_names(),
+                ),
+            );
+            // Per-filter apply-failure mode tracks the admin's stored
+            // `ApplyFailurePolicy` (Settings → Routing behavior). Read
+            // fresh on every apply so a mid-session change takes effect
+            // on the next reconcile/recompile. Map: best-effort → skip
+            // un-materializable filters; all-or-nothing / pre-flight →
+            // strict (one bad filter aborts the whole revision).
+            let failure_mode_source: nrr_service_runtime::per_sid_orchestrator::FilterFailureModeSource = {
                         let conn = Arc::clone(state_conn);
                         Arc::new(move || {
                             let slug = {
@@ -752,123 +809,123 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             }
                         })
                     };
-                // Kill-switch: the orchestrator
-                // resolves the active user's secondary (VPN) interface and
-                // catch-all exemptions through the route coordinator — the
-                // same resolution that drives the route table — so the
-                // kill-switch pins its egress condition to the live
-                // interface and never traps the tunnel / LAN / DHCP. Read
-                // fresh on every apply (a secondary reconnect changes the LUID /
-                // server IP). Returns `None` → kill-switch off (fail-open);
-                // it only activates when the user also enables
-                // `block_secondary_when_unavailable`.
-                let kill_switch_resolver: nrr_service_runtime::per_sid_orchestrator::KillSwitchResolver = {
+            // Kill-switch: the orchestrator
+            // resolves the active user's secondary (VPN) interface and
+            // catch-all exemptions through the route coordinator — the
+            // same resolution that drives the route table — so the
+            // kill-switch pins its egress condition to the live
+            // interface and never traps the tunnel / LAN / DHCP. Read
+            // fresh on every apply (a secondary reconnect changes the LUID /
+            // server IP). Returns `None` → kill-switch off (fail-open);
+            // it only activates when the user also enables
+            // `block_secondary_when_unavailable`.
+            let kill_switch_resolver: nrr_service_runtime::per_sid_orchestrator::KillSwitchResolver = {
                         let coord = Arc::clone(&route_coord);
                         Arc::new(move |sid: &str, machine: &nrr_service_runtime::machine_reading::MachineReading| {
                             coord.kill_switch_exemptions(sid, machine)
                         })
                     };
-                // What policy may do about IPv6 for this SID: the same
-                // coordinator, because the answer is a fact about the links it
-                // already resolves.
-                let ipv6_guard_resolver: nrr_service_runtime::per_sid_orchestrator::Ipv6GuardResolver = {
-                        let coord = Arc::clone(&route_coord);
-                        Arc::new(move |sid: &str, machine: &nrr_service_runtime::machine_reading::MachineReading| {
+            // What policy may do about IPv6 for this SID: the same
+            // coordinator, because the answer is a fact about the links it
+            // already resolves.
+            let ipv6_guard_resolver: nrr_service_runtime::per_sid_orchestrator::Ipv6GuardResolver = {
+                let coord = Arc::clone(&route_coord);
+                Arc::new(move |sid: &str, machine: &nrr_service_runtime::machine_reading::MachineReading| {
                             coord.ipv6_guard(sid, machine)
                         })
-                    };
-                // Fail-closed exemptions: resolved even
-                // when the secondary is gone, so a fail-closed block-all
-                // (mode B) keeps LAN / manageability and lets the tunnel
-                // reconnect. Same route coordinator, different entrypoint.
-                let fail_closed_exemptions_resolver: nrr_service_runtime::per_sid_orchestrator::FailClosedExemptionsResolver = {
+            };
+            // Fail-closed exemptions: resolved even
+            // when the secondary is gone, so a fail-closed block-all
+            // (mode B) keeps LAN / manageability and lets the tunnel
+            // reconnect. Same route coordinator, different entrypoint.
+            let fail_closed_exemptions_resolver: nrr_service_runtime::per_sid_orchestrator::FailClosedExemptionsResolver = {
                         let coord = Arc::clone(&route_coord);
                         Arc::new(move |sid: &str, machine: &nrr_service_runtime::machine_reading::MachineReading| {
                             coord.fail_closed_exemptions(sid, machine)
                         })
                     };
-                // Which link each connection rides, so a flow sweep spares one
-                // on a tunnel the user runs beside ours.
-                let flow_links_resolver: nrr_service_runtime::per_sid_orchestrator::FlowLinksResolver = {
-                        let coord = Arc::clone(&route_coord);
-                        Arc::new(move |sid: &str, machine: &nrr_service_runtime::machine_reading::MachineReading| {
+            // Which link each connection rides, so a flow sweep spares one
+            // on a tunnel the user runs beside ours.
+            let flow_links_resolver: nrr_service_runtime::per_sid_orchestrator::FlowLinksResolver = {
+                let coord = Arc::clone(&route_coord);
+                Arc::new(move |sid: &str, machine: &nrr_service_runtime::machine_reading::MachineReading| {
                             coord.flow_links(sid, machine)
                         })
-                    };
-                // The one reading of the machine each compute hands the three
-                // resolvers above, so a pass enumerates it once.
-                let machine_reader: nrr_service_runtime::per_sid_orchestrator::MachineReader = {
-                    let coord = Arc::clone(&route_coord);
-                    Arc::new(move || coord.read_machine())
+            };
+            // The one reading of the machine each compute hands the three
+            // resolvers above, so a pass enumerates it once.
+            let machine_reader: nrr_service_runtime::per_sid_orchestrator::MachineReader = {
+                let coord = Arc::clone(&route_coord);
+                Arc::new(move || coord.read_machine())
+            };
+            // Learned VPN client apps: pre-seed the
+            // verified-client registry from the state DB so the proactive
+            // app-scoped exemption arms on the FIRST compute of the
+            // session. Survivors only: a since-uninstalled client must not
+            // keep its hole in the block-all.
+            {
+                let loaded = {
+                    let guard = state_conn.lock().unwrap_or_else(|p| p.into_inner());
+                    nrr_storage::vpn_client_apps::VpnClientAppsRepository::new(&guard)
+                        .load()
+                        .unwrap_or_default()
                 };
-                // Learned VPN client apps: pre-seed the
-                // verified-client registry from the state DB so the proactive
-                // app-scoped exemption arms on the FIRST compute of the
-                // session. Survivors only: a since-uninstalled client must not
-                // keep its hole in the block-all.
-                {
-                    let loaded = {
-                        let guard = state_conn.lock().unwrap_or_else(|p| p.into_inner());
-                        nrr_storage::vpn_client_apps::VpnClientAppsRepository::new(&guard)
-                            .load()
-                            .unwrap_or_default()
-                    };
-                    let survivors: Vec<String> = loaded
-                        .into_iter()
-                        .filter(|p| std::path::Path::new(p).is_file())
-                        .collect();
-                    if !survivors.is_empty() {
-                        tracing::info!(
-                            target: "nrr::vpn-learn",
-                            msg_key = "svc-persid-vpn-client-apps-preseeded",
-                            clients = survivors.len(),
-                            "pre-seeded verified VPN client apps from the state DB",
-                        );
-                        learned_vpn_client_apps.seed(&survivors, std::time::SystemTime::now());
-                    }
+                let survivors: Vec<String> = loaded
+                    .into_iter()
+                    .filter(|p| std::path::Path::new(p).is_file())
+                    .collect();
+                if !survivors.is_empty() {
+                    tracing::info!(
+                        target: "nrr::vpn-learn",
+                        msg_key = "svc-persid-vpn-client-apps-preseeded",
+                        clients = survivors.len(),
+                        "pre-seeded verified VPN client apps from the state DB",
+                    );
+                    learned_vpn_client_apps.seed(&survivors, std::time::SystemTime::now());
                 }
-                // On-disk filter-id ledger so a hard-killed
-                // prior instance's orphaned filters reap BY ID at the next
-                // start (robust vs. an unreliable WFP enumerate). Sibling of
-                // logs/ under the service data dir.
-                let filter_ledger = Arc::new(
-                    nrr_service_runtime::wfp_filter_ledger::WfpFilterLedger::new(
-                        artifacts.topology.data_dir.join("wfp-filters.ledger"),
-                    ),
-                );
-                // The DNS refresher is built much further down (it needs the
-                // cache and the egress policy), so the apply path reaches it
-                // through a slot filled once that construction lands.
-                let dns_resolve_slot = Arc::clone(&dns_resolve_now_slot);
-                let dns_resolve_busy = Arc::clone(&dns_resolve_now_busy);
-                // The one answer to "who holds a filter set": every served
-                // user (tray or no tray — see `served_sids`) minus whoever
-                // paused, read fresh under the orchestrator's membership lock
-                // by the pass, the registry listener, the pause dispatcher and
-                // the fake-IP replan alike. Same settings DB the pause writes
-                // to, so a flag written before the call is seen by it. A flag
-                // read that fails is an unknown answer, never an empty one.
-                let enforced_sids: nrr_service_runtime::per_sid_orchestrator::EnforcedSidsSource = {
-                    let coord = Arc::clone(&route_coord);
-                    let registry = Arc::clone(&sid_registry);
-                    let conn = Arc::clone(state_conn);
-                    Arc::new(move || -> Result<Vec<String>, String> {
-                        let paused = {
-                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                            nrr_storage::pause_state::RoutingPauseStateRepository::new(&guard)
-                                .list_paused()
-                                .map_err(|e| format!("pause-state read failed: {e}"))?
-                        };
-                        Ok(coord
-                            .effective_enforcement_sids(&registry.active_sids())
-                            .into_iter()
-                            .filter(|sid| !paused.iter().any(|p| p == sid))
-                            .collect())
-                    })
-                };
-                let orch = Arc::new(
+            }
+            // On-disk filter-id ledger so a hard-killed
+            // prior instance's orphaned filters reap BY ID at the next
+            // start (robust vs. an unreliable WFP enumerate). Sibling of
+            // logs/ under the service data dir.
+            let filter_ledger = Arc::new(
+                nrr_service_runtime::wfp_filter_ledger::WfpFilterLedger::new(
+                    artifacts.topology.data_dir.join("wfp-filters.ledger"),
+                ),
+            );
+            // The DNS refresher is built much further down (it needs the
+            // cache and the egress policy), so the apply path reaches it
+            // through a slot filled once that construction lands.
+            let dns_resolve_slot = Arc::clone(&dns_resolve_now_slot);
+            let dns_resolve_busy = Arc::clone(&dns_resolve_now_busy);
+            // The one answer to "who holds a filter set": every served
+            // user (tray or no tray — see `served_sids`) minus whoever
+            // paused, read fresh under the orchestrator's membership lock
+            // by the pass, the registry listener, the pause dispatcher and
+            // the fake-IP replan alike. Same settings DB the pause writes
+            // to, so a flag written before the call is seen by it. A flag
+            // read that fails is an unknown answer, never an empty one.
+            let enforced_sids: nrr_service_runtime::per_sid_orchestrator::EnforcedSidsSource = {
+                let coord = Arc::clone(&route_coord);
+                let registry = Arc::clone(&sid_registry);
+                let conn = Arc::clone(state_conn);
+                Arc::new(move || -> Result<Vec<String>, String> {
+                    let paused = {
+                        let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                        nrr_storage::pause_state::RoutingPauseStateRepository::new(&guard)
+                            .list_paused()
+                            .map_err(|e| format!("pause-state read failed: {e}"))?
+                    };
+                    Ok(coord
+                        .effective_enforcement_sids(&registry.active_sids())
+                        .into_iter()
+                        .filter(|sid| !paused.iter().any(|p| p == sid))
+                        .collect())
+                })
+            };
+            let orch = Arc::new(
                         PerSidApplyOrchestrator::new(
-                            Arc::new(session),
+                            Arc::clone(&session),
                             route_source,
                             rules_provider,
                             fqdn_cache,
@@ -1096,94 +1153,94 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             })
                         }),
                     );
-                // The orchestrator's install listener is registered AFTER
-                // the pause coordinator is built (below), as a PAUSE-AWARE
-                // reconcile that skips paused SIDs. The registry is empty at
-                // construction (no active SID yet), so deferring the
-                // registration races nothing.
-                // Startup orphan cleanup: adopt our /32
-                // secondary routes left in the OS table by a previous run so
-                // the first recompute reconciles them. Runs before any
-                // listener can fire (no active SID yet at construction).
-                route_coord.adopt_orphans_from_table();
-                // A dead instance's filters (a non-dynamic session's survive
-                // `taskkill /F` until reboot): stripped now when nobody has
-                // leak protection on, else kept until the first pass over a
-                // present user adopts them. Runs before any active-SID
-                // listener fires (registry empty at construction).
-                match orphaned_blocks_at_start(super::offline_reset::leak_guard_armed_anywhere()) {
-                    OrphanedBlocks::AdoptOnFirstPass => orch.defer_orphans_to_first_pass(),
-                    OrphanedBlocks::StripNow => {
-                        // By persisted id first (robust when enumerate
-                        // under-reports), then the enumerate-based block strip.
-                        orch.cleanup_persisted_orphans();
-                        match orch.cleanup_wfp_blocks_only() {
-                            Ok(0) => {}
-                            Ok(n) => tracing::warn!(
-                                target: "nrr::runtime",
-                                msg_key = "svc-persid-startup-blocks-stripped",
-                                stripped_blocks = n as u64,
-                                "startup reconciliation: stripped orphaned block/kill-switch \
-                                 WFP filter(s) left by a prior instance",
-                            ),
-                            Err(e) => tracing::warn!(
-                                target: "nrr::runtime",
-                                msg_key = "svc-persid-startup-block-strip-failed",
-                                error = %e,
-                                "startup block-filter reconciliation failed",
-                            ),
-                        }
+            // The orchestrator's install listener is registered AFTER
+            // the pause coordinator is built (below), as a PAUSE-AWARE
+            // reconcile that skips paused SIDs. The registry is empty at
+            // construction (no active SID yet), so deferring the
+            // registration races nothing.
+            // Startup orphan cleanup: adopt our /32
+            // secondary routes left in the OS table by a previous run so
+            // the first recompute reconciles them. Runs before any
+            // listener can fire (no active SID yet at construction).
+            route_coord.adopt_orphans_from_table();
+            // A dead instance's filters (a non-dynamic session's survive
+            // `taskkill /F` until reboot) stay until the first real pass
+            // over a present user adopts them; a pass before the engine
+            // opens touches nothing. With nobody's leak protection on, a
+            // start whose engine answers in time also lifts the blocks now,
+            // before any pass is wired — later, a pass may already hold
+            // blocks of its own.
+            let startup_orphans =
+                orphaned_blocks_at_start(super::offline_reset::leak_guard_armed_anywhere());
+            orch.defer_orphans_to_first_pass();
+            health_agg.record_as(
+                WFP_ENGINE_HEALTH_SOURCE,
+                HealthComponent::Apply,
+                nrr_service_runtime::state::ServiceHealthSeverity::Degraded,
+                "the filtering engine has not handed out a session yet — rules are not \
+                 enforced; the service keeps asking and applies them as soon as it answers",
+            );
+            let on_late: Box<dyn FnOnce() + Send> = {
+                let orch = Arc::clone(&orch);
+                let health = Arc::clone(&health_agg);
+                Box::new(move || first_pass_after_late_engine(&orch, &health))
+            };
+            if open_wfp_session_or_keep_trying(Arc::clone(&session), on_late) {
+                health_agg.clear_as(WFP_ENGINE_HEALTH_SOURCE, HealthComponent::Apply);
+                if startup_orphans == OrphanedBlocks::StripNow {
+                    // By id first (robust when enumerate under-reports), then
+                    // every block the enumerate finds.
+                    orch.strip_inherited_now();
+                    match orch.cleanup_wfp_blocks_only() {
+                        Ok(0) => {}
+                        Ok(n) => tracing::warn!(
+                            target: "nrr::runtime",
+                            msg_key = "svc-persid-startup-blocks-stripped",
+                            stripped_blocks = n as u64,
+                            "startup reconciliation: stripped orphaned block/kill-switch \
+                             WFP filter(s) left by a prior instance",
+                        ),
+                        Err(e) => tracing::warn!(
+                            target: "nrr::runtime",
+                            msg_key = "svc-persid-startup-block-strip-failed",
+                            error = %e,
+                            "startup block-filter reconciliation failed",
+                        ),
                     }
                 }
-                // Recompute the route table on every active-user transition
-                // (login/logout/switch). Every served user's routes share the
-                // table; nobody served tears it down (no user → no routes).
-                {
-                    let coord = Arc::clone(&route_coord);
-                    sid_registry.add_listener(Arc::new(move |snapshot: &[String]| {
-                        if let Err(e) = coord.recompute_active(snapshot) {
-                            tracing::error!(
-                                target: "nrr::route-coordinator",
-                                msg_key = "svc-persid-route-recompute-failed",
-                                error = %e,
-                                "route recompute on active-user change failed",
-                            );
-                        }
-                    }));
-                }
-                (
-                    Some(orch),
-                    Some(route_coord),
-                    Some(route_seeder),
-                    Some(observe_consumer),
-                    Some(known_direct),
-                    Some(auto_rules_engine),
-                    Some(app_destination_memory),
-                )
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "nrr::runtime",
-                    msg_key = "svc-persid-no-wfp-session-noop",
-                    error = %format!("{e:?}"),
-                    "no filtering-engine session for orchestrator construction (failed or timed \
-                     out); per-SID apply layer will run in noop mode",
-                );
-                // Without this the degradation is log-only: the service reports
-                // Running, the GUI shows rules as applied, and nothing is
-                // enforced. `Degraded` (not `Blocking`) — editing rules still
-                // works, they just do not reach the kernel until a restart.
-                health_agg.record(
-                    HealthComponent::Apply,
-                    nrr_service_runtime::state::ServiceHealthSeverity::Degraded,
-                    "the filtering engine did not hand out a session at startup — rules are not \
-                     being enforced; restart the service once the Base Filtering Engine (BFE) is \
-                     healthy",
-                );
-                (None, None, None, None, None, None, None)
+            // Recompute the route table on every active-user transition
+            // (login/logout/switch). Every served user's routes share the
+            // table; nobody served tears it down (no user → no routes).
+            {
+                let coord = Arc::clone(&route_coord);
+                sid_registry.add_listener(Arc::new(move |snapshot: &[String]| {
+                    if let Err(e) = coord.recompute_active(snapshot) {
+                        tracing::error!(
+                            target: "nrr::route-coordinator",
+                            msg_key = "svc-persid-route-recompute-failed",
+                            error = %e,
+                            "route recompute on active-user change failed",
+                        );
+                    }
+                }));
             }
-        },
-        _ => (None, None, None, None, None, None, None),
+            (
+                Some(orch),
+                Some(route_coord),
+                Some(route_seeder),
+                Some(observe_consumer),
+                Some(known_direct),
+                Some(auto_rules_engine),
+                Some(app_destination_memory),
+            )
+        }
+        // No apply stack will ever own the filters, so a dead instance's
+        // blocks are lifted here or by nobody (leak protection still keeps them).
+        _ => {
+            strip_orphaned_block_filters_standalone();
+            (None, None, None, None, None, None, None)
+        }
     };
 
     // Routing-pause coordinator, wired to the REAL

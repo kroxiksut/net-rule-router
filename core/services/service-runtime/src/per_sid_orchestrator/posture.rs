@@ -154,7 +154,9 @@ impl PerSidApplyOrchestrator {
     ///
     /// Steady states never flush — the leak-guard reconcile recomputes every
     /// few seconds and a per-tick flush would defeat the OS cache entirely.
-    pub(super) fn note_block_all_state(&self, sid: &str, armed: bool) {
+    /// `true` when it flushed, so the fail-closed edge of the same compute
+    /// need not flush again; a failed flush leaves that edge its own try.
+    pub(super) fn note_block_all_state(&self, sid: &str, armed: bool) -> bool {
         let transitioned = {
             let mut g = self
                 .block_all_flush_state
@@ -169,7 +171,7 @@ impl PerSidApplyOrchestrator {
             }
         };
         if !transitioned {
-            return;
+            return false;
         }
         // publish the new "any SID armed?" posture for the GUI
         // banner. On the transition edge only (same throttle as the flush).
@@ -177,21 +179,27 @@ impl PerSidApplyOrchestrator {
             status.set(self.any_block_all_armed());
         }
         match self.dns_cache_control.flush_resolver_cache() {
-            Ok(()) => tracing::info!(
-                target: "nrr::per_sid_orchestrator",
-                msg_key = "persid-posture-dns-flush-ok",
-                sid,
-                block_all_armed = armed,
-                "flushed OS DNS resolver cache on kill-switch block-all transition — pre-transition cached names will re-query and become observable",
-            ),
-            Err(e) => tracing::warn!(
-                target: "nrr::per_sid_orchestrator",
-                msg_key = "persid-posture-dns-flush-failed",
-                sid,
-                block_all_armed = armed,
-                error = %e,
-                "OS DNS resolver cache flush failed on kill-switch block-all transition — names the OS already cached stay invisible to the DNS observer until their TTL expires",
-            ),
+            Ok(()) => {
+                tracing::info!(
+                    target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-posture-dns-flush-ok",
+                    sid,
+                    block_all_armed = armed,
+                    "flushed OS DNS resolver cache on kill-switch block-all transition — pre-transition cached names will re-query and become observable",
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-posture-dns-flush-failed",
+                    sid,
+                    block_all_armed = armed,
+                    error = %e,
+                    "OS DNS resolver cache flush failed on kill-switch block-all transition — names the OS already cached stay invisible to the DNS observer until their TTL expires",
+                );
+                false
+            }
         }
     }
 
@@ -199,11 +207,11 @@ impl PerSidApplyOrchestrator {
     /// the additional link unresolved, and publish the "any SID armed?" answer
     /// on the transition edge.
     ///
-    /// No cache flush and no logging of its own: the posture it mirrors is
-    /// already logged where it is decided, and this latch exists for readers
-    /// that must not treat a rule host as covered while the guard has nothing
-    /// but its known addresses to block with.
-    pub(super) fn note_fail_closed_state(&self, sid: &str, armed: bool) {
+    /// The OS cache is flushed once on each edge: when the guard takes hold, an
+    /// address cached while the tunnel was up would otherwise carry a rule
+    /// host over the main link (one the census spared is not blocked); when
+    /// it lets go, the failures it caused would otherwise outlive it.
+    pub(super) fn note_fail_closed_state(&self, sid: &str, armed: bool, cache_flushed: bool) {
         let transitioned = {
             let mut g = self
                 .fail_closed_state
@@ -223,6 +231,17 @@ impl PerSidApplyOrchestrator {
         if let Some(status) = self.fail_closed_posture_status.as_ref() {
             status.set(self.any_fail_closed_armed());
         }
+        if !cache_flushed {
+            if let Err(e) = self.dns_cache_control.flush_resolver_cache() {
+                tracing::warn!(
+                    target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-posture-dns-flush-link-edge-failed",
+                    sid,
+                    error = %e,
+                    "OS DNS resolver cache flush failed as the additional link went down or came back — cached answers outlive the change until their TTL expires",
+                );
+            }
+        }
     }
 
     /// Drop every per-SID record describing an enforcement that is gone: the
@@ -236,8 +255,8 @@ impl PerSidApplyOrchestrator {
             .remove(sid);
         crate::enforced_addresses::global_enforced_addresses().forget(sid);
         crate::ipv6_disposition::global_ipv6_dispositions().forget(sid);
-        self.note_block_all_state(sid, false);
-        self.note_fail_closed_state(sid, false);
+        let flushed = self.note_block_all_state(sid, false);
+        self.note_fail_closed_state(sid, false, flushed);
         self.update_killswitch_registry(sid, KillswitchBlockIds::default());
         self.clear_pending_vpn_clients(sid);
         self.posture_log_state

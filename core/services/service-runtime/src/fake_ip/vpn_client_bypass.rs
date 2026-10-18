@@ -128,7 +128,15 @@ impl VpnClientFlowBypass for OwnerLookupVpnClientBypass {
         let Some(image) = self.owner.owner_image_name(client, fake) else {
             return false;
         };
-        let matched = self.confirmed.matches_image(&image);
+        // Whose confirmation counts is the flow owner's: a second table read,
+        // paid only once the image already matched someone's pick.
+        let matched = self.confirmed.matches_image(&image)
+            && self.confirmed.matches_image_for(
+                self.owner
+                    .owner_principal(client, fake, nrr_platform_api::fake_ip::FlowTransport::Tcp)
+                    .as_deref(),
+                &image,
+            );
         if matched {
             tracing::debug!(
                 target: "nrr::fake-ip",

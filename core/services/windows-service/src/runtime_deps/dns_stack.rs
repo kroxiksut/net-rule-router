@@ -20,6 +20,8 @@ pub(super) fn build_dns_resolver_factory(
     known_direct: Option<&Arc<nrr_service_runtime::known_direct::KnownDirectRegistry>>,
     block_all_armed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     fail_closed_armed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    fail_closed_armed_for: Option<nrr_service_runtime::dns_stack::PrincipalFlag>,
+    served_sids: Option<nrr_service_runtime::dns_resolver_ports::ResolverPrincipalsFn>,
     fake_assembly: Option<Arc<nrr_service_runtime::fake_ip::FakeIpAssembly>>,
     fake_ip_running: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     fake_ip_secondary_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -42,10 +44,12 @@ pub(super) fn build_dns_resolver_factory(
         settings_conn: Arc::clone(settings_conn?),
         cache: Arc::clone(cache_store?),
         active_sid: Arc::clone(active_routing_sid?),
+        served_sids,
         recompute_hook: route_recompute_hook?.clone(),
         known_direct: known_direct.map(Arc::clone),
         block_all_armed,
         fail_closed_armed,
+        fail_closed_armed_for,
         fake_assembly,
         fake_ip_running,
         fake_ip_secondary_ready,
@@ -110,10 +114,15 @@ pub(super) struct CoordinatorRelaySourceAddrs {
     pub(super) coordinator: Arc<nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator>,
     pub(super) active_sid: nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn,
     pub(super) cache: RelaySourceAddrCache,
+    /// The same resolution for the other served users whose flows the relay
+    /// carries, by SID.
+    pub(super) owner_cache: OwnerSourceAddrCache,
 }
 
 type ResolvedSourceIps = (Option<std::net::Ipv4Addr>, Option<std::net::Ipv4Addr>);
 type RelaySourceAddrCache = Mutex<Option<(std::time::Instant, ResolvedSourceIps)>>;
+pub(super) type OwnerSourceAddrCache =
+    Mutex<std::collections::HashMap<String, (std::time::Instant, ResolvedSourceIps)>>;
 
 /// How long one adapter-source resolution serves relay dials before a fresh
 /// look at the live adapters. Short enough to track a VPN reconnect promptly,
@@ -133,6 +142,21 @@ impl CoordinatorRelaySourceAddrs {
             None => (None, None),
         };
         *cache = Some((std::time::Instant::now(), ips));
+        ips
+    }
+
+    /// [`Self::current`] for another served user's own links.
+    fn current_for(&self, sid: &str) -> ResolvedSourceIps {
+        let mut cache = self.owner_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((resolved_at, ips)) = cache.get(sid) {
+            if resolved_at.elapsed() < RELAY_SOURCE_ADDR_TTL {
+                return *ips;
+            }
+        }
+        // Users sign out; an entry nobody refreshed is dropped, not kept.
+        cache.retain(|_, (resolved_at, _)| resolved_at.elapsed() < RELAY_SOURCE_ADDR_TTL);
+        let ips = self.coordinator.resolve_egress_source_ips(sid);
+        cache.insert(sid.to_owned(), (std::time::Instant::now(), ips));
         ips
     }
 }
@@ -159,6 +183,7 @@ pub(super) fn build_dns_egress_policy(
         coordinator: Arc::clone(coordinator),
         active_sid,
         cache: Mutex::new(None),
+        owner_cache: Mutex::default(),
     });
     Arc::new(
         nrr_service_runtime::dns_egress::SecondaryPreferredEgress::new(
@@ -171,6 +196,15 @@ pub(super) fn build_dns_egress_policy(
 impl nrr_service_runtime::fake_ip::RelaySourceAddrs for CoordinatorRelaySourceAddrs {
     fn decide(
         &self,
+        route: nrr_shared::RouteRole,
+        remote: &std::net::SocketAddr,
+    ) -> nrr_service_runtime::fake_ip::SourceBindDecision {
+        nrr_service_runtime::fake_ip::RelaySourceAddrs::decide_for(self, None, route, remote)
+    }
+
+    fn decide_for(
+        &self,
+        owner: Option<&str>,
         route: nrr_shared::RouteRole,
         remote: &std::net::SocketAddr,
     ) -> nrr_service_runtime::fake_ip::SourceBindDecision {
@@ -187,7 +221,10 @@ impl nrr_service_runtime::fake_ip::RelaySourceAddrs for CoordinatorRelaySourceAd
                 },
             };
         }
-        let (primary, secondary) = self.current();
+        let (primary, secondary) = match owner {
+            Some(sid) => self.current_for(sid),
+            None => self.current(),
+        };
         match route {
             RouteRole::Primary => primary.map_or(SourceBindDecision::Unbound, |ip| {
                 SourceBindDecision::Bind(ip.into())
@@ -203,6 +240,7 @@ impl nrr_service_runtime::fake_ip::RelaySourceAddrs for CoordinatorRelaySourceAd
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_fake_ip_stack_factory(
     assembly: Arc<nrr_service_runtime::fake_ip::FakeIpAssembly>,
     cache_store: Option<&Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>>,
@@ -212,6 +250,7 @@ pub(super) fn build_fake_ip_stack_factory(
         &Arc<nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator>,
     >,
     auto_rules_engine: Option<&Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>>,
+    served_principals: nrr_service_runtime::fake_ip::ServedPrincipalsFn,
     liveness: Arc<TaskLiveness>,
 ) -> Option<nrr_service_runtime::fake_ip::FakeIpStackFactory> {
     use nrr_platform_api::fake_ip::tun::{TunAdapterConfig, TunAdapterPort};
@@ -279,6 +318,7 @@ pub(super) fn build_fake_ip_stack_factory(
                     coordinator: Arc::clone(coordinator),
                     active_sid: Arc::clone(&active_sid),
                     cache: Mutex::new(None),
+                    owner_cache: Mutex::default(),
                 }));
             }
             None => {
@@ -381,6 +421,13 @@ pub(super) fn build_fake_ip_stack_factory(
             msg_key = "svc-dns-fakeip-stack-up",
             "fake-IP TUN adapter is open with the pool route in place — bringing the userspace stack up",
         );
+        // With two or more users served, each flow takes its own owner's rules
+        // and links.
+        let flow_owners = Arc::new(nrr_service_runtime::fake_ip::ServedFlowOwners::new(
+            Arc::new(nrr_platform_windows::flow_owner::WindowsFlowOwnerLookup::new()),
+            Arc::clone(&served_principals),
+            Arc::clone(&active_sid),
+        ));
         Some(
             assembly
                 .build_stack(device, dialer, upstream, routes, StackWaker::new())
@@ -390,6 +437,7 @@ pub(super) fn build_fake_ip_stack_factory(
                 // (the user is ON this site right now — a fact DNS cannot
                 // deliver when the browser answers from its own cache).
                 .with_flow_observer(flow_observer)
+                .with_flow_owners(flow_owners)
                 // Fake-IP instant reset — the same process-wide flag
                 // `ProductionServiceStability::set` flips live, so a rebuilt
                 // stack (watchdog rebuild, restart after a toggle) always

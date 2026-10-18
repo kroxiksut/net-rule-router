@@ -5,6 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use nrr_ipc_client::IpcClient;
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     CacheClearRequest, CacheClearResponse, CacheEntriesListRequest, CacheEntriesListResponse,
@@ -444,7 +445,7 @@ fn route_label(texts: &Texts, route: &str) -> String {
 fn row_text(texts: &Texts, e: &CacheEntryDto) -> String {
     format!(
         "{} → {} · {} · {}",
-        e.hostname,
+        display_text(&e.hostname),
         e.ip,
         route_label(texts, &e.expected_route),
         slug_label(texts, "freshness", &e.freshness),
@@ -454,7 +455,7 @@ fn row_text(texts: &Texts, e: &CacheEntryDto) -> String {
 fn detail_lines(texts: &Texts, e: &CacheEntryDto) -> Vec<ViewLine> {
     let field = |key: Key, value: String| ViewLine::text(format!("{}: {value}", texts.get(key)));
     let mut lines = vec![
-        field(keys::COL_HOST, e.hostname.clone()),
+        field(keys::COL_HOST, display_text(&e.hostname).into_owned()),
         field(keys::COL_IP, e.ip.clone()),
     ];
     if !e.fake_ip.is_empty() {

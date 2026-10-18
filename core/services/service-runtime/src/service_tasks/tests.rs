@@ -708,10 +708,12 @@ fn the_live_refresh_pass_restamps_held_destinations_only() {
         LiveConnection {
             process_path: "/usr/bin/messenger".to_string(),
             remote: Ipv4Addr::new(203, 0, 113, 7),
+            owner: None,
         },
         LiveConnection {
             process_path: "/usr/bin/messenger".to_string(),
             remote: Ipv4Addr::new(203, 0, 113, 99),
+            owner: None,
         },
     ]);
     let wiring = LiveConnectionRefreshWiring {

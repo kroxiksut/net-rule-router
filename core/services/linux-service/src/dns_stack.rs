@@ -41,6 +41,12 @@ impl DnsCapture {
     pub(crate) fn answers_dns(&self) -> bool {
         matches!(self, Self::Via(_))
     }
+
+    /// Whether systemd-resolved holds the machine's DNS cache, the one cache
+    /// the service can flush.
+    pub(crate) fn caches_in_resolved(&self) -> bool {
+        matches!(self, Self::Via(m) if matches!(m.method, DnsCaptureMethod::Resolved))
+    }
 }
 
 /// One set of mechanism parts per process: the resolver arms through them and

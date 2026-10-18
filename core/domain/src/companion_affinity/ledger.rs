@@ -717,6 +717,9 @@ impl CompanionAffinityLedger {
     /// which grounds. Tiers are tried strongest first; `None` means the pair
     /// stays unproposed — the deliberate default, since a wrong proposal grows
     /// the rule book that every packet is matched against.
+    ///
+    /// `use_` is the only thing that moves the bar, and it moves it in one
+    /// place: the single-window brand fallback at the end.
     fn qualify(
         &self,
         anchor_hostname: &str,
@@ -724,44 +727,34 @@ impl CompanionAffinityLedger {
         pair: &PairStats,
         candidate: &CandidateState,
         affinity: f64,
-    ) -> Option<CompanionSignal> {
-        if is_brand_related(anchor_hostname, candidate_hostname) {
-            // Brand relation states ownership, not need. An operator's
-            // advertising and telemetry domains carry the brand exactly as
-            // plainly as the asset host a page cannot render without
-            // (an operator's ad domain beside its asset domain under one of
-            // that operator's product hosts), so the shared name opens the tier and
-            // evidence decides it — one sighting is not a relationship.
-            //
-            // Ownership is measured with `nearest_share`, not `affinity`:
-            // affinity divides by how many OTHER anchors pulled the same
-            // candidate, and a brand's shared asset host is pulled by all of
-            // them by design — the threshold would drop precisely the companion
-            // worth proposing.
-            // Exclusivity is the evidence that separates them, and `affinity`
-            // measures exactly that: the share of all the windows this candidate
-            // was ever seen in that belong to THIS anchor. A site's own hosts
-            // ride along with that site; an operator's advertising, telemetry
-            // and shared asset domains ride along with everything, which is what
-            // drops them to affinities in the thousandths.
-            if affinity >= self.config.brand_min_affinity {
-                return Some(CompanionSignal::BrandRelated);
-            }
-            // Not proven as kin — fall through to the tiers below, which judge
-            // it on temporal evidence like any other name.
-        }
-        // Sub-resource, not neighbour in time. Both tiers below rest on temporal
-        // attribution, and that attribution is only as good as the assumption
-        // that the anchor is the page doing the fetching. When most of the hits
-        // this anchor claims happened while somebody else's page was loading,
-        // the assumption is false — this is how a rule host in one tab collects
+        use_: ProposalUse,
+    ) -> Option<(CompanionSignal, Option<LessCertainBasis>)> {
+        // Sub-resource, not neighbour in time. Every tier rests on the anchor
+        // being the page doing the fetching. When most of the hits this anchor
+        // claims happened while somebody else's page was loading, the
+        // assumption is false — this is how a rule host in one tab collects
         // another site's CDN (`tubecdn.test` under `www.search.test`,
-        // `cdninsta.test` under `cdn.assistant.example`). Brand relation above is
-        // exempt: a shared name states ownership regardless of timing.
+        // `cdninsta.test` under `cdn.assistant.example`), and how a hostile
+        // page that embeds a rule host beside a look-alike of its brand would
+        // get that look-alike proposed. A shared name buys no exemption: the
+        // name is the very thing the page chose.
         let mostly_someone_elses =
             pair.foreign_parent_hits > 0 && pair.foreign_parent_hits * 2 > pair.nearest_hits.max(1);
         if mostly_someone_elses {
             return None;
+        }
+        // Brand relation states ownership, not need: an operator's advertising
+        // and telemetry domains carry the brand as plainly as the asset host a
+        // page cannot render without. Exclusivity separates them, and
+        // `affinity` measures exactly that — a site's own hosts ride along with
+        // that site, an operator's everything-hosts ride along with every site
+        // and drop to affinities in the thousandths. One sighting is not a
+        // relationship, so independent windows are required as for co-activity;
+        // kin that falls short is judged by the tiers below like any name.
+        let brand_kin = is_brand_related(anchor_hostname, candidate_hostname)
+            && affinity >= self.config.brand_min_affinity;
+        if brand_kin && pair.distinct_windows >= self.config.min_distinct_windows {
+            return Some((CompanionSignal::BrandRelated, None));
         }
         if is_delivery_named(candidate_hostname) {
             let nearest_share =
@@ -802,13 +795,22 @@ impl CompanionAffinityLedger {
                 || proven_by_use
                 || single_obvious_owner
             {
-                return Some(CompanionSignal::DeliveryName);
+                return Some((CompanionSignal::DeliveryName, None));
             }
         }
         if pair.distinct_windows >= self.config.min_distinct_windows
             && affinity >= self.config.min_affinity
         {
-            return Some(CompanionSignal::CoActivity);
+            return Some((CompanionSignal::CoActivity, None));
+        }
+        // Last, so any tier that stands on full evidence wins over it. Only a
+        // person may weigh one window of a shared name; the page check above
+        // still applies, so another page's fetch is never credited.
+        if brand_kin && pair.distinct_windows == 1 && use_ == ProposalUse::OfferedForReview {
+            return Some((
+                CompanionSignal::BrandRelated,
+                Some(LessCertainBasis::BrandSeenOnce),
+            ));
         }
         None
     }
@@ -823,7 +825,8 @@ impl CompanionAffinityLedger {
     /// documentation and [`CompanionSignal`]).
     ///
     /// Pure read — the ledger is not mutated. Output ordering is fully
-    /// deterministic: anchor hostname ascending, then signal (strongest first),
+    /// deterministic: anchor hostname ascending, then certain before less
+    /// certain, then signal (strongest first),
     /// then affinity descending, then proposed value ascending; at most
     /// [`CompanionAffinityConfig::max_proposals_per_anchor`] per anchor, so the
     /// cap drops the weakest evidence first.
@@ -831,13 +834,32 @@ impl CompanionAffinityLedger {
     /// Exclusion checks receive every candidate hostname and every
     /// suffix-proposal apex; an excluded apex falls back to exact-host
     /// proposals for its non-excluded members.
+    ///
+    /// The bar for [`ProposalUse::AuthoredUnasked`]; see [`Self::proposals_for`].
     pub fn proposals<E>(&self, now_ms: u64, exclusions: &E) -> Vec<CompanionProposal>
+    where
+        E: CandidateExclusions + ?Sized,
+    {
+        self.proposals_for(now_ms, exclusions, ProposalUse::AuthoredUnasked)
+    }
+
+    /// [`Self::proposals`] for whoever acts on them. With
+    /// [`ProposalUse::OfferedForReview`] the list may also hold less certain
+    /// exact hosts, sorted after every certain offer of the same anchor; every
+    /// certain row is identical to what the unattended bar yields.
+    pub fn proposals_for<E>(
+        &self,
+        now_ms: u64,
+        exclusions: &E,
+        use_: ProposalUse,
+    ) -> Vec<CompanionProposal>
     where
         E: CandidateExclusions + ?Sized,
     {
         struct Member<'a> {
             hostname: &'a str,
             signal: CompanionSignal,
+            less_certain: Option<LessCertainBasis>,
             affinity: f64,
             nearest_share: f64,
             distinct_windows: u32,
@@ -880,7 +902,8 @@ impl CompanionAffinityLedger {
                 };
                 let affinity =
                     f64::from(pair.distinct_windows) / f64::from(candidate.total_windows);
-                let Some(signal) = self.qualify(anchor_name, host, pair, candidate, affinity)
+                let Some((signal, less_certain)) =
+                    self.qualify(anchor_name, host, pair, candidate, affinity, use_)
                 else {
                     continue;
                 };
@@ -894,6 +917,7 @@ impl CompanionAffinityLedger {
                     .push(Member {
                         hostname: host.as_str(),
                         signal,
+                        less_certain,
                         affinity,
                         nearest_share: f64::from(pair.nearest_hits)
                             / f64::from(candidate.total_hits.max(1)),
@@ -924,14 +948,22 @@ impl CompanionAffinityLedger {
                     last_seen_ms: m.last_seen_ms,
                     primary_behavior: m.primary_behavior,
                     observed_members: Vec::new(),
+                    less_certain: m.less_certain,
                 };
                 // Only true subdomains justify generalizing to `*.apex` — the
                 // apex alone is not evidence that a whole suffix belongs on the
                 // route. (It IS covered by the resulting rule, which is why no
                 // separate exact proposal is emitted for it below when the
                 // suffix proposal fires.)
-                let subdomains: Vec<&Member<'_>> =
-                    members.iter().filter(|m| m.hostname != *apex).collect();
+                //
+                // A less certain member takes no part in widening, in either
+                // use: one look-alike name is what a hostile page registers.
+                // It is offered as the exact host it is, after the rest.
+                let (subdomains, less_certain_subdomains): (Vec<&Member<'_>>, Vec<&Member<'_>>) =
+                    members
+                        .iter()
+                        .filter(|m| m.hostname != *apex)
+                        .partition(|m| m.less_certain.is_none());
                 // A name that carries the anchor's brand or is a delivery name
                 // is evidence about the domain, not just about itself:
                 // `static.cdninsta.test` says the whole CDN serves the site.
@@ -946,10 +978,12 @@ impl CompanionAffinityLedger {
                 // on the strength of one asset host. A dedicated delivery apex
                 // (`cdninsta.test`, `videocdn.test`, `cdn.example`) carries
                 // the mask itself, and that is the shape worth generalizing.
+                //
+                // A brand alone never reaches the apex: a look-alike apex is
+                // exactly what a hostile page can register. Two distinct named
+                // subdomains below (counted next) are what widens it.
                 let generalizes_alone = subdomains.iter().any(|m| match m.signal {
-                    CompanionSignal::BrandRelated => {
-                        brand_relation(anchor_name, apex) == BrandRelation::Named
-                    }
+                    CompanionSignal::BrandRelated => false,
                     CompanionSignal::DeliveryName => is_delivery_named(apex),
                     CompanionSignal::CoActivity => false,
                 });
@@ -1020,7 +1054,11 @@ impl CompanionAffinityLedger {
                         names.dedup();
                         names
                     },
+                    less_certain: None,
                 };
+                // Suffixes proposed for this group, so a less certain host they
+                // already cover is not offered beside them.
+                let mut widened: Vec<String> = Vec::new();
                 if suffix_proposed {
                     per_anchor.push(summarize(&subdomains, (*apex).to_string()));
                 } else {
@@ -1049,10 +1087,21 @@ impl CompanionAffinityLedger {
                             remaining.into_iter().partition(|m| {
                                 m.hostname == shared || is_under_suffix(m.hostname, &shared)
                             });
+                        widened.push(shared.clone());
                         per_anchor.push(summarize(&covered, shared));
                         remaining = rest;
                     }
                     per_anchor.extend(remaining.iter().map(|m| exact(m)));
+                    per_anchor.extend(
+                        less_certain_subdomains
+                            .iter()
+                            .filter(|m| {
+                                !widened.iter().any(|s| {
+                                    m.hostname == s.as_str() || is_under_suffix(m.hostname, s)
+                                })
+                            })
+                            .map(|m| exact(m)),
+                    );
                 }
                 // `*.apex` already covers the apex; a second exact proposal for
                 // it would be a redundant entry in the user's review list.
@@ -1060,9 +1109,11 @@ impl CompanionAffinityLedger {
                     per_anchor.extend(members.iter().filter(|m| m.hostname == *apex).map(exact));
                 }
             }
+            // Less certain last, so the cap drops them before any certain offer.
             per_anchor.sort_by(|a, b| {
-                a.signal
-                    .cmp(&b.signal)
+                a.less_certain
+                    .cmp(&b.less_certain)
+                    .then_with(|| a.signal.cmp(&b.signal))
                     .then_with(|| b.affinity.total_cmp(&a.affinity))
                     .then_with(|| a.proposed.value().cmp(b.proposed.value()))
             });
@@ -1075,6 +1126,7 @@ impl CompanionAffinityLedger {
         out.sort_by(|a, b| {
             a.anchor_hostname
                 .cmp(&b.anchor_hostname)
+                .then_with(|| a.less_certain.cmp(&b.less_certain))
                 .then_with(|| a.signal.cmp(&b.signal))
                 .then_with(|| b.affinity.total_cmp(&a.affinity))
                 .then_with(|| a.proposed.value().cmp(b.proposed.value()))

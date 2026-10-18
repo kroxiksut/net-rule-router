@@ -10,22 +10,22 @@
 //! it. The action ids come from the contracts crate, so the names polkit
 //! registers and the names the service asks under cannot drift.
 //!
-//! ## Why three actions and not one
+//! ## Why four actions and not one
 //!
 //! An administrator writing a rule wants to distinguish "may edit the shared
 //! baseline everyone falls back to" (rolling it back included) from "may switch
-//! protection off" from "may erase shared history". One coarse action would
-//! force them to grant all three together or none.
+//! protection off" from "may erase shared history" from "may change a setting
+//! every user shares". One coarse action would force them to grant all of them
+//! together or none.
 //!
 //! ## Defaults
 //!
-//! Only the active console session is asked (`auth_admin_keep`: an
-//! administrator's password, remembered briefly so a multi-step flow does not
-//! prompt at every step). Every other subject gets `no` — an inactive local
-//! session and a remote one (`allow_any`: SSH, cron) alike. A session not at the
-//! console does not reshape the machine's network, and a remote one must not be
-//! the more privileged of the two. No console verb needs these actions: an
-//! administrator over SSH acts as root, whom polkit answers without them.
+//! Every subject is asked for an administrator's password on every change
+//! (`auth_admin`, never `_keep`: a remembered grant would let the next change
+//! through unasked): the console session, an inactive local one, and a remote
+//! one (`allow_any`: SSH) alike. Knowing that password is what `sudo` asks too, so a terminal over SSH
+//! is no better placed than one typing `sudo`; a subject with nobody to type it
+//! (cron, a service) is refused by polkit for want of an agent.
 //!
 //! `#[cfg(target_os = "linux")]`: a Linux-only install artefact, kept next to
 //! `systemd`, which writes it as part of the install plan.
@@ -35,7 +35,8 @@
 use std::path::{Path, PathBuf};
 
 use nrr_shared::ipc_transport::{
-    ACTION_CLEAR_SHARED_DATA, ACTION_DISABLE_PROTECTION, ACTION_EDIT_BASELINE,
+    ACTION_CHANGE_MACHINE_SETTINGS, ACTION_CLEAR_SHARED_DATA, ACTION_DISABLE_PROTECTION,
+    ACTION_EDIT_BASELINE,
 };
 
 /// Where polkit reads action definitions from.
@@ -63,7 +64,7 @@ struct ActionSpec {
     message_ru: &'static str,
 }
 
-const ACTIONS: [ActionSpec; 3] = [
+const ACTIONS: [ActionSpec; 4] = [
     ActionSpec {
         id: ACTION_EDIT_BASELINE,
         label_en: "Edit the shared routing rules",
@@ -85,6 +86,13 @@ const ACTIONS: [ActionSpec; 3] = [
         message_en: "Authentication is required to erase data shared by every user of this computer.",
         message_ru: "Требуется подтверждение, чтобы удалить данные, общие для всех пользователей компьютера.",
     },
+    ActionSpec {
+        id: ACTION_CHANGE_MACHINE_SETTINGS,
+        label_en: "Change settings shared by every user",
+        label_ru: "Изменение общих настроек компьютера",
+        message_en: "Authentication is required to change a setting shared by every user of this computer.",
+        message_ru: "Требуется подтверждение, чтобы изменить настройку, общую для всех пользователей компьютера.",
+    },
 ];
 
 /// polkit's three implicit authorizations, by where the subject sits.
@@ -99,9 +107,9 @@ struct ActionDefaults {
 
 /// The same for every action: see "Defaults" in the module doc.
 const DEFAULTS: ActionDefaults = ActionDefaults {
-    any: "no",
-    inactive: "no",
-    active: "auth_admin_keep",
+    any: "auth_admin",
+    inactive: "auth_admin",
+    active: "auth_admin",
 };
 
 /// Render the polkit action file.
@@ -166,7 +174,10 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nrr_shared::ipc_transport::IpcOperationClass;
+    use nrr_shared::ipc::IpcOperationName;
+    use nrr_shared::ipc_transport::{
+        needs_administrator_action, IpcOperationClass, AUTHORIZATION_ACTIONS,
+    };
 
     /// Every action the service can ask about must be registered, or polkit
     /// answers "unknown action" and the operation is refused with no way for an
@@ -175,14 +186,16 @@ mod tests {
     #[test]
     fn every_action_the_service_asks_about_is_declared() {
         let rendered = render_actions_file();
-        for class in IpcOperationClass::ALL {
-            let Some(action) = class.authorization_action() else {
-                continue;
-            };
+        let by_class = IpcOperationClass::ALL
+            .iter()
+            .filter_map(|class| class.authorization_action());
+        let by_refusal = IpcOperationName::ALL
+            .iter()
+            .map(|op| needs_administrator_action(*op));
+        for action in by_class.chain(by_refusal).chain(AUTHORIZATION_ACTIONS) {
             assert!(
                 rendered.contains(&format!("<action id=\"{action}\">")),
-                "{action} is asked for by {} but not declared in the policy file",
-                class.slug()
+                "{action} is asked for but not declared in the policy file",
             );
         }
     }
@@ -195,6 +208,11 @@ mod tests {
         let asked: Vec<&str> = IpcOperationClass::ALL
             .iter()
             .filter_map(|c| c.authorization_action())
+            .chain(
+                IpcOperationName::ALL
+                    .iter()
+                    .map(|op| needs_administrator_action(*op)),
+            )
             .collect();
         for action in ACTIONS.iter() {
             assert!(
@@ -219,11 +237,12 @@ mod tests {
         );
     }
 
-    /// A remote subject is never better placed than an inactive local session:
-    /// both are refused outright, only the console is asked. Read back from the
-    /// rendered file, per action, so a per-action override cannot slip past.
+    /// Every subject is asked for an administrator's password at every change,
+    /// a remote one (the terminal over SSH) included; none is let through
+    /// without it, nor on a grant remembered from the last one. Read back from
+    /// the rendered file, per action, so an override cannot slip past.
     #[test]
-    fn only_the_active_console_session_is_ever_asked() {
+    fn every_session_is_asked_for_an_administrators_password() {
         let rendered = render_actions_file();
         for action in ACTIONS.iter() {
             let open = format!("<action id=\"{}\">", action.id);
@@ -236,16 +255,21 @@ mod tests {
                 let to = block[from..].find(&format!("</{tag}>"))? + from;
                 Some(&block[from..to])
             };
-            assert_eq!(value("allow_any"), Some("no"), "{}: allow_any", action.id);
+            assert_eq!(
+                value("allow_any"),
+                Some("auth_admin"),
+                "{}: allow_any",
+                action.id
+            );
             assert_eq!(
                 value("allow_inactive"),
-                Some("no"),
+                Some("auth_admin"),
                 "{}: allow_inactive",
                 action.id
             );
             assert_eq!(
                 value("allow_active"),
-                Some("auth_admin_keep"),
+                Some("auth_admin"),
                 "{}: allow_active",
                 action.id
             );

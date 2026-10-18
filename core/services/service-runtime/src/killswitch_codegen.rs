@@ -795,6 +795,14 @@ pub fn catch_all_kill_switch_filters(
     // #1 — permit everything that egresses via the secondary adapter.
     filters.push(exempt_egress(sid, resolution.secondary_luid, weight));
     weight += 1;
+    // Somebody else's tunnel keeps what it carries, as under the fail-closed
+    // twin: a corporate VPN beside ours is not an exit off the tunnel.
+    filters.extend(foreign_tunnel_egress(
+        sid,
+        &exemptions.foreign_tunnel_luids,
+        resolution.secondary_luid,
+        &mut weight,
+    ));
     // The floor both postures share.
     filters.extend(base_ale_exemptions(
         sid,
@@ -853,6 +861,12 @@ pub fn catch_all_kill_switch_filters(
             pw,
         ));
         pw += 1;
+        filters.extend(foreign_tunnel_packet_egress(
+            sid,
+            &exemptions.foreign_tunnel_luids,
+            resolution.secondary_luid,
+            &mut pw,
+        ));
         filters.extend(base_packet_exemptions(
             sid,
             TR,
@@ -898,6 +912,12 @@ pub fn catch_all_kill_switch_filters(
         exemptions.secondary_luid,
         &exemptions.bootstrap_server_ips_v6,
         &exemptions.local_subnets_v6,
+    ));
+    filters.extend(foreign_tunnel_egress_v6(
+        sid,
+        &exemptions.foreign_tunnel_luids,
+        resolution.secondary_luid,
+        true,
     ));
 
     filters
@@ -1059,13 +1079,14 @@ mod exemptions;
 
 use exemptions::{
     base_ale_exemptions, base_packet_exemptions, exempt_direct_host, exempt_dns_over_primary,
-    exempt_egress, exempt_probe_target, exempt_subnet,
+    exempt_egress, exempt_probe_target, exempt_subnet, foreign_tunnel_egress,
+    foreign_tunnel_packet_egress,
 };
 pub use exemptions::{default_block_exemptions, MAX_DNS_SERVER_PERMITS};
 
 mod v6;
 
-pub use v6::{catch_all_v6_filters, default_block_exemptions_v6};
+pub use v6::{catch_all_v6_filters, default_block_exemptions_v6, foreign_tunnel_egress_v6};
 
 mod fail_closed;
 pub use fail_closed::*;

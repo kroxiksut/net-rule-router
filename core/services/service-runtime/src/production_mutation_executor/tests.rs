@@ -218,7 +218,61 @@ fn an_undecodable_payload_is_left_alone_for_the_validator_to_reject() {
     };
     ProductionMutationExecutor::canonicalize_rules_payload(&mut p, HostPlatform::Windows);
     assert_eq!(p.rules_json, "not json at all");
-    assert_eq!(p.content_hash, "h");
+    assert_eq!(
+        p.content_hash,
+        format!("{:x}", Sha256::digest(b"not json at all"))
+    );
+}
+
+/// A canonical book under a wrong hash must not dedupe to the active revision
+/// and pass for "already active".
+#[test]
+fn a_wrong_hash_on_canonical_bytes_is_replaced() {
+    let (exec, conn) = build_test_executor();
+    let baseline = nrr_storage::BASELINE_PRINCIPAL;
+    assert!(matches!(
+        exec.execute(rules_update_of(&gui_book("a.example")), baseline),
+        MutationOutcome::Completed(_)
+    ));
+    let active = active_rules_json(&conn);
+    let active_hash = {
+        let g = conn.lock().unwrap();
+        nrr_storage::revisions::RevisionsRepository::new(&g)
+            .get_active()
+            .unwrap()
+            .expect("active")
+            .content_hash
+    };
+    let mut p = RulesUpdatePayload {
+        rules_json: active.replace("a.example", "b.example"),
+        content_hash: active_hash.clone(),
+        correlation_id: None,
+    };
+    ProductionMutationExecutor::canonicalize_rules_payload(&mut p, HostPlatform::Windows);
+    assert_ne!(p.content_hash, active_hash);
+    assert_eq!(
+        p.content_hash,
+        format!("{:x}", Sha256::digest(p.rules_json.as_bytes()))
+    );
+
+    let outcome = exec.execute(
+        StoredMutation {
+            kind: MutationKind::RulesUpdate,
+            payload: serde_json::json!({
+                "rules-json": active.replace("a.example", "b.example"),
+                "content-hash": active_hash,
+            }),
+            correlation_id: None,
+            issuer_sid: String::new(),
+            caller_is_elevated: false,
+        },
+        baseline,
+    );
+    assert!(
+        matches!(&outcome, MutationOutcome::Completed(v) if v["outcome"] != "already-active"),
+        "{outcome:?}"
+    );
+    assert!(active_rules_json(&conn).contains("b.example"));
 }
 
 #[test]
@@ -640,51 +694,45 @@ fn reimport_of_superseded_content_reactivates_instead_of_failing() {
     let coord = build_test_coordinator(Arc::clone(&state_conn));
     let exec = ProductionMutationExecutor::new(Arc::clone(&coord));
 
-    let rules_update = |content_hash: &str, body: &str| StoredMutation {
+    // The client's hash is ignored: the service hashes the bytes itself.
+    let rules_update = |body: &str| StoredMutation {
         kind: MutationKind::RulesUpdate,
         payload: serde_json::json!({
             "rules-json": body,
-            "content-hash": content_hash,
+            "content-hash": "client-supplied",
         }),
         correlation_id: None,
         issuer_sid: String::new(),
         caller_is_elevated: false,
     };
+    let hash_of = |body: &str| Some(format!("{:x}", Sha256::digest(body.as_bytes())));
     let active_hash = || coord.current_active().unwrap().map(|r| r.content_hash);
+    let (a, b) = (r#"{"v":"a"}"#, r#"{"v":"b"}"#);
 
     // 1. Apply A → A active.
     assert!(matches!(
-        exec.execute(
-            rules_update("hash-A", r#"{"v":"a"}"#),
-            nrr_storage::BASELINE_PRINCIPAL
-        ),
+        exec.execute(rules_update(a), nrr_storage::BASELINE_PRINCIPAL),
         MutationOutcome::Completed(_)
     ));
-    assert_eq!(active_hash().as_deref(), Some("hash-A"));
+    assert_eq!(active_hash(), hash_of(a));
 
     // 2. Apply B → B active, A superseded.
     assert!(matches!(
-        exec.execute(
-            rules_update("hash-B", r#"{"v":"b"}"#),
-            nrr_storage::BASELINE_PRINCIPAL
-        ),
+        exec.execute(rules_update(b), nrr_storage::BASELINE_PRINCIPAL),
         MutationOutcome::Completed(_)
     ));
-    assert_eq!(active_hash().as_deref(), Some("hash-B"));
+    assert_eq!(active_hash(), hash_of(b));
 
     // 3. Re-apply A (dedups to the now-Superseded revision). Must
     //    succeed and make A active again — NOT fail.
-    let outcome = exec.execute(
-        rules_update("hash-A", r#"{"v":"a"}"#),
-        nrr_storage::BASELINE_PRINCIPAL,
-    );
+    let outcome = exec.execute(rules_update(a), nrr_storage::BASELINE_PRINCIPAL);
     assert!(
         matches!(outcome, MutationOutcome::Completed(_)),
         "re-import of superseded content must reactivate, got {outcome:?}"
     );
     assert_eq!(
-        active_hash().as_deref(),
-        Some("hash-A"),
+        active_hash(),
+        hash_of(a),
         "the previously-superseded revision A must be live again"
     );
 }
@@ -1818,6 +1866,41 @@ fn an_active_blocking_alert_refuses_auto_authored_rules_until_acknowledged() {
     }
 }
 
+/// A rollback writes rules too: an unacknowledged tamper alert holds it like
+/// every other writer.
+#[test]
+fn an_active_blocking_alert_refuses_a_rollback() {
+    use crate::tamper_bootstrap::SECURITY_ALERT_GATE_CODE;
+    use nrr_diagnostics::audit::alert::{InMemorySecurityAlertsRepository, SecurityAlert};
+    use nrr_diagnostics::audit::kind::AuditEventKind;
+
+    let (exec, _conn) = build_test_executor();
+    let alerts: Arc<dyn SecurityAlertsRepository> =
+        Arc::new(InMemorySecurityAlertsRepository::new());
+    alerts
+        .insert(&SecurityAlert {
+            alert_id: "alt-1".into(),
+            kind: AuditEventKind::DbTamperDetected.as_str().into(),
+            state: SecurityAlertState::Active,
+            raised_event_seq: 0,
+            raised_file: "scan".into(),
+            ack_event_seq: None,
+            ack_file: None,
+            resolved_event_seq: None,
+            resolved_file: None,
+            created_at: 1,
+            updated_at: 1,
+            reason_code: "r".into(),
+        })
+        .unwrap();
+    let exec = exec.with_alerts_repo(alerts);
+
+    match exec.rollback(nrr_storage::BASELINE_PRINCIPAL, None) {
+        MutationOutcome::Failed(e) => assert_eq!(e.code, SECURITY_ALERT_GATE_CODE),
+        other => panic!("expected the tamper gate, got {other:?}"),
+    }
+}
+
 /// One rule with the given conditions, as a submitted `rules-update` payload.
 fn shaped_rules_update(
     address: bool,
@@ -2776,4 +2859,337 @@ fn a_network_on_both_routes_is_refused_unless_the_book_in_force_held_it() {
         ),
         MutationOutcome::Completed(_)
     ));
+}
+
+/// One program folder in the same form on both routes is refused like one
+/// network on both routes, in the preview and on save; another form of the
+/// folder is a narrower or wider rule and goes through.
+#[test]
+fn a_folder_on_both_routes_is_refused_like_a_network() {
+    let (exec, _conn) = build_test_executor();
+    let baseline = nrr_storage::BASELINE_PRINCIPAL;
+    let (tree, only) = if cfg!(windows) {
+        (r"C:\Apps\Tool\*", r"C:\Apps\Tool\")
+    } else {
+        ("/opt/tool/*", "/opt/tool/")
+    };
+    let book = |primary: &str, secondary: &str| {
+        let rule = |id: &str, path: &str| {
+            serde_json::json!({
+                "id": id, "enabled": true,
+                "app-match": {
+                    "pattern": { "kind": "path", "value": path },
+                    "include-child-processes": false,
+                },
+            })
+        };
+        serde_json::json!({
+            "schema-version": 5,
+            "primary": [rule("r-p", primary)],
+            "secondary": [rule("r-s", secondary)],
+        })
+        .to_string()
+    };
+    let tie = book(tree, tree);
+    match exec.execute(rules_update(tie.clone()), baseline) {
+        MutationOutcome::Failed(e) => {
+            assert_eq!(e.code, "folder-on-both-routes");
+            assert!(e.args.contains_key("folder"), "{:?}", e.args);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let review = exec.preview_rules_update(
+        &serde_json::json!({ "rules-json": tie, "content-hash": "h" }),
+        baseline,
+    );
+    assert!(
+        review.diff_summary.to_lowercase().contains("tool"),
+        "{}",
+        review.diff_summary
+    );
+    assert!(matches!(
+        exec.execute(rules_update(book(tree, only)), baseline),
+        MutationOutcome::Completed(_)
+    ));
+}
+
+// ── A user still on the baseline ────────────────────────────────────────
+
+const UNDIVERGED: &str = "S-1-5-21-1-2-3-1001";
+
+fn book_of(primary: &[&str], secondary: &[&str]) -> String {
+    let rules = |set: &str, values: &[&str]| -> Vec<serde_json::Value> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                serde_json::json!({
+                    "id": format!("r-{set}-{i}"),
+                    "enabled": true,
+                    "address-match": { "kind": "exact-fqdn", "value": value },
+                    "comment": "",
+                    "action": "route",
+                })
+            })
+            .collect()
+    };
+    serde_json::json!({
+        "schema-version": 1,
+        "primary": rules("p", primary),
+        "secondary": rules("s", secondary),
+    })
+    .to_string()
+}
+
+fn own_revisions(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>, principal: &str) -> i64 {
+    conn.lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM revisions WHERE principal = ?1",
+            rusqlite::params![principal],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn seeded_baseline() -> (
+    ProductionMutationExecutor,
+    Arc<std::sync::Mutex<rusqlite::Connection>>,
+) {
+    let (exec, conn) = build_test_executor();
+    let seeded = exec.execute(
+        rules_update_of(&book_of(&["a.example"], &["vpn.example"])),
+        nrr_storage::BASELINE_PRINCIPAL,
+    );
+    assert!(
+        matches!(seeded, MutationOutcome::Completed(_)),
+        "{seeded:?}"
+    );
+    (exec, conn)
+}
+
+/// The review of a user who never diverged compares with the baseline they
+/// run: an unchanged table changes nothing, one added rule is one rule (the
+/// tray's "add a rule" expects exactly that diff).
+#[test]
+fn an_undiverged_user_is_reviewed_against_the_baseline() {
+    let (exec, _conn) = seeded_baseline();
+    let preview = |book: String| {
+        exec.preview(
+            MutationKind::RulesUpdate,
+            &serde_json::json!({ "rules-json": book, "content-hash": "client-supplied" }),
+            UNDIVERGED,
+        )
+    };
+
+    let unchanged = preview(book_of(&["a.example"], &["vpn.example"]));
+    assert!(
+        unchanged.rules_added.is_empty() && unchanged.rules_removed.is_empty(),
+        "an unchanged table shows no diff: {unchanged:?}"
+    );
+
+    let plus_one = preview(book_of(&["a.example", "b.example"], &["vpn.example"]));
+    assert_eq!(plus_one.rules_added.len(), 1, "{plus_one:?}");
+    assert!(plus_one.rules_removed.is_empty(), "{plus_one:?}");
+}
+
+/// Confirming the baseline unchanged does not store a copy that would stop
+/// following the administrator's edits.
+#[test]
+fn an_undiverged_user_confirming_the_baseline_stays_on_it() {
+    let (exec, conn) = seeded_baseline();
+
+    let outcome = exec.execute(
+        rules_update_of(&book_of(&["a.example"], &["vpn.example"])),
+        UNDIVERGED,
+    );
+
+    assert!(
+        matches!(&outcome, MutationOutcome::Completed(v) if v["outcome"] == "already-active"),
+        "{outcome:?}"
+    );
+    assert_eq!(own_revisions(&conn, UNDIVERGED), 0);
+
+    // A real edit still diverges.
+    let edited = exec.execute(
+        rules_update_of(&book_of(&["a.example", "b.example"], &["vpn.example"])),
+        UNDIVERGED,
+    );
+    assert!(
+        matches!(&edited, MutationOutcome::Completed(v) if v["outcome"] != "already-active"),
+        "{edited:?}"
+    );
+    assert!(own_revisions(&conn, UNDIVERGED) > 0);
+}
+
+/// A one-route import by a user on the baseline keeps the baseline's other
+/// route rather than an empty one.
+#[test]
+fn a_one_route_import_on_the_baseline_keeps_its_other_route() {
+    let (exec, conn) = seeded_baseline();
+    let single = serde_json::json!({
+        "primary-bytes-b64": b64("--- Domains\nmine.example\n"),
+        "include-child-processes": false,
+    });
+
+    let outcome = exec.execute_preset_import(&single, UNDIVERGED);
+
+    assert!(
+        matches!(outcome, MutationOutcome::Completed(_)),
+        "{outcome:?}"
+    );
+    let g = conn.lock().unwrap();
+    let own = nrr_storage::revisions::RevisionsRepository::new(&g)
+        .get_active_for(UNDIVERGED)
+        .unwrap()
+        .expect("the import diverged the user")
+        .rules_json;
+    assert!(own.contains("mine.example"), "{own}");
+    assert!(
+        own.contains("vpn.example"),
+        "baseline secondary kept: {own}"
+    );
+    assert!(!own.contains("a.example"), "{own}");
+}
+
+// ── Two writers ─────────────────────────────────────────────────────────
+
+fn update_built_on(rules_json: &str, base: &str) -> StoredMutation {
+    StoredMutation {
+        kind: MutationKind::RulesUpdate,
+        payload: serde_json::json!({
+            "rules-json": rules_json,
+            "content-hash": "client-supplied",
+            "base-revision": base,
+        }),
+        correlation_id: None,
+        issuer_sid: String::new(),
+        caller_is_elevated: false,
+    }
+}
+
+/// Two writers start from the same rules; the second to land is refused
+/// with a code the client offers a merge for, and the first one's rule stays.
+/// The refused writer, rebuilt on what the first one's answer names, lands.
+#[test]
+fn of_two_writers_on_one_base_the_second_is_refused_not_applied() {
+    let (exec, conn) = seeded_baseline();
+    let base = exec
+        .coordinator
+        .base_revision_for(UNDIVERGED)
+        .expect("base");
+
+    let first = exec.execute(
+        update_built_on(
+            &book_of(&["a.example", "first.example"], &["vpn.example"]),
+            &base,
+        ),
+        UNDIVERGED,
+    );
+    let MutationOutcome::Completed(first) = first else {
+        panic!("the first writer lands: {first:?}");
+    };
+
+    let second_book = book_of(&["a.example", "second.example"], &["vpn.example"]);
+    let preview = exec.preview(
+        MutationKind::RulesUpdate,
+        &update_built_on(&second_book, &base).payload,
+        UNDIVERGED,
+    );
+    assert!(
+        preview.risk_signals.iter().any(|s| matches!(
+            s,
+            RiskSignalDto::ChangeRefused { code, .. } if code == "rules-changed-elsewhere"
+        )),
+        "the review says so before anything is confirmed: {preview:?}"
+    );
+    match exec.execute(update_built_on(&second_book, &base), UNDIVERGED) {
+        MutationOutcome::Failed(e) => assert_eq!(e.code, "rules-changed-elsewhere"),
+        other => panic!("the second writer is refused: {other:?}"),
+    }
+    let in_force = {
+        let g = conn.lock().unwrap();
+        nrr_storage::revisions::RevisionsRepository::new(&g)
+            .get_active_for(UNDIVERGED)
+            .unwrap()
+            .expect("own")
+            .rules_json
+    };
+    assert!(in_force.contains("first.example"), "{in_force}");
+    assert!(!in_force.contains("second.example"), "{in_force}");
+
+    // Asking for exactly the rules in force is no conflict: it is how a
+    // client settles an apply by previewing it again.
+    let settled = exec.preview(
+        MutationKind::RulesUpdate,
+        &update_built_on(
+            &book_of(&["a.example", "first.example"], &["vpn.example"]),
+            &base,
+        )
+        .payload,
+        UNDIVERGED,
+    );
+    assert!(
+        !settled
+            .risk_signals
+            .iter()
+            .any(|s| matches!(s, RiskSignalDto::ChangeRefused { .. })),
+        "{settled:?}"
+    );
+
+    let new_base = first["base-revision"]
+        .as_str()
+        .expect("the answer names the new rules");
+    assert!(matches!(
+        exec.execute(update_built_on(&second_book, new_base), UNDIVERGED),
+        MutationOutcome::Completed(_)
+    ));
+}
+
+/// A writer that passed the early check and then waited for another
+/// activation is checked again inside the gate: the rules moved while it
+/// waited, so it is refused and its candidate never reads as pending.
+#[test]
+fn a_write_that_waited_for_the_gate_is_checked_again_inside_it() {
+    let (exec, conn) = seeded_baseline();
+    let stale = exec
+        .coordinator
+        .base_revision_for(nrr_storage::BASELINE_PRINCIPAL)
+        .expect("base");
+    assert!(matches!(
+        exec.execute(
+            rules_update_of(&book_of(&["moved.example"], &[])),
+            nrr_storage::BASELINE_PRINCIPAL
+        ),
+        MutationOutcome::Completed(_)
+    ));
+
+    let rules_json = minimal_rules_json();
+    let id = exec
+        .coordinator
+        .submit_candidate(crate::activation_coordinator::CandidateSubmission {
+            principal: nrr_storage::BASELINE_PRINCIPAL.to_string(),
+            content_hash: format!("{:x}", Sha256::digest(rules_json.as_bytes())),
+            rules_json,
+            source: RulesRevisionSource::GuiRulesEdit,
+            correlation_id: "c-late".into(),
+            risk_level: None,
+            review_summary_json: None,
+        })
+        .expect("candidate");
+    let token = exec
+        .coordinator
+        .issue_confirmation_token(&id, COORDINATOR_TOKEN_TTL_SECS)
+        .expect("token");
+    assert_eq!(
+        exec.coordinator
+            .activate_over(&id, &token, "c-late", Some(&stale))
+            .unwrap_err(),
+        PolicyError::RulesChangedElsewhere
+    );
+    assert!(active_rules_json(&conn).contains("moved.example"));
+    assert_eq!(
+        exec.coordinator.status_of(&id).expect("status"),
+        RevisionStatus::Rejected
+    );
 }

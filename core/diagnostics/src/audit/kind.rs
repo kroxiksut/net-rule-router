@@ -64,6 +64,9 @@ pub enum AuditEventKind {
     /// store failed). The service keeps routing without it until a start
     /// where it can run again.
     IntegrityCheckUnavailable,
+    /// Files an administrator handed the installer were refused at the
+    /// service's first start; the shared rules stayed as they were.
+    ProvisioningRefused,
 }
 
 impl AuditEventKind {
@@ -88,6 +91,7 @@ impl AuditEventKind {
             Self::UntrustedRevisionRejected => "untrusted_revision_rejected",
             Self::AuditChainRestarted => "audit_chain_restarted",
             Self::IntegrityCheckUnavailable => "integrity_check_unavailable",
+            Self::ProvisioningRefused => "provisioning_refused",
         }
     }
 
@@ -112,6 +116,7 @@ impl AuditEventKind {
             "untrusted_revision_rejected" => Some(Self::UntrustedRevisionRejected),
             "audit_chain_restarted" => Some(Self::AuditChainRestarted),
             "integrity_check_unavailable" => Some(Self::IntegrityCheckUnavailable),
+            "provisioning_refused" => Some(Self::ProvisioningRefused),
             _ => None,
         }
     }
@@ -127,6 +132,7 @@ impl AuditEventKind {
                 | Self::KeyResetWithExistingData
                 | Self::UntrustedRevisionRejected
                 | Self::IntegrityCheckUnavailable
+                | Self::ProvisioningRefused
         )
     }
 }
@@ -210,6 +216,7 @@ mod tests {
             AuditEventKind::UntrustedRevisionRejected,
             AuditEventKind::AuditChainRestarted,
             AuditEventKind::IntegrityCheckUnavailable,
+            AuditEventKind::ProvisioningRefused,
         ] {
             let s = kind.as_str();
             let back = AuditEventKind::from_str(s).expect("round trip");
@@ -251,6 +258,7 @@ mod tests {
         assert!(AuditEventKind::KeyResetWithExistingData.requires_alert());
         assert!(AuditEventKind::UntrustedRevisionRejected.requires_alert());
         assert!(AuditEventKind::IntegrityCheckUnavailable.requires_alert());
+        assert!(AuditEventKind::ProvisioningRefused.requires_alert());
         assert!(!AuditEventKind::ReviewApproved.requires_alert());
         assert!(!AuditEventKind::RevisionActivated.requires_alert());
     }

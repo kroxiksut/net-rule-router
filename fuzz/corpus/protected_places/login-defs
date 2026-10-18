@@ -1,0 +1,2 @@
+ENV_SUPATH	PATH=/usr/local/sbin:/usr/sbin
+ENV_PATH PATH=/usr/local/bin:/usr/bin

@@ -195,6 +195,12 @@ const TABLE: &[Row] = &[
         tray: Read,
         tui: Read,
     },
+    Row {
+        slug: "traffic-carried-by-another-user",
+        gui: Read,
+        tray: Read,
+        tui: Read,
+    },
 ];
 
 /// Events the IPC client makes up itself, not the service: they have no

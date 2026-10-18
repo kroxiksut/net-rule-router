@@ -11,7 +11,8 @@
 use nrr_shared::ipc::IpcOperationName;
 
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 use crate::managers::PolicyManager;
 
@@ -42,8 +43,29 @@ impl UnimplementedHandler {
     }
 }
 
-impl IpcHandler for UnimplementedHandler {
-    fn handle(&self, _request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+/// Refuses in the precheck: with nothing behind it there is nothing to audit.
+impl CheckedIpcHandler for UnimplementedHandler {
+    type Checked = std::convert::Infallible;
+
+    fn precheck(
+        &self,
+        _request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        Err(IpcError {
+            code: IpcErrorCode::RecoveryRequired,
+            message: format!("operation {} not yet implemented", self.op.slug()),
+            diagnostics_id: None,
+        })
+    }
+
+    fn execute(
+        &self,
+        _checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        // Never reached: precheck refuses every request of a stub.
         Err(IpcError {
             code: IpcErrorCode::RecoveryRequired,
             message: format!("operation {} not yet implemented", self.op.slug()),

@@ -23,6 +23,7 @@ use nrr_client_logic::rules_table::{
     file_row_from_service_wire, main_route_check_hosts, main_route_rank, normalize_host_input,
     parsed_rule_target_route, parsed_rule_verify, rule_row_to_wire_dto, RowOrigin, RuleRow,
     RuleType, RulesFileOptions, TargetRoute, WireDtoOptions, PRESET_FORMAT_VERSION,
+    RULES_FILE_HINT_KEYS,
 };
 use nrr_client_logic::Route;
 use nrr_shared::ipc_payloads::{
@@ -372,6 +373,42 @@ fn bound_wire_row_index_matches_js() {
 }
 
 #[test]
+fn suggested_primary_binding_matches_js() {
+    let (base_document, _) = load_vectors("adapters");
+    let base = base_document["base-row"].clone();
+    // Both sides read the same full rows: the base row under each patch.
+    let rows_of = move |input: &Value| -> Value {
+        Value::Array(
+            input["rows"]
+                .as_array()
+                .expect("rows is an array")
+                .iter()
+                .map(|patch| merged(&base, patch))
+                .collect(),
+        )
+    };
+    let rows_for_js = rows_of.clone();
+    check(
+        "suggested_primary_binding",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "suggestedPrimaryBinding({}, {})",
+                rows_for_js(input),
+                arg(input, "name")
+            )
+        },
+        |input| {
+            let rows: Vec<InterfaceRowDto> =
+                serde_json::from_value(rows_of(input)).expect("rows are InterfaceRowDto");
+            let name = input["name"].as_str().expect("name is a string");
+            serde_json::to_value(adapters::suggested_primary_binding(&rows, name))
+                .expect("binding serialises")
+        },
+    );
+}
+
+#[test]
 fn interfaces_source_is_live_matches_js() {
     check(
         "interfaces_source_is_live",
@@ -444,6 +481,27 @@ fn preset_format_version_matches_js() {
         JsLib::rules().eval_json("CANONICAL_PRESET_FORMAT_VERSION"),
         json!(PRESET_FORMAT_VERSION)
     );
+}
+
+/// One hint on both sides: the marker the parsers skip, the keys with their
+/// English text, and that English as the lines when nothing translates.
+#[test]
+fn rules_file_hint_matches_js() {
+    let mut js = JsLib::rules();
+    assert_eq!(
+        js.eval_json("RULES_FILE_HINT_PREFIX"),
+        json!(nrr_shared::preset_parser::SYNTAX_HINT_PREFIX)
+    );
+    let keys: Vec<Value> = RULES_FILE_HINT_KEYS
+        .iter()
+        .map(|(id, en)| json!([id, en]))
+        .collect();
+    assert_eq!(js.eval_json("RULES_FILE_HINT_KEYS"), Value::from(keys));
+    let english: Vec<&str> = RULES_FILE_HINT_KEYS.iter().map(|(_, en)| *en).collect();
+    assert_eq!(js.eval_json("rulesFileHintLines(null)"), json!(english));
+    let ids: Vec<&str> = RULES_FILE_HINT_KEYS.iter().map(|(id, _)| *id).collect();
+    let by_key = "rulesFileHintLines(function (key, fallback) { return key })";
+    assert_eq!(js.eval_json(by_key), json!(ids));
 }
 
 #[test]
@@ -588,6 +646,7 @@ fn rows_from_parsed_rules_match_js() {
             format!(
                 "(function (r, route) {{ return {{ target: parsedRuleTargetRoute(r, route), \
                  verify: parsedRuleVerify(r), \
+                 value: parsedRuleStoredValue(r), \
                  drift: driftRowFromParsedRule(r, route) }} }})({}, {})",
                 arg(input, "rule"),
                 arg(input, "route")
@@ -600,6 +659,7 @@ fn rows_from_parsed_rules_match_js() {
             json!({
                 "target": parsed_rule_target_route(&rule, file).as_str(),
                 "verify": parsed_rule_verify(&rule),
+                "value": rule.stored_value(),
                 "drift": drift_row_to_js(&drift_row_from_parsed_rule(&rule, file)),
             })
         },
@@ -620,12 +680,13 @@ fn rules_file_text_matches_js() {
         &mut JsLib::rules(),
         |input| {
             format!(
-                "buildCanonicalRulesText(__model({}), {}, {}, {}, {})",
+                "buildCanonicalRulesText(__model({}), {}, {}, {}, {}, {})",
                 arg(input, "rows"),
                 arg(input, "route"),
                 arg(input, "passthrough"),
                 arg(input, "includeComments"),
-                lit(&Value::from(os_of(input)))
+                lit(&Value::from(os_of(input))),
+                arg(input, "hint")
             )
         },
         |input| {
@@ -633,11 +694,13 @@ fn rules_file_text_matches_js() {
                 .into_iter()
                 .map(|(name, raw)| (name, raw.as_str().unwrap_or_default().to_owned()))
                 .collect();
+            let hint = strings(&input["hint"]);
             let options = RulesFileOptions {
                 include_comments: input["includeComments"].as_bool().unwrap_or(true),
                 exported_at: EXPORTED_AT,
                 passthrough: &passthrough,
                 os: os_of(input),
+                syntax_hint: &hint,
             };
             Value::from(build_rules_file_text(
                 &rows_from_js(&input["rows"]),

@@ -12,6 +12,16 @@ QtObject {
     /// RpcTransport instance.
     property var rpc: null
 
+    /// The `base-revision` of the rules list the table was built from, or
+    /// null when none was read. Sent with every write: the service refuses one
+    /// built from rules that have changed since (`rules-changed-elsewhere`)
+    /// rather than undoing that change.
+    property var baseRevision: null
+
+    /// A write landed and its answer named the rules now in force (`base`,
+    /// null when it did not say): the owner builds the next write on it.
+    signal baseRevisionMoved(var base)
+
     readonly property bool bridgeReady: typeof nrrNativeBridge !== "undefined"
         && nrrNativeBridge !== null
         && typeof nrrNativeBridge.rpcMutationSubmit === "function"
@@ -25,7 +35,8 @@ QtObject {
             : ("client-stub-" + String(Date.now()))
     }
 
-    /// Preview `rulesJson`. `opts`: `{ origin, adminBaseline, contentHash }`;
+    /// Preview `rulesJson`. `opts`: `{ origin, adminBaseline, contentHash,
+    /// baseRevision }` (the last defaults to `baseRevision` above);
     /// `origin` travels on the wire in the correlation id, so a duplicate in
     /// the service log names its caller. Returns the request `state`
     /// (`{rulesJson, contentHash, correlationId, adminBaseline}`) once sent, or
@@ -45,11 +56,18 @@ QtObject {
         // `mutation-request` class (the broker relays the UAC) and lands in the
         // shared baseline instead of the caller's own partition.
         if (o.adminBaseline) payload["admin-baseline"] = true
+        // "Set baseline" copies the table over the baseline on purpose: the
+        // table's base names the caller's own rules, not the baseline's.
+        var base = (o.baseRevision !== undefined) ? o.baseRevision : submitter.baseRevision
+        if (!o.adminBaseline && base !== null && base !== undefined) {
+            payload["base-revision"] = String(base)
+        }
         var state = {
             rulesJson: payload["rules-json"],
             contentHash: payload["content-hash"],
             correlationId: corr,
-            adminBaseline: !!o.adminBaseline
+            adminBaseline: !!o.adminBaseline,
+            baseRevision: (payload["base-revision"] !== undefined) ? payload["base-revision"] : null
         }
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "rules-update", payload, true /* dryRun */, "")
@@ -89,6 +107,10 @@ QtObject {
             "correlation-id": st.correlationId
         }
         if (st.adminBaseline) payload["admin-baseline"] = true
+        // The confirm must carry the previewed payload as it was.
+        if (st.baseRevision !== null && st.baseRevision !== undefined) {
+            payload["base-revision"] = String(st.baseRevision)
+        }
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "rules-update", payload, false /* dryRun */, token)
         if (!rpcCorr || String(rpcCorr) === "") return false
@@ -103,8 +125,11 @@ QtObject {
             // The confirm only accepts the change; its verdict is on the
             // operation record.
             rpc.readMutationOutcome(p, rpc.settleByPreview("rules-update", payload),
-                function(failure, failureArgs) {
+                function(failure, failureArgs, result) {
                     if (failure === "") {
+                        var moved = (result && result["base-revision"] !== undefined)
+                            ? String(result["base-revision"]) : null
+                        submitter.baseRevisionMoved(moved)
                         done(true, r)
                         return
                     }

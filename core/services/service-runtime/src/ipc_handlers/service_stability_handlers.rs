@@ -26,7 +26,8 @@ use nrr_shared::ipc_payloads::{
 };
 
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 use crate::ipc_handlers::providers::{
     ServiceStabilityConfigProvider, ServiceStabilityConfigWriter, SettingsWriteError,
@@ -137,11 +138,16 @@ const REPORTED_ONLY_WIRE_KEYS: &[&str] = &[
     "conn-trace-ndjson-forced-by",
 ];
 
-impl IpcHandler for ServiceStabilityConfigSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        const OP: &str = "settings.service-stability.set";
-        let req: ServiceStabilityConfigSetRequest =
-            serde_json::from_value(request.payload.clone()).map_err(|e| malformed(OP, e))?;
+const SET_OP: &str = "settings.service-stability.set";
+
+impl ServiceStabilityConfigSetHandler {
+    /// Machine-wide fields change only with rights; compared with the stored
+    /// value, so `execute` asks again in case it moved since the precheck.
+    fn gate(
+        &self,
+        req: &ServiceStabilityConfigSetRequest,
+        ctx: &IpcRequestContext,
+    ) -> Result<(), IpcError> {
         let changed = if ctx.caller_is_elevated {
             Vec::new()
         } else {
@@ -155,11 +161,9 @@ impl IpcHandler for ServiceStabilityConfigSetHandler {
                 requested = ?req.config.allow_user_rule_edits,
                 "refused a non-elevated attempt to change the administrative rules lock",
             );
-            return Err(IpcError {
-                code: IpcErrorCode::Forbidden,
-                message: "changing who may edit routing rules requires an elevated client".into(),
-                diagnostics_id: None,
-            });
+            return Err(IpcError::needs_administrator(
+                "changing who may edit routing rules requires an elevated client",
+            ));
         }
         if !changed.is_empty() {
             tracing::warn!(
@@ -173,6 +177,32 @@ impl IpcHandler for ServiceStabilityConfigSetHandler {
                 crate::machine_scoped::MachineScopedSetting::ServiceStability,
             ));
         }
+        Ok(())
+    }
+}
+
+impl CheckedIpcHandler for ServiceStabilityConfigSetHandler {
+    type Checked = ServiceStabilityConfigSetRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        let req: ServiceStabilityConfigSetRequest =
+            serde_json::from_value(request.payload.clone()).map_err(|e| malformed(SET_OP, e))?;
+        self.gate(&req, ctx)?;
+        Ok(req)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        const OP: &str = SET_OP;
+        self.gate(&req, ctx)?;
         let sid = if ctx.caller_stored().is_empty() {
             None
         } else {

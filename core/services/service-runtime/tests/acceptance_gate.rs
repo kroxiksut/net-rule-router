@@ -23,9 +23,10 @@ use nrr_service_runtime::{
     ApplyAttemptMarker,
     ApplyMarkerStore,
     ApplyPhase,
+    // ipc
+    CheckedIpcHandler,
     DegradedMode,
     DegradedModeStatus,
-    // ipc
     HandlerOutcome,
     IpcAuditEmitter,
     IpcClientProfile,
@@ -42,6 +43,7 @@ use nrr_service_runtime::{
     NoopRecoveryAuditSink,
     // policy_loader
     PolicyLoadResult,
+    Prechecked,
     RecoveryAuditRecord,
     RecoveryAuditSink,
     RecoveryDecision,
@@ -128,8 +130,21 @@ fn mid_apply_marker() -> ApplyAttemptMarker {
 }
 
 struct EchoHandler;
-impl IpcHandler for EchoHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for EchoHandler {
+    type Checked = ();
+    fn precheck(
+        &self,
+        _request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> Result<(), nrr_service_runtime::IpcError> {
+        Ok(())
+    }
+    fn execute(
+        &self,
+        _checked: Prechecked<()>,
+        request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         Ok(serde_json::json!({ "echo": request.operation.slug() }))
     }
 }
@@ -137,7 +152,7 @@ impl IpcHandler for EchoHandler {
 fn make_router() -> IpcRouter {
     let mut reg = IpcHandlerRegistry::new();
     reg.register(IpcOperationName::ServiceHealthGet, EchoHandler);
-    reg.register(IpcOperationName::MutationSubmit, EchoHandler);
+    reg.register_checked(IpcOperationName::MutationSubmit, EchoHandler);
     IpcRouter::new(reg, Arc::new(NoopIpcAuditEmitter::default()), 1)
 }
 
@@ -357,8 +372,21 @@ fn the_tray_may_still_subscribe_to_push_events() {
 // ─────────────────────────────────────────────────────────────────────────────
 /// Refuses the request whose id is `req-refused`, echoes every other one.
 struct RefusingHandler;
-impl IpcHandler for RefusingHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for RefusingHandler {
+    type Checked = ();
+    fn precheck(
+        &self,
+        _request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> Result<(), nrr_service_runtime::IpcError> {
+        Ok(())
+    }
+    fn execute(
+        &self,
+        _checked: Prechecked<()>,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         if request.request_id == "req-refused" {
             return Err(nrr_service_runtime::IpcError {
                 code: IpcErrorCode::Internal,
@@ -373,7 +401,7 @@ impl IpcHandler for RefusingHandler {
 #[test]
 fn a_finished_mutation_releases_its_slot_for_the_next_caller() {
     let mut reg = IpcHandlerRegistry::new();
-    reg.register(IpcOperationName::MutationSubmit, RefusingHandler);
+    reg.register_checked(IpcOperationName::MutationSubmit, RefusingHandler);
     // One slot: a leaked guard shows up as BusyConflict on the very next call.
     let router = IpcRouter::new(reg, Arc::new(NoopIpcAuditEmitter::default()), 1);
 

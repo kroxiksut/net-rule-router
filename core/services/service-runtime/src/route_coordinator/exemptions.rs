@@ -247,7 +247,7 @@ impl SecondaryRouteCoordinator {
                         target: "nrr::route-coordinator",
                         msg_key = "route-failclosed-cached-subnets",
                         sid = %sid,
-                        subnets = local_subnets.len(),
+                        subnet_count = local_subnets.len(),
                         "leak protection: using the last known local subnets so the block-all keeps LAN reachable",
                     );
                 }
@@ -377,23 +377,9 @@ pub(crate) fn foreign_tunnel_indexes(
                 == Some(nrr_platform_api::AdapterAvailability::Available)
         })
         .collect();
-    let sole_default_holder = |v6: bool| {
-        let mut holders = available.iter().map(|a| a.index).filter(|index| {
-            routes.iter().any(|r| {
-                r.interface_index == *index
-                    && r.prefix_length == 0
-                    && !r.is_ours
-                    && r.destination.is_ipv6() == v6
-            })
-        });
-        match (holders.next(), holders.next()) {
-            (Some(only), None) => Some(only),
-            _ => None,
-        }
-    };
-    let uplinks: Vec<u32> = [sole_default_holder(false), sole_default_holder(true)]
+    let uplinks: Vec<u32> = [false, true]
         .into_iter()
-        .flatten()
+        .filter_map(|v6| crate::routing_setup::sole_default_route_holder(adapters, routes, v6))
         .collect();
     available
         .into_iter()

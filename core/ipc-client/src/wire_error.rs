@@ -7,6 +7,7 @@
 
 use crate::connection::IpcClientError;
 use nrr_shared::client_error_codes as codes;
+use nrr_shared::ipc_transport::{forbidden_client_code, IpcErrorCode};
 
 /// Map an [`IpcClientError`] to `(wire_slug, message)`.
 pub fn ipc_error_to_wire(err: &IpcClientError) -> (&'static str, String) {
@@ -20,6 +21,13 @@ pub fn ipc_error_to_wire(err: &IpcClientError) -> (&'static str, String) {
         // slugs: the rules section keys its read-only state off the first, and
         // `forbidden` would send the second to the elevated broker, which
         // cannot lift the alert gate.
+        // The elevation gate's outcome (no agent, no authority, declined) is
+        // its own code; every other `Forbidden` stays the one a broker retries.
+        IpcClientError::ServerError {
+            code: IpcErrorCode::Forbidden,
+            message,
+            ..
+        } => (forbidden_client_code(message), message.clone()),
         IpcClientError::ServerError { code, message, .. } => (code.client_slug(), message.clone()),
     }
 }
@@ -48,6 +56,17 @@ mod tests {
             code,
             message: message.into(),
         }
+    }
+
+    #[test]
+    fn the_elevation_gates_outcome_reaches_the_client_as_its_own_code() {
+        let no_agent = server_error(
+            IpcErrorCode::Forbidden,
+            "elevation-agent-missing: no authentication agent",
+        );
+        assert_eq!(ipc_error_to_wire(&no_agent).0, "elevation-agent-missing");
+        let needs = server_error(IpcErrorCode::Forbidden, "needs-administrator: retention");
+        assert_eq!(ipc_error_to_wire(&needs).0, "forbidden");
     }
 
     #[test]

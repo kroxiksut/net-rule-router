@@ -65,6 +65,8 @@ const RUNTIME_KEY_SOURCE_FILES: &[&str] = &[
     "apps/desktop/tray/src/lib.rs",
     // The terminal interface's one key table.
     "apps/tui/src/keys.rs",
+    // The launcher's own notice when the Qt host cannot load its libraries.
+    "apps/desktop/launcher/src/launcher/host_start_failure/mod.rs",
 ];
 
 /// Root of the QML tree, walked recursively for `tr()` keys.
@@ -195,6 +197,34 @@ fn the_terminal_elevation_refusal_is_worded_for_every_host() {
                 map.get(key).is_some_and(|text| !text.is_empty()),
                 "locale '{locale}' lacks {key}"
             );
+        }
+    }
+}
+
+/// Both clients word a less certain offer's basis through a key built from
+/// its slug, so every slug the service can send needs one in every locale.
+#[test]
+fn every_less_certain_basis_is_worded() {
+    for locale in BASELINE_LOCALES {
+        let map = raw_locale_map(locale);
+        for slug in nrr_shared::ipc_payloads::AUTO_RULE_LESS_CERTAIN_SLUGS {
+            let key = format!("rules.suggestions.less-certain.{slug}");
+            assert!(
+                map.get(&key).is_some_and(|text| text.contains("{site}")),
+                "locale '{locale}' lacks {key}, or it does not name the site"
+            );
+        }
+    }
+}
+
+/// A path that names no program says why, by its error's slug.
+#[test]
+fn every_path_error_is_worded() {
+    for locale in BASELINE_LOCALES {
+        let map = raw_locale_map(locale);
+        for error in nrr_shared::app_path::AppPathError::ALL {
+            let key = format!("rules.validation.match-value-invalid.{}", error.slug());
+            assert!(map.contains_key(&key), "locale '{locale}' lacks {key}");
         }
     }
 }

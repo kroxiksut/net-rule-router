@@ -51,14 +51,25 @@ fn pure_kinds() -> BTreeSet<String> {
 #[test]
 fn every_notice_kind_is_named_alike_in_the_service_and_the_windows() {
     let domain = domain_kinds();
-    assert_eq!(domain.len(), 8, "{domain:?}");
+    assert_eq!(domain.len(), 9, "{domain:?}");
     assert_eq!(pure_kinds(), domain);
 }
+
+/// Kinds the tray lists in its menu and never raises as a notice: the window's
+/// card carries their "Don't show…".
+const LISTED_IN_TRAY_MENU_ONLY: [&str; 1] = ["external-address"];
 
 #[test]
 fn the_tray_offers_the_mute_on_every_kind_and_gates_each_one() {
     let tray = repo_file("apps/desktop/qml/Tray.qml");
     for kind in domain_kinds() {
+        if LISTED_IN_TRAY_MENU_ONLY.contains(&kind.as_str()) {
+            assert!(
+                !tray.contains(&format!("_offerNotice(\"{kind}\"")),
+                "{kind} is raised by the tray again: give it its mute back"
+            );
+            continue;
+        }
         assert!(
             tray.contains(&format!("_noticeMuteAction(\"{kind}\")")),
             "no \"Don't show…\" button for {kind}"

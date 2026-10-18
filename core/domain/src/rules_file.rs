@@ -49,6 +49,7 @@
 //! - `value  # text` — active rule with inline comment (label in GUI)
 //! - `# value` — disabled rule (GUI toggle-off maps to commenting the line)
 //! - `?value` — in `--- Domains`, `--- Auto` and `--- IP`: check where it works
+//! - `!value` — in any section: deny the traffic (`# !value` when disabled)
 //! - lines with only `#` text and no rule token — free comments, ignored by parser
 //! - empty lines — ignored
 //!

@@ -295,6 +295,106 @@ fn the_newcomer_alone_is_told_which_destinations_another_user_holds() {
     assert_eq!(standing.routes_held(PETYA), None);
 }
 
+fn carried_notices(
+    bus: &crate::ipc_handlers::event_bus::EventBus,
+    sub: &str,
+) -> Vec<(String, bool, String)> {
+    bus.peek_pending_for(sub, 64)
+        .into_iter()
+        .filter_map(|e| match e.event {
+            nrr_shared::ipc_payloads::StatusUpdateEvent::TrafficCarriedByAnotherUser {
+                sid,
+                carried,
+                link,
+            } => Some((sid, carried, link)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Vasya signed in first and sends everything through his tunnel, so what
+/// Petya's rules do not route rides it. Petya alone is told, by the
+/// connection's name and once per change; Vasya is not; the end is news too.
+#[test]
+fn the_later_user_alone_is_told_that_another_users_tunnel_carries_their_traffic() {
+    let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+    let petya_sub = bus
+        .subscribe_as("petya".into(), Some(PETYA.into()), None)
+        .subscription_id;
+    let vasya_sub = bus
+        .subscribe_as("vasya".into(), Some(VASYA.into()), None)
+        .subscription_id;
+    let mut m = machine();
+    m.coord = m.coord.with_event_bus(Arc::clone(&bus));
+    m.user(VASYA, &m.vpn_a, &[1]);
+    m.policy.set_mode(
+        VASYA,
+        crate::per_sid_orchestrator::PerSidBehaviorMode::PreferSecondaryWhenAvailable,
+    );
+    m.user(PETYA, &m.vpn_b, &[2]);
+    m.signed_in(&[VASYA]);
+    m.coord.recompute_active(&[]).unwrap();
+    m.signed_in(&[VASYA, PETYA]);
+    m.coord.recompute_active(&[]).unwrap();
+    m.coord.recompute_active(&[]).unwrap();
+
+    assert_eq!(
+        carried_notices(&bus, &petya_sub),
+        vec![(PETYA.to_string(), true, "desc vpn-a".to_string())],
+        "one notice for one change, however many passes"
+    );
+    assert!(
+        carried_notices(&bus, &vasya_sub).is_empty(),
+        "the user whose tunnel it is is not told"
+    );
+    assert_eq!(m.links_to(2), vec![11], "Petya's own rules keep his link");
+    let standing = m.coord.enforcement_status();
+    assert_eq!(
+        standing.traffic_carried(PETYA).map(|c| c.link),
+        Some("desc vpn-a".to_string()),
+        "the snapshot carries it for a client that connects later"
+    );
+    assert_eq!(standing.traffic_carried(VASYA), None);
+
+    m.signed_in(&[PETYA]);
+    m.coord.recompute_active(&[]).unwrap();
+    assert_eq!(
+        carried_notices(&bus, &petya_sub).last(),
+        Some(&(PETYA.to_string(), false, String::new())),
+        "the tunnel's owner gone, the notice ends"
+    );
+    assert_eq!(standing.traffic_carried(PETYA), None);
+}
+
+/// Petya signed in first with ordinary internet: Vasya's "everything through
+/// my tunnel" stays out of the table, so nobody's traffic is carried.
+#[test]
+fn nobody_is_told_when_the_earlier_user_has_no_tunnel_overlay() {
+    let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+    let petya_sub = bus
+        .subscribe_as("petya".into(), Some(PETYA.into()), None)
+        .subscription_id;
+    let vasya_sub = bus
+        .subscribe_as("vasya".into(), Some(VASYA.into()), None)
+        .subscription_id;
+    let mut m = machine();
+    m.coord = m.coord.with_event_bus(Arc::clone(&bus));
+    m.user(PETYA, &m.vpn_b, &[2]);
+    m.user(VASYA, &m.vpn_a, &[1]);
+    m.policy.set_mode(
+        VASYA,
+        crate::per_sid_orchestrator::PerSidBehaviorMode::PreferSecondaryWhenAvailable,
+    );
+    m.signed_in(&[PETYA]);
+    m.coord.recompute_active(&[]).unwrap();
+    m.signed_in(&[PETYA, VASYA]);
+    m.coord.recompute_active(&[]).unwrap();
+
+    assert!(carried_notices(&bus, &petya_sub).is_empty());
+    assert!(carried_notices(&bus, &vasya_sub).is_empty());
+    assert_eq!(m.coord.enforcement_status().traffic_carried(PETYA), None);
+}
+
 /// One enumeration that misses the longer-served user must not hand their
 /// destination to the newcomer and back.
 #[test]

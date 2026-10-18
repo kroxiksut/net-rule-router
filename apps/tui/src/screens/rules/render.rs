@@ -1,7 +1,9 @@
 //! The Rules screen as panels of lines, for both renderers.
 
-use nrr_client_logic::placeholders::fill_placeholders;
-use nrr_client_logic::rules_table::{RuleRow, RuleType, TargetRoute};
+use nrr_client_logic::placeholders::{fill_placeholders, list_summary};
+use nrr_client_logic::rule_value_class::misplaced_target_type;
+use nrr_client_logic::rules_table::{RuleType, TargetRoute};
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc_payloads::{ReviewRiskLevel, ReviewSummaryResponse, RuleSummaryEntryDto};
 use nrr_shared::platform_profile::PlatformProfile;
 use serde_json::Value;
@@ -15,8 +17,8 @@ pub const REVIEW_PAGE: usize = 12;
 /// Overlaps the form spells out before it counts the rest.
 const FORM_OVERLAPS: usize = 3;
 use super::{
-    gateway, main_route, text, verdicts, Busy, Choice, ChoicePurpose, Input, InputPurpose, Mode,
-    Phase, SetList,
+    bulk, gateway, main_route, recent, text, verdicts, Busy, Choice, ChoicePurpose, Input,
+    InputPurpose, Mode, Phase, SetList,
 };
 use crate::i18n::Texts;
 use crate::keys;
@@ -64,6 +66,11 @@ pub fn view(app: &AppState, texts: &Texts) -> ScreenView {
         Mode::Gateway(stage) => Panel {
             title: texts.get(text::GATEWAY_TITLE),
             lines: gateway::lines(stage, texts),
+            feed: false,
+        },
+        Mode::Bulk(form) => Panel {
+            title: texts.get(text::MODE_SEVERAL),
+            lines: bulk::lines(form, texts),
             feed: false,
         },
     };
@@ -144,7 +151,12 @@ fn state_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         filter.push(Segment::strong(format!(" · {}: ", texts.get(text::SEARCH))));
         filter.push(Segment::plain(table.search.clone()));
     }
-    if table.sort != SortMode::Display {
+    if let Some(shown) = &table.recent {
+        filter.push(Segment::strong(format!(" · {}: ", texts.get(text::RECENT))));
+        filter.push(Segment::plain(
+            texts.get(recent::period_label(shown.period)),
+        ));
+    } else if table.sort != SortMode::Display {
         filter.push(Segment::strong(format!(" · {}: ", texts.get(text::SORT))));
         filter.push(Segment::plain(texts.get(table.sort.label())));
     }
@@ -173,10 +185,8 @@ fn verdict_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     ];
     for (value, to) in &waiting.shown {
         let route = route_text(&TargetRoute::from_slug(to), texts);
-        let item = texts.fill(
-            text::VERDICTS_ITEM,
-            &[("value", value.clone()), ("route", route)],
-        );
+        let value = display_text(value).into_owned();
+        let item = texts.fill(text::VERDICTS_ITEM, &[("value", value), ("route", route)]);
         lines.push(ViewLine::text(format!("     {item}")));
     }
     if waiting.more > 0 {
@@ -196,13 +206,19 @@ fn route_text(route: &TargetRoute, texts: &Texts) -> String {
     route_label(route).map_or_else(|| route.as_str().to_owned(), |k| texts.get(k))
 }
 
-/// A rule's route with its `?` mark.
-fn rule_route_text(rule: &RuleRow, texts: &Texts) -> String {
-    let route = route_text(&rule.target_route, texts);
-    if rule.is_verify() {
-        format!("{route} ?")
-    } else {
-        route
+/// A route as the form offers it: a deny names the action, not the row mark.
+fn form_route_text(route: &TargetRoute, texts: &Texts) -> String {
+    match route {
+        TargetRoute::Block => texts.get(text::ROUTE_DENY),
+        other => route_text(other, texts),
+    }
+}
+
+/// A route as the open choice list spells it out.
+fn route_option_text(route: &TargetRoute, texts: &Texts) -> String {
+    match route {
+        TargetRoute::Block => texts.get(text::ROUTE_DENY_DESCRIPTION),
+        other => route_text(other, texts),
     }
 }
 
@@ -236,6 +252,7 @@ fn verdict_word(verdict: &Verdict, texts: &Texts) -> Option<Segment> {
 
 /// One rule; `with_main_route` when the list shows the main-route column.
 fn row_lines(
+    app: &AppState,
     n: usize,
     row: &Row,
     chosen: bool,
@@ -244,31 +261,47 @@ fn row_lines(
 ) -> Vec<ViewLine> {
     let rule = &row.rule;
     let switch = texts.get(if rule.enabled { text::ON } else { text::OFF });
-    let mut head = format!(
-        "{}{n}. [{switch}] {}  {}  {} — {}",
+    let lead = format!(
+        "{}{n}. [{switch}] {}  {}  {} — ",
         if chosen { "> " } else { "  " },
         rule.id,
         type_label(&rule.rule_type, texts),
-        rule.match_value,
-        rule_route_text(rule, texts),
+        display_text(&rule.match_value),
     );
+    let route = route_text(&rule.target_route, texts);
+    // The route's `?` mark, then the rest of the row.
+    let mut tail = if rule.is_verify() {
+        " ?".to_owned()
+    } else {
+        String::new()
+    };
     let cell = if with_main_route {
         main_route::cell(row)
     } else {
         None
     };
     if let Some((word, _)) = cell {
-        head.push_str(&format!(
+        tail.push_str(&format!(
             " · {}: {}",
             texts.get(text::MAIN_ROUTE_COLUMN),
             texts.get(word)
         ));
     }
-    let mut first = vec![if chosen {
-        Segment::strong(head)
+    if let Some(mark) = recent::mark_text(app, rule, texts) {
+        tail.push_str(&format!(" · {mark}"));
+    }
+    let mut first = if chosen {
+        vec![Segment::selected(format!("{lead}{route}{tail}"))]
     } else {
-        Segment::plain(head)
-    }];
+        let mut segments = vec![
+            Segment::plain(lead),
+            Segment::route_slug(route, rule.target_route.as_str()),
+        ];
+        if !tail.is_empty() {
+            segments.push(Segment::plain(tail));
+        }
+        segments
+    };
     if let Some(word) = verdict_word(&row.verdict, texts) {
         first.push(Segment::plain(" — "));
         first.push(word);
@@ -281,6 +314,10 @@ fn row_lines(
         if row.verdict.status != VerdictStatus::Valid {
             details.push(verdict_message(&row.verdict, texts));
         }
+        if let Some(target) = misplaced_target_type(&row.verdict.message_key) {
+            let label = type_label(&RuleType::from_slug(target), texts);
+            details.push(texts.fill(text::MOVE_TO_TYPE, &[("type", label)]));
+        }
         if rule.is_verify() {
             details.push(texts.get(text::VERIFY_HINT));
         }
@@ -290,8 +327,9 @@ fn row_lines(
         if rule.auto_origin().is_some() {
             details.push(texts.get(text::AUTO_ORIGIN));
         }
+        details.extend(recent::previous_lines(app, rule, texts));
         if !rule.comment.is_empty() {
-            details.push(format!("# {}", rule.comment));
+            details.push(format!("# {}", display_text(&rule.comment)));
         }
         for detail in details {
             lines.push(ViewLine::text(format!("     {detail}")));
@@ -306,17 +344,24 @@ fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         if !table.is_loaded() {
             return Vec::new();
         }
-        return vec![
+        let mut lines = vec![
             ViewLine::new(vec![Segment::strong(texts.get(text::EMPTY_TITLE))]),
             ViewLine::text(texts.get(text::EMPTY_BODY)),
         ];
+        lines.extend(recent::extra_lines(app, texts));
+        return lines;
     }
     let visible = table.visible();
     let total = table.rows.len().to_string();
     if visible.is_empty() {
-        return vec![ViewLine::text(
-            texts.fill(text::NONE_SHOWN, &[("total", total)]),
-        )];
+        let mut lines = Vec::new();
+        if table.recent.as_ref().is_none_or(|r| !r.marks.is_empty()) {
+            lines.push(ViewLine::text(
+                texts.fill(text::NONE_SHOWN, &[("total", total)]),
+            ));
+        }
+        lines.extend(recent::extra_lines(app, texts));
+        return lines;
     }
     let cursor = table.cursor.min(visible.len() - 1);
     let first = cursor / PAGE * PAGE;
@@ -330,10 +375,35 @@ fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             ("total", total),
         ],
     ))];
+    let misplaced: Vec<String> = table
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let target = misplaced_target_type(&row.verdict.message_key)?;
+            Some(format!(
+                "{}: {} \u{2192} {}",
+                display_text(&row.rule.match_value),
+                type_label(&row.rule.rule_type, texts),
+                type_label(&RuleType::from_slug(target), texts)
+            ))
+        })
+        .collect();
+    if !misplaced.is_empty() {
+        let more = texts.get(keys::APP_UNRESOLVED_MORE);
+        lines.push(ViewLine::text(texts.fill(
+            text::MISPLACED_COUNT,
+            &[
+                ("n", misplaced.len().to_string()),
+                ("rules", list_summary(&misplaced, &more)),
+            ],
+        )));
+        lines.push(ViewLine::text(texts.get(text::MOVE_ALL_TO_TYPE)));
+    }
     let column = main_route::column_shown(app);
     for (at, &master) in visible.iter().enumerate().take(last).skip(first) {
         let chosen = at == cursor && app.focus == crate::state::Focus::Feed;
         lines.extend(row_lines(
+            app,
             at + 1,
             &table.rows[master],
             chosen,
@@ -341,6 +411,7 @@ fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             texts,
         ));
     }
+    lines.extend(recent::extra_lines(app, texts));
     lines
 }
 
@@ -401,9 +472,23 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
         let (label, value) = match field {
             Field::Type => (text::FIELD_TYPE, type_label(&form.rule_type, texts)),
             Field::Value => (text::FIELD_VALUE, form.value.clone()),
-            Field::Route => (text::FIELD_ROUTE, route_text(&form.route, texts)),
+            Field::Route => (text::FIELD_ROUTE, form_route_text(&form.route, texts)),
             Field::Comment => (text::FIELD_COMMENT, form.comment.clone()),
             Field::Verify => {
+                if form.any_zone() {
+                    lines.push(ViewLine::text(format!(
+                        "     {}",
+                        texts.get(text::VERIFY_ANY_ZONE)
+                    )));
+                    continue;
+                }
+                if form.verify_refused_by_deny() {
+                    lines.push(ViewLine::text(format!(
+                        "     {}",
+                        texts.get(text::VERIFY_DENY)
+                    )));
+                    continue;
+                }
                 if !form.verify_offered() {
                     continue;
                 }
@@ -451,11 +536,39 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
             Segment::plain(value),
         ]));
         match field {
-            Field::Type if current => {
-                let types = offered_types();
-                let labels: Vec<String> = types.iter().map(|t| type_label(t, texts)).collect();
-                let chosen = types.iter().position(|t| *t == form.rule_type);
-                lines.extend(options(&labels, chosen, texts));
+            Field::Type => {
+                if current {
+                    let types = offered_types();
+                    let labels: Vec<String> = types.iter().map(|t| type_label(t, texts)).collect();
+                    let chosen = types.iter().position(|t| *t == form.rule_type);
+                    lines.extend(options(&labels, chosen, texts));
+                    if form.editing.is_none() {
+                        lines.push(ViewLine::text(format!(
+                            "     {}. {} {}",
+                            types.len() + 1,
+                            texts.get(text::UNTICKED),
+                            texts.get(text::SEVERAL_OPTION)
+                        )));
+                    }
+                }
+                if form.rule_type == RuleType::Application {
+                    let note = if PlatformProfile::current().os == "linux" {
+                        text::APP_ROUTING_NOTE_LINUX
+                    } else {
+                        text::APP_ROUTING_NOTE
+                    };
+                    lines.push(ViewLine::text(format!("     {}", texts.get(note))));
+                }
+                // An application deny is no guarantee where the platform cannot
+                // hold the app's first connections.
+                if form.rule_type == RuleType::Application
+                    && !PlatformProfile::current().supports.per_app_block_leakproof
+                {
+                    lines.push(ViewLine::text(format!(
+                        "     {}",
+                        texts.get(text::APP_NOT_LEAKPROOF)
+                    )));
+                }
             }
             Field::Value => {
                 match form.verdict() {
@@ -473,6 +586,13 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
                         }
                     }
                 }
+                if let Some(target) = form.switch_target() {
+                    let label = type_label(&target, texts);
+                    lines.push(ViewLine::text(format!(
+                        "     {}",
+                        texts.fill(text::FORM_SWITCH_TYPE, &[("type", label)])
+                    )));
+                }
                 let hint =
                     texts.dynamic(&format!("rules.hint.{}", hint_suffix(&form.rule_type)), "");
                 if current && !hint.is_empty() {
@@ -482,7 +602,8 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
             Field::Route => {
                 if current {
                     let routes = route_options();
-                    let labels: Vec<String> = routes.iter().map(|r| route_text(r, texts)).collect();
+                    let labels: Vec<String> =
+                        routes.iter().map(|r| route_option_text(r, texts)).collect();
                     let chosen = routes.iter().position(|r| *r == form.route);
                     lines.extend(options(&labels, chosen, texts));
                 }
@@ -535,6 +656,8 @@ pub fn choice_len(purpose: &ChoicePurpose) -> usize {
         ChoicePurpose::Filter => RouteFilter::ALL.len(),
         ChoicePurpose::Quit | ChoicePurpose::ImportMode { .. } => 3,
         ChoicePurpose::Preset(list) => list.sets.len(),
+        ChoicePurpose::Recent => 4,
+        ChoicePurpose::Restore(count) => *count,
         ChoicePurpose::Delete(_) | ChoicePurpose::Reload | ChoicePurpose::Overwrite(_) => 2,
     }
 }
@@ -553,7 +676,7 @@ fn choice_lines(app: &AppState, choice: &Choice, texts: &Texts) -> Vec<ViewLine>
                 .table
                 .rows
                 .get(*i)
-                .map(|r| format!("{} {}", r.rule.id, r.rule.match_value))
+                .map(|r| format!("{} {}", r.rule.id, display_text(&r.rule.match_value)))
                 .unwrap_or_default();
             (
                 get(text::DELETE_TITLE),
@@ -593,6 +716,16 @@ fn choice_lines(app: &AppState, choice: &Choice, texts: &Texts) -> Vec<ViewLine>
             get(text::OVERWRITE_QUESTION),
             vec![path.display().to_string()],
             vec![get(text::OVERWRITE), get(text::CANCEL)],
+        ),
+        ChoicePurpose::Recent => (
+            get(text::RECENT_QUESTION),
+            Vec::new(),
+            recent::choice_labels(texts),
+        ),
+        ChoicePurpose::Restore(_) => (
+            get(text::RESTORE_QUESTION),
+            Vec::new(),
+            recent::restore_labels(app, texts),
         ),
     };
     let mut lines = vec![ViewLine::new(vec![Segment::strong(question)])];

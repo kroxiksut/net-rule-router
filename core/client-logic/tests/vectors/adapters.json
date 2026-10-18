@@ -86,6 +86,7 @@
     { "name": "IPv6 all-zero gateway with a forwarding path", "input": { "patch": { "gateway": "::" } } },
     { "name": "IPv6 all-zero long form without a forwarding path", "input": { "patch": { "gateway": "::0", "has-forwarding-path": false } } },
     { "name": "padded gateway", "input": { "patch": { "gateway": " 192.0.2.1 ", "has-forwarding-path": false } } },
-    { "name": "cyrillic connection name", "input": { "patch": { "name": "Домашняя сеть", "interface-description": "Example Wireless Adapter" } } }
+    { "name": "cyrillic connection name", "input": { "patch": { "name": "Домашняя сеть", "interface-description": "Example Wireless Adapter" } } },
+    { "name": "bidi override and zero-width space in the names are shown", "input": { "patch": { "name": "Wi-Fi‮2", "interface-description": "Example​ Adapter\u001b[2J" } } }
   ]
 }

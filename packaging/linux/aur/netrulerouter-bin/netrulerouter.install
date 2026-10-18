@@ -1,0 +1,32 @@
+# pacman hooks for netrulerouter-bin. The service is not enabled on install, as
+# Arch packages do not; an upgrade restarts it only if it was running, and a
+# removal stops it and puts the network back first, as the .deb does.
+
+_nrr_lib=/usr/libexec/netrulerouter/scripts/lib
+
+_nrr_load() {
+  . "$_nrr_lib/service-paths.sh"
+  . "$_nrr_lib/package-functions.sh"
+}
+
+post_install() {
+  echo "NetRuleRouter is installed. Start the service and keep it on at boot:"
+  echo "    sudo systemctl enable --now netrulerouter.service"
+  echo "If it ever leaves the machine without network:"
+  echo "    sudo /usr/libexec/netrulerouter/scripts/reset-network.sh"
+}
+
+post_upgrade() {
+  _nrr_load && nrr_pkg_restart_if_running
+}
+
+pre_remove() {
+  _nrr_load && nrr_pkg_stop_and_reset_network
+}
+
+post_remove() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed netrulerouter.service >/dev/null 2>&1 || true
+  echo "The service data stays in /var/lib/netrulerouter; remove it by hand if"
+  echo "you no longer need it. The audit trail is in the same place."
+}

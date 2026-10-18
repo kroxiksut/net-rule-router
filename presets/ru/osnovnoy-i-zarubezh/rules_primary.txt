@@ -1,4 +1,4 @@
-# NetRuleRouter preset - version 1
+# NetRuleRouter preset - version 8
 # name: RU Osnovnoy I Zarubezh - Primary Route
 # description: Russian zones and domestic services on global domains routed to primary
 # author: NetRuleRouter contributors
@@ -39,8 +39,7 @@ su  # Историческая зона СССР (.su)
 *.vkuseraudio.net
 *.webmoney.com
 *.ya.cc
-*.yandex.com
-*.yandex.net
+yandex.*
 *.yandexcloud.net
 *.yastatic.net
 

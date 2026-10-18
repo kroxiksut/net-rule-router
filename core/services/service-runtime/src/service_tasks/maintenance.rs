@@ -282,6 +282,26 @@ fn checkpoint_logged(database: &str, outcome: nrr_storage::StorageResult<()>) {
     }
 }
 
+// ── Connection-history write-back ────────────────────────────────────────────
+
+/// Writes the connection history folded since the last tick and, every few
+/// minutes, ages it out and holds it to its size cap. `Optional`: a lost tick
+/// costs a minute of history, never routing.
+pub fn build_conn_history_flush_task(
+    history: Arc<crate::conn_history::ConnHistory>,
+) -> ServiceTask {
+    ServiceTask::periodic(
+        TASK_ID_CONN_HISTORY_FLUSH,
+        TaskClass::Optional,
+        CONN_HISTORY_FLUSH_INTERVAL,
+        0,
+        move |_stop| {
+            history.flush(crate::conn_observation_consumer::now_unix_ms());
+            TaskOutcome::Continue
+        },
+    )
+}
+
 // ── Operation-results GC ─────────────────────────────────────────────────────
 
 /// Periodic GC for the in-memory operation-results table. Operation

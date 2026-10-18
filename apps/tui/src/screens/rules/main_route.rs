@@ -86,7 +86,7 @@ pub fn progress_text(check: &Check, texts: &Texts) -> String {
 /// `c`: ask about every additional-route host on screen. A running check is
 /// not started twice.
 pub fn start(app: &mut AppState) -> bool {
-    if app.rules.main_route.check.is_some() {
+    if app.rules.main_route.check.is_some() || !super::own_rules_on_screen(app) {
         return true;
     }
     if !app.link.is_connected() {

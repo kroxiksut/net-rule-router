@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use nrr_shared::ipc::IpcOperationName;
 
 use crate::ipc::{
-    canonical_operation_class, HandlerOutcome, IpcError, IpcErrorCode, IpcHandler,
-    IpcRequestContext, IpcRequestEnvelope,
+    canonical_operation_class, CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode,
+    IpcRequestContext, IpcRequestEnvelope, Prechecked,
 };
 use crate::ipc_handlers::mutation_submit::resolve_confirm_principal;
 use crate::ipc_handlers::mutation_token_store::{
@@ -87,8 +87,24 @@ impl RollbackHandler {
     }
 }
 
-impl IpcHandler for RollbackHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+/// A rollback request its precheck accepted.
+pub enum CheckedRollback {
+    DryRun(RollbackRequest),
+    /// The token is spent; this is what it was reviewed for.
+    Rollback {
+        principal: String,
+        resolved: String,
+    },
+}
+
+impl CheckedIpcHandler for RollbackHandler {
+    type Checked = CheckedRollback;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
         let body: RollbackRequest = if request.payload.is_null() {
             RollbackRequest::default()
         } else {
@@ -115,23 +131,48 @@ impl IpcHandler for RollbackHandler {
 
         // Refused on the dry-run too, so a locked user hears it before the
         // real request rather than after.
-        if !rule_edits_allowed_for(self.stability.as_ref(), ctx.caller_is_elevated) {
-            return Err(IpcError {
-                code: IpcErrorCode::RulesLocked,
-                message: RULES_LOCKED_MESSAGE.into(),
-                diagnostics_id: None,
-            });
-        }
+        self.lock_gate(ctx)?;
 
         if body.dry_run {
-            self.handle_dry_run(body, ctx)
+            Ok(CheckedRollback::DryRun(body))
         } else {
-            self.handle_rollback(request, body, ctx)
+            self.precheck_rollback(request, body, ctx)
+        }
+    }
+
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        match checked.into_inner() {
+            CheckedRollback::DryRun(body) => self.handle_dry_run(body, ctx),
+            CheckedRollback::Rollback {
+                principal,
+                resolved,
+            } => {
+                // The lock may have been turned on while this was audited.
+                self.lock_gate(ctx)?;
+                self.handle_rollback(&principal, &resolved, ctx)
+            }
         }
     }
 }
 
 impl RollbackHandler {
+    fn lock_gate(&self, ctx: &IpcRequestContext) -> Result<(), IpcError> {
+        if rule_edits_allowed_for(self.stability.as_ref(), ctx.caller_is_elevated) {
+            Ok(())
+        } else {
+            Err(IpcError {
+                code: IpcErrorCode::RulesLocked,
+                message: RULES_LOCKED_MESSAGE.into(),
+                diagnostics_id: None,
+            })
+        }
+    }
+
     fn handle_dry_run(&self, body: RollbackRequest, ctx: &IpcRequestContext) -> HandlerOutcome {
         let principal =
             resolve_confirm_principal(rollback_class(body.admin_baseline), ctx.caller_stored())?;
@@ -177,12 +218,13 @@ impl RollbackHandler {
         })
     }
 
-    fn handle_rollback(
+    /// Spends the token, refused or not, and checks it against the request.
+    fn precheck_rollback(
         &self,
         request: &IpcRequestEnvelope,
         body: RollbackRequest,
         ctx: &IpcRequestContext,
-    ) -> HandlerOutcome {
+    ) -> Result<CheckedRollback, IpcError> {
         // Before the token is spent, so an unauthenticated caller keeps it.
         let principal = resolve_confirm_principal(request.operation_class, ctx.caller_stored())?;
         let token = request
@@ -194,12 +236,18 @@ impl RollbackHandler {
                 message: "rollback.request requires a confirmation token from its dry-run".into(),
                 diagnostics_id: None,
             })?;
+        // The shared baseline belongs to no one: its rollback may be confirmed
+        // by an administrator other than whoever ran the dry-run. A rollback
+        // of the caller's own chain stays bound to them.
+        let elevated_confirm =
+            request.operation_class.requires_elevation() && ctx.caller_is_elevated;
         let stored = self
             .token_store
-            .consume_for(
+            .consume_for_confirmer(
                 token,
                 IpcOperationName::RollbackRequest,
                 ctx.caller_stored(),
+                elevated_confirm,
                 Instant::now(),
             )
             .map_err(IpcError::from)?;
@@ -232,10 +280,22 @@ impl RollbackHandler {
                 diagnostics_id: None,
             });
         }
+        Ok(CheckedRollback::Rollback {
+            principal,
+            resolved: resolved.to_owned(),
+        })
+    }
+
+    fn handle_rollback(
+        &self,
+        principal: &str,
+        resolved: &str,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         let op_id = self
             .operation_store
             .enqueue_for(crate::ipc_handlers::operation_status_store::owner_of(ctx));
-        let outcome = self.executor.rollback(&principal, Some(resolved));
+        let outcome = self.executor.rollback(principal, Some(resolved));
         match outcome {
             MutationOutcome::Completed(result) => {
                 self.operation_store
@@ -269,7 +329,7 @@ fn rollback_class(admin_baseline: bool) -> crate::ipc::IpcOperationClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{IpcOperationClass, IPC_PROTOCOL_VERSION};
+    use crate::ipc::{IpcHandler, IpcOperationClass, IPC_PROTOCOL_VERSION};
     use crate::ipc_handlers::operation_status_store::{OperationError, OperationState};
     use crate::ipc_handlers::test_fakes::{FakeMutationExecutor, FakeRulesLock, FAKE_LKG_REVISION};
     use nrr_shared::ipc::IpcClientProfile;

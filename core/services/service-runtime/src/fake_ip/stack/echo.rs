@@ -35,12 +35,17 @@ impl FakeIpStack {
     /// Carry `call` when the relay would carry a connection to its destination.
     /// `false` leaves the packet to the stack exactly as before.
     pub(super) fn relay_echo(&mut self, call: EchoCall) -> bool {
-        let decision = self.relay.decide_endpoints(
-            SocketAddr::new(call.source.into(), 0),
-            SocketAddr::new(call.destination.into(), 0),
-        );
-        let RelayDecision::Relay { target, .. } = decision else {
+        let source = SocketAddr::new(call.source.into(), 0);
+        let destination = SocketAddr::new(call.destination.into(), 0);
+        let RelayDecision::Relay { target, .. } = self.relay.decide_endpoints(source, destination)
+        else {
             return false;
+        };
+        // No socket table lists an echo, so on a machine serving several users
+        // its owner is unknown and the probe is dropped, never sent for someone
+        // else.
+        let Ok(target) = self.relay.for_owner(target, source, destination, None) else {
+            return true;
         };
         let answers = Arc::clone(&self.echo_answers);
         if answers.in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_ECHOES_IN_FLIGHT {

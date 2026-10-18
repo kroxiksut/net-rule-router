@@ -350,7 +350,10 @@ fn diagnostics_export_archive_carries_manifest_and_service_logs() {
 
     let mut zip = zip::ZipArchive::new(std::fs::File::open(archive_path).expect("open archive"))
         .expect("the export must be a readable zip");
-    let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+    let names: Vec<String> = zip
+        .file_names()
+        .map(|name| name.expect("entry name").into_owned())
+        .collect();
     assert!(
         names.iter().any(|n| n == "manifest.json"),
         "manifest.json missing: {names:?}"

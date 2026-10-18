@@ -24,7 +24,7 @@ pub fn handle_a_query(
     // may leave only through the tunnel, and a query over the main link would
     // hand the provider exactly the name the guard withholds the address of.
     let rule_host = oracle.is_rule_host(hostname);
-    let resolve = if rule_host && leak_guard.blocking() {
+    let resolve = if rule_host && leak_guard.blocking_for_host(hostname) {
         upstream.resolve_tunnel_only_within(hostname, AddressFamily::Ipv4, hold.budget)
     } else {
         upstream.resolve_within(hostname, AddressFamily::Ipv4, hold.budget)
@@ -38,7 +38,9 @@ pub fn handle_a_query(
         },
         // A rule host the tunnel could not resolve while the guard blocks is
         // withheld, never forwarded: the forward would be the leak.
-        Err(ResolveError::Unavailable(reason)) if rule_host && leak_guard.blocking() => {
+        Err(ResolveError::Unavailable(reason))
+            if rule_host && leak_guard.blocking_for_host(hostname) =>
+        {
             tracing::info!(
                 target: "nrr::dns-resolver",
                 msg_key = "dns-resolver-withheld-name-leak-guard",
@@ -195,11 +197,7 @@ pub fn handle_a_query(
     // here read every rotated CDN address as covered: on the reporting machine
     // 2158 rule-host answers went out in a day, not one of them enforced, while
     // the gate reported the steady state.
-    let unenforced: Vec<Ipv4Addr> = answered
-        .iter()
-        .copied()
-        .filter(|ip| !enforced_view.is_enforced(*ip))
-        .collect();
+    let unenforced: Vec<Ipv4Addr> = enforced_view.unenforced_for_host(hostname, &answered);
     let all_enforced = unenforced.is_empty();
     // The full run that would carry these takes seconds; their routes alone
     // take a millisecond, and the route decides which link the first connect
@@ -244,7 +242,7 @@ pub fn handle_a_query(
         ReconcileOutcome::AheadOfEnforcement => !all_enforced,
         ReconcileOutcome::Installed | ReconcileOutcome::Deferred => false,
     };
-    if missed_install && leak_guard.blocking() {
+    if missed_install && leak_guard.blocking_for_host(hostname) {
         tracing::warn!(
             target: "nrr::dns-resolver",
             msg_key = "dns-resolver-withheld-leak-guard",
@@ -313,14 +311,16 @@ pub fn handle_aaaa_query(
     let started = std::time::Instant::now();
     // Every caller here holds a rule host; the same tunnel-only rule as the A
     // path applies while the guard blocks.
-    let resolve = if leak_guard.blocking() {
+    let resolve = if leak_guard.blocking_for_host(hostname) {
         upstream.resolve_tunnel_only_within(hostname, AddressFamily::Ipv6, hold.budget)
     } else {
         upstream.resolve_within(hostname, AddressFamily::Ipv6, hold.budget)
     };
     let resolved = match resolve {
         Ok(r) => r,
-        Err(ResolveError::Unavailable(_)) if leak_guard.blocking() => return AaaaOutcome::Withheld,
+        Err(ResolveError::Unavailable(_)) if leak_guard.blocking_for_host(hostname) => {
+            return AaaaOutcome::Withheld
+        }
         Err(e) => return AaaaOutcome::Upstream(e),
     };
     let all: Vec<std::net::Ipv6Addr> = resolved
@@ -373,7 +373,7 @@ pub fn handle_aaaa_query(
         reconcile,
         ReconcileOutcome::DeadlineExceeded | ReconcileOutcome::AheadOfEnforcement
     );
-    if missed_install && leak_guard.blocking() {
+    if missed_install && leak_guard.blocking_for_host(hostname) {
         tracing::warn!(
             target: "nrr::dns-resolver",
             msg_key = "dns-resolver-withheld-leak-guard-ipv6",

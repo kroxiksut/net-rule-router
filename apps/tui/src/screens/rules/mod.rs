@@ -5,12 +5,14 @@
 
 mod ace;
 mod apply;
+mod bulk;
 mod files;
 mod folder;
 mod form;
 mod gateway;
 mod main_route;
 mod own_settings;
+mod recent;
 mod render;
 mod table;
 mod text;
@@ -19,7 +21,8 @@ pub mod verdicts;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nrr_client_logic::rules_table::search_box_text;
+use nrr_client_logic::rule_value_class::misplaced_target_type;
+use nrr_client_logic::rules_table::{search_box_text, RuleRow, RuleType, TargetRoute};
 use nrr_shared::ipc_payloads::RulesListResponse;
 use nrr_shared::rules_json::FREE_MAX_RULES;
 use nrr_shared::rules_overlap::{find_route_overlaps, RouteOverlap};
@@ -27,7 +30,7 @@ use nrr_shared::user_settings::UserSettingsError;
 
 use self::apply::{Failure, Finished, Previewed, Review};
 use self::files::{Preset, RuleSet};
-use self::form::{Field, Form, Saved};
+use self::form::{offered_types, Field, Form, Saved};
 use self::table::{RouteFilter, Table, PAGE};
 use super::{overlaps, Screen, ScreenId};
 use crate::i18n::{Key, Texts};
@@ -45,6 +48,8 @@ pub enum Mode {
     Review(Box<Review>),
     /// `v`: a rule for a VPN's gateway.
     Gateway(Box<gateway::Stage>),
+    /// `A`: several rules at once, as lines of a rules file.
+    Bulk(Box<bulk::BulkForm>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +77,8 @@ pub enum ChoicePurpose {
     ImportMode { set: Box<RuleSet>, path: String },
     Preset(SetList),
     Overwrite(PathBuf),
+    Recent,
+    Restore(usize),
 }
 
 /// The rule sets offered, and where they came from.
@@ -204,6 +211,12 @@ pub struct RulesState {
     pub main_route: main_route::MainRoute,
     /// The comment a VPN-gateway rule gets, in the reader's language.
     pub gateway_comment: String,
+    /// The syntax hint a written rules file opens with, in the reader's
+    /// language.
+    pub file_hint: Vec<String>,
+    /// The `base-revision` of the rules on screen: what the next apply is
+    /// built on. `None` until a read names it.
+    pub base_revision: Option<String>,
 }
 
 impl RulesState {
@@ -220,6 +233,10 @@ impl RulesState {
 pub fn on_texts(app: &mut AppState, texts: &Texts) {
     app.rules.my_rules = texts.get(text::MY_RULES);
     app.rules.gateway_comment = texts.get(text::GATEWAY_COMMENT);
+    app.rules.file_hint = text::file_hint_keys()
+        .into_iter()
+        .map(|k| texts.get(k))
+        .collect();
 }
 
 pub struct RulesScreen;
@@ -240,10 +257,14 @@ impl Screen for RulesScreen {
             text::HELP_FILES,
             text::HELP_FOLDER,
             text::HELP_RELOAD,
+            text::HELP_BOOK,
             text::HELP_VERDICTS,
+            text::HELP_MOVE_TO_TYPE,
             text::HELP_MAIN_ROUTE,
             text::HELP_GATEWAY,
             text::HELP_FORM,
+            text::HELP_BULK,
+            text::HELP_RECENT,
         ]
     }
 
@@ -260,9 +281,13 @@ impl Screen for RulesScreen {
             text::PLAIN_FILES,
             text::PLAIN_FOLDER,
             text::PLAIN_RELOAD,
+            text::PLAIN_BOOK,
             text::PLAIN_VERDICTS,
             text::PLAIN_MAIN_ROUTE,
             text::PLAIN_GATEWAY,
+            text::PLAIN_BULK,
+            text::PLAIN_MOVE_TO_TYPE,
+            text::PLAIN_RECENT,
         ]
     }
 
@@ -287,6 +312,7 @@ impl Screen for RulesScreen {
             Mode::Choice(choice) => choice_key(app, choice, key),
             Mode::Review(review) => review_key(app, review, key),
             Mode::Gateway(stage) => gateway::on_key(app, *stage, key),
+            Mode::Bulk(form) => bulk::on_key(app, form, key),
         }
     }
 
@@ -310,6 +336,17 @@ impl Screen for RulesScreen {
             Mode::Form(mut form) => {
                 if line == "!" {
                     return true;
+                }
+                if line == "!t" {
+                    form.switch_type();
+                    refresh_form(app, &mut form);
+                    app.rules.mode = Mode::Form(form);
+                    return true;
+                }
+                // The number past the last type: several rules instead.
+                let several = (offered_types().len() + 1).to_string();
+                if form.editing.is_none() && form.field == Field::Type && line == several {
+                    return bulk::start(app, form.route.clone(), form.value.clone(), true);
                 }
                 if form.answer(line) {
                     save_form(app, form);
@@ -358,6 +395,12 @@ impl Screen for RulesScreen {
                 gateway::on_line(app, *stage, line);
                 true
             }
+            Mode::Bulk(form) => {
+                if line != "!" {
+                    bulk::on_line(app, form, line);
+                }
+                true
+            }
         }
     }
 
@@ -371,6 +414,7 @@ impl Screen for RulesScreen {
             }
             Mode::Review(_) => Some(text::PLAIN_REVIEW_PROMPT),
             Mode::Gateway(stage) => gateway::plain_prompt(stage),
+            Mode::Bulk(form) => Some(bulk::plain_prompt(form)),
         }
     }
 }
@@ -482,7 +526,7 @@ pub fn on_revision_changed(app: &mut AppState) {
 
 fn load(app: &mut AppState) {
     app.rules.busy = Some(Busy::Loading);
-    app.outbox.push(apply::load_job());
+    app.outbox.push(apply::load_job(app.rules.baseline));
 }
 
 fn loaded(app: &mut AppState, result: Result<RulesListResponse, Failure>) {
@@ -492,9 +536,12 @@ fn loaded(app: &mut AppState, result: Result<RulesListResponse, Failure>) {
         Ok(list) => {
             rules.load_error = None;
             rules.unrecognized = list.unrecognized;
+            rules.base_revision = list.base_revision.clone();
             rules.table.load(&list.rows);
             overlaps::refresh(app);
             verdicts::write_bound_files(app);
+            // The set the service holds was read again: an apply may be in it.
+            recent::refresh(app);
         }
         Err(failure) => {
             rules.load_error = Some(failure);
@@ -528,7 +575,9 @@ fn finished(app: &mut AppState, finished: Finished) {
     rules.busy = None;
     let quit = std::mem::take(&mut rules.quit_after_apply);
     rules.note = Some(match finished {
-        Finished::Applied => {
+        Finished::Applied { base } => {
+            // The next apply is built on what this one left in force.
+            rules.base_revision = base;
             rules.table.mark_applied();
             if quit {
                 app.quit = true;
@@ -562,7 +611,11 @@ fn start_apply(app: &mut AppState) {
         app.rules.note = Some(Note::new(text::APPLY_OFFLINE));
         return;
     }
-    let Some(pending) = apply::pending_from(&app.rules.table, app.rules.baseline) else {
+    let Some(pending) = apply::pending_from(
+        &app.rules.table,
+        app.rules.baseline,
+        app.rules.base_revision.as_deref(),
+    ) else {
         app.rules.note = Some(Note::failed(
             text::ACTIVATE_FAILED,
             Failure::code("gui-internal"),
@@ -612,6 +665,60 @@ fn toggle(app: &mut AppState, master: Option<usize>) {
     if let Some(row) = master.and_then(|i| app.rules.table.rows.get_mut(i)) {
         row.rule.enabled = !row.rule.enabled;
     }
+}
+
+/// Gives the chosen rule the type its value is, when its verdict says the
+/// value belongs to another; only on this key, never on its own. `false` when
+/// the row has no such offer, so the key does nothing else.
+fn move_to_type(app: &mut AppState, master: Option<usize>) -> bool {
+    let offered = master
+        .and_then(|i| app.rules.table.rows.get(i))
+        .is_some_and(|row| misplaced_target_type(&row.verdict.message_key).is_some());
+    if !offered {
+        return false;
+    }
+    if !locked(app) && master.is_some_and(|i| refile_row(&mut app.rules.table.rows[i])) {
+        app.rules.note = Some(Note::new(text::RULE_UPDATED));
+    }
+    true
+}
+
+/// Every rule with that offer, moved at once; `false` when there is none.
+fn move_all_to_type(app: &mut AppState) -> bool {
+    let offered = app
+        .rules
+        .table
+        .rows
+        .iter()
+        .any(|row| misplaced_target_type(&row.verdict.message_key).is_some());
+    if !offered {
+        return false;
+    }
+    if !locked(app) {
+        let mut moved = false;
+        for row in &mut app.rules.table.rows {
+            moved |= refile_row(row);
+        }
+        if moved {
+            app.rules.note = Some(Note::new(text::RULE_UPDATED));
+        }
+    }
+    true
+}
+
+/// The row under the type its verdict names, judged again there.
+fn refile_row(row: &mut table::Row) -> bool {
+    let Some(target) = misplaced_target_type(&row.verdict.message_key) else {
+        return false;
+    };
+    let refiled = table::Row::new(RuleRow {
+        rule_type: RuleType::from_slug(target),
+        ..row.rule.clone()
+    });
+    row.rule = refiled.rule;
+    row.ace_lower = refiled.ace_lower;
+    row.verdict = refiled.verdict;
+    true
 }
 
 fn ask(app: &mut AppState, purpose: ChoicePurpose) {
@@ -884,7 +991,8 @@ fn bind_imported(
 /// does after every write.
 fn export(app: &mut AppState, path: &Path) {
     let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    if let Err((file, error)) = files::write_set(path, &app.rules.table, &exported_at) {
+    let written = files::write_set(path, &app.rules.table, &app.rules.file_hint, &exported_at);
+    if let Err((file, error)) = written {
         let file = file.display().to_string();
         let note = Note::with(text::WRITE_FAILED, vec![("path", file), ("error", error)]);
         app.rules.note = Some(note);
@@ -953,6 +1061,8 @@ fn pick(app: &mut AppState, choice: Choice) {
             }
         }
         ChoicePurpose::Overwrite(path) if at == 0 => export(app, &path),
+        ChoicePurpose::Recent => recent::picked(app, at),
+        ChoicePurpose::Restore(_) => recent::restore(app, at),
         _ => {}
     }
 }
@@ -991,9 +1101,50 @@ fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
             'c' => return main_route::start(app),
             'v' => return gateway::start(app),
             'O' => change_order(app),
+            'T' => return move_to_type(app, selected),
+            'M' => return move_all_to_type(app),
+            'A' => return bulk::start(app, TargetRoute::Primary, String::new(), false),
+            'R' => return recent::ask(app),
+            'U' => return recent::ask_restore(app),
+            'b' => switch_book(app),
             _ => return false,
         },
         _ => return false,
+    }
+    true
+}
+
+/// `b`: the other set, the caller's own rules or the baseline every user
+/// without rules of their own follows. Every writer of this terminal writes the
+/// set on screen, so edits made in one are applied or dropped before the other
+/// is shown.
+fn switch_book(app: &mut AppState) {
+    let rules = &mut app.rules;
+    if rules.busy.is_some() {
+        return;
+    }
+    if rules.table.is_dirty() {
+        rules.note = Some(Note::new(text::BOOK_DIRTY));
+        return;
+    }
+    rules.baseline = !rules.baseline;
+    rules.note = Some(Note::new(if rules.baseline {
+        text::BOOK_BASELINE
+    } else {
+        text::BOOK_OWN
+    }));
+    load(app);
+}
+
+/// What a writer outside this screen says when [`own_rules_on_screen`] refuses.
+pub const OWN_RULES_ONLY: Key = text::OWN_RULES_ONLY;
+
+/// A writer that only reaches the caller's own rules, refused while the
+/// baseline is on screen: the set shown and the set written stay one.
+pub fn own_rules_on_screen(app: &mut AppState) -> bool {
+    if app.rules.baseline {
+        app.rules.note = Some(Note::new(text::OWN_RULES_ONLY));
+        return false;
     }
     true
 }
@@ -1049,6 +1200,12 @@ fn form_key(app: &mut AppState, mut form: Box<Form>, key: KeyEvent) -> bool {
                 save_form(app, form);
             }
             return true;
+        }
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            form.switch_type();
+        }
+        KeyCode::F(2) if form.editing.is_none() => {
+            return bulk::start(app, form.route.clone(), form.value.clone(), true);
         }
         KeyCode::Up | KeyCode::BackTab => form.move_field(-1),
         KeyCode::Down | KeyCode::Tab => form.move_field(1),
@@ -1173,6 +1330,7 @@ fn list_line(app: &mut AppState, line: &str) -> bool {
         "<" => app.rules.table.move_cursor(-page),
         "s" => start_apply(app),
         "r" => reload(app),
+        "b" => switch_book(app),
         "i" => start_input(app, InputPurpose::Import),
         "x" => start_input(app, InputPurpose::Export),
         "p" => presets(app),
@@ -1182,6 +1340,27 @@ fn list_line(app: &mut AppState, line: &str) -> bool {
         "c" => return main_route::start(app),
         "v" => return gateway::start(app),
         "O" => change_order(app),
+        "A" => return bulk::start(app, TargetRoute::Primary, String::new(), false),
+        "T" => {
+            let master = numbered(app, arg);
+            if let Some(i) = master {
+                app.rules.table.select(i);
+            }
+            return move_to_type(app, master);
+        }
+        "M" => return move_all_to_type(app),
+        "R" => return recent::ask(app),
+        "U" => {
+            // `U 2` puts back the second deleted rule listed.
+            match arg.trim().parse::<usize>() {
+                Ok(n) if (1..=recent::restore_len(app)).contains(&n) => {
+                    if !locked(app) {
+                        recent::restore(app, n - 1);
+                    }
+                }
+                _ => return recent::ask_restore(app),
+            }
+        }
         _ => return false,
     }
     true

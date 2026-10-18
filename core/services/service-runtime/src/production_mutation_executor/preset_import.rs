@@ -37,6 +37,11 @@ impl ProductionMutationExecutor {
         if let Some(refusal) = self.submission_gate_refusal(&assembled.rules_json, principal) {
             return refusal;
         }
+        if let Some(e) =
+            self.moved_rules_refusal(&assembled.rules_json, base_revision_in(payload), principal)
+        {
+            return refused_summary(&e);
+        }
         let scored = self.score_candidate_for_payload(&assembled.rules_json, principal);
         // Planned from the assembled rules, not from a stored candidate — see
         // the rules-preview path above.
@@ -65,6 +70,13 @@ impl ProductionMutationExecutor {
         if let Some(e) = self.network_refusal(&assembled.rules_json, principal) {
             return MutationOutcome::Failed(e);
         }
+        if let Some(noop) = self.baseline_already_in_force(&assembled.rules_json, principal) {
+            return noop;
+        }
+        let base = base_revision_in(payload);
+        if let Some(e) = self.moved_rules_refusal(&assembled.rules_json, base, principal) {
+            return MutationOutcome::Failed(e);
+        }
         let correlation = assembled
             .correlation_id
             .clone()
@@ -82,42 +94,23 @@ impl ProductionMutationExecutor {
             "preset candidate submitted (a deduped id == an existing/active \
              revision means no new rules were detected)"
         );
-        if let Some(outcome) =
-            self.drive_deduped_revision_active(&revision_id, &correlation, principal)
-        {
-            return outcome;
+        let outcome = self.activate_submitted(&revision_id, &correlation, principal, base);
+        match &outcome {
+            MutationOutcome::Completed(_) => tracing::info!(
+                target: "nrr::mutation::preset",
+                msg_key = "prod-preset-activate-ok",
+                revision_id = %revision_id,
+                "preset activate OK"
+            ),
+            MutationOutcome::Failed(e) => tracing::warn!(
+                target: "nrr::mutation::preset",
+                msg_key = "prod-preset-activate-failed",
+                revision_id = %revision_id,
+                error = %e.message,
+                "preset activate FAILED"
+            ),
         }
-        let token = match self
-            .coordinator
-            .issue_confirmation_token(&revision_id, COORDINATOR_TOKEN_TTL_SECS)
-        {
-            Ok(t) => t,
-            Err(e) => return policy_error_outcome(&e),
-        };
-        match self
-            .coordinator
-            .activate(&revision_id, &token, &correlation)
-        {
-            Ok(outcome) => {
-                tracing::info!(
-                    target: "nrr::mutation::preset",
-                    msg_key = "prod-preset-activate-ok",
-                    revision_id = %revision_id,
-                    "preset activate OK"
-                );
-                activation_to_outcome(outcome)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "nrr::mutation::preset",
-                    msg_key = "prod-preset-activate-failed",
-                    revision_id = %revision_id,
-                    error = %e,
-                    "preset activate FAILED"
-                );
-                policy_error_outcome(&e)
-            }
-        }
+        self.with_new_base(outcome, principal)
     }
 
     /// Common assembly: payload deserialization → byte decoding →
@@ -170,9 +163,8 @@ impl ProductionMutationExecutor {
             _ => None,
         };
 
-        // Build the full canonical book. For single-route imports, the
-        // OTHER route is carried over from the currently-active revision
-        // (or starts empty if none).
+        // For single-route imports the OTHER route is carried over from the
+        // book in force (the baseline for a user who never diverged).
         // Each match arm's `expect()` is an invariant: the `target` discriminant
         // already proves the matching `*_set` Option is `Some` (decoded above).
         #[allow(clippy::expect_used)]

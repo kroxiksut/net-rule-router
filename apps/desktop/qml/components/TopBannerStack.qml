@@ -264,11 +264,12 @@ Item {
                         ? (root.secondaryReconfirmVisible
                             ? root.tr("status.secondary-reconfirm",
                                 "Your additional adapter \"{name}\" looks reinstalled (new ID). Re-confirm it so the stored binding matches.")
-                                .replace("{name}", String(root.prefs.selectedSecondaryInterfaceName || ""))
+                                .replace("{name}", Pure.displayText(root.prefs.selectedSecondaryInterfaceName))
                             : root.tr("status.secondary-unresolved",
                                 "The additional adapter \"{name}\" assigned to your rules isn't available right now — start it, or choose a different adapter in Interfaces and routes. While it's missing, matching traffic is blocked (leak protection) instead of leaking over your main connection.")
-                                .replace("{name}", String(root.prefs.selectedSecondaryInterfaceName || "")))
+                                .replace("{name}", Pure.displayText(root.prefs.selectedSecondaryInterfaceName)))
                         : ""
+                    textFormat: Text.PlainText
                     verticalAlignment: Text.AlignVCenter
                     wrapMode: topBannerStack.combinedAmberExpanded
                         ? Text.WordWrap : Text.NoWrap
@@ -538,16 +539,17 @@ Item {
                     ? (root.secondaryReconfirmVisible
                         ? root.tr("status.secondary-reconfirm",
                             "Your additional adapter \"{name}\" looks reinstalled (new ID). Re-confirm it so the stored binding matches.")
-                            .replace("{name}", String(root.prefs.selectedSecondaryInterfaceName || ""))
+                            .replace("{name}", Pure.displayText(root.prefs.selectedSecondaryInterfaceName))
                         : (root.secondaryUnresolvedVisible
                             ? root.tr("status.secondary-unresolved",
                                 "The additional adapter \"{name}\" assigned to your rules isn't available right now — start it, or choose a different adapter in Interfaces and routes. While it's missing, matching traffic is blocked (leak protection) instead of leaking over your main connection.")
-                                .replace("{name}", String(root.prefs.selectedSecondaryInterfaceName || ""))
+                                .replace("{name}", Pure.displayText(root.prefs.selectedSecondaryInterfaceName))
                             : root.tr("status.vpn-split-conflict",
                                 "Your additional adapter \"{name}\" is up and carrying exactly what you asked it to: your {n} rule(s) go through it, everything else stays on your main connection. That is selective routing doing its job — nothing here needs fixing. If you would rather send everything through it, switch the mode in Settings → Routing behavior.")
                                 .replace("{name}", root.interfacesRolesController._vpnConflictSecondaryDisplayName())
                                 .replace("{n}", String(root.interfacesRolesController._enabledSecondaryRuleCount()))))
                     : ""
+                textFormat: Text.PlainText
                 verticalAlignment: Text.AlignVCenter
                 wrapMode: Text.WordWrap
                 Accessible.role: Accessible.StaticText
@@ -1020,6 +1022,7 @@ Item {
                 Layout.preferredWidth: 0
                 color: "white"
                 text: root.localNetworkOfferText
+                textFormat: Text.PlainText
                 verticalAlignment: Text.AlignVCenter
                 wrapMode: Text.WordWrap
                 Accessible.role: Accessible.StaticText
@@ -1083,6 +1086,7 @@ Item {
                 Layout.preferredWidth: 0
                 color: "white"
                 text: root.appGroupsOfferText
+                textFormat: Text.PlainText
                 verticalAlignment: Text.AlignVCenter
                 wrapMode: Text.WordWrap
                 Accessible.role: Accessible.StaticText

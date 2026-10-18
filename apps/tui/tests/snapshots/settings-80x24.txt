@@ -1,5 +1,5 @@
 Service: OK
-┌> Screens──────────────────┐┌Settings sections────────────────────────────────┐
+╭> Screens──────────────────╮╭Settings sections────────────────────────────────╮
 │  1 Status                 ││> c1. Notifications                              │
 │  2 First run              ││  c2. Routing behavior                           │
 │  3 Interfaces and routes  ││  c3. Apply failure policy                       │
@@ -20,5 +20,5 @@ Service: OK
 │      Check for updates    ││                                                 │
 │      Terminal             ││                                                 │
 │                           ││                                                 │
-└───────────────────────────┘└─────────────────────────────────────────────────┘
+╰───────────────────────────╯╰─────────────────────────────────────────────────╯
 F1: help   q: quit

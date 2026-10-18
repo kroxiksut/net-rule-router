@@ -20,7 +20,8 @@ pub fn main_route_rank(slug: &str) -> u8 {
 /// The hosts "Check the main route" asks about (`mainRouteCheckHosts`): the
 /// enabled host rules of the additional route, in ACE form when the row
 /// carries it, without a leading `*.`, lower-cased, each once in first-seen
-/// order. A zone names no single address to try.
+/// order. A zone or a site in every zone (`x.*`) names no single address to
+/// try.
 pub fn main_route_check_hosts<'a>(
     rows: impl IntoIterator<Item = (&'a RuleRow, Option<&'a str>)>,
 ) -> Vec<String> {
@@ -40,7 +41,7 @@ pub fn main_route_check_hosts<'a>(
             .unwrap_or(value)
             .trim()
             .to_lowercase();
-        if !host.is_empty() && seen.insert(host.clone()) {
+        if !host.is_empty() && !host.ends_with(".*") && seen.insert(host.clone()) {
             hosts.push(host);
         }
     }

@@ -1947,6 +1947,7 @@ fn no_capability_set_unlocks_an_unimplemented_shape() {
         per_app_block_leakproof: true,
         per_user_all_protocol_scoping: true,
         app_match: AppMatchMechanism::WfpAppId,
+        app_path_rules: true,
     };
     for caps in [
         everything,

@@ -196,14 +196,11 @@ QtObject {
     }
 
     /// The local preference mirrors follow a write the service confirmed,
-    /// whoever sent it: the user, the parked delivery, a restore. Reassigning
-    /// the preferences also recomputes `strictKillSwitchActive` from them.
+    /// whoever sent it: the user, the parked delivery, a restore.
     function _mirrorConfirmedPolicy(req, changed) {
         var patch = Pure.routePolicyPrefMirrorPatch(req, changed)
         if (Object.keys(patch).length === 0) return
         root.commitPrefs(patch)
-        // The strict-kill-switch notice means nothing while the master is OFF.
-        if (patch.routeKillSwitchEnabled === false) root.strictKillSwitchActive = false
         // Coverage decides whether `x` and `*.x` are one rule or two.
         if (patch.hasOwnProperty("routeIncludeSubdomains")) root.refreshRulesOverlaps()
     }
@@ -587,8 +584,7 @@ QtObject {
     /// Aggressive kill-switch SCOPE. When ON, the split-mode fail-closed block
     /// cuts ALL egress (except explicitly primary-routed + exemptions) while the
     /// additional adapter is unavailable, instead of only the cached secondary
-    /// destination IPs. `strictKillSwitchActive`, the notice the notifications
-    /// centre gates on, follows the preference mirror once the service confirms.
+    /// destination IPs.
     function applyKillSwitchBlockAll(enabled) {
         var want = enabled === true
         _applyRoutePolicyKey("kill-switch-block-all", want, {

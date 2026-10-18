@@ -337,6 +337,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 struct ProcessImage {
     started_unix_ms: u64,
     path: String,
+    /// The account it runs as: whose rules and suggestions its connects feed.
+    user_sid: Option<String>,
 }
 
 /// Looks a pid up among the processes alive now.
@@ -354,6 +356,7 @@ struct PendingLookup {
 /// A resolved process and the last moment it was seen holding its pid.
 struct KnownImage {
     path: String,
+    user_sid: Option<String>,
     confirmed_unix_ms: u64,
 }
 
@@ -370,8 +373,12 @@ impl KnownProcesses {
     /// the pid no earlier. A process object keeps its pid while it exists, so
     /// between those two moments no other process can have had it.
     fn path_at(&self, pid: u32, at: u64) -> Option<&str> {
+        self.image_at(pid, at).map(|image| image.path.as_str())
+    }
+
+    fn image_at(&self, pid: u32, at: u64) -> Option<&KnownImage> {
         let (_, image) = self.images.range((pid, 0)..=(pid, at)).next_back()?;
-        (at <= image.confirmed_unix_ms).then_some(image.path.as_str())
+        (at <= image.confirmed_unix_ms).then_some(image)
     }
 
     /// `image` held `pid` at some moment no earlier than `now`.
@@ -381,6 +388,7 @@ impl KnownProcesses {
             .entry((pid, image.started_unix_ms))
             .or_insert(KnownImage {
                 path: image.path,
+                user_sid: image.user_sid,
                 confirmed_unix_ms: now,
             });
         entry.confirmed_unix_ms = entry.confirmed_unix_ms.max(now);
@@ -565,16 +573,19 @@ fn attach_process_paths(
             obs.process_path = None;
             continue;
         };
-        if let Some(path) = known.path_at(obs.pid, at) {
-            obs.process_path = Some(path.to_owned());
+        if let Some(image) = known.image_at(obs.pid, at) {
+            obs.process_path = Some(image.path.clone());
+            obs.user_sid = image.user_sid.clone();
             continue;
         }
         let image = seen
             .entry(obs.pid)
             .or_insert_with(|| live.image_of(obs.pid));
-        obs.process_path = match image {
-            Some(image) if image.started_unix_ms <= at => Some(image.path.clone()),
-            _ => None,
+        (obs.process_path, obs.user_sid) = match image {
+            Some(image) if image.started_unix_ms <= at => {
+                (Some(image.path.clone()), image.user_sid.clone())
+            }
+            _ => (None, None),
         };
     }
 }
@@ -603,6 +614,7 @@ impl LiveProcessImages for SystemProcesses {
             (handle, times, created)
         };
         let path = crate::win32_ffi::process::image_path_of(handle);
+        let user_sid = crate::win32_ffi::console_session::process_handle_user_sid(handle);
         // SAFETY: opened above and not used after this call.
         unsafe {
             let _ = CloseHandle(handle);
@@ -612,6 +624,7 @@ impl LiveProcessImages for SystemProcesses {
         Some(ProcessImage {
             started_unix_ms: filetime_to_unix_ms(&created)?,
             path,
+            user_sid,
         })
     }
 }
@@ -701,6 +714,19 @@ mod tests {
                 ProcessImage {
                     started_unix_ms,
                     path: path.into(),
+                    user_sid: None,
+                },
+            );
+            self
+        }
+
+        fn with_user(mut self, pid: u32, started_unix_ms: u64, path: &str, sid: &str) -> Self {
+            self.alive.insert(
+                pid,
+                ProcessImage {
+                    started_unix_ms,
+                    path: path.into(),
+                    user_sid: Some(sid.into()),
                 },
             );
             self
@@ -801,7 +827,41 @@ mod tests {
         ProcessImage {
             started_unix_ms,
             path: path.into(),
+            user_sid: None,
         }
+    }
+
+    /// Two users' browsers: each connect carries its own process's account,
+    /// so neither user's suggestions are built from the other's visits.
+    #[test]
+    fn each_connect_carries_the_account_of_its_own_process() {
+        const ALICE: &str = "S-1-5-21-111-222-333-1001";
+        const BOB: &str = "S-1-5-21-111-222-333-1002";
+        let mut live = FakeProcesses::default()
+            .with_user(10, 1_000, APP, ALICE)
+            .with_user(20, 1_000, APP, BOB);
+        let mut batch = vec![
+            event(10, Some(5_000), ConnectionProgress::Attempt),
+            event(20, Some(5_000), ConnectionProgress::Attempt),
+        ];
+        attach_process_paths(&mut batch, &KnownProcesses::default(), &mut live);
+        assert_eq!(batch[0].user_sid.as_deref(), Some(ALICE));
+        assert_eq!(batch[1].user_sid.as_deref(), Some(BOB));
+
+        // Named by the resolver thread before the process went away.
+        let mut known = KnownProcesses::default();
+        known.record(
+            30,
+            ProcessImage {
+                started_unix_ms: 1_000,
+                path: APP.into(),
+                user_sid: Some(BOB.into()),
+            },
+            6_000,
+        );
+        let mut gone = vec![event(30, Some(5_500), ConnectionProgress::Attempt)];
+        attach_process_paths(&mut gone, &known, &mut FakeProcesses::default());
+        assert_eq!(gone[0].user_sid.as_deref(), Some(BOB));
     }
 
     fn wait_until(mut done: impl FnMut() -> bool) -> bool {

@@ -71,13 +71,11 @@ void NrrNativeBridge::triggerTrayAction(const QString &actionId) {
 }
 
 bool NrrNativeBridge::savePreferences(const QString &serializedPayload) {
-    // Persistence is the launcher's responsibility: it parses
-    // `NRR_PREFS_JSON:<payload>` lines emitted via `console.log` from
-    // QML on every preferences mutation, and writes the latest payload
-    // back through `nrr-ui-support` after the host exits. The Qt host
-    // therefore only needs to forward the marker on stdout — no
-    // subprocess hop, no temp file.
-    const QByteArray serialized = serializedPayload.toUtf8();
+    // The launcher persists the `NRR_PREFS_JSON:` line from stdout. One line
+    // per payload: a raw line break would start a line of the caller's
+    // choosing (JSON puts none inside strings, so spaces keep it valid).
+    QByteArray serialized = serializedPayload.toUtf8();
+    serialized.replace('\n', ' ').replace('\r', ' ');
     std::fputs("NRR_PREFS_JSON:", stdout);
     std::fwrite(serialized.constData(), 1, static_cast<size_t>(serialized.size()), stdout);
     std::fputc('\n', stdout);
@@ -108,12 +106,12 @@ QVariantMap NrrNativeBridge::takePendingGuiRequest() {
         return {};
     }
 
-    // The launcher logs that it wrote the request; without this line nothing
-    // records that anyone read it, and a tray click that opens no window is
-    // indistinguishable from one that was never delivered.
-    std::printf("NRR_HOST_ACTIVATION_CONSUMED keys=%s\n",
-                document.object().keys().join(QLatin1Char(',')).toUtf8().constData());
-    std::fflush(stdout);
+    // Records that the request was read. Only a count: the file is writable by
+    // any process of this user, and its text on a protocol stream could forge
+    // a launcher request.
+    std::fprintf(stderr, "NRR_HOST_ACTIVATION_CONSUMED keys=%lld\n",
+                 static_cast<long long>(document.object().size()));
+    std::fflush(stderr);
     return document.object().toVariantMap();
 }
 

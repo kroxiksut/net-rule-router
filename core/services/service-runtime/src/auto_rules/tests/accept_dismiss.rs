@@ -9,7 +9,7 @@ fn accepting_authors_with_the_user_confirmed_reason_and_clears_the_offer() {
     f.engine.tick(SID, later());
     let ids: Vec<String> = f.engine.candidates(SID).into_iter().map(|c| c.id).collect();
 
-    let outcome = f.engine.accept(SID, &ids, later()).expect("accept");
+    let outcome = f.engine.accept(SID, &ids, false, later()).expect("accept");
     assert_eq!(outcome.applied, 1);
     assert_eq!(outcome.unknown, 0);
     assert_eq!(outcome.pending, 0);
@@ -35,7 +35,7 @@ fn accepting_reports_an_anchor_the_author_could_not_refresh() {
     let ids: Vec<String> = f.engine.candidates(SID).into_iter().map(|c| c.id).collect();
     f.author.leave_anchor();
 
-    let outcome = f.engine.accept(SID, &ids, later()).expect("accept");
+    let outcome = f.engine.accept(SID, &ids, false, later()).expect("accept");
 
     assert_eq!(outcome.applied, 1);
     assert!(outcome.anchor_skipped);
@@ -47,7 +47,7 @@ fn a_host_whose_accepted_rule_the_user_deleted_is_offered_again() {
     two_visits(&f.engine, &["cdn.example"]);
     f.engine.tick(SID, later());
     let ids: Vec<String> = f.engine.candidates(SID).into_iter().map(|c| c.id).collect();
-    f.engine.accept(SID, &ids, later()).expect("accept");
+    f.engine.accept(SID, &ids, false, later()).expect("accept");
 
     // The user edits their rules file and drops the rule they just accepted.
     *f.rules.book.lock().unwrap_or_else(|p| p.into_inner()) = CanonicalRuleBook {
@@ -74,7 +74,7 @@ fn accepting_an_unknown_id_is_reported_without_failing_the_call() {
     let mut ids: Vec<String> = f.engine.candidates(SID).into_iter().map(|c| c.id).collect();
     ids.push("arc-does-not-exist".to_string());
 
-    let outcome = f.engine.accept(SID, &ids, later()).expect("accept");
+    let outcome = f.engine.accept(SID, &ids, false, later()).expect("accept");
     assert_eq!(outcome.applied, 1);
     assert_eq!(outcome.unknown, 1);
 }
@@ -92,7 +92,7 @@ fn a_refused_write_reports_its_reason_and_leaves_the_offer_standing() {
 
     let err = f
         .engine
-        .accept(SID, &ids, later())
+        .accept(SID, &ids, false, later())
         .expect_err("the cap must refuse the write");
     assert_eq!(err.code, "rule-cap-exceeded");
     assert_eq!(
@@ -116,7 +116,9 @@ fn accepting_without_an_author_wired_refuses_cleanly_and_keeps_the_offer() {
     engine.tick(SID, later());
     let ids: Vec<String> = engine.candidates(SID).into_iter().map(|c| c.id).collect();
 
-    let err = engine.accept(SID, &ids, later()).expect_err("no author");
+    let err = engine
+        .accept(SID, &ids, false, later())
+        .expect_err("no author");
     assert_eq!(err.code, "authoring-unavailable");
     assert_eq!(engine.candidates(SID).len(), 1);
 }
@@ -349,4 +351,26 @@ fn restoring_an_unknown_id_is_reported_without_failing() {
         .restore_dismissed(SID, &["arc-nope".to_string()], later());
     assert_eq!(outcome.applied, 0);
     assert_eq!(outcome.unknown, 1);
+}
+
+/// The same site in another zone names that site, and accepting it as such
+/// writes the site in every zone instead of the one name offered.
+#[test]
+fn an_offer_in_another_zone_of_the_site_can_be_taken_for_every_zone() {
+    let f = fixture(AutoRulesMode::Suggest);
+    two_visits(&f.engine, &["site.test"]);
+    f.engine.tick(SID, later());
+    let offers = f.engine.candidates(SID);
+    let offer = offers
+        .iter()
+        .find(|c| c.proposed_match == "site.test")
+        .expect("the other zone is offered");
+    assert_eq!(offer.any_zone_site, "site");
+
+    f.engine
+        .accept(SID, std::slice::from_ref(&offer.id), true, later())
+        .expect("accept");
+    let calls = f.author.calls();
+    assert_eq!(calls[0].1[0].match_kind, AuthoredMatchKind::AnyZoneSite);
+    assert_eq!(calls[0].1[0].value, "site");
 }

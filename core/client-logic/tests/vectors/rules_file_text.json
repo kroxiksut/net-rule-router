@@ -50,6 +50,10 @@
         { "enabled": true, "ruleType": "exact-ip", "matchValue": "192.0.2.50", "targetRoute": "secondary", "originReason": "site-companion", "originAnchor": "site.example" },
         { "enabled": true, "ruleType": "domain", "matchValue": "plain.example", "targetRoute": "secondary", "originReason": "", "originAnchor": "ignored.example" }
       ] } },
+    { "name": "an app-authored program rule keeps its section and its provenance", "input": { "route": "secondary", "os": "linux", "rows": [
+        { "enabled": true, "ruleType": "application", "matchValue": "client", "targetRoute": "secondary", "comment": "note", "originReason": "vpn-client-bootstrap", "originAnchor": "vpn.example", "originAdded": "2026-01-01" },
+        { "enabled": false, "ruleType": "application", "matchValue": "other.exe", "targetRoute": "secondary", "originReason": "user-confirmed" }
+      ] } },
     { "name": "control characters neutralised", "input": { "route": "primary", "rows": [
         { "enabled": true, "ruleType": "domain", "matchValue": "evil.example\n--- Zones", "targetRoute": "primary", "comment": "line\rbreak\u0085end" },
         { "enabled": true, "ruleType": "application", "matchValue": "tab\tkept.exe", "targetRoute": "primary", "comment": "\u0007bell" },
@@ -76,6 +80,26 @@
     { "name": "unicode hosts stay unicode", "input": { "route": "primary", "rows": [
         { "enabled": true, "ruleType": "zone", "matchValue": "рф", "targetRoute": "primary", "comment": "кириллица" },
         { "enabled": false, "ruleType": "domain", "matchValue": "*.пример.рф", "targetRoute": "primary" }
-      ] } }
+      ] } },
+    { "name": "a block in every section is marked before the value", "input": { "route": "secondary", "os": "windows", "rows": [
+        { "enabled": true, "ruleType": "zone", "matchValue": "example", "targetRoute": "block" },
+        { "enabled": true, "ruleType": "suffix-domain", "matchValue": "*.metrics.example", "targetRoute": "block", "comment": "telemetry" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "site.*", "targetRoute": "block" },
+        { "enabled": false, "ruleType": "exact-ip", "matchValue": "192.0.2.7", "targetRoute": "block", "comment": "off for now" },
+        { "enabled": true, "ruleType": "subnet", "matchValue": "10.0.0.0/8", "targetRoute": "block" },
+        { "enabled": true, "ruleType": "ip-range", "matchValue": "10.0.0.5-10.0.0.40", "targetRoute": "block" },
+        { "enabled": true, "ruleType": "application", "matchValue": "telemetry.exe", "targetRoute": "block" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "tracker.example.net", "targetRoute": "block", "originReason": "user-confirmed", "originAnchor": "example.com", "originAdded": "2026-02-02" }
+      ] } },
+    { "name": "blocks stay out of the primary file", "input": { "route": "primary", "rows": [
+        { "enabled": true, "ruleType": "domain", "matchValue": "ads.example", "targetRoute": "block" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "kept.example", "targetRoute": "primary" }
+      ] } },
+    {"name":"the syntax hint goes after the header, a line each behind #:","input":{"route":"secondary","rows":[{"enabled":true,"ruleType":"domain","matchValue":"example.com","targetRoute":"secondary","comment":"updates"},{"enabled":false,"ruleType":"domain","matchValue":"off.example.com","targetRoute":"secondary"},{"enabled":true,"ruleType":"domain","matchValue":"ads.example.net","targetRoute":"block"}],"hint":["--- Name         section header: rule type below     --- Domains","value            rule: goes over this file's route   example.com","*.value          the site and all its subdomains     *.example.com","value.*          the site in every zone              example.*","!value           deny: through no connection at all  !ads.example.net","?value           this route while the site opens     ?mail.example.com","# value          rule kept but turned off            # example.com","value  # note    rule with your note                 example.com  # updates","value +children  the app and the programs it starts  codex.exe +children","# text           comment, not a rule                 # my notes"]}},
+    {"name":"the syntax hint in Russian","input":{"route":"primary","rows":[{"enabled":true,"ruleType":"exact-ip","matchValue":"192.0.2.7","targetRoute":"primary"}],"hint":["--- Имя             заголовок секции: тип правил ниже    --- Domains","значение            правило: маршрут этого файла         example.com","*.значение          сайт со всеми поддоменами            *.example.com","значение.*          сайт в любой зоне                    example.*","!значение           запрет: ни через одно подключение    !ads.example.net","?значение           этот маршрут, пока сайт открывается  ?mail.example.com","# значение          правило сохранено, но выключено      # example.com","значение  # текст   правило с вашей заметкой             example.com  # почта","значение +children  приложение и его дочерние программы  codex.exe +children","# текст             комментарий, не правило              # мои заметки"]}},
+    {"name":"a hint line is one line and trimmed; blank ones are left out","input":{"route":"primary","rows":[],"hint":["  a\nb  ","","   ","\t","c\u0007d"]}},
+    {"name":"an overlong hint line is left out; 200 UTF-16 units still fit","input":{"route":"primary","rows":[],"hint":["xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy","😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀","😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀"]}},
+    {"name":"at most 16 hint lines","input":{"route":"primary","rows":[],"hint":["line 0","line 1","line 2","line 3","line 4","line 5","line 6","line 7","line 8","line 9","line 10","line 11","line 12","line 13","line 14","line 15","line 16","line 17","line 18","line 19"]}},
+    {"name":"an empty hint writes none","input":{"route":"primary","rows":[],"hint":[]}}
   ]
 }

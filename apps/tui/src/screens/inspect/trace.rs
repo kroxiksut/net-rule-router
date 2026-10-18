@@ -1,15 +1,18 @@
 //! «Connection trace»: recent outbound connections, the route each took and
 //! why. The same `conn-trace.entries.list` the GUI reads, drained when the
 //! screen first opens and again on `r`; it never refreshes by itself, so a
-//! line is not pulled from under someone reading it.
+//! line is not pulled from under someone reading it. `h` swaps in the user's
+//! kept history (`conn-history.list`) for a period, as the GUI's switch does.
 
 use std::cell::RefCell;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use nrr_client_logic::conn_trace::{is_ipv6_endpoint, is_non_internet_address};
 use nrr_ipc_client::IpcClient;
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
+    ConnHistoryEntryDto, ConnHistoryListRequest, ConnHistoryListResponse,
     ConnTraceEntriesListRequest, ConnTraceEntriesListResponse, ConnTraceEntryDto,
 };
 use nrr_shared::pagination::{PaginationParams, MAX_PAGE_SIZE};
@@ -20,13 +23,71 @@ use super::{
 };
 use crate::backend::Reply;
 use crate::i18n::{Key, Texts};
+use crate::screens::settings::Clock;
 use crate::screens::{Screen, ScreenId};
 use crate::state::AppState;
-use crate::view::{Panel, ScreenView, ViewLine};
+use crate::view::{Panel, ScreenView, Segment, ViewLine};
 
 /// The service keeps at most this many; reading them all lets the search
 /// cover the whole ring, as the GUI's open-time drain does.
 const DRAIN_CAP: usize = 1000;
+
+/// Kept-history rows read in one go, as the GUI does; the rest of a long
+/// period is one `r` with a narrower search away.
+const HISTORY_DRAIN_CAP: usize = 2000;
+
+/// What the kept history covers, as the GUI's period picker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Period {
+    #[default]
+    Hour,
+    Today,
+    Week,
+}
+
+impl Period {
+    fn next(self) -> Self {
+        match self {
+            Self::Hour => Self::Today,
+            Self::Today => Self::Week,
+            Self::Week => Self::Hour,
+        }
+    }
+
+    fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "hour" => Some(Self::Hour),
+            "today" => Some(Self::Today),
+            "week" => Some(Self::Week),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> Key {
+        match self {
+            Self::Hour => keys::HISTORY_HOUR,
+            Self::Today => keys::HISTORY_TODAY,
+            Self::Week => keys::HISTORY_WEEK,
+        }
+    }
+
+    /// Where the period starts, in Unix milliseconds; "today" from local
+    /// midnight.
+    fn start_ms(self, clock: &Clock) -> i64 {
+        let now = clock.now();
+        match self {
+            Self::Hour => now.saturating_sub(3_600_000),
+            Self::Week => now.saturating_sub(7 * 86_400_000),
+            Self::Today => {
+                let offset_ms = i64::from((clock.utc_offset)(now)).saturating_mul(1000);
+                clock
+                    .local_day()
+                    .saturating_mul(86_400_000)
+                    .saturating_sub(offset_ms)
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct TraceState {
@@ -48,6 +109,15 @@ pub struct TraceState {
     /// The entries the last picture listed, in order. The search matches the
     /// words on screen, which only the renderer has; keys act on what was seen.
     visible: RefCell<Vec<usize>>,
+    /// Reading the kept history rather than the latest connections.
+    history: bool,
+    period: Period,
+    /// Per kept row, beside `entries`: attempts and the first time.
+    kept: Vec<(u64, i64)>,
+    history_enabled: bool,
+    history_available: bool,
+    removed: u64,
+    skipped: u64,
 }
 
 impl Default for TraceState {
@@ -67,6 +137,13 @@ impl Default for TraceState {
             pager: Pager::default(),
             generation: 0,
             visible: RefCell::new(Vec::new()),
+            history: false,
+            period: Period::default(),
+            kept: Vec::new(),
+            history_enabled: true,
+            history_available: true,
+            removed: 0,
+            skipped: 0,
         }
     }
 }
@@ -98,6 +175,15 @@ impl TraceState {
 
     fn set_query(&mut self, query: String) {
         self.query = query;
+        self.pager = Pager::default();
+    }
+
+    /// Swap what is listed; the rows of the other view are not this one's.
+    fn set_view(&mut self, history: bool, period: Period) {
+        self.history = history;
+        self.period = period;
+        self.entries.clear();
+        self.kept.clear();
         self.pager = Pager::default();
     }
 
@@ -145,15 +231,101 @@ fn drain(client: &dyn IpcClient) -> Result<Drained, String> {
     }
 }
 
+struct Kept {
+    entries: Vec<ConnTraceEntryDto>,
+    meta: Vec<(u64, i64)>,
+    enabled: bool,
+    available: bool,
+    removed: u64,
+    skipped: u64,
+}
+
+/// A kept row in the live row's shape, so the filters, the search and the
+/// detail read it the way they read a live one.
+fn as_trace_row(h: ConnHistoryEntryDto) -> ConnTraceEntryDto {
+    ConnTraceEntryDto {
+        process: h.process,
+        process_path: h.process_path,
+        proto: String::new(),
+        local: String::new(),
+        remote: h.remote_ip,
+        egress_role: h.route,
+        egress_ifindex: 0,
+        verdict: h.verdict,
+        blocked_by: h.blocked_by,
+        block_reason: h.block_reason,
+        expected_route: String::new(),
+        observed_at_ms: h.last_seen_ms,
+        relay_for: String::new(),
+        rule_host: String::new(),
+        remote_host_count: u32::from(!h.host.is_empty()),
+        remote_hosts: if h.host.is_empty() {
+            Vec::new()
+        } else {
+            vec![h.host]
+        },
+        remote_host_floor: String::new(),
+        remote_fake_ip: false,
+    }
+}
+
+fn drain_history(client: &dyn IpcClient, from_ms: i64) -> Result<Kept, String> {
+    let mut out = Kept {
+        entries: Vec::new(),
+        meta: Vec::new(),
+        enabled: true,
+        available: true,
+        removed: 0,
+        skipped: 0,
+    };
+    let mut cursor = None;
+    loop {
+        let request = ConnHistoryListRequest {
+            from_unix_ms: from_ms,
+            pagination: PaginationParams {
+                cursor,
+                page_size: MAX_PAGE_SIZE,
+            },
+            ..ConnHistoryListRequest::default()
+        };
+        let payload = serde_json::to_value(&request).map_err(unencodable)?;
+        let answer = call(client, IpcOperationName::ConnHistoryList, payload)?;
+        let page: ConnHistoryListResponse = serde_json::from_value(answer).map_err(bad_response)?;
+        out.enabled = page.enabled;
+        out.available = page.available;
+        out.removed = page.removed;
+        out.skipped = page.skipped;
+        for row in page.page.items {
+            out.meta.push((row.attempts, row.first_seen_ms));
+            out.entries.push(as_trace_row(row));
+        }
+        cursor = page.page.next_cursor;
+        if cursor.is_none() || out.entries.len() >= HISTORY_DRAIN_CAP {
+            return Ok(out);
+        }
+    }
+}
+
+enum Read {
+    Now(Drained),
+    History(Kept),
+}
+
 fn load(app: &mut AppState) {
+    let from_ms = app.inspect.trace.period.start_ms(&app.settings.clock);
     let state = &mut app.inspect.trace;
     state.asked = true;
     state.loading = true;
     state.error = None;
     state.generation += 1;
     let generation = state.generation;
+    let history = state.history;
     queue(app, move |client| {
-        let result = drain(client);
+        let result = if history {
+            drain_history(client, from_ms).map(Read::History)
+        } else {
+            drain(client).map(Read::Now)
+        };
         Reply::new(move |app| {
             let state = &mut app.inspect.trace;
             // A newer read supersedes this one.
@@ -162,16 +334,32 @@ fn load(app: &mut AppState) {
             }
             state.loading = false;
             match result {
-                Ok(drained) => {
+                Ok(Read::Now(drained)) => {
                     state.entries = drained.entries;
+                    state.kept.clear();
                     state.observer_active = drained.observer_active;
                     state.stream_enabled = drained.stream_enabled;
+                    state.pager.clamp(state.entries.len());
+                }
+                Ok(Read::History(kept)) => {
+                    state.entries = kept.entries;
+                    state.kept = kept.meta;
+                    state.history_enabled = kept.enabled;
+                    state.history_available = kept.available;
+                    state.removed = kept.removed;
+                    state.skipped = kept.skipped;
                     state.pager.clamp(state.entries.len());
                 }
                 Err(slug) => state.error = Some(slug),
             }
         })
     });
+}
+
+/// Switch between the latest connections and the kept history, then read.
+fn show(app: &mut AppState, history: bool, period: Period) {
+    app.inspect.trace.set_view(history, period);
+    load(app);
 }
 
 fn label(texts: &Texts, family: &str, slug: &str) -> String {
@@ -214,11 +402,12 @@ fn remote_text(texts: &Texts, e: &ConnTraceEntryDto) -> String {
             address.to_owned()
         };
     };
+    let first = display_text(first);
     let name = if host_count(e) > 1 {
         let others = (host_count(e) - 1).to_string();
-        fill_numbered(&texts.get(keys::TRACE_HOST_OTHERS), &[first, &others])
+        fill_numbered(&texts.get(keys::TRACE_HOST_OTHERS), &[&first, &others])
     } else {
-        first.clone()
+        first.into_owned()
     };
     format!("{address} · {name}")
 }
@@ -260,7 +449,12 @@ fn explain_selected(app: &mut AppState) {
     let Some(e) = app.inspect.trace.selected_entry() else {
         return;
     };
-    let address = remote_address(&e.remote).to_owned();
+    // A kept row carries the address alone.
+    let address = if app.inspect.trace.history {
+        e.remote.clone()
+    } else {
+        remote_address(&e.remote).to_owned()
+    };
     let first_name = e.remote_hosts.first().map_or("", String::as_str);
     let subject = [e.rule_host.as_str(), first_name, address.as_str()]
         .into_iter()
@@ -289,10 +483,11 @@ impl Screen for TraceScreen {
         pager.clamp(shown.len());
         let detail = shown
             .get(pager.selected)
-            .map(|&i| detail_lines(texts, &state.entries[i]))
+            .map(|&i| detail_lines(texts, &state.entries[i], state.kept.get(i)))
             .unwrap_or_default();
         let list = page_lines(texts, pager, shown.len(), false, |row| {
-            row_text(texts, &state.entries[shown[row]])
+            let i = shown[row];
+            row_text(texts, &state.entries[i], state.kept.get(i))
         });
         let summary = summary_lines(app, texts, shown.len());
         *state.visible.borrow_mut() = shown;
@@ -327,6 +522,7 @@ impl Screen for TraceScreen {
             keys::HELP_PAGES,
             keys::HELP_REFRESH,
             keys::TRACE_HELP_OUTAGE,
+            keys::TRACE_HELP_HISTORY,
             keys::TRACE_SUBTITLE,
             keys::TRACE_VERDICT_NOTE,
         ]
@@ -341,6 +537,7 @@ impl Screen for TraceScreen {
             keys::TRACE_HELP_FILTERS,
             keys::HELP_REFRESH,
             keys::TRACE_HELP_OUTAGE,
+            keys::TRACE_PLAIN_HISTORY,
         ]
     }
 
@@ -376,6 +573,14 @@ impl Screen for TraceScreen {
             KeyCode::Char('/') => state.typing = Some(state.query.clone()),
             KeyCode::Char('r') => load(app),
             KeyCode::Char('o') => app.open(ScreenId::OutageBlocks),
+            KeyCode::Char('h') => {
+                let (history, period) = (!state.history, state.period);
+                show(app, history, period);
+            }
+            KeyCode::Char('t') if state.history => {
+                let period = state.period.next();
+                show(app, true, period);
+            }
             KeyCode::Char(c @ ('b' | 'l' | 'v')) => state.toggle(c),
             KeyCode::Enter => explain_selected(app),
             code => {
@@ -396,6 +601,22 @@ impl Screen for TraceScreen {
             ("p", "") => state.pager.previous_page(),
             ("r", "") => load(app),
             ("o", "") => app.open(ScreenId::OutageBlocks),
+            ("h", "") => {
+                let (history, period) = (!state.history, state.period);
+                show(app, history, period);
+            }
+            ("h", "now") => {
+                let period = state.period;
+                show(app, false, period);
+            }
+            ("h", word) => match Period::from_word(word.trim()) {
+                Some(period) => show(app, true, period),
+                None => return false,
+            },
+            ("t", "") if state.history => {
+                let period = state.period.next();
+                show(app, true, period);
+            }
             ("/", text) => state.set_query(text.to_owned()),
             ("b", "") => state.toggle('b'),
             ("l", "") => state.toggle('l'),
@@ -424,15 +645,53 @@ fn summary_lines(app: &AppState, texts: &Texts, shown: usize) -> Vec<ViewLine> {
         };
         lines.push(ViewLine::text(texts.get(word)));
     }
+    if state.history {
+        lines.push(ViewLine::text(format!(
+            "{}: {}",
+            texts.get(keys::HISTORY_MODE),
+            texts.get(state.period.label())
+        )));
+    }
     if let Some(slug) = &state.error {
+        let failed = if state.history {
+            keys::HISTORY_FAILED
+        } else {
+            keys::TRACE_FAILED
+        };
         lines.push(ViewLine::text(format!(
             "{}{}",
-            texts.get(keys::TRACE_FAILED),
+            texts.get(failed),
             error_text(texts, slug)
         )));
     }
+    if state.history && !state.loading && state.error.is_none() {
+        // The history says what it could not keep.
+        for (count, key) in [
+            (state.removed, keys::HISTORY_REMOVED),
+            (state.skipped, keys::HISTORY_SKIPPED),
+        ] {
+            if count > 0 {
+                let count = count.to_string();
+                lines.push(ViewLine::text(fill_numbered(&texts.get(key), &[&count])));
+            }
+        }
+    }
     if state.loading && state.entries.is_empty() {
         lines.push(ViewLine::text(texts.get(keys::TRACE_LOADING)));
+    } else if state.asked
+        && !state.loading
+        && state.error.is_none()
+        && state.entries.is_empty()
+        && state.history
+    {
+        let why = if !state.history_available {
+            keys::HISTORY_UNAVAILABLE
+        } else if !state.history_enabled {
+            keys::HISTORY_OFF
+        } else {
+            keys::HISTORY_EMPTY
+        };
+        lines.push(ViewLine::text(texts.get(why)));
     } else if state.asked && !state.loading && state.error.is_none() && state.entries.is_empty() {
         // Three different silences, never presented as one.
         let why = if !state.stream_enabled {
@@ -477,26 +736,30 @@ fn summary_lines(app: &AppState, texts: &Texts, shown: usize) -> Vec<ViewLine> {
     lines
 }
 
-fn row_text(texts: &Texts, e: &ConnTraceEntryDto) -> String {
+fn row_text(texts: &Texts, e: &ConnTraceEntryDto, kept: Option<&(u64, i64)>) -> String {
     let process = if e.process.is_empty() {
-        "—"
+        "—".into()
     } else {
-        e.process.as_str()
+        display_text(&e.process)
     };
-    format!(
+    let mut row = format!(
         "{process} → {} — {} · {}",
         remote_text(texts, e),
         label(texts, "egress", &e.egress_role),
         verdict_label(texts, e),
-    )
+    );
+    if let Some((attempts, _)) = kept {
+        row.push_str(&format!(" · {}: {attempts}", texts.get(keys::COL_ATTEMPTS)));
+    }
+    row
 }
 
-fn detail_lines(texts: &Texts, e: &ConnTraceEntryDto) -> Vec<ViewLine> {
+fn detail_lines(texts: &Texts, e: &ConnTraceEntryDto, kept: Option<&(u64, i64)>) -> Vec<ViewLine> {
     let or_dash = |s: &str| {
         if s.is_empty() {
             "—".to_owned()
         } else {
-            s.to_owned()
+            display_text(s).into_owned()
         }
     };
     let mut lines = vec![ViewLine::text(format!(
@@ -505,8 +768,9 @@ fn detail_lines(texts: &Texts, e: &ConnTraceEntryDto) -> Vec<ViewLine> {
         or_dash(&e.process)
     ))];
     if !e.process_path.is_empty() {
+        let path = display_text(&e.process_path);
         lines.push(ViewLine::text(
-            texts.fill(keys::TRACE_PATH, &[("path", &e.process_path)]),
+            texts.fill(keys::TRACE_PATH, &[("path", &path)]),
         ));
     }
     lines.push(ViewLine::text(format!(
@@ -523,14 +787,14 @@ fn detail_lines(texts: &Texts, e: &ConnTraceEntryDto) -> Vec<ViewLine> {
         let count = host_count(e).to_string();
         names.push_str(&fill_numbered(&texts.get(keys::TRACE_NAMES), &[&count]));
         names.push(' ');
-        names.push_str(&e.remote_hosts.join(", "));
+        let shown: Vec<_> = e.remote_hosts.iter().map(|h| display_text(h)).collect();
+        names.push_str(&shown.join(", "));
         lines.push(ViewLine::text(names));
     }
-    lines.push(ViewLine::text(format!(
-        "{}: {}",
-        texts.get(keys::COL_EGRESS),
-        label(texts, "egress", &e.egress_role)
-    )));
+    lines.push(ViewLine::new(vec![
+        Segment::plain(format!("{}: ", texts.get(keys::COL_EGRESS))),
+        Segment::route_slug(label(texts, "egress", &e.egress_role), &e.egress_role),
+    ]));
     if is_leak(e) {
         lines.push(ViewLine::text(texts.get(keys::TRACE_LEAK)));
     }
@@ -549,6 +813,22 @@ fn detail_lines(texts: &Texts, e: &ConnTraceEntryDto) -> Vec<ViewLine> {
         }
     }
     lines.push(ViewLine::text(verdict));
+    if let Some((attempts, first_ms)) = kept {
+        let (attempts, first, last) = (
+            attempts.to_string(),
+            wall_clock(*first_ms),
+            wall_clock(e.observed_at_ms),
+        );
+        lines.push(ViewLine::text(fill_numbered(
+            &texts.get(keys::HISTORY_ROW_DETAIL),
+            &[&attempts, &first, &last],
+        )));
+        lines.push(ViewLine::text(format!(
+            "Enter / e: {}",
+            texts.get(keys::TRACE_WHY)
+        )));
+        return lines;
+    }
     let mut facts = format!(
         "{} · {} {} · {}",
         label(texts, "proto", &e.proto),

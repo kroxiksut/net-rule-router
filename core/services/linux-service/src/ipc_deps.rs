@@ -421,6 +421,16 @@ pub(crate) fn build_ipc_surface(
     // passes the same gates as one the user saves.
     let mutation_executor = Arc::new(mutation_executor);
 
+    // Files placed in the provisioning folder land in the baseline before the
+    // first pass reads it: the socket is not listening yet.
+    if let Some(dir) = nrr_platform_api::paths::production_provision_dir() {
+        use nrr_service_runtime::provisioning::{apply_staged, ProvisionApplier};
+        let mut applier = ProvisionApplier::new(mutation_executor.as_ref(), &state_conn);
+        applier.audit = audit_writer.as_deref();
+        applier.alerts = Some(alerts_repo.as_ref());
+        let _ = apply_staged(&dir, &applier);
+    }
+
     // Wired but shadowed: the launcher answers `autostart.*` before the socket
     // hop because autostart is per-user and this daemon runs as root, where
     // `$HOME` is `/root` — an entry written here is one no session ever reads.
@@ -516,9 +526,30 @@ pub(crate) fn build_ipc_surface(
                 .with_event_bus(event_bus),
         ),
     );
+    // Each caller's own book judges the rows of the cache and connection
+    // views, and decides which cached names a non-administrator may see.
+    let expectation_cache = Arc::clone(&cache_store);
+    let expectation_rules = Arc::new(ProductionRulesProvider::new(Arc::clone(&stats_state_conn)));
     // Archives go under the runtime directory: the state tree is `0700`, and a
     // user cannot open a file below a directory they cannot traverse.
     let deps = deps
+        .with_conn_trace_expectation(
+            expectation_rules,
+            Arc::new(
+                nrr_service_runtime::fqdn_cache_lookup::SqliteFqdnCacheLookup::new(
+                    expectation_cache,
+                    nrr_storage::FreshnessThresholds::default_production(),
+                ),
+            ),
+            Arc::new(|| {
+                use nrr_platform_api::active_principals::ActivePrincipalSource;
+                LogindActivePrincipals
+                    .active_principals()
+                    .ok()?
+                    .first()
+                    .map(|p| p.as_stored().to_owned())
+            }),
+        )
         // The tamper gate at the socket, and the elevation an acknowledgement
         // needs once it would adopt another user's rows.
         .with_alerts_repo(alerts_repo)
@@ -534,7 +565,7 @@ pub(crate) fn build_ipc_surface(
         )
         .with_system_info(nrr_platform_linux::system_info::collect())
         .with_file_handoff(Arc::new(nrr_platform_linux::file_handoff::ChownFileHandoff))
-        .with_conn_trace_ring(conn_trace_ring)
+        .with_conn_trace_ring(Arc::clone(&conn_trace_ring))
         // Tells a daemon's connections from a person's for the VPN-gateway read.
         .with_unix_sys_uid_max(nrr_platform_linux::service_account_uids::read_sys_uid_max())
         // The same status the planner publishes rule conflicts into.
@@ -571,9 +602,11 @@ pub(crate) fn build_ipc_surface(
             &stats_state_conn,
         )))
             as Arc<dyn nrr_service_runtime::ipc_handlers::providers::LinkProviderWriter>)
-        .with_principal_data_purger(Arc::new(ProductionPrincipalDataPurger::new(Arc::clone(
-            &stats_state_conn,
-        )))
+        // A full reset erases the user's connection history too.
+        .with_principal_data_purger(Arc::new(
+            ProductionPrincipalDataPurger::new(Arc::clone(&stats_state_conn))
+                .with_conn_history(Arc::clone(&conn_trace_ring)),
+        )
             as Arc<dyn nrr_service_runtime::ipc_handlers::providers::PrincipalDataPurger>)
         // The planner reads this list for the DoH lockdown on this OS too.
         .with_doh_resolver_store(Arc::new(ProductionDohResolverListStore::new(Arc::clone(

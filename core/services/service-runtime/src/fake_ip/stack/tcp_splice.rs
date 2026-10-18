@@ -8,6 +8,7 @@
 //! Same inherent impl, split across files.
 
 use super::*;
+use nrr_platform_api::fake_ip::FlowTransport;
 
 impl FakeIpStack {
     /// Open a flow for a fresh TCP SYN to an in-scope fake address.
@@ -30,12 +31,26 @@ impl FakeIpStack {
             self.warn_at_flow_capacity();
             return;
         }
-        let (hostname, target) = match self.relay.decide(packet) {
-            RelayDecision::Relay { hostname, target } => (hostname, target),
-            // Anything else (not ours, unmapped, out of scope, no upstream) gets
-            // no socket, so smoltcp answers the SYN with a reset — the flow fails
-            // closed instead of leaking to a guess.
-            refusal => {
+        let decided = match self.relay.decide(packet) {
+            RelayDecision::Relay { hostname, target } => self
+                .relay
+                .for_owner(
+                    target,
+                    packet.key.source,
+                    packet.key.destination,
+                    Some(FlowTransport::Tcp),
+                )
+                .map(|target| (hostname, target))
+                .map_err(RelayDecision::from),
+            refusal => Err(refusal),
+        };
+        let (hostname, target) = match decided {
+            Ok(carried) => carried,
+            // Anything else (not ours, unmapped, out of scope, no upstream, an
+            // owner it may not be carried for) gets no socket, so smoltcp
+            // answers the SYN with a reset — the flow fails closed instead of
+            // leaking to a guess.
+            Err(refusal) => {
                 self.log_gate.log_refusal(&packet.key.destination, &refusal);
                 return;
             }
@@ -43,8 +58,12 @@ impl FakeIpStack {
         // Notify the observer (VPN self-heal) with the client's own endpoint and
         // the fake destination it dialed. Must be prompt — the production
         // observer only enqueues.
-        self.flow_observer
-            .on_flow_opened(packet.key.source, packet.key.destination, &hostname);
+        self.flow_observer.on_flow_opened(
+            packet.key.source,
+            packet.key.destination,
+            &hostname,
+            target.owner.as_deref(),
+        );
 
         let rx = tcp::SocketBuffer::new(vec![0u8; self.socket_buffer_bytes]);
         let tx = tcp::SocketBuffer::new(vec![0u8; self.socket_buffer_bytes]);

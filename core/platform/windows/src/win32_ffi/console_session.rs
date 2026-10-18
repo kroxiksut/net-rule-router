@@ -15,7 +15,8 @@ use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::System::RemoteDesktop::{
     WTSActive, WTSDisconnected, WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
-    WTSQueryUserToken, WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
+    WTSQuerySessionInformationW, WTSQueryUserToken, WTSSessionInfo, WTSINFOW,
+    WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -64,6 +65,93 @@ pub fn interactive_user_sids() -> Vec<String> {
         users.extend(console_fallback_sid(current_process_user_sid()));
     }
     users
+}
+
+/// [`interactive_user_sids`], each with when that user signed in (Unix ms;
+/// the earliest of their sessions). `None` where the session reports no time.
+pub fn interactive_user_sign_ins() -> Vec<(String, Option<u64>)> {
+    let users = interactive_user_sids();
+    if users.is_empty() {
+        return Vec::new();
+    }
+    let logons = session_logons();
+    users
+        .into_iter()
+        .map(|sid| {
+            let at = logons.get(&sid).copied();
+            (sid, at)
+        })
+        .collect()
+}
+
+/// Earliest logon time per signed-in user, over every user session.
+fn session_logons() -> std::collections::HashMap<String, u64> {
+    let mut info: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    let mut logons = std::collections::HashMap::new();
+    // SAFETY: both out-params are valid; on success `info` points at `count`
+    // entries allocated by WTS, released below with WTSFreeMemory.
+    if unsafe { WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut info, &mut count) }
+        .is_err()
+        || info.is_null()
+    {
+        return logons;
+    }
+    // SAFETY: WTS returned `count` contiguous entries at `info`, alive until freed.
+    let ids: Vec<u32> = unsafe { std::slice::from_raw_parts(info, count as usize) }
+        .iter()
+        .map(|e| e.SessionId)
+        .filter(|id| *id != 0)
+        .collect();
+    // SAFETY: `info` came from WTSEnumerateSessionsW and is freed exactly once.
+    unsafe { WTSFreeMemory(info.cast()) };
+    for id in ids {
+        let (Some(sid), Some(at)) = (session_user_sid(id), session_logon_unix_ms(id)) else {
+            continue;
+        };
+        logons
+            .entry(sid)
+            .and_modify(|earliest: &mut u64| *earliest = (*earliest).min(at))
+            .or_insert(at);
+    }
+    logons
+}
+
+/// When session `session_id` was logged on, as Unix ms.
+fn session_logon_unix_ms(session_id: u32) -> Option<u64> {
+    let mut buffer = windows::core::PWSTR::null();
+    let mut bytes: u32 = 0;
+    // SAFETY: current server, valid out-params; on success `buffer` holds a
+    // WTS-allocated `WTSINFOW` of `bytes` bytes, freed below.
+    let ok = unsafe {
+        WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            WTSSessionInfo,
+            &mut buffer,
+            &mut bytes,
+        )
+    };
+    if ok.is_err() || buffer.is_null() {
+        return None;
+    }
+    let logon = if (bytes as usize) >= std::mem::size_of::<WTSINFOW>() {
+        // SAFETY: the buffer is at least one `WTSINFOW`, as the API documents
+        // for this class; read unaligned, as WTS makes no alignment promise.
+        Some(unsafe { std::ptr::read_unaligned(buffer.0.cast::<WTSINFOW>()) }.LogonTime)
+    } else {
+        None
+    };
+    // SAFETY: the WTS allocation is freed exactly once and not used after.
+    unsafe { WTSFreeMemory(buffer.0.cast()) };
+    filetime_ticks_to_unix_ms(logon?)
+}
+
+/// 100 ns ticks since 1601 as Unix ms; `None` for zero or pre-1970 values.
+fn filetime_ticks_to_unix_ms(ticks: i64) -> Option<u64> {
+    const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+    let since_epoch = ticks.checked_sub(UNIX_EPOCH_TICKS).filter(|t| *t > 0)?;
+    u64::try_from(since_epoch / 10_000).ok()
 }
 
 /// How long one session enumeration answers. The routing SID is asked on every
@@ -241,19 +329,25 @@ pub fn process_user_sid(pid: u32) -> Option<String> {
     // SAFETY: plain FFI call; a failure returns an error, success a process
     // handle we own and close below.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
-    let mut token = HANDLE::default();
-    // SAFETY: `process` is the handle just opened; `token` is a valid out-param.
-    let sid = if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.is_ok() {
-        // SAFETY: `token` is the just-opened token, valid until closed here.
-        let sid = unsafe { token_user_sid_string(token) };
-        // SAFETY: close the token exactly once.
-        let _ = unsafe { CloseHandle(token) };
-        sid
-    } else {
-        None
-    };
+    let sid = process_handle_user_sid(process);
     // SAFETY: close the process handle exactly once.
     let _ = unsafe { CloseHandle(process) };
+    sid
+}
+
+/// [`process_user_sid`] for a process handle the caller already holds (opened
+/// with at least `PROCESS_QUERY_LIMITED_INFORMATION`); the handle stays open.
+pub fn process_handle_user_sid(process: HANDLE) -> Option<String> {
+    let mut token = HANDLE::default();
+    // SAFETY: `process` is a live handle the caller owns; `token` is a valid
+    // out-param.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.is_err() {
+        return None;
+    }
+    // SAFETY: `token` is the just-opened token, valid until closed here.
+    let sid = unsafe { token_user_sid_string(token) };
+    // SAFETY: close the token exactly once.
+    let _ = unsafe { CloseHandle(token) };
     sid
 }
 
@@ -305,6 +399,14 @@ unsafe fn token_user_sid_string(token: HANDLE) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_logon_filetime_converts_to_unix_ms() {
+        // 2001-09-09T01:46:40Z = 1_000_000_000_000 ms.
+        let ticks = 116_444_736_000_000_000 + 1_000_000_000_000 * 10_000;
+        assert_eq!(filetime_ticks_to_unix_ms(ticks), Some(1_000_000_000_000));
+        assert_eq!(filetime_ticks_to_unix_ms(0), None);
+    }
 
     const ALICE: &str = "S-1-5-21-111-222-333-1001";
     const BOB: &str = "S-1-5-21-111-222-333-1002";

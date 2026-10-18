@@ -406,12 +406,27 @@ impl WfpFilterSpec {
         WfpPrincipal::of(self.user_sid.as_deref())
     }
 
-    /// Validate that every condition this spec carries is expressible at its
-    /// layer. Returns the human-readable reason of the first
-    /// violation. The real `FwpmFilterAdd0` rejects such filters with
-    /// `FWP_E_CONDITION_NOT_FOUND` at apply time — catching it here turns a
-    /// silent per-filter skip in production (and a false green in tests,
-    /// where the mock engine accepts anything) into a structured error.
+    /// The connect half of each filter, moved onto the forwarding layers. The
+    /// layers below it repeat a destination per protocol, which the forwarding
+    /// path cannot tell apart; a port or user condition does not exist there.
+    #[must_use]
+    pub fn onto_forwarding_path(mut specs: Vec<Self>) -> Vec<Self> {
+        specs.retain(|spec| spec.layer.supports_ale_scoping());
+        for spec in &mut specs {
+            spec.layer = if spec.layer.is_v6() {
+                WfpLayerKey::IpForwardV6
+            } else {
+                WfpLayerKey::IpForwardV4
+            };
+            spec.user_sid = None;
+            spec.ip_protocol = None;
+            spec.remote_port = None;
+        }
+        let mut seen = std::collections::HashSet::new();
+        specs.retain(|spec| seen.insert(spec.id));
+        specs
+    }
+
     /// Whether any destination condition is present, in either family.
     pub fn names_a_destination(&self) -> bool {
         self.remote_ip.is_some()

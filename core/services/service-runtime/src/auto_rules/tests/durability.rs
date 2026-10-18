@@ -28,6 +28,8 @@ fn candidate_dto(id: &str, affinity: f64, last_seen_unix_ms: i64) -> AutoRuleCan
         served_by_main_link: false,
         third_party: None,
         secondary_reach: None,
+        any_zone_site: String::new(),
+        less_certain: String::new(),
     }
 }
 
@@ -144,7 +146,7 @@ fn accepting_removes_the_persisted_pending_record() {
     assert_eq!(store.load_all().get(SID).map(Vec::len), Some(1));
 
     f.engine
-        .accept(SID, &ids, later())
+        .accept(SID, &ids, false, later())
         .expect("author is wired");
     assert!(
         store.load_all().get(SID).is_none_or(Vec::is_empty),

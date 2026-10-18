@@ -9,6 +9,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import "../components"
+import "../lib/pure.js" as Pure
 
 ColumnLayout {
     id: section
@@ -35,7 +36,7 @@ ColumnLayout {
                 .replace("{hypervisor}", name)
         if (route === "block")
             return root.tr("rules.vm.route-now-block",
-                "The rules block the traffic of every {hypervisor} machine.")
+                "The rules deny the traffic of every {hypervisor} machine.")
                 .replace("{hypervisor}", name)
         return root.tr("rules.vm.route-now", "Every {hypervisor} machine goes over {route}.")
             .replace("{hypervisor}", name)
@@ -271,7 +272,7 @@ ColumnLayout {
                             Label {
                                 Layout.fillWidth: true
                                 Layout.preferredWidth: 0
-                                visible: root.allowUserRuleEdits === false
+                                visible: root.ruleEditsLocked === true
                                 wrapMode: Text.Wrap
                                 color: root.mutedTextColor
                                 text: root.uiRevision >= 0
@@ -302,7 +303,7 @@ ColumnLayout {
                                                     .replace("{route}", root.routeLabel(route))
                                                 : ""
                                             highlighted: current
-                                            enabled: !current && root.allowUserRuleEdits !== false
+                                            enabled: !current && root.ruleEditsLocked !== true
                                             Accessible.role: Accessible.Button
                                             Accessible.name: text
                                             onClicked: {
@@ -353,8 +354,8 @@ ColumnLayout {
                                     Layout.maximumWidth: 380
                                     model: hypervisorBlock.machines
                                     textRole: "name"
-                                    labelResolver: function(item) { return item ? String(item.name) : "" }
-                                    displayText: hypervisorBlock.machine ? String(hypervisorBlock.machine.name) : ""
+                                    labelResolver: function(item) { return item ? Pure.displayText(item.name) : "" }
+                                    displayText: hypervisorBlock.machine ? Pure.displayText(hypervisorBlock.machine.name) : ""
                                     currentIndex: hypervisorBlock.machineIndex
                                     onActivated: hypervisorBlock.machineIndex = currentIndex
                                     Accessible.role: Accessible.ComboBox

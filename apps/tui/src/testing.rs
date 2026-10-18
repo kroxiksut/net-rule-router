@@ -297,6 +297,7 @@ pub fn enforcement(status: &str, role: &str) -> crate::backend::BackendEvent {
             role: role.into(),
             candidates: Vec::new(),
             since_unix_ms: None,
+            quiet: false,
         },
     )))
 }

@@ -147,7 +147,12 @@ impl ProductionRulesSnapshotProvider {
                 }
             }
         }
-        if let Some(store) = self.app_observations.as_ref() {
+        // The caller's own observations, where they are kept per user.
+        if let Some(store) = self
+            .app_observations
+            .as_ref()
+            .and_then(|store| store.scope_for(Some(principal)))
+        {
             for row in &mut resp.rows {
                 // Only a rule that actually produces host routes: an
                 // application rule bound to the additional link, showing what
@@ -178,27 +183,58 @@ impl ProductionRulesSnapshotProvider {
 }
 
 impl ProductionRulesSnapshotProvider {
-    /// Project a resolved active revision into the GUI rows. Shared by the
-    /// baseline-only `rules_snapshot` and the per-principal
+    /// The rows of the book `principal` is under, read as the rules provider
+    /// resolves it (a revision mid-activation, their own, then the baseline).
+    /// Shared by the baseline-only `rules_snapshot` and the per-principal
     /// `rules_snapshot_for`.
-    fn project(
-        active: nrr_storage::revisions::RevisionRecord,
+    fn snapshot_in_force(
+        &self,
+        principal: &str,
         route_filter: RulesRouteFilter,
     ) -> RulesListResponse {
-        let active_revision_id = Some(active.revision_id.clone());
+        let empty = |base_revision: Option<String>| RulesListResponse {
+            rows: Vec::new(),
+            supported_rule_types: rule_type_slugs(),
+            active_revision_id: None,
+            unrecognized: 0,
+            main_route_pending: 0,
+            base_revision,
+        };
+        let Ok(conn) = self.conn.lock() else {
+            return empty(None);
+        };
+        match crate::production_rules_provider::book_in_force_for(&conn, principal) {
+            Ok(Some(book)) => Self::project(&book, route_filter),
+            Ok(None) => empty(Some(crate::production_rules_provider::base_revision_of(
+                None,
+            ))),
+            Err(_) => empty(None),
+        }
+    }
+
+    /// Project the book in force into the GUI rows.
+    fn project(
+        book: &crate::production_rules_provider::BookInForce,
+        route_filter: RulesRouteFilter,
+    ) -> RulesListResponse {
+        let active_revision_id = book.revision_id.clone();
+        let base_revision = Some(crate::production_rules_provider::base_revision_of(Some(
+            book,
+        )));
         // The stored JSON was validated on the write path; a decode
         // failure here means stale/corrupt data — surface the revision id
-        // with no rows rather than erroring the whole read.
-        let Ok(dto) = crate::production_rules_provider::read_stored_rules(
-            &active.rules_json,
-            &active.revision_id,
-        ) else {
+        // with no rows rather than erroring the whole read. Nothing to build
+        // a write on, though.
+        let Ok(dto) =
+            crate::production_rules_provider::read_stored_rules(&book.rules_json, book.origin())
+        else {
             return RulesListResponse {
                 rows: Vec::new(),
                 supported_rule_types: rule_type_slugs(),
                 active_revision_id,
                 unrecognized: 0,
                 main_route_pending: 0,
+                base_revision: None,
             };
         };
 
@@ -239,69 +275,39 @@ impl ProductionRulesSnapshotProvider {
             active_revision_id,
             unrecognized: u32::try_from(unrecognized).unwrap_or(u32::MAX),
             main_route_pending: 0,
+            base_revision,
         }
     }
 }
 
 impl RulesSnapshotProvider for ProductionRulesSnapshotProvider {
     fn rules_snapshot(&self, route_filter: RulesRouteFilter) -> RulesListResponse {
-        let empty = RulesListResponse {
-            rows: Vec::new(),
-            supported_rule_types: rule_type_slugs(),
-            active_revision_id: None,
-            unrecognized: 0,
-            main_route_pending: 0,
-        };
-        let mut resp = {
-            let Ok(conn) = self.conn.lock() else {
-                return empty;
-            };
-            let repo = nrr_storage::revisions::RevisionsRepository::new(&conn);
-            match repo.get_active() {
-                Ok(Some(rec)) => Self::project(rec, route_filter),
-                _ => return empty,
-            }
-        };
-        // Annotate AFTER releasing the DB lock — the `hosts` read is file I/O.
+        let mut resp = self.snapshot_in_force(nrr_storage::BASELINE_PRINCIPAL, route_filter);
+        // The `hosts` read is file I/O, done with the DB lock released.
         self.annotate(&mut resp, "");
         resp
     }
 
-    /// The caller's per-principal active revision, with
-    /// read-through to the shared baseline when the caller has not diverged
-    /// yet (mirrors `ProductionRulesProvider::active_rules_for`).
+    /// The caller's book, read through to the shared baseline while they have
+    /// not diverged.
     fn rules_snapshot_for(
         &self,
         route_filter: RulesRouteFilter,
         principal: &str,
     ) -> RulesListResponse {
-        let empty = RulesListResponse {
-            rows: Vec::new(),
-            supported_rule_types: rule_type_slugs(),
-            active_revision_id: None,
-            unrecognized: 0,
-            main_route_pending: 0,
-        };
-        let mut resp = {
-            let Ok(conn) = self.conn.lock() else {
-                return empty;
-            };
-            let repo = nrr_storage::revisions::RevisionsRepository::new(&conn);
-            // Caller's own active first; fall back to baseline read-through.
-            if let Ok(Some(rec)) = repo.get_active_for(principal) {
-                Self::project(rec, route_filter)
-            } else if principal != nrr_storage::BASELINE_PRINCIPAL {
-                match repo.get_active_for(nrr_storage::BASELINE_PRINCIPAL) {
-                    Ok(Some(rec)) => Self::project(rec, route_filter),
-                    _ => return empty,
-                }
-            } else {
-                return empty;
-            }
-        };
-        // Annotate AFTER releasing the DB lock — the `hosts` read is file I/O.
+        let mut resp = self.snapshot_in_force(principal, route_filter);
+        // The `hosts` read is file I/O, done with the DB lock released.
         self.annotate(&mut resp, principal);
         resp
+    }
+
+    fn recent_changes_for(
+        &self,
+        principal: &str,
+        since: i64,
+        now: i64,
+    ) -> Result<nrr_shared::ipc_payloads::RulesRecentChangesResponse, String> {
+        crate::recent_rule_changes::read_for(&self.conn, principal, since, now)
     }
 }
 
@@ -309,14 +315,11 @@ impl RulesSnapshotProvider for ProductionRulesSnapshotProvider {
 /// address-side match for the displayed type/value (an AND rule with both
 /// an address and an app match shows the address; an app-only rule falls
 /// back to the application pattern).
-fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str) -> RuleRowEntry {
+pub(crate) fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str) -> RuleRowEntry {
     let (rule_type, match_value) = nrr_domain::rule_value_validation::wire_rule_values(dto)
         .next()
         .unwrap_or(("application", String::new()));
     let rule_type = rule_type.to_string();
-    let validation =
-        nrr_domain::rule_value_validation::validate_rule_value(&rule_type, &match_value);
-    let message_key = validation.message_key();
     // A Block-action rule displays as the "block" route regardless of which
     // bucket it physically lives in — set membership is enforcement-irrelevant
     // for a blocked rule (the WFP codegen drops it). A `?` rule shows its own
@@ -330,6 +333,18 @@ fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str) -> RuleRo
         // ever gets here.
         nrr_shared::rules_json::RuleAction::Unrecognized(slug) => slug.clone(),
     };
+    // A stored rule on a protected program is not applied; the row says why.
+    let validation = match nrr_domain::protected_places::RuleEffect::from_route_slug(&target_route)
+    {
+        Some(effect) => nrr_domain::rule_value_validation::validate_rule_value_in(
+            &rule_type,
+            &match_value,
+            effect,
+            crate::protected_rules::places(),
+        ),
+        None => nrr_domain::rule_value_validation::validate_rule_value(&rule_type, &match_value),
+    };
+    let message_key = validation.message_key();
     RuleRowEntry {
         id: dto.id.clone(),
         rule_type,
@@ -513,7 +528,8 @@ impl RoutePolicySource for ProductionRoutePolicySource {
         } else {
             Vec::new()
         };
-        Some(PerSidPolicySnapshot {
+        let secondary_unset_blocks = secondary_unset_blocks(&conn, &record);
+        let mut snapshot = PerSidPolicySnapshot {
             primary: record.primary.map(record_binding_to_per_sid),
             secondary: record.secondary.map(record_binding_to_per_sid),
             mode: behavior_mode_to_per_sid(record.mode),
@@ -540,8 +556,43 @@ impl RoutePolicySource for ProductionRoutePolicySource {
             zone_priority_over_ip: record.zone_priority_over_ip,
             app_rules_take_all_addresses: record.app_rules_take_all_addresses,
             guard_forwarded_traffic: record.forwarded_outage != "unprotected",
-        })
+        };
+        if secondary_unset_blocks {
+            refuse_unbound_secondary_rules(&mut snapshot);
+        }
+        Some(snapshot)
     }
+}
+
+/// The administrator's install-time answer for additional-route rules while
+/// no additional connection is bound: `block` refuses them. Only once a main
+/// connection is bound — before that nothing at all is enforced. A policy that
+/// cannot be read refuses too: the safe reading of an unknown Fail-Closed.
+fn secondary_unset_blocks(conn: &Connection, record: &RoutePolicyRecord) -> bool {
+    use nrr_storage::install_policy::{InstallPolicyRepository, SecondaryUnset};
+    if record.primary.is_none() || record.secondary.is_some() {
+        return false;
+    }
+    match InstallPolicyRepository::new(conn).get() {
+        Ok(policy) => policy.secondary_unset == SecondaryUnset::Block,
+        Err(_) => true,
+    }
+}
+
+/// The leak guard in its narrowest form: the addresses the additional-route
+/// rules name are blocked, everything else goes out as it would. A guard the
+/// user already turned on keeps their own posture.
+fn refuse_unbound_secondary_rules(snapshot: &mut PerSidPolicySnapshot) {
+    if snapshot.kill_switch_enabled && snapshot.kill_switch_fail_closed {
+        return;
+    }
+    snapshot.kill_switch_enabled = true;
+    snapshot.kill_switch_fail_closed = true;
+    snapshot.block_secondary_when_unavailable = true;
+    snapshot.kill_switch_block_all = false;
+    snapshot.mode_a_coverage_strategy = nrr_domain::mode_a_coverage::ModeACoverageStrategy::PerIp;
+    // Without an additional connection there is nothing to prefer.
+    snapshot.mode = PerSidBehaviorMode::PreferPrimary;
 }
 
 /// Production DoH resolver baseline store over the state DB.
@@ -713,7 +764,7 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
             raw => nrr_domain::rule_value_validation::normalize_network_domain(raw)
                 .ok_or(RoutePolicyWriteError::InvalidNetworkDomain)?,
         };
-        let record = RoutePolicyRecord {
+        let mut record = RoutePolicyRecord {
             primary: request.primary.as_ref().map(dto_binding_to_record),
             secondary: request.secondary.as_ref().map(dto_binding_to_record),
             mode: dto_mode_to_storage(request.mode),
@@ -775,6 +826,7 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
                 .conn
                 .lock()
                 .map_err(|_| RoutePolicyWriteError::Storage("connection mutex poisoned".into()))?;
+            apply_install_default_mode(&conn, sid, &mut record);
             let repo = RouteBindingsRepository::new(&conn);
             repo.update_for_sid(sid, &record, now_secs())
                 .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
@@ -790,6 +842,29 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
         // After the lock is released: the rules provider takes it itself.
         let has_secondary_rules = has_secondary_rules_for(&self.conn, sid);
         Ok(record_to_dto(written, providers, has_secondary_rules))
+    }
+}
+
+/// A user's first saved policy starts from the administrator's install-time
+/// mode unless the request names another one. Strict needs an additional
+/// connection, so without one the request's mode stands.
+fn apply_install_default_mode(conn: &Connection, sid: &str, record: &mut RoutePolicyRecord) {
+    if record.mode != BehaviorMode::PreferPrimary {
+        return;
+    }
+    if RouteBindingsRepository::new(conn)
+        .has_policy_for_sid(sid)
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let Ok(policy) = nrr_storage::install_policy::InstallPolicyRepository::new(conn).get() else {
+        return;
+    };
+    match policy.default_route_mode {
+        Some(BehaviorMode::StrictSecondaryFailClosed) if record.secondary.is_none() => {}
+        Some(mode) => record.mode = mode,
+        None => {}
     }
 }
 
@@ -830,11 +905,47 @@ impl LinkProviderWriter for ProductionRoutePolicyWriter {
 /// `Arc<Mutex<Connection>>` as the other per-SID writers in this module.
 pub struct ProductionPrincipalDataPurger {
     conn: Arc<Mutex<Connection>>,
+    /// Where each user's connection history hangs: a record of where a person
+    /// went is part of what a full reset erases.
+    trace_ring: Option<Arc<crate::conn_observation_consumer::ConnectionTraceRing>>,
 }
 
 impl ProductionPrincipalDataPurger {
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            trace_ring: None,
+        }
+    }
+
+    /// Erase the connection history the ring carries along with the rest.
+    #[must_use]
+    pub fn with_conn_history(
+        mut self,
+        ring: Arc<crate::conn_observation_consumer::ConnectionTraceRing>,
+    ) -> Self {
+        self.trace_ring = Some(ring);
+        self
+    }
+
+    /// `None` erases every user's. A history that cannot be reached is said in
+    /// the log and never fails the reset: the rest of it has already happened.
+    fn forget_history(&self, sid: Option<&str>) {
+        let Some(history) = self.trace_ring.as_ref().and_then(|r| r.history()) else {
+            return;
+        };
+        let outcome = match sid {
+            Some(sid) => history.forget(sid),
+            None => history.forget_all(),
+        };
+        if let Err(e) = outcome {
+            tracing::warn!(
+                target: "nrr::conn-history",
+                msg_key = "conn-history-reset-failed",
+                error = %e,
+                "full reset could not erase the connection history; the rest of the reset went ahead",
+            );
+        }
     }
 }
 
@@ -860,6 +971,8 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
         } else {
             0
         };
+        drop(conn);
+        self.forget_history(Some(sid));
         Ok(PrincipalDataPurgeResponse {
             rows_deleted: summary.rows_deleted,
             tables_touched: summary.tables_touched as u32,
@@ -892,6 +1005,8 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
             }
         }
         total.principals_purged = principals.len() as u32;
+        drop(conn);
+        self.forget_history(None);
         Ok(total)
     }
 
@@ -1167,7 +1282,7 @@ impl MutationExecutor for NoopMutationExecutor {
         })
     }
 
-    fn safe_disable(&self, _reason: &str) -> MutationOutcome {
+    fn safe_disable(&self, _principal: &str, _reason: &str) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
             args: Default::default(),
             code: "not-implemented".into(),
@@ -1525,6 +1640,94 @@ fn adapter_to_entry(
 #[cfg(test)]
 mod adapters_snapshot_tests;
 
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod principal_purge_history_tests {
+    use super::*;
+    use crate::conn_history::{ConnHistory, HistoryRead};
+    use crate::conn_observation_consumer::{ConnectionTraceRecord, ConnectionTraceRing};
+    use nrr_platform_api::conn_observe::egress::{EgressInterface, EgressRole};
+    use nrr_platform_api::conn_observe::{ConnectionVerdict, TransportProtocol};
+    use nrr_storage::repository::MigrationRunner;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    const ALICE: &str = "S-1-5-21-1-2-3-1001";
+    const BOB: &str = "S-1-5-21-1-2-3-1002";
+    const T0: u64 = 1_700_000_000_000;
+
+    fn state() -> Arc<Mutex<Connection>> {
+        let runner = nrr_storage::migration::SqliteMigrationRunner::for_state_db(
+            Connection::open_in_memory().expect("in-memory"),
+        );
+        runner.run_pending_migrations().expect("migrate");
+        Arc::new(Mutex::new(runner.into_connection()))
+    }
+
+    fn row(owner: &str) -> ConnectionTraceRecord {
+        ConnectionTraceRecord {
+            process_path: Some("/usr/bin/browser".into()),
+            user_sid: Some(owner.into()),
+            protocol: TransportProtocol::Tcp,
+            local: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 5)), 50_000),
+            remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 443),
+            egress: EgressInterface {
+                ifindex: 2,
+                role: EgressRole::Primary,
+            },
+            verdict: ConnectionVerdict::Permit,
+            blocked_by_nrr: None,
+            nrr_drop_spec_id: None,
+            nrr_block_reason: None,
+            observed_unix_ms: Some(T0),
+            remote_names: None,
+        }
+    }
+
+    fn rows_of(history: &ConnHistory, sid: &str) -> usize {
+        let read = HistoryRead {
+            principal: Some(sid),
+            to_ms: T0 * 2,
+            limit: 100,
+            ..HistoryRead::default()
+        };
+        history.read(&read, T0).expect("read").0.len()
+    }
+
+    #[test]
+    fn a_full_reset_erases_the_callers_history_and_no_one_elses() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ring = Arc::new(ConnectionTraceRing::new(8));
+        ring.attach_history(Arc::new(ConnHistory::open(
+            dir.path().join("nrr_conn_history.db"),
+        )));
+        ring.push(row(ALICE));
+        ring.push(row(BOB));
+        let history = Arc::clone(ring.history().expect("attached"));
+        history.flush(T0);
+        let purger = ProductionPrincipalDataPurger::new(state()).with_conn_history(ring);
+
+        purger.purge_for_sid(ALICE, false).expect("reset");
+        assert_eq!(rows_of(&history, ALICE), 0);
+        assert_eq!(rows_of(&history, BOB), 1);
+
+        purger.purge_all_principals(false).expect("reset everyone");
+        assert_eq!(rows_of(&history, BOB), 0);
+    }
+
+    #[test]
+    fn a_history_out_of_reach_never_fails_the_reset() {
+        let ring = Arc::new(ConnectionTraceRing::new(8));
+        ring.attach_history(Arc::new(ConnHistory::new(None, None)));
+        let purger = ProductionPrincipalDataPurger::new(state()).with_conn_history(ring);
+        purger
+            .purge_for_sid(ALICE, true)
+            .expect("the reset goes on");
+        purger
+            .purge_all_principals(true)
+            .expect("the reset goes on");
+    }
+}
+
 // ── hosts-override annotation tests ───────────────────────────────────────────
 
 #[cfg(test)]
@@ -1653,23 +1856,13 @@ mod doh_resolver_ip_tests {
 #[allow(clippy::expect_used)]
 mod rules_list_projection_tests {
     use super::*;
-    use nrr_domain::rules_revision::{RevisionStatus, RulesRevisionSource};
+    use crate::production_rules_provider::BookInForce;
+    use nrr_storage::repository::MigrationRunner;
 
-    fn record(rules_json: &str) -> nrr_storage::revisions::RevisionRecord {
-        nrr_storage::revisions::RevisionRecord {
-            revision_id: "rev-1".into(),
-            content_hash: String::new(),
+    fn record(rules_json: &str) -> BookInForce {
+        BookInForce {
+            revision_id: Some("rev-1".into()),
             rules_json: rules_json.into(),
-            status: RevisionStatus::Active,
-            source: RulesRevisionSource::GuiRulesEdit,
-            correlation_id: String::new(),
-            created_at: 0,
-            activated_at: None,
-            superseded_at: None,
-            superseded_by: None,
-            rejected_reason: None,
-            review_summary_json: None,
-            risk_level: None,
         }
     }
 
@@ -1677,13 +1870,192 @@ mod rules_list_projection_tests {
     #[test]
     fn rules_this_build_cannot_read_are_not_listed() {
         let json = r#"{"primary":[{"address-match":{"kind":"exact-fqdn","value":"a.test"},"enabled":true,"id":"r-1"},{"address-match":{"from":1,"kind":"port-range"},"enabled":true,"id":"r-2"}],"schema-version":9,"secondary":[{"action":"throttle","address-match":{"kind":"zone","name":"test"},"enabled":true,"id":"r-3"}]}"#;
-        let listed = ProductionRulesSnapshotProvider::project(record(json), RulesRouteFilter::All);
+        let listed = ProductionRulesSnapshotProvider::project(&record(json), RulesRouteFilter::All);
         let ids: Vec<&str> = listed.rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["r-1"]);
         // Hidden, but counted, so the screen can say they do nothing here.
         assert_eq!(listed.unrecognized, 2);
         let primary_only =
-            ProductionRulesSnapshotProvider::project(record(json), RulesRouteFilter::Primary);
+            ProductionRulesSnapshotProvider::project(&record(json), RulesRouteFilter::Primary);
         assert_eq!(primary_only.unrecognized, 1);
+    }
+
+    fn state_conn() -> Arc<Mutex<Connection>> {
+        let runner = nrr_storage::migration::SqliteMigrationRunner::for_state_db(
+            Connection::open_in_memory().expect("in-memory"),
+        );
+        runner.run_pending_migrations().expect("migrate");
+        Arc::new(Mutex::new(runner.into_connection()))
+    }
+
+    const BOOK: &str = r#"{"primary":[{"address-match":{"kind":"exact-fqdn","value":"a.test"},"enabled":true,"id":"r-1"}],"schema-version":1,"secondary":[]}"#;
+
+    /// The list is the book in force: a revision mid-activation over the
+    /// stored one, the baseline for a user who never diverged, and a name to
+    /// build a write on that moves with it.
+    #[test]
+    fn the_list_is_the_book_in_force_and_names_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nrr_service_state.db");
+        let runner = nrr_storage::migration::SqliteMigrationRunner::for_state_db(
+            Connection::open(&path).expect("open"),
+        );
+        runner.run_pending_migrations().expect("migrate");
+        let conn = runner.into_connection();
+        conn.execute(
+            "INSERT INTO revisions (principal, revision_id, content_hash, rules_json, status, \
+             source, correlation_id, created_at, activated_at) \
+             VALUES (?1, 'rev-b', 'h', ?2, 'active', 'gui-rules-edit', 'c', 1, 1)",
+            rusqlite::params![nrr_storage::BASELINE_PRINCIPAL, BOOK],
+        )
+        .expect("seed baseline");
+        let provider = ProductionRulesSnapshotProvider::new(Arc::new(Mutex::new(conn)));
+        let user = "S-1-5-21-1-2-3-1001";
+
+        let inherited = provider.rules_snapshot_for(RulesRouteFilter::All, user);
+        assert_eq!(inherited.rows.len(), 1, "read through to the baseline");
+        let base = inherited.base_revision.clone().expect("a base to build on");
+        assert!(!base.is_empty());
+
+        let applying = BOOK.replace("a.test", "b.test");
+        let overlay = crate::applying_revision_overlay::publish(
+            &Connection::open(&path).expect("open"),
+            user,
+            &applying,
+        );
+        let mid = provider.rules_snapshot_for(RulesRouteFilter::All, user);
+        assert_eq!(
+            mid.rows[0].match_value, "b.test",
+            "the revision being applied"
+        );
+        assert_ne!(mid.base_revision.as_deref(), Some(base.as_str()));
+        drop(overlay);
+
+        let empty = ProductionRulesSnapshotProvider::new(state_conn())
+            .rules_snapshot_for(RulesRouteFilter::All, user);
+        assert_eq!(
+            empty.base_revision.as_deref(),
+            Some(""),
+            "no rules is a base too"
+        );
+    }
+}
+
+#[cfg(test)]
+mod install_policy_tests {
+    use super::*;
+    use nrr_storage::install_policy::{InstallPolicy, InstallPolicyRepository, SecondaryUnset};
+    use nrr_storage::repository::MigrationRunner;
+
+    fn conn() -> Arc<Mutex<Connection>> {
+        let runner = nrr_storage::migration::SqliteMigrationRunner::for_state_db(
+            Connection::open_in_memory().expect("in-memory"),
+        );
+        runner.run_pending_migrations().expect("migrate");
+        Arc::new(Mutex::new(runner.into_connection()))
+    }
+
+    fn binding(id: &str) -> RouteBindingRecord {
+        RouteBindingRecord {
+            stable_id: id.into(),
+            display_name: id.into(),
+            user_confirmed: true,
+            known_stable_ids: Vec::new(),
+        }
+    }
+
+    fn store(conn: &Arc<Mutex<Connection>>, sid: &str, secondary: bool, unset: SecondaryUnset) {
+        let guard = conn.lock().expect("conn");
+        InstallPolicyRepository::new(&guard)
+            .set(
+                &InstallPolicy {
+                    secondary_unset: unset,
+                    default_route_mode: None,
+                },
+                1,
+            )
+            .expect("policy");
+        let mut record = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+        record.primary = Some(binding("main"));
+        record.secondary = secondary.then(|| binding("tunnel"));
+        RouteBindingsRepository::new(&guard)
+            .update_for_sid(sid, &record, 1)
+            .expect("bind");
+    }
+
+    #[test]
+    fn nothing_is_planned_for_a_user_who_bound_nothing_whatever_the_install_policy() {
+        let conn = conn();
+        store(&conn, "S-1-5-21-other", false, SecondaryUnset::Block);
+        let source = ProductionRoutePolicySource::new(Arc::clone(&conn));
+        assert!(source.load_for_sid("S-1-5-21-new").is_none());
+    }
+
+    #[test]
+    fn block_refuses_additional_route_rules_until_a_connection_is_bound() {
+        let conn = conn();
+        store(&conn, "S-1-5-21-1", false, SecondaryUnset::Block);
+        let snapshot = ProductionRoutePolicySource::new(Arc::clone(&conn))
+            .load_for_sid("S-1-5-21-1")
+            .expect("policy");
+        assert!(snapshot.kill_switch_enabled && snapshot.kill_switch_fail_closed);
+        assert!(
+            !snapshot.kill_switch_block_all,
+            "only those rules, not everything"
+        );
+        assert_eq!(
+            snapshot.mode_a_coverage_strategy,
+            nrr_domain::mode_a_coverage::ModeACoverageStrategy::PerIp
+        );
+
+        store(&conn, "S-1-5-21-1", true, SecondaryUnset::Block);
+        let bound = ProductionRoutePolicySource::new(Arc::clone(&conn))
+            .load_for_sid("S-1-5-21-1")
+            .expect("policy");
+        assert!(
+            !bound.kill_switch_enabled,
+            "a bound connection ends the refusal"
+        );
+    }
+
+    #[test]
+    fn direct_leaves_additional_route_rules_to_go_out_directly() {
+        let conn = conn();
+        store(&conn, "S-1-5-21-1", false, SecondaryUnset::Direct);
+        let snapshot = ProductionRoutePolicySource::new(conn)
+            .load_for_sid("S-1-5-21-1")
+            .expect("policy");
+        assert!(!snapshot.kill_switch_enabled);
+    }
+
+    #[test]
+    fn the_install_mode_seeds_only_a_first_write_that_names_none() {
+        let conn = conn();
+        let guard = conn.lock().expect("conn");
+        InstallPolicyRepository::new(&guard)
+            .set(
+                &InstallPolicy {
+                    secondary_unset: SecondaryUnset::Direct,
+                    default_route_mode: Some(BehaviorMode::PreferSecondaryWhenAvailable),
+                },
+                1,
+            )
+            .expect("policy");
+        let mut first = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+        apply_install_default_mode(&guard, "S-1-5-21-1", &mut first);
+        assert_eq!(first.mode, BehaviorMode::PreferSecondaryWhenAvailable);
+
+        let mut stored = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+        stored.primary = Some(binding("main"));
+        RouteBindingsRepository::new(&guard)
+            .update_for_sid("S-1-5-21-2", &stored, 1)
+            .expect("bind");
+        let mut later = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+        apply_install_default_mode(&guard, "S-1-5-21-2", &mut later);
+        assert_eq!(
+            later.mode,
+            BehaviorMode::PreferPrimary,
+            "a stored policy is the user's"
+        );
     }
 }

@@ -133,6 +133,15 @@ pub fn ipc_operation_timeout(op: IpcOperationName) -> Duration {
         IpcOperationName::ConnTraceEntriesList
         | IpcOperationName::ConnTraceOutageBlocksList
         | IpcOperationName::VpnGatewayCandidatesList => Duration::from_secs(5),
+        // Up to a hundred stored revisions read and compared one by one.
+        IpcOperationName::RulesRecentChangesList => Duration::from_secs(10),
+        // One grouped read over a week of folded hours, or a per-user delete
+        // in a file of at most tens of megabytes.
+        IpcOperationName::ConnHistoryList | IpcOperationName::ConnHistoryClear => {
+            Duration::from_secs(10)
+        }
+        // One state-DB row.
+        IpcOperationName::ConnHistorySettingsSet => Duration::from_secs(2),
         // Hashes a ~400 KiB DLL and verifies its signature; the signature
         // check can touch the certificate store, so give it more room than a
         // pure in-memory read.
@@ -196,9 +205,63 @@ pub fn ipc_operation_timeout(op: IpcOperationName) -> Duration {
     }
 }
 
+/// How long a person may take over the authority's password prompt: the
+/// service's own wait for it.
+pub const AUTHORIZATION_PROMPT_BUDGET: Duration = Duration::from_secs(120);
+
+/// Whether the service itself stops to ask for an administrator's password
+/// before answering (Linux, through polkit). Elsewhere the client elevates.
+const SERVICE_ASKS_FOR_THE_PASSWORD: bool = cfg!(target_os = "linux");
+
+/// [`ipc_operation_timeout`] for this request, plus the password prompt where
+/// the service may stop to ask it.
+pub fn ipc_request_timeout(op: IpcOperationName, payload: &serde_json::Value) -> Duration {
+    with_prompt(
+        ipc_operation_timeout(op),
+        nrr_shared::ipc_transport::may_need_administrator(op, payload),
+    )
+}
+
+/// The longest [`ipc_request_timeout`] of `op` over any payload: for a caller
+/// that has to fix its wait before it sees the request.
+pub fn ipc_operation_bound(op: IpcOperationName) -> Duration {
+    with_prompt(
+        ipc_operation_timeout(op),
+        nrr_shared::ipc_transport::may_ever_need_administrator(op),
+    )
+}
+
+fn with_prompt(timeout: Duration, may_prompt: bool) -> Duration {
+    if SERVICE_ASKS_FOR_THE_PASSWORD && may_prompt {
+        timeout + AUTHORIZATION_PROMPT_BUDGET
+    } else {
+        timeout
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where the service asks for the password itself, a request that may need
+    /// it waits for a person; one that never does keeps its own budget.
+    #[test]
+    fn only_a_request_that_may_need_an_administrator_waits_for_the_password() {
+        let op = IpcOperationName::TrafficStatsSet;
+        let prompted = ipc_request_timeout(op, &serde_json::json!({}));
+        let expected = if cfg!(target_os = "linux") {
+            ipc_operation_timeout(op) + AUTHORIZATION_PROMPT_BUDGET
+        } else {
+            ipc_operation_timeout(op)
+        };
+        assert_eq!(prompted, expected);
+        assert_eq!(ipc_operation_bound(op), expected);
+        let read = IpcOperationName::ServiceHealthGet;
+        assert_eq!(
+            ipc_request_timeout(read, &serde_json::json!({})),
+            ipc_operation_timeout(read)
+        );
+    }
 
     #[test]
     fn timeout_matrix_covers_every_operation_in_catalog() {

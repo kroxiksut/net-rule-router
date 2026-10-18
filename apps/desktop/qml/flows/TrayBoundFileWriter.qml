@@ -24,13 +24,18 @@ QtObject {
     property var presence: null
     /// `PlatformProfile.os`: picks the application section of the file.
     property string os: ""
+    /// The tray window, whose `tr()` words the file's syntax hint.
+    property var textSource: null
 
     /// ACE codec for the shared serializer; a `.pragma library` cannot reach
     /// the bridge, so the conversion crosses as a callback.
     property var aceCodec: HostAceCodec {}
 
     /// The same writer the main window uses.
-    property var fileWriter: RulesFileWriter { rpc: writer.rpc }
+    property var fileWriter: RulesFileWriter {
+        rpc: writer.rpc
+        textSource: writer.textSource
+    }
 
     /// One write at a time: the trigger is a push, and a burst of them would
     /// otherwise interleave two full read-build-write chains over one file.

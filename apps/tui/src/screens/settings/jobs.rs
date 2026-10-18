@@ -12,10 +12,11 @@ use nrr_platform_api::service_control::ServiceControlError;
 use nrr_shared::ipc::IpcOperationName as Op;
 use nrr_shared::ipc_payloads::{
     ApplyFailurePolicyDto, BlockNoticeMuteDto, BlockNoticeMuteScopeDto,
-    BlockNoticeMutesListResponse, LocalDnsSuffixesGetResponse, LocalNetworksGetResponse,
-    LocalNetworksSetResponse, LogRetentionConfigDto, LogRetentionConfigSetRequest,
-    LogsClearResponse, RetentionSettingsDto, RetentionSettingsSetRequest,
-    SettingsExportFullResponse, StorageUsageDto, TrafficStatsGetResponse, TrafficStatsSettingsDto,
+    BlockNoticeMutesListResponse, ConnHistoryClearResponse, ConnHistoryListResponse,
+    LocalDnsSuffixesGetResponse, LocalNetworksGetResponse, LocalNetworksSetResponse,
+    LogRetentionConfigDto, LogRetentionConfigSetRequest, LogsClearResponse, RetentionSettingsDto,
+    RetentionSettingsSetRequest, SettingsExportFullResponse, StorageUsageDto,
+    TrafficStatsGetResponse, TrafficStatsSettingsDto,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
@@ -241,6 +242,62 @@ pub fn load_traffic(day: i64) -> Job {
     job(move |client| {
         let result = loaded(traffic_of(client, day));
         Reply::new(move |app| app.settings.data.traffic = result)
+    })
+}
+
+/// The caller's choices ride on the history read; the present moment is
+/// enough to carry them and costs the service nothing to answer.
+fn conn_history_of(client: &dyn IpcClient) -> Result<ConnHistoryListResponse, Failure> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    read(
+        client,
+        Op::ConnHistoryList,
+        json!({ "from-unix-ms": now_ms, "to-unix-ms": now_ms,
+                "pagination": { "page_size": 1 } }),
+    )
+}
+
+pub fn load_conn_history() -> Job {
+    job(move |client| {
+        let result = loaded(conn_history_of(client));
+        Reply::new(move |app| app.settings.data.conn_history = result)
+    })
+}
+
+pub fn set_conn_history(enabled: Option<bool>, retention_days: Option<u32>) -> Job {
+    job(move |client| {
+        let mut patch = Map::new();
+        if let Some(on) = enabled {
+            patch.insert("enabled".into(), Value::Bool(on));
+        }
+        if let Some(days) = retention_days {
+            patch.insert("retention-days".into(), Value::from(days));
+        }
+        let result = call(client, Op::ConnHistorySettingsSet, Value::Object(patch))
+            .and_then(|_| conn_history_of(client));
+        written(result, Words::Key(text::SAVED), |app, history| {
+            app.settings.data.conn_history = Loadable::Ready(history);
+        })
+    })
+}
+
+pub fn clear_conn_history() -> Job {
+    job(move |client| {
+        let result = read::<ConnHistoryClearResponse>(client, Op::ConnHistoryClear, json!({}))
+            .and_then(|cleared| conn_history_of(client).map(|history| (cleared, history)));
+        Reply::new(move |app| match result {
+            Ok((cleared, history)) => {
+                app.settings.data.conn_history = Loadable::Ready(history);
+                app.settings.done(Words::Fill(
+                    text::HISTORY_CLEARED,
+                    vec![("count", cleared.erased.to_string())],
+                ));
+            }
+            Err(failure) => app.settings.failed(text::NOT_SAVED, failure),
+        })
     })
 }
 

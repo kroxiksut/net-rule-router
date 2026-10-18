@@ -22,11 +22,13 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID,
-    MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
+    TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
 };
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
+use nrr_platform_api::fake_ip::FlowTransport;
 use nrr_platform_api::FlowOwnerLookup;
 
 /// Production [`FlowOwnerLookup`] over the Windows TCP connection table.
@@ -51,6 +53,84 @@ impl FlowOwnerLookup for WindowsFlowOwnerLookup {
         )?;
         process_image_basename(pid)
     }
+
+    fn owner_principal(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        transport: FlowTransport,
+    ) -> Option<String> {
+        let SocketAddr::V4(local_v4) = local else {
+            return None; // IPv4 relay only (see module doc)
+        };
+        let local = (*local_v4.ip(), local_v4.port());
+        let pid = match transport {
+            FlowTransport::Tcp => {
+                let SocketAddr::V4(remote_v4) = remote else {
+                    return None;
+                };
+                owning_pid_v4(local, (*remote_v4.ip(), remote_v4.port()))?
+            }
+            FlowTransport::Udp => udp_owning_pid_v4(local)?,
+        };
+        crate::win32_ffi::console_session::process_user_sid(pid)
+    }
+}
+
+/// The PID of the UDP socket bound to `local`. A socket bound to the wildcard
+/// address on that port answers when no exact binding does: an unconnected
+/// client socket is listed that way.
+fn udp_owning_pid_v4(local: Endpoint) -> Option<u32> {
+    let buffer = read_udp_owner_pid_table()?;
+    let header =
+        std::mem::size_of::<MIB_UDPTABLE_OWNER_PID>() - std::mem::size_of::<MIB_UDPROW_OWNER_PID>();
+    let fits = buffer.len().saturating_sub(header) / std::mem::size_of::<MIB_UDPROW_OWNER_PID>();
+    let mut wildcard = None;
+    // SAFETY: `read_udp_owner_pid_table` returns a buffer the API filled with a
+    // `MIB_UDPTABLE_OWNER_PID`; the row count is clamped to what the buffer
+    // holds, so every row read lies inside it.
+    unsafe {
+        let table = buffer.as_ptr().cast::<MIB_UDPTABLE_OWNER_PID>();
+        let count = ((*table).dwNumEntries as usize).min(fits);
+        let rows = std::ptr::addr_of!((*table).table).cast::<MIB_UDPROW_OWNER_PID>();
+        for i in 0..count {
+            let row = &*rows.add(i);
+            let (ip, port) = row_endpoint(row.dwLocalAddr, row.dwLocalPort);
+            if port != local.1 {
+                continue;
+            }
+            if ip == local.0 {
+                return Some(row.dwOwningPid);
+            }
+            if ip.is_unspecified() {
+                wildcard = Some(row.dwOwningPid);
+            }
+        }
+    }
+    wildcard
+}
+
+/// `GetExtendedUdpTable` for IPv4, grown until the table fits.
+fn read_udp_owner_pid_table() -> Option<Vec<u8>> {
+    read_growing(
+        std::mem::size_of::<MIB_UDPTABLE_OWNER_PID>(),
+        TABLE_HEADROOM_ROWS * std::mem::size_of::<MIB_UDPROW_OWNER_PID>(),
+        |buffer, size| {
+            // SAFETY: `buffer` is writable for `*size` bytes, its full length;
+            // the API writes at most that much, or only updates `size`.
+            unsafe {
+                GetExtendedUdpTable(
+                    Some(buffer.as_mut_ptr().cast::<c_void>()),
+                    size,
+                    false,
+                    AF_INET.0 as u32,
+                    UDP_TABLE_OWNER_PID,
+                    0,
+                )
+            }
+        },
+    )
+    .ok()
 }
 
 /// One (local, remote) IPv4 endpoint pair, network-independent.

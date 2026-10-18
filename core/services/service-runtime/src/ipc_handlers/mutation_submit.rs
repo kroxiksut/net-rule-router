@@ -32,8 +32,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcOperationClass, IpcRequestContext,
-    IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcOperationClass,
+    IpcRequestContext, IpcRequestEnvelope, Prechecked,
 };
 use crate::ipc_handlers::mutation_token_store::{
     MutationTokenStore, StoredMutation, DEFAULT_MUTATION_TOKEN_TTL,
@@ -133,15 +133,61 @@ impl MutationSubmitHandler {
     }
 }
 
-impl IpcHandler for MutationSubmitHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+/// A submit its precheck accepted.
+pub struct CheckedSubmit {
+    body: MutationSubmitRequest,
+    /// For a confirm, the partition the write lands in and what its token
+    /// stood for; `None` for a dry run.
+    confirm: Option<(String, StoredMutation)>,
+}
+
+impl CheckedIpcHandler for MutationSubmitHandler {
+    type Checked = CheckedSubmit;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
         let body: MutationSubmitRequest =
             serde_json::from_value(request.payload.clone()).map_err(|e| IpcError {
                 code: IpcErrorCode::MalformedRequest,
                 message: format!("mutation.submit payload invalid: {e}"),
                 diagnostics_id: None,
             })?;
+        self.gates(&body, ctx)?;
+        let confirm = if body.dry_run {
+            Self::dry_run_class_matches(request)?;
+            None
+        } else {
+            Some(self.precheck_confirm(request, &body, ctx)?)
+        };
+        Ok(CheckedSubmit { body, confirm })
+    }
 
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        let CheckedSubmit { body, confirm } = checked.into_inner();
+        match confirm {
+            None => self.handle_dry_run(body, ctx),
+            Some((principal, stored)) => {
+                // The alert and lock state may have changed while the request
+                // was being audited.
+                self.gates(&body, ctx)?;
+                self.handle_confirm(principal, stored, ctx)
+            }
+        }
+    }
+}
+
+impl MutationSubmitHandler {
+    /// The refusals both phases share: the alert stand-in, the tamper gate,
+    /// clearing an alert on other users' behalf, the administrative rules lock.
+    fn gates(&self, body: &MutationSubmitRequest, ctx: &IpcRequestContext) -> Result<(), IpcError> {
         let is_alert_mutation = matches!(
             body.mutation_kind,
             MutationKind::SecurityAlertAck | MutationKind::SecurityAlertResolve
@@ -155,12 +201,9 @@ impl IpcHandler for MutationSubmitHandler {
                 .and_then(serde_json::Value::as_str)
                 == Some(crate::alert_audience::OTHER_PRINCIPAL_ALERT_ID)
         {
-            return Err(IpcError {
-                code: IpcErrorCode::Forbidden,
-                message: "This alert concerns another user's rules — administrator rights required"
-                    .into(),
-                diagnostics_id: None,
-            });
+            return Err(IpcError::needs_administrator(
+                "This alert concerns another user's rules — administrator rights required",
+            ));
         }
 
         // Tamper gate, answered here on both phases so the dry-run is refused
@@ -200,13 +243,10 @@ impl IpcHandler for MutationSubmitHandler {
                     .as_ref()
                     .is_some_and(|reads| reads(ctx.caller_stored()))
             {
-                return Err(IpcError {
-                    code: IpcErrorCode::Forbidden,
-                    message: "Clearing this alert also adopts other users' rules — \
-                              administrator rights required"
-                        .into(),
-                    diagnostics_id: None,
-                });
+                return Err(IpcError::needs_administrator(
+                    "Clearing this alert also adopts other users' rules — administrator rights \
+                     required",
+                ));
             }
         }
 
@@ -226,12 +266,7 @@ impl IpcHandler for MutationSubmitHandler {
                 diagnostics_id: None,
             });
         }
-
-        if body.dry_run {
-            self.handle_dry_run(request, body, ctx)
-        } else {
-            self.handle_confirm(request, body, ctx)
-        }
+        Ok(())
     }
 }
 
@@ -280,15 +315,10 @@ fn preview_principal(caller_sid: &str) -> String {
 }
 
 impl MutationSubmitHandler {
-    fn handle_dry_run(
-        &self,
-        request: &IpcRequestEnvelope,
-        body: MutationSubmitRequest,
-        ctx: &IpcRequestContext,
-    ) -> HandlerOutcome {
-        // Class consistency: dry-run intentionally bypasses the
-        // router-level token gate by declaring `ReadSnapshot`. A
-        // mismatched envelope is almost certainly a client bug.
+    /// Class consistency: dry-run intentionally bypasses the router-level
+    /// token gate by declaring `ReadSnapshot`. A mismatched envelope is almost
+    /// certainly a client bug.
+    fn dry_run_class_matches(request: &IpcRequestEnvelope) -> Result<(), IpcError> {
         if request.operation_class != IpcOperationClass::ReadSnapshot {
             return Err(IpcError {
                 code: IpcErrorCode::MalformedRequest,
@@ -299,7 +329,14 @@ impl MutationSubmitHandler {
                 diagnostics_id: None,
             });
         }
+        Ok(())
+    }
 
+    fn handle_dry_run(
+        &self,
+        body: MutationSubmitRequest,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         // Preview the caller's effective rules and bind
         // the minted token to the caller's SID so it cannot be replayed
         // by a different principal on confirm.
@@ -350,12 +387,15 @@ impl MutationSubmitHandler {
         })
     }
 
-    fn handle_confirm(
+    /// Class, target partition and token of a confirm. The token is spent
+    /// here, refused or not, so a captured one cannot be retried; what it stood
+    /// for travels on to `execute`.
+    fn precheck_confirm(
         &self,
         request: &IpcRequestEnvelope,
-        body: MutationSubmitRequest,
+        body: &MutationSubmitRequest,
         ctx: &IpcRequestContext,
-    ) -> HandlerOutcome {
+    ) -> Result<(String, StoredMutation), IpcError> {
         // Confirm accepts either the elevated baseline
         // class (`MutationRequest`) or the non-elevated per-principal
         // class (`UserScopedMutation`). The router has already enforced
@@ -386,67 +426,30 @@ impl MutationSubmitHandler {
         } else {
             resolve_confirm_principal(request.operation_class, ctx.caller_stored())?
         };
-
-        // Router has already verified the token is present and
-        // non-empty (PreconditionFailed). Defensive check below
-        // surfaces a well-formed error if the router contract drifts.
-        let token = request
-            .confirmation_token
-            .as_deref()
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| IpcError {
-                code: IpcErrorCode::PreconditionFailed,
-                message: "mutation.submit confirm requires a non-empty confirmation token".into(),
-                diagnostics_id: None,
-            })?;
-
-        let now = Instant::now();
         let stored = self
             .token_store
-            .consume(token, IpcOperationName::MutationSubmit, now)
+            .consume(
+                confirm_token(request)?,
+                IpcOperationName::MutationSubmit,
+                Instant::now(),
+            )
             .map_err(IpcError::from)?;
+        token_matches(
+            request,
+            ctx,
+            &stored.issuer_sid,
+            stored.kind,
+            body.mutation_kind,
+        )?;
+        Ok((principal, stored))
+    }
 
-        // Cross-principal token isolation, scoped to
-        // `UserScopedMutation` only. The token was minted during a dry-run
-        // by `stored.issuer_sid`; a different authenticated principal must
-        // not replay it to commit content under ITS OWN per-SID scope.
-        //
-        // Deliberately NOT applied to `MutationRequest`
-        // (admin baseline edit): the target is the shared baseline (not
-        // the caller's partition), authorization is the router-enforced
-        // elevation, and the elevated confirm legitimately arrives under a
-        // different SID than the dry-run when a cross-account UAC (or the
-        // elevation broker) relays it. Binding the baseline token to the
-        // dry-run SID would wrongly reject that flow.
-        //
-        // Skipped when the issuer SID is empty (non-Windows / harness).
-        if request.operation_class == IpcOperationClass::UserScopedMutation
-            && !stored.issuer_sid.is_empty()
-            && stored.issuer_sid != ctx.caller_stored()
-        {
-            return Err(IpcError {
-                code: IpcErrorCode::PreconditionFailed,
-                message: "confirmation token was issued for a different principal".into(),
-                diagnostics_id: None,
-            });
-        }
-
-        // Cross-check: the stored payload must agree with the body the
-        // client just sent. The body's `mutation_kind` and `payload`
-        // are advisory on confirm, but a divergence is a clear sign
-        // of a client/middleware bug — fail loudly rather than execute
-        // something the user didn't review.
-        if stored.kind != body.mutation_kind {
-            return Err(IpcError {
-                code: IpcErrorCode::PreconditionFailed,
-                message: format!(
-                    "confirm body mutation_kind ({:?}) does not match stored kind ({:?})",
-                    body.mutation_kind, stored.kind
-                ),
-                diagnostics_id: None,
-            });
-        }
-
+    fn handle_confirm(
+        &self,
+        principal: String,
+        stored: StoredMutation,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         let op_id = self
             .operation_store
             .enqueue_for(crate::ipc_handlers::operation_status_store::owner_of(ctx));
@@ -472,10 +475,77 @@ impl MutationSubmitHandler {
     }
 }
 
+/// Router has already verified the token is present and non-empty
+/// (PreconditionFailed); this surfaces a well-formed error if that contract
+/// drifts.
+fn confirm_token(request: &IpcRequestEnvelope) -> Result<&str, IpcError> {
+    request
+        .confirmation_token
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| IpcError {
+            code: IpcErrorCode::PreconditionFailed,
+            message: "mutation.submit confirm requires a non-empty confirmation token".into(),
+            diagnostics_id: None,
+        })
+}
+
+/// Whether a token issued by `issuer_sid` for `stored_kind` may confirm this
+/// request.
+fn token_matches(
+    request: &IpcRequestEnvelope,
+    ctx: &IpcRequestContext,
+    issuer_sid: &str,
+    stored_kind: MutationKind,
+    body_kind: MutationKind,
+) -> Result<(), IpcError> {
+    // Cross-principal token isolation, scoped to
+    // `UserScopedMutation` only. The token was minted during a dry-run
+    // by `issuer_sid`; a different authenticated principal must
+    // not replay it to commit content under ITS OWN per-SID scope.
+    //
+    // Deliberately NOT applied to `MutationRequest`
+    // (admin baseline edit): the target is the shared baseline (not
+    // the caller's partition), authorization is the router-enforced
+    // elevation, and the elevated confirm legitimately arrives under a
+    // different SID than the dry-run when a cross-account UAC (or the
+    // elevation broker) relays it. Binding the baseline token to the
+    // dry-run SID would wrongly reject that flow.
+    //
+    // Skipped when the issuer SID is empty (non-Windows / harness).
+    if request.operation_class == IpcOperationClass::UserScopedMutation
+        && !issuer_sid.is_empty()
+        && issuer_sid != ctx.caller_stored()
+    {
+        return Err(IpcError {
+            code: IpcErrorCode::PreconditionFailed,
+            message: "confirmation token was issued for a different principal".into(),
+            diagnostics_id: None,
+        });
+    }
+
+    // Cross-check: the stored payload must agree with the body the
+    // client just sent. The body's `mutation_kind` and `payload`
+    // are advisory on confirm, but a divergence is a clear sign
+    // of a client/middleware bug — fail loudly rather than execute
+    // something the user didn't review.
+    if stored_kind != body_kind {
+        return Err(IpcError {
+            code: IpcErrorCode::PreconditionFailed,
+            message: format!(
+                "confirm body mutation_kind ({:?}) does not match stored kind ({:?})",
+                body_kind, stored_kind
+            ),
+            diagnostics_id: None,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::IPC_PROTOCOL_VERSION;
+    use crate::ipc::{IpcHandler, IPC_PROTOCOL_VERSION};
     use crate::ipc_handlers::operation_status_store::OperationState;
     use crate::ipc_handlers::payloads::MutationKind;
     use crate::ipc_handlers::test_fakes::{FakeMutationExecutor, FakeRulesLock};
@@ -1018,8 +1088,8 @@ mod tests {
         > {
             self.0.rollback_target(principal, target)
         }
-        fn safe_disable(&self, reason: &str) -> MutationOutcome {
-            self.0.safe_disable(reason)
+        fn safe_disable(&self, principal: &str, reason: &str) -> MutationOutcome {
+            self.0.safe_disable(principal, reason)
         }
     }
 

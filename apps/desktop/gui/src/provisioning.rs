@@ -11,8 +11,10 @@
 //! their administrator) authored, and the app's own state lives in preferences.
 
 use std::env;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use nrr_platform_api::admin_authored::AdminAuthoredFiles;
 use serde::Deserialize;
 
 /// File name looked for next to the executable and under the machine state
@@ -72,23 +74,65 @@ pub struct LoadedProvisioning {
     pub source_path: PathBuf,
 }
 
+/// Largest sheet read: the answers are a handful of short strings.
+const MAX_SHEET_BYTES: u64 = 64 * 1024;
+
+/// One place a sheet may come from, and whether it must be shown to have been
+/// placed by an administrator before it is believed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Candidate {
+    path: PathBuf,
+    admin_only: bool,
+}
+
 /// Search order: next to the executable (portable copy, installer payload),
 /// then the machine state root. Never a directory above the executable: a
 /// sheet there could be planted by another local user and would seed policy.
-pub fn load() -> Option<LoadedProvisioning> {
-    for candidate in candidate_paths() {
-        match read_answers(&candidate) {
+///
+/// The state root may predate the service, created by any local account, so a
+/// sheet there counts only when `machine_files` says no ordinary account could
+/// have written it. The executable's own folder needs no such proof: whoever
+/// can write there can replace the executable too.
+pub fn load(machine_files: &dyn AdminAuthoredFiles) -> Option<LoadedProvisioning> {
+    let executable = env::current_exe().ok();
+    load_from(
+        &candidate_paths_for(
+            executable.as_deref().and_then(Path::parent),
+            nrr_platform_api::paths::production_data_root().as_deref(),
+        ),
+        machine_files,
+    )
+}
+
+fn load_from(
+    candidates: &[Candidate],
+    machine_files: &dyn AdminAuthoredFiles,
+) -> Option<LoadedProvisioning> {
+    for candidate in candidates {
+        if !candidate.path.exists() {
+            continue;
+        }
+        if candidate.admin_only {
+            if let Some(why) = machine_files.untrusted_because(&candidate.path) {
+                eprintln!(
+                    "nrr-gui: ignoring {}: not placed by an administrator ({why})",
+                    candidate.path.display()
+                );
+                continue;
+            }
+        }
+        match read_answers(&candidate.path) {
             Ok(Some(answers)) => {
                 return Some(LoadedProvisioning {
                     answers,
-                    source_path: candidate,
+                    source_path: candidate.path.clone(),
                 })
             }
             Ok(None) => continue,
             Err(message) => {
                 // A malformed sheet must not take the wizard down with it: the
                 // user still has to be able to set the app up by hand.
-                eprintln!("nrr-gui: ignoring {}: {message}", candidate.display());
+                eprintln!("nrr-gui: ignoring {}: {message}", candidate.path.display());
                 continue;
             }
         }
@@ -96,28 +140,32 @@ pub fn load() -> Option<LoadedProvisioning> {
     None
 }
 
-fn candidate_paths() -> Vec<PathBuf> {
-    let executable = env::current_exe().ok();
-    candidate_paths_for(
-        executable.as_deref().and_then(Path::parent),
-        nrr_platform_api::paths::production_data_root().as_deref(),
-    )
-}
-
-fn candidate_paths_for(executable_dir: Option<&Path>, state_root: Option<&Path>) -> Vec<PathBuf> {
-    executable_dir
-        .into_iter()
-        .chain(state_root)
-        .map(|dir| dir.join(PROVISIONING_FILE_NAME))
-        .collect()
+fn candidate_paths_for(executable_dir: Option<&Path>, state_root: Option<&Path>) -> Vec<Candidate> {
+    let beside = executable_dir.map(|dir| Candidate {
+        path: dir.join(PROVISIONING_FILE_NAME),
+        admin_only: false,
+    });
+    let machine = state_root.map(|dir| Candidate {
+        path: dir.join(PROVISIONING_FILE_NAME),
+        admin_only: true,
+    });
+    beside.into_iter().chain(machine).collect()
 }
 
 /// `Ok(None)` = no file there. `Err` = the file exists but could not be used.
 fn read_answers(path: &Path) -> Result<Option<ProvisioningAnswers>, String> {
-    if !path.exists() {
-        return Ok(None);
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut text = String::new();
+    file.take(MAX_SHEET_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| e.to_string())?;
+    if text.len() as u64 > MAX_SHEET_BYTES {
+        return Err(format!("larger than {MAX_SHEET_BYTES} bytes"));
     }
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let answers: ProvisioningAnswers =
         serde_json::from_str(&text).map_err(|e| format!("not a valid answer sheet: {e}"))?;
     if answers.is_empty() {
@@ -130,6 +178,42 @@ fn read_answers(path: &Path) -> Result<Option<ProvisioningAnswers>, String> {
 mod tests {
     use super::*;
 
+    struct Refuse;
+    impl AdminAuthoredFiles for Refuse {
+        fn untrusted_because(&self, _path: &Path) -> Option<String> {
+            Some("planted".to_owned())
+        }
+    }
+    struct Believe;
+    impl AdminAuthoredFiles for Believe {
+        fn untrusted_because(&self, _path: &Path) -> Option<String> {
+            None
+        }
+    }
+
+    /// A fresh directory removed on drop; this crate has no temp-dir crate.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir =
+                env::temp_dir().join(format!("nrr-provisioning-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Self(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const SHEET: &str =
+        r#"{"kill-switch":false,"doh-lockdown":false,"fake-ip":false,"rule-set":"none"}"#;
+
     #[test]
     fn the_sheet_is_looked_for_only_beside_the_binary_and_under_the_state_root() {
         let binary_dir = Path::new("package").join("bin");
@@ -137,10 +221,43 @@ mod tests {
         assert_eq!(
             candidate_paths_for(Some(&binary_dir), Some(state_root)),
             vec![
-                binary_dir.join(PROVISIONING_FILE_NAME),
-                state_root.join(PROVISIONING_FILE_NAME),
+                Candidate {
+                    path: binary_dir.join(PROVISIONING_FILE_NAME),
+                    admin_only: false,
+                },
+                Candidate {
+                    path: state_root.join(PROVISIONING_FILE_NAME),
+                    admin_only: true,
+                },
             ]
         );
+    }
+
+    #[test]
+    fn a_machine_sheet_an_ordinary_account_could_have_placed_is_ignored() {
+        let state_root = Scratch::new("machine");
+        std::fs::write(state_root.path().join(PROVISIONING_FILE_NAME), SHEET).expect("plant");
+        let candidates = candidate_paths_for(None, Some(state_root.path()));
+        assert_eq!(load_from(&candidates, &Refuse), None);
+        let believed = load_from(&candidates, &Believe).expect("an administrator's sheet");
+        assert!(believed.answers.completes_first_run());
+    }
+
+    #[test]
+    fn the_sheet_beside_the_binary_needs_no_proof_of_authorship() {
+        let binary_dir = Scratch::new("beside");
+        std::fs::write(binary_dir.path().join(PROVISIONING_FILE_NAME), SHEET).expect("write");
+        let candidates = candidate_paths_for(Some(binary_dir.path()), None);
+        assert!(load_from(&candidates, &Refuse).is_some());
+    }
+
+    #[test]
+    fn an_oversized_sheet_is_refused_unread() {
+        let dir = Scratch::new("oversized");
+        let path = dir.path().join(PROVISIONING_FILE_NAME);
+        let padding = " ".repeat(MAX_SHEET_BYTES as usize);
+        std::fs::write(&path, format!("{padding}{SHEET}")).expect("write");
+        assert!(read_answers(&path).is_err());
     }
 
     #[test]

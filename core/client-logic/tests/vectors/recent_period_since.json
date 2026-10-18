@@ -1,0 +1,95 @@
+{
+  "description": "pure.js recentPeriodSince: where the Recent filter's period starts",
+  "cases": [
+    {
+      "name": "last hour",
+      "input": {
+        "period": "hour",
+        "now": 1792236730,
+        "offset": 180
+      },
+      "expected": 1792233130
+    },
+    {
+      "name": "seven days",
+      "input": {
+        "period": "week",
+        "now": 1792236730,
+        "offset": 180
+      },
+      "expected": 1791631930
+    },
+    {
+      "name": "today from local midnight moscow",
+      "input": {
+        "period": "today",
+        "now": 1792236730,
+        "offset": 180
+      },
+      "expected": 1792184400
+    },
+    {
+      "name": "today from local midnight utc",
+      "input": {
+        "period": "today",
+        "now": 1792236730,
+        "offset": 0
+      },
+      "expected": 1792195200
+    },
+    {
+      "name": "today west of utc",
+      "input": {
+        "period": "today",
+        "now": 1792236730,
+        "offset": -300
+      },
+      "expected": 1792213200
+    },
+    {
+      "name": "today far east",
+      "input": {
+        "period": "today",
+        "now": 1792236730,
+        "offset": 840
+      },
+      "expected": 1792231200
+    },
+    {
+      "name": "today exactly at midnight",
+      "input": {
+        "period": "today",
+        "now": 1792184400,
+        "offset": 180
+      },
+      "expected": 1792184400
+    },
+    {
+      "name": "today a second before midnight",
+      "input": {
+        "period": "today",
+        "now": 1792184399,
+        "offset": 180
+      },
+      "expected": 1792098000
+    },
+    {
+      "name": "today half-hour zone",
+      "input": {
+        "period": "today",
+        "now": 1792236730,
+        "offset": 330
+      },
+      "expected": 1792175400
+    },
+    {
+      "name": "unknown period reads as today",
+      "input": {
+        "period": "",
+        "now": 1792236730,
+        "offset": 180
+      },
+      "expected": 1792184400
+    }
+  ]
+}

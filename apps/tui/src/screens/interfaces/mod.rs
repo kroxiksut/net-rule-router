@@ -8,6 +8,7 @@ pub mod keys;
 use crossterm::event::{KeyCode, KeyEvent};
 use nrr_client_logic::adapters::{display_name, held_other_role, role_hint, unroutable_reason};
 use nrr_client_logic::Route;
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc_payloads::InterfaceRowDto;
 
 use self::keys as k;
@@ -400,15 +401,16 @@ fn panels(app: &AppState, texts: &Texts) -> Vec<Panel> {
 fn role_lines(app: &AppState, rows: &[InterfaceRowDto], texts: &Texts) -> Vec<ViewLine> {
     let mut lines = vec![ViewLine::text(texts.get(k::ROLE_EXPLANATION))];
     for route in Route::ALL {
-        let mut segments = vec![Segment::strong(format!(
-            "{}: ",
-            texts.get(role_label(route))
-        ))];
+        let mut segments = vec![
+            Segment::route(texts.get(role_label(route)), route),
+            Segment::plain(": "),
+        ];
         if let Some(row) = rows.iter().find(|row| holds(row, route)) {
             segments.push(Segment::plain(format!("{} — ", display_name(row))));
             segments.push(availability(row, texts));
         } else if let Some(bound) = binding(app, route) {
-            segments.push(Segment::plain(format!("{} — ", bound.display_name)));
+            let name = display_text(&bound.display_name);
+            segments.push(Segment::plain(format!("{name} — ")));
             segments.push(Segment::state(texts.get(k::REMEMBERED), StateTone::Caution));
         } else {
             segments.push(Segment::state(
@@ -435,7 +437,7 @@ fn adapter_lines(app: &AppState, rows: &[InterfaceRowDto], texts: &Texts) -> Vec
             let marker = if i == cursor { ">" } else { " " };
             let head = format!("{marker} {}. {}", i + 1, display_name(row));
             let mut segments = vec![if i == cursor {
-                Segment::strong(head)
+                Segment::selected(head)
             } else {
                 Segment::plain(head)
             }];
@@ -445,10 +447,8 @@ fn adapter_lines(app: &AppState, rows: &[InterfaceRowDto], texts: &Texts) -> Vec
             segments.push(Segment::plain(" — "));
             segments.push(availability(row, texts));
             if let Some(route) = Route::ALL.into_iter().find(|r| holds(row, *r)) {
-                segments.push(Segment::strong(format!(
-                    " — {}",
-                    texts.get(role_label(route))
-                )));
+                segments.push(Segment::plain(" — "));
+                segments.push(Segment::route(texts.get(role_label(route)), route));
             }
             ViewLine::new(segments)
         })
@@ -469,7 +469,7 @@ fn detail_lines(row: &InterfaceRowDto, texts: &Texts) -> Vec<ViewLine> {
     }
     let mut device = Vec::new();
     if !row.interface_description.is_empty() && row.interface_description != row.name {
-        device.push(row.interface_description.clone());
+        device.push(display_text(&row.interface_description).into_owned());
     }
     if let Some(tech) = row.device_technology.as_deref().filter(|t| !t.is_empty()) {
         device.push(texts.dynamic(&format!("interfaces.device-technology.{tech}"), tech));

@@ -54,8 +54,16 @@
 //! Addresses a rule names — exactly, or inside a subnet or range — are the
 //! opposite case: they are policy, not observation, and belong to that rule, so
 //! they are never written back as an application's destinations.
+//!
+//! ## Whose destinations
+//!
+//! Where observations are kept per user, each row is written with its user and
+//! seeds only that user's store: an address Alice's browser used must never
+//! become a route in Bob's plan. A machine-wide store writes and reads rows
+//! with no owner. A row without an owner therefore never reaches a per-user
+//! store — including every row written before rows had owners — and ages out.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -69,16 +77,20 @@ use crate::fqdn_cache_lookup::ENFORCEMENT_CONFIRMATION_WINDOW;
 use crate::per_sid_orchestrator::RulesProvider;
 use crate::wfp_codegen::PER_HOSTNAME_IP_CAP;
 
-/// Persist one application's currently-known destinations, stamped with the
-/// confirmation time. The production impl writes
-/// `nrr_storage::app_destinations::AppDestinationsRepository::upsert`.
-pub type AppDestinationPersistFn = Arc<dyn Fn(&str, &[Ipv4Addr], SystemTime) + Send + Sync>;
+pub use nrr_storage::app_destinations::RememberedDestination;
 
-/// Load every `(app pattern, destination)` pair confirmed at or after the given
-/// instant. The production impl reads
+/// Persist one application's currently-known destinations for an owner (`None`
+/// for a machine-wide store), stamped with the confirmation time. The
+/// production impl writes
+/// `nrr_storage::app_destinations::AppDestinationsRepository::upsert`.
+pub type AppDestinationPersistFn =
+    Arc<dyn Fn(Option<&str>, &str, &[Ipv4Addr], SystemTime) + Send + Sync>;
+
+/// Load every remembered destination confirmed at or after the given instant,
+/// with its owner. The production impl reads
 /// `nrr_storage::app_destinations::AppDestinationsRepository::load_confirmed_since`
 /// and prunes what falls outside it.
-pub type AppDestinationLoadFn = Arc<dyn Fn(SystemTime) -> Vec<(String, Ipv4Addr)> + Send + Sync>;
+pub type AppDestinationLoadFn = Arc<dyn Fn(SystemTime) -> Vec<RememberedDestination> + Send + Sync>;
 
 /// Outcome of one [`AppDestinationMemory::flush`] pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -147,13 +159,36 @@ impl AppDestinationMemory {
         let cutoff = now
             .checked_sub(self.window)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let pairs = (self.load)(cutoff);
-        if pairs.is_empty() {
+        let rows = (self.load)(cutoff);
+        if rows.is_empty() {
             return 0;
         }
-        // Rows an earlier build wrote passed an older filter: hold them to the
-        // one `flush` applies today. With nobody's rules readable yet there is
-        // nothing to hold them to; codegen still gates them by the rules.
+        let seeded = if self.observations.keeps_per_principal() {
+            self.seed_each_owner(rows)
+        } else {
+            self.seed_machine_wide(rows)
+        };
+        if seeded > 0 {
+            tracing::info!(
+                target: "nrr::app-routing",
+                msg_key = "appdestmem-preseeded",
+                destinations = seeded,
+                "pre-seeded application destinations from earlier sessions — their routes exist before the first connection",
+            );
+        }
+        seeded
+    }
+
+    /// The machine-wide store takes the rows with no owner. Rows an earlier
+    /// build wrote passed an older filter: hold them to the one `flush` applies
+    /// today. With nobody's rules readable yet there is nothing to hold them
+    /// to; codegen still gates them by the rules.
+    fn seed_machine_wide(&self, rows: Vec<RememberedDestination>) -> usize {
+        let pairs: Vec<(String, Ipv4Addr)> = rows
+            .into_iter()
+            .filter(|row| row.owner.is_none())
+            .map(|row| (row.app_key, row.ip))
+            .collect();
         let books = self.present_books();
         let pairs: Vec<(String, Ipv4Addr)> = if books.is_empty() {
             pairs
@@ -163,14 +198,35 @@ impl AppDestinationMemory {
                 .filter(|(key, ip)| books.iter().any(|book| admits(book, key, *ip)))
                 .collect()
         };
-        let seeded = self.observations.seed_many(&pairs);
-        if seeded > 0 {
-            tracing::info!(
-                target: "nrr::app-routing",
-                msg_key = "appdestmem-preseeded",
-                destinations = seeded,
-                "pre-seeded application destinations from earlier sessions — their routes exist before the first connection",
-            );
+        self.observations.seed_many(&pairs)
+    }
+
+    /// Kept per user, each owner's rows go into that owner's store alone, held
+    /// to that owner's rules where they are readable. A row with no owner
+    /// seeds nobody.
+    fn seed_each_owner(&self, rows: Vec<RememberedDestination>) -> usize {
+        let mut by_owner: BTreeMap<String, Vec<(String, Ipv4Addr)>> = BTreeMap::new();
+        for row in rows {
+            if let Some(owner) = row.owner {
+                by_owner
+                    .entry(owner)
+                    .or_default()
+                    .push((row.app_key, row.ip));
+            }
+        }
+        let mut seeded = 0;
+        for (owner, pairs) in by_owner {
+            let Some(store) = self.observations.scope_for(Some(&owner)) else {
+                continue;
+            };
+            let pairs: Vec<(String, Ipv4Addr)> = match self.rules.active_rules_for(&owner) {
+                Some(snapshot) => pairs
+                    .into_iter()
+                    .filter(|(key, ip)| admits(&snapshot.rule_book, key, *ip))
+                    .collect(),
+                None => pairs,
+            };
+            seeded += store.seed_many(&pairs);
         }
         seeded
     }
@@ -186,7 +242,7 @@ impl AppDestinationMemory {
             let Some(snapshot) = self.rules.active_rules_for(&sid) else {
                 continue;
             };
-            self.flush_for(&snapshot, now, &mut written, &mut summary);
+            self.flush_for(&sid, &snapshot, now, &mut written, &mut summary);
         }
         summary
     }
@@ -209,22 +265,33 @@ impl AppDestinationMemory {
     /// persisting them twice would double the reported counts.
     fn flush_for(
         &self,
+        sid: &str,
         snapshot: &crate::per_sid_orchestrator::ActiveRulesSnapshot,
         now: SystemTime,
         written: &mut std::collections::HashSet<String>,
         summary: &mut FlushSummary,
     ) {
+        // Kept per user, the destinations are this user's own.
+        let Some(observations) = self.observations.scope_for(Some(sid)) else {
+            return;
+        };
+        let owner = self.observations.keeps_per_principal().then_some(sid);
         for pattern in routed_app_patterns(&snapshot.rule_book.secondary) {
             // The column is `app_key` and the observation store answers on
             // keys; persisting the rule spelling instead left rows nothing
             // could later withdraw.
             let key = crate::app_observation_lookup::app_key(&pattern);
-            if key.is_empty() || !written.insert(key.clone()) {
+            // Shared observations are written once; a user's own, once each.
+            let written_as = match owner {
+                Some(owner) => format!("{owner}/{key}"),
+                None => key.clone(),
+            };
+            if key.is_empty() || !written.insert(written_as) {
                 continue;
             }
             // The same slice the codegen enforces: sorted, capped identically,
             // so nothing is persisted that could not become a route anyway.
-            let ips = self.observations.ips_for_app(&pattern);
+            let ips = observations.ips_for_app(&pattern);
             if ips.is_empty() {
                 continue;
             }
@@ -236,7 +303,7 @@ impl AppDestinationMemory {
             // `prune_before` never has anything to prune. Untouched rows keep
             // the `learned_at` they earned — the upsert only moves it forward
             // for the addresses named here.
-            let seen = self.observations.take_seen_since_flush(&pattern);
+            let seen = observations.take_seen_since_flush(&pattern);
             let confirmed: Vec<Ipv4Addr> = ips
                 .iter()
                 .copied()
@@ -246,7 +313,7 @@ impl AppDestinationMemory {
             if confirmed.is_empty() {
                 continue;
             }
-            (self.persist)(&key, &confirmed, now);
+            (self.persist)(owner, &key, &confirmed, now);
             summary.apps = summary.apps.saturating_add(1);
             summary.destinations = summary.destinations.saturating_add(confirmed.len() as u32);
         }
@@ -294,8 +361,11 @@ pub fn routed_app_patterns(set: &CanonicalRuleSet) -> BTreeSet<String> {
         .filter(|r| r.enabled && matches!(r.action, RuleAction::Route))
         .filter(|r| r.address_match.is_none())
         .filter_map(|r| r.app_match.as_ref())
-        .map(|app| match &app.pattern {
-            CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.clone(),
+        .filter_map(|app| match &app.pattern {
+            CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => Some(s.clone()),
+            // TODO: a path rule learns destinations once its programs can be
+            // listed; until then it names none.
+            CanonicalAppPattern::Path(_) => None,
         })
         .collect()
 }
@@ -356,21 +426,25 @@ mod tests {
 
     /// Persisted rows shared between the fake persist + load closures, so one
     /// fixture exercises a full session hand-off.
+    type PersistedRow = (Option<String>, String, Ipv4Addr, SystemTime);
+
     #[derive(Default)]
     struct FakeTable {
-        rows: Mutex<Vec<(String, Ipv4Addr, SystemTime)>>,
+        rows: Mutex<Vec<PersistedRow>>,
     }
 
     impl FakeTable {
         fn persist_fn(table: &Arc<FakeTable>) -> AppDestinationPersistFn {
             let table = Arc::clone(table);
-            Arc::new(move |app: &str, ips: &[Ipv4Addr], now: SystemTime| {
-                let mut g = table.rows.lock().unwrap_or_else(|p| p.into_inner());
-                for ip in ips {
-                    g.retain(|(a, i, _)| !(a == app && i == ip));
-                    g.push((app.to_string(), *ip, now));
-                }
-            })
+            Arc::new(
+                move |owner: Option<&str>, app: &str, ips: &[Ipv4Addr], now: SystemTime| {
+                    let mut g = table.rows.lock().unwrap_or_else(|p| p.into_inner());
+                    for ip in ips {
+                        g.retain(|(o, a, i, _)| !(o.as_deref() == owner && a == app && i == ip));
+                        g.push((owner.map(str::to_owned), app.to_string(), *ip, now));
+                    }
+                },
+            )
         }
 
         fn load_fn(table: &Arc<FakeTable>) -> AppDestinationLoadFn {
@@ -378,8 +452,12 @@ mod tests {
             Arc::new(move |cutoff: SystemTime| {
                 let g = table.rows.lock().unwrap_or_else(|p| p.into_inner());
                 g.iter()
-                    .filter(|(_, _, at)| *at >= cutoff)
-                    .map(|(a, i, _)| (a.clone(), *i))
+                    .filter(|(_, _, _, at)| *at >= cutoff)
+                    .map(|(o, a, i, _)| RememberedDestination {
+                        owner: o.clone(),
+                        app_key: a.clone(),
+                        ip: *i,
+                    })
                     .collect()
             })
         }
@@ -495,7 +573,7 @@ mod tests {
         // from an earlier session is not loaded at all.
         let table = Arc::new(FakeTable::default());
         let rules = book(vec![app_rule("r1", "messenger.exe")]);
-        FakeTable::persist_fn(&table)("chrome.exe", &[ip(9)], SystemTime::now());
+        FakeTable::persist_fn(&table)(None, "chrome.exe", &[ip(9)], SystemTime::now());
 
         let store = Arc::new(AppObservationStore::new());
         let mem = memory(&store, rules.clone(), &table);
@@ -510,7 +588,7 @@ mod tests {
     fn a_remembered_address_a_rule_now_names_is_not_loaded() {
         let table = Arc::new(FakeTable::default());
         let now = SystemTime::now();
-        FakeTable::persist_fn(&table)("messenger", &[ip(5), ip(50), ip(60)], now);
+        FakeTable::persist_fn(&table)(None, "messenger", &[ip(5), ip(50), ip(60)], now);
         let mut rules = book(vec![app_rule("r1", "messenger.exe")]);
         let address = |id: &str, ip: Ipv4Addr| CanonicalRule {
             address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(ip))),
@@ -545,7 +623,47 @@ mod tests {
         let mem = memory(&store, rules, &table);
         mem.flush(SystemTime::now());
         let rows = table.rows.lock().unwrap_or_else(|p| p.into_inner());
-        assert_eq!(rows.iter().map(|r| r.1).collect::<Vec<_>>(), vec![ip(5)]);
+        assert_eq!(rows.iter().map(|r| r.2).collect::<Vec<_>>(), vec![ip(5)]);
+    }
+
+    /// Each signed-in user's own book, by SID.
+    struct TwoUsersRules;
+    impl RulesProvider for TwoUsersRules {
+        fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+            None
+        }
+        fn active_rules_for(&self, principal: &str) -> Option<ActiveRulesSnapshot> {
+            let app = match principal {
+                "S-A" => "messenger.exe",
+                "S-B" => "chat.exe",
+                _ => return None,
+            };
+            Some(ActiveRulesSnapshot {
+                rule_book: book(vec![app_rule(principal, app)]),
+            })
+        }
+    }
+
+    #[test]
+    fn every_signed_in_users_application_destinations_are_remembered() {
+        // A fresh store each time: a flush drains what it has written back.
+        let flushed = |present: Vec<&'static str>| {
+            let store = Arc::new(AppObservationStore::new());
+            store.record("messenger.exe", ip(7));
+            store.record("chat.exe", ip(8));
+            let table = Arc::new(FakeTable::default());
+            let mem = AppDestinationMemory::new(
+                Arc::clone(&store),
+                Arc::new(TwoUsersRules) as Arc<dyn RulesProvider>,
+                Arc::new(move || present.iter().map(|s| (*s).to_owned()).collect()),
+                FakeTable::persist_fn(&table),
+                FakeTable::load_fn(&table),
+            );
+            mem.flush(SystemTime::now()).apps
+        };
+        // Handed the console user alone, the second user's rule starts cold.
+        assert_eq!(flushed(vec!["S-A"]), 1);
+        assert_eq!(flushed(vec!["S-A", "S-B"]), 2);
     }
 
     #[test]
@@ -587,7 +705,7 @@ mod tests {
         // Persisted under the observation key, which is what a later
         // withdrawal looks the row up by.
         assert_eq!(
-            table.rows.lock().unwrap_or_else(|p| p.into_inner())[0].0,
+            table.rows.lock().unwrap_or_else(|p| p.into_inner())[0].1,
             "messenger"
         );
     }
@@ -626,7 +744,7 @@ mod tests {
             }
         );
         let rows = table.rows.lock().unwrap_or_else(|p| p.into_inner());
-        assert_eq!(rows.iter().map(|r| r.1).collect::<Vec<_>>(), vec![ip(5)]);
+        assert_eq!(rows.iter().map(|r| r.2).collect::<Vec<_>>(), vec![ip(5)]);
     }
 
     #[test]
@@ -637,8 +755,8 @@ mod tests {
         let stale = now
             .checked_sub(ENFORCEMENT_CONFIRMATION_WINDOW + Duration::from_secs(60))
             .expect("clock past the epoch");
-        FakeTable::persist_fn(&table)("messenger.exe", &[ip(1)], stale);
-        FakeTable::persist_fn(&table)("messenger.exe", &[ip(2)], now);
+        FakeTable::persist_fn(&table)(None, "messenger.exe", &[ip(1)], stale);
+        FakeTable::persist_fn(&table)(None, "messenger.exe", &[ip(2)], now);
 
         let store = Arc::new(AppObservationStore::new());
         let mem = memory(&store, rules.clone(), &table);
@@ -755,5 +873,92 @@ mod tests {
         let mem = memory(&second, rules.clone(), &table);
         assert_eq!(mem.warm_load(SystemTime::now()), 1);
         assert_eq!(routes_for(&rules, &second), vec![ip(3)]);
+    }
+
+    fn plan_of(store: &Arc<AppObservationStore>, principal: &str, app: &str) -> Vec<Ipv4Addr> {
+        store
+            .scope_for(Some(principal))
+            .expect("kept per user")
+            .ips_for_app(app)
+    }
+
+    /// Kept per user, a remembered destination goes back to its owner alone:
+    /// Bob's rule for the same program never routes Alice's addresses, and a
+    /// row nobody owns (every row from before rows had owners) seeds nobody.
+    #[test]
+    fn seeding_gives_each_user_only_their_own_destinations() {
+        let table = Arc::new(FakeTable::default());
+        let now = SystemTime::now();
+        let persist = FakeTable::persist_fn(&table);
+        persist(Some("uid:1000"), "firefox", &[ip(1)], now);
+        persist(Some("uid:1001"), "firefox", &[ip(2)], now);
+        persist(None, "firefox", &[ip(3)], now);
+
+        let store = Arc::new(AppObservationStore::per_principal());
+        let mem = memory(&store, book(vec![app_rule("r1", "firefox")]), &table);
+        assert_eq!(mem.warm_load(now), 2);
+        assert_eq!(plan_of(&store, "uid:1000", "firefox"), vec![ip(1)]);
+        assert_eq!(plan_of(&store, "uid:1001", "firefox"), vec![ip(2)]);
+        assert!(
+            plan_of(&store, "uid:1002", "firefox").is_empty(),
+            "a row without an owner reaches nobody"
+        );
+    }
+
+    /// Kept per user, a flush writes each user's destinations under that user,
+    /// and the next session hands them back to that user only.
+    #[test]
+    fn a_per_user_flush_round_trips_to_the_same_user() {
+        let table = Arc::new(FakeTable::default());
+        let rules = book(vec![app_rule("r1", "firefox")]);
+        let store = Arc::new(AppObservationStore::per_principal());
+        store
+            .scope_for(Some("uid:1000"))
+            .expect("owner known")
+            .record("/usr/bin/firefox", ip(7));
+        let mem = AppDestinationMemory::new(
+            Arc::clone(&store),
+            Arc::new(FixedRules {
+                book: rules.clone(),
+            }) as Arc<dyn RulesProvider>,
+            Arc::new(|| vec!["uid:1000".to_string(), "uid:1001".to_string()]),
+            FakeTable::persist_fn(&table),
+            FakeTable::load_fn(&table),
+        );
+        assert_eq!(
+            mem.flush(SystemTime::now()),
+            FlushSummary {
+                apps: 1,
+                destinations: 1
+            }
+        );
+        {
+            let rows = table.rows.lock().unwrap_or_else(|p| p.into_inner());
+            let written: Vec<(Option<&str>, Ipv4Addr)> =
+                rows.iter().map(|r| (r.0.as_deref(), r.2)).collect();
+            assert_eq!(written, vec![(Some("uid:1000"), ip(7))]);
+        }
+
+        let next = Arc::new(AppObservationStore::per_principal());
+        let mem = memory(&next, rules, &table);
+        assert_eq!(mem.warm_load(SystemTime::now()), 1);
+        assert_eq!(plan_of(&next, "uid:1000", "firefox"), vec![ip(7)]);
+        assert!(plan_of(&next, "uid:1001", "firefox").is_empty());
+    }
+
+    /// A machine-wide store keeps no owner, so it takes back only rows that
+    /// have none.
+    #[test]
+    fn a_machine_wide_store_takes_only_ownerless_rows() {
+        let table = Arc::new(FakeTable::default());
+        let now = SystemTime::now();
+        let persist = FakeTable::persist_fn(&table);
+        persist(None, "messenger", &[ip(1)], now);
+        persist(Some("S-A"), "messenger", &[ip(2)], now);
+
+        let store = Arc::new(AppObservationStore::new());
+        let mem = memory(&store, book(vec![app_rule("r1", "messenger.exe")]), &table);
+        assert_eq!(mem.warm_load(now), 1);
+        assert_eq!(store.ips_for_app("messenger.exe"), vec![ip(1)]);
     }
 }

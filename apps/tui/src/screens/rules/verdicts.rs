@@ -127,6 +127,9 @@ pub fn move_all(app: &mut AppState) -> bool {
     if notice(app).is_none() {
         return false;
     }
+    if !super::own_rules_on_screen(app) {
+        return true;
+    }
     if !app.link.is_connected() {
         app.rules.note = Some(offline());
         return true;
@@ -257,8 +260,8 @@ pub fn write_bound_files(app: &mut AppState) {
         if path.is_empty() {
             continue;
         }
-        let table = &app.rules.table;
-        let written = files::write_route(Path::new(&path), route, table, &exported_at);
+        let (table, hint) = (&app.rules.table, &app.rules.file_hint);
+        let written = files::write_route(Path::new(&path), route, table, hint, &exported_at);
         if let Err((path, error)) = written {
             let path = path.display().to_string();
             app.rules.note = Some(Note::with(

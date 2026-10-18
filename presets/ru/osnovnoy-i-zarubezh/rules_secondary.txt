@@ -1,4 +1,4 @@
-# NetRuleRouter preset - version 1
+# NetRuleRouter preset - version 8
 # name: RU Osnovnoy I Zarubezh - Secondary Route
 # description: Foreign social, messaging, AI, and developer services routed to secondary
 # author: NetRuleRouter contributors
@@ -30,6 +30,9 @@ youtu.be
 *.cdninstagram.com
 *.character.ai
 *.chatgpt.com
+*.oaistatic.com
+*.oaistatsig.com
+*.oaiusercontent.com
 *.civitai.com
 *.claude.ai
 *.claude.com
@@ -38,8 +41,7 @@ youtu.be
 *.discord.com
 *.discord.media
 *.discordapp.com
-*.facebook.com
-*.facebook.net
+facebook.*
 *.fb.com
 *.fbcdn.net
 *.fbsbx.com
@@ -86,8 +88,7 @@ youtu.be
 *.t.co
 *.t.me
 *.teamcity.com
-*.telegram.me
-*.telegram.org
+telegram.*
 *.threads.com
 *.threads.net
 *.tiktok.com
@@ -101,8 +102,7 @@ youtu.be
 *.viber.com
 *.viber.me
 *.wechat.com
-*.whatsapp.com
-*.whatsapp.net
+whatsapp.*
 *.x.ai
 *.x.com
 *.xusercontent.com
@@ -120,6 +120,7 @@ youtu.be
 *.qt.io  # Developer and IT services measured as unreachable from this country
 *.releases.hashicorp.com  # Developer and IT services measured as unreachable from this country
 *.sentry.io  # Developer and IT services measured as unreachable from this country
+autodesk.*  # Design and engineering software unavailable from this country
 
 --- Windows
 Cursor.exe

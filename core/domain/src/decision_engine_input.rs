@@ -207,8 +207,13 @@ fn normalize_app_identity_value(
         return (None, vec![InputAvailabilitySignal::AppContextUnavailable]);
     }
     let mut norm_warnings: Vec<NormalizationWarning> = Vec::new();
-    let original_path = ctx.process_path.clone();
     let contains_sep = trimmed.contains('/') || trimmed.contains('\\');
+    // A caller that knows only the image path passes it as the name: path
+    // rules match it, name rules its file name.
+    let original_path = ctx
+        .process_path
+        .clone()
+        .or_else(|| contains_sep.then(|| trimmed.to_owned()));
 
     let filename = if contains_sep {
         let stripped = trimmed

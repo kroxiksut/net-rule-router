@@ -2,13 +2,26 @@
 //! this model, so the full-screen picture and the line-mode transcript cannot
 //! say different things.
 
-/// How a piece of text is marked. Colour is reserved for state words: the only
-/// way to get a coloured tone is [`Segment::state`], which takes the word.
+use nrr_client_logic::Route;
+
+/// How a piece of text is marked. A colour that means something is given
+/// only with its words: a state colour by [`Segment::state`], a route colour by
+/// [`Segment::route`]. The rest only set text apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     Plain,
-    /// Headings and names: bold, never coloured.
+    /// Names and labels: bold, never coloured.
     Strong,
+    /// Headings and table header rows.
+    Accent,
+    /// Hints and secondary text; plain without colour.
+    Muted,
+    /// The name of the main route.
+    RoutePrimary,
+    /// The name of the additional route.
+    RouteSecondary,
+    /// The row under the cursor, which also carries the `>` marker.
+    Selected,
     Good,
     Caution,
     Bad,
@@ -32,6 +45,48 @@ impl Segment {
         Self {
             text: text.into(),
             tone: Tone::Strong,
+        }
+    }
+
+    pub fn accent(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: Tone::Accent,
+        }
+    }
+
+    pub fn muted(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: Tone::Muted,
+        }
+    }
+
+    /// The row under the cursor; the caller puts the `>` marker in `text`.
+    pub fn selected(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: Tone::Selected,
+        }
+    }
+
+    /// A route's name; the colour only repeats it.
+    pub fn route(name: impl Into<String>, route: Route) -> Self {
+        Self {
+            text: name.into(),
+            tone: match route {
+                Route::Primary => Tone::RoutePrimary,
+                Route::Secondary => Tone::RouteSecondary,
+            },
+        }
+    }
+
+    /// `name` marked as its route when `slug` is one of the two; plain
+    /// otherwise (a block, no route, an unknown slug).
+    pub fn route_slug(name: impl Into<String>, slug: &str) -> Self {
+        match Route::from_slug(slug) {
+            Some(route) => Self::route(name, route),
+            None => Self::plain(name),
         }
     }
 

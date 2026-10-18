@@ -100,11 +100,11 @@ fn pairs_say_which_route_the_sites_take() {
         "{wide}"
     );
     assert!(
-        wide.contains("They are blocked: on a tie a block wins"),
+        wide.contains("They are denied: on a tie a deny wins"),
         "{wide}"
     );
     assert!(
-        wide.contains("A block rule is part of this pair; change it in the rules list."),
+        wide.contains("A deny rule is part of this pair; change it in the rules list."),
         "{wide}"
     );
     assert!(
@@ -256,7 +256,7 @@ fn conflicts_in_the_applied_rules_are_worded() {
     assert!(wide.contains("Conflicts in the applied rules"), "{wide}");
     assert!(
         wide.contains(
-            "*.tracker.example does not block pixel.tracker.example: it shares 192.0.2.7 with cdn.example.com"
+            "*.tracker.example does not deny pixel.tracker.example: it shares 192.0.2.7 with cdn.example.com"
         ),
         "{wide}"
     );

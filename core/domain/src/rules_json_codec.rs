@@ -56,10 +56,9 @@ use crate::rules_revision::{
 };
 use crate::validation::{
     canonical_app_pattern, canonical_host_name, canonical_ip_address, canonical_ip_range,
-    canonical_subnet, settle_verify, HostNameKind, ValidationError,
+    canonical_name_pattern, canonical_subnet, settle_verify, HostNameKind, ValidationError,
 };
 use crate::RuleId;
-use nrr_shared::app_identity::ExecutableNaming;
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -224,6 +223,9 @@ fn encode_address_match(m: &CanonicalAddressMatch) -> AddressMatchDto {
         CanonicalAddressMatch::SuffixDomain(suffix) => AddressMatchDto::SuffixDomain {
             suffix: suffix.clone(),
         },
+        CanonicalAddressMatch::AnyZoneDomain(base) => {
+            AddressMatchDto::AnyZoneDomain { base: base.clone() }
+        }
         CanonicalAddressMatch::Zone(name) => AddressMatchDto::Zone { name: name.clone() },
         CanonicalAddressMatch::ExactIp(IpAddr::V4(addr)) => AddressMatchDto::ExactIpv4 {
             address: addr.to_string(),
@@ -246,6 +248,9 @@ fn encode_app_match(m: &CanonicalAppMatch) -> AppMatchDto {
         pattern: match &m.pattern {
             CanonicalAppPattern::Exact(v) => AppPatternDto::Exact { value: v.clone() },
             CanonicalAppPattern::Glob(v) => AppPatternDto::Glob { value: v.clone() },
+            CanonicalAppPattern::Path(path) => AppPatternDto::Path {
+                value: path.as_str().to_string(),
+            },
         },
         include_child_processes: m.include_child_processes,
     }
@@ -265,7 +270,6 @@ pub fn decode(
     dto: CanonicalRulesJsonV1,
     platform: HostPlatform,
 ) -> Result<RulesRevisionContent, RulesJsonCodecError> {
-    let naming = platform.executable_naming();
     // A newer schema is read, not refused: its unknown kinds are kept aside,
     // so a revision written by a newer build survives a downgrade.
     if dto.schema_version == 0 {
@@ -276,8 +280,8 @@ pub fn decode(
     }
 
     let mut unrecognized = UnrecognizedRules::default();
-    let primary = decode_route(dto.primary, naming, &mut unrecognized.primary)?;
-    let secondary = decode_route(dto.secondary, naming, &mut unrecognized.secondary)?;
+    let primary = decode_route(dto.primary, platform, &mut unrecognized.primary)?;
+    let secondary = decode_route(dto.secondary, platform, &mut unrecognized.secondary)?;
 
     Ok(RulesRevisionContent {
         rule_book: CanonicalRuleBook {
@@ -294,13 +298,13 @@ pub fn decode(
 /// nothing where it stands is settled as the rules file settles it.
 fn decode_route(
     rules: Vec<RuleDto>,
-    naming: ExecutableNaming,
+    platform: HostPlatform,
     kept: &mut Vec<RuleDto>,
 ) -> Result<Vec<CanonicalRule>, RulesJsonCodecError> {
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
         if !rule.is_unrecognized() {
-            let mut decoded = decode_rule(rule, naming)?;
+            let mut decoded = decode_rule(rule, platform)?;
             settle_verify(&mut decoded);
             out.push(decoded);
             continue;
@@ -321,17 +325,14 @@ fn decode_route(
     Ok(out)
 }
 
-fn decode_rule(
-    dto: RuleDto,
-    naming: ExecutableNaming,
-) -> Result<CanonicalRule, RulesJsonCodecError> {
+fn decode_rule(dto: RuleDto, platform: HostPlatform) -> Result<CanonicalRule, RulesJsonCodecError> {
     let address_match = dto
         .address_match
         .map(|m| decode_address_match(&dto.id, m))
         .transpose()?;
     let app_match = dto
         .app_match
-        .map(|m| decode_app_match(&dto.id, m, naming))
+        .map(|m| decode_app_match(&dto.id, m, platform))
         .transpose()?;
     if address_match.is_none() && app_match.is_none() {
         return Err(RulesJsonCodecError::EmptyMatch { rule_id: dto.id });
@@ -360,6 +361,10 @@ fn decode_address_match(
         }
         AddressMatchDto::SuffixDomain { suffix } => {
             CanonicalAddressMatch::SuffixDomain(respelled(HostNameKind::Domain, suffix))
+        }
+        AddressMatchDto::AnyZoneDomain { base } => {
+            let base = crate::AddressMatch::domain_value_name(&base).to_string();
+            CanonicalAddressMatch::AnyZoneDomain(respelled(HostNameKind::Domain, base))
         }
         AddressMatchDto::Zone { name } => {
             CanonicalAddressMatch::Zone(respelled(HostNameKind::Zone, name))
@@ -418,16 +423,29 @@ fn respelled(kind: HostNameKind, raw: String) -> String {
 /// The pipeline's reading of a wire application pattern: canonical spelling (a
 /// client may never have run validation, and two spellings of one rule would
 /// make the set unequal to itself) or the pipeline's refusal.
+///
+/// A `path` is read as the rules file reads the value; `exact` and `glob` are
+/// names, any directory dropped, as they were stored before paths existed.
 pub(crate) fn wire_app_pattern(
     pattern: &AppPatternDto,
-    naming: ExecutableNaming,
+    platform: HostPlatform,
     rule_id: &RuleId,
 ) -> Result<CanonicalAppPattern, ValidationError> {
+    let naming = platform.executable_naming();
     let (value, glob) = match pattern {
         // No process can carry a `*` in its name: an "exact" value holding one
         // is a mislabelled pattern.
         AppPatternDto::Exact { value } => (value, value.contains('*')),
         AppPatternDto::Glob { value } => (value, true),
+        AppPatternDto::Path { value } => {
+            return canonical_app_pattern(
+                value,
+                value.contains('*'),
+                platform,
+                rule_id,
+                &mut Vec::new(),
+            )
+        }
         AppPatternDto::Unrecognized(_) => {
             return Err(ValidationError::AppNameInvalid {
                 rule_id: rule_id.clone(),
@@ -435,16 +453,16 @@ pub(crate) fn wire_app_pattern(
             })
         }
     };
-    canonical_app_pattern(value, glob, naming, rule_id, &mut Vec::new())
+    canonical_name_pattern(value, glob, naming, rule_id, &mut Vec::new())
 }
 
 fn decode_app_match(
     rule_id: &str,
     m: AppMatchDto,
-    naming: ExecutableNaming,
+    platform: HostPlatform,
 ) -> Result<CanonicalAppMatch, RulesJsonCodecError> {
-    let pattern =
-        wire_app_pattern(&m.pattern, naming, &RuleId(rule_id.to_string())).map_err(|refusal| {
+    let pattern = wire_app_pattern(&m.pattern, platform, &RuleId(rule_id.to_string())).map_err(
+        |refusal| {
             let rule_id = rule_id.to_string();
             match refusal {
                 ValidationError::AppGlobTooWide { .. } => {
@@ -455,7 +473,8 @@ fn decode_app_match(
                     raw: m.pattern.value().to_owned(),
                 },
             }
-        })?;
+        },
+    )?;
     Ok(CanonicalAppMatch {
         pattern,
         include_child_processes: m.include_child_processes,
@@ -727,6 +746,102 @@ mod tests {
         assert_eq!(name(HostPlatform::Linux), "messenger-desktop");
         assert_eq!(name(HostPlatform::MacOS), "messenger-desktop");
         assert_eq!(name(HostPlatform::Windows), "messenger-desktop.exe");
+    }
+
+    fn app_dto(pattern: AppPatternDto) -> CanonicalRulesJsonV1 {
+        CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![RuleDto {
+                id: "r-app".into(),
+                enabled: true,
+                address_match: None,
+                app_match: Some(AppMatchDto {
+                    pattern,
+                    include_child_processes: false,
+                }),
+                comment: String::new(),
+                action: WireRuleAction::default(),
+                origin: None,
+            }],
+            secondary: vec![],
+        }
+    }
+
+    /// Every path form survives the wire in its own form, and the encoder
+    /// asks for the schema that added it.
+    #[test]
+    fn a_path_rule_round_trips_in_its_form() {
+        for (value, platform, stored) in [
+            (
+                r"C:\Apps\Tool.exe",
+                HostPlatform::Windows,
+                r"c:\apps\tool.exe",
+            ),
+            (r"C:\Apps\Tool", HostPlatform::Windows, r"c:\apps\tool\"),
+            (r"C:\Apps\Tool\*", HostPlatform::Windows, r"c:\apps\tool\*"),
+            ("/opt/Tool", HostPlatform::Linux, "/opt/Tool"),
+            ("/opt/Tool/", HostPlatform::Linux, "/opt/Tool/"),
+            ("/opt/Tool/*", HostPlatform::MacOS, "/opt/tool/*"),
+        ] {
+            let content = decode(
+                app_dto(AppPatternDto::Path {
+                    value: value.into(),
+                }),
+                platform,
+            )
+            .unwrap_or_else(|e| panic!("{value}: {e}"));
+            let wire = encode(&content);
+            assert_eq!(wire.schema_version, 5, "{value}");
+            assert_eq!(
+                wire.primary[0]
+                    .app_match
+                    .as_ref()
+                    .map(|m| m.pattern.clone()),
+                Some(AppPatternDto::Path {
+                    value: stored.into()
+                }),
+                "{value}"
+            );
+            assert_eq!(decode(wire, platform).expect("again"), content, "{value}");
+        }
+    }
+
+    /// A path that names no program is the pipeline's refusal on the wire too;
+    /// an `exact` value stored before paths existed still reads as its name.
+    #[test]
+    fn a_broken_path_is_refused_and_a_stored_name_keeps_its_reading() {
+        assert!(matches!(
+            decode(
+                app_dto(AppPatternDto::Path {
+                    value: r"C:\Apps\*.exe".into()
+                }),
+                HostPlatform::Windows
+            ),
+            Err(RulesJsonCodecError::AppNameInvalid { .. })
+        ));
+        assert!(matches!(
+            decode(
+                app_dto(AppPatternDto::Path {
+                    value: "C:\\Apps\\line\nbreak\\".into()
+                }),
+                HostPlatform::Windows
+            ),
+            Err(RulesJsonCodecError::AppNameInvalid { .. })
+        ));
+        let legacy = decode(
+            app_dto(AppPatternDto::Exact {
+                value: r"C:\Apps\Tool.exe".into(),
+            }),
+            HostPlatform::Windows,
+        )
+        .expect("decode");
+        assert_eq!(
+            legacy.rule_book.primary.rules()[0]
+                .app_match
+                .as_ref()
+                .map(|m| m.pattern.clone()),
+            Some(CanonicalAppPattern::Exact("tool.exe".into()))
+        );
     }
 
     #[test]

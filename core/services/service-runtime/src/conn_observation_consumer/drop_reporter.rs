@@ -78,17 +78,6 @@ impl ConnectionObservationConsumer {
             .contains(&ip)
     }
 
-    /// Did traffic leave over the secondary link recently enough that a direct
-    /// connection now is plausibly part of the same page?
-    // `pub(super)` because the impl is split across files and the caller
-    // is now another module.
-    pub(super) fn beside_routed_traffic(&self) -> bool {
-        self.last_secondary_at
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_some_and(|at| at.elapsed() <= COMPANION_WINDOW)
-    }
-
     /// Did the DoH/DoT lockdown band produce this drop? Read by the notice
     /// reason and by the FCrDNS gate, which must not name a resolver the
     /// lockdown just cut.
@@ -158,6 +147,13 @@ impl ConnectionObservationConsumer {
             return;
         }
         let reason = self.reason_for_drop(rec, killswitch_verified, default_block_id);
+        // A route that has not come up since the start is not an outage yet:
+        // its status notice speaks for it if it never does.
+        if reason == nrr_domain::block_notice::BlockReason::RouteUnavailable
+            && crate::startup_quiet::never_up(rec.user_sid.as_deref().unwrap_or_default())
+        {
+            return;
+        }
         if self.owner_scoped {
             if !self.announces_for_owner(rec, reason) {
                 return;

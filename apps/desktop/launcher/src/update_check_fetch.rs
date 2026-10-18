@@ -283,7 +283,9 @@ fn now_ms() -> u128 {
 }
 
 fn write_cache(cache: &UpdateCheckCache) {
-    let path = cache_path();
+    let Some(path) = cache_path() else {
+        return;
+    };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }

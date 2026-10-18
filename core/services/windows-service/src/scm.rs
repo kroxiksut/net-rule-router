@@ -434,9 +434,6 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
         ),
     }
 
-    tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "strip-orphaned-filters", "boot stage entered");
-    crate::runtime_deps::strip_orphaned_block_filters_standalone();
-
     tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "build-deps", "boot stage entered");
     let deps = crate::runtime_deps::build_supervised_runtime_deps(&artifacts, verbosity_handle);
     tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "run-runtime", "boot stage entered");

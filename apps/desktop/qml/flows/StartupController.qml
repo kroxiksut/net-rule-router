@@ -80,7 +80,8 @@ QtObject {
             var slug = String(code || "").toLowerCase().replace(/_/g, "-")
             // A refused or declined elevation is an answer: the setting stays
             // off, and the user hears so instead of a silent default.
-            if (slug === "forbidden" || slug === "uac-declined") {
+            if (slug === "forbidden" || slug === "uac-declined"
+                    || slug === "elevation-agent-missing" || slug === "elevation-unavailable") {
                 if (sent["fake-ip-enabled"] === true) _noteFakeIpNeedsAdministrator()
                 root.statusLine = slug === "uac-declined"
                     ? root.tr("status.route-policy-uac-declined",

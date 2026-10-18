@@ -787,6 +787,10 @@ impl DnsInterceptListener {
             // are pinned to it and blocked. Handing one out would only make the
             // client wait on it; its IPv4 rides the tunnel.
             Ipv6Guard::FiltersOnly => nodata(),
+            // Nothing pins the family and the tunnel is gone: a forward asks
+            // the main link for the name, and its CNAME chain hands the A
+            // lookup a target no rule names.
+            Ipv6Guard::Off if self.leak_guard.blocking_for_host(qname) => self.withheld(query),
             Ipv6Guard::Off => {
                 // A hole, not a routine forward: the user wrote a rule for
                 // this host and its IPv6 traffic is about to ignore it. Said
@@ -834,7 +838,13 @@ impl DnsInterceptListener {
     /// kill-switch still decides what may leave. Nothing cached: SERVFAIL, so
     /// the client re-asks in a moment rather than waiting out its own timeout.
     fn rule_host_answer_without_upstream(&self, query: &[u8], qname: &str) -> ListenerAction {
-        let cached = self.sink.cached_routable_ips(qname);
+        // While the guard holds, an address the census spared would carry the
+        // connection over the main link: withhold, as the slow path does.
+        let cached = if self.leak_guard.blocking_for_host(qname) {
+            Vec::new()
+        } else {
+            self.sink.cached_routable_ips(qname)
+        };
         if cached.is_empty() {
             self.unresolved.note_unresolved(qname);
             return build_error_response(query, RCODE_SERVFAIL)
@@ -852,6 +862,11 @@ impl DnsInterceptListener {
         );
         build_a_response(query, &answered, self.response_ttl)
             .map_or(ListenerAction::Forward, ListenerAction::Respond)
+    }
+
+    fn withheld(&self, query: &[u8]) -> ListenerAction {
+        build_error_response(query, RCODE_SERVFAIL)
+            .map_or(ListenerAction::Drop, ListenerAction::Respond)
     }
 
     fn route_aaaa(
@@ -895,7 +910,9 @@ impl DnsInterceptListener {
             // over the very addresses the guard is holding back.
             AaaaOutcome::Withheld => build_error_response(query, RCODE_SERVFAIL)
                 .map_or(ListenerAction::Drop, ListenerAction::Respond),
-            AaaaOutcome::Upstream(ResolveError::Unavailable(_)) if self.leak_guard.blocking() => {
+            AaaaOutcome::Upstream(ResolveError::Unavailable(_))
+                if self.leak_guard.blocking_for_host(qname) =>
+            {
                 build_error_response(query, RCODE_SERVFAIL)
                     .map_or(ListenerAction::Drop, ListenerAction::Respond)
             }
@@ -939,7 +956,12 @@ impl DnsInterceptListener {
             return self.aaaa_action(query, &q.qname, lane_wait, budget);
         }
         if q.qtype != QTYPE_A {
-            return ListenerAction::Forward; // not an A query
+            // An HTTPS record carries address hints; while the guard holds, a
+            // rule host's name is not asked of the main link in any type.
+            if self.oracle.is_rule_host(&q.qname) && self.leak_guard.blocking_for_host(&q.qname) {
+                return self.withheld(query);
+            }
+            return ListenerAction::Forward;
         }
         let rule_covered = self.oracle.is_rule_host(&q.qname);
         if !rule_covered {
@@ -993,7 +1015,9 @@ impl DnsInterceptListener {
             }
             // The guard is blocking: a raw forward would carry this rule host's
             // name over the main link, the very thing it holds back.
-            QueryOutcome::Upstream(ResolveError::Unavailable(_)) if self.leak_guard.blocking() => {
+            QueryOutcome::Upstream(ResolveError::Unavailable(_))
+                if self.leak_guard.blocking_for_host(&q.qname) =>
+            {
                 self.unresolved.note_unresolved(&q.qname);
                 build_error_response(query, RCODE_SERVFAIL)
                     .map_or(ListenerAction::Drop, ListenerAction::Respond)

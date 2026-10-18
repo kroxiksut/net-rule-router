@@ -42,6 +42,8 @@ ComboBox {
         leftPadding: theme.spacingSm
         rightPadding: root.indicator ? root.indicator.width + root.spacing : theme.spacingSm
         text: root.displayText
+        // Items include adapter and program names: never read them as markup.
+        textFormat: Text.PlainText
         font: root.font
         color: root.enabled ? theme.colorText
                             : Qt.rgba(theme.colorText.r, theme.colorText.g,
@@ -87,6 +89,7 @@ ComboBox {
             leftPadding: theme.spacingSm
             rightPadding: theme.spacingSm
             text: root._labelFor(typeof modelData !== "undefined" ? modelData : model)
+            textFormat: Text.PlainText
             color: highlighted ? theme.colorOnAccent
                 : themedDelegate.enabled ? theme.colorText
                 : Qt.rgba(theme.colorText.r, theme.colorText.g, theme.colorText.b, 0.55)

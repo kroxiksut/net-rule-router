@@ -11,12 +11,17 @@ use super::*;
 /// sections/fields are ignored and [`ParseWarning::UnknownFormatVersion`] is
 /// emitted.
 ///
-/// Versions are cumulative: 1 (sections, comments, disabled rules), 3
-/// (`+block`), 4 (`--- Auto`), 5 (`--- CIDR`, `--- Ranges`), 6 (`?` before a
-/// domain value), 7 (`?` before an exact IP and in the main-route file).
+/// Versions are cumulative: 1 (sections, comments, disabled rules), 3 (a
+/// per-rule deny), 4 (`--- Auto`), 5 (`--- CIDR`, `--- Ranges`), 6 (`?` before
+/// a domain value), 7 (`?` before an exact IP and in the main-route file), 8
+/// (`name.*`, a site in every zone), 9 (a deny is `!` before the value), 10 (an
+/// application by path: a file, a folder, a folder with its subfolders).
+/// Versions 3 to 8 wrote a deny as a `+block` suffix; this build refuses that
+/// line rather than read it as a route. Before 10 a path in an application
+/// section named the file name only.
 /// Version 2 was a nested `- destination` syntax never implemented; the number
 /// stays retired so a file means the same thing in every build.
-pub const CURRENT_RULES_FILE_FORMAT_VERSION: u32 = 7;
+pub const CURRENT_RULES_FILE_FORMAT_VERSION: u32 = 10;
 
 /// Optional metadata declared in a preset file's preamble comments.
 ///
@@ -92,10 +97,11 @@ pub enum ParseWarning {
         /// The reason slug that was present.
         reason_slug: String,
     },
-    /// A line carried both `?` (check where it works) and `+block`.
-    /// The two contradict each other, so the line was not read as a rule.
+    /// A line carried both `?` (check where it works) and `!` (deny). The two
+    /// contradict each other, so neither was taken: the entry keeps both in
+    /// its value, which validation refuses.
     VerifyPrimaryWithBlock {
-        /// The match value of the refused line, without the `?`.
+        /// The match value as written, both marks included.
         match_value: String,
     },
 }

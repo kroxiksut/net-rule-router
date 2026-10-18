@@ -1,0 +1,190 @@
+{
+  "description": "pure.js suggestedPrimaryBinding: the main-connection binding a confirmed suggestion writes, from the one interfaces.snapshot row whose connection name or driver description is the suggested name; null when none or several answer. Rows are laid over the adapters base row.",
+  "cases": [
+    {
+      "name": "the one row named so",
+      "input": {
+        "rows": [
+          {
+            "persistent-id": "{00000000-0000-0000-0000-000000000001}",
+            "name": "Ethernet"
+          },
+          {
+            "persistent-id": "{00000000-0000-0000-0000-000000000002}",
+            "name": "Wi-Fi",
+            "interface-description": "Example Wireless Adapter"
+          }
+        ],
+        "name": "Ethernet"
+      },
+      "expected": {
+        "stable-id": "{00000000-0000-0000-0000-000000000001}",
+        "display-name": "Ethernet",
+        "user-confirmed": true
+      }
+    },
+    {
+      "name": "the driver description answers too, ASCII case aside",
+      "input": {
+        "rows": [
+          {
+            "persistent-id": "{00000000-0000-0000-0000-000000000002}",
+            "name": "Wi-Fi",
+            "interface-description": "Example Wireless Adapter"
+          }
+        ],
+        "name": "example wireless adapter"
+      },
+      "expected": {
+        "stable-id": "{00000000-0000-0000-0000-000000000002}",
+        "display-name": "Wi-Fi",
+        "user-confirmed": true
+      }
+    },
+    {
+      "name": "two rows with the name: nothing is chosen",
+      "input": {
+        "rows": [
+          {
+            "persistent-id": "{00000000-0000-0000-0000-000000000003}",
+            "name": "Ethernet"
+          },
+          {
+            "persistent-id": "{00000000-0000-0000-0000-000000000004}",
+            "name": "ethernet"
+          }
+        ],
+        "name": "Ethernet"
+      },
+      "expected": null
+    },
+    {
+      "name": "no row with the name",
+      "input": {
+        "rows": [
+          {
+            "persistent-id": "{00000000-0000-0000-0000-000000000005}",
+            "name": "Wi-Fi"
+          }
+        ],
+        "name": "Ethernet"
+      },
+      "expected": null
+    },
+    {
+      "name": "an empty name names nothing",
+      "input": {
+        "rows": [
+          {
+            "persistent-id": "{00000000-0000-0000-0000-000000000006}",
+            "name": ""
+          }
+        ],
+        "name": "  "
+      },
+      "expected": null
+    },
+    {
+      "name": "a linux link",
+      "input": {
+        "rows": [
+          {
+            "persistent-id": "linux-adapter:enp3s0",
+            "adapter-name": "enp3s0",
+            "name": "enp3s0",
+            "interface-description": "enp3s0"
+          }
+        ],
+        "name": "enp3s0"
+      },
+      "expected": {
+        "stable-id": "linux-adapter:enp3s0",
+        "display-name": "enp3s0",
+        "user-confirmed": true
+      }
+    },
+    {
+      "name": "surrounding spaces are not part of the name",
+      "input": {
+        "rows": [
+          {
+            "persistent-id": "{00000000-0000-0000-0000-000000000007}",
+            "name": "Ethernet 2"
+          }
+        ],
+        "name": "  Ethernet 2 "
+      },
+      "expected": {
+        "stable-id": "{00000000-0000-0000-0000-000000000007}",
+        "display-name": "Ethernet 2",
+        "user-confirmed": true
+      }
+    },
+    {
+      "name": "a row without an id cannot be bound",
+      "input": {
+        "rows": [
+          {
+            "persistent-id": "",
+            "name": "Ethernet"
+          }
+        ],
+        "name": "Ethernet"
+      },
+      "expected": null
+    },
+    {
+      "name": "one row's description is another row's name: both answer",
+      "input": {
+        "rows": [
+          {
+            "persistent-id": "{00000000-0000-0000-0000-000000000008}",
+            "name": "Uplink"
+          },
+          {
+            "persistent-id": "{00000000-0000-0000-0000-000000000009}",
+            "name": "Wi-Fi",
+            "interface-description": "Uplink"
+          }
+        ],
+        "name": "Uplink"
+      },
+      "expected": null
+    },
+    {
+      "name": "a row with no connection name shows the suggested one",
+      "input": {
+        "rows": [
+          {
+            "persistent-id": "{00000000-0000-0000-0000-00000000000a}",
+            "name": "",
+            "interface-description": "Example Wireless Adapter"
+          }
+        ],
+        "name": "Example Wireless Adapter"
+      },
+      "expected": {
+        "stable-id": "{00000000-0000-0000-0000-00000000000a}",
+        "display-name": "Example Wireless Adapter",
+        "user-confirmed": true
+      }
+    },
+    {
+      "name": "a non-ASCII name matches as written",
+      "input": {
+        "rows": [
+          {
+            "persistent-id": "{00000000-0000-0000-0000-00000000000b}",
+            "name": "Беспроводная сеть"
+          }
+        ],
+        "name": "Беспроводная сеть"
+      },
+      "expected": {
+        "stable-id": "{00000000-0000-0000-0000-00000000000b}",
+        "display-name": "Беспроводная сеть",
+        "user-confirmed": true
+      }
+    }
+  ]
+}

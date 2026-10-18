@@ -15,7 +15,7 @@
 //! Rules are grouped by [`rule_identity_key`](crate::review::rule_identity_key)
 //! — the traffic they match (`address_match` + `app_match`), **not** the
 //! synthetic `r-NNNN` id (which is regenerated on every import) — and paired
-//! inside a group by [`pair_identity_group`], so `x` and `x +block` in one book
+//! inside a group by [`pair_identity_group`], so `x` and `!x` in one book
 //! stay two rules. The route role is tracked separately, so the *same* rule
 //! assigned to a *different* route surfaces as a conflict rather than an
 //! add/remove churn.
@@ -216,7 +216,7 @@ type Placed<'a> = (&'a CanonicalRule, RouteRole);
 
 /// Group a rule book by content identity. Both route sets are walked; the
 /// route role is carried alongside so a retarget can be detected. Every rule
-/// is kept: a group holding `x` and `x +block` is two rules, not one.
+/// is kept: a group holding `x` and `!x` is two rules, not one.
 fn index(
     book: &CanonicalRuleBook,
     coverage: SubdomainCoverage,
@@ -249,7 +249,7 @@ fn pair_key(group: &str, multi: bool, (rule, route): Placed<'_>) -> String {
 }
 
 /// What makes two enabled copies in opposite route sets one rule named twice:
-/// the identity plus the action. `x` on one route and `x +block` on the other
+/// the identity plus the action. `x` on one route and `!x` on the other
 /// are two instructions, and neither is switched off for the other.
 fn cross_set_key(rule: &CanonicalRule, coverage: SubdomainCoverage) -> String {
     let key = rule_identity_key_under(rule, coverage);
@@ -1201,7 +1201,7 @@ mod tests {
         rule
     }
 
-    /// `x` and `x +block` in one set are opposite instructions; the pairing
+    /// `x` and `!x` in one set are opposite instructions; the pairing
     /// used to hold one rule per address and dropped the other from the book.
     #[test]
     fn route_and_block_on_one_host_in_one_set_both_reach_the_merged_book() {

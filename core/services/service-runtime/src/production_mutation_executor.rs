@@ -9,10 +9,10 @@
 //!   `activate` → `MutationOutcome`
 //! - `rollback` → `rollback_to(target)` → `MutationOutcome`
 //! - `safe_disable` → `crash_recovery::execute_safe_disable` (audit +
-//!   confirmation) THEN the REAL teardown via the routing-pause coordinator
-//!   (`pause_all_active`: remove every active SID's WFP filters + persist the
-//!   pause, resumable via the routing-pause toggle). Requires
-//!   `with_pause_coordinator`; audit-only + `apply-layer-unavailable` without it.
+//!   confirmation) THEN the caller's own pause via the routing-pause
+//!   coordinator, resumable by their routing-pause toggle. Other users keep
+//!   their routing. Requires `with_pause_coordinator`; refused with
+//!   `apply-layer-unavailable` without it.
 //!
 //! Other `MutationKind` variants (`RouteBindingsUpdate`, `PresetImport`,
 //! `PresetExport`, `SettingsExport`) return a structured "not yet
@@ -76,7 +76,6 @@ use nrr_shared::ipc_payloads::{
     RollbackTargetDto, StatusUpdateEvent,
 };
 use nrr_shared::rules_json;
-use nrr_storage::revisions::RevisionsRepository;
 use rusqlite::Connection;
 
 /// 5-minute TTL for the *internal* coordinator confirmation token. The
@@ -309,8 +308,13 @@ impl ProductionMutationExecutor {
         if !refused.is_empty() {
             return Some(invalid_rule_value_summary(&refused));
         }
-        crate::activation_coordinator::network_on_both_routes(rules_json, carried.as_deref())
-            .map(|network| refused_summary(&network_on_both_routes_error(&network)))
+        if let Some(network) =
+            crate::activation_coordinator::network_on_both_routes(rules_json, carried.as_deref())
+        {
+            return Some(refused_summary(&network_on_both_routes_error(&network)));
+        }
+        crate::activation_coordinator::folder_on_both_routes(rules_json, carried.as_deref())
+            .map(|folder| refused_summary(&folder_on_both_routes_error(&folder)))
     }
 
     /// Defense-in-depth rule caps on every write: the user's own rules up to
@@ -387,29 +391,28 @@ impl ProductionMutationExecutor {
     /// removed on every pass. Canonicalizing here makes the two identical
     /// before anything downstream compares them.
     ///
-    /// A payload we cannot decode is left exactly as it came: rejecting it is
-    /// the validation layer's call, not this one's.
+    /// A payload we cannot decode keeps its bytes: rejecting it is the
+    /// validation layer's call. The hash is always the service's own — a
+    /// client's wrong one would dedupe to the active revision and answer
+    /// "already active" without applying anything.
     fn canonicalize_rules_payload(payload: &mut RulesUpdatePayload, platform: HostPlatform) {
-        let Ok(dto) = serde_json::from_str::<nrr_shared::rules_json::CanonicalRulesJsonV1>(
+        let canonical = serde_json::from_str::<nrr_shared::rules_json::CanonicalRulesJsonV1>(
             &payload.rules_json,
-        ) else {
-            return;
-        };
-        let Ok(content) = nrr_domain::rules_json_codec::decode(dto, platform) else {
-            return;
-        };
-        let Ok(canonical) = nrr_shared::rules_json::to_canonical_string(
-            &nrr_domain::rules_json_codec::encode(&content),
-        ) else {
-            return;
-        };
-        if canonical == payload.rules_json {
-            return;
+        )
+        .ok()
+        .and_then(|dto| nrr_domain::rules_json_codec::decode(dto, platform).ok())
+        .and_then(|content| {
+            nrr_shared::rules_json::to_canonical_string(&nrr_domain::rules_json_codec::encode(
+                &content,
+            ))
+            .ok()
+        });
+        if let Some(canonical) = canonical {
+            payload.rules_json = canonical;
         }
         let mut hasher = Sha256::new();
-        hasher.update(canonical.as_bytes());
+        hasher.update(payload.rules_json.as_bytes());
         payload.content_hash = format!("{:x}", hasher.finalize());
-        payload.rules_json = canonical;
     }
 
     fn submission_from(
@@ -454,6 +457,11 @@ impl ProductionMutationExecutor {
         if let Some(refusal) = self.submission_gate_refusal(&parsed.rules_json, principal) {
             return refusal;
         }
+        if let Some(e) =
+            self.moved_rules_refusal(&parsed.rules_json, base_revision_in(payload), principal)
+        {
+            return refused_summary(&e);
+        }
         // The score is reflected back into the wire `ReviewSummaryResponse`.
         let scored = self.score_candidate_for_payload(&parsed.rules_json, principal);
         // Planned from the payload, NOT from a stored candidate. This is a read
@@ -491,11 +499,8 @@ impl ProductionMutationExecutor {
     ) -> Option<ScoredCandidate> {
         let conn = self.state_conn.as_ref()?;
         let candidate_book = decode_rule_book(rules_json, self.host_platform)?;
-        // Diff against the CALLER's per-principal active book,
-        // not the baseline: comparing every candidate against the
-        // (often-populated) baseline would make a user whose own active set
-        // differs see "no changes" even though their edit/preset genuinely
-        // differed.
+        // Against the book the caller is under: their own once they diverged,
+        // the baseline until then — never the baseline over their own.
         let prev_book = load_active_rule_book(conn, principal, self.host_platform);
 
         let prev_profile = prev_book.map(|book| profile_for(conn, principal, book));
@@ -784,6 +789,17 @@ impl MutationExecutor for ProductionMutationExecutor {
     }
 
     fn rollback(&self, principal: &str, target_revision_id: Option<&str>) -> MutationOutcome {
+        // A rules write like any other: an unacknowledged tamper alert holds it
+        // (the rules lock is the rollback handler's, which knows the caller).
+        if let Some(repo) = self.alerts_repo.as_ref() {
+            if mutation_refused_by_alert(MutationKind::RulesUpdate, repo.as_ref()) {
+                return MutationOutcome::Failed(OperationError {
+                    args: Default::default(),
+                    code: SECURITY_ALERT_GATE_CODE.into(),
+                    message: SECURITY_ALERT_GATE_MESSAGE.into(),
+                });
+            }
+        }
         let target = match rollback_target_of(target_revision_id) {
             Ok(target) => target,
             Err(error) => return MutationOutcome::Failed(error),
@@ -815,7 +831,15 @@ impl MutationExecutor for ProductionMutationExecutor {
         }))
     }
 
-    fn safe_disable(&self, reason: &str) -> MutationOutcome {
+    fn safe_disable(&self, principal: &str, reason: &str) -> MutationOutcome {
+        if principal.is_empty() {
+            return MutationOutcome::Failed(OperationError {
+                args: Default::default(),
+                code: "safe-disable-teardown-failed".into(),
+                message: "safe-disable acts on the caller's own routing; the caller is unknown"
+                    .into(),
+            });
+        }
         // Calls `crash_recovery::execute_safe_disable` with
         // the production recovery audit sink. The IPC-level confirmation
         // token has already been validated by the upstream handler; we
@@ -854,9 +878,9 @@ impl MutationExecutor for ProductionMutationExecutor {
             SafeDisableOutcome::Disabled {
                 disabled_at_epoch_secs,
             } => {
-                // The SafeDisableExecuted audit is written; now perform the REAL
-                // teardown — remove every active SID's WFP filters and persist
-                // the pause so a routing-pause `resume` reinstalls them.
+                // The SafeDisableExecuted audit is written; now pause the
+                // caller alone — another signed-in user's protection is not
+                // theirs to lift — and tell them, as the toggle does.
                 let Some(coordinator) = self.pause_coordinator.as_ref() else {
                     // Unreachable given the `apply_available` gate above.
                     return MutationOutcome::Failed(OperationError {
@@ -865,13 +889,24 @@ impl MutationExecutor for ProductionMutationExecutor {
                         message: "pause coordinator not wired; cannot suspend enforcement".into(),
                     });
                 };
-                match coordinator.pause_all_active(Some(reason)) {
-                    Ok(paused) => MutationOutcome::Completed(serde_json::json!({
-                        "outcome": "safe-disabled",
-                        "disabled-at-secs": disabled_at_epoch_secs,
-                        "reason": reason,
-                        "suspended-sids": paused.len(),
-                    })),
+                match coordinator.pause(principal, Some(reason)) {
+                    Ok(()) => {
+                        if let Some(bus) = self.event_bus.as_ref() {
+                            bus.publish_for(
+                                principal,
+                                StatusUpdateEvent::RoutingPauseStateChanged {
+                                    sid: principal.to_string(),
+                                    paused: true,
+                                },
+                            );
+                        }
+                        MutationOutcome::Completed(serde_json::json!({
+                            "outcome": "safe-disabled",
+                            "disabled-at-secs": disabled_at_epoch_secs,
+                            "reason": reason,
+                            "suspended-sids": 1,
+                        }))
+                    }
                     Err(e) => MutationOutcome::Failed(OperationError {
                         args: Default::default(),
                         code: "safe-disable-teardown-failed".into(),
@@ -1062,7 +1097,25 @@ fn canonicalize_route_bytes(
             code: "malformed-payload".into(),
             message: format!("PresetImport: base64 decode failed for {route:?}: {e}"),
         })?;
-    let outcome = validate_preset_bytes(&bytes);
+    canonicalize_route_file_bytes(
+        &bytes,
+        route,
+        include_child_processes,
+        import_only_active,
+        platform,
+    )
+}
+
+/// [`canonicalize_route_bytes`] past the base64 layer: what a rules file on
+/// disk goes through, so a provisioned file meets the parser an imported one does.
+pub(crate) fn canonicalize_route_file_bytes(
+    bytes: &[u8],
+    route: RouteRole,
+    include_child_processes: bool,
+    import_only_active: bool,
+    platform: HostPlatform,
+) -> Result<CanonicalRuleSet, OperationError> {
+    let outcome = validate_preset_bytes(bytes);
     let parse_outcome = match outcome {
         PresetFileValidationOutcome::Accepted { parse_outcome } => parse_outcome,
         PresetFileValidationOutcome::AcceptedWithWarnings { parse_outcome, .. } => parse_outcome,
@@ -1220,9 +1273,9 @@ fn rejection_to_operation_error(
     }
 }
 
-/// Single-route preset import preserves the OTHER route's rules from
-/// the currently active revision. Returns empty when no active revision
-/// exists or any storage/decode failure occurs (first-import scenario).
+/// Single-route preset import preserves the OTHER route's rules from the book
+/// in force — the baseline for a user who never diverged. Empty when there is
+/// none or it does not read (first-import scenario).
 fn load_active_primary(
     conn: Option<&Arc<Mutex<Connection>>>,
     principal: &str,
@@ -1244,28 +1297,8 @@ fn load_active_book_or_empty(
     principal: &str,
     platform: HostPlatform,
 ) -> CanonicalRuleBook {
-    let Some(conn) = conn else {
-        return CanonicalRuleBook::default();
-    };
-    let Ok(guard) = conn.lock() else {
-        return CanonicalRuleBook::default();
-    };
-    let repo = RevisionsRepository::new(&guard);
-    let record = match repo.get_active_for(principal) {
-        Ok(Some(r)) => r,
-        _ => return CanonicalRuleBook::default(),
-    };
-    let dto = match crate::production_rules_provider::read_stored_rules(
-        &record.rules_json,
-        &record.revision_id,
-    ) {
-        Ok(d) => d,
-        Err(_) => return CanonicalRuleBook::default(),
-    };
-    match rules_json_codec::decode(dto, platform) {
-        Ok(c) => c.rule_book,
-        Err(_) => CanonicalRuleBook::default(),
-    }
+    conn.and_then(|conn| load_active_rule_book(conn, principal, platform))
+        .unwrap_or_default()
 }
 
 fn not_implemented_summary(reason: &str) -> ReviewSummaryResponse {
@@ -1335,24 +1368,18 @@ fn decode_rule_book(rules_json: &str, platform: HostPlatform) -> Option<Canonica
     Some(content.rule_book)
 }
 
-/// Load the currently-active revision's rule book, if any. `None`
-/// means "no prev revision" (first activation) OR storage failure;
-/// risk scoring degrades gracefully either way (the new signals
-/// `RuleSetEmptied` / `HighRemovalRatio` simply don't fire when prev
-/// is None).
+/// The book `principal` is under, resolved as the rules provider resolves it
+/// (a revision mid-activation, their own, then the baseline) and decoded for
+/// `platform`. `None` means no book (first activation) or one that does not
+/// read; risk scoring degrades either way (`RuleSetEmptied` /
+/// `HighRemovalRatio` simply do not fire).
 fn load_active_rule_book(
     conn: &Arc<Mutex<Connection>>,
     principal: &str,
     platform: HostPlatform,
 ) -> Option<CanonicalRuleBook> {
     let guard = conn.lock().ok()?;
-    let repo = nrr_storage::revisions::RevisionsRepository::new(&guard);
-    let record = repo.get_active_for(principal).ok()??;
-    let dto = crate::production_rules_provider::read_stored_rules(
-        &record.rules_json,
-        &record.revision_id,
-    )
-    .ok()?;
+    let dto = crate::production_rules_provider::stored_book_in_force_for(&guard, principal)?;
     Some(rules_json_codec::decode(dto, platform).ok()?.rule_book)
 }
 
@@ -1636,6 +1663,17 @@ fn network_on_both_routes_error(network: &str) -> OperationError {
     }
 }
 
+/// The GUI's `errors.<code>` for one program folder written on both routes.
+const FOLDER_ON_BOTH_ROUTES_CODE: &str = "folder-on-both-routes";
+
+fn folder_on_both_routes_error(folder: &str) -> OperationError {
+    OperationError {
+        args: std::collections::BTreeMap::from([("folder".to_owned(), folder.to_owned())]),
+        code: FOLDER_ON_BOTH_ROUTES_CODE.into(),
+        message: format!("the program folder {folder} is on both routes; give it one route"),
+    }
+}
+
 fn invalid_rule_value_error(rules: &[RefusedRuleValue]) -> OperationError {
     let ids: Vec<&str> = rules.iter().map(|r| r.rule_id.as_str()).collect();
     OperationError {
@@ -1721,6 +1759,7 @@ fn policy_error(err: &PolicyError) -> OperationError {
             "busy-conflict",
             "another rules change is still being applied".into(),
         ),
+        PolicyError::RulesChangedElsewhere => ("rules-changed-elsewhere", err.to_string()),
         PolicyError::ActivationNotRecorded {
             revision_id,
             detail,
@@ -1753,6 +1792,9 @@ fn policy_error(err: &PolicyError) -> OperationError {
         PolicyError::NetworkOnBothRoutes { network } => {
             return network_on_both_routes_error(network);
         }
+        PolicyError::FolderOnBothRoutes { folder } => {
+            return folder_on_both_routes_error(folder);
+        }
     };
     OperationError {
         args: Default::default(),
@@ -1779,6 +1821,7 @@ mod preset_import;
 mod tests;
 mod unrecognized;
 
+use activation_drive::base_revision_in;
 use unrecognized::carry_forward;
 #[cfg(test)]
 pub(crate) use unrecognized::first_report_of_book;

@@ -17,8 +17,9 @@ use crate::ipc_handlers::payloads::{
     LogRetentionConfigSetRequest, MigrationStatusGetResponse, MutationKind,
     PrincipalDataPurgeResponse, RetentionSettingsDto, RetentionSettingsSetRequest, ReviewRiskLevel,
     ReviewSummaryResponse, RoutePolicyDto, RoutePolicyUpdateRequest, RoutingPauseDto,
-    RulesListResponse, RulesRouteFilter, SecondaryRouteStateDto, SnapshotInterfacesResponse,
-    StorageUsageDto, TrafficStatsGetRequest, TrafficStatsGetResponse, TrafficStatsSettingsDto,
+    RulesListResponse, RulesRecentChangesResponse, RulesRouteFilter, SecondaryRouteStateDto,
+    SnapshotInterfacesResponse, StorageUsageDto, TrafficStatsGetRequest, TrafficStatsGetResponse,
+    TrafficStatsSettingsDto,
 };
 
 /// Synchronous source of an `AdaptersSnapshot` for the IPC layer.
@@ -82,6 +83,18 @@ pub trait RulesSnapshotProvider: Send + Sync {
         _principal: &str,
     ) -> RulesListResponse {
         self.rules_snapshot(route_filter)
+    }
+
+    /// What `principal` changed in their own rules from `since` to `now`
+    /// (Unix seconds), told from their stored revisions. A source without a
+    /// revision history has nothing to tell.
+    fn recent_changes_for(
+        &self,
+        _principal: &str,
+        _since: i64,
+        _now: i64,
+    ) -> Result<RulesRecentChangesResponse, String> {
+        Ok(RulesRecentChangesResponse::default())
     }
 }
 
@@ -168,11 +181,11 @@ pub trait MutationExecutor: Send + Sync {
         target_revision_id: Option<&str>,
     ) -> Result<Option<nrr_shared::ipc_payloads::RollbackTargetDto>, OperationError>;
 
-    /// Execute the safe-disable flow: remove all routes/filters owned
-    /// by the service and mark the runtime as `ApplyLayerDisabled`. The
-    /// `reason` is a free-form string captured in audit. Production
-    /// wiring routes to `crate::crash_recovery::execute_safe_disable`.
-    fn safe_disable(&self, reason: &str) -> MutationOutcome;
+    /// Execute the safe-disable flow for `principal` alone: their routing and
+    /// leak guard come down and their pause is persisted, which their own
+    /// `routing.pause.toggle` lifts. Everyone else on the machine keeps theirs.
+    /// The `reason` is captured in audit.
+    fn safe_disable(&self, principal: &str, reason: &str) -> MutationOutcome;
 }
 
 /// Convenience: classify a `ReviewSummary` by its risk level field.

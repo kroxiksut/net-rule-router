@@ -14,7 +14,7 @@ pub fn lines(items: &[String], cursor: Option<usize>) -> Vec<ViewLine> {
         .map(|(i, item)| {
             let text = format!("{}. {item}", i + 1);
             if cursor == Some(i) {
-                ViewLine::new(vec![Segment::strong(format!("> {text}"))])
+                ViewLine::new(vec![Segment::selected(format!("> {text}"))])
             } else {
                 ViewLine::text(format!("  {text}"))
             }

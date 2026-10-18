@@ -124,6 +124,21 @@ pub fn registrable_domain(hostname: &str) -> Option<&str> {
     Some(hostname)
 }
 
+/// The site two names share when they differ only in the zone
+/// (`webpub.example.com` and `example.net` -> `example`): the base of one
+/// `example.*` rule that covers both. A token shorter than a brand names no
+/// site (`t.co` and `t.me` are two services).
+pub fn site_shared_across_zones<'a>(anchor: &'a str, candidate: &str) -> Option<&'a str> {
+    let anchor_domain = registrable_domain(anchor)?;
+    let candidate_domain = registrable_domain(candidate)?;
+    if anchor_domain.eq_ignore_ascii_case(candidate_domain) {
+        return None;
+    }
+    let (site, _) = anchor_domain.split_once('.')?;
+    let (other, _) = candidate_domain.split_once('.')?;
+    (site.eq_ignore_ascii_case(other) && site.len() >= MIN_BRAND_TOKEN_LEN).then_some(site)
+}
+
 // ── Name-shape signals ────────────────────────────────────────────────────────
 
 /// Shortest brand token accepted for a substring relation.

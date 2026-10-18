@@ -46,16 +46,14 @@ use crate::{
 
 // ── Resource limits ───────────────────────────────────────────────────────────
 
-/// Maximum byte length of a single match value string.
+/// Maximum byte length of a single match value string: a DNS name (253 octets)
+/// and a program name fit. A path in an application section has its own
+/// bound ([`nrr_shared::app_path::MAX_PATH_VALUE_BYTES`]).
 ///
-/// - DNS names: RFC 1035 §2.3.4 caps the total FQDN at 253 octets.
-/// - Windows process names: NTFS max filename 255 chars.
-/// - We use 260 as a safe upper bound that covers all current match value types.
-///
-/// Values exceeding this limit are rejected at the parse stage. This prevents
+/// Values exceeding the limit are rejected at the parse stage. This prevents
 /// pathological inputs (e.g. a 1 MiB "domain name") from entering later
 /// validation stages.
-pub const MAX_MATCH_VALUE_LEN: usize = 260;
+pub const MAX_MATCH_VALUE_LEN: usize = nrr_shared::rule_value_class::MAX_RULE_VALUE_BYTES;
 
 /// Maximum character count of a single inline comment (the label after `#`
 /// on an active rule line).
@@ -324,14 +322,18 @@ pub fn validate_preset_bytes(bytes: &[u8]) -> PresetFileValidationOutcome {
 
     // Stage 4: match value length check — applies to known and unknown sections.
     for section in &parse_outcome.parsed.sections {
+        let style = app_section_style(section.section);
         for entry in &section.entries {
-            if entry.match_value.len() > MAX_MATCH_VALUE_LEN {
+            let limit = style.map_or(MAX_MATCH_VALUE_LEN, |style| {
+                nrr_shared::app_path::app_value_byte_limit(&entry.match_value, style)
+            });
+            if entry.match_value.len() > limit {
                 return PresetFileValidationOutcome::Rejected(
                     PresetImportRejectedReason::MatchValueTooLong {
                         section: section.section.name().to_string(),
                         value: truncate_for_display(&entry.match_value),
                         len: entry.match_value.len(),
-                        limit: MAX_MATCH_VALUE_LEN,
+                        limit,
                     },
                 );
             }
@@ -504,6 +506,20 @@ fn first_control_character(outcome: &ParseOutcome) -> Option<PresetImportRejecte
         }
     }
     None
+}
+
+/// How an application section spells paths; `None` for any other section.
+fn app_section_style(
+    section: crate::rules_file::RulesFileSection,
+) -> Option<nrr_shared::app_path::PathStyle> {
+    use crate::rules_file::RulesFileSection as S;
+    use nrr_shared::app_path::PathStyle;
+    match section {
+        S::Windows => Some(PathStyle::Windows),
+        S::Linux => Some(PathStyle::Linux),
+        S::MacOS => Some(PathStyle::MacOS),
+        S::Zones | S::Domains | S::Ip | S::Cidr | S::Ranges | S::Auto => None,
+    }
 }
 
 /// Truncates a match value string to 64 bytes for safe inclusion in
@@ -840,6 +856,32 @@ mod tests {
                 limit,
                 ..
             }) if len == MAX_MATCH_VALUE_LEN + 1 && limit == MAX_MATCH_VALUE_LEN
+        ));
+    }
+
+    /// A path in an application section has its own, longer bound; a name
+    /// there keeps the short one.
+    #[test]
+    fn an_application_path_is_held_to_its_own_bound() {
+        use nrr_shared::app_path::MAX_PATH_VALUE_BYTES;
+        let path = format!("/opt/{}", "a".repeat(MAX_PATH_VALUE_BYTES - 5));
+        assert_eq!(path.len(), MAX_PATH_VALUE_BYTES);
+        assert!(validate_preset_bytes(format!("--- Linux\n{path}\n").as_bytes()).is_accepted());
+        let longer = format!("{path}a");
+        assert!(matches!(
+            validate_preset_bytes(format!("--- Linux\n{longer}\n").as_bytes()),
+            PresetFileValidationOutcome::Rejected(PresetImportRejectedReason::MatchValueTooLong {
+                limit,
+                ..
+            }) if limit == MAX_PATH_VALUE_BYTES
+        ));
+        let name = "a".repeat(MAX_MATCH_VALUE_LEN + 1);
+        assert!(matches!(
+            validate_preset_bytes(format!("--- Linux\n{name}\n").as_bytes()),
+            PresetFileValidationOutcome::Rejected(PresetImportRejectedReason::MatchValueTooLong {
+                limit,
+                ..
+            }) if limit == MAX_MATCH_VALUE_LEN
         ));
     }
 

@@ -3,6 +3,7 @@
 //! Settings → Routing, where every network is listed.
 
 use nrr_ipc_client::IpcClient;
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     LocalNetworkDto, LocalNetworksGetRequest, LocalNetworksGetResponse,
@@ -74,7 +75,7 @@ pub fn announce(app: &mut AppState, texts: &Texts, now: std::time::Instant) -> V
         question,
         &[
             ("cidr", network.cidr.clone()),
-            ("adapter", network.adapter.clone()),
+            ("adapter", display_text(&network.adapter).into_owned()),
         ],
     );
     if more > 0 {

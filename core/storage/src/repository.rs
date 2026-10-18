@@ -185,6 +185,11 @@ pub trait CacheRepository {
     fn list_hostnames_under_suffix(&self, suffix: &str, limit: usize)
         -> StorageResult<Vec<String>>;
 
+    /// Cached hostnames that carry `site` as whole labels — `site.…` or
+    /// `….site.…` — most recently seen first, at most `limit`. A superset of
+    /// what a `site.*` rule covers: the caller decides where the zone starts.
+    fn list_hostnames_with_site(&self, site: &str, limit: usize) -> StorageResult<Vec<String>>;
+
     /// List cached `(hostname, ip)` resolution rows for the read-only
     /// cache-entries viewer (Diagnostics → Cache).
     ///

@@ -19,7 +19,10 @@
 //! 4. Wrap the resulting [`CanonicalRuleBook`] in an
 //!    [`ActiveRulesSnapshot`]. The behaviour mode is not part of it: every
 //!    planner takes it from the per-user policy
-//!    (`behavior_mode_for_codegen`).
+//!    (`behavior_mode_for_codegen`). The enforcement read leaves out a rule
+//!    that denies a protected program or folder or sends one over the
+//!    additional route (`protected_rules`), and names it for the Overlaps
+//!    screen.
 //!
 //! Steps 2–4 run once per source: each read checks only the source's identity
 //! (overlay blob or active revision id + hash), the subdomain flag and the
@@ -77,6 +80,8 @@ struct ReadKey {
     include_subdomains: bool,
     /// Generation of the principal's check verdicts (`verify_overlay`).
     verify_generation: u64,
+    /// Generation of the sites `site.*` rules were seen under.
+    any_zone_generation: u64,
 }
 
 #[derive(Clone)]
@@ -128,12 +133,16 @@ impl PartialEq for ReadKey {
         self.source == other.source
             && self.include_subdomains == other.include_subdomains
             && self.verify_generation == other.verify_generation
+            && self.any_zone_generation == other.any_zone_generation
     }
 }
 
 struct DecodedRead {
     key: ReadKey,
     snapshot: Option<ActiveRulesSnapshot>,
+    /// Stored rules kept out of `snapshot` by the protection of system
+    /// programs and folders.
+    withheld: Vec<nrr_domain::protected_places::ProtectedRule>,
 }
 
 impl ProductionRulesProvider {
@@ -268,6 +277,11 @@ impl ProductionRulesProvider {
             include_subdomains: for_enforcement
                 && Self::reads_include_subdomains(&guard, principal),
             verify_generation: verify.as_ref().map_or(0, |(generation, _)| *generation),
+            any_zone_generation: if for_enforcement {
+                crate::any_zone_sites::generation()
+            } else {
+                0
+            },
         };
         let mut decoded = self.decoded.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(hit) = decoded
@@ -299,6 +313,7 @@ impl ProductionRulesProvider {
                         },
                         include_subdomains: key.include_subdomains,
                         verify_generation: key.verify_generation,
+                        any_zone_generation: key.any_zone_generation,
                     },
                     Self::snapshot_from_record(&record),
                 ),
@@ -335,11 +350,25 @@ impl ProductionRulesProvider {
         if !for_enforcement {
             return RulesRead::Rules(snapshot);
         }
+        // After the coverage, so a `*.` twin of an exact rule counts as naming
+        // its zone outright.
+        snapshot.rule_book = crate::any_zone_sites::expand(snapshot.rule_book);
+        // A stored rule that denies a system program, or sends one over the
+        // additional route, stays in the book and out of enforcement.
+        let (book, withheld) = crate::protected_rules::withhold(snapshot.rule_book);
+        snapshot.rule_book = book;
+        let changed = decoded
+            .get(principal)
+            .is_none_or(|previous| previous.withheld != withheld);
+        if changed {
+            crate::protected_rules::report_withheld(principal, &withheld);
+        }
         decoded.insert(
             principal.to_owned(),
             DecodedRead {
                 key,
                 snapshot: Some(snapshot.clone()),
+                withheld,
             },
         );
         RulesRead::Rules(snapshot)
@@ -432,6 +461,76 @@ pub(crate) fn read_stored_rules(
     Ok(dto)
 }
 
+/// The stored rules `principal` is under right now, as they were stored.
+pub(crate) struct BookInForce {
+    /// `None` for a revision mid-activation, which has no committed row yet.
+    pub(crate) revision_id: Option<String>,
+    pub(crate) rules_json: String,
+}
+
+impl BookInForce {
+    /// What a decode failure is logged under.
+    pub(crate) fn origin(&self) -> &str {
+        self.revision_id.as_deref().unwrap_or("applying-revision")
+    }
+}
+
+/// The book `principal` is under right now, resolved as every reader resolves
+/// it: a revision mid-activation, then their own active revision, then the
+/// baseline. `Ok(None)` when there is none; a storage error is not "none".
+pub(crate) fn book_in_force_for(
+    guard: &Connection,
+    principal: &str,
+) -> Result<Option<BookInForce>, String> {
+    let repo = RevisionsRepository::new(guard);
+    let read = |p: &str| -> Result<Option<BookInForce>, String> {
+        if let Some(json) = applying_revision_overlay::applying_for(guard, p) {
+            return Ok(Some(BookInForce {
+                revision_id: None,
+                rules_json: json.to_string(),
+            }));
+        }
+        repo.get_active_for(p)
+            .map(|found| {
+                found.map(|record| BookInForce {
+                    revision_id: Some(record.revision_id),
+                    rules_json: record.rules_json,
+                })
+            })
+            .map_err(|e| format!("revisions.get_active_for({p}): {e}"))
+    };
+    match read(principal)? {
+        Some(book) => Ok(Some(book)),
+        None if principal != BASELINE_PRINCIPAL => read(BASELINE_PRINCIPAL),
+        None => Ok(None),
+    }
+}
+
+/// How a writer names the rules it built from (`base-revision`): the digest
+/// of the stored bytes in force, `""` for none. Taken from the bytes, not a
+/// stored hash, so a revision mid-activation is named like a committed one.
+pub(crate) fn base_revision_of(book: Option<&BookInForce>) -> String {
+    use sha2::{Digest, Sha256};
+    book.map_or_else(String::new, |book| {
+        format!("{:x}", Sha256::digest(book.rules_json.as_bytes()))
+    })
+}
+
+/// The base a write by `principal` is checked against right now.
+pub(crate) fn base_revision_for(guard: &Connection, principal: &str) -> Result<String, String> {
+    book_in_force_for(guard, principal).map(|book| base_revision_of(book.as_ref()))
+}
+
+/// [`book_in_force_for`] read through [`read_stored_rules`]. `None` when there
+/// is none, it does not read, or storage failed.
+pub(crate) fn stored_book_in_force_for(
+    guard: &Connection,
+    principal: &str,
+) -> Option<rules_json::CanonicalRulesJsonV1> {
+    let book = book_in_force_for(guard, principal).ok()??;
+    read_stored_rules(&book.rules_json, book.origin()).ok()
+}
+
 /// The one line saying stored rules no book may hold were dropped on read.
 pub(crate) fn report_dropped_rules(dropped: usize, origin: &str) {
     if dropped == 0 {
@@ -503,6 +602,24 @@ impl RulesProvider for ProductionRulesProvider {
                 RevisionsRepository::new(&guard).active_identity_for(principal),
                 Ok(None)
             )
+    }
+
+    fn base_revision_for(&self, principal: &str) -> Option<String> {
+        let guard = self.conn.lock().ok()?;
+        base_revision_for(&guard, principal).ok()
+    }
+
+    /// From the last enforcement read: the planners ask right after one.
+    fn withheld_rules_for(
+        &self,
+        principal: &str,
+    ) -> Vec<nrr_domain::protected_places::ProtectedRule> {
+        self.decoded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(principal)
+            .map(|read| read.withheld.clone())
+            .unwrap_or_default()
     }
 
     fn stored_revision_for(&self, principal: &str) -> Option<String> {
@@ -621,6 +738,94 @@ mod tests {
             &json
         ));
         assert!(decode_rules_snapshot(&json, "test").is_some());
+    }
+
+    /// A book that denies a program the system needs, beside an ordinary
+    /// rule: the gate accepts it, the ordinary rule is enforced, the protected
+    /// one stays in the book, is kept out of enforcement and is listed.
+    #[test]
+    fn a_protected_rule_is_accepted_withheld_and_listed() {
+        use nrr_shared::rules_json::{
+            AddressMatchDto, AppMatchDto, AppPatternDto, CanonicalRulesJsonV1, RuleAction, RuleDto,
+            RULES_JSON_SCHEMA_VERSION,
+        };
+        let critical = if cfg!(windows) {
+            "svchost.exe"
+        } else if cfg!(target_os = "macos") {
+            "configd"
+        } else {
+            "networkmanager"
+        };
+        let dto = CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![
+                RuleDto {
+                    id: "r-site".into(),
+                    enabled: true,
+                    address_match: Some(AddressMatchDto::ExactFqdn {
+                        value: "site.example".into(),
+                    }),
+                    app_match: None,
+                    comment: String::new(),
+                    action: RuleAction::Route,
+                    origin: None,
+                },
+                RuleDto {
+                    id: "r-deny".into(),
+                    enabled: true,
+                    address_match: None,
+                    app_match: Some(AppMatchDto {
+                        pattern: AppPatternDto::Exact {
+                            value: critical.into(),
+                        },
+                        include_child_processes: false,
+                    }),
+                    comment: String::new(),
+                    action: RuleAction::Block,
+                    origin: None,
+                },
+            ],
+            secondary: vec![],
+        };
+        let json = rules_json::to_canonical_string(&dto).expect("serialise");
+        assert!(
+            crate::activation_coordinator::rules_with_refused_values(&json, None).is_empty(),
+            "the apply is accepted"
+        );
+
+        let conn = make_state_conn();
+        insert_active_revision(&conn, &json);
+        let provider = ProductionRulesProvider::new(conn);
+        let enforced = provider.active_rules().expect("rules present");
+        let ids: Vec<&str> = enforced
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .map(|r| r.id.as_str())
+            // A domain rule carries its subdomain companion `<id>+sub`.
+            .filter(|id| !id.ends_with("+sub"))
+            .collect();
+        assert_eq!(ids, ["r-site"], "the ordinary rule is enforced alone");
+
+        let withheld = provider.withheld_rules_for(BASELINE_PRINCIPAL);
+        assert_eq!(withheld.len(), 1);
+        assert_eq!(withheld[0].rule_id.as_str(), "r-deny");
+        let listed = crate::rule_conflicts::protected_rule_dtos(&withheld);
+        assert_eq!(
+            listed[0].kind,
+            nrr_shared::ipc_payloads::RuleConflictKind::ProtectedTarget
+        );
+        assert_eq!(listed[0].reason, "critical-process");
+
+        let stored = provider
+            .stored_rules_for(BASELINE_PRINCIPAL)
+            .expect("stored rules");
+        assert_eq!(
+            stored.rule_book.primary.rules().len(),
+            2,
+            "the rule stays in the user's book"
+        );
     }
 
     #[test]

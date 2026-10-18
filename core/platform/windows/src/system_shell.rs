@@ -16,7 +16,8 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::UI::Shell::{
     FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
-    FOLDERID_RoamingAppData, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
+    FOLDERID_ProgramFilesX64, FOLDERID_ProgramFilesX86, FOLDERID_Public, FOLDERID_RoamingAppData,
+    FOLDERID_UserProfiles, FOLDERID_Windows, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
 };
 
 /// Where every supported Windows keeps it; used only if the API itself fails,
@@ -81,6 +82,43 @@ pub fn roaming_app_data_directory() -> Option<PathBuf> {
 #[must_use]
 pub fn user_profile_directory() -> Option<PathBuf> {
     known_folder(&FOLDERID_Profile)
+}
+
+/// The Windows folder as the shell registers it, or `None` when it cannot say.
+#[must_use]
+pub fn windows_directory() -> Option<PathBuf> {
+    known_folder(&FOLDERID_Windows)
+}
+
+/// Every `Program Files` folder the shell registers (64-bit, 32-bit and this
+/// process's own), without repeats.
+#[must_use]
+pub fn program_files_directories() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for id in [
+        &FOLDERID_ProgramFilesX64,
+        &FOLDERID_ProgramFilesX86,
+        &FOLDERID_ProgramFiles,
+    ] {
+        if let Some(dir) = known_folder(id) {
+            if !out.contains(&dir) {
+                out.push(dir);
+            }
+        }
+    }
+    out
+}
+
+/// The folder holding every user's profile (`C:\Users`), or `None`.
+#[must_use]
+pub fn user_profiles_directory() -> Option<PathBuf> {
+    known_folder(&FOLDERID_UserProfiles)
+}
+
+/// The profile every user shares (`C:\Users\Public`), or `None`.
+#[must_use]
+pub fn public_directory() -> Option<PathBuf> {
+    known_folder(&FOLDERID_Public)
 }
 
 fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {

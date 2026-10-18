@@ -59,28 +59,12 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
         &scoped(&PrincipalScope::ServiceAccounts),
         secondary_luid,
     ));
-    out.extend(forwarding_path(lower_kill_switch_flows(
-        &scoped(&PrincipalScope::Forwarded),
-        secondary_luid,
-    )));
+    // Forwarded packets are judged only on the forwarding layers, by
+    // destination and egress.
+    out.extend(WfpFilterSpec::onto_forwarding_path(
+        lower_kill_switch_flows(&scoped(&PrincipalScope::Forwarded), secondary_luid),
+    ));
     out
-}
-
-/// Forwarded packets are judged only on the forwarding layers, by destination
-/// and egress: the connect half of each filter, moved there.
-fn forwarding_path(mut specs: Vec<WfpFilterSpec>) -> Vec<WfpFilterSpec> {
-    specs.retain(|spec| spec.layer.supports_ale_scoping());
-    for spec in &mut specs {
-        spec.layer = if spec.layer.is_v6() {
-            WfpLayerKey::IpForwardV6
-        } else {
-            WfpLayerKey::IpForwardV4
-        };
-        spec.user_sid = None;
-        spec.ip_protocol = None;
-        spec.remote_port = None;
-    }
-    specs
 }
 
 fn lower_kill_switch_flows(flows: &[&FlowRule], secondary_luid: u64) -> Vec<WfpFilterSpec> {

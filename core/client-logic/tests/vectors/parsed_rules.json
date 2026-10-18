@@ -13,6 +13,9 @@
     { "name": "range in primary", "input": { "route": "primary", "rule": { "id-hint": 9, "enabled": true, "rule-type": "ip-range", "section-name": "Ranges", "match-value": "192.0.2.10-192.0.2.20", "comment": "x", "line-number": 15 } } },
     { "name": "application disabled", "input": { "route": "secondary", "rule": { "id-hint": 10, "enabled": false, "rule-type": "application", "section-name": "Windows", "match-value": "client.exe", "comment": "", "line-number": 16 } } },
     { "name": "auto rule keeps only routing", "input": { "route": "secondary", "rule": { "id-hint": 11, "enabled": true, "rule-type": "domain", "section-name": "Auto", "match-value": "img.site.example", "comment": "note", "origin": { "kind": "auto", "reason": "site-companion", "anchor": "site.example", "added": "2026-01-01" }, "line-number": 17 } } },
-    { "name": "unicode host", "input": { "route": "primary", "rule": { "id-hint": 12, "enabled": true, "rule-type": "domain", "section-name": "Domains", "match-value": "пример.рф", "comment": "", "line-number": 18 } } }
+    { "name": "unicode host", "input": { "route": "primary", "rule": { "id-hint": 12, "enabled": true, "rule-type": "domain", "section-name": "Domains", "match-value": "пример.рф", "comment": "", "line-number": 18 } } },
+    { "name": "a program with +children keeps the flag in the table", "input": { "route": "secondary", "rule": { "id-hint": 14, "enabled": false, "rule-type": "application", "section-name": "Windows", "match-value": "codex.exe", "comment": "", "children": true, "line-number": 20 } } },
+    { "name": "a denied program with +children", "input": { "route": "primary", "rule": { "id-hint": 15, "enabled": true, "rule-type": "application", "section-name": "Windows", "match-value": "tool.exe", "comment": "", "blocked": true, "children": true, "line-number": 21 } } },
+    { "name": "+children on a domain is not kept", "input": { "route": "primary", "rule": { "id-hint": 16, "enabled": true, "rule-type": "domain", "section-name": "Domains", "match-value": "example.com", "comment": "", "children": true, "line-number": 22 } } }
   ]
 }

@@ -5,7 +5,10 @@
 //! in English. `tests/client_error_codes_are_translated.rs` holds the locales
 //! to this list and every producer that spells a code itself to the list.
 
-use crate::ipc_transport::{IpcErrorCode, ELEVATION_DECLINED_CLIENT_SLUG};
+use crate::ipc_transport::{
+    IpcErrorCode, ELEVATION_AGENT_MISSING_CLIENT_SLUG, ELEVATION_DECLINED_CLIENT_SLUG,
+    ELEVATION_UNAVAILABLE_CLIENT_SLUG,
+};
 
 // A call that got no usable answer from the service.
 pub const TRANSPORT_DISCONNECTED: &str = "transport-disconnected";
@@ -68,6 +71,7 @@ pub const CLIENT_ERROR_CODES: &[&str] = &[
     "control-character",
     "invalid-rule-value",
     "network-on-both-routes",
+    "folder-on-both-routes",
     "network-covers-link",
     "network-covers-fake-ip-pool",
     "rule-kind-unknown",
@@ -89,6 +93,7 @@ pub const CLIENT_ERROR_CODES: &[&str] = &[
     "marker-write-failed",
     "activation-not-recorded",
     "revision-integrity-rejected",
+    "rules-changed-elsewhere",
     "not-implemented",
     // Rule-file import.
     "payload-too-large",
@@ -124,6 +129,8 @@ pub const CLIENT_ERROR_CODES: &[&str] = &[
     USER_SETTINGS_UNAVAILABLE,
     // Elevation and service control.
     ELEVATION_DECLINED_CLIENT_SLUG,
+    ELEVATION_AGENT_MISSING_CLIENT_SLUG,
+    ELEVATION_UNAVAILABLE_CLIENT_SLUG,
     SERVICE_NOT_INSTALLED,
     SERVICE_CONTROL_FAILED,
     SERVICE_RELOCATION_FAILED,

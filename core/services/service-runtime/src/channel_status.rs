@@ -28,14 +28,28 @@ type AbsentSince = HashMap<String, [Option<Instant>; 2]>;
 pub struct ChannelStatusPublisher {
     board: RouteEnforcementStatus,
     absent_since: Mutex<AbsentSince>,
+    /// The connection to offer as main to a principal who bound none.
+    suggest_primary: Option<PrimarySuggestionFn>,
 }
+
+/// Asked only for a principal with nothing bound.
+pub type PrimarySuggestionFn = std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 impl ChannelStatusPublisher {
     pub fn new(board: RouteEnforcementStatus) -> Self {
         Self {
             board,
             absent_since: Mutex::new(HashMap::new()),
+            suggest_primary: None,
         }
+    }
+
+    /// Name the sole default-route holder in the `no-policy` report, so the
+    /// notice can offer it for confirmation.
+    #[must_use]
+    pub fn with_primary_suggestion(mut self, suggest: PrimarySuggestionFn) -> Self {
+        self.suggest_primary = Some(suggest);
+        self
     }
 
     pub fn board(&self) -> &RouteEnforcementStatus {
@@ -83,12 +97,13 @@ impl ChannelStatusPublisher {
         }
         if unbound(&report.primary) && unbound(&report.secondary) {
             absent.remove(principal);
+            let suggestion = self.suggest_primary.as_ref().and_then(|suggest| suggest());
             board.publish(
                 events,
                 principal,
                 "no-policy",
                 MACHINE_WIDE_ROLE,
-                Vec::new(),
+                suggestion.into_iter().collect(),
             );
             for role in ["primary", "secondary"] {
                 board.clear_role(events, principal, role);
@@ -226,6 +241,18 @@ mod tests {
 
         publisher.observe(None, [("p", &down)], now);
         assert_eq!(board.status_of("p", "").as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn nothing_bound_names_the_connection_to_confirm_as_main() {
+        let publisher = ChannelStatusPublisher::new(RouteEnforcementStatus::new())
+            .with_primary_suggestion(std::sync::Arc::new(|| Some("Ethernet".to_owned())));
+        let unbound = report(ChannelState::Unbound, ChannelState::Unbound);
+        publisher.observe(None, [("p", &unbound)], Instant::now());
+        let reports = publisher.board().for_principal("p");
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].status, "no-policy");
+        assert_eq!(reports[0].candidates, vec!["Ethernet".to_owned()]);
     }
 
     #[test]

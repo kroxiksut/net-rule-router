@@ -18,6 +18,7 @@ use nrr_client_logic::auto_rules::{
 };
 use nrr_client_logic::route_policy::build_full_update_request;
 use nrr_ipc_client::{ipc_error_to_wire, ipc_operation_timeout, IpcClient};
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     AutoRuleCandidateDto, AutoRuleCandidatesActionRequest, AutoRuleCandidatesActionResponse,
@@ -100,11 +101,15 @@ enum Note {
     NothingToDo(usize),
     Cancelled,
     Offline,
+    /// The baseline is on the Rules screen; additions go to the caller's own.
+    OwnRulesOnly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     Add,
+    /// Add as the site in every zone, where the offer names one.
+    AddAnyZone,
     Never,
     Restore,
     /// Add, and from now on add without asking — after a yes.
@@ -238,7 +243,7 @@ impl Screen for SuggestionsScreen {
         if rest.is_empty() {
             return matches!(letter, 'c' | 's' | 'v' | 'o') && command(app, letter, 0);
         }
-        if !matches!(letter, 'a' | 'n' | 'r' | 'm') {
+        if !matches!(letter, 'a' | 'z' | 'n' | 'r' | 'm') {
             return false;
         }
         let Ok(number) = rest.parse::<usize>() else {
@@ -282,6 +287,7 @@ fn scroll_for(state: &Suggestions) -> u16 {
 fn command(app: &mut AppState, letter: char, index: usize) -> bool {
     let action = match letter {
         'a' => Action::Add,
+        'z' => Action::AddAnyZone,
         'n' => Action::Never,
         'r' => Action::Restore,
         'm' => Action::Always,
@@ -329,8 +335,16 @@ fn act(app: &mut AppState, action: Action, index: usize) {
         Action::Restore => group.dismissed_ids.clone(),
         _ => group.pending_ids.clone(),
     };
-    if ids.is_empty() {
+    let no_site = matches!(action, Action::AddAnyZone)
+        && nrr_client_logic::auto_rules::any_zone_site(&group).is_empty();
+    if ids.is_empty() || no_site {
         app.suggestions.note = Some(Note::NothingToDo(index + 1));
+        return;
+    }
+    // Additions land in the caller's own rules; with the baseline on the Rules
+    // screen the set written would not be the set shown.
+    if app.rules.baseline && !matches!(action, Action::Never | Action::Restore) {
+        app.suggestions.note = Some(Note::OwnRulesOnly);
         return;
     }
     match action {
@@ -339,7 +353,8 @@ fn act(app: &mut AppState, action: Action, index: usize) {
             app.suggestions.confirm = Some(group.domain);
             app.suggestions.note = None;
         }
-        Action::Add => app.outbox.push(accept_job(ids)),
+        Action::Add => app.outbox.push(accept_job(ids, false)),
+        Action::AddAnyZone => app.outbox.push(accept_job(ids, true)),
         Action::Never => app.outbox.push(dismiss_job(ids)),
         Action::Restore => app.outbox.push(restore_job(ids)),
     }
@@ -419,9 +434,9 @@ fn finish(app: &mut AppState, note: Result<Note, CallError>) {
     load(app);
 }
 
-fn accept_job(ids: Vec<String>) -> Job {
+fn accept_job(ids: Vec<String>, as_any_zone: bool) -> Job {
     Box::new(move |client: &dyn IpcClient| {
-        let answer = accept(client, ids);
+        let answer = accept(client, ids, as_any_zone);
         Reply::new(move |app| {
             if let Ok(answer) = &answer {
                 app.suggestions.pending_count = answer.pending;
@@ -435,11 +450,12 @@ fn accept_job(ids: Vec<String>) -> Job {
 fn accept(
     client: &dyn IpcClient,
     ids: Vec<String>,
+    as_any_zone: bool,
 ) -> Result<AutoRuleCandidatesActionResponse, CallError> {
     call(
         client,
         IpcOperationName::AutoRuleCandidatesAccept,
-        &AutoRuleCandidatesActionRequest { ids },
+        &AutoRuleCandidatesActionRequest { ids, as_any_zone },
     )
 }
 
@@ -448,7 +464,10 @@ fn dismiss_job(ids: Vec<String>) -> Job {
         let answer: Result<AutoRuleCandidatesActionResponse, _> = call(
             client,
             IpcOperationName::AutoRuleCandidatesDismiss,
-            &AutoRuleCandidatesActionRequest { ids },
+            &AutoRuleCandidatesActionRequest {
+                ids,
+                as_any_zone: false,
+            },
         );
         Reply::new(move |app| {
             if let Ok(answer) = &answer {
@@ -477,7 +496,7 @@ fn always_job(ids: Vec<String>) -> Job {
     Box::new(move |client: &dyn IpcClient| {
         let switched = switch_to_auto(client);
         let did_switch = switched.is_ok();
-        let outcome = switched.and_then(|()| accept(client, ids));
+        let outcome = switched.and_then(|()| accept(client, ids, false));
         Reply::new(move |app| {
             if did_switch {
                 let named =
@@ -560,7 +579,7 @@ pub fn changed(
     let site = if top_anchor.is_empty() {
         texts.get(keys::NOTICE_SITE_FALLBACK)
     } else {
-        top_anchor.to_owned()
+        display_text(top_anchor).into_owned()
     };
     let screen = ScreenId::Suggestions;
     let body = format!(
@@ -682,6 +701,7 @@ fn note_text(note: &Note, texts: &Texts) -> String {
         Note::NothingToDo(n) => item(keys::NOTHING_TO_DO, *n),
         Note::Cancelled => texts.get(keys::CANCELLED),
         Note::Offline => texts.get(common::ROUTING_DISCONNECTED),
+        Note::OwnRulesOnly => texts.get(crate::screens::rules::OWN_RULES_ONLY),
     }
 }
 
@@ -737,7 +757,8 @@ fn empty_text(state: &Suggestions, texts: &Texts) -> String {
 
 /// Rows one group takes; [`group_lines`] must agree (a test holds them).
 fn group_line_count(group: &SuggestionGroup) -> usize {
-    let consumers = usize::from(!group.consumers.is_empty());
+    let consumers = usize::from(!group.consumers.is_empty())
+        + usize::from(!nrr_client_logic::auto_rules::any_zone_site(group).is_empty());
     let hosts: usize = group
         .hosts
         .iter()
@@ -753,9 +774,9 @@ fn group_lines(
     texts: &Texts,
 ) -> Vec<ViewLine> {
     let name = if group.is_app {
-        texts.fill(keys::APP_GROUP, &[("name", group.domain.as_str())])
+        texts.fill(keys::APP_GROUP, &[("name", display_text(&group.domain))])
     } else {
-        group.domain.clone()
+        display_text(&group.domain).into_owned()
     };
     let mut counts = Vec::new();
     let pending = group
@@ -774,17 +795,23 @@ fn group_lines(
         ));
     }
     let marker = if selected { "> " } else { "" };
-    let mut lines = vec![ViewLine::new(vec![
-        Segment::plain(format!("{marker}{}. ", index + 1)),
-        Segment::strong(name),
-        Segment::plain(format!(" — {}", counts.join(", "))),
-    ])];
+    let number = format!("{marker}{}. ", index + 1);
+    let counts = format!(" — {}", counts.join(", "));
+    let mut lines = vec![ViewLine::new(if selected {
+        vec![Segment::selected(format!("{number}{name}{counts}"))]
+    } else {
+        vec![
+            Segment::plain(number),
+            Segment::strong(name),
+            Segment::plain(counts),
+        ]
+    })];
     if !group.consumers.is_empty() {
-        let names: Vec<&str> = group
+        let names: Vec<_> = group
             .consumers
             .iter()
             .take(CONSUMERS_SHOWN)
-            .map(|c| c.hostname.as_str())
+            .map(|c| display_text(&c.hostname))
             .collect();
         let mut text = format!("   {} {}", texts.get(keys::NEEDED_BY), names.join(", "));
         let more = group.consumers.len().saturating_sub(CONSUMERS_SHOWN);
@@ -794,6 +821,13 @@ fn group_lines(
         }
         lines.push(ViewLine::text(text));
     }
+    let site = nrr_client_logic::auto_rules::any_zone_site(group);
+    if !site.is_empty() {
+        lines.push(ViewLine::text(format!(
+            "   {}",
+            texts.fill(keys::ANY_ZONE, &[("site", site)])
+        )));
+    }
     for host in &group.hosts {
         lines.extend(host_lines(group, host, texts));
     }
@@ -802,15 +836,18 @@ fn group_lines(
 
 fn host_lines(group: &SuggestionGroup, host: &SuggestionHost, texts: &Texts) -> Vec<ViewLine> {
     let shown_name = if host.match_kind == "suffix" {
-        format!("*.{}", host.match_value)
+        format!("*.{}", display_text(&host.match_value))
     } else {
-        host.match_value.clone()
+        display_text(&host.match_value).into_owned()
     };
     let status = texts.get(match host.status {
         HostStatus::Pending => keys::STATUS_PENDING,
         HostStatus::Dismissed => keys::STATUS_DISMISSED,
     });
     let mut facts = vec![status, behavior_text(host, texts)];
+    if !host.less_certain.is_empty() {
+        facts.push(texts.get(keys::LESS_CERTAIN));
+    }
     if let Some(third_party) = host.third_party {
         facts.push(texts.get(if third_party {
             keys::OWNERSHIP_THIRD_PARTY
@@ -847,12 +884,30 @@ fn behavior_text(host: &SuggestionHost, texts: &Texts) -> String {
 }
 
 fn has_evidence(host: &SuggestionHost) -> bool {
-    !host.signal.is_empty() || host.observations > 0 || host.affinity > 0.0
+    !host.signal.is_empty()
+        || host.observations > 0
+        || host.affinity > 0.0
+        || !host.less_certain.is_empty()
 }
 
-/// "How do you know?": the evidence travels with the offer.
+/// "How do you know?": the evidence travels with the offer, a less certain
+/// offer's basis first.
 fn evidence_text(host: &SuggestionHost, texts: &Texts) -> String {
     let mut parts = Vec::new();
+    if !host.less_certain.is_empty() {
+        let suffix = format!(".{}", host.less_certain);
+        // A basis this build has no words for leaves the mark alone to say it.
+        if let Some(basis) = keys::LESS_CERTAIN_BASES
+            .iter()
+            .find(|k| k.id.ends_with(&suffix))
+        {
+            parts.push(format!(
+                "{}: {}",
+                texts.get(keys::LESS_CERTAIN),
+                texts.fill(*basis, &[("site", display_text(&host.anchor))])
+            ));
+        }
+    }
     if !host.signal.is_empty() {
         let suffix = format!(".{}", host.signal);
         // A signal this build has no words for is shown by its slug.
@@ -879,9 +934,9 @@ fn evidence_text(host: &SuggestionHost, texts: &Texts) -> String {
 /// How far the rule reaches against what was actually seen.
 fn reach_text(group: &SuggestionGroup, host: &SuggestionHost, texts: &Texts) -> String {
     let scope = if group.is_app {
-        texts.fill(keys::REACH_APP, &[("app", group.domain.as_str())])
+        texts.fill(keys::REACH_APP, &[("app", display_text(&group.domain))])
     } else {
-        texts.fill(keys::REACH, &[("domain", host.match_value.as_str())])
+        texts.fill(keys::REACH, &[("domain", display_text(&host.match_value))])
     };
     let members = &host.observed_members;
     if members.is_empty() {
@@ -890,7 +945,7 @@ fn reach_text(group: &SuggestionGroup, host: &SuggestionHost, texts: &Texts) -> 
     let mut seen = members
         .iter()
         .take(MEMBERS_SHOWN)
-        .map(String::as_str)
+        .map(|m| display_text(m))
         .collect::<Vec<_>>()
         .join(", ");
     let more = members.len().saturating_sub(MEMBERS_SHOWN);

@@ -96,6 +96,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'lib\package-contents.ps1')
 $packageRoot = Join-Path $OutputRoot $(if ($Headless) { 'NetRuleRouter-headless' } else { 'NetRuleRouter' })
 # Binaries live in the package root: the user starts NetRuleRouter.exe
 # directly, with no wrapper script in between. Nothing collides there -
@@ -406,6 +407,9 @@ if (Test-Path $packageRoot) {
     Write-Step "replacing the previous package in '$packageRoot'"
     Remove-Item -Path $packageRoot -Recurse -Force
 }
+
+# Read before the build, so a broken list fails in seconds.
+$required = Get-PackageContents -RepoRoot $repoRoot -Variant $(if ($Headless) { 'headless' } else { 'full' })
 
 # ── Build ────────────────────────────────────────────────────────────────────
 
@@ -851,46 +855,17 @@ Set-Content -Path (Join-Path $packageRoot 'README.ru.txt') -Value $readMeRu -Enc
 
 # ── Verification ─────────────────────────────────────────────────────────────
 
-$required = @(
-    'nrr-service.exe',
-    'nrr-cli.exe',
-    'nrr-tui.exe',
-    'wintun.dll',
-    'locales\en.json',
-    'locales\ru.json',
-    'assets\icons\app\app.ico',
-    'README.txt',
-    'README.ru.txt',
-    'build-info.json'
-)
-if (-not $Headless) { $required += @(
-    'NetRuleRouter.exe',
-    'NetRuleRouterTray.exe',
-    'nrr-service.exe',
-    'nrr-cli.exe',
-    'nrr-tui.exe',
-    'nrr_qt_native_host.exe',
-    'wintun.dll',
-    'Qt6Core.dll',
-    'Qt6Quick.dll',
-    # The two image decoders the app actually needs; the trim above removes the
-    # rest, and removing one of these would blank every icon or the window icon.
-    'imageformats\qsvg.dll',
-    'imageformats\qico.dll',
-    'qml\QtQuick',
-    'apps\desktop\qml\Main.qml',
-    'apps\desktop\qml\Tray.qml',
-    'apps\desktop\qml\components\ThemedButton.qml',
-    'assets\icons\ui\apply.svg',
-    'locales\en.json',
-    'locales\ru.json',
-    'assets\icons\app\app.ico',
-    'assets\images\logo\logo-lockup-stacked.png',
-    'README.txt',
-    'README.ru.txt',
-    'build-info.json'
-) }
-$missing = $required | Where-Object { -not (Test-Path (Join-Path $packageRoot $_)) }
+# Every executable, its symbols and every user script shipped must be on the
+# list, or a new one would ship unchecked.
+$shipped = @($executables | ForEach-Object {
+    $_
+    ([IO.Path]::GetFileNameWithoutExtension($_) -replace '-', '_') + '.pdb'
+}) + @($userScripts | ForEach-Object { "scripts\$_" })
+$unlisted = @($shipped | Where-Object { $required -notcontains $_ })
+if ($unlisted) {
+    throw "packaging\windows\package-contents.txt does not list $($unlisted -join ', '), which this script ships."
+}
+$missing = Get-MissingContents -Root $packageRoot -Expected $required
 if ($missing) {
     throw "Package is incomplete, missing: $($missing -join ', ')"
 }

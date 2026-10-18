@@ -103,6 +103,7 @@ function normalizedFontScalePercent(value) {
 
 // Fill `{name}` from `args` and `{0}`, `{1}`… from `positional` in ONE pass:
 // a value is never re-scanned, so a `{host}` or `$&` inside it stays literal.
+// Values are names the service saw, so they go in through `displayText`.
 // A translation left with a hole reads worse than the English line, which
 // still carries the cause — so any unfilled placeholder shows `source` instead.
 function formatLogLine(translated, source, args, positional) {
@@ -110,8 +111,8 @@ function formatLogLine(translated, source, args, positional) {
     var indexed = positional || []
     var missing = false
     var filled = String(translated).replace(/\{(\w+)\}/g, function(whole, name) {
-        if (Object.prototype.hasOwnProperty.call(named, name)) return String(named[name])
-        if (/^\d+$/.test(name) && Number(name) < indexed.length) return String(indexed[Number(name)])
+        if (Object.prototype.hasOwnProperty.call(named, name)) return displayText(named[name])
+        if (/^\d+$/.test(name) && Number(name) < indexed.length) return displayText(indexed[Number(name)])
         missing = true
         return whole
     })
@@ -124,6 +125,71 @@ function formatStorageBytes(bytes) {
     if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KiB"
     if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MiB"
     return (n / (1024 * 1024 * 1024)).toFixed(2) + " GiB"
+}
+
+// ---- recent rule changes ----
+//
+// Twin of `nrr_client_logic::recent_changes`; `recent_*.json` vectors hold the
+// two together. No clock here: the caller passes the moment (Unix seconds)
+// and the reader's offset from UTC at that moment, in minutes east
+// (`-new Date(ms).getTimezoneOffset()`).
+
+function _recentFloorDiv(a, b) { return Math.floor(a / b) }
+function _recentMod(a, b) { return a - b * Math.floor(a / b) }
+
+// Unix seconds the period ("hour" | "today" | "week") starts at.
+function recentPeriodSince(period, now, offsetMinutes) {
+    var n = Number(now || 0)
+    var off = Number(offsetMinutes || 0) * 60
+    if (period === "hour") return n - 3600
+    if (period === "week") return n - 7 * 86400
+    var local = n + off
+    return local - _recentMod(local, 86400) - off
+}
+
+function _recentLocalDay(at, offsetMinutes) {
+    var local = Number(at || 0) + Number(offsetMinutes || 0) * 60
+    return { day: _recentFloorDiv(local, 86400),
+             minute: _recentFloorDiv(_recentMod(local, 86400), 60) }
+}
+
+function _recentTwo(n) { return (n < 10 ? "0" : "") + String(n) }
+
+function _recentClock(minute) {
+    return _recentTwo(_recentFloorDiv(minute, 60)) + ":" + _recentTwo(minute % 60)
+}
+
+// Day and month of a day number (days since 1970-01-01).
+function _recentDayMonth(days) {
+    var z = days + 719468
+    var era = _recentFloorDiv(z, 146097)
+    var doe = z - era * 146097
+    var yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524)
+        - Math.floor(doe / 146096)) / 365)
+    var doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100))
+    var mp = Math.floor((5 * doy + 2) / 153)
+    var day = doy - Math.floor((153 * mp + 2) / 5) + 1
+    var month = mp < 10 ? mp + 3 : mp - 9
+    return { day: day, month: month }
+}
+
+// `14.10 14:32`: the date always shown.
+function recentChangeStamp(at, offsetMinutes) {
+    var local = _recentLocalDay(at, offsetMinutes)
+    var dm = _recentDayMonth(local.day)
+    return _recentTwo(dm.day) + "." + _recentTwo(dm.month) + " " + _recentClock(local.minute)
+}
+
+// `14:32` today, `yesterday` with `{time}` filled the day before, the stamp
+// otherwise.
+function recentChangeTime(at, atOffsetMinutes, now, nowOffsetMinutes, yesterday) {
+    var local = _recentLocalDay(at, atOffsetMinutes)
+    var today = _recentLocalDay(now, nowOffsetMinutes).day
+    if (local.day === today) return _recentClock(local.minute)
+    if (local.day + 1 === today) {
+        return String(yesterday || "").split("{time}").join(_recentClock(local.minute))
+    }
+    return recentChangeStamp(at, atOffsetMinutes)
 }
 
 // ---- glyphs / external links ----
@@ -812,6 +878,31 @@ function boundWireRowIndex(rows, binding) {
     return -1
 }
 
+// The main-connection binding a confirmed suggestion writes: the one row whose
+// connection name or driver description is `name` (ASCII case aside). null
+// when no row or more than one answers to it: the choice then goes to the
+// interfaces window. Twin: nrr_client_logic::adapters::suggested_primary_binding.
+function suggestedPrimaryBinding(rows, name) {
+    var wanted = _asciiLower(String(name || "").trim())
+    if (!_isList(rows) || wanted === "") return null
+    var found = null
+    for (var i = 0; i < rows.length; i += 1) {
+        var row = rows[i] || {}
+        var shown = _asciiLower(String(row["name"] || "").trim())
+        var driver = _asciiLower(String(row["interface-description"] || "").trim())
+        if (shown !== wanted && driver !== wanted) continue
+        if (found !== null) return null
+        found = row
+    }
+    if (found === null || String(found["persistent-id"] || "") === "") return null
+    var display = String(found["name"] || "").trim()
+    return {
+        "stable-id": String(found["persistent-id"]),
+        "display-name": display !== "" ? display : String(name).trim(),
+        "user-confirmed": true
+    }
+}
+
 // ---- own fake-IP TUN adapter detection ----
 
 // True when a mapped interface row is NetRuleRouter's OWN fake-IP TUN adapter
@@ -914,9 +1005,9 @@ function adapterDisplayName(row) {
     if (!row) return ""
     var name = String(row.name || "").trim()
     var descr = String(row.description || "").trim()
-    if (name === "") return descr
-    if (descr === "" || descr === name) return name
-    return name + " \u2014 " + descr
+    if (name === "") return displayText(descr)
+    if (descr === "" || descr === name) return displayText(name)
+    return displayText(name + " \u2014 " + descr)
 }
 
 // The hint beside an adapter's kind: "no-internet" for a link with no way out,
@@ -994,6 +1085,10 @@ function previewRefusal(summary) {
 // shows the code's own text. `args` is the refusal's wire `args`.
 function refusalDetail(code, args) {
     if (!args) return null
+    var folder = String(args["folder"] || "")
+    if (code === "folder-on-both-routes" && folder !== "") {
+        return { key: "errors.folder-on-both-routes-named", values: { folder: folder } }
+    }
     var network = String(args["network"] || "")
     if (network === "") return null
     var kind = String(args["covers-kind"] || "")
@@ -1075,6 +1170,88 @@ function escapeMarkup(text) {
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 }
 
+// ---- foreign names on screen ----
+
+// Twin of `nrr_shared::display_text`, held to it by the display_text vectors.
+// A program name, exe path, adapter name or PTR name someone else wrote, made
+// safe to show: every character that executes, reorders or hides text becomes
+// a visible "·", and a name above the cap is cut in the middle. DISPLAY ONLY:
+// a value that builds or matches a rule never passes through here.
+var DISPLAY_TEXT_MAX_CHARS = 512
+var _DISPLAY_TEXT_HEAD = 255
+var _DISPLAY_TEXT_TAIL = DISPLAY_TEXT_MAX_CHARS - _DISPLAY_TEXT_HEAD - 1
+
+// The set of `needs_substitute`; a lone surrogate, which a Rust string cannot
+// hold, is flagged too.
+function _displayNeedsSubstitute(cp) {
+    if (cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f)) return true
+    if (cp >= 0xd800 && cp <= 0xdfff) return true
+    if (cp === 0x061c || cp === 0x200e || cp === 0x200f) return true
+    if ((cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2066 && cp <= 0x2069)) return true
+    if (cp === 0x00ad || cp === 0x034f || cp === 0x180e || cp === 0xfeff) return true
+    if ((cp >= 0x200b && cp <= 0x200d) || (cp >= 0x2060 && cp <= 0x2064)) return true
+    if (cp >= 0x206a && cp <= 0x206f) return true
+    if ((cp >= 0x1bca0 && cp <= 0x1bca3) || (cp >= 0x1d173 && cp <= 0x1d17a)) return true
+    if (cp === 0x115f || cp === 0x1160 || cp === 0x3164 || cp === 0xffa0) return true
+    if (cp === 0x2028 || cp === 0x2029 || (cp >= 0xfff9 && cp <= 0xfffb)) return true
+    return (cp >= 0xe0000 && cp <= 0xe007f) || (cp >= 0xe0100 && cp <= 0xe01ef)
+}
+
+// UTF-16 index after `count` code points from `from`.
+function _displayAdvance(s, from, count) {
+    var i = from
+    for (var n = 0; n < count && i < s.length; n += 1) i += s.codePointAt(i) > 0xffff ? 2 : 1
+    return i
+}
+
+// UTF-16 index `count` code points before the end.
+function _displayBackFromEnd(s, count) {
+    var j = s.length
+    for (var n = 0; n < count && j > 0; n += 1) {
+        j -= 1
+        var unit = s.charCodeAt(j)
+        if (unit >= 0xdc00 && unit <= 0xdfff && j > 0) {
+            var lead = s.charCodeAt(j - 1)
+            if (lead >= 0xd800 && lead <= 0xdbff) j -= 1
+        }
+    }
+    return j
+}
+
+function _displaySubstituted(s, from, to) {
+    var out = ""
+    var start = from
+    var i = from
+    while (i < to) {
+        var cp = s.codePointAt(i)
+        var width = cp > 0xffff ? 2 : 1
+        if (_displayNeedsSubstitute(cp)) {
+            out += s.substring(start, i) + "·"
+            start = i + width
+        }
+        i += width
+    }
+    return out + s.substring(start, to)
+}
+
+function displayText(value) {
+    var s = value === undefined || value === null ? "" : String(value)
+    if (_displayAdvance(s, 0, DISPLAY_TEXT_MAX_CHARS) >= s.length) {
+        return _displaySubstituted(s, 0, s.length)
+    }
+    var headEnd = _displayAdvance(s, 0, _DISPLAY_TEXT_HEAD)
+    var tailStart = _displayBackFromEnd(s, _DISPLAY_TEXT_TAIL)
+    return _displaySubstituted(s, 0, headEnd) + "…" + _displaySubstituted(s, tailStart, s.length)
+}
+
+// `displayText` over each item of a list; anything else is an empty list.
+function displayTextList(list) {
+    var out = []
+    if (!_isList(list)) return out
+    for (var i = 0; i < list.length; i += 1) out.push(displayText(list[i]))
+    return out
+}
+
 // What a screen reader gets from a StyledText body: the emphasis tags dropped
 // and the entities `escapeMarkup` wrote turned back into their characters.
 function markupToPlain(text) {
@@ -1100,7 +1277,9 @@ var MUTABLE_NOTICE_KINDS = {
     "secondary-down": ["notifications.enforcement.secondary-down.title",
         "The additional connection is not up"],
     "routes-held": ["notifications.routes-held.title",
-        "Some addresses follow another user's route"]
+        "Some addresses follow another user's route"],
+    "traffic-carried": ["notifications.traffic-carried.title",
+        "Your traffic goes through another user's tunnel"]
 }
 
 // How long each answer of the chooser holds; 0 is "until lifted".
@@ -2291,7 +2470,11 @@ function groupAutoRuleRows(candidates, dismissed) {
             servedByMainLink: !autoRuleShownByDefault(row),
             thirdParty: autoRuleRowThirdParty(row),
             observedMembers: (row["observed-members"] || row.observedMembers || []).map(String),
-            timestampMs: ts
+            timestampMs: ts,
+            anyZoneSite: status === "pending"
+                ? String(row["any-zone-site"] || row.anyZoneSite || "") : "",
+            lessCertain: status === "pending"
+                ? String(row["less-certain"] || row.lessCertain || "") : ""
         })
         if (status === "pending") group.pendingIds.push(id)
         else group.dismissedIds.push(id)
@@ -2323,6 +2506,17 @@ function groupAutoRuleRows(candidates, dismissed) {
         })
     }
     return groups
+}
+
+// The site a group's pending offers can be taken as, in every zone; "" when
+// none of them names one.
+function autoRuleGroupAnyZoneSite(group) {
+    var hosts = (group && group.hosts) || []
+    for (var i = 0; i < hosts.length; i += 1) {
+        if (hosts[i].status === "pending" && String(hosts[i].anyZoneSite || "") !== "")
+            return String(hosts[i].anyZoneSite)
+    }
+    return ""
 }
 
 // Groups whose consumer list includes `consumerFilter` (empty = no filter).

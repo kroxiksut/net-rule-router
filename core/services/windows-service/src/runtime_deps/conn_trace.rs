@@ -382,15 +382,28 @@ pub(super) fn build_conn_trace_pair(
         let engine_app = Arc::clone(engine);
         let engine = Arc::clone(engine);
         let sid_for_companion = Arc::clone(active_sid);
+        // Every sink below files under the connection's own user.
+        use nrr_service_runtime::conn_observation_consumer::suggestion_owner;
         consumer_builder = consumer_builder.with_companion_in_use(
             Arc::new(move |ip| recent.lookup(ip)),
-            Arc::new(move |hostname: &str| {
-                let Some(sid) = sid_for_companion() else {
+            Arc::new(move |owner: Option<&str>, hostname: &str| {
+                let Some(sid) = suggestion_owner(owner, &sid_for_companion) else {
                     return;
                 };
                 engine.note_candidate_in_use(&sid, hostname, std::time::SystemTime::now());
             }),
         );
+        // A direct connection is named by reverse lookup only for a user who
+        // collects suggestions, and only while their own traffic is routed.
+        {
+            let engine = Arc::clone(&engine_app);
+            let routing = Arc::clone(active_sid);
+            consumer_builder =
+                consumer_builder.with_primary_egress_learning(Arc::new(move |owner: &str| {
+                    suggestion_owner(Some(owner), &routing)
+                        .is_some_and(|sid| engine.learns_for(&sid))
+                }));
+        }
         // How the host fares on the primary link. The offer is "move this into
         // the tunnel", so whether it already works without one is the fact that
         // most changes the user's answer.
@@ -401,8 +414,8 @@ pub(super) fn build_conn_trace_pair(
         // destination, which is the only record of "this host does not open"
         // for a host nobody has a theory about yet.
         let stalls = nrr_service_runtime::primary_stall_registry::global_primary_stalls();
-        consumer_builder =
-            consumer_builder.with_companion_primary_health(Arc::new(move |hostname, stalled| {
+        consumer_builder = consumer_builder.with_companion_primary_health(Arc::new(
+            move |owner, hostname, stalled| {
                 let event = if stalled {
                     nrr_domain::companion_affinity::PrimaryHealthEvent::Stalled
                 } else {
@@ -412,7 +425,7 @@ pub(super) fn build_conn_trace_pair(
                 if let Some(report) = report.as_ref() {
                     nrr_service_runtime::primary_stall_registry::log_report(report);
                 }
-                let Some(sid) = sid_for_health() else {
+                let Some(sid) = suggestion_owner(owner, &sid_for_health) else {
                     return;
                 };
                 engine_health.note_primary_health(&sid, hostname, event);
@@ -438,7 +451,8 @@ pub(super) fn build_conn_trace_pair(
                         std::time::SystemTime::now(),
                     );
                 }
-            }));
+            },
+        ));
         // Programs most of whose addresses fail on the main link: offered whole,
         // unless the additional link already carries part of them.
         {
@@ -446,12 +460,16 @@ pub(super) fn build_conn_trace_pair(
             let engine_split = Arc::clone(&engine_app);
             let reach = nrr_service_runtime::app_main_link_reach::global_app_main_link_reach();
             consumer_builder = consumer_builder.with_app_main_link(Arc::new(
-                move |program: &str, remote: std::net::IpAddr, stalled: bool, named: bool| {
+                move |owner: Option<&str>,
+                      program: &str,
+                      remote: std::net::IpAddr,
+                      stalled: bool,
+                      named: bool| {
                     let at_ms = nrr_service_runtime::conn_observation_consumer::now_unix_ms();
                     let Some(verdict) = reach.note(program, remote, stalled, named, at_ms) else {
                         return;
                     };
-                    let Some(sid) = sid_for_app() else {
+                    let Some(sid) = suggestion_owner(owner, &sid_for_app) else {
                         return;
                     };
                     let now = std::time::SystemTime::now();
@@ -469,29 +487,30 @@ pub(super) fn build_conn_trace_pair(
             ));
             let sid_for_split = Arc::clone(active_sid);
             let reach = nrr_service_runtime::app_main_link_reach::global_app_main_link_reach();
-            consumer_builder =
-                consumer_builder.with_app_additional_link(Arc::new(move |program: &str| {
+            consumer_builder = consumer_builder.with_app_additional_link(Arc::new(
+                move |owner: Option<&str>, program: &str| {
                     let at_ms = nrr_service_runtime::conn_observation_consumer::now_unix_ms();
                     if reach.note_additional_link(program, at_ms).is_none() {
                         return;
                     }
-                    if let Some(sid) = sid_for_split() {
+                    if let Some(sid) = suggestion_owner(owner, &sid_for_split) {
                         engine_split.withdraw_app_offer(
                             &sid,
                             program,
                             std::time::SystemTime::now(),
                         );
                     }
-                }));
+                },
+            ));
         }
         // A censored host somebody actually went to. The placeholder answer
         // alone says only that the provider cuts the name — for everyone, ad
         // exchange and opened site alike; the connection says who went.
         {
             let sid_for_placeholder = Arc::clone(active_sid);
-            consumer_builder =
-                consumer_builder.with_placeholder_confirmed(Arc::new(move |hostname: &str| {
-                    let Some(sid) = sid_for_placeholder() else {
+            consumer_builder = consumer_builder.with_placeholder_confirmed(Arc::new(
+                move |owner: Option<&str>, hostname: &str| {
+                    let Some(sid) = suggestion_owner(owner, &sid_for_placeholder) else {
                         return;
                     };
                     engine_placeholder.note_placeholder_answer_host(
@@ -499,7 +518,8 @@ pub(super) fn build_conn_trace_pair(
                         hostname,
                         std::time::SystemTime::now(),
                     );
-                }));
+                },
+            ));
         }
         // Did the user go to this host, or did a page take them there? The
         // counts gate the main-link offer above; the distribution is logged so

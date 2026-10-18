@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 8
 # name: Turkey Default Split - Secondary Route
 # description: Platforms blocked nationwide in Turkey, and social and messaging services throttled during nationwide events
 # author: NetRuleRouter contributors
@@ -12,8 +12,7 @@
 
 *.discord.com  # Discord: blocked nationwide since October 2024
 discord.gg  # Discord: blocked nationwide since October 2024
-*.discordapp.com  # Discord: blocked nationwide since October 2024
-*.discordapp.net  # Discord: blocked nationwide since October 2024
+discordapp.*  # Discord: blocked nationwide since October 2024
 *.discord.media  # Discord: blocked nationwide since October 2024
 
 *.wattpad.com  # Wattpad: blocked nationwide since July 2024
@@ -23,11 +22,10 @@ discord.gg  # Discord: blocked nationwide since October 2024
 *.t.co  # X: throttled nationwide in March and September 2025
 *.twimg.com  # X: throttled nationwide in March and September 2025
 
-*.facebook.com  # Meta: throttled nationwide in March and September 2025
+facebook.*  # Meta: throttled nationwide in March and September 2025
 *.fb.com  # Meta: throttled nationwide in March and September 2025
 *.messenger.com  # Meta: throttled nationwide in March and September 2025
 *.fbcdn.net  # Meta: throttled nationwide in March and September 2025
-*.facebook.net  # Meta: throttled nationwide in March and September 2025
 *.fbsbx.com  # Meta: throttled nationwide in March and September 2025
 *.instagram.com  # Instagram: blocked in August 2024, throttled in March and September 2025
 *.cdninstagram.com  # Instagram: blocked in August 2024, throttled in March and September 2025
@@ -43,12 +41,10 @@ youtu.be  # YouTube: throttled nationwide in March and September 2025
 *.byteoversea.com  # TikTok: throttled nationwide in March and September 2025
 *.ibyteimg.com  # TikTok: throttled nationwide in March and September 2025
 
-*.whatsapp.com  # WhatsApp: throttled nationwide in March and September 2025
-*.whatsapp.net  # WhatsApp: throttled nationwide in March and September 2025
+whatsapp.*  # WhatsApp: throttled nationwide in March and September 2025
 wa.me  # WhatsApp: throttled nationwide in March and September 2025
-*.telegram.org  # Telegram: web client blocked and service throttled in 2025
+telegram.*  # Telegram: web client blocked and service throttled in 2025
 *.t.me  # Telegram: web client blocked and service throttled in 2025
-*.telegram.me  # Telegram: web client blocked and service throttled in 2025
 *.telesco.pe  # Telegram: web client blocked and service throttled in 2025
 *.signal.org  # Signal: throttled nationwide in March and September 2025
 *.signal.me  # Signal: throttled nationwide in March and September 2025

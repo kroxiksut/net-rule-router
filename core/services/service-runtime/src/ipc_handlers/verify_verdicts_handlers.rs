@@ -13,7 +13,8 @@ use nrr_shared::ipc_payloads::{
 
 use crate::auto_rules::AutoRulesEngine;
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 use crate::tamper_bootstrap::SECURITY_ALERT_GATE_CODE;
 
@@ -85,10 +86,25 @@ impl VerifyVerdictsAcceptHandler {
     }
 }
 
-impl IpcHandler for VerifyVerdictsAcceptHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for VerifyVerdictsAcceptHandler {
+    type Checked = VerifyVerdictsAcceptRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        principal(ctx)?;
+        parse(request, "rules.verify.verdicts.accept")
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         let sid = principal(ctx)?;
-        let req: VerifyVerdictsAcceptRequest = parse(request, "rules.verify.verdicts.accept")?;
         match self
             .engine
             .accept_verify_verdicts(sid, &req.rule_ids, SystemTime::now())
@@ -122,10 +138,25 @@ impl VerifyVerdictsDismissHandler {
     }
 }
 
-impl IpcHandler for VerifyVerdictsDismissHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for VerifyVerdictsDismissHandler {
+    type Checked = VerifyVerdictsDismissRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        principal(ctx)?;
+        parse(request, "rules.verify.verdicts.dismiss")
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         let sid = principal(ctx)?;
-        let req: VerifyVerdictsDismissRequest = parse(request, "rules.verify.verdicts.dismiss")?;
         reply(
             VerifyVerdictsDismissResponse {
                 dismissed: self.engine.dismiss_verify_verdicts(sid, &req.rule_ids),

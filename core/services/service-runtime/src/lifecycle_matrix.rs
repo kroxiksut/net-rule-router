@@ -474,6 +474,29 @@ mod tests {
         );
     }
 
+    /// Bytes from the network can at worst crash a unit of work, and through
+    /// it the process: every step of that chain keeps a protected user's
+    /// blocks — the panic, the restart, and the restarts running out.
+    #[test]
+    fn a_crash_from_hostile_bytes_never_lifts_leak_protection() {
+        let chain = [
+            LifecycleEdge::TaskPanic,
+            LifecycleEdge::StartAfterCrash,
+            LifecycleEdge::RestartsExhausted,
+        ];
+        for edge in chain {
+            assert_ne!(
+                expected_after(edge, ARMED).fail_closed_blocks,
+                Remove,
+                "{edge:?} lifted a protected user's blocks"
+            );
+        }
+        assert_eq!(
+            orphaned_blocks_at_start(true),
+            OrphanedBlocks::AdoptOnFirstPass
+        );
+    }
+
     #[test]
     fn spent_restarts_keep_blocks_only_under_leak_protection() {
         assert_eq!(

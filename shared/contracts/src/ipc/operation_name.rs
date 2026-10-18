@@ -332,10 +332,33 @@ pub enum IpcOperationName {
     /// [`crate::ipc_payloads::VpnGatewayCandidatesRequest`] →
     /// [`crate::ipc_payloads::VpnGatewayCandidatesResponse`].
     VpnGatewayCandidatesList,
+    /// What the caller added, changed and deleted in their own rules since a
+    /// moment, told from adjacent revisions of their own rule set. Read-only,
+    /// computed only when asked; the administrator's baseline edits are not
+    /// part of it.
+    /// [`crate::ipc_payloads::RulesRecentChangesRequest`] →
+    /// [`crate::ipc_payloads::RulesRecentChangesResponse`].
+    RulesRecentChangesList,
+    /// The caller's connections over a period, folded per program and
+    /// destination, read from the service's connection history. Every caller,
+    /// elevated or not, reads only their own. Query op, no elevation; never
+    /// part of the diagnostics archive.
+    /// [`crate::ipc_payloads::ConnHistoryListRequest`] →
+    /// [`crate::ipc_payloads::ConnHistoryListResponse`].
+    ConnHistoryList,
+    /// Erase the caller's own connection history. User-scoped, not elevated.
+    /// [`crate::ipc_payloads::ConnHistoryClearRequest`] →
+    /// [`crate::ipc_payloads::ConnHistoryClearResponse`].
+    ConnHistoryClear,
+    /// Switch the caller's own connection history on or off and choose how
+    /// many days it keeps. User-scoped, not elevated.
+    /// [`crate::ipc_payloads::ConnHistorySettingsSetRequest`] →
+    /// [`crate::ipc_payloads::ConnHistorySettingsSetResponse`].
+    ConnHistorySettingsSet,
 }
 
 impl IpcOperationName {
-    pub const ALL: [Self; 76] = [
+    pub const ALL: [Self; 80] = [
         Self::ContractNegotiate,
         Self::ServiceHealthGet,
         Self::SnapshotInitialGet,
@@ -412,6 +435,10 @@ impl IpcOperationName {
         Self::VerifyVerdictsAccept,
         Self::VerifyVerdictsDismiss,
         Self::VpnGatewayCandidatesList,
+        Self::RulesRecentChangesList,
+        Self::ConnHistoryList,
+        Self::ConnHistoryClear,
+        Self::ConnHistorySettingsSet,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -492,6 +519,10 @@ impl IpcOperationName {
             Self::VerifyVerdictsAccept => "rules.verify.verdicts.accept",
             Self::VerifyVerdictsDismiss => "rules.verify.verdicts.dismiss",
             Self::VpnGatewayCandidatesList => "vpn.gateway-candidates.list",
+            Self::RulesRecentChangesList => "rules.recent-changes.list",
+            Self::ConnHistoryList => "conn-history.list",
+            Self::ConnHistoryClear => "conn-history.clear",
+            Self::ConnHistorySettingsSet => "conn-history.settings.set",
         }
     }
 

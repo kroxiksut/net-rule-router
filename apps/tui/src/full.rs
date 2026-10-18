@@ -7,17 +7,21 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::backend::{Backend, BackendEvent, Command};
+use crate::elevation_prompt::PromptRequest;
 use crate::i18n::Texts;
 use crate::keys;
 use crate::screens::{connection_lines, menu_step, screen, MenuItem, ScreenId, COMMON_HELP};
 use crate::state::{AppState, Effect, Focus, NoticeLevel};
 use crate::view::{Panel, Tone, ViewLine};
+
+mod palette;
+use palette::Palette;
 
 /// How long a new notice also shows in the bottom line. It stays in the feed;
 /// nothing the user must act on depends on this timer.
@@ -61,6 +65,9 @@ fn event_loop(
             crate::screens::rules::on_texts(app, &current);
         }
         let texts = &current;
+        while let Some(request) = backend.take_prompt_request() {
+            hand_over_for_password(terminal, request, texts)?;
+        }
         let now = Instant::now();
         while let Ok(event) = events.try_recv() {
             for effect in app.apply(event, texts, now) {
@@ -82,6 +89,22 @@ fn event_loop(
         }
     }
     Ok(())
+}
+
+/// The agent asks for the password on the terminal itself, so the screen goes
+/// back to a plain terminal until the job that asked is done with it.
+fn hand_over_for_password(
+    terminal: &mut DefaultTerminal,
+    request: PromptRequest,
+    texts: &Texts,
+) -> io::Result<()> {
+    ratatui::restore();
+    println!("{}", texts.get(keys::PASSWORD_PROMPT));
+    let _ = request.ready.send(true);
+    // Closes when the job is done, however it ended.
+    let _ = request.done.recv();
+    *terminal = ratatui::try_init()?;
+    terminal.clear()
 }
 
 fn ring_bell() {
@@ -157,36 +180,28 @@ fn has_feed(app: &AppState, texts: &Texts) -> bool {
 // ── Lines ────────────────────────────────────────────────────────────────────
 
 fn style_for(tone: Tone, options: RenderOptions) -> Style {
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    if !options.colour {
-        return if tone == Tone::Plain {
-            Style::default()
-        } else {
-            bold
-        };
-    }
-    match tone {
-        Tone::Plain => Style::default(),
-        Tone::Strong => bold,
-        Tone::Good => Style::default().fg(Color::Green),
-        Tone::Caution => bold.fg(Color::Yellow),
-        Tone::Bad => bold.fg(Color::Red),
-    }
+    Palette::new(options).tone(tone)
 }
 
-pub fn to_line(line: &ViewLine, options: RenderOptions) -> Line<'static> {
+fn styled_line(line: &ViewLine, style: impl Fn(Tone) -> Style) -> Line<'static> {
     Line::from(
         line.segments
             .iter()
-            .map(|s| Span::styled(s.text.clone(), style_for(s.tone, options)))
+            .map(|s| Span::styled(s.text.clone(), style(s.tone)))
             .collect::<Vec<_>>(),
     )
 }
 
+pub fn to_line(line: &ViewLine, options: RenderOptions) -> Line<'static> {
+    styled_line(line, |tone| style_for(tone, options))
+}
+
+/// The connection lines, drawn on the title bar.
 pub fn header_lines(app: &AppState, texts: &Texts, options: RenderOptions) -> Vec<Line<'static>> {
+    let palette = Palette::new(options);
     connection_lines(app, texts)
         .iter()
-        .map(|l| to_line(l, options))
+        .map(|l| styled_line(l, |tone| palette.on_bar(tone)))
         .collect()
 }
 
@@ -214,7 +229,7 @@ pub fn menu_lines(app: &AppState, texts: &Texts) -> Vec<Line<'static>> {
                 }
             };
             if current && app.focus == Focus::Menu {
-                Line::styled(text, Style::default().add_modifier(Modifier::REVERSED))
+                Line::styled(text, Palette::focus())
             } else {
                 Line::from(text)
             }
@@ -243,7 +258,8 @@ pub fn content_panels(app: &AppState, texts: &Texts) -> Vec<Panel> {
     screen(app.screen).view(app, texts).panels
 }
 
-/// The bottom line: a notice that just arrived, then the key hint.
+/// The bottom lines: a notice that just arrived, then the key hint, which
+/// the status bar carries.
 pub fn footer_lines(
     app: &AppState,
     texts: &Texts,
@@ -296,21 +312,32 @@ pub fn draw(
     now: Instant,
 ) {
     let area = frame.area();
+    let palette = Palette::new(options);
     let header = header_lines(app, texts, options);
-    let footer = footer_lines(app, texts, options, now);
-    let [header_area, body_area, footer_area] = Layout::vertical([
+    let mut notice = footer_lines(app, texts, options, now);
+    let hint: Vec<Line<'static>> = notice.pop().into_iter().collect();
+    let [header_area, body_area, notice_area, hint_area] = Layout::vertical([
         Constraint::Length(wrapped_rows(&header, area.width)),
         Constraint::Min(3),
-        Constraint::Length(wrapped_rows(&footer, area.width)),
+        Constraint::Length(wrapped_rows(&notice, area.width)),
+        Constraint::Length(wrapped_rows(&hint, area.width)),
     ])
     .areas(area);
     frame.render_widget(
-        Paragraph::new(header).wrap(Wrap { trim: false }),
+        Paragraph::new(header)
+            .style(palette.bar())
+            .wrap(Wrap { trim: false }),
         header_area,
     );
     frame.render_widget(
-        Paragraph::new(footer).wrap(Wrap { trim: false }),
-        footer_area,
+        Paragraph::new(notice).wrap(Wrap { trim: false }),
+        notice_area,
+    );
+    frame.render_widget(
+        Paragraph::new(hint)
+            .style(palette.bar())
+            .wrap(Wrap { trim: false }),
+        hint_area,
     );
 
     let menu = menu_lines(app, texts);
@@ -373,7 +400,7 @@ pub fn draw(
 }
 
 /// A panel: its title as text (marked `>` and inverted when focused), the
-/// lines wrapped, never cut. Frame lines only when `--ascii` is off.
+/// lines wrapped, never cut. Rounded frame lines only when `--ascii` is off.
 fn draw_panel(
     frame: &mut Frame,
     area: Rect,
@@ -383,13 +410,11 @@ fn draw_panel(
     scroll: u16,
     options: RenderOptions,
 ) {
+    let palette = Palette::new(options);
     let title_line = if focused {
-        Line::styled(
-            format!("> {title}"),
-            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
-        )
+        Line::styled(format!("> {title}"), palette.title(true))
     } else {
-        Line::styled(title, Style::default().add_modifier(Modifier::BOLD))
+        Line::styled(title, palette.title(false))
     };
     let body = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -400,7 +425,11 @@ fn draw_panel(
         frame.render_widget(Paragraph::new(title_line), title_area);
         frame.render_widget(body, body_area);
     } else {
-        frame.render_widget(body.block(Block::bordered().title(title_line)), area);
+        let block = Block::bordered()
+            .border_type(palette.border_type())
+            .border_style(palette.border(focused))
+            .title(title_line);
+        frame.render_widget(body.block(block), area);
     }
 }
 

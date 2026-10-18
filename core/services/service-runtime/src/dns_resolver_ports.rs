@@ -38,15 +38,25 @@ use nrr_platform_api::dns::AddressFamily;
 /// rotating host re-installs enforcement soon after via TTL-driven re-query.
 const DEFAULT_TTL_SECS: u32 = 300;
 
-/// [`RuleHostOracle`] backed by the active rule book: a query is a rule host iff
-/// it matches an enabled **secondary** rule for the routing-active principal
-/// (same `rule_set_matches` the DNS observer uses — single source of truth). A
-/// non-matching host, or no routing-active user, takes the resolver's fail-open
-/// path. Only secondary rules are enforced destinations, so a primary-only
-/// match is deliberately NOT a rule host here.
+/// The users whose books the local resolver answers by, routing user first.
+pub type ResolverPrincipalsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// The routing user alone, for a wiring that names no served set.
+pub fn principals_of_routing_user(
+    active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+) -> ResolverPrincipalsFn {
+    Arc::new(move || active_sid().into_iter().collect())
+}
+
+/// [`RuleHostOracle`] over the served users' books: a query is a rule host iff
+/// an enabled **secondary** rule of ANY served user matches it (same
+/// `rule_set_matches` the DNS observer uses). A query carries no trace of who
+/// asked — on Windows every program's query comes from the DNS Client service —
+/// so the host's owners are the users whose rules name it. Only secondary rules
+/// are enforced destinations, so a primary-only match is NOT a rule host.
 pub struct ActiveRuleHostOracle {
     rules_provider: Arc<dyn RulesProvider>,
-    active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    principals: ResolverPrincipalsFn,
 }
 
 impl ActiveRuleHostOracle {
@@ -56,20 +66,76 @@ impl ActiveRuleHostOracle {
     ) -> Self {
         Self {
             rules_provider,
-            active_sid,
+            principals: principals_of_routing_user(active_sid),
         }
+    }
+
+    /// Answer for every user in `served`, not only the routing one.
+    #[must_use]
+    pub fn with_served(mut self, served: ResolverPrincipalsFn) -> Self {
+        self.principals = served;
+        self
+    }
+
+    /// The served users whose secondary rules name `hostname`.
+    pub fn owners_of(&self, hostname: &str) -> Vec<String> {
+        (self.principals)()
+            .into_iter()
+            .filter(|sid| {
+                self.rules_provider
+                    .active_rules_for(sid)
+                    .is_some_and(|s| rule_set_matches(hostname, &s.rule_book.secondary))
+            })
+            .collect()
     }
 }
 
 impl RuleHostOracle for ActiveRuleHostOracle {
     fn is_rule_host(&self, hostname: &str) -> bool {
-        let Some(sid) = (self.active_sid)() else {
-            return false;
-        };
-        let Some(snapshot) = self.rules_provider.active_rules_for(&sid) else {
-            return false;
-        };
-        rule_set_matches(hostname, &snapshot.rule_book.secondary)
+        (self.principals)().iter().any(|sid| {
+            self.rules_provider
+                .active_rules_for(sid)
+                .is_some_and(|s| rule_set_matches(hostname, &s.rule_book.secondary))
+        })
+    }
+}
+
+/// The leak guard as each served user's own: a rule host is withheld while the
+/// guard of a user whose rule names it holds, so one user's tunnel going down
+/// fails nobody else's names.
+pub struct HostOwnersLeakGuard {
+    oracle: Arc<ActiveRuleHostOracle>,
+    principals: ResolverPrincipalsFn,
+    armed_for: crate::dns_stack::PrincipalFlag,
+}
+
+impl HostOwnersLeakGuard {
+    pub fn new(
+        oracle: Arc<ActiveRuleHostOracle>,
+        principals: ResolverPrincipalsFn,
+        armed_for: crate::dns_stack::PrincipalFlag,
+    ) -> Self {
+        Self {
+            oracle,
+            principals,
+            armed_for,
+        }
+    }
+}
+
+impl crate::dns_resolver::LeakGuardPosture for HostOwnersLeakGuard {
+    fn blocking(&self) -> bool {
+        (self.principals)().iter().any(|sid| (self.armed_for)(sid))
+    }
+
+    fn blocking_for_host(&self, hostname: &str) -> bool {
+        // The latch read first: a disarmed machine costs no book match.
+        self.blocking()
+            && self
+                .oracle
+                .owners_of(hostname)
+                .iter()
+                .any(|sid| (self.armed_for)(sid))
     }
 }
 
@@ -1284,7 +1350,7 @@ impl FactSink for CacheFactSink {
 /// through to the unchanged fail-open reply.
 pub struct ActiveSecondaryOwnedIps {
     rules_provider: Arc<dyn RulesProvider>,
-    active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    principals: ResolverPrincipalsFn,
     fqdn: Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
     memo: Mutex<Option<(std::time::Instant, Arc<SecondaryAddressOwners>)>>,
 }
@@ -1302,20 +1368,27 @@ impl ActiveSecondaryOwnedIps {
     ) -> Self {
         Self {
             rules_provider,
-            active_sid,
+            principals: principals_of_routing_user(active_sid),
             fqdn,
             memo: Mutex::new(None),
         }
     }
 
+    /// Steer away from any served user's additional-link addresses: on a
+    /// machine-wide route table, each of them is somebody's tunnel.
+    #[must_use]
+    pub fn with_served(mut self, served: ResolverPrincipalsFn) -> Self {
+        self.principals = served;
+        self
+    }
+
     fn rebuild(&self) -> SecondaryAddressOwners {
-        let Some(sid) = (self.active_sid)() else {
-            return SecondaryAddressOwners::default();
-        };
-        let Some(snapshot) = self.rules_provider.active_rules_for(&sid) else {
-            return SecondaryAddressOwners::default();
-        };
-        SecondaryAddressOwners::build(&snapshot.rule_book, self.fqdn.as_ref())
+        let parts = (self.principals)()
+            .iter()
+            .filter_map(|sid| self.rules_provider.active_rules_for(sid))
+            .map(|snapshot| SecondaryAddressOwners::build(&snapshot.rule_book, self.fqdn.as_ref()))
+            .collect();
+        SecondaryAddressOwners::union(parts)
     }
 
     /// Memoized read with an injected `now` — the trait impl passes
@@ -1695,6 +1768,9 @@ impl SyncReconciler for HookSyncReconciler {
 pub struct ActiveSidEnforcedAddresses {
     active_sid: crate::supervised_runtime::ActiveRoutingSidFn,
     register: Arc<crate::enforced_addresses::EnforcedAddressRegister>,
+    /// With several users served, a host's answer is held until it is carried
+    /// for each user whose rule names it.
+    owners: Option<Arc<ActiveRuleHostOracle>>,
 }
 
 impl ActiveSidEnforcedAddresses {
@@ -1702,13 +1778,45 @@ impl ActiveSidEnforcedAddresses {
         Self {
             active_sid,
             register: crate::enforced_addresses::global_enforced_addresses(),
+            owners: None,
         }
+    }
+
+    /// Judge each answer by the users whose rules name its host.
+    #[must_use]
+    pub fn with_host_owners(mut self, oracle: Arc<ActiveRuleHostOracle>) -> Self {
+        self.owners = Some(oracle);
+        self
     }
 }
 
 impl crate::dns_resolver::EnforcedAddressView for ActiveSidEnforcedAddresses {
     fn is_enforced(&self, ip: std::net::Ipv4Addr) -> bool {
         (self.active_sid)().is_some_and(|sid| self.register.is_enforced(&sid, ip))
+    }
+
+    fn unenforced_for_host(
+        &self,
+        hostname: &str,
+        answered: &[std::net::Ipv4Addr],
+    ) -> Vec<std::net::Ipv4Addr> {
+        let owners = self
+            .owners
+            .as_ref()
+            .map(|oracle| oracle.owners_of(hostname))
+            .unwrap_or_default();
+        if owners.is_empty() {
+            return answered
+                .iter()
+                .copied()
+                .filter(|ip| !self.is_enforced(*ip))
+                .collect();
+        }
+        answered
+            .iter()
+            .copied()
+            .filter(|ip| !owners.iter().all(|sid| self.register.is_enforced(sid, *ip)))
+            .collect()
     }
 }
 

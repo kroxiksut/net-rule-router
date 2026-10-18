@@ -469,3 +469,52 @@ fn fail_closed_mode_b_arms_without_server_ips() {
         "V4 ALE + 4 named V4 packet + V6 ALE + V6 packet block-all"
     );
 }
+
+/// A network can hand out a more specific route for a rule host through the
+/// main link (a DHCP classless static route). The leak guard never reads the
+/// route table: the host is blocked on every interface, and permitted above that
+/// block only while the flow leaves through the additional link, so a planted
+/// route ends in the block instead of on the main link.
+#[test]
+fn a_planted_route_for_a_rule_host_meets_the_block_not_the_main_link() {
+    const SECONDARY: u64 = 0x2222;
+    let host = Ipv4Addr::new(203, 0, 113, 77);
+    let out = kill_switch_filters(
+        "S",
+        &[IpAddr::V4(host)],
+        SECONDARY,
+        KillSwitchProtocols::ALL,
+    );
+    let names_host =
+        |f: &&WfpFilterSpec| f.remote_ip == Some(host) || f.remote_ip_set.contains(&host);
+    let ale = |f: &&WfpFilterSpec| f.layer == WfpLayerKey::AleAuthConnectV4;
+
+    let blocks: Vec<_> = out
+        .iter()
+        .filter(names_host)
+        .filter(ale)
+        .filter(|f| f.action == WfpAction::Block)
+        .collect();
+    assert!(
+        !blocks.is_empty(),
+        "no connect-layer block for the rule host"
+    );
+    assert!(
+        blocks.iter().all(|f| f.local_interface_luid.is_none()),
+        "the block must hold whatever interface a route picks"
+    );
+    let permits: Vec<_> = out
+        .iter()
+        .filter(names_host)
+        .filter(ale)
+        .filter(|f| f.action == WfpAction::Permit)
+        .collect();
+    assert!(
+        !permits.is_empty(),
+        "no connect-layer permit for the rule host"
+    );
+    for permit in &permits {
+        assert_eq!(permit.local_interface_luid, Some(SECONDARY));
+        assert!(blocks.iter().all(|b| permit.weight > b.weight));
+    }
+}

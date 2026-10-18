@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleSet};
-use nrr_domain::decision_matching::{match_suffix_domain, match_zone};
+use nrr_domain::decision_matching::{match_any_zone_domain, match_suffix_domain, match_zone};
 use nrr_domain::rule_specificity::match_specificity;
 use nrr_platform_api::dns::{DnsCacheReadPort, NoopDnsCacheRead};
 use nrr_platform_api::dns_observe::DnsObservation;
@@ -245,7 +245,13 @@ pub(crate) fn secondary_ip_claims(
                     None,
                 );
             }
-            Some(CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_)) | None => {}
+            // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
+            Some(
+                CanonicalAddressMatch::Subnet(_)
+                | CanonicalAddressMatch::IpRange(_)
+                | CanonicalAddressMatch::AnyZoneDomain(_),
+            )
+            | None => {}
         }
     }
     SecondaryIpClaims {
@@ -320,6 +326,11 @@ pub(crate) fn rule_covers(rule: &nrr_domain::canonical::CanonicalRule, hostname:
         // subdomains only. Both helpers live in `nrr-domain` so this gate
         // and the decision engine can never disagree.
         Some(CanonicalAddressMatch::SuffixDomain(s)) => match_suffix_domain(hostname, s),
+        // Matched by itself, not by its twins: the gate has to know a zone
+        // nobody has resolved yet.
+        Some(CanonicalAddressMatch::AnyZoneDomain(b)) => {
+            match_any_zone_domain(hostname, b).is_some()
+        }
         Some(CanonicalAddressMatch::Zone(z)) => match_zone(hostname, z),
         _ => false,
     }
@@ -347,6 +358,11 @@ pub(crate) fn rule_set_match_kind(
                 consider(0, "exact-fqdn");
             }
             Some(CanonicalAddressMatch::SuffixDomain(s)) if match_suffix_domain(hostname, s) => {
+                consider(1, "subdomain");
+            }
+            Some(CanonicalAddressMatch::AnyZoneDomain(b))
+                if match_any_zone_domain(hostname, b).is_some() =>
+            {
                 consider(1, "subdomain");
             }
             Some(CanonicalAddressMatch::Zone(z)) if match_zone(hostname, z) => {

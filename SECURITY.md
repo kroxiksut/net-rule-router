@@ -2,7 +2,7 @@
 
 This page describes the trust model NetRuleRouter actually implements today: who may change routing policy, what protects that policy, and where the protection stops. It states the known gaps plainly; a gap is listed here until it is closed, and a promise that the code does not keep does not belong on this page.
 
-To report a vulnerability, see [`CONTRIBUTING.md`](CONTRIBUTING.md#reporting-a-security-issue). A report that names the boundary it crosses is much easier to act on.
+To report a vulnerability, do not open a public issue: use [Report a vulnerability](https://github.com/kroxiksut/net-rule-router/security/advisories/new), which opens a private advisory, or e-mail <fmalkov91@gmail.com>. What to include is in [`CONTRIBUTING.md`](CONTRIBUTING.md#reporting-a-security-issue). A report that names the boundary it crosses is much easier to act on.
 
 ## What the product protects
 
@@ -23,7 +23,18 @@ The product does not protect against:
 
 Anonymity, censorship circumvention and content filtering are not product goals, and nothing on this page should be read as evidence of them. User-facing wording for these limits lives in [`docs/en/what-routing-changes.md`](docs/en/what-routing-changes.md).
 
-Browser-side encrypted DNS (DoH/DoT) hides names from the provider and from the product at the same time, which weakens rule matching and leak protection for that traffic. The product exposes this as an explicit setting that can block browser encrypted DNS, rather than as a silently accepted gap.
+Browser-side encrypted DNS (DoH/DoT) hides names from the provider and from the product at the same time, which weakens rule matching and leak protection for that traffic. For a user who has rules for the additional connection, browser encrypted DNS is blocked by default; the setting can switch the block off, and then this gap is accepted knowingly rather than silently.
+
+## Known limitations of this release
+
+Each of these is described, with what to do about it, in [`docs/en/known-limitations.md`](docs/en/known-limitations.md), and stays listed until it is fixed:
+- leak protection is not in force for the first seconds after the computer starts, until the service has applied the rules;
+- without virtual addresses (fake-IP; Windows only, off by default), sites that share one server address cannot be routed apart;
+- a rule for a site name does not cover an application that looks up names on its own while leak protection is off;
+- on Windows, leak protection that blocks everything for one user also holds back IPv6, ping and VPN protocols such as IPsec for the other users of the computer;
+- with leak protection blocking everything, the sign-in page of a public Wi-Fi network cannot open;
+- on Linux with strict reverse-path filtering, a second signed-in user may get no replies over the additional connection;
+- the tray and the window do not yet offer a way back after the service stops unexpectedly.
 
 ## Components and who owns what
 
@@ -43,8 +54,8 @@ The app, the tray and the console talk to the service over a local named pipe. T
 
 - **Who can connect.** Any signed-in user can connect and send requests. Only the system, administrators and the service itself can create the endpoint; an ordinary user cannot open a second instance of it to intercept other users' requests.
 - **The client checks the server.** Before sending anything, a client confirms that the process answering on the endpoint is the registered service itself, so a process that claimed the endpoint name first receives nothing. For that check, and for the status badge, ordinary users may query the service's status. Signed-in interactive users may also start the service; they cannot stop or reconfigure it.
-- **The service checks the caller.** The service identifies the caller from the connection itself — account, elevation and integrity level — never from anything the request claims. Low-integrity processes are refused. Each operation is classified by the service as read-only or state-changing, and state-changing operations are checked against the caller's rights and written to the audit trail before they run.
-- **Scoped answers.** Diagnostics reads return the caller's own records plus machine-level ones; an administrator sees everything. Notifications about one user's state reach only that user's connections. No request can name another user as its target or audience.
+- **The service checks the caller.** The service identifies the caller from the connection itself — account, elevation and integrity level — never from anything the request claims. Low-integrity processes are refused. Each operation is classified by the service as read-only or state-changing, and state-changing operations are checked against the caller's rights and validated before they run; only a request the service accepts is written to the audit trail. A refused request leaves no audit record, so refused requests cannot push genuine history out of the trail.
+- **Scoped answers.** Diagnostics reads return the caller's own records plus machine-level ones; an administrator sees everything. A machine-level log line that names a host, an address or a path is shown to administrators only. The name cache is shared by the computer: an ordinary user sees in it only the names their own rules cover, and clearing it, like clearing the logs, needs an administrator. Notifications about one user's state reach only that user's connections. No request can name another user as its target or audience.
 
 **Known gap.** The service tells its own clients apart (app, tray, console) by the name of the connecting executable. That decides which set of operations a client may call, not whose data it reaches — the account still comes from the connection — but it is not a strong identity.
 
@@ -71,7 +82,7 @@ The helper is held to narrow rules:
 
 ## Installation scope
 
-The service is installed machine-wide only; there is no per-user install. A release build never registers the service from a directory an ordinary user can write to: whoever can replace the service executable gets code execution as the system account. Installing from such a directory — an unpacked portable copy on the desktop or a USB stick — registers a copy instead: the service executable and the files it loads are copied into `NetRuleRouter Service` under Program Files, a folder only administrators can change, checked byte for byte after copying, and registered from there only once that folder is confirmed out of reach of ordinary accounts. A later install from a newer copy updates it; removing the service removes it. The folder you install from is trusted at the moment you install, as with any installer; changes made to it afterwards no longer reach the service. Installing or updating the service requires elevation.
+The service is installed machine-wide only; there is no per-user install. A release build never registers the service from a directory an ordinary user can write to: whoever can replace the service executable gets code execution as the system account. Installing from such a directory — an unpacked portable copy on the desktop or a USB stick — registers a copy instead: the service executable and the files it loads are copied into `NetRuleRouter Service` under Program Files, a folder only administrators can change, checked byte for byte after copying, and registered from there only once that folder is confirmed out of reach of ordinary accounts. A later install from a newer copy updates it; removing the service removes it. The folder you install from is trusted at the moment you install, as with any installer; changes made to it afterwards no longer reach the service. On Linux the install refuses a service binary that is not owned by root or that sits in a folder other accounts can write to, and says where to copy it. Installing or updating the service requires elevation.
 
 On Windows every executable loads libraries only from the Windows system directory and its own installation folder, never from the current directory or `PATH`. The interface takes its Qt plugins and QML modules from the installation folder only: environment variables and folders outside it cannot redirect them. That makes the installation folder the one place whose integrity matters, so it must stay writable by administrators only.
 
@@ -135,6 +146,8 @@ There is no telemetry and no account login. Besides the traffic you route, the p
 - once the first release is published (before that, no such request is made), every N days (14 by default, adjustable), from the app window, makes one anonymous request to the project's GitHub releases page to see whether a newer version exists. It only shows a notification: it never downloads, installs or changes routing. The check can be turned off in Settings, and then the request is not made at all. Help → Check for updates makes the same single request when you choose it, whether or not the automatic check is on.
 
 Logging is minimal by default. Verbose logging is an explicit choice that switches itself off after the chosen period or at the next restart. Browser-history seeding is opt-in and reads only the requesting user's own browser profiles.
+
+The connection history — which of your programs connected where, and over which route — is kept on this computer for 7 days unless you choose otherwise, never in the diagnostic archive. In NetRuleRouter every person reads only their own, administrators included: a record of where someone went is theirs, not machine diagnostics. You can clear it or switch it off at any time in Settings without administrator rights, and a full reset erases it. The file itself sits in the service's folder, which only the system and administrators can open.
 
 ## Not built yet
 

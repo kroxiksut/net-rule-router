@@ -212,6 +212,33 @@ impl ConfirmedVpnClients {
         })
     }
 
+    /// [`Self::matches_image`] for the user whose flow it is: a confirmation is
+    /// that user's choice and exempts only their own programs. With the owner
+    /// unknown it holds only while a single user has confirmed anything.
+    #[must_use]
+    pub fn matches_image_for(&self, owner: Option<&str>, image: &str) -> bool {
+        if !self.is_armed() {
+            return false;
+        }
+        let needle = image.trim();
+        if needle.is_empty() {
+            return false;
+        }
+        let by_sid = self.by_sid.read().unwrap_or_else(|p| p.into_inner());
+        let matches = |paths: &Vec<ConfirmedPath>| {
+            paths.iter().any(|entry| {
+                entry.full_lower.eq_ignore_ascii_case(needle)
+                    || entry.basename_lower.eq_ignore_ascii_case(needle)
+            })
+        };
+        match owner {
+            Some(owner) => by_sid
+                .iter()
+                .any(|(sid, paths)| sid.eq_ignore_ascii_case(owner) && matches(paths)),
+            None => by_sid.len() == 1 && by_sid.values().any(matches),
+        }
+    }
+
     /// Every confirmed path, deduplicated case-insensitively. Order is not
     /// significant — consumers fold this into a set.
     #[must_use]
@@ -268,6 +295,23 @@ pub fn global_confirmed_vpn_clients() -> Arc<ConfirmedVpnClients> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// One user's confirmation exempts that user's programs only: another
+    /// user's browser of the same name keeps its tunnel.
+    #[test]
+    fn a_confirmation_exempts_only_the_confirming_users_flows() {
+        let confirmed = ConfirmedVpnClients::new();
+        confirmed.publish("S-1-5-21-100-1002", &[r"C:\Apps\chrome.exe".to_string()]);
+        assert!(confirmed.matches_image_for(Some("S-1-5-21-100-1002"), "chrome.exe"));
+        assert!(!confirmed.matches_image_for(Some("S-1-5-21-100-1001"), "chrome.exe"));
+        // Owner unread, one user confirmed: the single-user case keeps working.
+        assert!(confirmed.matches_image_for(None, "chrome.exe"));
+        confirmed.publish("S-1-5-21-100-1001", &[r"C:\Apps\wg.exe".to_string()]);
+        assert!(
+            !confirmed.matches_image_for(None, "chrome.exe"),
+            "with two users confirming, an unowned flow is nobody's choice"
+        );
+    }
 
     #[test]
     fn register_returns_true_for_new_path_false_for_repeat() {

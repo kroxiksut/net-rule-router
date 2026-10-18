@@ -23,6 +23,7 @@ Notifications:
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the listed programs as your VPN, so leak protection keeps them working
+  p: confirm the suggested main connection; another one is chosen under Interfaces and routes
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Diagnostics and logs
@@ -170,7 +171,7 @@ Commands on this screen:
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
 Explain sample: site.example  →  Additional — Allowed
-Explain sample: Blocked by an address rule: this name resolves to a blocked address (203.0.113.2)
+Explain sample: Denied by an address rule: this name resolves to a denied address (203.0.113.2)
 
 Screen: Diagnostics and logs
 Service: OK

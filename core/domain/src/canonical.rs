@@ -32,19 +32,27 @@ use std::net::IpAddr;
 use nrr_shared::ip_block::{IpBlock, IpRange};
 use nrr_shared::RouteRole;
 
+pub use nrr_shared::app_path::{AppPath, AppPathKind};
+
 use crate::{RouteBehaviorMode, RouteBinding};
 
 /// Normalized application match pattern.
 ///
-/// `Exact` — lowercase filename, `.exe` suffix guaranteed, path stripped.
+/// `Exact` — lowercase filename, `.exe` suffix on Windows.
 /// `Glob`  — lowercase glob pattern, bare `*` rejected at validation time.
 ///           Runtime matching uses `*` as zero-or-more-chars.
+/// `Path`  — a file, a folder or a folder with its subfolders, written with a
+///           separator; see [`AppPath`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CanonicalAppPattern {
     /// Exact process filename (e.g. `chrome.exe`).
     Exact(String),
     /// Glob pattern (e.g. `*vpn*.exe`).
     Glob(String),
+    /// A program by where it lives (`c:\apps\app.exe`, `c:\apps\`,
+    /// `c:\apps\*`, `/opt/app`). Boxed: paths are rare, and inline one
+    /// would grow every rule.
+    Path(Box<AppPath>),
 }
 
 impl CanonicalAppPattern {
@@ -52,6 +60,15 @@ impl CanonicalAppPattern {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Exact(s) | Self::Glob(s) => s.as_str(),
+            Self::Path(path) => path.as_str(),
+        }
+    }
+
+    /// The path the pattern names, when it names one.
+    pub fn path(&self) -> Option<&AppPath> {
+        match self {
+            Self::Path(path) => Some(path.as_ref()),
+            Self::Exact(_) | Self::Glob(_) => None,
         }
     }
 }
@@ -120,6 +137,12 @@ pub enum CanonicalAddressMatch {
     /// expressible by adding an exact rule for the apex. See
     /// [`match_suffix_domain`](crate::decision_matching::match_suffix_domain).
     SuffixDomain(String),
+    /// Matches the site `base` in every zone, with its subdomains, written
+    /// `base.*`: for a host it is the `*.base.<zone>` rule, the zone being the
+    /// host's public suffix (see
+    /// [`match_any_zone_domain`](crate::decision_matching::match_any_zone_domain)).
+    /// A rule naming the zone outright beats it.
+    AnyZoneDomain(String),
     /// Matches all hosts in a TLD or internal domain zone.
     ///
     /// Zone name is the suffix label — e.g. `ru`, `com`, `intra`, `corp`. Normalized:
@@ -153,6 +176,7 @@ impl CanonicalAddressMatch {
         match self {
             Self::ExactFqdn(label) => label.clone(),
             Self::SuffixDomain(label) => format!("*.{label}"),
+            Self::AnyZoneDomain(base) => format!("{base}.*"),
             Self::Zone(name) => name.clone(),
             Self::ExactIp(addr) => addr.to_string(),
             Self::Subnet(block) => block.to_string(),
@@ -174,7 +198,7 @@ impl CanonicalAddressMatch {
     pub(crate) fn sort_key_str(&self) -> String {
         match self {
             Self::ExactFqdn(label) => label.clone(),
-            Self::SuffixDomain(label) => label.clone(),
+            Self::SuffixDomain(label) | Self::AnyZoneDomain(label) => label.clone(),
             Self::Zone(name) => name.clone(),
             // v4 keys keep their historic form, so stored orderings do not
             // move; a v6 key sorts after every v4 one.
@@ -241,7 +265,8 @@ impl CanonicalRule {
     /// does **not** reflect runtime evaluation priority, which is configurable for
     /// Zone vs ExactIp (see `ZonePriorityPolicy`):
     /// `ExactFqdn(0) < SuffixDomain(1) < Zone(2) < ExactIp(3) < Application(4)
-    /// < Subnet(5) < IpRange(6)`.
+    /// < Subnet(5) < IpRange(6) < AnyZoneDomain(7)`; a new kind takes the next
+    /// number so stored orderings never move.
     /// Within each group, the match value string is used for lexicographic
     /// ordering. Not total on its own — [`CanonicalRuleSet::from_rules`] adds
     /// the tie-breaker.
@@ -255,6 +280,7 @@ impl CanonicalRule {
                     CanonicalAddressMatch::ExactIp(_) => 3u8,
                     CanonicalAddressMatch::Subnet(_) => 5u8,
                     CanonicalAddressMatch::IpRange(_) => 6u8,
+                    CanonicalAddressMatch::AnyZoneDomain(_) => 7u8,
                 };
                 (group, m.sort_key_str())
             }
@@ -280,6 +306,7 @@ impl CanonicalRule {
                 let kind = match m.pattern {
                     CanonicalAppPattern::Exact(_) => 0u8,
                     CanonicalAppPattern::Glob(_) => 1u8,
+                    CanonicalAppPattern::Path(_) => 2u8,
                 };
                 (kind, m.pattern.as_str(), m.include_child_processes)
             })
@@ -507,6 +534,75 @@ impl CanonicalRuleBook {
         CanonicalRuleBook {
             primary: self.primary.with_subdomain_coverage(),
             secondary: self.secondary.with_subdomain_coverage(),
+        }
+    }
+
+    /// Whether an enabled rule of either set is `*.{name}` itself: such a rule
+    /// keeps a `base.*` rule off the zone it spells out.
+    pub fn names_suffix_outright(&self, name: &str) -> bool {
+        self.primary
+            .rules
+            .iter()
+            .chain(&self.secondary.rules)
+            .any(|r| {
+                r.enabled
+                    && matches!(&r.address_match,
+                        Some(CanonicalAddressMatch::SuffixDomain(s)) if s == name)
+            })
+    }
+
+    /// Whether either set holds a `base.*` rule.
+    pub fn has_any_zone_rules(&self) -> bool {
+        self.primary
+            .rules
+            .iter()
+            .chain(&self.secondary.rules)
+            .any(|r| {
+                matches!(
+                    r.address_match,
+                    Some(CanonicalAddressMatch::AnyZoneDomain(_))
+                )
+            })
+    }
+
+    /// The book as enforcement must see it: each enabled `base.*` rule gains a
+    /// `*.base.<zone>` twin for every `base.<zone>` that `sites(base)` reports
+    /// seen, bar a zone some rule names outright. Enforcement fans out over
+    /// suffix rules, so the twins carry the rule; the `base.*` rule itself
+    /// stays for the DNS gate, which matches names nobody has seen yet.
+    ///
+    /// Enforcement-only, like [`Self::with_subdomain_coverage`] and applied
+    /// after it; never stored, hashed or written back.
+    pub fn with_any_zone_sites(&self, sites: impl Fn(&str) -> Vec<String>) -> CanonicalRuleBook {
+        if !self.has_any_zone_rules() {
+            return self.clone();
+        }
+        let expand = |set: &CanonicalRuleSet| {
+            let mut out = set.rules.clone();
+            for rule in set.rules.iter().filter(|r| r.enabled) {
+                let Some(CanonicalAddressMatch::AnyZoneDomain(base)) = &rule.address_match else {
+                    continue;
+                };
+                let mut named = sites(base);
+                named.sort_unstable();
+                named.dedup();
+                for name in named {
+                    if self.names_suffix_outright(&name) {
+                        continue;
+                    }
+                    out.push(CanonicalRule {
+                        id: crate::RuleId(format!("{}+{name}", rule.id.0)),
+                        address_match: Some(CanonicalAddressMatch::SuffixDomain(name)),
+                        origin: None,
+                        ..rule.clone()
+                    });
+                }
+            }
+            CanonicalRuleSet::from_rules(out)
+        };
+        CanonicalRuleBook {
+            primary: expand(&self.primary),
+            secondary: expand(&self.secondary),
         }
     }
 

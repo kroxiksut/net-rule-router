@@ -1,0 +1,85 @@
+{
+  "description": "rules.js ruleValueKey: a rule apart from its route, as recent changes and an undo match rules",
+  "cases": [
+    {
+      "name": "domain as typed",
+      "input": {
+        "ruleType": "domain",
+        "matchValue": "Site.Example"
+      },
+      "expected": "domain|site.example"
+    },
+    {
+      "name": "suffix-domain folds to domain",
+      "input": {
+        "ruleType": "suffix-domain",
+        "matchValue": "*.Example.ORG"
+      },
+      "expected": "domain|*.example.org"
+    },
+    {
+      "name": "exact-fqdn stays its own type",
+      "input": {
+        "ruleType": "exact-fqdn",
+        "matchValue": "Api.Example"
+      },
+      "expected": "exact-fqdn|api.example"
+    },
+    {
+      "name": "ipv4 folds to exact-ip",
+      "input": {
+        "ruleType": "exact-ipv4",
+        "matchValue": "192.0.2.1"
+      },
+      "expected": "exact-ip|192.0.2.1"
+    },
+    {
+      "name": "ipv6 folds to exact-ip",
+      "input": {
+        "ruleType": "exact-ipv6",
+        "matchValue": "2001:DB8::1"
+      },
+      "expected": "exact-ip|2001:db8::1"
+    },
+    {
+      "name": "zone",
+      "input": {
+        "ruleType": "zone",
+        "matchValue": "RU"
+      },
+      "expected": "zone|ru"
+    },
+    {
+      "name": "application lower-cased",
+      "input": {
+        "ruleType": "application",
+        "matchValue": "Corp.EXE"
+      },
+      "expected": "application|corp.exe"
+    },
+    {
+      "name": "subnet",
+      "input": {
+        "ruleType": "subnet",
+        "matchValue": "10.0.0.0/8"
+      },
+      "expected": "subnet|10.0.0.0/8"
+    },
+    {
+      "name": "empty value",
+      "input": {
+        "ruleType": "domain",
+        "matchValue": ""
+      },
+      "expected": "domain|"
+    },
+    {
+      "name": "cyrillic host",
+      "input": {
+        "ruleType": "domain",
+        "matchValue": "ПРИМЕР.РФ"
+      },
+      "expected": "domain|пример.рф"
+    }
+  ]
+}

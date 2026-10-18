@@ -30,8 +30,12 @@ QtObject {
                 || typeof nrrNativeBridge.punycodeEncodeHost !== "function") {
             return trimmed
         }
-        var ace = String(nrrNativeBridge.punycodeEncodeHost(trimmed) || "")
-        return ace !== "" ? ace : trimmed
+        // A wildcard is not a label: only the name between them converts.
+        var head = trimmed.indexOf("*.") === 0 ? "*." : ""
+        var tail = /\.\*$/.test(trimmed) ? ".*" : ""
+        var name = trimmed.substring(head.length, trimmed.length - tail.length)
+        var ace = String(nrrNativeBridge.punycodeEncodeHost(name) || "")
+        return ace !== "" ? head + ace + tail : trimmed
     }
 
     /// The ACE form of a host the user typed in Unicode, or "" when there is

@@ -40,7 +40,7 @@ pub const INTERSECTING: Key = key(
 );
 pub const BLOCK_TIE: Key = key(
     "rules.overlaps.block-tie",
-    "{winner} names the same sites as {loser} on {loser-route}. They are blocked: on a tie a block wins over a route.",
+    "{winner} names the same sites as {loser} on {loser-route}. They are denied: on a tie a deny wins over a route.",
 );
 pub const BLOCK_TIE_WARNING: Key = key(
     "rules.overlaps.block-tie-warning",
@@ -60,7 +60,7 @@ pub const REASON_INTERSECTING: Key = key(
     "rules.overlaps.reason.intersecting",
     "Narrower where they meet",
 );
-pub const REASON_BLOCK_TIE: Key = key("rules.overlaps.reason.block-tie", "A block wins a tie");
+pub const REASON_BLOCK_TIE: Key = key("rules.overlaps.reason.block-tie", "A deny wins a tie");
 pub const DECISION_LABEL: Key = key("rules.overlaps.column.decision", "Decision");
 pub const CONFIRMED: Key = key("rules.overlaps.confirmed", "Confirmed");
 pub const NOT_CONFIRMED: Key = key("tui.overlaps.not-confirmed", "Not confirmed");
@@ -71,7 +71,7 @@ pub const SEND_OVER_WHOLE: Key = key(
 );
 pub const BLOCK_NOTE: Key = key(
     "rules.overlaps.block-note",
-    "A block rule is part of this pair; change it in the rules list.",
+    "A deny rule is part of this pair; change it in the rules list.",
 );
 
 pub const CONFLICTS_TITLE: Key = key(
@@ -84,11 +84,11 @@ pub const CONFLICTS_HINT: Key = key(
 );
 pub const CONFLICT_LITERAL_BLOCK: Key = key(
     "rules.overlaps.conflicts.literal-block",
-    "{rule}: {host} resolves to {ip}, and a block of that address wins over any name rule, so the address is blocked.",
+    "{rule}: {host} resolves to {ip}, and a deny of that address wins over any name rule, so the address is denied.",
 );
 pub const CONFLICT_LEAK: Key = key(
     "rules.overlaps.conflicts.leak",
-    "{rule} does not block {host}: it shares {ip} with {via}, which a narrower rule routes, so the address stays open.",
+    "{rule} does not deny {host}: it shares {ip} with {via}, which a narrower rule routes, so the address stays open.",
 );
 pub const CONFLICT_UNSUPPORTED: Key = key(
     "rules.overlaps.conflicts.unsupported-shape",
@@ -98,6 +98,10 @@ pub const CONFLICT_CARVING_OVER_CAP: Key = key(
     "rules.overlaps.conflicts.carving-over-cap",
     "{rule} holds more narrower rules than can be carved out of it, so it applies to its whole network and the narrower rules inside it do not take effect. Split it into smaller networks.",
 );
+pub const CONFLICT_PROTECTED: Key = key(
+    "rules.overlaps.conflicts.protected",
+    "The rule {rule} is not applied. {reason}",
+);
 pub const CONFLICT_MORE: Key = key(
     "rules.overlaps.conflicts.more",
     "Addresses affected besides this one: {count}.",
@@ -105,7 +109,7 @@ pub const CONFLICT_MORE: Key = key(
 
 pub const ROUTE_PRIMARY: Key = key("label.primary", "Primary");
 pub const ROUTE_SECONDARY: Key = key("label.secondary", "Additional");
-pub const ROUTE_BLOCK: Key = key("label.block", "Block");
+pub const ROUTE_BLOCK: Key = key("label.block", "Denied");
 pub const TYPE_DOMAIN: Key = key("rules.type.domain", "Domain");
 pub const TYPE_ZONE: Key = key("rules.type.zone", "Zone");
 pub const TYPE_EXACT_IP: Key = key("rules.type.exact-ip", "Exact IP");
@@ -222,6 +226,7 @@ pub fn all() -> Vec<Key> {
         CONFLICT_LEAK,
         CONFLICT_CARVING_OVER_CAP,
         CONFLICT_UNSUPPORTED,
+        CONFLICT_PROTECTED,
         CONFLICT_MORE,
         ROUTE_PRIMARY,
         ROUTE_SECONDARY,

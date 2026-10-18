@@ -23,9 +23,9 @@
 //! |                                 | light/dark under a running window is answered by the same probe   |
 //! |                                 | the cold start used.                                              |
 //! | `local.rule-value-verdict`      | The Add/Edit rule dialog's gate — the verdict the rules table     |
-//! |                                 | shows for one value, via `rule_value_validation`.                 |
-//! | `local.rule-values-classify`    | A pasted address list, each line sorted into exact IP / subnet /  |
-//! |                                 | range with that type's verdict.                                   |
+//! |                                 | shows for one value, via `rule_value_validation`; with `route`,   |
+//! |                                 | the protection of system programs is judged too.                  |
+//! | `local.rule-values-verdicts`    | The verdict on each value of a pasted list of rules, in one call. |
 //! | `local.user-settings.intent-*`  | What the user decided about the service's settings, read from and |
 //! |                                 | recorded in their own settings file, for "Restore my settings".   |
 //!
@@ -117,7 +117,7 @@ pub fn handle_local_request(
         "local.canonical-rules-hash" => handle_canonical_rules_hash(payload),
         "local.rules-overlaps" => handle_rules_overlaps(payload),
         "local.rule-value-verdict" => handle_rule_value_verdict(payload),
-        "local.rule-values-classify" => handle_rule_values_classify(payload),
+        "local.rule-values-verdicts" => handle_rule_values_verdicts(payload),
         "local.service-info" => handle_service_info(client),
         "local.vpn.discover" => handle_vpn_discover(),
         "local.app-groups.discover" => handle_app_groups_discover(),
@@ -563,10 +563,20 @@ fn handle_rule_value_verdict(payload: &Value) -> LocalHandlerResult {
             .and_then(Value::as_str)
             .ok_or(LocalHandlerError::MissingField(field))
     };
-    let verdict = nrr_application::rule_value_validation::validate_rule_value(
-        text("rule-type")?,
-        text("match-value")?,
-    );
+    use nrr_application::rule_value_validation::{
+        validate_rule_value, validate_rule_value_for, RuleEffect,
+    };
+    let (rule_type, value) = (text("rule-type")?, text("match-value")?);
+    // The route the dialog has chosen: a deny or the additional route may not
+    // name a program the system needs. Absent, the value alone is judged.
+    let effect = payload
+        .get("route")
+        .and_then(Value::as_str)
+        .and_then(RuleEffect::from_route_slug);
+    let verdict = match effect {
+        Some(effect) => validate_rule_value_for(rule_type, value, effect),
+        None => validate_rule_value(rule_type, value),
+    };
     Ok(json!({
         "status": verdict.status_slug(),
         "message-key": verdict.message_key(),
@@ -574,51 +584,42 @@ fn handle_rule_value_verdict(payload: &Value) -> LocalHandlerResult {
     }))
 }
 
-/// Locale key of a pasted line that is no address, network or range.
-const UNRECOGNIZED_LINE_KEY: &str = "rules.paste.line-unrecognized";
+/// Most values one `local.rule-values-verdicts` call judges: the bulk Add form
+/// reads no more lines (`nrr_client_logic::bulk_rules::MAX_LINES`).
+const MAX_VERDICTS: usize = 1000;
 
-/// A pasted list, one entry per line (commas and semicolons also separate),
-/// each sorted into the address type it is and judged as that type. Blank
-/// entries and `#` comment lines are skipped; past the Free rule cap the list
-/// is cut, since nothing beyond it could be added.
-fn handle_rule_values_classify(payload: &Value) -> LocalHandlerResult {
-    let text = payload
-        .get("text")
+/// The verdict on each `{ "rule-type", "match-value" }` of `values-json`, in
+/// order: the bulk Add form's preview asks once for the whole paste. Past
+/// [`MAX_VERDICTS`] nothing is judged and the answer says so.
+fn handle_rule_values_verdicts(payload: &Value) -> LocalHandlerResult {
+    let values_json = payload
+        .get("values-json")
         .and_then(Value::as_str)
-        .ok_or(LocalHandlerError::MissingField("text"))?;
-    let mut entries = text
-        .split(['\n', '\r', ',', ';'])
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty() && !entry.starts_with('#'));
-    let rows: Vec<Value> = entries
-        .by_ref()
-        .take(nrr_shared::rules_json::FREE_MAX_RULES)
-        .map(classify_rule_value)
-        .collect();
-    let truncated = entries.next().is_some();
-    Ok(json!({ "rows": rows, "truncated": truncated }))
-}
-
-fn classify_rule_value(value: &str) -> Value {
-    use nrr_application::ip_network_policy::IpValueKind;
-    let Some(kind) = IpValueKind::of(value) else {
-        return json!({
-            "value": value,
-            "rule-type": "",
-            "status": "error",
-            "message-key": UNRECOGNIZED_LINE_KEY,
-            "args": {},
-        });
+        .ok_or(LocalHandlerError::MissingField("values-json"))?;
+    let values: Vec<Value> = serde_json::from_str(values_json)?;
+    let field = |value: &Value, name: &str| -> String {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
     };
-    let rule_type = kind.rule_type_slug();
-    let verdict = nrr_application::rule_value_validation::validate_rule_value(rule_type, value);
-    json!({
-        "value": value,
-        "rule-type": rule_type,
-        "status": verdict.status_slug(),
-        "message-key": verdict.message_key(),
-        "args": verdict.args(),
-    })
+    let verdicts: Vec<Value> = values
+        .iter()
+        .take(MAX_VERDICTS)
+        .map(|value| {
+            let verdict = nrr_application::rule_value_validation::validate_rule_value(
+                &field(value, "rule-type"),
+                &field(value, "match-value"),
+            );
+            json!({
+                "status": verdict.status_slug(),
+                "message-key": verdict.message_key(),
+                "args": verdict.args(),
+            })
+        })
+        .collect();
+    Ok(json!({ "verdicts": verdicts, "truncated": values.len() > MAX_VERDICTS }))
 }
 
 /// Every exact rule already covered by a wildcard rule, so the rules screen
@@ -703,8 +704,9 @@ mod tests {
         assert_eq!(refused["status"], "error");
         assert_eq!(
             refused["message-key"],
-            "rules.validation.match-value-invalid.domain"
+            "rules.validation.match-value-invalid.is-exact-ip"
         );
+        assert_eq!(refused["args"]["type"], "exact-ip");
         let out_of_range = ask("exact-ip", "300.1.1.1");
         assert_eq!(out_of_range["args"]["octet"], "300");
         assert!(matches!(
@@ -717,75 +719,114 @@ mod tests {
         ));
     }
 
-    fn classify(text: &str) -> Value {
-        handle_local_request(
-            "local.rule-values-classify",
-            &json!({ "text": text }),
-            &empty_client(),
-        )
-        .expect("classification")
+    /// With the route on the form, a deny or the additional route naming a
+    /// program the system needs is refused before the rule is saved.
+    #[test]
+    fn the_dialog_refuses_a_deny_of_a_critical_process() {
+        let critical = if cfg!(windows) {
+            "svchost.exe"
+        } else if cfg!(target_os = "macos") {
+            "configd"
+        } else {
+            "NetworkManager"
+        };
+        let ask = |route: Option<&str>| {
+            let mut payload = json!({ "rule-type": "application", "match-value": critical });
+            if let Some(route) = route {
+                payload["route"] = json!(route);
+            }
+            handle_local_request("local.rule-value-verdict", &payload, &empty_client())
+                .expect("verdict")
+        };
+        for route in ["block", "secondary"] {
+            let refused = ask(Some(route));
+            assert_eq!(refused["status"], "error", "{route}");
+            assert_eq!(
+                refused["message-key"],
+                "rules.validation.match-value-invalid.protected-critical-process"
+            );
+        }
+        assert_eq!(ask(Some("primary"))["status"], "valid");
+        assert_eq!(ask(None)["status"], "valid");
     }
 
-    /// A mixed paste comes back sorted by type, each line with that type's
-    /// verdict, and a line that is no address says so.
+    fn verdicts(values: &Value) -> Value {
+        handle_local_request(
+            "local.rule-values-verdicts",
+            &json!({ "values-json": values.to_string() }),
+            &empty_client(),
+        )
+        .expect("verdicts")
+    }
+
+    /// A pasted list is judged value by value, in order, each as the rules
+    /// table would judge it.
     #[test]
-    fn a_pasted_list_is_sorted_into_addresses_subnets_and_ranges() {
-        let answer = classify(concat!(
-            "203.0.113.7\r\n198.51.100.0/24\n\n# office\n",
-            "192.0.2.10 - 192.0.2.20, 2001:db8::/48; example.com\n",
-            "198.0.0.0/7\n198.51.100.9/24",
-        ));
+    fn a_pasted_list_gets_one_verdict_per_value_in_order() {
+        let answer = verdicts(&json!([
+            { "rule-type": "exact-ip", "match-value": "203.0.113.7" },
+            { "rule-type": "subnet", "match-value": "198.0.0.0/7" },
+            { "rule-type": "subnet", "match-value": "198.51.100.9/24" },
+            { "rule-type": "domain", "match-value": "chrome.exe" },
+            { "match-value": "example.com" },
+        ]));
         assert_eq!(answer["truncated"], json!(false));
-        let rows = answer["rows"].as_array().expect("rows");
-        let summary: Vec<(&str, &str, &str)> = rows
+        let rows = answer["verdicts"].as_array().expect("verdicts");
+        let summary: Vec<(&str, &str)> = rows
             .iter()
             .map(|r| {
                 (
-                    r["value"].as_str().expect("value"),
-                    r["rule-type"].as_str().expect("rule-type"),
                     r["status"].as_str().expect("status"),
+                    r["message-key"].as_str().expect("message-key"),
                 )
             })
             .collect();
         assert_eq!(
             summary,
             vec![
-                ("203.0.113.7", "exact-ip", "valid"),
-                ("198.51.100.0/24", "subnet", "valid"),
-                ("192.0.2.10 - 192.0.2.20", "ip-range", "valid"),
-                ("2001:db8::/48", "subnet", "valid"),
-                ("example.com", "", "error"),
-                ("198.0.0.0/7", "subnet", "error"),
-                ("198.51.100.9/24", "subnet", "warning"),
+                ("valid", ""),
+                (
+                    "error",
+                    "rules.validation.match-value-invalid.network-too-wide"
+                ),
+                (
+                    "warning",
+                    "rules.validation.match-value-warning.subnet-host-bits"
+                ),
+                (
+                    "error",
+                    "rules.validation.match-value-invalid.is-application"
+                ),
+                ("error", "rules.validation.unknown-rule-type"),
             ]
         );
-        assert_eq!(rows[4]["message-key"], UNRECOGNIZED_LINE_KEY);
-        assert_eq!(
-            rows[5]["message-key"],
-            "rules.validation.match-value-invalid.network-too-wide"
-        );
-        assert_eq!(
-            rows[6]["message-key"],
-            "rules.validation.match-value-warning.subnet-host-bits"
-        );
-        assert_eq!(rows[6]["args"]["network"], "198.51.100.0/24");
+        assert_eq!(rows[2]["args"]["network"], "198.51.100.0/24");
     }
 
-    /// Nothing past the Free cap could be added, so the answer stops there
-    /// and says it did.
+    /// Past the bound nothing more is judged, and the answer says so; a
+    /// payload that is no list is refused.
     #[test]
-    fn a_paste_longer_than_the_rule_cap_is_cut_and_flagged() {
-        let cap = nrr_shared::rules_json::FREE_MAX_RULES;
-        let text = (0..=cap)
-            .map(|i| format!("10.{}.{}.1", i / 256, i % 256))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let answer = classify(&text);
-        assert_eq!(answer["rows"].as_array().expect("rows").len(), cap);
+    fn a_list_longer_than_the_bound_is_cut_and_flagged() {
+        let many: Vec<Value> = (0..=MAX_VERDICTS)
+            .map(|i| json!({ "rule-type": "exact-ip", "match-value": format!("10.0.{}.{}", i / 256, i % 256) }))
+            .collect();
+        let answer = verdicts(&Value::from(many));
+        assert_eq!(
+            answer["verdicts"].as_array().expect("verdicts").len(),
+            MAX_VERDICTS
+        );
         assert_eq!(answer["truncated"], json!(true));
         assert!(matches!(
-            handle_local_request("local.rule-values-classify", &json!({}), &empty_client()),
-            Err(LocalHandlerError::MissingField("text"))
+            handle_local_request("local.rule-values-verdicts", &json!({}), &empty_client()),
+            Err(LocalHandlerError::MissingField("values-json"))
+        ));
+        assert!(matches!(
+            handle_local_request(
+                "local.rule-values-verdicts",
+                &json!({ "values-json": "{ not json" }),
+                &empty_client(),
+            ),
+            Err(LocalHandlerError::MalformedRulesJson(_))
         ));
     }
 

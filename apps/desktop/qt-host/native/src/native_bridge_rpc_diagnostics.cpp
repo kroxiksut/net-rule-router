@@ -84,6 +84,20 @@ QString NrrNativeBridge::rpcConnTraceOutageBlocksList() {
     return emitRpcRequest(QStringLiteral("conn-trace.outage-blocks.list"), QJsonObject());
 }
 
+QString NrrNativeBridge::rpcConnHistoryList(const QVariantMap &payload) {
+    return emitRpcRequest(QStringLiteral("conn-history.list"),
+                          QJsonObject::fromVariantMap(payload));
+}
+
+QString NrrNativeBridge::rpcConnHistoryClear() {
+    return emitRpcRequest(QStringLiteral("conn-history.clear"), QJsonObject());
+}
+
+QString NrrNativeBridge::rpcConnHistorySettingsSet(const QVariantMap &payload) {
+    return emitRpcRequest(QStringLiteral("conn-history.settings.set"),
+                          QJsonObject::fromVariantMap(payload));
+}
+
 QString NrrNativeBridge::rpcVpnGatewayCandidatesList(const QString &program) {
     QJsonObject obj;
     obj.insert(QStringLiteral("program"), program);

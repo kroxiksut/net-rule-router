@@ -753,6 +753,8 @@ fn block_rank(
         CanonicalAddressMatch::ExactFqdn(_) => NameClaim::ExactFqdn,
         CanonicalAddressMatch::SuffixDomain(s) => NameClaim::Suffix(label_count(s)),
         CanonicalAddressMatch::Zone(z) => NameClaim::Zone(label_count(z)),
+        // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
+        CanonicalAddressMatch::AnyZoneDomain(_) => return None,
     };
     Some(host_rank(own, order))
 }
@@ -857,7 +859,8 @@ fn name_claims(
                     networks.extend(m.ip_blocks().into_iter().flatten().copied());
                 }
             }
-            None => {}
+            // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
+            Some(CanonicalAddressMatch::AnyZoneDomain(_)) | None => {}
         }
     }
     SetClaims {
@@ -1075,7 +1078,8 @@ pub fn address_rule_ips(
                     );
                 }
             }
-            None => {}
+            // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
+            Some(CanonicalAddressMatch::AnyZoneDomain(_)) | None => {}
         }
     }
     out

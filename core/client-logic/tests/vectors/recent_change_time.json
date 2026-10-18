@@ -1,0 +1,159 @@
+{
+  "description": "pure.js recentChangeTime: when a recent rule change happened, as the rules list shows it",
+  "cases": [
+    {
+      "name": "same minute",
+      "input": {
+        "at": 1792236730,
+        "at-offset": 180,
+        "now": 1792236730,
+        "now-offset": 180,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "14:32"
+    },
+    {
+      "name": "earlier today",
+      "input": {
+        "at": 1792225923,
+        "at-offset": 180,
+        "now": 1792236730,
+        "now-offset": 180,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "11:32"
+    },
+    {
+      "name": "just after local midnight",
+      "input": {
+        "at": 1792184460,
+        "at-offset": 180,
+        "now": 1792236730,
+        "now-offset": 180,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "00:01"
+    },
+    {
+      "name": "just before local midnight is yesterday",
+      "input": {
+        "at": 1792184340,
+        "at-offset": 180,
+        "now": 1792236730,
+        "now-offset": 180,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "вчера 23:59"
+    },
+    {
+      "name": "yesterday morning",
+      "input": {
+        "at": 1792132330,
+        "at-offset": 180,
+        "now": 1792236730,
+        "now-offset": 180,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "вчера 09:32"
+    },
+    {
+      "name": "two days ago shows the date",
+      "input": {
+        "at": 1792063930,
+        "at-offset": 180,
+        "now": 1792236730,
+        "now-offset": 180,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "15.10 14:32"
+    },
+    {
+      "name": "six days ago",
+      "input": {
+        "at": 1791714730,
+        "at-offset": 180,
+        "now": 1792236730,
+        "now-offset": 180,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "11.10 13:32"
+    },
+    {
+      "name": "english template",
+      "input": {
+        "at": 1792150330,
+        "at-offset": 180,
+        "now": 1792236730,
+        "now-offset": 180,
+        "yesterday": "yesterday {time}"
+      },
+      "expected": "yesterday 14:32"
+    },
+    {
+      "name": "utc reader",
+      "input": {
+        "at": 1792200730,
+        "at-offset": 0,
+        "now": 1792236730,
+        "now-offset": 0,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "01:32"
+    },
+    {
+      "name": "west of utc crosses the date line differently",
+      "input": {
+        "at": 1792182730,
+        "at-offset": -300,
+        "now": 1792236730,
+        "now-offset": -300,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "вчера 15:32"
+    },
+    {
+      "name": "clock shift between the two moments",
+      "input": {
+        "at": 1792150330,
+        "at-offset": 240,
+        "now": 1792236730,
+        "now-offset": 180,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "вчера 15:32"
+    },
+    {
+      "name": "a moment ahead of now shows the date",
+      "input": {
+        "at": 1792409530,
+        "at-offset": 180,
+        "now": 1792236730,
+        "now-offset": 180,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "19.10 14:32"
+    },
+    {
+      "name": "first of the month",
+      "input": {
+        "at": 1790845500,
+        "at-offset": 0,
+        "now": 1792236730,
+        "now-offset": 0,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "01.10 09:05"
+    },
+    {
+      "name": "leap day",
+      "input": {
+        "at": 1709251140,
+        "at-offset": 0,
+        "now": 1792236730,
+        "now-offset": 0,
+        "yesterday": "вчера {time}"
+      },
+      "expected": "29.02 23:59"
+    }
+  ]
+}

@@ -120,6 +120,11 @@ pub struct SuggestionHost {
     pub third_party: Option<bool>,
     pub observed_members: Vec<String>,
     pub timestamp_ms: i64,
+    /// The site this offer and its anchor share across zones; empty when none.
+    pub any_zone_site: String,
+    /// Why the offer is less certain (`AUTO_RULE_LESS_CERTAIN_SLUGS`); empty
+    /// when it rests on full evidence, and always for an answered row.
+    pub less_certain: String,
 }
 
 impl SuggestionHost {
@@ -191,6 +196,8 @@ pub fn group_rows(
         } else {
             row.first_seen_unix_ms
         },
+        any_zone_site: row.any_zone_site.clone(),
+        less_certain: row.less_certain.clone(),
     });
     let answered = dismissed.iter().map(|row| SuggestionHost {
         id: row.candidate_id.clone(),
@@ -209,6 +216,8 @@ pub fn group_rows(
         third_party: None,
         observed_members: Vec::new(),
         timestamp_ms: row.dismissed_at_unix_ms,
+        any_zone_site: String::new(),
+        less_certain: String::new(),
     });
     for host in pending.chain(answered) {
         if host.match_value.is_empty() {
@@ -256,6 +265,18 @@ pub fn group_rows(
         group.hosts.push(host);
     }
     groups
+}
+
+/// The site a group's pending offers can be taken as, in every zone; empty
+/// when none of them names one (`autoRuleGroupAnyZoneSite`).
+pub fn any_zone_site(group: &SuggestionGroup) -> &str {
+    group
+        .hosts
+        .iter()
+        .filter(|h| h.status == HostStatus::Pending)
+        .map(|h| h.any_zone_site.as_str())
+        .find(|site| !site.is_empty())
+        .unwrap_or("")
 }
 
 /// Pending hosts a group lists after the filters (`countShownPendingAutoRuleHosts`).

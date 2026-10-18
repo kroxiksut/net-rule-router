@@ -375,6 +375,10 @@ public:
     /// the "Show rules applied by the service" toolbar action.
     Q_INVOKABLE QString rpcRulesList();
 
+    /// What the caller added, changed and deleted in their own rules since
+    /// `since` (Unix seconds), newest first (`rules.recent-changes.list`).
+    Q_INVOKABLE QString rpcRulesRecentChangesList(qint64 since);
+
     Q_INVOKABLE QString rpcRetentionSettingsGet();
     Q_INVOKABLE QString rpcRetentionSettingsSet(const QVariantMap &payload);
 
@@ -506,12 +510,16 @@ public:
     /// Async wrapper over the launcher-local `local.rule-value-verdict` RPC:
     /// the Add/Edit rule dialog's gate. The callback gets
     /// `{status, message-key, args}` — the verdict the rules table shows.
-    Q_INVOKABLE QString rpcRuleValueVerdict(const QString &ruleType, const QString &matchValue);
+    /// `route` (`primary` / `secondary` / `block`, empty for none) lets the
+    /// verdict refuse a deny or additional route on a system program.
+    Q_INVOKABLE QString rpcRuleValueVerdict(const QString &ruleType, const QString &matchValue,
+                                            const QString &route = QString());
 
-    /// Async wrapper over the launcher-local `local.rule-values-classify` RPC:
-    /// a pasted address list sorted line by line. The callback gets `{rows,
-    /// truncated}`, each row `{value, rule-type, status, message-key, args}`.
-    Q_INVOKABLE QString rpcRuleValuesClassify(const QString &text);
+    /// Async wrapper over the launcher-local `local.rule-values-verdicts` RPC:
+    /// the verdict on each value of a pasted list of rules. `valuesJson` is a
+    /// JSON array of `{rule-type, match-value}`; the callback gets `{verdicts,
+    /// truncated}`, each verdict `{status, message-key, args}`, in order.
+    Q_INVOKABLE QString rpcRuleValuesVerdicts(const QString &valuesJson);
 
     /// Async wrapper over the launcher-local
     /// `local.vpn.discover` RPC. Scans the machine (running processes +
@@ -782,6 +790,13 @@ public:
     // What leak protection blocked during the caller's last outage of the
     // additional route, folded per program and address.
     Q_INVOKABLE QString rpcConnTraceOutageBlocksList();
+
+    // The caller's own folded connection history; the payload is the
+    // `conn-history.list` request (period, filters, pagination).
+    Q_INVOKABLE QString rpcConnHistoryList(const QVariantMap &payload);
+    Q_INVOKABLE QString rpcConnHistoryClear();
+    // `enabled` and/or `retention-days` for the caller's history.
+    Q_INVOKABLE QString rpcConnHistorySettingsSet(const QVariantMap &payload);
 
     // The remote addresses one program connected to recently, most likely
     // VPN gateway first. `program` is its file name; a path is reduced to it.

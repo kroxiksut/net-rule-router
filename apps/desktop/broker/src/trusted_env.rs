@@ -10,118 +10,32 @@
 
 use std::path::PathBuf;
 
-/// Variables an elevated child needs to run at all, plus the roots we derive
-/// paths from. Anything not listed here is deliberately not passed on.
-const FORWARDED: &[&str] = &[
-    "ProgramData",
-    "SystemRoot",
-    "windir",
-    "SystemDrive",
-    "Path",
-    "PATHEXT",
-    "ComSpec",
-    "NUMBER_OF_PROCESSORS",
-    "PROCESSOR_ARCHITECTURE",
-    "OS",
-];
-
 #[cfg(windows)]
-// Two Win32 reads with no Rust-side alternative: the machine environment hive
-// and the Windows directory. Both are read-only and bounded by a caller-owned
-// buffer; the crate is where the product's Win32 `unsafe` already lives.
-#[allow(unsafe_code)]
 mod imp {
-    use std::collections::BTreeMap;
-
-    const MACHINE_ENVIRONMENT_KEY: &str =
-        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
-
-    /// Reads the machine-scope environment block from `HKLM`.
-    pub fn machine_environment() -> BTreeMap<String, String> {
-        use windows::core::HSTRING;
-        use windows::Win32::System::Registry::{
-            RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
-        };
-
-        let mut out = BTreeMap::new();
-        for name in super::FORWARDED {
-            let subkey = HSTRING::from(MACHINE_ENVIRONMENT_KEY);
-            let value = HSTRING::from(*name);
-            let mut size: u32 = 0;
-            // Two calls: the first sizes the buffer, the second fills it.
-            let sized = unsafe {
-                RegGetValueW(
-                    HKEY_LOCAL_MACHINE,
-                    &subkey,
-                    &value,
-                    RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
-                    None,
-                    None,
-                    Some(&mut size),
-                )
-            };
-            if sized.is_err() || size == 0 {
-                continue;
-            }
-            let mut buffer = vec![0u16; (size as usize).div_ceil(2)];
-            let read = unsafe {
-                RegGetValueW(
-                    HKEY_LOCAL_MACHINE,
-                    &subkey,
-                    &value,
-                    RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
-                    None,
-                    Some(buffer.as_mut_ptr().cast()),
-                    Some(&mut size),
-                )
-            };
-            if read.is_err() {
-                continue;
-            }
-            let len = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
-            let text = String::from_utf16_lossy(&buffer[..len]);
-            if !text.is_empty() {
-                out.insert((*name).to_string(), text);
-            }
-        }
-        // The Windows root, `ProgramData` and the system drive are not in the
-        // environment key: the shell composes them at logon. Without
-        // `ProgramData` the service cannot resolve its data root and `install`
-        // fails outright, so each is asked of the API instead.
-        out.entry("SystemRoot".to_string())
-            .or_insert_with(system_directory_root);
-        out.entry("windir".to_string())
-            .or_insert_with(system_directory_root);
-        if let Some(dir) = nrr_platform_windows::system_shell::program_data_directory() {
-            out.entry("ProgramData".to_string())
-                .or_insert_with(|| dir.to_string_lossy().into_owned());
-        }
-        let drive = out
-            .get("SystemRoot")
-            .and_then(|root| root.get(..2))
-            .map(str::to_owned);
-        if let Some(drive) = drive {
-            out.entry("SystemDrive".to_string()).or_insert(drive);
-        }
-        out
-    }
-
-    /// `%SystemRoot%` read from the API rather than the environment.
-    fn system_directory_root() -> String {
-        use windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
-        let mut buffer = [0u16; 260];
-        let len = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) } as usize;
-        String::from_utf16_lossy(&buffer[..len.min(buffer.len())])
-    }
+    pub use nrr_platform_windows::machine_environment::machine_environment;
 }
 
 #[cfg(not(windows))]
 mod imp {
     use std::collections::BTreeMap;
 
+    /// The variables the Windows build forwards; no per-user override of the
+    /// machine environment exists here to defend against.
+    const FORWARDED: &[&str] = &[
+        "ProgramData",
+        "SystemRoot",
+        "windir",
+        "SystemDrive",
+        "Path",
+        "PATHEXT",
+        "ComSpec",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "OS",
+    ];
+
     pub fn machine_environment() -> BTreeMap<String, String> {
-        // No per-user override of the machine environment to defend against.
-        super::FORWARDED
+        FORWARDED
             .iter()
             .filter_map(|name| std::env::var(name).ok().map(|v| ((*name).to_string(), v)))
             .collect()
@@ -153,31 +67,13 @@ mod tests {
 
     #[test]
     fn a_child_never_inherits_the_users_environment() {
-        // Set a variable the forwarding list does not name; the child must not
-        // see it, whatever the parent's environment holds.
-        std::env::set_var("NRR_TEST_USER_POISON", "1");
         let mut cmd = std::process::Command::new("cmd");
+        cmd.env("NRR_TEST_USER_POISON", "1");
         apply_machine_environment(&mut cmd);
         let carried: Vec<_> = cmd
             .get_envs()
             .filter_map(|(k, v)| v.map(|_| k.to_string_lossy().into_owned()))
             .collect();
         assert!(!carried.iter().any(|k| k == "NRR_TEST_USER_POISON"));
-        assert!(
-            carried.iter().all(|k| FORWARDED.contains(&k.as_str())),
-            "only the forwarded set may reach the child: {carried:?}"
-        );
-    }
-
-    /// The machine hive names neither; a child without `ProgramData` cannot
-    /// resolve the service data root and every `install` fails.
-    #[cfg(windows)]
-    #[test]
-    fn program_data_and_system_drive_reach_the_child_even_when_the_hive_lacks_them() {
-        let env = imp::machine_environment();
-        let program_data = env.get("ProgramData").expect("ProgramData");
-        assert!(std::path::Path::new(program_data).is_absolute());
-        let drive = env.get("SystemDrive").expect("SystemDrive");
-        assert!(drive.len() == 2 && drive.ends_with(':'), "{drive}");
     }
 }

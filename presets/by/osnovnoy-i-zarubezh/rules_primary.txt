@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 8
 # name: BY Osnovnoy I Zarubezh - Primary Route
 # description: Belarus/local and regional services routed to primary
 # author: NetRuleRouter contributors
@@ -22,8 +22,7 @@ ru              # Российская Федерация (.ru)
 # *.icq.com    # сервис закрыт, включать незачем
 *.ok.com
 
-*.yandex.com  # Yandex and related infrastructure on global TLDs
-*.yandex.net  # Yandex and related infrastructure on global TLDs
+yandex.*  # Yandex and related infrastructure on global TLDs
 *.yastatic.net  # Yandex and related infrastructure on global TLDs
 *.yandexcloud.net  # Yandex and related infrastructure on global TLDs
 *.ya.cc  # Yandex and related infrastructure on global TLDs

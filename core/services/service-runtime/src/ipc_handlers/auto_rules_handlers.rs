@@ -18,7 +18,8 @@ use nrr_shared::ipc_payloads::{
 
 use crate::auto_rules::{shown_by_default_count, ActionSummary, AutoRulesEngine};
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 use crate::tamper_bootstrap::SECURITY_ALERT_GATE_CODE;
 
@@ -41,16 +42,18 @@ fn principal(ctx: &IpcRequestContext) -> Result<&str, IpcError> {
 }
 
 fn parse_ids(request: &IpcRequestEnvelope) -> Result<Vec<String>, IpcError> {
+    parse_action(request).map(|parsed| parsed.ids)
+}
+
+fn parse_action(request: &IpcRequestEnvelope) -> Result<AutoRuleCandidatesActionRequest, IpcError> {
     if request.payload.is_null() {
-        return Ok(Vec::new());
+        return Ok(AutoRuleCandidatesActionRequest::default());
     }
-    let parsed: AutoRuleCandidatesActionRequest = serde_json::from_value(request.payload.clone())
-        .map_err(|e| IpcError {
+    serde_json::from_value(request.payload.clone()).map_err(|e| IpcError {
         code: IpcErrorCode::MalformedRequest,
         message: format!("autorules payload invalid: {e}"),
         diagnostics_id: None,
-    })?;
-    Ok(parsed.ids)
+    })
 }
 
 fn parse_dismissed_restore_ids(request: &IpcRequestEnvelope) -> Result<Vec<String>, IpcError> {
@@ -123,11 +126,30 @@ impl AutoRuleCandidatesAcceptHandler {
     }
 }
 
-impl IpcHandler for AutoRuleCandidatesAcceptHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for AutoRuleCandidatesAcceptHandler {
+    type Checked = AutoRuleCandidatesActionRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        principal(ctx)?;
+        parse_action(request)
+    }
+
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         let sid = principal(ctx)?;
-        let ids = parse_ids(request)?;
-        match self.engine.accept(sid, &ids, SystemTime::now()) {
+        let action = checked.into_inner();
+        match self
+            .engine
+            .accept(sid, &action.ids, action.as_any_zone, SystemTime::now())
+        {
             Ok(summary) => action_response(summary),
             // The rule write was refused — the Free rule cap, an unacknowledged
             // security alert holding the tamper gate shut, a policy error. Pass
@@ -158,10 +180,26 @@ impl AutoRuleCandidatesDismissHandler {
     }
 }
 
-impl IpcHandler for AutoRuleCandidatesDismissHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for AutoRuleCandidatesDismissHandler {
+    type Checked = Vec<String>;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        principal(ctx)?;
+        parse_ids(request)
+    }
+
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         let sid = principal(ctx)?;
-        let ids = parse_ids(request)?;
+        let ids = checked.into_inner();
         action_response(self.engine.dismiss(sid, &ids, SystemTime::now()))
     }
 }
@@ -178,10 +216,26 @@ impl AutoRuleCandidatesForgetHandler {
     }
 }
 
-impl IpcHandler for AutoRuleCandidatesForgetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for AutoRuleCandidatesForgetHandler {
+    type Checked = Vec<String>;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        principal(ctx)?;
+        parse_ids(request)
+    }
+
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         let sid = principal(ctx)?;
-        let ids = parse_ids(request)?;
+        let ids = checked.into_inner();
         action_response(self.engine.forget_candidates(sid, &ids, SystemTime::now()))
     }
 }
@@ -224,10 +278,26 @@ impl AutoRuleDismissedRestoreHandler {
     }
 }
 
-impl IpcHandler for AutoRuleDismissedRestoreHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for AutoRuleDismissedRestoreHandler {
+    type Checked = Vec<String>;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        principal(ctx)?;
+        parse_dismissed_restore_ids(request)
+    }
+
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         let sid = principal(ctx)?;
-        let ids = parse_dismissed_restore_ids(request)?;
+        let ids = checked.into_inner();
         let summary = self.engine.restore_dismissed(sid, &ids, SystemTime::now());
         serde_json::to_value(AutoRuleDismissedRestoreResponse {
             restored: summary.applied,

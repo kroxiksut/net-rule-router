@@ -13,7 +13,8 @@
 use std::sync::Arc;
 
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 use crate::ipc_handlers::payloads::RoutePolicyUpdateRequest;
 use crate::ipc_handlers::providers::{
@@ -40,8 +41,15 @@ impl RoutePolicyUpdateHandler {
     }
 }
 
-impl IpcHandler for RoutePolicyUpdateHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for RoutePolicyUpdateHandler {
+    /// The request with any `apply-only` fields laid over the stored row.
+    type Checked = RoutePolicyUpdateRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
         if ctx.caller_stored().is_empty() {
             return Err(IpcError {
                 code: IpcErrorCode::Internal,
@@ -75,7 +83,15 @@ impl IpcHandler for RoutePolicyUpdateHandler {
                 },
             ));
         }
+        Ok(req)
+    }
 
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         match self.writer.update_for_sid(ctx.caller_stored(), &req) {
             Ok(dto) => {
                 // The policy is durably written; trigger a mid-session WFP
@@ -183,7 +199,7 @@ fn map_write_error(err: RoutePolicyWriteError) -> IpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{IpcOperationClass, IPC_PROTOCOL_VERSION};
+    use crate::ipc::{IpcHandler, IpcOperationClass, IPC_PROTOCOL_VERSION};
     use crate::ipc_handlers::payloads::{
         BehaviorModeDto, BindingSourceDto, RouteBindingDto, RoutePolicyDto,
     };

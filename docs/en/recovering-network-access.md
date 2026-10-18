@@ -9,16 +9,22 @@ protection can outlive the service and leave the machine unable to reach the
 network or resolve names, with no running service left to lift it.
 
 This only happens after an abnormal stop. A normal **Stop**, **Exit**, or
-**Uninstall** always restores networking cleanly — you never need this page for
-those.
+**Uninstall** restores networking. If the service could not hand the system DNS
+settings back, the app says so and offers **Restore network** (Option 2 below).
 
 If it does happen, there are two ways to recover.
 
 ## Option 1 — Reboot
 
-The simplest fix. NetRuleRouter's routing and name-resolution changes are
-designed to clear on restart, so a reboot returns the machine to its normal
-networking on its own.
+The simplest fix. Traffic filters and routes clear on restart.
+
+On Windows the DNS redirect is kept in the system settings and survives a
+restart. The service removes it as it starts with Windows, and if the service
+keeps failing to start, Windows hands name resolution back after the last
+attempt. If the service has been disabled or removed, names may still not
+resolve after a reboot — use Option 2.
+
+On Linux a reboot clears the DNS redirect as well.
 
 ## Option 2 — Reset without rebooting
 

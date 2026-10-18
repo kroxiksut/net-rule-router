@@ -8,13 +8,17 @@ pub fn encode(host: &str) -> String {
     if trimmed.is_ascii() {
         return trimmed.to_owned();
     }
-    // A suffix wildcard is not a label, so it stays outside the conversion.
+    // A wildcard is not a label, so it stays outside the conversion.
     let (prefix, name) = match trimmed.strip_prefix("*.") {
         Some(rest) => ("*.", rest),
         None => ("", trimmed),
     };
+    let (name, suffix) = match name.strip_suffix(".*") {
+        Some(rest) => (rest, ".*"),
+        None => (name, ""),
+    };
     match idna::domain_to_ascii(name) {
-        Ok(ace) if !ace.is_empty() => format!("{prefix}{ace}"),
+        Ok(ace) if !ace.is_empty() => format!("{prefix}{ace}{suffix}"),
         _ => trimmed.to_owned(),
     }
 }

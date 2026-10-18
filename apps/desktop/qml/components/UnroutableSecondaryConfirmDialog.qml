@@ -105,6 +105,7 @@ Dialog {
             wrapMode: Text.Wrap
             font.bold: true
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+            textFormat: Text.PlainText
             text: root.tr("dialog.unroutable-secondary.adapter-line",
                 "Adapter: {name}").replace("{name}", root.adapterName)
             Accessible.role: Accessible.StaticText

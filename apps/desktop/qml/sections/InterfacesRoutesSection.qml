@@ -659,8 +659,9 @@ ColumnLayout {
                                 Layout.fillWidth: true
                                 text: {
                                     var nm = String(modelData.name || "")
-                                    return nm !== "" ? nm : String(modelData.id || "")
+                                    return Pure.displayText(nm !== "" ? nm : String(modelData.id || ""))
                                 }
+                                textFormat: Text.PlainText
                                 color: root.mutedTextColor
                                 font.italic: true
                                 font.bold: true
@@ -796,9 +797,10 @@ ColumnLayout {
                             spacing: 0
                             Label {
                                 Layout.fillWidth: true
-                                text: model.name
+                                text: Pure.displayText(model.name)
                                 color: root.textColor
                                 font.bold: true
+                                textFormat: Text.PlainText
                                 elide: Text.ElideRight
                             }
                             // What the device is and which role the
@@ -830,12 +832,13 @@ ColumnLayout {
                                 text: {
                                     var parts = []
                                     var d = String(model.description || "")
-                                    if (d !== "" && d !== String(model.name || "")) parts.push(d)
+                                    if (d !== "" && d !== String(model.name || "")) parts.push(Pure.displayText(d))
                                     var tech = String(model.deviceTechnology || "")
                                     if (tech !== "" && root.uiRevision >= 0)
                                         parts.push(root.tr("interfaces.device-technology." + tech, tech))
                                     return parts.join(" · ")
                                 }
+                                textFormat: Text.PlainText
                                 color: root.mutedTextColor
                                 wrapMode: Text.WordWrap
                                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)

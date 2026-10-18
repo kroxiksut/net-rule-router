@@ -588,6 +588,21 @@ fn server_ip(value: &str) -> Option<Ipv4Addr> {
 
 /// The machine's DNS servers per link, as resolved holds them — never through
 /// `/etc/resolv.conf`, which under the redirect names resolved itself, i.e. us.
+/// resolved's cache, flushed through `resolvectl` as the redirect does.
+pub struct ResolvedDnsCacheControl<C: DnsCommands>(pub C);
+
+impl<C: DnsCommands> nrr_platform_api::DnsCacheControlPort for ResolvedDnsCacheControl<C> {
+    fn flush_resolver_cache(&self) -> Result<(), nrr_platform_api::DnsCacheFlushError> {
+        match self.0.run("resolvectl", &["flush-caches"]) {
+            Ok(reply) if reply.success => Ok(()),
+            Ok(_) => Err(nrr_platform_api::DnsCacheFlushError::Failed { code: 0 }),
+            Err(_) => Err(nrr_platform_api::DnsCacheFlushError::Unsupported {
+                reason: "resolvectl could not be run",
+            }),
+        }
+    }
+}
+
 pub struct ResolvedDnsServers<C: DnsCommands>(pub C);
 
 impl<C: DnsCommands> SystemDnsServersPort for ResolvedDnsServers<C> {

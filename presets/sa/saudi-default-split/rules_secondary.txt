@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 8
 # name: Saudi Arabia Default Split - Secondary Route
 # description: Messengers and platforms blocked in Saudi Arabia, and WhatsApp whose calls are restricted
 # author: NetRuleRouter contributors
@@ -11,8 +11,7 @@
 # Checked: September 2026. AI, developer and major social services are not listed: they serve Saudi Arabia directly.
 # Calls reach relay servers by address; the app rules below carry them on desktop.
 
-*.whatsapp.com  # WhatsApp: voice and video calls restricted since 2019
-*.whatsapp.net  # WhatsApp: voice and video calls restricted since 2019
+whatsapp.*  # WhatsApp: voice and video calls restricted since 2019
 
 *.viber.com  # Viber: blocked nationwide since 2013
 *.imo.im  # imo: blocked nationwide

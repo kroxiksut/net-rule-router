@@ -157,6 +157,12 @@ pub fn run() -> ExitCode {
     // The same supervised runtime the Windows service runs — supervisor, health
     // aggregation, IPC accept task, retention jobs.
     let health = Arc::new(HealthAggregator::new());
+    // Before any rules read: every one judges protected programs by these.
+    nrr_service_runtime::protected_rules::install(
+        nrr_platform_api::protected_places::ProtectedPlacesSource::protected_places(
+            &nrr_platform_linux::protected_places::LinuxProtectedPlaces,
+        ),
+    );
     // One bus, two ends: the runtime tasks publish into it, the socket server's
     // workers drain it for their subscription. Two instances would leave a
     // subscribed client silently on poll-only.

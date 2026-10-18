@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc_payloads::{
     EnforcementStatusDto, RoutesHeldDto, SnapshotInitialResponse, StatusUpdateEvent,
 };
@@ -66,6 +67,9 @@ pub struct Notice {
 pub struct EnforcementDown {
     pub status: String,
     pub candidates: Vec<String>,
+    /// Not up since the service started and still within the start-up wait:
+    /// shown, never announced, and its end is no news either.
+    pub quiet: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +107,9 @@ pub struct AppState {
     pub enforcement_down: BTreeMap<String, EnforcementDown>,
     /// This user's destinations another signed-in user's routing holds.
     pub routes_held: Option<RoutesHeldDto>,
+    /// Another signed-in user's connection that carries what this user's
+    /// rules do not route, as the service names it (empty when it could not).
+    pub traffic_carried: Option<String>,
     /// The system-DNS notice is up for the state as it stands.
     pub system_dns_notice_raised: bool,
     /// The newest notices, at most [`FEED_CAPACITY`].
@@ -139,6 +146,7 @@ pub struct AppState {
     /// VPN-named programs leak protection does not trust by place, awaiting
     /// the user's word.
     pub vpn_trust: crate::vpn_trust::VpnTrustState,
+    pub primary_suggestion: crate::primary_suggestion::PrimarySuggestionState,
     /// Blocks kept while no surface was open, read on connect.
     pub block_backlog: crate::block_backlog::BlockBacklogState,
     pub local_network_offer: crate::local_network_offer::LocalNetworkOfferState,
@@ -153,6 +161,7 @@ impl AppState {
             fetch_error: None,
             enforcement_down: BTreeMap::new(),
             routes_held: None,
+            traffic_carried: None,
             system_dns_notice_raised: false,
             notices: Vec::new(),
             notice_count: 0,
@@ -174,6 +183,7 @@ impl AppState {
             restore: crate::restore::RestoreState::default(),
             settings: crate::screens::settings::SettingsState::default(),
             vpn_trust: crate::vpn_trust::VpnTrustState::default(),
+            primary_suggestion: crate::primary_suggestion::PrimarySuggestionState::default(),
             block_backlog: Default::default(),
             local_network_offer: Default::default(),
             forwarded_traffic: Default::default(),
@@ -240,6 +250,7 @@ impl AppState {
                 let later = crate::screens::rules::verdicts::announce(self, texts, now)
                     .into_iter()
                     .chain(crate::vpn_trust::announce(self, texts, now))
+                    .chain(crate::primary_suggestion::announce(self, texts, now))
                     .chain(crate::block_backlog::announce(self, texts, now))
                     .chain(crate::local_network_offer::announce(self, texts, now));
                 for effect in later {
@@ -252,6 +263,11 @@ impl AppState {
             BackendEvent::Snapshot(snapshot) => {
                 let reports = snapshot.enforcement_status.clone();
                 let held = snapshot.routes_held_by_another_user.clone();
+                let carried = snapshot
+                    .traffic_carried_by_another_user
+                    .as_ref()
+                    .filter(|report| report.carried)
+                    .map(|report| report.link.clone());
                 self.vpn_trust.pending = snapshot.pending_vpn_clients.clone();
                 self.snapshot = Some(*snapshot);
                 self.fetch_error = None;
@@ -266,6 +282,7 @@ impl AppState {
                 for effect in self
                     .routes_held_changed(held, texts, now)
                     .into_iter()
+                    .chain(self.traffic_carried_changed(carried, texts, now))
                     .chain(self.system_dns_reading(dns_not_restored, texts, now))
                     .chain(crate::forwarded_traffic::reading(self, texts, now))
                 {
@@ -290,12 +307,14 @@ impl AppState {
                 status,
                 role,
                 candidates,
+                quiet,
                 ..
             } => {
                 // The leak-guard banner is read from the snapshot, and a link
                 // coming back moves no adapter: re-read it, as the GUI does.
                 let restored = status.is_empty() || status == "ok";
-                let mut effects = self.enforcement_changed(status, role, candidates, texts, now);
+                let mut effects =
+                    self.enforcement_changed(status, role, candidates, quiet, texts, now);
                 if restored && !effects.contains(&Effect::Refresh) {
                     effects.push(Effect::Refresh);
                 }
@@ -315,13 +334,19 @@ impl AppState {
                 let held = (count > 0).then_some(RoutesHeldDto { count, sample });
                 self.routes_held_changed(held, texts, now)
             }
+            StatusUpdateEvent::TrafficCarriedByAnotherUser { carried, link, .. } => {
+                self.traffic_carried_changed(carried.then_some(link), texts, now)
+            }
             StatusUpdateEvent::SystemDnsNotRestored => self.system_dns_reading(true, texts, now),
-            StatusUpdateEvent::HostUnreachableOnBothRoutes { host, .. } => self.notify(
-                NoticeLevel::Info,
-                texts.get(keys::HOST_UNREACHABLE_TITLE),
-                texts.fill(keys::HOST_UNREACHABLE_BODY, &[("host", &host)]),
-                now,
-            ),
+            StatusUpdateEvent::HostUnreachableOnBothRoutes { host, .. } => {
+                let host = display_text(&host).into_owned();
+                self.notify(
+                    NoticeLevel::Info,
+                    texts.get(keys::HOST_UNREACHABLE_TITLE),
+                    texts.fill(keys::HOST_UNREACHABLE_BODY, &[("host", &host)]),
+                    now,
+                )
+            }
             StatusUpdateEvent::SecondaryExternalAddressObserved {
                 adapter_name,
                 external_address,
@@ -333,15 +358,15 @@ impl AppState {
                 );
                 if !adapter_name.is_empty() {
                     body.push(' ');
-                    body.push_str(
-                        &texts.fill(keys::EXTERNAL_ADDRESS_ADAPTER, &[("name", &adapter_name)]),
-                    );
+                    body.push_str(&texts.fill(
+                        keys::EXTERNAL_ADDRESS_ADAPTER,
+                        &[("name", display_text(&adapter_name))],
+                    ));
                 }
-                self.notify(
+                self.note_in_feed(
                     NoticeLevel::Info,
                     texts.get(keys::EXTERNAL_ADDRESS_TITLE),
                     body,
-                    now,
                 )
             }
             StatusUpdateEvent::AdaptersChanged { .. } | StatusUpdateEvent::HealthChanged { .. } => {
@@ -354,7 +379,7 @@ impl AppState {
             } => {
                 match crate::screens::suggestions::changed(self, pending_count, &top_anchor, texts)
                 {
-                    Some((title, body)) => self.notify(NoticeLevel::Info, title, body, now),
+                    Some((title, body)) => self.note_in_feed(NoticeLevel::Info, title, body),
                     None => Vec::new(),
                 }
             }
@@ -388,8 +413,9 @@ impl AppState {
                 let app = if app.is_empty() {
                     texts.get(keys::BLOCK_NOTICE_APP_UNKNOWN)
                 } else {
-                    app
+                    display_text(&app).into_owned()
                 };
+                let destination = display_text(&destination).into_owned();
                 let body = texts.fill(
                     keys::BLOCK_NOTICE_BODY,
                     &[
@@ -412,7 +438,7 @@ impl AppState {
                 }
                 let body = texts.fill(
                     keys::UNASSIGNED_TUNNEL_BODY,
-                    &[("adapter", adapter_name.as_str())],
+                    &[("adapter", display_text(&adapter_name))],
                 );
                 self.notify(
                     NoticeLevel::Warning,
@@ -432,8 +458,8 @@ impl AppState {
                 let body = texts.fill(
                     keys::LOCAL_NETWORK_TOO_WIDE_BODY,
                     &[
-                        ("adapter", adapter_name.as_str()),
-                        ("network", network.as_str()),
+                        ("adapter", display_text(&adapter_name)),
+                        ("network", display_text(&network)),
                     ],
                 );
                 self.notify(
@@ -458,10 +484,7 @@ impl AppState {
             StatusUpdateEvent::AppRuleLearningDestinations { apps, .. } => self.notify(
                 NoticeLevel::Info,
                 texts.get(keys::APP_RULE_LEARNING_TITLE),
-                texts.fill(
-                    keys::APP_RULE_LEARNING_BODY,
-                    &[("apps", apps.join(", ").as_str())],
-                ),
+                texts.fill(keys::APP_RULE_LEARNING_BODY, &[("apps", shown_list(&apps))]),
                 now,
             ),
             // The whole list each time; an empty one is a question withdrawn,
@@ -530,18 +553,23 @@ impl AppState {
             let held = self
                 .enforcement_down
                 .get(&report.role)
-                .map_or("ok", |down| down.status.as_str());
+                .map_or(("ok", false), |down| (down.status.as_str(), down.quiet));
             let status = if report.status.is_empty() {
                 "ok"
             } else {
                 report.status.as_str()
             };
-            if held == status {
+            if held == (status, report.quiet && status != "ok") {
                 continue;
             }
-            for effect in
-                self.enforcement_changed(report.status, report.role, report.candidates, texts, now)
-            {
+            for effect in self.enforcement_changed(
+                report.status,
+                report.role,
+                report.candidates,
+                report.quiet,
+                texts,
+                now,
+            ) {
                 if !effects.contains(&effect) {
                     effects.push(effect);
                 }
@@ -550,9 +578,6 @@ impl AppState {
         effects
     }
 
-    /// Another user's routing holds some of this user's destinations, or
-    /// stopped holding them. The snapshot repeats the standing report on every
-    /// refresh, so one equal to the state held is not news.
     /// The system DNS left redirected: said when it appears, with the way out;
     /// not repeated while it lasts.
     fn system_dns_reading(
@@ -575,6 +600,9 @@ impl AppState {
         )
     }
 
+    /// Another user's routing holds some of this user's destinations, or
+    /// stopped holding them. The snapshot repeats the standing report on every
+    /// refresh, so one equal to the state held is not news.
     fn routes_held_changed(
         &mut self,
         held: Option<RoutesHeldDto>,
@@ -601,17 +629,50 @@ impl AppState {
         }
     }
 
+    /// Another user's tunnel carries this user's unrouted traffic, or stopped
+    /// carrying it; like the held destinations, a repeat is not news.
+    fn traffic_carried_changed(
+        &mut self,
+        link: Option<String>,
+        texts: &Texts,
+        now: Instant,
+    ) -> Vec<Effect> {
+        if self.traffic_carried == link {
+            return Vec::new();
+        }
+        let was_carried = self.traffic_carried.is_some();
+        self.traffic_carried = link.clone();
+        match link {
+            Some(link) => {
+                let (title, body) = traffic_carried_text(&link, texts);
+                self.notify(NoticeLevel::Warning, title, body, now)
+            }
+            None if was_carried => self.notify(
+                NoticeLevel::Info,
+                texts.get(keys::TRAFFIC_CARRIED_TITLE),
+                texts.get(keys::TRAFFIC_CARRIED_CLEARED),
+                now,
+            ),
+            None => Vec::new(),
+        }
+    }
+
     /// A standing state per role: a later report replaces it, `ok` ends it.
     fn enforcement_changed(
         &mut self,
         status: String,
         role: String,
         candidates: Vec<String>,
+        quiet: bool,
         texts: &Texts,
         now: Instant,
     ) -> Vec<Effect> {
         if status.is_empty() || status == "ok" {
-            if self.enforcement_down.remove(&role).is_some() {
+            if self
+                .enforcement_down
+                .remove(&role)
+                .is_some_and(|down| !down.quiet)
+            {
                 let mut body = texts.get(keys::ENF_RESTORED_BODY);
                 // What leak protection held back meanwhile has a list of its own.
                 if role == "secondary" {
@@ -630,9 +691,30 @@ impl AppState {
             return Vec::new();
         }
         let (title, body) = enforcement_text(&status, &role, &candidates, texts);
-        self.enforcement_down
-            .insert(role, EnforcementDown { status, candidates });
+        self.enforcement_down.insert(
+            role,
+            EnforcementDown {
+                status,
+                candidates,
+                quiet,
+            },
+        );
+        if quiet {
+            return Vec::new();
+        }
         self.notify(NoticeLevel::Warning, title, body, now)
+    }
+
+    /// Into the feed only: no footer line, no bell. For news that matters
+    /// when looked for, not when it happens.
+    fn note_in_feed(&mut self, level: NoticeLevel, title: String, body: String) -> Vec<Effect> {
+        self.notices.push(Notice { level, title, body });
+        self.notice_count += 1;
+        if self.notices.len() > FEED_CAPACITY {
+            let excess = self.notices.len() - FEED_CAPACITY;
+            self.notices.drain(..excess);
+        }
+        Vec::new()
     }
 
     pub(crate) fn notify(
@@ -642,12 +724,7 @@ impl AppState {
         body: String,
         now: Instant,
     ) -> Vec<Effect> {
-        self.notices.push(Notice { level, title, body });
-        self.notice_count += 1;
-        if self.notices.len() > FEED_CAPACITY {
-            let excess = self.notices.len() - FEED_CAPACITY;
-            self.notices.drain(..excess);
-        }
+        self.note_in_feed(level, title, body);
         self.last_notice_at = Some(now);
         if self.bell {
             vec![Effect::Bell]
@@ -670,6 +747,26 @@ pub fn routes_held_text(held: &RoutesHeldDto, texts: &Texts) -> (String, String)
     )
 }
 
+/// The GUI's wording for traffic another signed-in user's tunnel carries,
+/// naming the connection when the service could.
+pub fn traffic_carried_text(link: &str, texts: &Texts) -> (String, String) {
+    let body = if link.is_empty() {
+        texts.get(keys::TRAFFIC_CARRIED_BODY_UNNAMED)
+    } else {
+        texts.fill(keys::TRAFFIC_CARRIED_BODY, &[("link", display_text(link))])
+    };
+    (texts.get(keys::TRAFFIC_CARRIED_TITLE), body)
+}
+
+/// Names someone else chose, as a comma list fit for the screen.
+fn shown_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| display_text(name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The GUI's wording for an enforcement report: what happened, and what to do.
 /// An unknown status still says the one thing that matters.
 pub fn enforcement_text(
@@ -678,7 +775,7 @@ pub fn enforcement_text(
     candidates: &[String],
     texts: &Texts,
 ) -> (String, String) {
-    let list = candidates.join(", ");
+    let list = shown_list(candidates);
     let with_list = |title: Key, body: Key, empty: Key| {
         let body = if candidates.is_empty() {
             texts.get(empty)
@@ -710,6 +807,13 @@ pub fn enforcement_text(
             texts.get(keys::ENF_NO_WAY_OUT_TITLE),
             texts.get(keys::ENF_NO_WAY_OUT_BODY),
         ),
+        "no-policy" if !candidates.is_empty() => (
+            texts.fill(
+                keys::ENF_SUGGEST_TITLE,
+                &[("name", &*display_text(&candidates[0]))],
+            ),
+            texts.get(keys::ENF_SUGGEST_BODY),
+        ),
         "no-policy" => (
             texts.get(keys::ENF_NO_POLICY_TITLE),
             texts.get(keys::ENF_NO_POLICY_BODY),
@@ -737,6 +841,7 @@ pub fn enforcement_text(
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+    use nrr_shared::ipc_payloads::TrafficCarriedDto;
 
     fn texts() -> Texts {
         Texts::load(Some("en"), &[])
@@ -754,6 +859,52 @@ mod tests {
         app
     }
 
+    fn quiet_enforcement(status: &str, role: &str) -> BackendEvent {
+        BackendEvent::Push(PushEvent::Status(Box::new(
+            StatusUpdateEvent::EnforcementStatusChanged {
+                sid: "S".into(),
+                status: status.into(),
+                role: role.into(),
+                candidates: Vec::new(),
+                since_unix_ms: None,
+                quiet: true,
+            },
+        )))
+    }
+
+    #[test]
+    fn a_route_not_up_yet_at_start_is_shown_but_not_announced() {
+        let fixture = Fixture::healthy();
+        let mut app = connected(&fixture);
+        let t = texts();
+        let before = app.notices.len();
+        app.apply(
+            quiet_enforcement("secondary-down", "secondary"),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.routing_state(), RoutingState::Limited);
+        assert_eq!(app.notices.len(), before, "quiet at start");
+        app.apply(enforcement("ok", "secondary"), &t, Instant::now());
+        assert_eq!(app.notices.len(), before, "coming up is no news either");
+
+        app.apply(
+            quiet_enforcement("secondary-down", "secondary"),
+            &t,
+            Instant::now(),
+        );
+        app.apply(
+            enforcement("secondary-down", "secondary"),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(
+            app.notices.len(),
+            before + 1,
+            "the wait is over: one notice"
+        );
+    }
+
     fn enforcement(status: &str, role: &str) -> BackendEvent {
         BackendEvent::Push(PushEvent::Status(Box::new(
             StatusUpdateEvent::EnforcementStatusChanged {
@@ -762,8 +913,20 @@ mod tests {
                 role: role.into(),
                 candidates: Vec::new(),
                 since_unix_ms: None,
+                quiet: false,
             },
         )))
+    }
+
+    #[test]
+    fn a_suggested_main_connection_is_named_in_the_notice() {
+        let t = texts();
+        let (title, body) = enforcement_text("no-policy", "", &["Ethernet".to_owned()], &t);
+        assert!(title.contains("Ethernet"), "{title}");
+        assert!(!body.is_empty());
+        let (plain, _) = enforcement_text("no-policy", "", &[], &t);
+        assert!(!plain.contains("Ethernet"));
+        assert_ne!(plain, title);
     }
 
     #[test]
@@ -828,7 +991,7 @@ mod tests {
         assert_eq!(app.notices[0].title, "Connection blocked");
         assert_eq!(
             app.notices[0].body,
-            "A rule blocks this connection. Destination: cdn.example. Application: messenger.exe. Attempts: 3."
+            "A rule denies this connection. Destination: cdn.example. Application: messenger.exe. Attempts: 3."
         );
 
         // A reason this build does not know, and no application named.
@@ -1111,6 +1274,94 @@ mod tests {
         assert!(app.routes_held.is_none());
     }
 
+    fn carried(carried: bool, link: &str) -> BackendEvent {
+        BackendEvent::Push(PushEvent::Status(Box::new(
+            StatusUpdateEvent::TrafficCarriedByAnotherUser {
+                sid: "S".into(),
+                carried,
+                link: link.into(),
+            },
+        )))
+    }
+
+    /// Another user's tunnel carrying this user's traffic is told once, by the
+    /// connection's name, whether the push or a snapshot brings it; its end
+    /// is news too.
+    #[test]
+    fn traffic_carried_by_another_user_is_told_once_and_its_end_too() {
+        let t = texts();
+        let mut app = connected(&Fixture::healthy());
+        app.apply(carried(true, "Office Tunnel"), &t, Instant::now());
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.notices[0].level, NoticeLevel::Warning);
+        assert_eq!(
+            app.notices[0].title,
+            "Your traffic goes through another user's tunnel"
+        );
+        assert!(
+            app.notices[0]
+                .body
+                .contains("through the tunnel \"Office Tunnel\"."),
+            "{:?}",
+            app.notices[0]
+        );
+        assert_eq!(app.routing_state(), RoutingState::Active);
+
+        let mut snapshot = Fixture::healthy().snapshot();
+        snapshot.traffic_carried_by_another_user = Some(TrafficCarriedDto {
+            carried: true,
+            link: "Office Tunnel".into(),
+        });
+        app.apply(
+            BackendEvent::Snapshot(Box::new(snapshot)),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 1, "the same state is not news");
+
+        app.apply(carried(false, ""), &t, Instant::now());
+        assert_eq!(app.notices.len(), 2);
+        assert_eq!(app.notices[1].level, NoticeLevel::Info);
+        assert_eq!(
+            app.notices[1].body,
+            "Your traffic no longer goes through another user's tunnel."
+        );
+        assert!(app.traffic_carried.is_none());
+    }
+
+    /// A terminal opened later learns it from the snapshot, and a later
+    /// snapshot without it ends it.
+    #[test]
+    fn a_late_terminal_learns_carried_traffic_from_the_snapshot() {
+        let t = texts();
+        let mut app = AppState::new(ScreenId::Status, false);
+        app.apply(BackendEvent::Link(Link::Connected), &t, Instant::now());
+        let mut snapshot = Fixture::healthy().snapshot();
+        snapshot.traffic_carried_by_another_user = Some(TrafficCarriedDto {
+            carried: true,
+            link: String::new(),
+        });
+        app.apply(
+            BackendEvent::Snapshot(Box::new(snapshot)),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 1);
+        assert!(
+            app.notices[0].body.contains("through their tunnel."),
+            "{:?}",
+            app.notices[0]
+        );
+
+        app.apply(
+            BackendEvent::Snapshot(Box::new(Fixture::healthy().snapshot())),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 2);
+        assert_eq!(app.notices[1].level, NoticeLevel::Info);
+    }
+
     /// The system DNS left redirected is said once while it lasts, whether the
     /// push or a snapshot brings it, and again once it clears and comes back.
     #[test]
@@ -1225,6 +1476,7 @@ mod tests {
                 role: (*role).into(),
                 candidates: Vec::new(),
                 since_unix_ms: None,
+                quiet: false,
             })
             .collect();
         BackendEvent::Snapshot(Box::new(snapshot))

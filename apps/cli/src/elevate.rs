@@ -114,10 +114,13 @@ pub fn canonical_argv(command: &Command) -> Vec<String> {
             word("install"),
             format!("--start-mode={}", start_mode.slug()),
         ],
-        Command::Uninstall { purge } => {
+        Command::Uninstall { purge, purge_audit } => {
             let mut argv = vec![word("uninstall")];
             if *purge {
                 argv.push(word("--purge"));
+            }
+            if *purge_audit {
+                argv.push(word("--purge-audit"));
             }
             argv
         }
@@ -248,7 +251,12 @@ pub fn run_relay(request: &RelayRequest) -> u8 {
     if takes_the_service_down(&request.args) {
         nrr_platform_api::elevation::settle_after_elevation();
     }
-    match std::process::Command::new(exe).args(&request.args).output() {
+    let mut command = std::process::Command::new(exe);
+    command.args(&request.args);
+    // Elevated on this user's behalf, this process carries their environment,
+    // which they may rewrite without rights; the command gets the machine's.
+    crate::platform::use_machine_environment(&mut command);
+    match command.output() {
         Ok(output) => {
             let code = output
                 .status
@@ -525,8 +533,18 @@ mod tests {
             Command::Install {
                 start_mode: nrr_platform_api::service_control::ServiceStartMode::OnAppLaunch,
             },
-            Command::Uninstall { purge: false },
-            Command::Uninstall { purge: true },
+            Command::Uninstall {
+                purge: false,
+                purge_audit: false,
+            },
+            Command::Uninstall {
+                purge: true,
+                purge_audit: false,
+            },
+            Command::Uninstall {
+                purge: true,
+                purge_audit: true,
+            },
             Command::Start,
             Command::Stop,
             Command::Restart,

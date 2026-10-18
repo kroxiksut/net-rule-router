@@ -96,11 +96,13 @@ cyan "[fuzz] ${#targets[@]} target(s), ${seconds}s each, timeout ${timeout_secs}
 
 failed=()
 passed=()
+index=0
 for target in "${targets[@]}"; do
+  index=$((index + 1))
   seed_dir="$fuzz_dir/corpus/$target"
   work_dir="$fuzz_dir/work/$target"
   mkdir -p "$work_dir" "$seed_dir"
-  cyan "[fuzz] $target"
+  cyan "[fuzz] ($index/${#targets[@]}) $target, started $(date +%H:%M)"
   status=0
   (
     cd "$repo_root"

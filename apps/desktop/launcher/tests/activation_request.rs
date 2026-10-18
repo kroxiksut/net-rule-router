@@ -189,6 +189,7 @@ fn cold_start_context_carries_the_launch_action() {
         &status,
         false,
         &nrr_launcher::rpc_dispatcher::host_answer_deadlines(),
+        &nrr_platform_api::admin_authored::TrustNothing,
     )
     .expect("write context");
 

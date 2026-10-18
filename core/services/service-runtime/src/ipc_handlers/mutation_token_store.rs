@@ -268,6 +268,26 @@ impl MutationTokenStore {
         self.take(token, operation, Some(caller), now)
     }
 
+    /// [`Self::consume_for`], except that an elevated confirmer is not held to
+    /// the issuer: a confirm relayed through elevation (a standard account's
+    /// UAC prompt answered with an administrator's password) arrives under the
+    /// administrator's principal. An unelevated stranger is still refused.
+    pub fn consume_for_confirmer(
+        &self,
+        token: &str,
+        operation: IpcOperationName,
+        caller: &str,
+        caller_is_elevated: bool,
+        now: Instant,
+    ) -> Result<StoredMutation, ConsumeError> {
+        self.take(
+            token,
+            operation,
+            (!caller_is_elevated).then_some(caller),
+            now,
+        )
+    }
+
     fn take(
         &self,
         token: &str,
@@ -510,5 +530,23 @@ mod tests {
         );
         let t = s.issue(OP, payload_of("S-1-5-21-1"), deadline);
         assert!(s.consume_for(&t, OP, "S-1-5-21-1", now).is_ok());
+    }
+
+    #[test]
+    fn an_elevated_confirmer_may_differ_from_the_issuer_and_a_plain_one_may_not() {
+        let s = MutationTokenStore::new();
+        let now = Instant::now();
+        let deadline = now + DEFAULT_MUTATION_TOKEN_TTL;
+        let t = s.issue(OP, payload_of("S-1-5-21-1"), deadline);
+        assert_eq!(
+            s.consume_for_confirmer(&t, OP, "S-1-5-21-2", false, now)
+                .unwrap_err(),
+            ConsumeError::NotFound
+        );
+        let t = s.issue(OP, payload_of("S-1-5-21-1"), deadline);
+        let stored = s
+            .consume_for_confirmer(&t, OP, "S-1-5-21-500", true, now)
+            .expect("an administrator confirms another account's dry-run");
+        assert_eq!(stored.issuer_sid, "S-1-5-21-1");
     }
 }

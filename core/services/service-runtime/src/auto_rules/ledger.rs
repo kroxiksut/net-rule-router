@@ -34,6 +34,12 @@ impl AutoRulesEngine {
         self.settings(sid).mode
     }
 
+    /// Whether `sid` has suggestions on at all: with them off nothing about
+    /// their traffic is worth a lookup.
+    pub fn learns_for(&self, sid: &str) -> bool {
+        self.mode(sid) != AutoRulesMode::Off
+    }
+
     /// The route `sid`'s unmatched traffic takes, from the user's policy.
     pub(super) fn default_route_role(&self, sid: &str) -> RouteRole {
         self.settings(sid).behavior_mode.default_route_role()
@@ -289,7 +295,20 @@ impl AutoRulesEngine {
     }
 
     /// `auto` mode: write the rules without asking. Returns how many landed.
+    ///
+    /// A less certain offer is parked for a person instead, whatever produced
+    /// it: the unattended bar already leaves them out, and this is the one
+    /// place a rule is written unasked, so the guarantee is held here too.
     pub(super) fn author_now(&self, sid: &str, fresh: &[PendingCandidate], now: SystemTime) -> u32 {
+        let (asked, unasked): (Vec<PendingCandidate>, Vec<PendingCandidate>) =
+            fresh.iter().cloned().partition(|c| is_less_certain(&c.dto));
+        if !asked.is_empty() {
+            self.park(sid, asked, unix_ms(now));
+        }
+        if unasked.is_empty() {
+            return 0;
+        }
+        let fresh = unasked.as_slice();
         let Some(author) = self.author.get() else {
             // No author wired: park rather than discard the finding, so wiring
             // authoring later does not start from zero. Nothing was authored.

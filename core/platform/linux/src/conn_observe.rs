@@ -180,6 +180,11 @@ impl nrr_platform_api::conn_observe::live::LiveConnectionSource for ProcfsLiveCo
                 Some(nrr_platform_api::conn_observe::live::LiveConnection {
                     process_path: exe,
                     remote,
+                    owner: Some(
+                        nrr_platform_api::enforcement::UserPrincipal::from_linux_uid(socket.uid)
+                            .as_stored()
+                            .to_owned(),
+                    ),
                 })
             })
             .collect()

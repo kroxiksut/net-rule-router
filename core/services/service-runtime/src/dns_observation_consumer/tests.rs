@@ -97,6 +97,7 @@ fn obs(host: &str, ip: [u8; 4]) -> DnsObservation {
     DnsObservation {
         hostname: host.into(),
         ipv4s: vec![Ipv4Addr::from(ip)],
+        owner: None,
     }
 }
 
@@ -205,6 +206,41 @@ fn a_site_answered_with_a_placeholder_offers_itself_for_the_tunnel() {
         candidates[0].signal,
         nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER,
     );
+}
+
+/// Two users served: a lookup teaches only the user whose program made it. One
+/// with no known owner, or another user's, makes no offer to the lead.
+#[test]
+fn another_users_lookup_makes_no_offer_to_the_lead() {
+    let (cache, lookup) = in_memory_cache();
+    let (c, engine) = consumer_with_learning(
+        vec![exact_fqdn_rule("r1", "site.example")],
+        Arc::clone(&cache),
+        Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+    );
+    let c = c.with_present_principals(Arc::new(|| vec!["S-A".to_string(), "S-B".to_string()]));
+    let owned = |host: &str, owner: Option<&str>| DnsObservation {
+        owner: owner.map(str::to_owned),
+        ..obs(host, [192, 0, 2, 1])
+    };
+
+    c.consume(
+        &[
+            owned("unowned-journal.example", None),
+            owned("bobs-journal.example", Some("S-B")),
+        ],
+        at_ms(0),
+    );
+    assert!(
+        engine.candidates("S-A").is_empty(),
+        "{:?}",
+        engine.candidates("S-A")
+    );
+
+    c.consume(&[owned("alices-journal.example", Some("S-A"))], at_ms(1));
+    let candidates = engine.candidates("S-A");
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    assert_eq!(candidates[0].anchor, "alices-journal.example");
 }
 
 /// Positive control for the line between the two: a hosts-file pin looks
@@ -874,6 +910,7 @@ fn loopback_and_unspecified_observations_are_not_cached_or_collateral() {
         &[DnsObservation {
             hostname: "mix.example.com".into(),
             ipv4s: vec![Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(198, 51, 100, 4)],
+            owner: None,
         }],
         SystemTime::now(),
     );

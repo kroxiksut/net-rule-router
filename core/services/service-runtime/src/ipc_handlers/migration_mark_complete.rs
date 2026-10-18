@@ -11,7 +11,8 @@
 use std::sync::Arc;
 
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 use crate::ipc_handlers::payloads::{MigrationMarkCompleteRequest, MigrationMarkCompleteResponse};
 use crate::ipc_handlers::providers::{MigrationCompletionWriter, RoutePolicyWriteError};
@@ -26,8 +27,14 @@ impl MigrationMarkCompleteHandler {
     }
 }
 
-impl IpcHandler for MigrationMarkCompleteHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for MigrationMarkCompleteHandler {
+    type Checked = MigrationMarkCompleteRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
         if ctx.caller_stored().is_empty() {
             return Err(IpcError {
                 code: IpcErrorCode::Internal,
@@ -44,7 +51,15 @@ impl IpcHandler for MigrationMarkCompleteHandler {
                 message: format!("migration.mark.complete payload invalid: {e}"),
                 diagnostics_id: None,
             })?;
+        Ok(req)
+    }
 
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         match self.writer.mark_migration_complete(
             ctx.caller_stored(),
             &req.migration_id,
@@ -78,7 +93,7 @@ impl IpcHandler for MigrationMarkCompleteHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{IpcOperationClass, IPC_PROTOCOL_VERSION};
+    use crate::ipc::{IpcHandler, IpcOperationClass, IPC_PROTOCOL_VERSION};
     use crate::ipc_handlers::payloads::MIGRATION_ID_LEGACY_PREFERENCES_V1;
     use crate::ipc_handlers::providers::MigrationCompletionRecord;
     use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};

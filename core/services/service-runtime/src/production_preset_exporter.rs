@@ -30,7 +30,6 @@ use nrr_domain::rules_file::{
 };
 use nrr_domain::rules_json_codec;
 use nrr_shared::RouteRole;
-use nrr_storage::revisions::RevisionsRepository;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -159,33 +158,17 @@ impl PresetExportSource for ProductionPresetExporter {
             .conn
             .lock()
             .map_err(|_| PresetExportError::LockPoisoned)?;
-        let repo = RevisionsRepository::new(&guard);
-        // Per-SID read-through. The console user's edits live in
-        // THEIR SID's revision chain (that's what drives enforcement), while
-        // `__baseline__` may be empty. Resolve the caller's own active
-        // revision first, then fall back to the shared admin baseline — the
-        // same pattern as `ProductionRulesSnapshotProvider::rules_snapshot_for`
-        // and the explain path's `load_active_rule_book`. StorageError mapping
-        // preserved on both reads.
-        let record = match repo
-            .get_active_for(principal)
-            .map_err(|e| PresetExportError::StorageError(e.to_string()))?
-        {
-            Some(rec) => rec,
-            None if principal != nrr_storage::BASELINE_PRINCIPAL => repo
-                .get_active_for(nrr_storage::BASELINE_PRINCIPAL)
-                .map_err(|e| PresetExportError::StorageError(e.to_string()))?
-                .ok_or(PresetExportError::NoActiveRevision)?,
-            None => return Err(PresetExportError::NoActiveRevision),
-        };
+        // The book in force, as the rules provider resolves it: a revision
+        // mid-activation, the caller's own, then the shared baseline.
+        let book = crate::production_rules_provider::book_in_force_for(&guard, principal)
+            .map_err(PresetExportError::StorageError)?
+            .ok_or(PresetExportError::NoActiveRevision)?;
 
         // Wire-shape parse first; this catches malformed/older blobs
         // before the codec runs.
-        let dto = crate::production_rules_provider::read_stored_rules(
-            &record.rules_json,
-            &record.revision_id,
-        )
-        .map_err(|e| PresetExportError::DecodeError(format!("wire parse: {e}")))?;
+        let dto =
+            crate::production_rules_provider::read_stored_rules(&book.rules_json, book.origin())
+                .map_err(|e| PresetExportError::DecodeError(format!("wire parse: {e}")))?;
         // Names are spelled for the section they are written under.
         let platform = self
             .host_app_section

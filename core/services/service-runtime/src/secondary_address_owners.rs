@@ -39,6 +39,9 @@ pub struct SecondaryAddressOwners {
     /// Addresses inside an additional network that a main-link rule names more
     /// closely — literally, or through an exact or suffix name.
     main_closer: HashSet<IpAddr>,
+    /// Other served users' claims: an address any of them sends over their
+    /// additional link is claimed here too.
+    also: Vec<SecondaryAddressOwners>,
 }
 
 impl SecondaryAddressOwners {
@@ -72,7 +75,24 @@ impl SecondaryAddressOwners {
             networks,
             network_labels,
             main_closer,
+            also: Vec::new(),
         }
+    }
+
+    /// Every served user's claims at once; each part keeps its own book's
+    /// narrower-rule rules.
+    #[must_use]
+    pub fn union(mut parts: Vec<Self>) -> Self {
+        if parts.len() < 2 {
+            return parts.pop().unwrap_or_default();
+        }
+        let mut first = parts.remove(0);
+        first.also = parts;
+        first
+    }
+
+    fn parts(&self) -> impl Iterator<Item = &Self> + Clone {
+        std::iter::once(self).chain(self.also.iter())
     }
 
     /// Literal and host claims only, for callers and tests without networks.
@@ -90,13 +110,18 @@ impl SecondaryAddressOwners {
     /// Nothing is sent over the additional link by address.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.named.is_empty() && self.network_labels.is_empty()
+        self.parts()
+            .all(|p| p.named.is_empty() && p.network_labels.is_empty())
     }
 
     /// The host, literal or network that sends `ip` over the additional link,
     /// or `None` when policy keeps it elsewhere.
     #[must_use]
     pub fn owner_of(&self, ip: IpAddr) -> Option<Cow<'_, str>> {
+        self.parts().find_map(|p| p.own_owner_of(ip))
+    }
+
+    fn own_owner_of(&self, ip: IpAddr) -> Option<Cow<'_, str>> {
         if let IpAddr::V4(v4) = ip {
             if let Some(holder) = self.named.get(&v4) {
                 // A network outranks a zone: a main one takes a zone-only claim.
@@ -123,7 +148,10 @@ impl SecondaryAddressOwners {
     /// literal of the additional link names it.
     #[must_use]
     pub fn owned_by_network_only(&self, ip: &Ipv4Addr) -> bool {
-        !self.named.contains_key(ip) && self.network_owner(IpAddr::V4(*ip)).is_some()
+        self.parts().all(|p| !p.named.contains_key(ip))
+            && self
+                .parts()
+                .any(|p| p.network_owner(IpAddr::V4(*ip)).is_some())
     }
 
     /// The additional network holding `ip` most narrowly, unless a narrower

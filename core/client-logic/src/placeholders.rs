@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use nrr_shared::display_text::display_text;
+
 /// `text` with each `{name}` replaced by its value, pair by pair in the order
 /// given (`fillPlaceholders`).
 ///
@@ -43,6 +45,7 @@ pub fn list_summary(items: &[String], more: &str) -> String {
 ///
 /// A translation left with a hole reads worse than the English line, which
 /// still names the cause, so any unfilled placeholder returns `source`.
+/// Values are names the service saw, so they go in through [`display_text`].
 pub fn format_log_line(
     translated: &str,
     source: &str,
@@ -75,7 +78,7 @@ pub fn format_log_line(
             .count();
         if name_len > 0 && after.as_bytes().get(name_len) == Some(&b'}') {
             match lookup(&after[..name_len], args, positional) {
-                Some(value) => out.push_str(value),
+                Some(value) => out.push_str(&display_text(value)),
                 None => return source.to_owned(),
             }
             rest = &after[name_len + 1..];

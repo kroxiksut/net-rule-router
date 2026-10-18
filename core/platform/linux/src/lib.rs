@@ -332,6 +332,15 @@ mod adapter_kind;
 /// `nrr_platform_api::single_instance::SingleInstancePort`.
 pub mod single_instance;
 
+/// The search paths and install folder a rule may not deny or route over the
+/// tunnel, behind `nrr_platform_api::protected_places::ProtectedPlacesSource`.
+pub mod protected_places;
+
+/// Whether a file root relies on is out of reach of ordinary accounts, behind
+/// `nrr_platform_api::admin_authored::AdminAuthoredFiles`.
+#[cfg(target_os = "linux")]
+pub mod trusted_location;
+
 /// The address half of adapter enumeration, kept apart because it is the one
 /// part that needs a syscall rather than a file.
 #[cfg(target_os = "linux")]

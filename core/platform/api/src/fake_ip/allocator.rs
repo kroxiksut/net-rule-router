@@ -1,7 +1,9 @@
 //! Fake-IP address pool and the hostname <-> fake-address map.
 //!
 //! Pure, OS-neutral, deterministic: given the same sequence of calls the same
-//! hostname always lands on the same address, on every platform. The resolver
+//! hostname always lands on the same address, on every platform. The one
+//! clock read is recycling's: a binding touched recently is never handed to
+//! another hostname, whatever the call sequence. The resolver
 //! (Mode B) calls [`FakeIpAllocator::allocate`] when answering a query for a
 //! hostname in scope; the userspace stack calls
 //! [`FakeIpAllocator::domain_for_ip`] when a packet arrives for a fake address,
@@ -21,10 +23,11 @@
 //! TUN adapter itself carries (the peer/gateway the OS routes towards). The last
 //! index of the v4 range is reserved as its broadcast address.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use nrr_shared::ip_block::IpBlock;
 
@@ -375,7 +378,16 @@ struct Slot {
     domain: String,
     /// Monotonic use counter — the recycling order when the pool fills up.
     last_used: u64,
+    /// When it was last used, which decides whether it may be recycled.
+    touched: Instant,
 }
+
+/// How long a binding stays its hostname's after its last use, whatever fills
+/// the pool. An application holds the address in its own DNS cache and opens
+/// new connections to it well past the answer; recycling it sooner sends those
+/// to a hostname somebody else asked for, and a flood of names from any local
+/// program is enough to force it.
+pub const RECYCLE_MIN_IDLE: Duration = Duration::from_secs(10 * 60);
 
 /// A change to the hostname <-> index map, reported to the registered
 /// [`BindingChangeSink`] so a persistence layer can mirror the map without the
@@ -411,6 +423,10 @@ pub struct FakeIpAllocator {
     cursor: u32,
     /// Indices freed by [`FakeIpAllocator::release`], reused before the cursor.
     freed: Vec<u32>,
+    /// `(last_used, index)` of every binding, oldest first: the recycling
+    /// victim without a walk over the pool under its lock.
+    by_age: BTreeSet<(u64, u32)>,
+    min_recycle_idle: Duration,
     tick: u64,
     sink: Option<BindingChangeSink>,
 }
@@ -442,9 +458,44 @@ impl FakeIpAllocator {
             by_index: HashMap::new(),
             cursor: FAKE_IP_FIRST_HOST_INDEX,
             freed: Vec::new(),
+            by_age: BTreeSet::new(),
+            min_recycle_idle: RECYCLE_MIN_IDLE,
             tick: 0,
             sink: None,
         }
+    }
+
+    /// Recycle bindings idle for at least `idle` instead of
+    /// [`RECYCLE_MIN_IDLE`].
+    #[must_use]
+    pub fn with_min_recycle_idle(mut self, idle: Duration) -> Self {
+        self.min_recycle_idle = idle;
+        self
+    }
+
+    /// Mark `index` as used now.
+    fn touch(&mut self, index: u32) {
+        self.tick = self.tick.saturating_add(1);
+        let tick = self.tick;
+        if let Some(slot) = self.by_index.get_mut(&index) {
+            self.by_age.remove(&(slot.last_used, index));
+            slot.last_used = tick;
+            slot.touched = Instant::now();
+            self.by_age.insert((tick, index));
+        }
+    }
+
+    fn insert_slot(&mut self, index: u32, domain: String) {
+        self.tick = self.tick.saturating_add(1);
+        self.by_index.insert(
+            index,
+            Slot {
+                domain,
+                last_used: self.tick,
+                touched: Instant::now(),
+            },
+        );
+        self.by_age.insert((self.tick, index));
     }
 
     /// Register the observer that mirrors binding changes (persistence).
@@ -470,14 +521,7 @@ impl FakeIpAllocator {
             {
                 continue;
             }
-            self.tick = self.tick.saturating_add(1);
-            self.by_index.insert(
-                index,
-                Slot {
-                    domain: key.clone(),
-                    last_used: self.tick,
-                },
-            );
+            self.insert_slot(index, key.clone());
             self.by_domain.insert(key, index);
         }
         // Never-used allocation resumes past the highest restored index; the
@@ -519,22 +563,12 @@ impl FakeIpAllocator {
         if key.is_empty() {
             return Err(FakeIpError::EmptyDomain);
         }
-        self.tick = self.tick.saturating_add(1);
         if let Some(&index) = self.by_domain.get(&key) {
-            if let Some(slot) = self.by_index.get_mut(&index) {
-                slot.last_used = self.tick;
-            }
+            self.touch(index);
             return Ok(self.binding_at(index));
         }
         let index = self.take_index()?;
-        let tick = self.tick;
-        self.by_index.insert(
-            index,
-            Slot {
-                domain: key.clone(),
-                last_used: tick,
-            },
-        );
+        self.insert_slot(index, key.clone());
         self.by_domain.insert(key.clone(), index);
         if let Some(sink) = &self.sink {
             sink(&BindingChange::Bound { domain: key, index });
@@ -554,11 +588,8 @@ impl FakeIpAllocator {
     /// outside the pool or its binding was already recycled.
     pub fn domain_for_ip(&mut self, addr: IpAddr) -> Option<String> {
         let index = self.config.index_of(addr)?;
-        self.tick = self.tick.saturating_add(1);
-        let tick = self.tick;
-        let slot = self.by_index.get_mut(&index)?;
-        slot.last_used = tick;
-        Some(slot.domain.clone())
+        self.touch(index);
+        self.by_index.get(&index).map(|slot| slot.domain.clone())
     }
 
     /// Read-only variant of [`Self::domain_for_ip`] for diagnostics/explain.
@@ -588,7 +619,9 @@ impl FakeIpAllocator {
         let key = normalize_hostname(domain);
         match self.by_domain.remove(&key) {
             Some(index) => {
-                self.by_index.remove(&index);
+                if let Some(slot) = self.by_index.remove(&index) {
+                    self.by_age.remove(&(slot.last_used, index));
+                }
                 self.freed.push(index);
                 if let Some(sink) = &self.sink {
                     sink(&BindingChange::Released { index });
@@ -603,6 +636,7 @@ impl FakeIpAllocator {
     pub fn clear(&mut self) {
         self.by_domain.clear();
         self.by_index.clear();
+        self.by_age.clear();
         self.freed.clear();
         self.cursor = FAKE_IP_FIRST_HOST_INDEX;
     }
@@ -624,7 +658,8 @@ impl FakeIpAllocator {
     }
 
     /// A free index: a released one, then a never-used one, then the
-    /// least-recently-used binding recycled.
+    /// least-recently-used binding recycled — unless even that one was used
+    /// within [`Self::with_min_recycle_idle`], when the pool is exhausted.
     fn take_index(&mut self) -> Result<u32, FakeIpError> {
         if let Some(index) = self.freed.pop() {
             return Ok(index);
@@ -635,19 +670,21 @@ impl FakeIpAllocator {
             self.cursor = self.cursor.saturating_add(1);
             return Ok(index);
         }
-        let victim = self
-            .by_index
-            .iter()
-            .min_by_key(|(index, slot)| (slot.last_used, **index))
-            .map(|(index, slot)| (*index, slot.domain.clone()));
-        match victim {
-            Some((index, domain)) => {
-                self.by_domain.remove(&domain);
-                self.by_index.remove(&index);
-                Ok(index)
-            }
-            None => Err(FakeIpError::PoolExhausted),
+        let Some(&(last_used, index)) = self.by_age.first() else {
+            return Err(FakeIpError::PoolExhausted);
+        };
+        let Some(slot) = self.by_index.get(&index) else {
+            self.by_age.remove(&(last_used, index));
+            return Err(FakeIpError::PoolExhausted);
+        };
+        if slot.touched.elapsed() < self.min_recycle_idle {
+            return Err(FakeIpError::PoolExhausted);
         }
+        let domain = slot.domain.clone();
+        self.by_age.remove(&(last_used, index));
+        self.by_domain.remove(&domain);
+        self.by_index.remove(&index);
+        Ok(index)
     }
 }
 
@@ -682,6 +719,28 @@ mod tests {
             v6_base: None,
             v6_prefix_len: 0,
         })
+        .with_min_recycle_idle(Duration::ZERO)
+    }
+
+    /// A flood of new names cannot take an address an application may still
+    /// connect to: past the pool, the newcomer is refused instead.
+    #[test]
+    fn a_recently_used_binding_is_not_recycled_for_another_hostname() {
+        let mut alloc = tiny_pool(29).with_min_recycle_idle(RECYCLE_MIN_IDLE);
+        let mut live = Vec::new();
+        for i in 0..5 {
+            live.push(alloc.allocate(&format!("h{i}.example")).expect("allocate"));
+        }
+        assert_eq!(
+            alloc.allocate("flood.example"),
+            Err(FakeIpError::PoolExhausted)
+        );
+        for (i, binding) in live.iter().enumerate() {
+            assert_eq!(
+                alloc.domain_for_ip(IpAddr::V4(binding.v4)).as_deref(),
+                Some(format!("h{i}.example").as_str())
+            );
+        }
     }
 
     #[test]

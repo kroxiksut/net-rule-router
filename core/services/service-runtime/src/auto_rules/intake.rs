@@ -205,7 +205,9 @@ impl AutoRulesEngine {
         }
         // A tunnel client dialling its own servers fails on the main link by
         // design; routing it through the tunnel it is building is a loop.
-        if crate::vpn_client_registry::global_confirmed_vpn_clients().matches_image(&program) {
+        if crate::vpn_client_registry::global_confirmed_vpn_clients()
+            .matches_image_for(Some(sid), &program)
+        {
             return false;
         }
         let now_ms = unix_ms(now);
@@ -246,6 +248,8 @@ impl AutoRulesEngine {
                 served_by_main_link: false,
                 third_party: None,
                 secondary_reach: None,
+                any_zone_site: String::new(),
+                less_certain: String::new(),
             },
             route: RouteRole::Secondary,
             match_kind: AuthoredMatchKind::Application,
@@ -547,6 +551,8 @@ impl AutoRulesEngine {
                 third_party: None,
                 // Nobody has asked the additional route about this host yet.
                 secondary_reach: None,
+                any_zone_site: String::new(),
+                less_certain: String::new(),
             },
             route: RouteRole::Secondary,
             match_kind: AuthoredMatchKind::SuffixDomain,

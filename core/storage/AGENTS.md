@@ -1,12 +1,13 @@
 # nrr-storage
 
-Synchronous SQLite persistence for three databases:
+Synchronous SQLite persistence for four databases:
 
 | File | Kind | On corruption |
 |------|------|---------------|
 | `nrr_fqdn_ip_cache.db` | Rebuildable | Delete + rebuild |
 | `nrr_service_state.db` | Service-critical | Reported at boot, then rolled back to a trusted earlier revision |
 | `nrr_traffic_stats.db` | Rebuildable (traffic ledger; its settings live in the state DB so a rebuild keeps them) | Delete + rebuild |
+| `nrr_conn_history.db` | Rebuildable (per-user connection history, own migration catalogue; each user's on/off and period live in the state DB so a rebuild never re-enables a history the user switched off) | Delete + rebuild |
 
 A schema NEWER than this build supports (`SchemaTooNew`, a downgrade) is not corruption: the data is whole, only we do not understand it. Never delete, rebuild or overwrite it; report and stay off that store.
 

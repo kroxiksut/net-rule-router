@@ -776,6 +776,137 @@ fn oracle_fails_open_when_no_active_user() {
     assert!(!oracle.is_rule_host("assistant.example"));
 }
 
+// ── Several users served at once ─────────────────────────────────────────
+
+const ALICE: &str = "S-1-5-21-100-1001";
+const BOB: &str = "S-1-5-21-100-1002";
+
+/// Each user's own book, by SID.
+struct PerUserRules(Vec<(&'static str, CanonicalRuleBook)>);
+
+impl RulesProvider for PerUserRules {
+    fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+        None
+    }
+    fn active_rules_for(&self, principal: &str) -> Option<ActiveRulesSnapshot> {
+        self.0
+            .iter()
+            .find(|(sid, _)| *sid == principal)
+            .map(|(_, book)| ActiveRulesSnapshot {
+                rule_book: book.clone(),
+            })
+    }
+}
+
+fn secondary_book(rules: Vec<CanonicalRule>) -> CanonicalRuleBook {
+    CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![]),
+        secondary: CanonicalRuleSet::from_rules(rules),
+    }
+}
+
+/// Alice routes the resolver; Bob's rule host is still a rule host, owned by
+/// Bob alone.
+fn two_users() -> (Arc<PerUserRules>, ResolverPrincipalsFn) {
+    let rules = Arc::new(PerUserRules(vec![
+        (
+            ALICE,
+            secondary_book(vec![exact_rule("a", "alice-site.example")]),
+        ),
+        (
+            BOB,
+            secondary_book(vec![exact_rule("b", "bob-site.example")]),
+        ),
+    ]));
+    let served: ResolverPrincipalsFn = Arc::new(|| vec![ALICE.to_owned(), BOB.to_owned()]);
+    (rules, served)
+}
+
+#[test]
+fn a_host_is_a_rule_host_for_whichever_served_user_names_it() {
+    let (rules, served) = two_users();
+    let routing_only = ActiveRuleHostOracle::new(
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(|| Some(ALICE.to_owned())),
+    );
+    // The failure this fixes: the routing user's book alone missed Bob's host.
+    assert!(!routing_only.is_rule_host("bob-site.example"));
+
+    let oracle = routing_only.with_served(served);
+    assert!(oracle.is_rule_host("alice-site.example"));
+    assert!(oracle.is_rule_host("bob-site.example"));
+    assert!(!oracle.is_rule_host("nobody.example"));
+    assert_eq!(oracle.owners_of("bob-site.example"), vec![BOB.to_owned()]);
+    assert_eq!(
+        oracle.owners_of("alice-site.example"),
+        vec![ALICE.to_owned()]
+    );
+    assert!(oracle.owners_of("nobody.example").is_empty());
+}
+
+#[test]
+fn one_users_guard_withholds_only_the_hosts_that_users_rules_name() {
+    use crate::dns_resolver::LeakGuardPosture;
+    let (rules, served) = two_users();
+    let oracle = Arc::new(
+        ActiveRuleHostOracle::new(rules, Arc::new(|| Some(ALICE.to_owned())))
+            .with_served(Arc::clone(&served)),
+    );
+    // Bob's tunnel is down; Alice's is up.
+    let guard = HostOwnersLeakGuard::new(oracle, served, Arc::new(|sid: &str| sid == BOB));
+    assert!(guard.blocking(), "someone's guard holds");
+    assert!(guard.blocking_for_host("bob-site.example"));
+    assert!(
+        !guard.blocking_for_host("alice-site.example"),
+        "Bob's guard must not fail Alice's names"
+    );
+}
+
+#[test]
+fn an_answer_is_held_until_carried_for_each_owner_of_its_host() {
+    use crate::dns_resolver::EnforcedAddressView;
+    let (rules, served) = two_users();
+    let oracle = Arc::new(
+        ActiveRuleHostOracle::new(rules, Arc::new(|| Some(ALICE.to_owned()))).with_served(served),
+    );
+    let view = ActiveSidEnforcedAddresses {
+        active_sid: Arc::new(|| Some(ALICE.to_owned())),
+        register: Arc::new(crate::enforced_addresses::EnforcedAddressRegister::default()),
+        owners: None,
+    }
+    .with_host_owners(oracle);
+    let bob_ip = ip(203, 0, 113, 20);
+    view.register.publish(ALICE, [bob_ip]);
+    // Carried for Alice is not carried for Bob, whose rule names the host.
+    assert_eq!(
+        view.unenforced_for_host("bob-site.example", &[bob_ip]),
+        vec![bob_ip]
+    );
+    view.register.publish(BOB, [bob_ip]);
+    assert!(view
+        .unenforced_for_host("bob-site.example", &[bob_ip])
+        .is_empty());
+}
+
+#[test]
+fn direct_answers_are_steered_off_every_served_users_additional_link() {
+    use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
+    use std::time::Instant;
+    let (rules, served) = two_users();
+    let fqdn = Arc::new(MockFqdnCacheLookup::new());
+    let bob_ip = ip(203, 0, 113, 21);
+    fqdn.set_ips("bob-site.example", vec![bob_ip]);
+    let owned = ActiveSecondaryOwnedIps::new(
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(|| Some(ALICE.to_owned())),
+        Arc::clone(&fqdn) as Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
+    );
+    assert!(!owned.owned_ips_at(Instant::now()).contains(&bob_ip));
+    let owned = ActiveSecondaryOwnedIps::new(rules, Arc::new(|| Some(ALICE.to_owned())), fqdn)
+        .with_served(served);
+    assert!(owned.owned_ips_at(Instant::now()).contains(&bob_ip));
+}
+
 // ── ActiveSecondaryOwnedIps — direct-answer steering set ─────────────────
 
 /// The  case: `workspace.search.example` (direct) shares every

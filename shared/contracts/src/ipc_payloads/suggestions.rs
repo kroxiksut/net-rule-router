@@ -217,6 +217,15 @@ pub fn is_self_signed_signal(signal: &str) -> bool {
     AUTO_RULE_SELF_SIGNED_SIGNALS.contains(&signal)
 }
 
+/// [`AutoRuleCandidateDto::less_certain`]: the host is named like the site and
+/// was seen beside it in one visit only. Offered for a person to decide, never
+/// added without asking.
+pub const AUTO_RULE_LESS_CERTAIN_BRAND_SEEN_ONCE: &str = "brand-seen-once";
+
+/// Every [`AutoRuleCandidateDto::less_certain`] slug. The empty value — an
+/// offer on full evidence — is deliberately not one.
+pub const AUTO_RULE_LESS_CERTAIN_SLUGS: &[&str] = &[AUTO_RULE_LESS_CERTAIN_BRAND_SEEN_ONCE];
+
 /// [`AutoRuleCandidateDto::primary_behavior`]: connections to the host went
 /// through on the main route — it already works without the tunnel.
 pub const AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS: &str = "responds";
@@ -363,6 +372,21 @@ pub struct AutoRuleCandidateDto {
     /// Additive on the wire: absent for peers that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_reach: Option<bool>,
+    /// The site the anchor and this host both are, in different zones
+    /// (`example` for `www.example.com` and `example.net`): the offer can be
+    /// taken as one `example.*` rule instead. Empty when they are not one site.
+    ///
+    /// Additive on the wire: absent for peers that predate it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub any_zone_site: String,
+    /// Why the offer is less certain than one the service would add on its own
+    /// — one of [`AUTO_RULE_LESS_CERTAIN_SLUGS`] — or empty when it rests on
+    /// full evidence. Such an offer is only ever asked, never authored without
+    /// a person's answer, whatever the mode is later switched to.
+    ///
+    /// Additive on the wire: absent for peers that predate it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub less_certain: String,
 }
 
 /// `autorules.candidates.list` request — no parameters; the caller's own SID
@@ -400,6 +424,10 @@ pub struct AutoRuleCandidatesListResponse {
 pub struct AutoRuleCandidatesActionRequest {
     #[serde(default)]
     pub ids: Vec<String>,
+    /// Accept only: write each offer that names one (`any-zone-site`) as the
+    /// site in every zone rather than the one name offered.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub as_any_zone: bool,
 }
 
 /// Response shared by `autorules.candidates.accept` and

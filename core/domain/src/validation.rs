@@ -36,12 +36,13 @@ use crate::{
         CanonicalAddressMatch, CanonicalAppMatch, CanonicalAppPattern, CanonicalProfile,
         CanonicalRule, CanonicalRuleBook, CanonicalRuleSet, RuleAction,
     },
-    ip_network_policy::{self, IpValueKind},
-    rules_file::HostPlatform,
+    ip_network_policy,
+    rules_file::{HostPlatform, RulesFileSection},
     ActiveConfiguration, AddressMatch, AppMatch, AppMatchPattern, Rule, RuleId,
 };
 use nrr_shared::app_identity::ExecutableNaming;
 use nrr_shared::ip_block::{IpBlock, IpRange};
+use nrr_shared::preset_parser::ParsedRuleType;
 
 use crate::address_class::canonical_ip;
 
@@ -72,13 +73,14 @@ pub enum ValidationError {
     /// internationalized domain name per UTS#46/IDNA2008.
     DomainInvalidIdn { rule_id: RuleId, value: String },
 
-    /// An address value written under the heading of another kind: a subnet
-    /// in `--- IP`, an address in `--- CIDR`. Section is type, so the value is
-    /// never re-filed; `belongs_in` names the right one.
-    WrongAddressSection {
+    /// A value whose spelling is another rule type's, written under this
+    /// one's heading: a subnet in `--- IP`, `chrome.exe` in `--- Domains`, an
+    /// address in `--- Windows`. Section is type, so the value is never
+    /// re-filed; `belongs_in` names the right one.
+    WrongSection {
         rule_id: RuleId,
         value: String,
-        belongs_in: IpValueKind,
+        belongs_in: RulesFileSection,
     },
 
     /// A `Subnet` rule value that is not a network (`a.b.c.d/len`).
@@ -132,6 +134,14 @@ pub enum ValidationError {
     /// An application value the rules file cannot hold: longer than a match
     /// value may be, or carrying a line break or other control character.
     AppNameInvalid { rule_id: RuleId, value: String },
+
+    /// An application value written as a path that names no program: a `*`
+    /// not standing last, a relative path, or a broken one.
+    AppPathInvalid {
+        rule_id: RuleId,
+        value: String,
+        problem: nrr_shared::app_path::AppPathError,
+    },
 
     /// More rules than a book may hold — see [`rule_cap_excess`].
     TooManyRules { count: usize, limit: usize },
@@ -200,7 +210,7 @@ impl ValidationError {
             Self::RuleEmptyMatch { rule_id }
             | Self::DomainEmptyValue { rule_id }
             | Self::DomainInvalidIdn { rule_id, .. }
-            | Self::WrongAddressSection { rule_id, .. }
+            | Self::WrongSection { rule_id, .. }
             | Self::InvalidSubnet { rule_id, .. }
             | Self::InvalidIpRange { rule_id, .. }
             | Self::NetworkTooWide { rule_id, .. }
@@ -210,7 +220,8 @@ impl ValidationError {
             | Self::DomainInvalidValue { rule_id, .. }
             | Self::ZoneEmptyName { rule_id }
             | Self::AppGlobTooWide { rule_id }
-            | Self::AppNameInvalid { rule_id, .. } => Some(rule_id),
+            | Self::AppNameInvalid { rule_id, .. }
+            | Self::AppPathInvalid { rule_id, .. } => Some(rule_id),
         }
     }
 }
@@ -245,19 +256,14 @@ impl fmt::Display for ValidationError {
             Self::DomainInvalidValue { rule_id, value } => {
                 write!(f, "rule {rule_id}: '{value}' is not a host name")
             }
-            Self::WrongAddressSection {
+            Self::WrongSection {
                 rule_id,
                 value,
                 belongs_in,
             } => {
-                let section = match belongs_in {
-                    IpValueKind::Address => "IP",
-                    IpValueKind::Subnet => "CIDR",
-                    IpValueKind::Range => "Ranges",
-                };
                 write!(
                     f,
-                    "rule {rule_id}: '{value}' belongs in the --- {section} section"
+                    "rule {rule_id}: '{value}' belongs in the --- {belongs_in} section"
                 )
             }
             Self::InvalidSubnet { rule_id, value } => {
@@ -311,6 +317,13 @@ impl fmt::Display for ValidationError {
             }
             Self::AppNameInvalid { rule_id, value } => {
                 write!(f, "rule {rule_id}: {value:?} is not an application name")
+            }
+            Self::AppPathInvalid {
+                rule_id,
+                value,
+                problem,
+            } => {
+                write!(f, "rule {rule_id}: {value:?} names no program ({problem})")
             }
         }
     }
@@ -663,7 +676,7 @@ impl ValidationOutcome {
 /// 2. For each rule in primary and secondary rule sets:
 ///    a. Validate that the rule has at least one match condition.
 ///    b. Normalize `address_match` (domain case/dot/IDN; IP version check).
-///    c. Normalize `app_match` (path strip, lowercase, `.exe` on Windows).
+///    c. Normalize `app_match` (a path, or a name: lowercase, `.exe` on Windows).
 /// 3. Deduplicate within each rule set; detect cross-set duplicates.
 /// 4. Build [`CanonicalProfile`] with [`CanonicalRuleSet`]s in canonical order.
 /// 5. Check for behavior-mode / binding incompatibilities (warnings only).
@@ -680,7 +693,6 @@ pub fn validate_and_canonicalize(
     config: &ActiveConfiguration,
     platform: HostPlatform,
 ) -> ValidationOutcome {
-    let naming = platform.executable_naming();
     let mut errors: Vec<ValidationError> = Vec::new();
     let mut warnings: Vec<ValidationWarning> = Vec::new();
 
@@ -724,14 +736,14 @@ pub fn validate_and_canonicalize(
     let primary_rules = normalize_rule_set(
         &config.rule_book.primary.rules,
         RouteRole::Primary,
-        naming,
+        platform,
         &mut errors,
         &mut warnings,
     );
     let secondary_rules = normalize_rule_set(
         &config.rule_book.secondary.rules,
         RouteRole::Secondary,
-        naming,
+        platform,
         &mut errors,
         &mut warnings,
     );
@@ -794,7 +806,9 @@ fn collect_rule_errors_only(config: &ActiveConfiguration, errors: &mut Vec<Valid
             });
         }
         match &rule.address_match {
-            Some(AddressMatch::ExactFqdn(v)) | Some(AddressMatch::SuffixDomain(v)) => {
+            Some(AddressMatch::ExactFqdn(v))
+            | Some(AddressMatch::SuffixDomain(v))
+            | Some(AddressMatch::AnyZoneDomain(v)) => {
                 if let Err(e) = normalize_domain_label(v, &rule.id, &mut discard) {
                     errors.push(e);
                 }
@@ -810,13 +824,13 @@ fn collect_rule_errors_only(config: &ActiveConfiguration, errors: &mut Vec<Valid
 fn normalize_rule_set(
     rules: &[Rule],
     role: RouteRole,
-    naming: ExecutableNaming,
+    platform: HostPlatform,
     errors: &mut Vec<ValidationError>,
     warnings: &mut Vec<ValidationWarning>,
 ) -> Vec<CanonicalRule> {
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
-        if let Some(mut canonical) = normalize_rule(rule, naming, errors, warnings) {
+        if let Some(mut canonical) = normalize_rule(rule, platform, errors, warnings) {
             if settle_verify(&mut canonical) {
                 warnings.push(ValidationWarning::VerifyIgnored {
                     rule_id: canonical.id.clone(),
@@ -857,7 +871,7 @@ fn verify_applies(rule: &CanonicalRule) -> bool {
 /// the rule should be excluded from the canonical output.
 fn normalize_rule(
     rule: &Rule,
-    naming: ExecutableNaming,
+    platform: HostPlatform,
     errors: &mut Vec<ValidationError>,
     warnings: &mut Vec<ValidationWarning>,
 ) -> Option<CanonicalRule> {
@@ -866,6 +880,10 @@ fn normalize_rule(
         errors.push(ValidationError::RuleEmptyMatch {
             rule_id: rule.id.clone(),
         });
+        return None;
+    }
+    if let Some(misplaced) = misplaced_in_rule(rule, platform) {
+        errors.push(misplaced);
         return None;
     }
 
@@ -893,6 +911,15 @@ fn normalize_rule(
         Some(AddressMatch::SuffixDomain(value)) => {
             match canonical_host_name(HostNameKind::Domain, value, &rule.id, warnings) {
                 Ok(normalized) => Some(CanonicalAddressMatch::SuffixDomain(normalized)),
+                Err(e) => {
+                    errors.push(e);
+                    return None;
+                }
+            }
+        }
+        Some(AddressMatch::AnyZoneDomain(base)) => {
+            match canonical_host_name(HostNameKind::Domain, base, &rule.id, warnings) {
+                Ok(normalized) => Some(CanonicalAddressMatch::AnyZoneDomain(normalized)),
                 Err(e) => {
                     errors.push(e);
                     return None;
@@ -939,12 +966,13 @@ fn normalize_rule(
     // Normalize app_match.
     let app_match = match rule.app_match.as_ref() {
         None => None,
-        Some(a) => match normalize_app_match(a, naming, &rule.id, warnings) {
+        Some(a) => match normalize_app_match(a, platform, &rule.id, warnings) {
             Ok(canonical) => Some(canonical),
             // A rules file is stored data: a value the pipeline refuses
             // outright is dropped, the rest of the file still imports — same
             // policy as an address that is never a destination.
             Err(ValidationError::AppNameInvalid { rule_id, .. })
+            | Err(ValidationError::AppPathInvalid { rule_id, .. })
             | Err(ValidationError::AppGlobTooWide { rule_id }) => {
                 warnings.push(ValidationWarning::AppPatternRefusedDropped {
                     rule_id,
@@ -970,6 +998,33 @@ fn normalize_rule(
         // authorship, not a match value, so there is nothing to normalise.
         origin: rule.origin.clone(),
     })
+}
+
+/// A value of `rule` its spelling places in another section than the one it
+/// was read from, each value as the file spells it.
+fn misplaced_in_rule(rule: &Rule, platform: HostPlatform) -> Option<ValidationError> {
+    let address = rule.address_match.as_ref().map(|m| {
+        let section = match m {
+            AddressMatch::Zone(_) => ParsedRuleType::Zone,
+            AddressMatch::ExactFqdn(_)
+            | AddressMatch::SuffixDomain(_)
+            | AddressMatch::AnyZoneDomain(_) => ParsedRuleType::Domain,
+            AddressMatch::ExactIp(_) => ParsedRuleType::ExactIp,
+            AddressMatch::Subnet(_) => ParsedRuleType::Subnet,
+            AddressMatch::IpRange(_) => ParsedRuleType::IpRange,
+        };
+        (section, m.to_display_string())
+    });
+    let app = rule.app_match.as_ref().map(|a| {
+        let raw = match &a.pattern {
+            AppMatchPattern::Exact(raw) | AppMatchPattern::Glob(raw) => raw.clone(),
+        };
+        (ParsedRuleType::Application, raw)
+    });
+    address
+        .into_iter()
+        .chain(app)
+        .find_map(|(section, value)| misplaced_value(section, &value, &rule.id, platform))
 }
 
 /// Which host-name rule a value is written for.
@@ -1091,12 +1146,12 @@ fn reject_if_not_a_hostname(value: &str, rule_id: &RuleId) -> Result<(), Validat
     {
         return Err(
             match canonical_ip_address(value, rule_id, &mut Vec::new()) {
-                // A well-formed address is a value in the wrong section: it
-                // would never match a host name.
+                // A well-formed address would never match a host name.
                 Ok(_) | Err(ValidationError::IpAddressNotADestination { .. }) => {
-                    ValidationError::DomainInvalidValue {
+                    ValidationError::WrongSection {
                         rule_id: rule_id.clone(),
                         value: value.to_string(),
+                        belongs_in: RulesFileSection::Ip,
                     }
                 }
                 Err(refusal) => refusal,
@@ -1162,7 +1217,7 @@ pub(crate) fn canonical_ip_address(
 
 /// Names what an unparseable address value is, when its shape says so.
 fn address_refusal(value: &str, rule_id: &RuleId) -> ValidationError {
-    wrong_section(value, rule_id, IpValueKind::Address).unwrap_or_else(|| {
+    wrong_section(value, rule_id, ParsedRuleType::ExactIp).unwrap_or_else(|| {
         ValidationError::InvalidIpAddress {
             rule_id: rule_id.clone(),
             value: value.to_string(),
@@ -1170,16 +1225,45 @@ fn address_refusal(value: &str, rule_id: &RuleId) -> ValidationError {
     })
 }
 
-/// The section a value of another kind belongs in, when it is written under
-/// `section`'s heading.
-fn wrong_section(value: &str, rule_id: &RuleId, section: IpValueKind) -> Option<ValidationError> {
-    IpValueKind::of(value)
-        .filter(|kind| *kind != section)
-        .map(|belongs_in| ValidationError::WrongAddressSection {
+/// The section a value of another type belongs in, when it is written under
+/// `section`'s heading. An application named here is this build's platform's:
+/// a caller that knows the file's platform asks [`misplaced_value`] first.
+fn wrong_section(
+    value: &str,
+    rule_id: &RuleId,
+    section: ParsedRuleType,
+) -> Option<ValidationError> {
+    misplaced_value(section, value, rule_id, HostPlatform::compiled())
+}
+
+/// The refusal of a value whose spelling is another rule type's than
+/// `section`, written in `platform`'s file; `None` when `section` holds it.
+/// The one place a section's type is held to the value: the rules file, the
+/// Add dialog's verdict and the service's acceptance of a revision come here.
+pub(crate) fn misplaced_value(
+    section: ParsedRuleType,
+    value: &str,
+    rule_id: &RuleId,
+    platform: HostPlatform,
+) -> Option<ValidationError> {
+    nrr_shared::rule_value_class::misplaced_rule_value(section, value, platform.executable_naming())
+        .map(|kind| ValidationError::WrongSection {
             rule_id: rule_id.clone(),
-            value: value.to_string(),
-            belongs_in,
+            value: value.trim().to_string(),
+            belongs_in: section_of(kind, platform),
         })
+}
+
+/// The section of `platform`'s file a `kind` rule is written in.
+pub(crate) const fn section_of(kind: ParsedRuleType, platform: HostPlatform) -> RulesFileSection {
+    match kind {
+        ParsedRuleType::Zone => RulesFileSection::Zones,
+        ParsedRuleType::Domain => RulesFileSection::Domains,
+        ParsedRuleType::ExactIp => RulesFileSection::Ip,
+        ParsedRuleType::Subnet => RulesFileSection::Cidr,
+        ParsedRuleType::IpRange => RulesFileSection::Ranges,
+        ParsedRuleType::Application => platform.app_section(),
+    }
 }
 
 /// The canonical network of a `--- CIDR` value, or the error the rule
@@ -1192,7 +1276,7 @@ pub(crate) fn canonical_subnet(
     let value = value.trim();
     let Some(written) = IpBlock::parse(value) else {
         return Err(
-            wrong_section(value, rule_id, IpValueKind::Subnet).unwrap_or_else(|| {
+            wrong_section(value, rule_id, ParsedRuleType::Subnet).unwrap_or_else(|| {
                 ValidationError::InvalidSubnet {
                     rule_id: rule_id.clone(),
                     value: value.to_string(),
@@ -1237,7 +1321,7 @@ pub(crate) fn canonical_ip_range(
     });
     let Some(range) = parsed else {
         return Err(
-            wrong_section(value, rule_id, IpValueKind::Range).unwrap_or_else(|| {
+            wrong_section(value, rule_id, ParsedRuleType::IpRange).unwrap_or_else(|| {
                 ValidationError::InvalidIpRange {
                     rule_id: rule_id.clone(),
                     value: value.to_string(),
@@ -1309,15 +1393,11 @@ fn check_networks(
     Ok(())
 }
 
-/// Normalizes an [`AppMatch`]:
-///
-/// - `Exact`: strips any directory path separator, lowercases, and appends
-///   `.exe` if absent — on Windows only; Linux and macOS names carry no suffix.
-/// - `Glob`: lowercases only; path-stripping and `.exe` appending are not applied
-///   because the user controls the full pattern. Bare `*` is rejected as too broad.
+/// Normalizes an [`AppMatch`] as `platform` spells it: see
+/// [`canonical_app_pattern`].
 fn normalize_app_match(
     app: &AppMatch,
-    naming: ExecutableNaming,
+    platform: HostPlatform,
     rule_id: &RuleId,
     warnings: &mut Vec<ValidationWarning>,
 ) -> Result<CanonicalAppMatch, ValidationError> {
@@ -1326,30 +1406,81 @@ fn normalize_app_match(
         AppMatchPattern::Glob(raw) => (raw.as_str(), true),
     };
     Ok(CanonicalAppMatch {
-        pattern: canonical_app_pattern(raw, glob, naming, rule_id, warnings)?,
+        pattern: canonical_app_pattern(raw, glob, platform, rule_id, warnings)?,
         include_child_processes: app.include_child_processes,
     })
 }
 
-/// The canonical pattern of an application rule value (`glob`: written as a
-/// pattern), or the error the rule pipeline refuses it with. The one answer to
-/// "is this an application rule": the import pipeline, the per-row verdict and
+/// The canonical pattern of an application rule value as `platform` spells
+/// it, or the error the rule pipeline refuses it with. The one answer to "is
+/// this an application rule": the import pipeline, the per-row verdict and
 /// the service's acceptance of a revision all read it.
+///
+/// A value with a path separator is a path ([`nrr_shared::app_path::AppPath`]);
+/// any other is a name, or a mask over names when `glob` (it holds a `*`).
 pub(crate) fn canonical_app_pattern(
     raw: &str,
     glob: bool,
-    naming: ExecutableNaming,
+    platform: HostPlatform,
     rule_id: &RuleId,
     warnings: &mut Vec<ValidationWarning>,
 ) -> Result<CanonicalAppPattern, ValidationError> {
-    if raw.len() > crate::preset_validation::MAX_MATCH_VALUE_LEN
+    let style = platform.path_style();
+    if nrr_shared::app_path::is_path_value(raw, style) {
+        refuse_unholdable_app_value(raw, rule_id, nrr_shared::app_path::MAX_PATH_VALUE_BYTES)?;
+        return nrr_shared::app_path::AppPath::parse(raw, style)
+            .map(|path| CanonicalAppPattern::Path(Box::new(path)))
+            .map_err(|problem| ValidationError::AppPathInvalid {
+                rule_id: rule_id.clone(),
+                value: raw.to_string(),
+                problem,
+            });
+    }
+    canonical_name_pattern(raw, glob, platform.executable_naming(), rule_id, warnings)
+}
+
+/// A value no application rule can hold: longer than `limit` bytes, a
+/// character the file cannot carry, or a deny mark left inside it.
+fn refuse_unholdable_app_value(
+    raw: &str,
+    rule_id: &RuleId,
+    limit: usize,
+) -> Result<(), ValidationError> {
+    // A deny mark left in the value (`! app.exe`, `app.exe +block`) names no
+    // process; a name may hold a space, so nothing else would refuse it and
+    // the deny would land as a route.
+    let trimmed = raw.trim();
+    let misplaced_deny = nrr_shared::preset_parser::carries_retired_block_flag(trimmed)
+        || trimmed
+            .strip_prefix(nrr_shared::preset_parser::VERIFY_PRIMARY_PREFIX)
+            .unwrap_or(trimmed)
+            .starts_with(nrr_shared::preset_parser::DENY_PREFIX);
+    if raw.len() > limit
         || nrr_shared::preset_parser::first_forbidden_field_char(raw).is_some()
+        || misplaced_deny
     {
         return Err(ValidationError::AppNameInvalid {
             rule_id: rule_id.clone(),
             value: raw.to_string(),
         });
     }
+    Ok(())
+}
+
+/// The canonical name or name mask of `raw`, any directory in it dropped:
+/// how a wire `exact` or `glob` pattern reads, which a path never is.
+///
+/// - exact: lowercased, `.exe` appended where `naming` spells programs so;
+/// - glob: lowercased only, the user owns the whole pattern; one that reduces
+///   to a bare `*` is refused as too broad.
+pub(crate) fn canonical_name_pattern(
+    raw: &str,
+    glob: bool,
+    naming: ExecutableNaming,
+    rule_id: &RuleId,
+    warnings: &mut Vec<ValidationWarning>,
+) -> Result<CanonicalAppPattern, ValidationError> {
+    refuse_unholdable_app_value(raw, rule_id, crate::preset_validation::MAX_MATCH_VALUE_LEN)?;
     if glob {
         let lowercased = crate::app_identity::canonical_glob_process_pattern(raw);
         // Judged by the key the matcher compares, not the text: `C:\Games\*`,
@@ -1388,7 +1519,7 @@ pub(crate) fn canonical_app_pattern(
 /// thing about it — `id` and `comment` are metadata and stay out.
 ///
 /// `action` and `enabled` are part of the identity because they are what the
-/// rule DOES: `example.com` next to `example.com +block` are opposite
+/// rule DOES: `example.com` next to `!example.com` are opposite
 /// instructions, and folding them left whichever came first while the other
 /// vanished behind a "duplicate removed" note. The same went for a disabled
 /// copy above an enabled one — the set kept the disabled line.
@@ -1537,6 +1668,35 @@ pub fn networks_on_both_routes(book: &CanonicalRuleBook) -> Vec<String> {
         .filter(|rule| primary.contains(&MatchKey::across_sets(rule)))
         .filter_map(|rule| rule.address_match.as_ref())
         .map(CanonicalAddressMatch::to_display_string)
+        .collect()
+}
+
+/// The folders both routes name in the same form ("this folder only" or
+/// "with subfolders"), both routing them, as the secondary rule spells them:
+/// the same tie as one network on both routes, refused the same way. A folder
+/// in another form is a narrower or wider rule, which the order settles.
+#[must_use]
+pub fn folders_on_both_routes(book: &CanonicalRuleBook) -> Vec<String> {
+    use nrr_shared::app_path::{AppPath, AppPathKind};
+    fn routed_folder(rule: &CanonicalRule) -> Option<&AppPath> {
+        if !rule.enabled || rule.action != RuleAction::Route || rule.address_match.is_some() {
+            return None;
+        }
+        let path = rule.app_match.as_ref()?.pattern.path()?;
+        matches!(path.kind(), AppPathKind::Folder | AppPathKind::FolderTree).then_some(path)
+    }
+    let primary: std::collections::HashSet<&AppPath> = book
+        .primary
+        .rules()
+        .iter()
+        .filter_map(routed_folder)
+        .collect();
+    book.secondary
+        .rules()
+        .iter()
+        .filter_map(routed_folder)
+        .filter(|path| primary.contains(path))
+        .map(|path| path.as_str().to_string())
         .collect()
 }
 

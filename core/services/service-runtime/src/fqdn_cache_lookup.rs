@@ -171,6 +171,14 @@ pub trait FqdnCacheLookup: Send + Sync {
         hosts
     }
 
+    /// Every cached hostname a `base.*` rule covers, most recently seen first
+    /// and at most `limit`
+    /// ([`nrr_domain::decision_matching::match_any_zone_domain`]). Defaults to
+    /// none, so mocks and cold caches give the rule no `*.base.<zone>` twins.
+    fn hostnames_for_any_zone(&self, _base: &str, _limit: usize) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Number of distinct **direct** (non-secondary)
     /// hostnames observed sharing `ip` (`direct_on_ip` for the shared-IP
     /// policy). `0` ⇒ not observably shared. Defaults to `0` so test mocks and
@@ -298,6 +306,25 @@ impl FqdnCacheLookup for MockFqdnCacheLookup {
         matched.truncate(limit);
         matched
     }
+
+    fn hostnames_for_any_zone(&self, base: &str, limit: usize) -> Vec<String> {
+        let g = self.inner.lock().unwrap();
+        covered_by_any_zone(g.entries.iter().map(|(h, _)| h.as_str()), base, limit)
+    }
+}
+
+/// The hosts among `hosts` a `base.*` rule covers, lowercased, in the order
+/// given: not every stored name is lowercase, and the rule's base is.
+fn covered_by_any_zone<'a>(
+    hosts: impl Iterator<Item = &'a str>,
+    base: &str,
+    limit: usize,
+) -> Vec<String> {
+    hosts
+        .map(str::to_ascii_lowercase)
+        .filter(|h| nrr_domain::decision_matching::match_any_zone_domain(h, base).is_some())
+        .take(limit)
+        .collect()
 }
 
 fn canonicalize_hostname(input: &str) -> String {
@@ -450,6 +477,26 @@ impl FqdnCacheLookup for SqliteFqdnCacheLookup {
                     error = %e,
                     suffix = %suffix,
                     "list_hostnames_under_suffix failed; treating as cold"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    fn hostnames_for_any_zone(&self, base: &str, limit: usize) -> Vec<String> {
+        let Ok(guard) = self.cache.lock() else {
+            return Vec::new();
+        };
+        // The query over-reads (`base` anywhere as whole labels); a few times
+        // the limit leaves room for the names the zone test drops.
+        match guard.list_hostnames_with_site(base, limit.saturating_mul(4)) {
+            Ok(hosts) => covered_by_any_zone(hosts.iter().map(String::as_str), base, limit),
+            Err(e) => {
+                tracing::warn!(
+                    target: "nrr::wfp-codegen",
+                    msg_key = "fqdncache-site-lookup-failed",
+                    error = %e,
+                    "list_hostnames_with_site failed; treating as cold"
                 );
                 Vec::new()
             }
@@ -688,6 +735,14 @@ impl FqdnCacheLookup for FqdnCacheSnapshot {
             .collect();
         hosts.sort_unstable();
         hosts
+    }
+
+    fn hostnames_for_any_zone(&self, base: &str, limit: usize) -> Vec<String> {
+        covered_by_any_zone(
+            self.hostnames_by_recency.iter().map(String::as_str),
+            base,
+            limit,
+        )
     }
 
     fn direct_host_count_for_ip(&self, ip: Ipv4Addr) -> u32 {

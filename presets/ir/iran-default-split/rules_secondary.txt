@@ -26,6 +26,9 @@
 *.signal.org
 *.openai.com
 *.chatgpt.com
+*.oaistatic.com
+*.oaistatsig.com
+*.oaiusercontent.com
 *.anthropic.com
 *.claude.ai
 *.claude.com

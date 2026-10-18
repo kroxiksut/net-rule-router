@@ -12,7 +12,7 @@ use super::*;
 /// # Algorithm
 ///
 /// Lines are classified in order:
-/// 1. Empty or whitespace-only → ignored.
+/// 1. Empty or whitespace-only, or a `#:` syntax-hint line → ignored.
 /// 2. `--- SectionName` → section header; starts a new section context.
 /// 3. `# value` → disabled rule if the part after `#` is a single word;
 ///    otherwise a free comment (ignored).
@@ -102,7 +102,7 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
     for line in input.lines() {
         let trimmed = line.trim();
 
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || nrr_shared::preset_parser::is_syntax_hint_line(trimmed) {
             continue;
         }
 
@@ -207,7 +207,7 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
         let verify_values =
             matches!(slot, Slot::Known(idx) if known[*idx].section.takes_verify_prefix());
 
-        let mut entry = if let Some(rest) = trimmed.strip_prefix('#') {
+        let (mut entry, markers) = if let Some(rest) = trimmed.strip_prefix('#') {
             // Possibly a disabled rule — `nrr_shared` owns the one predicate
             // that tells a disabled rule from a prose comment.
             let rest = rest.trim_start();
@@ -216,16 +216,12 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                 continue;
             }
             let (value, comment) = split_inline_comment(rest);
-            let value = value.trim();
-            // Extract the `+block` flag BEFORE the whitespace check so a
-            // disabled blocked rule (`# example.com +block`) is not mistaken
-            // for a prose comment.
-            let (value, blocked) = extract_rule_flags(value);
-            let (value, verify_primary) = take_verify_prefix(value, verify_values);
+            let value = extract_rule_flags(value.trim());
+            let (value, markers) = take_rule_markers(&value, verify_values);
+            // By the section, not by whether this host applies it: a disabled
+            // spaced path in another OS's section is still a rule to keep.
             let rule_type = match &current {
-                Some(Slot::Known(idx)) => {
-                    nrr_shared::preset_parser::classify_section_lenient(known[*idx].section.name())
-                }
+                Some(Slot::Known(idx)) => Some(known[*idx].section.rule_type()),
                 _ => None,
             };
             let is_rule = match rule_type {
@@ -236,51 +232,58 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                 // Prose comment like "# this is a note about example.com" — ignore.
                 continue;
             }
-            RulesFileEntry {
-                match_value: value,
-                inline_comment: comment,
-                enabled: false,
-                blocked,
-                verify_primary,
-                origin: None,
-            }
+            (
+                RulesFileEntry {
+                    match_value: value,
+                    inline_comment: comment,
+                    enabled: false,
+                    blocked: markers.deny,
+                    verify_primary: markers.verify,
+                    origin: None,
+                },
+                markers,
+            )
         } else {
             let (value, comment) = split_inline_comment(trimmed);
-            let value = value.trim();
+            let value = extract_rule_flags(value.trim());
             if value.is_empty() {
                 continue;
             }
-            let (value, blocked) = extract_rule_flags(value);
-            let (value, verify_primary) = take_verify_prefix(value, verify_values);
+            let (value, markers) = take_rule_markers(&value, verify_values);
             if value.is_empty() {
                 continue;
             }
-            RulesFileEntry {
-                match_value: value,
-                inline_comment: comment,
-                enabled: true,
-                blocked,
-                verify_primary,
-                origin: None,
-            }
+            (
+                RulesFileEntry {
+                    match_value: value,
+                    inline_comment: comment,
+                    enabled: true,
+                    blocked: markers.deny,
+                    verify_primary: markers.verify,
+                    origin: None,
+                },
+                markers,
+            )
         };
 
-        // "Check where it works" and "drop it" contradict each other; the
-        // line is refused rather than one of them guessed.
-        if entry.verify_primary && entry.blocked {
+        // "Check where it works" and "drop it" contradict each other: the
+        // line keeps both marks in its value, which validation refuses.
+        if markers.contradictory {
             warnings.push(ParseWarning::VerifyPrimaryWithBlock {
-                match_value: entry.match_value,
+                match_value: entry.match_value.clone(),
             });
-            continue;
         }
 
         match slot {
             Slot::Known(idx) => {
-                // Provenance tokens are read in the app-authored section only,
-                // so a user comment that happens to start with `auto:` in
-                // their own list is never swallowed.
-                if known[*idx].section.is_app_authored() {
+                // Never in the user's own address sections, so a comment there
+                // starting with `auto:` is never swallowed. An application line
+                // without the tokens is simply the user's.
+                let section = known[*idx].section;
+                if section.is_app_authored() {
                     take_provenance(&mut entry, &mut warnings);
+                } else if section.carries_provenance() {
+                    take_provenance_if_any(&mut entry);
                 }
                 known[*idx].entries.push(entry)
             }
@@ -342,6 +345,19 @@ fn take_provenance(entry: &mut RulesFileEntry, warnings: &mut Vec<ParseWarning>)
     }
 }
 
+/// [`take_provenance`] for a section where a line without the tokens is
+/// ordinary: nothing to report.
+fn take_provenance_if_any(entry: &mut RulesFileEntry) {
+    if let Some(provenance) = entry
+        .inline_comment
+        .as_deref()
+        .and_then(parse_provenance_comment)
+    {
+        entry.inline_comment = provenance.note;
+        entry.origin = Some(provenance.origin);
+    }
+}
+
 /// Splits a rule line at the first `#`, returning `(value, inline_comment)`.
 ///
 /// Both parts are trimmed. `inline_comment` is `None` when there is no `#`.
@@ -361,58 +377,23 @@ fn split_inline_comment(s: &str) -> (String, Option<String>) {
     }
 }
 
-/// Per-rule `+block` flag token (docs/en/rules-file-format.md Blocking destinations). Placed after the match
-/// value and before any inline `#` comment; mirrors the `+children` convention.
-pub(super) const BLOCK_FLAG: &str = "+block";
-
-/// Per-rule child-process flag, documented in the rules-file format.
-///
-/// Consumed but not acted on: the matcher needs a process-tree snapshot it is
-/// never given (see the note in `decision_rules_matching`). Consuming it is not
-/// cosmetic — left in the value, `codex.exe +children` normalised to the
-/// executable pattern `codex.exe +children.exe`, which matches nothing, so a
-/// user following the shipped documentation got a rule that silently covered
-/// no process at all. Dropped, the rule covers the named process, which is the
-/// closest thing to what was asked for.
-const CHILDREN_FLAG: &str = "+children";
-
-/// Splits a match value into its head (the actual match value) and the parsed
-/// per-rule flags, extracting the documented flag tokens.
-///
-/// The first whitespace-separated token is always the match value; a subsequent
-/// `+block` token is consumed and reported as `blocked = true`, and
-/// `+children` is consumed as well (see [`CHILDREN_FLAG`] for why it is
-/// consumed while nothing acts on it). Non-flag trailing tokens are preserved
-/// in the returned head so the semantic validator can still diagnose them
-/// (e.g. accidental whitespace in a value).
-fn extract_rule_flags(value: &str) -> (String, bool) {
-    let mut blocked = false;
-    let mut kept: Vec<&str> = Vec::new();
-    for (idx, token) in value.split_whitespace().enumerate() {
-        if idx > 0 && token == BLOCK_FLAG {
-            blocked = true;
-        } else if idx > 0 && token == CHILDREN_FLAG {
-            // Consumed, not acted on — see `CHILDREN_FLAG`.
-        } else {
-            kept.push(token);
-        }
-    }
-    (kept.join(" "), blocked)
+/// The value with its words rejoined and `+children` taken off, by the one
+/// reading the GUI's parser shares. Nothing acts on the flag yet, but left in,
+/// `codex.exe +children` normalised to the pattern `codex.exe +children.exe`
+/// and covered no process at all.
+pub(crate) fn extract_rule_flags(value: &str) -> String {
+    nrr_shared::preset_parser::split_children_flag(value).0
 }
 
-/// Lifts the `?` prefix off `value` in a host-name or exact-IP section;
-/// anywhere else it stays part of the value, which that section's validation
-/// then refuses.
-fn take_verify_prefix(value: String, verify_values: bool) -> (String, bool) {
-    if !verify_values {
-        return (value, false);
-    }
-    let (rest, verify) = nrr_shared::preset_parser::split_verify_primary(&value);
-    if verify {
-        (rest.to_string(), true)
-    } else {
-        (value, false)
-    }
+/// Lifts the `!` prefix off `value` in any section, and the `?` prefix in a
+/// host-name or exact-IP one; a mark anywhere else stays part of the value,
+/// which validation then refuses. One reading with the GUI parser.
+fn take_rule_markers(
+    value: &str,
+    verify_values: bool,
+) -> (String, nrr_shared::preset_parser::RuleMarkers) {
+    let (rest, markers) = nrr_shared::preset_parser::split_rule_markers(value, verify_values);
+    (rest.to_string(), markers)
 }
 
 // ── File-to-RuleSet conversion ────────────────────────────────────────────────

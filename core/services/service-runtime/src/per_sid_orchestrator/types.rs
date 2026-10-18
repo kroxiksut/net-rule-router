@@ -223,6 +223,24 @@ pub trait RulesProvider: Send + Sync {
     fn stored_revision_for(&self, _principal: &str) -> Option<String> {
         None
     }
+
+    /// The `base-revision` a write built from [`Self::stored_rules_for`] names
+    /// (see `production_rules_provider::base_revision_of`). Read before the
+    /// book, so a change in between makes the write refused, never lost.
+    /// `None` when the provider cannot name it: the write is then unchecked.
+    fn base_revision_for(&self, _principal: &str) -> Option<String> {
+        None
+    }
+
+    /// The enabled rules [`Self::active_rules_for`] kept out of enforcement
+    /// because they deny a protected program or folder or send one over the
+    /// additional route, for the Overlaps screen. Fixtures withhold nothing.
+    fn withheld_rules_for(
+        &self,
+        _principal: &str,
+    ) -> Vec<nrr_domain::protected_places::ProtectedRule> {
+        Vec::new()
+    }
 }
 
 /// No-op rules provider — always returns `None`. Useful in test

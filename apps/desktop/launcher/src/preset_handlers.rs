@@ -140,13 +140,21 @@ struct ServiceVerdict {
 /// in a hand-edited file therefore looked accepted right up until the apply
 /// refused the whole file, with nothing on screen saying which line was wrong.
 fn row_validation(result: &PresetParseResult) -> Vec<Value> {
-    use nrr_application::rule_value_validation::validate_rule_value;
+    use nrr_application::rule_value_validation::{
+        validate_rule_value, validate_rule_value_for, RuleEffect,
+    };
 
     result
         .rules
         .iter()
         .filter_map(|rule| {
-            let verdict = validate_rule_value(rule.rule_type.slug(), &rule.match_value);
+            // A deny is a deny in either file; which file a route sits in the
+            // text alone does not say, so a route is judged by the apply.
+            let verdict = if rule.blocked {
+                validate_rule_value_for(rule.rule_type.slug(), &rule.match_value, RuleEffect::Deny)
+            } else {
+                validate_rule_value(rule.rule_type.slug(), &rule.match_value)
+            };
             if matches!(
                 verdict,
                 nrr_application::rule_value_validation::RuleValueValidation::Valid

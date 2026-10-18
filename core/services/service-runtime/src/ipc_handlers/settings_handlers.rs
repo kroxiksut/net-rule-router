@@ -9,11 +9,16 @@
 //! `caller_sid.is_empty()` is treated as a transport error (`Internal`)
 //! for per-SID writers (routing pause, autostart). The machine-wide writers
 //! gate a change by value (`machine_scoped`); their class needs no elevation.
+//!
+//! Every writer checks its request in `precheck`, before the router audits it.
+//! A machine-scoped gate compares against the stored value, so `execute` asks
+//! it again: the value may have moved between the two.
 
 use std::sync::Arc;
 
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 use crate::ipc_handlers::payloads::{
     ApplyFailurePolicyGetRequest, ApplyFailurePolicySetRequest, AutostartGetRequest,
@@ -43,6 +48,26 @@ fn serialise(op: &'static str, value: impl serde::Serialize) -> HandlerOutcome {
         message: format!("{op} response serialisation failed: {e}"),
         diagnostics_id: None,
     })
+}
+
+fn decode<T: serde::de::DeserializeOwned>(
+    op: &'static str,
+    request: &IpcRequestEnvelope,
+) -> Result<T, IpcError> {
+    serde_json::from_value(request.payload.clone()).map_err(|e| malformed(op, e))
+}
+
+/// A per-principal write from a caller the transport could not attribute.
+fn require_sid<'c>(op: &'static str, ctx: &'c IpcRequestContext) -> Result<&'c str, IpcError> {
+    let sid = ctx.caller_stored();
+    if sid.is_empty() {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("{op}: caller SID unavailable"),
+            diagnostics_id: None,
+        });
+    }
+    Ok(sid)
 }
 
 fn map_settings_write_error(err: SettingsWriteError) -> IpcError {
@@ -96,19 +121,46 @@ impl RetentionSettingsSetHandler {
     }
 }
 
-impl IpcHandler for RetentionSettingsSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let req: RetentionSettingsSetRequest = serde_json::from_value(request.payload.clone())
-            .map_err(|e| malformed("settings.retention.set", e))?;
-        if !crate::machine_scoped::machine_scoped_write_allowed(
-            &retention_fields(&req),
+impl RetentionSettingsSetHandler {
+    fn gate(
+        &self,
+        req: &RetentionSettingsSetRequest,
+        ctx: &IpcRequestContext,
+    ) -> Result<(), IpcError> {
+        if crate::machine_scoped::machine_scoped_write_allowed(
+            &retention_fields(req),
             &retention_fields_of(&self.provider.get()),
             ctx.caller_is_elevated,
         ) {
-            return Err(crate::machine_scoped::machine_scoped_refusal(
+            Ok(())
+        } else {
+            Err(crate::machine_scoped::machine_scoped_refusal(
                 crate::machine_scoped::MachineScopedSetting::Retention,
-            ));
+            ))
         }
+    }
+}
+
+impl CheckedIpcHandler for RetentionSettingsSetHandler {
+    type Checked = RetentionSettingsSetRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        let req: RetentionSettingsSetRequest = decode("settings.retention.set", request)?;
+        self.gate(&req, ctx)?;
+        Ok(req)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        self.gate(&req, ctx)?;
         match self.writer.set(&req) {
             Ok(dto) => serialise("settings.retention.set", dto),
             Err(e) => Err(map_settings_write_error(e)),
@@ -178,13 +230,49 @@ impl LogRetentionConfigSetHandler {
     }
 }
 
-impl IpcHandler for LogRetentionConfigSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let req: LogRetentionConfigSetRequest = serde_json::from_value(request.payload.clone())
-            .map_err(|e| malformed("settings.log-retention.set", e))?;
+impl LogRetentionConfigSetHandler {
+    fn gate(
+        &self,
+        req: &LogRetentionConfigSetRequest,
+        ctx: &IpcRequestContext,
+    ) -> Result<(), IpcError> {
+        let current = self.provider.get();
+        if crate::machine_scoped::machine_scoped_write_allowed(
+            &(
+                req.log_max_age_days,
+                req.log_max_size_bytes,
+                req.audit_max_age_days,
+                req.audit_max_size_bytes,
+            ),
+            &(
+                current.log_max_age_days,
+                current.log_max_size_bytes,
+                current.audit_max_age_days,
+                current.audit_max_size_bytes,
+            ),
+            ctx.caller_is_elevated,
+        ) {
+            Ok(())
+        } else {
+            Err(crate::machine_scoped::machine_scoped_refusal(
+                crate::machine_scoped::MachineScopedSetting::LogRetention,
+            ))
+        }
+    }
+}
+
+impl CheckedIpcHandler for LogRetentionConfigSetHandler {
+    type Checked = LogRetentionConfigSetRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        let req: LogRetentionConfigSetRequest = decode("settings.log-retention.set", request)?;
         // The same row drives the SCHEDULED audit pass, so accepting a value
         // under the floor would let a settings edit erase the audit trail the
-        // product promises no user action can erase. Refused here, not clamped
+        // product promises no user action can erase. Refused, not clamped
         // silently, so the GUI can say why.
         if req.audit_max_age_days < nrr_diagnostics::MIN_AUDIT_MAX_AGE_DAYS
             || (req.audit_max_size_bytes > 0
@@ -200,26 +288,17 @@ impl IpcHandler for LogRetentionConfigSetHandler {
                 diagnostics_id: None,
             });
         }
-        let current = self.provider.get();
-        if !crate::machine_scoped::machine_scoped_write_allowed(
-            &(
-                req.log_max_age_days,
-                req.log_max_size_bytes,
-                req.audit_max_age_days,
-                req.audit_max_size_bytes,
-            ),
-            &(
-                current.log_max_age_days,
-                current.log_max_size_bytes,
-                current.audit_max_age_days,
-                current.audit_max_size_bytes,
-            ),
-            ctx.caller_is_elevated,
-        ) {
-            return Err(crate::machine_scoped::machine_scoped_refusal(
-                crate::machine_scoped::MachineScopedSetting::LogRetention,
-            ));
-        }
+        self.gate(&req, ctx)?;
+        Ok(req)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        self.gate(&req, ctx)?;
         match self.writer.set(&req) {
             Ok(dto) => serialise("settings.log-retention.set", dto),
             Err(e) => Err(map_settings_write_error(e)),
@@ -263,19 +342,47 @@ impl ApplyFailurePolicySetHandler {
     }
 }
 
-impl IpcHandler for ApplyFailurePolicySetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let req: ApplyFailurePolicySetRequest = serde_json::from_value(request.payload.clone())
-            .map_err(|e| malformed("settings.apply-failure-policy.set", e))?;
-        if !crate::machine_scoped::machine_scoped_write_allowed(
+impl ApplyFailurePolicySetHandler {
+    fn gate(
+        &self,
+        req: &ApplyFailurePolicySetRequest,
+        ctx: &IpcRequestContext,
+    ) -> Result<(), IpcError> {
+        if crate::machine_scoped::machine_scoped_write_allowed(
             &req.policy,
             &self.provider.get().policy,
             ctx.caller_is_elevated,
         ) {
-            return Err(crate::machine_scoped::machine_scoped_refusal(
+            Ok(())
+        } else {
+            Err(crate::machine_scoped::machine_scoped_refusal(
                 crate::machine_scoped::MachineScopedSetting::ApplyFailurePolicy,
-            ));
+            ))
         }
+    }
+}
+
+impl CheckedIpcHandler for ApplyFailurePolicySetHandler {
+    type Checked = ApplyFailurePolicySetRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        let req: ApplyFailurePolicySetRequest =
+            decode("settings.apply-failure-policy.set", request)?;
+        self.gate(&req, ctx)?;
+        Ok(req)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        self.gate(&req, ctx)?;
         let sid = if ctx.caller_stored().is_empty() {
             None
         } else {
@@ -300,23 +407,29 @@ impl AutoRuleCandidatesProbeHandler {
     }
 }
 
-impl IpcHandler for AutoRuleCandidatesProbeHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let req: nrr_shared::ipc_payloads::AutoRuleCandidatesProbeRequest =
-            serde_json::from_value(request.payload.clone())
-                .map_err(|e| malformed("autorules.candidates.probe", e))?;
-        let sid = ctx.caller_stored();
-        if sid.is_empty() {
-            return Err(IpcError {
-                code: IpcErrorCode::Internal,
-                message: "autorules.candidates.probe: caller SID unavailable".into(),
-                diagnostics_id: None,
-            });
-        }
+impl CheckedIpcHandler for AutoRuleCandidatesProbeHandler {
+    type Checked = nrr_shared::ipc_payloads::AutoRuleCandidatesProbeRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        let req = decode("autorules.candidates.probe", request)?;
+        require_sid("autorules.candidates.probe", ctx)?;
+        Ok(req)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        let sid = require_sid("autorules.candidates.probe", ctx)?;
         serialise(
             "autorules.candidates.probe",
-            self.runner
-                .probe(sid.as_ref(), &req.ids, &req.rule_hostnames),
+            self.runner.probe(sid, &req.ids, &req.rule_hostnames),
         )
     }
 }
@@ -333,22 +446,29 @@ impl RefusingAnchorSetHandler {
     }
 }
 
-impl IpcHandler for RefusingAnchorSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let req: nrr_shared::ipc_payloads::RefusingAnchorSetRequest =
-            serde_json::from_value(request.payload.clone())
-                .map_err(|e| malformed("autorules.refusing-anchor.set", e))?;
-        let sid = ctx.caller_stored();
-        if sid.is_empty() {
-            return Err(IpcError {
-                code: IpcErrorCode::Internal,
-                message: "autorules.refusing-anchor.set: caller SID unavailable".into(),
-                diagnostics_id: None,
-            });
-        }
+impl CheckedIpcHandler for RefusingAnchorSetHandler {
+    type Checked = nrr_shared::ipc_payloads::RefusingAnchorSetRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        let req = decode("autorules.refusing-anchor.set", request)?;
+        require_sid("autorules.refusing-anchor.set", ctx)?;
+        Ok(req)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        let sid = require_sid("autorules.refusing-anchor.set", ctx)?;
         serialise(
             "autorules.refusing-anchor.set",
-            self.writer.set(sid.as_ref(), &req.hostname, req.refusing),
+            self.writer.set(sid, &req.hostname, req.refusing),
         )
     }
 }
@@ -388,26 +508,30 @@ impl LocalNetworksSetHandler {
     }
 }
 
-impl IpcHandler for LocalNetworksSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let req: nrr_shared::ipc_payloads::LocalNetworksSetRequest =
-            serde_json::from_value(request.payload.clone())
-                .map_err(|e| malformed("settings.local-networks.set", e))?;
+impl CheckedIpcHandler for LocalNetworksSetHandler {
+    type Checked = nrr_shared::ipc_payloads::LocalNetworksSetRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        let req = decode("settings.local-networks.set", request)?;
         // These exemptions are per-principal; an unattributable caller must not
         // be able to write into someone else's set (or into an empty-SID row
         // nothing would ever read).
-        let sid = ctx.caller_stored();
-        if sid.is_empty() {
-            return Err(IpcError {
-                code: IpcErrorCode::Internal,
-                message: "settings.local-networks.set: caller SID unavailable".into(),
-                diagnostics_id: None,
-            });
-        }
-        serialise(
-            "settings.local-networks.set",
-            self.provider.set(sid.as_ref(), &req),
-        )
+        require_sid("settings.local-networks.set", ctx)?;
+        Ok(req)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        let sid = require_sid("settings.local-networks.set", ctx)?;
+        serialise("settings.local-networks.set", self.provider.set(sid, &req))
     }
 }
 
@@ -461,24 +585,47 @@ impl TrafficStatsSetHandler {
     }
 }
 
-impl IpcHandler for TrafficStatsSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let req: TrafficStatsSetRequest = serde_json::from_value(request.payload.clone())
-            .map_err(|e| malformed("traffic-stats.set", e))?;
-        // Accounting is machine-wide — the counters come from the adapters, not
-        // from a user — so turning it off or shortening its history is a
-        // decision for everyone. Unchanged saves still pass: the settings page
-        // sends the whole row back whether or not the user touched this part.
+impl TrafficStatsSetHandler {
+    /// Accounting is machine-wide — the counters come from the adapters, not
+    /// from a user — so turning it off or shortening its history is a decision
+    /// for everyone. Unchanged saves still pass: the settings page sends the
+    /// whole row back whether or not the user touched this part.
+    fn gate(&self, req: &TrafficStatsSetRequest, ctx: &IpcRequestContext) -> Result<(), IpcError> {
         let current = self.writer.settings().map_err(map_settings_write_error)?;
-        if !crate::machine_scoped::machine_scoped_write_allowed(
+        if crate::machine_scoped::machine_scoped_write_allowed(
             &req.settings,
             &current,
             ctx.caller_is_elevated,
         ) {
-            return Err(crate::machine_scoped::machine_scoped_refusal(
+            Ok(())
+        } else {
+            Err(crate::machine_scoped::machine_scoped_refusal(
                 crate::machine_scoped::MachineScopedSetting::TrafficStats,
-            ));
+            ))
         }
+    }
+}
+
+impl CheckedIpcHandler for TrafficStatsSetHandler {
+    type Checked = TrafficStatsSetRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        let req: TrafficStatsSetRequest = decode("traffic-stats.set", request)?;
+        self.gate(&req, ctx)?;
+        Ok(req)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        self.gate(&req, ctx)?;
         match self.writer.set(&req.settings) {
             Ok(dto) => serialise("traffic-stats.set", dto),
             Err(e) => Err(map_settings_write_error(e)),
@@ -496,9 +643,24 @@ impl TrafficStatsClearHandler {
     }
 }
 
-impl IpcHandler for TrafficStatsClearHandler {
-    fn handle(&self, _request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
-        // No request body — reset unconditionally.
+impl CheckedIpcHandler for TrafficStatsClearHandler {
+    /// No request body — the reset is unconditional.
+    type Checked = ();
+
+    fn precheck(
+        &self,
+        _request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> Result<(), IpcError> {
+        Ok(())
+    }
+
+    fn execute(
+        &self,
+        _checked: Prechecked<()>,
+        _request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         match self.writer.clear() {
             Ok(dto) => serialise("traffic-stats.clear", dto),
             Err(e) => Err(map_settings_write_error(e)),
@@ -518,11 +680,16 @@ impl TrafficHistoryMergeSetHandler {
     }
 }
 
-impl IpcHandler for TrafficHistoryMergeSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for TrafficHistoryMergeSetHandler {
+    type Checked = nrr_shared::ipc_payloads::TrafficHistoryMergeSetRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
         const OP: &str = "traffic-stats.history-merge.set";
-        let req: nrr_shared::ipc_payloads::TrafficHistoryMergeSetRequest =
-            serde_json::from_value(request.payload.clone()).map_err(|e| malformed(OP, e))?;
+        let req: Self::Checked = decode(OP, request)?;
         // A pair with an empty side, or a key joined to itself, is not an
         // answer to anything — and storing it would suppress the real question.
         if req.old_key.trim().is_empty()
@@ -535,6 +702,17 @@ impl IpcHandler for TrafficHistoryMergeSetHandler {
                 diagnostics_id: None,
             });
         }
+        Ok(req)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        const OP: &str = "traffic-stats.history-merge.set";
+        let req = req.into_inner();
         self.writer
             .set_history_link(&req.old_key, &req.new_key, req.merged)
             .map_err(map_settings_write_error)?;
@@ -588,19 +766,25 @@ impl RoutingPauseToggleHandler {
     }
 }
 
-impl IpcHandler for RoutingPauseToggleHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let req: RoutingPauseToggleRequest = serde_json::from_value(request.payload.clone())
-            .map_err(|e| malformed("routing.pause.toggle", e))?;
-        if ctx.caller_stored().is_empty() {
-            return Err(IpcError {
-                code: IpcErrorCode::Internal,
-                message:
-                    "caller SID unavailable; transport must populate IpcRequestContext.caller_stored()"
-                        .into(),
-                diagnostics_id: None,
-            });
-        }
+impl CheckedIpcHandler for RoutingPauseToggleHandler {
+    type Checked = RoutingPauseToggleRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        let req = decode("routing.pause.toggle", request)?;
+        require_sid("routing.pause.toggle", ctx)?;
+        Ok(req)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         match self
             .writer
             .toggle(ctx.caller_stored(), req.paused, req.reason.as_deref())
@@ -641,10 +825,23 @@ impl AutostartToggleHandler {
     }
 }
 
-impl IpcHandler for AutostartToggleHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let req: AutostartToggleRequest = serde_json::from_value(request.payload.clone())
-            .map_err(|e| malformed("autostart.toggle", e))?;
+impl CheckedIpcHandler for AutostartToggleHandler {
+    type Checked = AutostartToggleRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        decode("autostart.toggle", request)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         match self.writer.toggle(ctx.caller_stored(), req.enabled) {
             Ok(dto) => serialise("autostart.toggle", dto),
             Err(e) => Err(map_settings_write_error(e)),

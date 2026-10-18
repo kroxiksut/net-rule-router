@@ -150,7 +150,16 @@ pub fn probe_and_heal(
     let Some(image) = owner_lookup.owner_image_name(client, fake) else {
         return HealVerdict::Inconclusive;
     };
-    if !confirmed.matches_image(&image) && !looks_like_vpn(&image) {
+    // A confirmation heals only its own user's flows: another user's pick of
+    // the same file name must not take this user's host off fake-IP.
+    let confirmed_here = confirmed.matches_image(&image)
+        && confirmed.matches_image_for(
+            owner_lookup
+                .owner_principal(client, fake, nrr_platform_api::fake_ip::FlowTransport::Tcp)
+                .as_deref(),
+            &image,
+        );
+    if !confirmed_here && !looks_like_vpn(&image) {
         tracing::debug!(
             target: "nrr::fake-ip",
             hostname,
@@ -356,7 +365,13 @@ impl VpnSelfHealObserver {
 }
 
 impl FlowObserver for VpnSelfHealObserver {
-    fn on_flow_opened(&self, client: SocketAddr, fake: SocketAddr, hostname: &str) {
+    fn on_flow_opened(
+        &self,
+        client: SocketAddr,
+        fake: SocketAddr,
+        hostname: &str,
+        _owner: Option<&str>,
+    ) {
         // A literal address has nothing to heal (see `probe_and_heal`), and the
         // in-tunnel rescue produces one per flow — declining here keeps those
         // out of the queue instead of letting them crowd out real hostnames,

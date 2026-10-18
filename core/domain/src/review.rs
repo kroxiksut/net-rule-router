@@ -530,7 +530,7 @@ fn collect_overlapping_apexes(candidate: &CanonicalProfile, changes: &[RuleChang
 /// route role is *not* part of the key so that moving a rule between
 /// routes surfaces as `Retargeted` rather than Removed+Added.
 ///
-/// It names a group, not a rule: `x` and `x +block` share it, and
+/// It names a group, not a rule: `x` and `!x` share it, and
 /// [`pair_identity_group`] decides which rule of the group is which.
 ///
 /// `{:?}` over the two match `Option`s is a faithful, deterministic
@@ -585,7 +585,7 @@ pub(crate) fn rule_attributes_differ(prev: &CanonicalRule, next: &CanonicalRule)
 /// two books; returns `(left, right)` indexes, `None` where a rule has no
 /// counterpart.
 ///
-/// A group can hold several rules — `x` next to `x +block`, or `x` next to
+/// A group can hold several rules — `x` next to `!x`, or `x` next to
 /// `*.x` under coverage — and each must survive as itself. The closest pair is
 /// taken first: the same [`MatchKey`](crate::validation::MatchKey), then the
 /// same route, action and enabled state, in that order. A group of one on each
@@ -838,7 +838,7 @@ mod tests {
         assert!(removed as u32 * 100 / diff.prev_total_rules >= 50);
     }
 
-    /// `x` and `x +block` are two rules; the diff used to key both on the
+    /// `x` and `!x` are two rules; the diff used to key both on the
     /// address and lose one of them.
     #[test]
     fn adding_a_block_rule_beside_a_route_rule_for_the_same_host_is_one_addition() {

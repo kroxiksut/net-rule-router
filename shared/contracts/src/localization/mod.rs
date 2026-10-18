@@ -12,6 +12,17 @@ const RESERVED_ROOT_NAMESPACES: &[&str] = &["_system", "_service", "_internal"];
 const ALLOWED_METADATA_FIELDS: &[&str] =
     &["language", "label", "nativeLabel", "version", "fallbacks"];
 const MAX_RECOMMENDED_LOCALE_VALUE_LEN: usize = 2000;
+// Bounds on a locale file, which may come from a folder its user writes. The
+// largest shipped one is about 0.6 MiB with 4k keys of at most 74 bytes, so
+// these leave years of growth; past them a file is no translation, and every
+// client that loads it would pay memory for whatever was planted there.
+const MAX_LOCALE_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LOCALE_KEYS: usize = 50_000;
+const MAX_LOCALE_KEY_BYTES: usize = 512;
+const MAX_LOCALE_FALLBACKS: usize = 16;
+const MAX_LOCALE_FILES_PER_DIR: usize = 256;
+/// Past this, one line says the rest of a file's warnings went unlisted.
+const MAX_LOCALE_WARNINGS: usize = 64;
 const MANAGED_SUBFOLDER: &str = "managed";
 const USER_LOCALES_SUBFOLDER: &str = "locales";
 
@@ -280,6 +291,27 @@ pub fn load_locale_state() -> LocaleLoadState {
 /// anyone put a file there the language dropdown grew a second, byte-identical
 /// "Русский". Both rows resolve to the same descriptor (precedence is settled
 /// in `build_effective_locale_bundles`), so collapsing them loses nothing.
+/// One locale file's bytes through the loader as `<id>.json` in the user's
+/// folder beside an English baseline: the size bound, the parse, validation
+/// and the merge. Returns how many keys the merged languages hold.
+#[cfg(feature = "fuzzing")]
+#[must_use]
+pub fn fuzz_user_locale_file(id: &str, bytes: &[u8]) -> usize {
+    let mut user = new_candidate(id, format!("{id}.json"), LocaleSource::User);
+    fill_candidate(&mut user, bytes.to_vec());
+    let mut english = new_candidate("en", "en.json".to_string(), LocaleSource::Bundled);
+    english
+        .entries
+        .insert("menu.file".to_string(), "File".to_string());
+    let mut candidates = vec![english, user];
+    validate_cross_locale_rules(&mut candidates);
+    add_missing_baseline_coverage_warnings(&mut candidates);
+    build_effective_locale_bundles(&candidates)
+        .iter()
+        .map(|bundle| bundle.entries.len())
+        .sum()
+}
+
 mod bundles;
 mod candidates;
 mod validation;

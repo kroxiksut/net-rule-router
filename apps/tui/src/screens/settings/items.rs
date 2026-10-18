@@ -6,6 +6,7 @@ use nrr_client_logic::notice_mutes::MUTABLE_NOTICE_KINDS;
 use nrr_client_logic::units::format_storage_bytes;
 use nrr_client_logic::{route_policy, stability};
 use nrr_platform_api::service_control::{ServiceRunState, ServiceStartMode};
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc_payloads::{BlockNoticeMuteDto, BlockNoticeMuteScopeDto, TrafficRowDto};
 use serde_json::{Map, Value};
 
@@ -179,6 +180,10 @@ pub enum ItemId {
     Traffic(TrafficField),
     TrafficRetention,
     TrafficReset,
+    /// The caller's own connection history.
+    HistoryEnabled,
+    HistoryRetention,
+    HistoryClear,
     Pref(PrefField),
 }
 
@@ -343,10 +348,12 @@ fn until_ms(mute: &BlockNoticeMuteDto) -> Option<i64> {
 fn scope_words(scope: &BlockNoticeMuteScopeDto) -> Words {
     match scope {
         BlockNoticeMuteScopeDto::Host { host } => {
-            Words::Fill(t::MUTE_HOST, vec![("name", host.clone())])
+            let name = display_text(host).into_owned();
+            Words::Fill(t::MUTE_HOST, vec![("name", name)])
         }
         BlockNoticeMuteScopeDto::App { app } => {
-            Words::Fill(t::MUTE_APP, vec![("name", app.clone())])
+            let name = display_text(app).into_owned();
+            Words::Fill(t::MUTE_APP, vec![("name", name)])
         }
         // The reason's own words are a key named after the slug.
         BlockNoticeMuteScopeDto::Reason { reason } => Words::Nested(
@@ -569,10 +576,11 @@ fn local_networks(app: &AppState) -> Vec<Item> {
         v.push(info(Words::Key(t::LOCAL_EMPTY)));
     }
     for (index, network) in list.networks.iter().enumerate() {
+        let adapter = display_text(&network.adapter).into_owned();
         let origin = match network.kind.as_str() {
             "manual" => Words::Key(t::LOCAL_KIND_MANUAL),
-            "main-link" => Words::Fill(t::LOCAL_KIND_MAIN, vec![("name", network.adapter.clone())]),
-            _ => Words::Fill(t::LOCAL_KIND_VM, vec![("name", network.adapter.clone())]),
+            "main-link" => Words::Fill(t::LOCAL_KIND_MAIN, vec![("name", adapter)]),
+            _ => Words::Fill(t::LOCAL_KIND_VM, vec![("name", adapter)]),
         };
         let mut label = vec![raw(network.cidr.clone()), raw("  "), origin];
         let reason = match network.reason.as_str() {
@@ -1217,6 +1225,32 @@ fn logs(app: &AppState) -> Vec<Item> {
         }
     }
     v.push(action(ItemId::ClearLogs, t::CLEAR_LOGS, true));
+
+    v.push(heading(t::HISTORY_TITLE));
+    v.push(info(Words::Key(t::HISTORY_NOTE)));
+    match &s.data.conn_history {
+        Loadable::Ready(h) => {
+            if !h.available {
+                v.push(info(Words::Key(t::HISTORY_UNAVAILABLE)));
+            }
+            v.push(toggle(ItemId::HistoryEnabled, t::HISTORY_KEEP, h.enabled));
+            v.push(number(
+                ItemId::HistoryRetention,
+                Words::Join(vec![
+                    Words::Key(t::HISTORY_DAYS),
+                    raw(", "),
+                    Words::Key(t::DAYS_UNIT),
+                ]),
+                Some(i64::from(h.retention_days)),
+                1,
+                i64::from(h.max_retention_days.max(1)),
+            ));
+            if h.available {
+                v.push(action(ItemId::HistoryClear, t::HISTORY_CLEAR, true));
+            }
+        }
+        other => v.push(pending(app, other)),
+    }
 
     v.push(heading(t::STORAGE_TITLE));
     match &s.data.storage {

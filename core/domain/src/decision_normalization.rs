@@ -184,8 +184,8 @@ impl NormalizedIp {
 pub struct NormalizedAppIdentity {
     /// Lowercase `.exe`-suffixed filename with path stripped.  Primary match key.
     pub process_name: String,
-    /// Original process path before stripping, if available.
-    /// Not used for matching; preserved for explain/diagnostics.
+    /// The full image path, when the caller knows it: what a path rule
+    /// matches. Without it only name rules can match the process.
     pub original_path: Option<String>,
     /// Per-identity normalization warnings (weak identity, path stripped, etc.).
     pub warnings: Vec<NormalizationWarning>,

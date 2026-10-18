@@ -31,11 +31,23 @@ fn writing_a_diagnostic_archive_is_an_audited_action() {
         !class.requires_elevation() && !class.requires_confirmation_token(),
         "auditing it must not turn a support export into a UAC prompt"
     );
-    assert_eq!(
-        class,
-        canonical_operation_class(IpcOperationName::LogsClear, &empty),
-        "an export is diagnostic maintenance, like clearing the logs"
-    );
+}
+
+/// Clearing the logs or the name cache erases what every user of the machine
+/// did, so an unelevated caller is refused and asked for administrator rights,
+/// exactly like wiping the traffic ledger.
+#[test]
+fn clearing_logs_or_the_cache_needs_an_administrator() {
+    use nrr_shared::ipc::IpcOperationName;
+    use nrr_shared::ipc_transport::canonical_operation_class;
+
+    let empty = serde_json::json!({});
+    let ledger = canonical_operation_class(IpcOperationName::TrafficStatsClear, &empty);
+    for op in [IpcOperationName::LogsClear, IpcOperationName::CacheClear] {
+        let class = canonical_operation_class(op, &empty);
+        assert!(class.requires_elevation(), "{op:?}");
+        assert_eq!(class, ledger, "{op:?} is a wipe of shared data");
+    }
 }
 
 /// The acknowledgement echoes back exactly the rows the dry-run listed; the

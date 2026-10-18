@@ -43,19 +43,29 @@ impl ConnectionObservationConsumer {
                     .as_ref()
                     .and_then(|name_of| name_of(ip))
             });
-        if let Some(app) = self.app_main_link.as_ref() {
-            let program = self
-                .connection_programs
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(&(obs.local, obs.remote))
-                .map(|(program, _)| program.clone());
-            if let Some(program) = program {
-                app(&program, obs.remote.ip(), stalled, hostname.is_some());
-            }
+        let remembered = self
+            .connection_programs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(obs.local, obs.remote))
+            .map(|(program, owner, _)| (program.clone(), owner.clone()));
+        // A resend or a close carries no owner of its own on every platform.
+        let owner = obs
+            .user_sid
+            .clone()
+            .or_else(|| remembered.as_ref().and_then(|(_, owner)| owner.clone()));
+        if let (Some(app), Some((program, _))) = (self.app_main_link.as_ref(), remembered.as_ref())
+        {
+            app(
+                owner.as_deref(),
+                program.as_str(),
+                obs.remote.ip(),
+                stalled,
+                hostname.is_some(),
+            );
         }
         if let (Some(sink), Some(hostname)) = (self.companion_primary_health.as_ref(), hostname) {
-            sink(&hostname, stalled);
+            sink(owner.as_deref(), &hostname, stalled);
         }
     }
 
@@ -64,7 +74,7 @@ impl ConnectionObservationConsumer {
     pub(super) fn remember_program(&self, rec: &super::ConnectionTraceRecord, at_ms: u64) {
         const MAX_REMEMBERED: usize = 4096;
         const REMEMBERED_MS: u64 = 120_000;
-        if self.app_main_link.is_none() {
+        if self.app_main_link.is_none() && self.companion_primary_health.is_none() {
             return;
         }
         let Some(path) = rec.process_path.as_deref() else {
@@ -82,12 +92,15 @@ impl ConnectionObservationConsumer {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         if programs.len() >= MAX_REMEMBERED {
-            programs.retain(|_, (_, at)| at_ms.saturating_sub(*at) < REMEMBERED_MS);
+            programs.retain(|_, (_, _, at)| at_ms.saturating_sub(*at) < REMEMBERED_MS);
             if programs.len() >= MAX_REMEMBERED {
                 programs.clear();
             }
         }
-        programs.insert((rec.local, rec.remote), (program, at_ms));
+        programs.insert(
+            (rec.local, rec.remote),
+            (program, rec.user_sid.clone(), at_ms),
+        );
     }
 
     /// A connection the stack established over the additional link, attributed
@@ -105,7 +118,7 @@ impl ConnectionObservationConsumer {
         }
         let program = nrr_domain::app_offer::program_name(path);
         if !program.is_empty() {
-            sink(&program);
+            sink(rec.user_sid.as_deref(), &program);
         }
     }
 
@@ -146,7 +159,7 @@ impl ConnectionObservationConsumer {
     /// suggestion for a site nobody had opened.
     ///
     /// Called for every observation, established or not — see the caller.
-    pub(super) fn confirm_placeholder_use(&self, remote: IpAddr, at_ms: u64) {
+    pub(super) fn confirm_placeholder_use(&self, remote: IpAddr, at_ms: u64, owner: Option<&str>) {
         let Some(sink) = self.placeholder_confirmed.as_ref() else {
             return;
         };
@@ -162,8 +175,65 @@ impl ConnectionObservationConsumer {
                 address = %ip,
                 "a censored host was actually connected to - its offer may be parked now",
             );
-            sink(&host);
+            sink(owner, &host);
         }
+    }
+
+    /// Owners remembered as on a routed site at once; past it the list starts
+    /// over, which only delays a lookup.
+    const OWNERS_ON_SECONDARY_CAP: usize = 64;
+    /// Reverse lookups of direct connections per window, machine-wide.
+    const REVERSE_LOOKUPS_PER_WINDOW: u32 = 8;
+    const REVERSE_LOOKUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// `owner`'s traffic just left over their additional link.
+    pub(super) fn note_owner_on_secondary(&self, owner: Option<&str>) {
+        let mut seen = self
+            .owner_secondary_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let key = owner.unwrap_or_default();
+        if seen.len() >= Self::OWNERS_ON_SECONDARY_CAP && !seen.contains_key(key) {
+            seen.clear();
+        }
+        seen.insert(key.to_owned(), Instant::now());
+    }
+
+    /// Whether a direct connection of `owner`'s whose name nobody resolved may
+    /// be named by reverse lookup: only for an owner who collects suggestions,
+    /// whose OWN traffic is on a routed site right now, and within a small
+    /// budget. The lookup asks a resolver by plain text, so it is never made
+    /// for a user who did not ask for suggestions.
+    pub(super) fn primary_egress_may_learn(&self, owner: Option<&str>) -> bool {
+        let Some(learns) = self.primary_egress_learning.as_ref() else {
+            return false;
+        };
+        let key = owner.unwrap_or_default();
+        let on_secondary = self
+            .owner_secondary_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(key)
+            .is_some_and(|at| at.elapsed() <= COMPANION_WINDOW);
+        if !on_secondary || !learns(key) {
+            return false;
+        }
+        let mut budget = self
+            .reverse_budget
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let fresh = budget
+            .0
+            .is_none_or(|start| now.saturating_duration_since(start) > Self::REVERSE_LOOKUP_WINDOW);
+        if fresh {
+            *budget = (Some(now), 0);
+        }
+        if budget.1 >= Self::REVERSE_LOOKUPS_PER_WINDOW {
+            return false;
+        }
+        budget.1 += 1;
+        true
     }
 
     /// One connection that left over the primary link: if we can name its
@@ -171,7 +241,7 @@ impl ConnectionObservationConsumer {
     /// wrong way.
     // `pub(super)` because the impl is split across files and the caller
     // is now another module.
-    pub(super) fn note_companion_in_use(&self, remote: IpAddr) {
+    pub(super) fn note_companion_in_use(&self, remote: IpAddr, owner: Option<&str>) {
         let (Some(name_of), Some(sink)) = (
             self.name_for_address.as_ref(),
             self.companion_in_use.as_ref(),
@@ -199,7 +269,7 @@ impl ConnectionObservationConsumer {
             // reverse lookup, and only if a routed site is actually in play:
             // on an idle machine every direct connection would queue a query
             // for nothing.
-            if self.beside_routed_traffic() {
+            if self.primary_egress_may_learn(owner) {
                 if let Some(learner) = self.reverse_dns_learner.as_ref() {
                     if is_learnable_endpoint(ip) {
                         // Not a drop at all — a flow that left over the primary
@@ -215,6 +285,6 @@ impl ConnectionObservationConsumer {
             }
             return;
         };
-        sink(&hostname);
+        sink(owner, &hostname);
     }
 }

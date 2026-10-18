@@ -259,6 +259,9 @@ fn plan_host_routes(
         if let Some(app) = rule.app_match.as_ref() {
             let pattern = match &app.pattern {
                 CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.as_str(),
+                // TODO: a path rule is enforced once the platform can list the
+                // programs of a folder; until then it routes nothing.
+                CanonicalAppPattern::Path(_) => continue,
             };
             for ip in gate.admit(pattern, link).admitted {
                 if !push_host_route(IpAddr::V4(ip), &egress, seen, out, &mut per_rule) {
@@ -278,6 +281,8 @@ fn plan_host_routes(
             }
             // Routed by `plan_network_routes`, which needs both links' networks.
             Some(CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_)) => {}
+            // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
+            Some(CanonicalAddressMatch::AnyZoneDomain(_)) => {}
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
                 for ip in capped_for_host(cache, host, families) {
                     if !steerable(ip) {
@@ -533,7 +538,8 @@ pub(super) fn note_address_resolution(
     let name = match addr_match {
         CanonicalAddressMatch::ExactIp(_)
         | CanonicalAddressMatch::Subnet(_)
-        | CanonicalAddressMatch::IpRange(_) => return,
+        | CanonicalAddressMatch::IpRange(_)
+        | CanonicalAddressMatch::AnyZoneDomain(_) => return,
         CanonicalAddressMatch::ExactFqdn(host) => host,
         CanonicalAddressMatch::SuffixDomain(suffix) => suffix,
         CanonicalAddressMatch::Zone(zone) => zone,

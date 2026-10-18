@@ -174,12 +174,25 @@ fn a_short_brand_token_earns_the_host_but_not_the_apex() {
     );
 }
 
-/// The other half: a token long enough to name an operator still speaks for
-/// the whole apex on its own, which is what the tier is for.
+/// The other half: a token long enough to name an operator still reaches the
+/// whole apex, once two of its hosts have earned it — never from one alone.
 #[test]
 fn a_full_brand_token_still_speaks_for_the_apex() {
+    let mut one = defaults();
+    two_visits(&mut one, "chatapp.example", &["static.chatapp.test"]);
+    assert!(
+        one.proposals(150_000, &NoExclusions)
+            .iter()
+            .all(|p| !matches!(p.proposed, ProposedCompanionMatch::SuffixDomain(_))),
+        "one brand host must not widen to the apex"
+    );
+
     let mut ledger = defaults();
-    two_visits(&mut ledger, "chatapp.example", &["static.chatapp.test"]);
+    two_visits(
+        &mut ledger,
+        "chatapp.example",
+        &["static.chatapp.test", "media.chatapp.test"],
+    );
 
     let proposals = ledger.proposals(150_000, &NoExclusions);
     assert!(
@@ -194,10 +207,10 @@ fn a_full_brand_token_still_speaks_for_the_apex() {
     );
 }
 
-/// Shared branding outranks the page context: `static.chatapp.test` is
-/// ChatApp's whoever's page happened to be loading.
+/// A shared name is no exemption from the page context: a fetch made while
+/// another site's page was loading is that page's, brand or not.
 #[test]
-fn brand_relation_is_not_overruled_by_the_page_context() {
+fn brand_relation_does_not_overrule_the_page_context() {
     let mut ledger = defaults();
     let anchor = CoActivityKind::Anchor { route: SECONDARY };
     for start in [0_u64, 100_000] {
@@ -214,14 +227,48 @@ fn brand_relation_is_not_overruled_by_the_page_context() {
     assert!(
         proposals
             .iter()
-            .any(|p| p.signal == CompanionSignal::BrandRelated
-                && p.proposed.value().contains("chatapp.test")),
-        "a brand match states ownership and needs no page context: {:?}",
+            .all(|p| !p.proposed.value().contains("chatapp.test")),
+        "another page's fetch was credited to the rule host: {:?}",
         proposals
             .iter()
             .map(|p| p.proposed.value())
             .collect::<Vec<_>>()
     );
+}
+
+/// A hostile page embeds a rule host of the user's and a look-alike of its
+/// brand on a domain of the page's own. Viewing the page, however often, must
+/// not turn the look-alike into a rule — let alone `*.apex` of it.
+#[test]
+fn a_hostile_page_cannot_plant_a_brand_companion() {
+    let mut ledger = defaults();
+    let anchor = CoActivityKind::Anchor { route: SECONDARY };
+    for start in [0_u64, 100_000, 200_000] {
+        ledger.observe(start, "www.attacker.test", CoActivityKind::Candidate);
+        ledger.observe(start + 1_000, "login.mybank.example", anchor);
+        ledger.observe(
+            start + 2_000,
+            "x.mybank-cdn.test",
+            CoActivityKind::Candidate,
+        );
+    }
+    let proposals = ledger.proposals(250_000, &NoExclusions);
+    assert!(
+        proposals
+            .iter()
+            .all(|p| !p.proposed.value().contains("mybank-cdn")),
+        "{:?}",
+        proposals
+            .iter()
+            .map(|p| p.proposed.value())
+            .collect::<Vec<_>>()
+    );
+
+    // One sighting on the rule host's own page is not a relationship either.
+    let mut once = defaults();
+    once.observe(0, "login.mybank.example", anchor);
+    once.observe(1_000, "x.mybank-cdn.test", CoActivityKind::Candidate);
+    assert!(once.proposals(50_000, &NoExclusions).is_empty());
 }
 
 #[test]

@@ -170,10 +170,15 @@ impl SecondaryRouteCoordinator {
         if present.is_empty() {
             return present;
         }
-        self.served_ranks
+        let ordered = self
+            .served_ranks
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .order(&present, Instant::now())
+            .order(&present, Instant::now());
+        earliest_signed_in_first(
+            ordered,
+            &self.sign_in_times.lock().unwrap_or_else(|p| p.into_inner()),
+        )
     }
 
     fn signed_in_users(&self, fresh: bool) -> Vec<String> {
@@ -186,14 +191,37 @@ impl SecondaryRouteCoordinator {
             }
         }
         let now = Instant::now();
+        let sign_ins = self.api.interactive_user_sign_ins();
+        {
+            let mut times = self.sign_in_times.lock().unwrap_or_else(|p| p.into_inner());
+            for (sid, at) in &sign_ins {
+                if let Some(at) = at {
+                    times.insert(sid.clone(), *at);
+                }
+            }
+        }
         let users = self
             .signed_in_memory
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .answer(self.api.interactive_user_sids(), now);
+            .answer(sign_ins.into_iter().map(|(sid, _)| sid).collect(), now);
+        // Times only for whoever is still answered, so the map stays small.
+        self.sign_in_times
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|sid, _| users.contains(sid));
         *cache = Some((now, users.clone()));
         users
     }
+}
+
+/// `ordered` (by how long the service has served each) re-ordered by when each
+/// signed in: the earliest first, a user with no known time after everyone
+/// with one, ties kept as served. The same rule as the route-table owner's
+/// [`crate::route_table_owner::choose_route_table_owner`].
+fn earliest_signed_in_first(mut ordered: Vec<String>, times: &HashMap<String, u64>) -> Vec<String> {
+    ordered.sort_by_key(|sid| times.get(sid).map_or((true, 0), |at| (false, *at)));
+    ordered
 }
 
 /// The served set as an [`ActivePrincipalSource`], so a per-user task covers
@@ -231,6 +259,22 @@ mod tests {
 
     fn sids(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A service restart loses who it served first; the sign-in times do not.
+    #[test]
+    fn the_earlier_sign_in_ranks_first_whatever_order_the_service_saw() {
+        let mut times = HashMap::new();
+        times.insert("B".to_string(), 1_000);
+        times.insert("A".to_string(), 5_000);
+        // The restarted service met A first.
+        let seen = ServedRanks::default().order(&sids(&["A", "B", "C"]), Instant::now());
+        assert_eq!(seen, sids(&["A", "B", "C"]));
+        assert_eq!(
+            earliest_signed_in_first(seen, &times),
+            sids(&["B", "A", "C"]),
+            "earliest sign-in first, an unknown time last"
+        );
     }
 
     #[test]

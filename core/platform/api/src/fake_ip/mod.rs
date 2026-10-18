@@ -45,7 +45,7 @@ pub use allocator::{
     FakeIpPoolConfig, LocalSubnet, PoolCollision, FAKE_IP_FIRST_HOST_INDEX, FAKE_IP_GATEWAY_INDEX,
     FAKE_IP_V4_BASE, FAKE_IP_V4_PREFIX_LEN, FAKE_IP_V6_BASE, FAKE_IP_V6_PREFIX_LEN,
 };
-pub use flow_owner::{FlowOwnerLookup, MockFlowOwnerLookup, NoopFlowOwnerLookup};
+pub use flow_owner::{FlowOwnerLookup, FlowTransport, MockFlowOwnerLookup, NoopFlowOwnerLookup};
 pub use scope::{FakeIpScope, FakeIpVerdict, RealIpReason};
 pub use stale_flows::{
     EstablishedFlow, MockStaleFlowReset, NoopStaleFlowReset, StaleFlowReset, StaleFlowSweep,

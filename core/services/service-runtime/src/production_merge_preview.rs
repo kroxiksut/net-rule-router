@@ -42,7 +42,6 @@ use nrr_shared::merge_dto::{
 };
 use nrr_shared::rules_json;
 use nrr_shared::RouteRole;
-use nrr_storage::revisions::RevisionsRepository;
 use rusqlite::Connection;
 
 /// One merge-preview request, borrowed from the decoded wire payload.
@@ -137,29 +136,21 @@ impl ProductionMergePreviewSource {
         }
     }
 
-    /// Resolve the caller's active [`CanonicalRuleBook`] (per-SID read-through
-    /// to baseline). No active revision anywhere ⇒ an empty book.
+    /// The caller's book in force, as the rules provider resolves it (a
+    /// revision mid-activation, their own, then the baseline). None anywhere
+    /// is an empty book.
     fn service_book(&self, principal: &str) -> Result<CanonicalRuleBook, MergePreviewError> {
         let guard = self
             .conn
             .lock()
             .map_err(|_| MergePreviewError::LockPoisoned)?;
-        let repo = RevisionsRepository::new(&guard);
-        let record = match repo
-            .get_active_for(principal)
-            .map_err(|e| MergePreviewError::StorageError(e.to_string()))?
-        {
-            Some(rec) => Some(rec),
-            None if principal != nrr_storage::BASELINE_PRINCIPAL => repo
-                .get_active_for(nrr_storage::BASELINE_PRINCIPAL)
-                .map_err(|e| MergePreviewError::StorageError(e.to_string()))?,
-            None => None,
-        };
-        match record {
-            Some(rec) => {
+        let book = crate::production_rules_provider::book_in_force_for(&guard, principal)
+            .map_err(MergePreviewError::StorageError)?;
+        match book {
+            Some(book) => {
                 let dto = crate::production_rules_provider::read_stored_rules(
-                    &rec.rules_json,
-                    &rec.revision_id,
+                    &book.rules_json,
+                    book.origin(),
                 )
                 .map_err(|e| MergePreviewError::ServiceDecodeError(format!("wire parse: {e}")))?;
                 let content =
@@ -295,6 +286,7 @@ fn type_and_value(rule: &CanonicalRule) -> (String, String) {
         match addr {
             CanonicalAddressMatch::ExactFqdn(v) => ("domain".to_string(), v.clone()),
             CanonicalAddressMatch::SuffixDomain(v) => ("domain".to_string(), format!("*.{v}")),
+            CanonicalAddressMatch::AnyZoneDomain(v) => ("domain".to_string(), format!("{v}.*")),
             CanonicalAddressMatch::Zone(v) => ("zone".to_string(), v.clone()),
             CanonicalAddressMatch::ExactIp(a) => ("exact-ip".to_string(), a.to_string()),
             CanonicalAddressMatch::Subnet(b) => ("subnet".to_string(), b.to_string()),

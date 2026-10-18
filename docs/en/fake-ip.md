@@ -29,7 +29,8 @@ no certificates are installed.
 
 Fake-IP builds on the **local DNS resolver (Mode B)** — it is the resolver that
 hands each site its private address — so it is available only when Mode B is
-selected. The checkbox is greyed out in the default reactive mode.
+selected. Mode B is the default; in the reactive mode the checkbox is greyed
+out.
 
 Delivering traffic addressed to those private addresses needs a virtual network
 adapter:
@@ -82,12 +83,13 @@ address and connects to the real one directly. Browsers are the common case.
 Two ways to close this gap:
 
 - Turn off DoH in the browser or app, so it uses the system resolver again.
-- Turn on **Block browser DoH/DoT** in Settings, which makes name resolution
-  fall back to plaintext DNS the resolver can serve.
+- Keep **Block browser DoH/DoT** on in Settings (it is on by default once you
+  have rules for the additional connection), which makes name resolution fall
+  back to plaintext DNS the resolver can serve.
 
 ## Turning it on
 
-Fake-IP is **off by default**. To enable it: Settings → Routing → turn on the
-local DNS resolver (Mode B), then tick **Route sites over virtual addresses
-(fake-IP)**. The change applies immediately; no restart of the background
+Fake-IP is **off by default**. To enable it: Settings → Routing → make sure the
+local DNS resolver (Mode B, the default) is selected, then tick **Route sites
+over virtual addresses (fake-IP)**. The change applies immediately; no restart of the background
 service is needed.

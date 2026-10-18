@@ -593,12 +593,16 @@ const UNREACHABLE_MAX_BYTES: usize = 96;
 /// (VPN self-heal) uses it to notice a VPN client reaching its server through
 /// the relay. Called on the poll thread, so an implementation must return
 /// promptly (off-load any I/O).
+///
+/// `owner` is the served user the flow is carried for, `None` for the routing
+/// user: what the flow teaches belongs to whoever opened it.
 pub trait FlowObserver: Send + Sync {
     fn on_flow_opened(
         &self,
         client: std::net::SocketAddr,
         fake: std::net::SocketAddr,
         hostname: &str,
+        owner: Option<&str>,
     );
 }
 
@@ -612,6 +616,7 @@ impl FlowObserver for NoopFlowObserver {
         _client: std::net::SocketAddr,
         _fake: std::net::SocketAddr,
         _hostname: &str,
+        _owner: Option<&str>,
     ) {
     }
 }
@@ -795,6 +800,14 @@ impl FakeIpStack {
     #[must_use]
     pub fn with_dial_time_resolution(mut self, enabled: bool) -> Self {
         self.relay.set_dial_time_resolution(enabled);
+        self
+    }
+
+    /// Carry each new flow for the user who opened it. The default treats
+    /// every flow as the routing user's.
+    #[must_use]
+    pub fn with_flow_owners(mut self, owners: Arc<dyn super::relay::FlowOwners>) -> Self {
+        self.relay.set_flow_owners(owners);
         self
     }
 
@@ -1282,7 +1295,8 @@ impl DialLogGate {
         let hostname = match refusal {
             RelayDecision::Relay { .. } => return,
             RelayDecision::NoUpstreamAddress { hostname }
-            | RelayDecision::OutOfScope { hostname, .. } => hostname.clone(),
+            | RelayDecision::OutOfScope { hostname, .. }
+            | RelayDecision::OwnerRefused { hostname, .. } => hostname.clone(),
             _ => String::new(),
         };
         if self.first(format!("refuse|{destination}|{slug}")) {

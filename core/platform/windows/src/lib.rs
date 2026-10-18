@@ -96,6 +96,9 @@ pub mod key_store;
 // Windows lowering of the neutral `EnforcementPlan` into WFP filters (see the
 // module doc).
 pub mod lower_windows;
+// The machine-scope environment for a process elevated on a user's behalf.
+#[cfg(windows)]
+pub mod machine_environment;
 pub mod network_change;
 /// The Windows `EnforcementBackend` — the neutral plan reconciled onto WFP.
 pub mod wfp_backend;
@@ -115,6 +118,9 @@ pub mod process_error_stream;
 // Process starts from ETW behind the neutral `ProcessLineagePort`: who launched
 // a blocked program.
 pub mod process_lineage;
+// The folders and search path a rule may not deny or route over the tunnel.
+#[cfg(windows)]
+pub mod protected_places;
 pub mod reachability;
 // ICMP echo with a chosen hop limit and source address.
 pub mod icmp_echo;
@@ -136,6 +142,9 @@ pub mod single_instance;
 pub mod stale_flows;
 // Local civil-time offset (traffic ledger keys rows by the user's local day).
 pub mod local_time;
+// A child's missing-DLL failure as an exit code rather than the system's box,
+// and the parent's own error box.
+pub mod loader_failure;
 pub mod system_info;
 /// Windows implementation of the system display-language probe.
 pub mod system_locale;

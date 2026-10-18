@@ -67,7 +67,7 @@ by itself.
 | `4` | Rules | The rule table with search and filter; add, change, delete, switch on and off; mark a rule *not sure* to have it checked on the primary route first; your folder of rule sets; import and export; applying your changes. `c` checks whether the primary route reaches the sites of your additional-route rules, and the answer shows beside each rule, so you can see which rules still do real work; `Shift+O` lists the sites the primary route does not reach first. `v` adds a rule for a VPN's gateway, so a VPN that may connect only from one network (a work VPN allowed only from abroad, say) always connects through the route you choose: it asks for the program and the route, lists the addresses that program connected to lately, and takes a number or an address you type |
 | `5` | Overlaps | Pairs of rules that cover the same traffic, and which route actually wins |
 | `6` | Suggested addresses | Accept or decline what the application suggests adding to your rules |
-| `7` | Connection trace | Recent connections and which route they took, with an explanation for any line. `o` opens the list of what was blocked while the additional route was down |
+| `7` | Connection trace | Recent connections and which route they took, with an explanation for any line. `o` opens the list of what was blocked while the additional route was down. `h` switches to your connection history — one line per program and destination, with how many times it connected — and `t` picks the period: the last hour, today or the last 7 days |
 | `8` | Cache | Names and the addresses they resolved to; search and clearing |
 | `9` | Diagnostics and logs | Service health, security alerts, the explanation for a host, the log, exporting the diagnostic archive |
 | `0` | Settings | Notifications, routing behaviour, service management, presets, logs and retention, and the other service-side settings the application has. In the menu, Settings opens into its sections, so the arrows take you straight to the one you need |
@@ -101,10 +101,12 @@ a number and press `Enter`; `h` or `?` prints the help, `q` quits.
   Windows console, and with Orca, Speakup or BRLTTY on Linux. Nothing jumps
   around the screen; every change arrives as a new line to be read.
 - **Colour is never the only carrier of meaning.** Every state has a word —
-  "active", "limited", "error" — and colour only repeats it. With `--no-color`
-  or `NO_COLOR` nothing is lost.
-- **Focus is visible without colour:** the selected line is marked and shown in
-  reverse.
+  "active", "limited", "error" — and colour only repeats it; the main and the
+  additional connection are told apart by name, colour only helps the eye. Only
+  the terminal's own named colours are used, so the screen follows your terminal
+  theme, light or dark. With `--no-color` or `NO_COLOR` nothing is lost.
+- **Focus is visible without colour:** the selected line is marked with `>` and
+  shown in bold.
 - **No frame line carries meaning on its own.** Panels have text headings, and
   `--ascii` replaces the frames with plain characters.
 - **Nothing is timed.** No question disappears or answers itself, and every
@@ -117,12 +119,18 @@ a number and press `Enter`; `h` or `?` prints the help, `q` quits.
 
 - **Your own rules need no administrator rights.** Edit and apply them from an
   ordinary terminal; they apply to you.
-- **The shared baseline** that every user on the machine starts from, and
-  **managing the service** — install, start, stop — need an administrator
-  terminal on Windows, or `sudo nrr-tui` on Linux. Without those rights the
-  interface tells you so in words and shows the command that does it; it does
-  not pop up an elevation prompt of its own, because over SSH there is no
-  desktop to show one on.
+- **The Rules screen edits one set at a time**, and its title says which:
+  your own rules, or the baseline every user without rules of their own
+  follows. Press `b` to switch (in line mode, type `b`). Suggestions, the
+  main-route check and moving `?` rules change your own rules, so they wait
+  until your rules are on screen.
+- **The shared baseline**, settings of the whole computer, and **managing the
+  service** — install, start, stop — need an administrator. On Windows start
+  `nrr-tui` from a terminal opened with *Run as administrator*. On Linux
+  `nrr-tui` asks for the administrator's password right in the terminal, over
+  SSH too; under `sudo` the baseline is on screen from the start. In line mode
+  (`--plain`) there is no password prompt: the interface shows the `sudo`
+  command instead.
 - When the service is not installed or not running, the interface says which,
   shows the exact `nrr-cli` command that fixes it, and keeps checking until the
   service answers. In the meantime it shows only what it already knows and does

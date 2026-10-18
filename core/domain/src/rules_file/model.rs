@@ -120,6 +120,20 @@ impl RulesFileSection {
         }
     }
 
+    /// The rule type this section's values are written in, whatever host reads
+    /// the file: a `--- Windows` path is spelled the same on a Linux host.
+    pub const fn rule_type(self) -> nrr_shared::preset_parser::ParsedRuleType {
+        use nrr_shared::preset_parser::ParsedRuleType;
+        match self {
+            Self::Zones => ParsedRuleType::Zone,
+            Self::Domains | Self::Auto => ParsedRuleType::Domain,
+            Self::Ip => ParsedRuleType::ExactIp,
+            Self::Cidr => ParsedRuleType::Subnet,
+            Self::Ranges => ParsedRuleType::IpRange,
+            Self::Windows | Self::Linux | Self::MacOS => ParsedRuleType::Application,
+        }
+    }
+
     /// Parses a section header line of the form `--- SectionName`.
     ///
     /// Returns `None` if the line is not a section header or the section name
@@ -156,13 +170,18 @@ impl RulesFileSection {
     /// `true` for the section whose entries are authored by the application
     /// rather than by the user.
     ///
-    /// Entries here are the only ones that carry a
-    /// [`RulesFileEntry::origin`] — the parser reads the provenance tokens in
-    /// this section and nowhere else, so an inline comment that happens to
-    /// start with `auto:` in a user's own `--- Domains` list stays an ordinary
-    /// comment.
+    /// A domain rule the application wrote lives here and carries its
+    /// [`RulesFileEntry::origin`]; an entry here without one is reported.
     pub const fn is_app_authored(self) -> bool {
         matches!(self, Self::Auto)
+    }
+
+    /// Sections whose entries may carry a [`RulesFileEntry::origin`]: `Auto`,
+    /// and the application sections, where an app-authored rule keeps its own
+    /// section. An inline comment starting with `auto:` in `--- Domains` stays
+    /// an ordinary comment.
+    pub const fn carries_provenance(self) -> bool {
+        matches!(self, Self::Auto | Self::Windows | Self::Linux | Self::MacOS)
     }
 
     /// `true` for the sections whose values are host names or single
@@ -217,6 +236,25 @@ impl HostPlatform {
             Self::Linux | Self::MacOS => nrr_shared::app_identity::ExecutableNaming::AsNamed,
         }
     }
+
+    /// How this platform spells and compares the paths application rules
+    /// name.
+    pub const fn path_style(self) -> nrr_shared::app_path::PathStyle {
+        match self {
+            Self::Windows => nrr_shared::app_path::PathStyle::Windows,
+            Self::Linux => nrr_shared::app_path::PathStyle::Linux,
+            Self::MacOS => nrr_shared::app_path::PathStyle::MacOS,
+        }
+    }
+
+    /// The section this platform's application rules are written in.
+    pub const fn app_section(self) -> RulesFileSection {
+        match self {
+            Self::Windows => RulesFileSection::Windows,
+            Self::Linux => RulesFileSection::Linux,
+            Self::MacOS => RulesFileSection::MacOS,
+        }
+    }
 }
 
 // ── RulesFileEntry ────────────────────────────────────────────────────────────
@@ -232,8 +270,8 @@ pub struct RulesFileEntry {
     /// `true` = rule is active (uncommented line in file).
     /// `false` = rule is disabled (`# match_value` in file).
     pub enabled: bool,
-    /// `true` when the line carried the `+block` flag: matching traffic is
-    /// dropped (hard WFP block) regardless of which file the rule lives in.
+    /// `true` when the value carried the `!` prefix (`!example.com`): matching
+    /// traffic is dropped regardless of which file the rule lives in.
     pub blocked: bool,
     /// `true` when the value carried the `?` prefix (`?example.com`): check
     /// that the route of this file works for it. Read in the domain and

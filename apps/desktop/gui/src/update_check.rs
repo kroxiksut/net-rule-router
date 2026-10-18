@@ -37,20 +37,30 @@ pub struct UpdateCheckCache {
     pub html_url: String,
 }
 
-/// The cache file, next to the launcher logs in `%TEMP%\NetRuleRouter`.
-pub fn cache_path() -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(nrr_shared::product_identity::PRODUCT_NAME);
-    path.push("update-check.json");
-    path
+/// The cache file, in this user's own application folder. Never the temp
+/// directory: off Windows that is `/tmp`, shared by every account, and another
+/// user's file there would choose the link this window offers. `None` when
+/// the user has no such folder; the check then keeps no cache.
+pub fn cache_path() -> Option<PathBuf> {
+    let temp = std::env::temp_dir();
+    nrr_shared::user_paths::user_app_roots()
+        .into_iter()
+        .find(|root| !root.starts_with(&temp))
+        .map(|root| root.join("update-check.json"))
 }
+
+/// Largest cache read: four short fields.
+const MAX_CACHE_BYTES: u64 = 16 * 1024;
 
 /// Read the cache; a missing/corrupt file is an empty cache (never an error —
 /// the check is strictly best-effort).
 pub fn read_cache() -> UpdateCheckCache {
-    std::fs::read_to_string(cache_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+    use std::io::Read;
+    let mut text = String::new();
+    let read = cache_path()
+        .and_then(|path| std::fs::File::open(path).ok())
+        .and_then(|file| file.take(MAX_CACHE_BYTES).read_to_string(&mut text).ok());
+    read.and_then(|_| serde_json::from_str(&text).ok())
         .unwrap_or_default()
 }
 
@@ -125,15 +135,31 @@ pub fn interpret_release(cache: &UpdateCheckCache, current_version: &str) -> Rel
     }
 }
 
-/// The only thing a release link may be: an HTTPS page under the repository in
-/// [`RELEASES_REPO`].
+/// The only thing a release link may be: an HTTPS page under `releases` of
+/// the repository in [`RELEASES_REPO`] on `github.com`.
 ///
-/// A prefix test rather than a URL parse: the set of acceptable links has
-/// exactly one shape, and a parser would answer a question nobody asked while
-/// adding a dependency to a module that deliberately has none.
+/// A prefix alone is not that: the browser resolves `..` and its encodings, so
+/// `https://github.com/<repo>/../../someone/else` leaves the repository. The
+/// path is read segment by segment, and anything a browser could reinterpret —
+/// dot segments, escapes, backslashes, a query or a fragment — refuses it.
 fn release_url_is_trusted(url: &str) -> bool {
-    let expected = format!("https://github.com/{RELEASES_REPO}/");
-    url.starts_with(&expected)
+    let Some(path) = url.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let mut segments = path.split('/');
+    let repo_matches = RELEASES_REPO
+        .split('/')
+        .all(|expected| segments.next() == Some(expected));
+    if !repo_matches || segments.next() != Some("releases") {
+        return false;
+    }
+    segments.all(|segment| {
+        segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+'))
+    })
 }
 
 /// Parses `MAJOR.MINOR.PATCH[-prerelease]` (leading `v`/`V` and `+build`
@@ -302,6 +328,13 @@ mod tests {
             "http://github.com/kroxiksut/net-rule-router/releases/tag/v9.9.9",
             "https://github.com.evil.test/kroxiksut/net-rule-router/",
             "https://github.com/someone-else/net-rule-router/releases",
+            "https://github.com/kroxiksut/net-rule-router/../../attacker/net-rule-router/releases",
+            "https://github.com/kroxiksut/net-rule-router/releases/../../../attacker/x",
+            "https://github.com/kroxiksut/net-rule-router/releases/%2e%2e/%2e%2e/attacker",
+            "https://github.com/kroxiksut/net-rule-router/releases/tag\\..\\..\\attacker",
+            "https://github.com/kroxiksut/net-rule-router/releases/tag/v9?next=//evil.test",
+            "https://github.com/kroxiksut/net-rule-router/wiki/evil",
+            "https://github.com/kroxiksut/net-rule-router-evil/releases/tag/v9.9.9",
             "",
         ] {
             assert!(
@@ -315,6 +348,17 @@ mod tests {
             "0.1.0",
         )
         .is_some());
+    }
+
+    #[test]
+    fn the_cache_never_lives_in_the_shared_temp_directory() {
+        if let Some(path) = cache_path() {
+            assert!(
+                !path.starts_with(std::env::temp_dir()),
+                "{}",
+                path.display()
+            );
+        }
     }
 
     #[test]

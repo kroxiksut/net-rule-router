@@ -196,10 +196,15 @@ fn matched_conflict(decision: &RequestedRouteDecision) -> Option<ConflictMarker>
     }
 }
 
-// ── app_pattern_matches (glob) ───────────────────────────────────────────
+// ── app_match_specificity (glob) ─────────────────────────────────────────
 
 fn glob_names(pattern: &str, process: &str) -> bool {
-    app_pattern_matches(&CanonicalAppPattern::Glob(pattern.to_owned()), process)
+    let identity = NormalizedAppIdentity {
+        process_name: process.to_owned(),
+        original_path: None,
+        warnings: Vec::new(),
+    };
+    app_match_specificity(&CanonicalAppPattern::Glob(pattern.to_owned()), &identity).is_some()
 }
 
 #[test]
@@ -979,6 +984,163 @@ fn application_exact_beats_glob() {
     );
     assert_eq!(matched_rule_id(&d), Some("r-exact"));
     assert_eq!(matched_specificity(&d), Some(SpecificityScore::APP_EXACT));
+}
+
+fn app_path(raw: &str, style: nrr_shared::app_path::PathStyle) -> CanonicalAppMatch {
+    CanonicalAppMatch {
+        pattern: CanonicalAppPattern::Path(Box::new(
+            nrr_shared::app_path::AppPath::parse(raw, style).expect("a path"),
+        )),
+        include_child_processes: false,
+    }
+}
+
+fn win_path(raw: &str) -> CanonicalAppMatch {
+    app_path(raw, nrr_shared::app_path::PathStyle::Windows)
+}
+
+/// The application rule that wins for `image`, written as the caller that
+/// knows the image path passes it.
+fn app_winner(
+    primary: Vec<CanonicalRule>,
+    secondary: Vec<CanonicalRule>,
+    image: &str,
+) -> Option<String> {
+    let rb = book(primary, secondary);
+    let input = normalize_runtime_input(&runtime_input_for("example.com", None, Some(image)));
+    let d = match_rules(
+        &input,
+        &empty_lookup(),
+        &rb,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    matched_rule_id(&d).map(str::to_owned)
+}
+
+/// Full path, then exact name, then folder (deeper first, "this folder only"
+/// before "with subfolders"), then name glob.
+#[test]
+fn the_application_tier_orders_path_name_folder_glob() {
+    let image = r"C:\Apps\Tool\bin\tool.exe";
+    let all = || {
+        vec![
+            rule("r-glob", None, Some(app_glob("too*"))),
+            rule("r-tree-1", None, Some(win_path(r"C:\Apps\*"))),
+            rule("r-tree-2", None, Some(win_path(r"C:\Apps\Tool\*"))),
+            rule("r-tree-3", None, Some(win_path(r"C:\Apps\Tool\bin\*"))),
+            rule("r-only-3", None, Some(win_path(r"C:\Apps\Tool\bin\"))),
+            rule("r-name", None, Some(app_exact("tool.exe"))),
+            rule("r-file", None, Some(win_path(r"C:\Apps\Tool\bin\tool.exe"))),
+        ]
+    };
+    let mut rules = all();
+    for expected in [
+        "r-file", "r-name", "r-only-3", "r-tree-3", "r-tree-2", "r-tree-1", "r-glob",
+    ] {
+        assert_eq!(
+            app_winner(rules.clone(), vec![], image).as_deref(),
+            Some(expected)
+        );
+        rules.retain(|r| r.id.as_str() != expected);
+    }
+    assert_eq!(app_winner(rules, vec![], image), None);
+}
+
+/// A rule on the other route does not change the order: the narrower one wins
+/// wherever it is written.
+#[test]
+fn a_narrower_folder_on_the_other_route_wins() {
+    let image = r"C:\Apps\Tool\tool.exe";
+    let winner = app_winner(
+        vec![rule("r-wide", None, Some(win_path(r"C:\Apps\*")))],
+        vec![rule("r-narrow", None, Some(win_path(r"C:\Apps\Tool\")))],
+        image,
+    );
+    assert_eq!(winner.as_deref(), Some("r-narrow"));
+}
+
+/// "This folder only" does not reach a subfolder; a file rule names one file.
+#[test]
+fn a_folder_only_rule_does_not_reach_below_it() {
+    let image = r"C:\Apps\Tool\bin\tool.exe";
+    assert_eq!(
+        app_winner(
+            vec![rule("r-only", None, Some(win_path(r"C:\Apps\Tool\")))],
+            vec![],
+            image
+        ),
+        None
+    );
+    assert_eq!(
+        app_winner(
+            vec![rule(
+                "r-file",
+                None,
+                Some(win_path(r"C:\Apps\Tool\bin\other.exe"))
+            )],
+            vec![],
+            image
+        ),
+        None
+    );
+}
+
+/// A caller that knows only the name gets name rules; path rules need the
+/// image path.
+#[test]
+fn a_path_rule_needs_the_image_path() {
+    let rules = vec![rule("r-tree", None, Some(win_path(r"C:\Apps\*")))];
+    assert_eq!(app_winner(rules.clone(), vec![], "tool.exe"), None);
+    assert_eq!(
+        app_winner(rules, vec![], r"C:\Apps\tool.exe").as_deref(),
+        Some("r-tree")
+    );
+}
+
+/// A Linux path without a trailing slash is a file or a folder until the
+/// service looks: it matches either way, and as the file it is the narrower
+/// rule. Linux compares case exactly.
+#[test]
+fn an_undecided_linux_path_matches_as_a_file_or_a_folder() {
+    let linux = |raw: &str| app_path(raw, nrr_shared::app_path::PathStyle::Linux);
+    let rules = || {
+        vec![
+            rule("r-dir", None, Some(linux("/opt/tool"))),
+            rule("r-file", None, Some(linux("/opt/tool/run"))),
+        ]
+    };
+    assert_eq!(
+        app_winner(rules(), vec![], "/opt/tool/run").as_deref(),
+        Some("r-file")
+    );
+    assert_eq!(
+        app_winner(rules(), vec![], "/opt/tool/helper").as_deref(),
+        Some("r-dir")
+    );
+    assert_eq!(app_winner(rules(), vec![], "/opt/Tool/helper"), None);
+}
+
+/// `+children` and `!` are the rule's own, not the path's: a deny by folder
+/// is a deny.
+#[test]
+fn a_deny_by_folder_is_a_block() {
+    let mut deny = rule("r-deny", None, Some(win_path(r"C:\Apps\*")));
+    deny.action = crate::canonical::RuleAction::Block;
+    let rb = book(vec![deny], vec![]);
+    let input = normalize_runtime_input(&runtime_input_for(
+        "example.com",
+        None,
+        Some(r"C:\Apps\tool.exe"),
+    ));
+    let d = match_rules(
+        &input,
+        &empty_lookup(),
+        &rb,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    assert_eq!(matched_rule_id(&d), Some("r-deny"));
 }
 
 #[test]

@@ -1,11 +1,12 @@
 //! Privacy filtering and redaction.
 //!
-//! # Two components
+//! # Components
 //!
 //! | Module   | Responsibility                                               |
 //! |----------|--------------------------------------------------------------|
 //! | `mode`   | `RedactionMode` and its conversions                          |
 //! | `redact` | `Redacted<T>`, redaction markers, per-field helper functions |
+//! | `path_scrub` | Absolute paths inside free text, masked whole          |
 //!
 //! # Unified policy
 //!
@@ -15,6 +16,7 @@
 //! (log writer) automatically via `From` impls.
 
 pub mod mode;
+pub mod path_scrub;
 pub mod redact;
 
 pub use mode::RedactionMode;

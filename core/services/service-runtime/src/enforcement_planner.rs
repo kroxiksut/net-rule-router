@@ -346,6 +346,9 @@ pub fn plan_route_rules_with_shapes(
             } else if let Some(app) = rule.app_match.as_ref() {
                 let pattern = match &app.pattern {
                     CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.as_str(),
+                    // TODO: a path rule is enforced once the platform can list
+                    // the programs of a folder; until then it applies nothing.
+                    CanonicalAppPattern::Path(_) => continue,
                 };
                 // Per-exe-path ALE_APP_ID filters (slots 0..APP_PATH_FANOUT_CAP).
                 // No remote IP → DstMatch::Any; no packet mirror (the packet
@@ -489,6 +492,8 @@ fn for_each_target(
             families,
             &mut visit,
         ),
+        // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
+        CanonicalAddressMatch::AnyZoneDomain(_) => {}
     }
 }
 

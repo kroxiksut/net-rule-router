@@ -5,6 +5,7 @@
 //! refresh; the client fills it from the user's bindings before asking
 //! [`held_other_role`] or [`offered_for_role`].
 
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc_payloads::{InterfaceRowDto, RouteBindingDto};
 use nrr_shared::product_identity::TUN_ADAPTER_NAME;
 
@@ -112,17 +113,19 @@ pub fn can_carry_traffic_out(row: &InterfaceRowDto) -> bool {
 
 /// How an adapter reads to a user everywhere it is named
 /// (`adapterDisplayName`): the connection name the user knows, then the
-/// driver description when it adds something.
+/// driver description when it adds something. Both are the OS's text, so the
+/// result goes through [`display_text`]; it is never a key.
 pub fn display_name(row: &InterfaceRowDto) -> String {
     let name = js::trim(&row.name);
     let description = js::trim(&row.interface_description);
-    if name.is_empty() {
+    let joined = if name.is_empty() {
         description.to_owned()
     } else if description.is_empty() || description == name {
         name.to_owned()
     } else {
         format!("{name} \u{2014} {description}")
-    }
+    };
+    display_text(&joined).into_owned()
 }
 
 /// The hint beside an adapter's kind (`adapterRoleHintSlug`). A tunnel gets
@@ -173,4 +176,36 @@ pub fn bound_row_index(rows: &[InterfaceRowDto], binding: &RouteBindingDto) -> O
     };
     rows.iter()
         .position(|row| names(&row.persistent_id) || names(&row.adapter_name))
+}
+
+/// The main-connection binding a confirmed suggestion writes
+/// (`suggestedPrimaryBinding`): the one row whose connection name or driver
+/// description is `name`, ASCII case aside. `None` when no row or more than one
+/// answers to it — the choice then goes to the interfaces screen.
+pub fn suggested_primary_binding(rows: &[InterfaceRowDto], name: &str) -> Option<RouteBindingDto> {
+    let wanted = name.trim();
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut answering = rows.iter().filter(|row| {
+        row.name.trim().eq_ignore_ascii_case(wanted)
+            || row
+                .interface_description
+                .trim()
+                .eq_ignore_ascii_case(wanted)
+    });
+    let row = match (answering.next(), answering.next()) {
+        (Some(only), None) => only,
+        _ => return None,
+    };
+    if row.persistent_id.is_empty() {
+        return None;
+    }
+    let shown = row.name.trim();
+    Some(RouteBindingDto {
+        stable_id: row.persistent_id.clone(),
+        display_name: if shown.is_empty() { wanted } else { shown }.to_owned(),
+        user_confirmed: true,
+        known_stable_ids: Vec::new(),
+    })
 }

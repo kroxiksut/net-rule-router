@@ -27,6 +27,8 @@
 //! |------|------|---------------|
 //! | `nrr_fqdn_ip_cache.db` | Rebuildable | Delete + rebuild |
 //! | `nrr_service_state.db` | Service-critical | Reported at boot, then rolled back to a trusted earlier revision |
+//! | `nrr_traffic_stats.db` | Rebuildable | Delete + rebuild |
+//! | `nrr_conn_history.db` | Rebuildable | Delete + rebuild |
 //!
 //! See [`profile`] for path resolution and [`repository`] for the trait
 //! interfaces.
@@ -43,11 +45,15 @@ pub mod block_notice_journal;
 pub mod block_notice_mutes;
 pub mod bootstrap;
 pub mod change_generation;
+// Connection history over the rebuildable nrr_conn_history.db, and each
+// user's choices about it in the state DB.
+pub mod conn_history;
 pub mod doh_lockdown;
 pub mod dto;
 pub mod error;
 pub mod explain;
 pub mod explain_snapshots;
+pub mod install_policy;
 pub mod local_dns_suffixes;
 pub mod local_network_rules;
 pub mod log_retention_config;
@@ -91,13 +97,17 @@ pub use autostart_state::{
 };
 pub use backup::{backup_database, BackupReason};
 pub use bootstrap::{bootstrap_storage_directories, StorageBootstrapResult};
+pub use conn_history::{
+    ConnHistoryEntry, ConnHistoryPrefs, ConnHistoryPrefsRepository, ConnHistoryQuery,
+    ConnHistoryRow, SqliteConnHistoryStore,
+};
 pub use dto::CacheStats;
 pub use error::{IntegrityFailureKind, StorageError, StorageResult};
 pub use explain::DiagnosticRedactionLevel;
 pub use log_retention_config::{LogRetentionConfig, LogRetentionConfigRepository};
 pub use migration::{
-    open_connection, open_traffic_connection_or_rebuild, read_schema_version,
-    SqliteMigrationRunner, TrafficDbOpen,
+    open_conn_history_connection_or_rebuild, open_connection, open_traffic_connection_or_rebuild,
+    read_schema_version, rebuild_conn_history_db, SqliteMigrationRunner, TrafficDbOpen,
 };
 pub use mutation_tokens::{ConsumeOutcome, MutationTokenStoreSqlite, StoredMutationToken};
 pub use pause_state::{RoutingPauseRecord, RoutingPauseStateRepository};

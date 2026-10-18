@@ -765,6 +765,84 @@ fn cache_entries_carry_expected_route_when_expectation_wired() {
     assert_eq!(items[1]["expected_route"], "secondary");
 }
 
+/// Two users' names share one cache: each sees only what their own rules
+/// cover, judged by their own book; an administrator sees every name.
+#[test]
+fn cache_entries_show_each_user_only_their_own_names() {
+    use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
+    use crate::per_sid_orchestrator::ActiveRulesSnapshot;
+    use nrr_domain::canonical::{
+        CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
+    };
+    use nrr_domain::user_principal::UserPrincipal;
+    use nrr_domain::RuleId;
+
+    const ALICE: &str = "S-1-5-21-100-1001";
+    const BOB: &str = "S-1-5-21-100-1002";
+    struct TwoBooks;
+    impl RulesProvider for TwoBooks {
+        fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+            None
+        }
+        fn active_rules_for(&self, principal: &str) -> Option<ActiveRulesSnapshot> {
+            let suffix = match principal {
+                ALICE => "example.com",
+                BOB => "other.example.net",
+                _ => return None,
+            };
+            let rule = CanonicalRule {
+                id: RuleId(format!("r-{principal}")),
+                enabled: true,
+                address_match: Some(CanonicalAddressMatch::SuffixDomain(suffix.into())),
+                app_match: None,
+                comment: String::new(),
+                action: nrr_domain::RuleAction::Route,
+                origin: None,
+            };
+            Some(ActiveRulesSnapshot {
+                rule_book: CanonicalRuleBook {
+                    primary: CanonicalRuleSet::from_rules(vec![]),
+                    secondary: CanonicalRuleSet::from_rules(vec![rule]),
+                },
+            })
+        }
+    }
+    let h = CacheEntriesListHandler::new(seeded_cache()).with_route_expectation(
+        Arc::new(TwoBooks),
+        Arc::new(MockFqdnCacheLookup::new()),
+        Arc::new(|| Some(ALICE.to_string())),
+    );
+    let names = |principal: &str, elevated: bool| -> Vec<String> {
+        let ctx = ctx_for(UserPrincipal::from_windows_sid(principal).ok(), elevated);
+        let v = h
+            .handle(&envelope(serde_json::json!({})), &ctx)
+            .expect("ok");
+        v["page"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|i| i["hostname"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    assert_eq!(names(ALICE, false), vec!["sub.example.com".to_string()]);
+    assert_eq!(names(BOB, false), vec!["api.other.example.net".to_string()]);
+    assert_eq!(
+        names(BOB, true).len(),
+        2,
+        "an administrator sees every name"
+    );
+
+    // Bob's route column is judged by Bob's book, not the routing user's.
+    let ctx = ctx_for(UserPrincipal::from_windows_sid(BOB).ok(), true);
+    let v = h
+        .handle(&envelope(serde_json::json!({})), &ctx)
+        .expect("ok");
+    let items = v["page"]["items"].as_array().expect("items");
+    assert_eq!(items[0]["hostname"], "api.other.example.net");
+    assert_eq!(items[0]["expected_route"], "secondary");
+    assert_eq!(items[1]["expected_route"], "");
+}
+
 #[test]
 fn cache_entries_expected_route_empty_without_expectation() {
     let h = CacheEntriesListHandler::new(seeded_cache());
@@ -1010,7 +1088,7 @@ fn diagnostics_redaction_level_ships_the_extra_sections() {
         let mut names = Vec::new();
         for i in 0..zip.len() {
             let mut e = zip.by_index(i).expect("entry");
-            let n = e.name().to_string();
+            let n = e.name().expect("entry name").to_string();
             if n == "manifest.json" {
                 // Provenance is embedded — non-empty profile at minimum.
                 let mut body = String::new();

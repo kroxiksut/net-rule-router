@@ -83,7 +83,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 if let Some(stability) = deps.service_stability_provider.clone() {
                     handler = handler.with_stability_provider(stability);
                 }
-                registry.register(op, handler);
+                registry.register_checked(op, handler);
             }
             IpcOperationName::OperationStatusGet => {
                 registry.register(op, OperationStatusHandler::new(deps.operations.clone()));
@@ -98,13 +98,13 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 if let Some(stability) = deps.service_stability_provider.clone() {
                     handler = handler.with_stability_provider(stability);
                 }
-                registry.register(op, handler);
+                registry.register_checked(op, handler);
             }
             IpcOperationName::InterfacesRefreshRequest => {
                 registry.register(op, InterfacesRefreshHandler::new(deps.adapters.clone()));
             }
             IpcOperationName::ProductImpactDisableTemporary => {
-                registry.register(
+                registry.register_checked(
                     op,
                     ProductImpactDisableTemporaryHandler::new(
                         deps.mutation_executor.clone(),
@@ -134,8 +134,11 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             IpcOperationName::RulesList => {
                 registry.register(op, RulesListHandler::new(deps.rules.clone()));
             }
+            IpcOperationName::RulesRecentChangesList => {
+                registry.register(op, RulesRecentChangesHandler::new(deps.rules.clone()));
+            }
             IpcOperationName::RoutePolicyUpdate => {
-                registry.register(
+                registry.register_checked(
                     op,
                     RoutePolicyUpdateHandler::new(
                         deps.route_policy_writer.clone(),
@@ -147,7 +150,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 // Real handler only when the state-DB-backed
                 // writer is wired; a degraded boot keeps the stub.
                 if let Some(writer) = deps.link_provider_writer.clone() {
-                    registry.register(
+                    registry.register_checked(
                         op,
                         RouteLinkProviderSetHandler::new(
                             writer,
@@ -155,45 +158,45 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                         ),
                     );
                 } else {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             }
             IpcOperationName::DohResolversGet => {
                 if let Some(store) = deps.doh_resolver_store.clone() {
                     registry.register(op, DohResolversGetHandler::new(store));
                 } else {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             }
             IpcOperationName::DohResolversSet => {
                 if let Some(store) = deps.doh_resolver_store.clone() {
-                    registry.register(
+                    registry.register_checked(
                         op,
                         DohResolversSetHandler::new(store, deps.route_policy_apply_trigger.clone()),
                     );
                 } else {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             }
             IpcOperationName::LocalDnsSuffixesGet => {
                 if let Some((store, context)) = deps.local_dns_suffixes.clone() {
                     registry.register(op, LocalDnsSuffixesGetHandler::new(store, context));
                 } else {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             }
             IpcOperationName::LocalDnsSuffixesSet => {
                 if let Some((store, context)) = deps.local_dns_suffixes.clone() {
-                    registry.register(op, LocalDnsSuffixesSetHandler::new(store, context));
+                    registry.register_checked(op, LocalDnsSuffixesSetHandler::new(store, context));
                 } else {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             }
             IpcOperationName::SeedFromBrowserHistory => {
                 if let Some(seeder) = deps.browser_history_seeder.clone() {
-                    registry.register(op, SeedFromBrowserHistoryHandler::new(seeder));
+                    registry.register_checked(op, SeedFromBrowserHistoryHandler::new(seeder));
                 } else {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             }
             IpcOperationName::MigrationStatusGet => {
@@ -203,7 +206,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 );
             }
             IpcOperationName::MigrationMarkComplete => {
-                registry.register(
+                registry.register_checked(
                     op,
                     MigrationMarkCompleteHandler::new(deps.migration_completion.clone()),
                 );
@@ -213,7 +216,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 registry.register(op, RetentionSettingsGetHandler::new(deps.retention.clone()));
             }
             IpcOperationName::RetentionSettingsSet => {
-                registry.register(
+                registry.register_checked(
                     op,
                     RetentionSettingsSetHandler::new(
                         deps.retention_writer.clone(),
@@ -229,7 +232,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 );
             }
             IpcOperationName::LogRetentionConfigSet => {
-                registry.register(
+                registry.register_checked(
                     op,
                     LogRetentionConfigSetHandler::new(
                         deps.log_retention_writer.clone(),
@@ -244,7 +247,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 );
             }
             IpcOperationName::ApplyFailurePolicySet => {
-                registry.register(
+                registry.register_checked(
                     op,
                     ApplyFailurePolicySetHandler::new(
                         deps.apply_failure_policy_writer.clone(),
@@ -259,7 +262,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 registry.register(op, RoutingPauseGetHandler::new(deps.routing_pause.clone()));
             }
             IpcOperationName::RoutingPauseToggle => {
-                registry.register(
+                registry.register_checked(
                     op,
                     RoutingPauseToggleHandler::new(deps.routing_pause_writer.clone()),
                 );
@@ -268,7 +271,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 registry.register(op, AutostartGetHandler::new(deps.autostart.clone()));
             }
             IpcOperationName::AutostartToggle => {
-                registry.register(
+                registry.register_checked(
                     op,
                     AutostartToggleHandler::new(deps.autostart_writer.clone()),
                 );
@@ -303,7 +306,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             IpcOperationName::DiagnosticsExportArchive => {
                 match (deps.archives_dir.clone(), deps.app_version.clone()) {
                     (Some(dir), Some(ver)) => {
-                        registry.register(
+                        registry.register_checked(
                             op,
                             diagnostics_handlers::DiagnosticsExportArchiveHandler::new(
                                 deps.diagnostics.clone(),
@@ -320,7 +323,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                         );
                     }
                     _ => {
-                        registry.register(op, UnimplementedHandler::new(op));
+                        registry.register_checked(op, UnimplementedHandler::new(op));
                     }
                 }
             }
@@ -335,7 +338,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                         );
                     }
                     None => {
-                        registry.register(op, UnimplementedHandler::new(op));
+                        registry.register_checked(op, UnimplementedHandler::new(op));
                     }
                 }
             }
@@ -347,7 +350,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     deps.service_stability_provider.clone(),
                 ) {
                     (Some(writer), Some(provider)) => {
-                        registry.register(
+                        registry.register_checked(
                             op,
                             service_stability_handlers::ServiceStabilityConfigSetHandler::new(
                                 writer, provider,
@@ -355,14 +358,14 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                         );
                     }
                     _ => {
-                        registry.register(op, UnimplementedHandler::new(op));
+                        registry.register_checked(op, UnimplementedHandler::new(op));
                     }
                 }
             }
             // Real LogsClear handler. The facade
             // is always present (mock or production); no dep gate.
             IpcOperationName::LogsClear => {
-                registry.register(
+                registry.register_checked(
                     op,
                     diagnostics_handlers::LogsClearHandler::new(deps.diagnostics.clone()),
                 );
@@ -380,10 +383,10 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     if let Some(port) = deps.dns_cache_control.clone() {
                         handler = handler.with_dns_cache_control(port);
                     }
-                    registry.register(op, handler);
+                    registry.register_checked(op, handler);
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             // CacheEntriesList (read-only cache viewer). Gated
@@ -411,7 +414,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, handler);
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             // ConnTraceEntriesList (read-only connection-trace viewer).
@@ -440,7 +443,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, handler);
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             // The outage list rides the trace ring and its gates, so it is
@@ -461,7 +464,39 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, handler);
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
+                }
+            },
+            // Each user's connection history rides the trace ring: a ring with
+            // no history attached answers "unavailable", never "empty".
+            IpcOperationName::ConnHistoryList => match deps.conn_trace_ring.clone() {
+                Some(ring) => {
+                    registry.register(op, diagnostics_handlers::ConnHistoryListHandler::new(ring));
+                }
+                None => {
+                    registry.register_checked(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::ConnHistoryClear => match deps.conn_trace_ring.clone() {
+                Some(ring) => {
+                    registry.register_checked(
+                        op,
+                        diagnostics_handlers::ConnHistoryClearHandler::new(ring),
+                    );
+                }
+                None => {
+                    registry.register_checked(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::ConnHistorySettingsSet => match deps.conn_trace_ring.clone() {
+                Some(ring) => {
+                    registry.register_checked(
+                        op,
+                        diagnostics_handlers::ConnHistorySettingsSetHandler::new(ring),
+                    );
+                }
+                None => {
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             // Attribution + integrity of shipped
@@ -486,7 +521,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, preset_handlers::PresetExportGetHandler::new(source));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             // SettingsExportFull handler. Registered
@@ -505,7 +540,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                         );
                     }
                     _ => {
-                        registry.register(op, UnimplementedHandler::new(op));
+                        registry.register_checked(op, UnimplementedHandler::new(op));
                     }
                 }
             }
@@ -517,7 +552,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, merge_preview::RulesMergePreviewHandler::new(source));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             // Gated on the sampler-backed deps.
@@ -526,47 +561,47 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, TrafficStatsGetHandler::new(provider));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::TrafficStatsSet => match deps.traffic_stats_writer.clone() {
                 Some(writer) => {
-                    registry.register(op, TrafficStatsSetHandler::new(writer));
+                    registry.register_checked(op, TrafficStatsSetHandler::new(writer));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::TrafficHistoryMergeSet => match deps.traffic_stats_writer.clone() {
                 Some(writer) => {
-                    registry.register(op, TrafficHistoryMergeSetHandler::new(writer));
+                    registry.register_checked(op, TrafficHistoryMergeSetHandler::new(writer));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::TrafficStatsClear => match deps.traffic_stats_writer.clone() {
                 Some(writer) => {
-                    registry.register(op, TrafficStatsClearHandler::new(writer));
+                    registry.register_checked(op, TrafficStatsClearHandler::new(writer));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::AutoRuleCandidatesProbe => match deps.auto_rule_probe.clone() {
                 Some(runner) => {
-                    registry.register(op, AutoRuleCandidatesProbeHandler::new(runner));
+                    registry.register_checked(op, AutoRuleCandidatesProbeHandler::new(runner));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::RefusingAnchorSet => match deps.refusing_anchors.clone() {
                 Some(writer) => {
-                    registry.register(op, RefusingAnchorSetHandler::new(writer));
+                    registry.register_checked(op, RefusingAnchorSetHandler::new(writer));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::LocalNetworksGet => match deps.local_networks.clone() {
@@ -574,15 +609,15 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, LocalNetworksGetHandler::new(provider));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::LocalNetworksSet => match deps.local_networks.clone() {
                 Some(provider) => {
-                    registry.register(op, LocalNetworksSetHandler::new(provider));
+                    registry.register_checked(op, LocalNetworksSetHandler::new(provider));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             // Companion-domain suggestions — gated on the engine,
@@ -592,31 +627,31 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, AutoRuleCandidatesListHandler::new(engine));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::AutoRuleCandidatesAccept => match deps.auto_rules.clone() {
                 Some(engine) => {
-                    registry.register(op, AutoRuleCandidatesAcceptHandler::new(engine));
+                    registry.register_checked(op, AutoRuleCandidatesAcceptHandler::new(engine));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::AutoRuleCandidatesDismiss => match deps.auto_rules.clone() {
                 Some(engine) => {
-                    registry.register(op, AutoRuleCandidatesDismissHandler::new(engine));
+                    registry.register_checked(op, AutoRuleCandidatesDismissHandler::new(engine));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::AutoRuleCandidatesForget => match deps.auto_rules.clone() {
                 Some(engine) => {
-                    registry.register(op, AutoRuleCandidatesForgetHandler::new(engine));
+                    registry.register_checked(op, AutoRuleCandidatesForgetHandler::new(engine));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::AutoRuleDismissedList => match deps.auto_rules.clone() {
@@ -624,7 +659,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, AutoRuleDismissedListHandler::new(engine));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::VerifyVerdictsList => match deps.auto_rules.clone() {
@@ -632,23 +667,23 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, VerifyVerdictsListHandler::new(engine));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::VerifyVerdictsAccept => match deps.auto_rules.clone() {
                 Some(engine) => {
-                    registry.register(op, VerifyVerdictsAcceptHandler::new(engine));
+                    registry.register_checked(op, VerifyVerdictsAcceptHandler::new(engine));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::VerifyVerdictsDismiss => match deps.auto_rules.clone() {
                 Some(engine) => {
-                    registry.register(op, VerifyVerdictsDismissHandler::new(engine));
+                    registry.register_checked(op, VerifyVerdictsDismissHandler::new(engine));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             // Rides the trace ring but not its viewer switch: the switch hides
@@ -663,15 +698,15 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, handler);
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::AutoRuleDismissedRestore => match deps.auto_rules.clone() {
                 Some(engine) => {
-                    registry.register(op, AutoRuleDismissedRestoreHandler::new(engine));
+                    registry.register_checked(op, AutoRuleDismissedRestoreHandler::new(engine));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             // The backlog a surface drains when it comes up. Gated on its own
@@ -681,15 +716,15 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, BlockNoticeJournalListHandler::new(store));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::BlockNoticeJournalAck => match deps.block_notice_journal.clone() {
                 Some(store) => {
-                    registry.register(op, BlockNoticeJournalAckHandler::new(store));
+                    registry.register_checked(op, BlockNoticeJournalAckHandler::new(store));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             // Block-notice mutes — gated on the durable store; the
@@ -700,7 +735,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, BlockNoticeMutesListHandler::new(store));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::BlockNoticeMutesSet => {
@@ -709,10 +744,11 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     deps.block_notice_center.clone(),
                 ) {
                     (Some(store), Some(center)) => {
-                        registry.register(op, BlockNoticeMutesSetHandler::new(store, center));
+                        registry
+                            .register_checked(op, BlockNoticeMutesSetHandler::new(store, center));
                     }
                     _ => {
-                        registry.register(op, UnimplementedHandler::new(op));
+                        registry.register_checked(op, UnimplementedHandler::new(op));
                     }
                 }
             }
@@ -722,10 +758,13 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     deps.block_notice_center.clone(),
                 ) {
                     (Some(store), Some(center)) => {
-                        registry.register(op, BlockNoticeMutesRemoveHandler::new(store, center));
+                        registry.register_checked(
+                            op,
+                            BlockNoticeMutesRemoveHandler::new(store, center),
+                        );
                     }
                     _ => {
-                        registry.register(op, UnimplementedHandler::new(op));
+                        registry.register_checked(op, UnimplementedHandler::new(op));
                     }
                 }
             }
@@ -735,10 +774,11 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     deps.block_notice_center.clone(),
                 ) {
                     (Some(store), Some(center)) => {
-                        registry.register(op, BlockNoticeMutesClearHandler::new(store, center));
+                        registry
+                            .register_checked(op, BlockNoticeMutesClearHandler::new(store, center));
                     }
                     _ => {
-                        registry.register(op, UnimplementedHandler::new(op));
+                        registry.register_checked(op, UnimplementedHandler::new(op));
                     }
                 }
             }
@@ -753,19 +793,19 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                         if let Some(center) = deps.block_notice_center.clone() {
                             handler = handler.with_center(center);
                         }
-                        registry.register(op, handler);
+                        registry.register_checked(op, handler);
                     }
                     None => {
-                        registry.register(op, UnimplementedHandler::new(op));
+                        registry.register_checked(op, UnimplementedHandler::new(op));
                     }
                 }
             }
             IpcOperationName::PrincipalDataPurge => match deps.principal_data_purger.clone() {
                 Some(purger) => {
-                    registry.register(op, PrincipalDataPurgeHandler::new(purger));
+                    registry.register_checked(op, PrincipalDataPurgeHandler::new(purger));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
             IpcOperationName::PrincipalDataCount => match deps.principal_data_purger.clone() {
@@ -773,7 +813,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, PrincipalDataCountHandler::new(purger));
                 }
                 None => {
-                    registry.register(op, UnimplementedHandler::new(op));
+                    registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
         }

@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
-use nrr_shared::ipc_payloads::RoutesHeldDto;
+use nrr_shared::ipc_payloads::{RoutesHeldDto, TrafficCarriedDto};
 
 use super::merge::{merge_user_routes, MergedRouteView, RouteConflict};
 use super::*;
@@ -230,6 +230,7 @@ impl SecondaryRouteCoordinator {
             merged.view.set_link(sid, *link);
         }
         let _ = self.note_conflicts(&merged.conflicts);
+        self.note_traffic_carried(&merged.default_carried_by, &links);
         let delta = self.reconciler.reconcile(&merged.routes)?;
         if delta.is_noop() {
             tracing::debug!(
@@ -268,6 +269,7 @@ impl SecondaryRouteCoordinator {
         contributions.insert(sid.to_string(), plan.routes.clone());
         drop(contributions);
         let _ = self.note_conflicts(&[]);
+        self.note_traffic_carried(&[], &[]);
     }
 
     /// Nobody is served: no contributions, no claims, no conflicts.
@@ -279,6 +281,7 @@ impl SecondaryRouteCoordinator {
             .unwrap_or_else(|p| p.into_inner())
             .clear();
         let _ = self.note_conflicts(&[]);
+        self.note_traffic_carried(&[], &[]);
     }
 
     fn contribution_of(&self, sid: &str) -> Vec<RouteEntry> {
@@ -288,6 +291,17 @@ impl SecondaryRouteCoordinator {
             .get(sid)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The user whose tunnel carries `sid`'s unnamed traffic, because that
+    /// user's "everything through my tunnel" was in the table first. What the
+    /// notice "your traffic goes through another user's connection" reads.
+    pub fn default_carried_by(&self, sid: &str) -> Option<String> {
+        self.merged_view
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .default_carried_by(sid)
+            .map(str::to_owned)
     }
 
     /// Does the machine table send `address` through another user's link than
@@ -335,7 +349,7 @@ impl SecondaryRouteCoordinator {
                 sid = %sid,
                 holder = %holder,
                 count = lost.len(),
-                destinations = %sample,
+                addresses = %sample,
                 "another signed-in user already routes these destinations through a different link; they keep it, and with leak protection on this user's traffic to them is blocked rather than sent the other way",
             );
         }
@@ -389,6 +403,89 @@ impl SecondaryRouteCoordinator {
                     sid: sid.to_string(),
                     count: report.count,
                     sample: report.sample,
+                },
+            );
+        }
+    }
+
+    /// Tell each user whose unrouted traffic rides another user's tunnel the
+    /// connection that carries it — never whose it is — and end the notice
+    /// for whoever it no longer applies to. `carried` is the merge's
+    /// `(user, holder)` list, `links` each served user's own additional link.
+    pub(super) fn note_traffic_carried(
+        &self,
+        carried: &[(String, String)],
+        links: &[(String, Option<u32>)],
+    ) {
+        // Read only while somebody is carried: the common pass pays nothing.
+        let infos = if carried.is_empty() {
+            Vec::new()
+        } else {
+            self.api.get_adapter_infos().unwrap_or_default()
+        };
+        let mut now: BTreeMap<&str, String> = BTreeMap::new();
+        for (sid, holder) in carried {
+            let link = links
+                .iter()
+                .find(|(user, _)| user == holder)
+                .and_then(|(_, link)| *link);
+            let live = link
+                .and_then(|index| infos.iter().find(|info| info.index == index))
+                .map(|info| preferred_display_name(info).to_string());
+            let name = live
+                .or_else(|| {
+                    self.route_source
+                        .load_for_sid(holder)?
+                        .secondary
+                        .map(|binding| binding.display_name)
+                })
+                .unwrap_or_default();
+            now.insert(sid.as_str(), name);
+        }
+        for sid in self.enforcement_status.traffic_carried_principals() {
+            if !now.contains_key(sid.as_str()) {
+                self.publish_traffic_carried(
+                    &sid,
+                    TrafficCarriedDto {
+                        carried: false,
+                        link: String::new(),
+                    },
+                );
+            }
+        }
+        for (sid, link) in now {
+            self.publish_traffic_carried(
+                sid,
+                TrafficCarriedDto {
+                    carried: true,
+                    link,
+                },
+            );
+        }
+    }
+
+    /// Record `report` for `sid` and, when it changed, push it to `sid` only.
+    fn publish_traffic_carried(&self, sid: &str, report: TrafficCarriedDto) {
+        if !self
+            .enforcement_status
+            .record_traffic_carried(sid, report.clone())
+        {
+            return;
+        }
+        tracing::info!(
+            target: "nrr::route-coordinator",
+            sid = %sid,
+            carried = report.carried,
+            link = %report.link,
+            "whether this user's unrouted traffic leaves through another signed-in user's tunnel changed",
+        );
+        if let Some(bus) = self.events.as_ref() {
+            bus.publish_for(
+                sid,
+                nrr_shared::ipc_payloads::StatusUpdateEvent::TrafficCarriedByAnotherUser {
+                    sid: sid.to_string(),
+                    carried: report.carried,
+                    link: report.link,
                 },
             );
         }

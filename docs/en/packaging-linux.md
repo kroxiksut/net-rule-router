@@ -134,6 +134,15 @@ Package names follow Debian and Ubuntu for `.deb`, and RHEL and Fedora for
 `.rpm`. Distributions that name their packages differently (ALT, openSUSE) may
 not resolve the `.rpm` requirements; use the archive there.
 
+## If the window does not start
+
+When a library the window needs is missing or too old, the program says so
+instead of failing silently: in the terminal it was started from and, where
+`notify-send` is available, as a desktop notification. The message names the
+library and the log file, `~/.local/state/netrulerouter/launcher-main.log`. A
+system Qt older than 6.6 is reported this way too: update it, or use the
+terminal interface `nrr-tui`, which needs no Qt.
+
 ## Upgrading
 
 Install the newer packages over the old ones, the same way as above. A running

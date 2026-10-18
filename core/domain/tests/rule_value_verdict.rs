@@ -83,10 +83,18 @@ fn rows() -> Vec<(&'static str, String, &'static str)> {
         ("application", "*vpn*.exe", "valid"),
         ("application", "браузер.exe", "valid"),
         ("application", "C:\\Apps\\app.exe", "valid"),
-        ("application", "/usr/bin/app", "valid"),
         ("application", "app:1.exe", "valid"),
         ("application", "a?b.exe", "valid"),
         ("application", "*", "error"),
+        // A section is a type: a value spelled as another type's is refused
+        // wherever it is written, on every platform.
+        ("application", "192.0.2.7", "error"),
+        ("application", "10.0.0.0/24", "error"),
+        ("domain", "chrome.exe", "error"),
+        ("zone", "chrome.exe", "error"),
+        ("zone", "192.0.2.7", "error"),
+        ("zone", "example.*", "error"),
+        ("exact-ip", "chrome.exe", "error"),
         ("application", "app\u{1}.exe", "error"),
     ]
     .into_iter()
@@ -98,6 +106,20 @@ fn rows() -> Vec<(&'static str, String, &'static str)> {
     rows.push(("zone", long_idn, "error"));
     rows.push(("application", "a".repeat(260), "valid"));
     rows.push(("application", "a".repeat(261), "error"));
+    // The pipeline reads the Windows section; another platform spells its
+    // paths with `/` only, so these hold where the table judges as Windows.
+    if cfg!(windows) {
+        for (value, verdict) in [
+            (r"C:\Apps\", "valid"),
+            (r"C:\Apps", "valid"),
+            (r"C:\Apps\*", "valid"),
+            (r"C:\Apps\*.exe", "error"),
+            (r"Apps\app.exe", "error"),
+            ("/usr/bin/app", "error"),
+        ] {
+            rows.push(("application", value.to_string(), verdict));
+        }
+    }
     rows
 }
 
@@ -193,7 +215,11 @@ fn wire_rule(id: &str, rule_type: &str, value: &str) -> RuleDto {
         }
         _ => {
             rule.app_match = Some(AppMatchDto {
-                pattern: if value.contains('*') {
+                pattern: if value.contains(['\\', '/']) {
+                    AppPatternDto::Path {
+                        value: value.into(),
+                    }
+                } else if value.contains('*') {
                     AppPatternDto::Glob {
                         value: value.into(),
                     }

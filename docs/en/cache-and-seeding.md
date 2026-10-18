@@ -33,8 +33,8 @@ the first two — the other two exist to close specific gaps.
 
 ### 1. Live DNS observation
 
-While the service is running, it watches name resolution in your own session.
-When a program resolves a hostname that matches one of your rules, the
+While the service is running, it watches name resolution on the computer.
+When a program resolves a hostname that matches a rule of a signed-in user, the
 resulting IP address(es) are recorded. This is the primary, always-on source,
 and it requires no configuration — it is simply how the cache stays current
 with the sites you actually visit while NetRuleRouter is active.
@@ -66,6 +66,10 @@ Only hostnames are ever extracted. Full URLs, page titles, visit timestamps,
 and visit counts never leave the machine, and hostnames that do not match any
 of your active rules are discarded immediately rather than cached — the
 service cannot reconstruct your browsing history from what it keeps.
+
+The name cache is shared by the computer. An ordinary user sees in the cache
+viewer only the names their own rules cover; an administrator sees all of
+them. Clearing the cache needs an administrator.
 
 #### Supported browsers
 

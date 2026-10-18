@@ -1,0 +1,6 @@
+nrr_settings_export:
+  version: 1
+  rules_files:
+    primary: "C:\rulesA.txt"
+  behavior:
+    route_mode: "prefer-secondary-when-available" # chosen

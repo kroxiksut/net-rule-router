@@ -66,6 +66,7 @@ This window applies to the service's own log files in `service-logs/`, and to `l
 The following are structurally excluded and can never appear in an archive:
 
 - **Raw database files** — your rules, the resolution cache, and the service-state databases are never packaged.
+- **Your connection history** — which programs connected where stays on your computer; it is not part of any archive.
 - **Private keys or any secret material** — fields marked as secret cannot be serialized at all, by design.
 - **Full policy content or policy backups.**
 - Anything outside the sections listed above — **no browsing history, no credentials, no file contents, no keystrokes, and no telemetry.**
@@ -75,6 +76,8 @@ The following are structurally excluded and can never appear in an archive:
 The default privacy mode used for every archive reduces a hostname to its registrable domain (for example, `updates.example.com` becomes `example.com`) and replaces an IP address with a category marker (`<private-ipv4>` or `<public-ipv4>`) instead of the address itself. `logs.ndjson` and `audit_summary.json` are structured event records (message keys and correlation ids), so under normal export they do not carry raw hostnames or IP addresses at all.
 
 The one exception is the optional `explain_samples.json` section described above: because its whole purpose is to show why a routing decision was made, it can include a destination hostname. This section is off by default and only appears in a **Full diagnostics** export.
+
+If you export without administrator rights, file and folder paths inside error texts are replaced with `<masked-path>`, in the archive and in the Logs view alike: the line still says what failed, without naming files on the computer. An administrator sees those texts as written.
 
 Because the archive is a plain, human-readable `.zip`, you can always open any file inside it and inspect — or remove — a line before sharing it.
 

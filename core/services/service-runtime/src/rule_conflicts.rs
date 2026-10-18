@@ -181,6 +181,7 @@ pub fn rule_conflict_dtos(
                 host: host.clone(),
                 via_host: String::new(),
                 app: String::new(),
+                reason: String::new(),
             },
             RuleConflict::BlockLeaksSharedAddress {
                 rule_id,
@@ -198,6 +199,7 @@ pub fn rule_conflict_dtos(
                 host: host.clone(),
                 via_host: via_host.clone(),
                 app: String::new(),
+                reason: String::new(),
             },
             RuleConflict::UnsupportedRuleShape { rule_id, .. } => RuleConflictDto {
                 kind: RuleConflictKind::UnsupportedRuleShape,
@@ -212,6 +214,7 @@ pub fn rule_conflict_dtos(
                     .and_then(|r| r.app_match.as_ref())
                     .map(|a| a.pattern.as_str().to_string())
                     .unwrap_or_default(),
+                reason: String::new(),
             },
             RuleConflict::NetworkCarvingOverCap { rule_id, .. } => RuleConflictDto {
                 kind: RuleConflictKind::NetworkCarvingOverCap,
@@ -223,7 +226,31 @@ pub fn rule_conflict_dtos(
                 host: String::new(),
                 via_host: String::new(),
                 app: String::new(),
+                reason: String::new(),
             },
+        })
+        .collect()
+}
+
+/// Stored rules kept out of enforcement to protect a system program or folder,
+/// as the Overlaps screen lists them after the conflicts.
+#[must_use]
+pub fn protected_rule_dtos(
+    withheld: &[nrr_domain::protected_places::ProtectedRule],
+) -> Vec<RuleConflictDto> {
+    withheld
+        .iter()
+        .map(|rule| RuleConflictDto {
+            kind: RuleConflictKind::ProtectedTarget,
+            rule_id: rule.rule_id.as_str().to_string(),
+            rule_value: rule.value.clone(),
+            ip: String::new(),
+            count: 0,
+            other_rule_id: String::new(),
+            host: String::new(),
+            via_host: String::new(),
+            app: rule.value.clone(),
+            reason: rule.reason.slug().to_string(),
         })
         .collect()
 }
@@ -249,6 +276,7 @@ fn display_value(m: &CanonicalAddressMatch) -> String {
     match m {
         CanonicalAddressMatch::ExactFqdn(host) => host.clone(),
         CanonicalAddressMatch::SuffixDomain(suffix) => format!("*.{suffix}"),
+        CanonicalAddressMatch::AnyZoneDomain(base) => format!("{base}.*"),
         CanonicalAddressMatch::Zone(zone) => zone.clone(),
         CanonicalAddressMatch::ExactIp(ip) => ip.to_string(),
         CanonicalAddressMatch::Subnet(block) => block.to_string(),

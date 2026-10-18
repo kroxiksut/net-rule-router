@@ -227,12 +227,12 @@ pub fn fail_closed_block_all_filters(
     // `FailClosedExemptions::foreign_tunnel_luids` for why this is not a hole:
     // the permit is on the EGRESS interface, so it covers only packets that
     // actually leave through that tunnel.
-    for luid in &exemptions.foreign_tunnel_luids {
-        if *luid != 0 && *luid != exemptions.secondary_luid {
-            filters.push(exempt_egress(sid, *luid, weight));
-            weight += 1;
-        }
-    }
+    filters.extend(foreign_tunnel_egress(
+        sid,
+        &exemptions.foreign_tunnel_luids,
+        exemptions.secondary_luid,
+        &mut weight,
+    ));
     // ── ALE connect layer exemptions (TCP/UDP) ──
     filters.extend(base_ale_exemptions(
         sid,
@@ -293,6 +293,12 @@ pub fn fail_closed_block_all_filters(
     if protocols.wants_packet_layer() {
         const TR: WfpLayerKey = WfpLayerKey::OutboundTransportV4;
         let mut pw = PACKET_EXEMPT_BASE;
+        filters.extend(foreign_tunnel_packet_egress(
+            sid,
+            &exemptions.foreign_tunnel_luids,
+            exemptions.secondary_luid,
+            &mut pw,
+        ));
         filters.extend(base_packet_exemptions(
             sid,
             TR,
@@ -351,6 +357,12 @@ pub fn fail_closed_block_all_filters(
         exemptions.secondary_luid,
         &exemptions.bootstrap_server_ips_v6,
         &exemptions.local_subnets_v6,
+    ));
+    filters.extend(foreign_tunnel_egress_v6(
+        sid,
+        &exemptions.foreign_tunnel_luids,
+        exemptions.secondary_luid,
+        true,
     ));
 
     filters

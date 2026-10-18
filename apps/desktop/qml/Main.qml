@@ -26,7 +26,7 @@ ApplicationWindow {
     // emitted into the QML context by the launcher. Windows-all-supported
     // default so mock/preview (which emits no context) still renders every
     // section; the real profile loads from `context.platformProfile` below.
-    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, fakeIp: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, forwardedTrafficGuard: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, serviceStartOnAppLaunch: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
+    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, fakeIp: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, forwardedTrafficGuard: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, serviceStartOnAppLaunch: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false, appPathRules: false } })
     // Capability query for declarative, OS-agnostic section gating: a
     // feature-keyed section renders only when the running OS supports it.
     // Unknown feature or missing profile → true (show it), which is why the
@@ -213,6 +213,10 @@ ApplicationWindow {
     // fetch. The banner now stays visible even when the app holds local
     // rules — it switches to an "apply now" prompt (see emptyRulesBannerHasLocalRules).
     property int _serviceRuleCount: -1
+    /// The `base-revision` of the rules the table was last loaded from (or
+    /// last applied), null until known. Every rules write names it, so a write
+    /// over rules that changed elsewhere is refused instead of undoing them.
+    property var rulesBaseRevision: null
     readonly property bool emptyRulesBannerVisible:
         !!backendStatus && backendStatus.kind === "connected"
         && _serviceRuleCount === 0
@@ -476,19 +480,6 @@ ApplicationWindow {
                         ? " (" + String(backendStatus.lastError) + ")" : "")
             })
         }
-        if (strictKillSwitchActive) {
-            out.push({
-                "id": "strict-killswitch",
-                "severity": "warning",
-                "dismissible": false,
-                "title": tr("notifications.strict-killswitch.title",
-                    "Block-all leak protection is on"),
-                "body": tr("notifications.strict-killswitch.body",
-                    "While the additional adapter (VPN) is down, ALL internet is blocked except your local network — including normal browsing — until it comes back. Switch to the best-effort variant in Settings → Routing behavior if you want your main connection to keep working when the VPN drops."),
-                "actionKey": "open-routing-settings",
-                "actionText": tr("action.open-settings", "Open settings")
-            })
-        }
         // GitHub release check: the daily one's cached verdict, or the user's
         // own from the Help menu. Non-null only for a strictly newer release.
         var upd = updateCheckController.offer
@@ -533,9 +524,7 @@ ApplicationWindow {
         return Pure.noticesWarningsFirst(out)
     }
 
-    property bool strictKillSwitchActive: false
     onPrefsChanged: {
-        strictKillSwitchActive = !!(prefs && prefs.routeKillSwitchBlockAll === true)
         // A rebound rules file changes what the tray must compare against.
         // Guarded because prefs can be reassigned before the component tree is
         // finished, and a throw here would take the kill-switch mirror with it.
@@ -638,8 +627,11 @@ ApplicationWindow {
     // match / ambiguous), and no auto-heal candidate exists. Actionable: the
     // user should start the adapter or re-select one in Interfaces & routes.
     // While it is missing, matching traffic is blocked (leak protection).
+    // A status the service reports for the additional route speaks for it: its
+    // card, or its start-up quiet while the VPN is still coming up.
     readonly property bool secondaryUnresolvedVisible:
         uiRevision >= 0 && interfacesRolesController._secondaryUnresolved()
+        && enforcementStatusByRole["secondary"] === undefined
     // PERSISTED per-adapter acknowledgment for the VPN-split informational
     // banner. The blue banner fires in the NORMAL, healthy split state
     // (prefer-primary + a VPN-like secondary UP + ≥1 secondary rule), so it must
@@ -887,8 +879,8 @@ ApplicationWindow {
     function routeLabel(role) {
         return Rules.routeDisplayLabel(role, prefs.routePrimaryLabel, prefs.routeSecondaryLabel, tr)
     }
-    function routeRoleOptions(includeBlock) {
-        return Rules.routeRoleOptions(includeBlock, routeLabel)
+    function routeRoleOptions() {
+        return Rules.routeRoleOptions(true, routeLabel, tr)
     }
     function localeTextForLanguage(languageId, key, fallbackText) {
         return resolveCatalogText(languageId, key, fallbackText)
@@ -1311,7 +1303,7 @@ ApplicationWindow {
         }
     }
     function copyValueLabel(value) {
-        var text = String((value === undefined || value === null) ? "" : value)
+        var text = Pure.displayText(value)
         if (text.length > 40) text = text.substring(0, 39) + "…"
         return tr("action.copy-value", "Copy: ") + text
     }
@@ -1964,7 +1956,7 @@ ApplicationWindow {
         if (appGroupsOfferApps.length === 0) return ""
         var names = []
         for (var i = 0; i < appGroupsOfferApps.length && i < 3; i += 1)
-            names.push(String(appGroupsOfferApps[i].displayName || ""))
+            names.push(Pure.displayText(appGroupsOfferApps[i].displayName))
         var text = tr("status.app-groups-offer",
             "Found programs that can be given their own route: {names}.")
             .replace("{names}", names.join(", "))
@@ -2013,7 +2005,7 @@ ApplicationWindow {
             : tr("status.local-network-offer-open",
                 "Found your home network's IPv6 addresses: {cidr} ({adapter}). Open them to devices on this network while routed traffic is blocked?"))
             .replace("{cidr}", String(first.cidr || ""))
-            .replace("{adapter}", String(first.adapter || ""))
+            .replace("{adapter}", Pure.displayText(first.adapter))
         if (pendingLocalNetworks.length === 1) return head
         return head + " " + tr("status.local-network-offer-more",
             "{count} more found.").replace("{count}",
@@ -2454,6 +2446,7 @@ ApplicationWindow {
             // already held, so a premature write hid the notice and the chip.
             _applyStandingEnforcementStatus(p["enforcement-status"])
             _applyStandingRoutesHeld(p["routes-held-by-another-user"])
+            _applyStandingTrafficCarried(p["traffic-carried-by-another-user"])
         })
     }
     // Heal the service-side link-provider SSOT after a
@@ -2495,7 +2488,7 @@ ApplicationWindow {
     /// Human-readable summary of the unresolved app rules for the banner:
     /// the first few names, then "+N more" so a long list never blows the row.
     function _unenforcedAppRulesSummary() {
-        return Pure.listSummary(unenforcedAppRules,
+        return Pure.listSummary(Pure.displayTextList(unenforcedAppRules),
             tr("status.app-unresolved-more", "+{n} more"))
     }
     // Correlation-id RPC transport over the C++ bridge: the pending-callback
@@ -2963,7 +2956,7 @@ ApplicationWindow {
                         .replace("{count}", String(offer.bundledExePaths.length))
                     : tr("notifications.vpn-client-trust.body",
                         "{name} looks like a VPN client, but it is not installed in a protected program folder, so leak protection does not trust it on its own. Confirm it and it will keep working while leak protection is on."))
-                    .replace("{name}", offer.name),
+                    .replace("{name}", Pure.displayText(offer.name)),
                 "actionKey": bundled ? "trust-vpn-client-bundle" : "trust-vpn-client",
                 "actionText": bundled
                     ? tr("notifications.vpn-client-trust.action-bundle",
@@ -3005,7 +2998,7 @@ ApplicationWindow {
         delete _pendingVpnOffers[String(noticeId || "")]
         statusLine = tr("vpn-onboarding.confirmed-status",
             "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
-            .replace("{name}", offer.name)
+            .replace("{name}", Pure.displayText(offer.name))
     }
     function _writeLinkProviderSet(apps) {
         var req = {
@@ -3639,10 +3632,8 @@ ApplicationWindow {
                 }
                 break
             case "auto-rule-candidates-changed":
-                // The tray asks the question while this window is closed, and
-                // its notice retires itself. So the window keeps the count and
-                // a way in — otherwise an unanswered offer is unreachable until
-                // the service happens to announce it again.
+                // The tray only counts them in its menu, so the window keeps
+                // the count and a way in as well.
                 autoRuleSuggestionsController.autoRuleCandidatesPending = Number(event["pending-count"] || 0)
                 console.log("push: auto-rule candidates pending",
                     autoRuleSuggestionsController.autoRuleCandidatesPending)
@@ -3697,7 +3688,7 @@ ApplicationWindow {
                         "New application rule is settling in"),
                     "body": tr("notifications.app-rule-learning.body",
                         "{apps}: the service is still learning which addresses this program uses, so its first connection attempts may fail. Restart the program if it is already open.")
-                        .replace("{apps}", String((event["apps"] || []).join(", ")))
+                        .replace("{apps}", Pure.displayTextList(event["apps"]).join(", "))
                 })
                 break
             case "vpn-client-awaiting-confirmation":
@@ -3745,7 +3736,7 @@ ApplicationWindow {
                         "A site does not answer on either link"),
                     "body": tr("notifications.host-unreachable.body",
                         "{host} did not answer through the main link or through the additional one, so moving it would not help and nothing was offered. The problem is most likely on the site's side.")
-                        .replace("{host}", String(event["host"] || ""))
+                        .replace("{host}", Pure.displayText(event["host"]))
                 })
                 break
             case "secondary-external-address-observed":
@@ -3774,6 +3765,9 @@ ApplicationWindow {
                 break
             case "routes-held-by-another-user":
                 _onRoutesHeldByAnotherUser(event)
+                break
+            case "traffic-carried-by-another-user":
+                _onTrafficCarriedByAnotherUser(event)
                 break
             case "adapters-changed":
                 // The service's adapter monitor detected a
@@ -3833,7 +3827,7 @@ ApplicationWindow {
                 "The additional route is not assigned"),
             "body": tr("notifications.unassigned-tunnel.body",
                     "{adapter} is up, but no connection is assigned to the additional route — so the sites your rules send there will not open.")
-                .replace("{adapter}", adapter),
+                .replace("{adapter}", Pure.displayText(adapter)),
             "actionKey": "open-interfaces",
             "actionText": tr("notifications.unassigned-tunnel.action", "Assign it now")
         })
@@ -3858,8 +3852,8 @@ ApplicationWindow {
                 "This network looks suspicious"),
             "body": tr("notifications.local-network-too-wide.body",
                     "{adapter} reports {network} as its local network — far wider than any local network can be. It is not treated as local: devices on it stay blocked while leak protection is on, and sites inside it still follow your rules.")
-                .replace("{adapter}", adapter)
-                .replace("{network}", network)
+                .replace("{adapter}", Pure.displayText(adapter))
+                .replace("{network}", Pure.displayText(network))
         })
     }
 
@@ -3911,7 +3905,7 @@ ApplicationWindow {
         if (adapter !== "") {
             body = body + " " + Pure.fillPlaceholders(
                 tr("tray.external-address.adapter", "Adapter: {name}"),
-                { name: Pure.escapeMarkup(adapter) })
+                { name: Pure.escapeMarkup(Pure.displayText(adapter)) })
         }
         // One card per address: a reconnect that lands on the same one is not
         // news, and a card for an address the route no longer has is stale.
@@ -3942,6 +3936,10 @@ ApplicationWindow {
     /// role -> the service's last enforcement status slug for it, so a screen
     /// can tell a switched-off adapter (`secondary-down`) from a removed one.
     property var enforcementStatusByRole: ({})
+    /// Roles whose report is start-up quiet: not up since the service started
+    /// and still within its wait, so shown but neither announced nor, when it
+    /// comes up, celebrated.
+    property var _enforcementQuietRoles: []
     function _setEnforcementStatus(role, status) {
         var next = Object.assign({}, enforcementStatusByRole)
         if (status === "" || status === "ok") delete next[role]
@@ -3960,7 +3958,9 @@ ApplicationWindow {
             var report = reports[i] || {}
             var role = String(report.role || "")
             var status = String(report.status || "") || "ok"
-            if ((enforcementStatusByRole[role] || "ok") === status) continue
+            var quiet = report.quiet === true && status !== "ok"
+            if ((enforcementStatusByRole[role] || "ok") === status
+                    && (_enforcementQuietRoles.indexOf(role) >= 0) === quiet) continue
             _onEnforcementStatusChanged(report)
         }
     }
@@ -4040,8 +4040,17 @@ ApplicationWindow {
         var role = String(event.role || "")
         var status = String(event.status || "")
         var noticeId = "enforcement-status:" + role
+        var quiet = event.quiet === true && status !== "" && status !== "ok"
         _setEnforcementStatus(role, status)
         notificationsController._dropPushNotice(noticeId)
+        _enforcementQuietRoles = _enforcementQuietRoles.filter(
+            function(r) { return r !== role })
+        if (quiet) {
+            _enforcementQuietRoles = _enforcementQuietRoles.concat([role])
+            _enforcementDownRoles = _enforcementDownRoles.filter(
+                function(r) { return r !== role })
+            return
+        }
         var wasDown = _enforcementDownRoles.indexOf(role) >= 0
         if (status === "" || status === "ok") {
             // Coming back may mean the service re-matched a reinstalled adapter.
@@ -4065,7 +4074,7 @@ ApplicationWindow {
         if (status === "adapter-choice-needed") {
             body = tr("notifications.enforcement.adapter-choice.body",
                     "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}")
-                .replace("{list}", candidates.join(", "))
+                .replace("{list}", Pure.displayTextList(candidates).join(", "))
         } else if (status === "adapter-gone") {
             // A vendor that replaced its adapter outright, a driver that no
             // longer starts, a connection removed by hand. The cause differs,
@@ -4074,7 +4083,7 @@ ApplicationWindow {
             body = candidates.length > 0
                 ? tr("notifications.enforcement.adapter-gone.body",
                         "The connection your rules were set to use is no longer on this computer, so the rules are not being applied. Pick another one: {list}")
-                    .replace("{list}", candidates.join(", "))
+                    .replace("{list}", Pure.displayTextList(candidates).join(", "))
                 : tr("notifications.enforcement.adapter-gone.body-empty",
                     "The connection your rules were set to use is no longer on this computer, and there is nothing to replace it with right now.")
         } else if (status === "adapter-failed") {
@@ -4085,7 +4094,7 @@ ApplicationWindow {
             body = candidates.length > 0
                 ? tr("notifications.enforcement.adapter-failed.body",
                         "The connection your rules use is still installed, but its driver will not start, so the rules are not being applied. Reinstall it, or pick another one: {list}")
-                    .replace("{list}", candidates.join(", "))
+                    .replace("{list}", Pure.displayTextList(candidates).join(", "))
                 : tr("notifications.enforcement.adapter-failed.body-empty",
                     "The connection your rules use is still installed, but its driver will not start, and there is nothing to replace it with right now. Reinstalling it usually helps.")
         } else if (status === "no-primary-route") {
@@ -4094,6 +4103,14 @@ ApplicationWindow {
         } else if (status === "primary-no-way-out") {
             body = tr("notifications.enforcement.primary-no-way-out.body",
                 "The connection chosen as main has no gateway, so traffic your rules do not route is going out the way the system sends it instead. Choose the connection that actually reaches the internet as main.")
+        } else if (status === "no-policy" && candidates.length > 0) {
+            // The service names the one connection the route table points at;
+            // it is bound on the interfaces page or from the tray, never here.
+            title = tr("notifications.enforcement.no-policy.suggest-title",
+                    "Confirm your main connection: {name}")
+                .replace("{name}", Pure.displayText(String(candidates[0])))
+            body = tr("notifications.enforcement.no-policy.suggest-body",
+                "Nothing is routed until you confirm it. Rules for the additional connection wait until you choose one.")
         } else if (status === "no-policy") {
             body = tr("notifications.enforcement.no-policy.body",
                 "The service has no routing settings for you yet, so nothing is being routed. Choose the main and additional connections.")
@@ -4185,6 +4202,54 @@ ApplicationWindow {
         _onRoutesHeldByAnotherUser({ "count": count, "sample": sample })
     }
 
+    /// Id of the card saying another user's tunnel carries this user's
+    /// traffic, and the connection it names ("" while it does not).
+    property string _trafficCarriedNoticeId: ""
+    property string _trafficCarriedSignature: ""
+
+    /// What this user's rules do not route rides another signed-in user's
+    /// tunnel. One card per carrying connection; `carried: false` takes it down.
+    function _onTrafficCarriedByAnotherUser(event) {
+        var carried = !!(event && event.carried === true)
+        var link = carried ? Pure.displayText(String((event && event.link) || "")) : ""
+        var signature = carried ? "carried|" + link : ""
+        _trafficCarriedSignature = signature
+        if (_trafficCarriedNoticeId !== "")
+            notificationsController._dropPushNotice(_trafficCarriedNoticeId)
+        _trafficCarriedNoticeId = ""
+        if (signature === "") return
+        var noticeId = "traffic-carried:" + link
+        _trafficCarriedNoticeId = noticeId
+        var body = link !== ""
+            ? tr("notifications.traffic-carried.body",
+                "Another user of this computer signed in earlier and sends all their traffic through the tunnel \"{link}\". This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.")
+                .replace("{link}", function() { return link })
+            : tr("notifications.traffic-carried.body-unnamed",
+                "Another user of this computer signed in earlier and sends all their traffic through their tunnel. This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.")
+        notificationsController._addPushNoticeUnlessMuted("traffic-carried", {
+            "id": noticeId,
+            "severity": "warning",
+            "dismissible": true,
+            "kind": "traffic-carried",
+            "noticeMuteKind": "traffic-carried",
+            // Still carried on another day is worth saying again.
+            "refractoryMs": 86400000,
+            "title": tr("notifications.traffic-carried.title",
+                "Your traffic goes through another user's tunnel"),
+            "body": body
+        }, function() { return _trafficCarriedNoticeId === noticeId })
+    }
+
+    /// The snapshot's standing report, handled as the push it stands for; one
+    /// equal to the state already held is skipped.
+    function _applyStandingTrafficCarried(report) {
+        var carried = !!(report && report.carried === true)
+        var link = carried ? Pure.displayText(String((report && report.link) || "")) : ""
+        var signature = carried ? "carried|" + link : ""
+        if (signature === _trafficCarriedSignature) return
+        _onTrafficCarriedByAnotherUser({ "carried": carried, "link": carried ? report.link : "" })
+    }
+
     /// One reason slug -> the sentence explaining it. Mirrors the tray's own
     /// wording for the same event.
     function _blockNoticeReasonText(reason) {
@@ -4197,7 +4262,7 @@ ApplicationWindow {
                     "No rule covers this connection, so the default action blocked it.")
             case "blocked-by-rule":
                 return tr("notifications.block-notice.reason.blocked-by-rule",
-                    "A rule blocks this connection.")
+                    "A rule denies this connection.")
             case "ipv6-blocked":
                 return tr("notifications.block-notice.reason.ipv6-blocked",
                     "IPv6 is switched off while leak protection is on, so this connection did not go out.")
@@ -4247,7 +4312,7 @@ ApplicationWindow {
 
     function _addBlockNoticeBacklogCard(summary) {
         var hide = prefs.hideBlockNoticeAddresses === true
-        var list = hide ? "" : summary.shown.join(", ")
+        var list = hide ? "" : Pure.displayTextList(summary.shown).join(", ")
         if (!hide && summary.more > 0) {
             list = list + ", " + tr("notifications.block-notice.backlog.more", "and {count} more")
                 .replace("{count}", String(summary.more))
@@ -4286,8 +4351,8 @@ ApplicationWindow {
         var attempts = Number(event.attempts || 0)
         var destDisplay = prefs.hideBlockNoticeAddresses === true
             ? tr("notifications.block-notice.destination-hidden", "a hidden destination")
-            : destination
-        var appDisplay = app !== "" ? app
+            : Pure.displayText(destination)
+        var appDisplay = app !== "" ? Pure.displayText(app)
             : tr("notifications.block-notice.app-unknown", "unknown application")
         var body = tr("notifications.block-notice.body",
                 "{reason} Destination: {destination}. Application: {app}. Attempts: {attempts}.")
@@ -4696,7 +4761,6 @@ ApplicationWindow {
         if (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge && nrrNativeBridge.savePreferences) {
             nrrNativeBridge.savePreferences(JSON.stringify(payload))
         }
-        console.log("NRR_PREFS_JSON:" + JSON.stringify(payload))
     }
 
     // Open the VPN-client onboarding dialog. Entry
@@ -5032,6 +5096,14 @@ ApplicationWindow {
     /// setting can never lock the section by omission.
     property bool allowUserRuleEdits: true
 
+    /// The lock as it applies to this window: the service lets an elevated
+    /// administrator through it, so an elevated window is not locked.
+    readonly property bool ruleEditsLocked: allowUserRuleEdits === false && !_windowElevated
+
+    readonly property bool _windowElevated: typeof nrrNativeBridge !== "undefined"
+        && nrrNativeBridge !== null && typeof nrrNativeBridge.isElevated === "function"
+        && !!nrrNativeBridge.isElevated()
+
     /// The permission as known without a live read: a value parked while the
     /// service was down outranks the mirror of what the service last reported,
     /// matching the precedence every other field of this config follows.
@@ -5088,7 +5160,7 @@ ApplicationWindow {
     /// Rules toolbar all come through here, so a locked section cannot be
     /// walked around with a keyboard shortcut.
     function openLoadRuleListWindow() {
-        if (!allowUserRuleEdits) {
+        if (ruleEditsLocked) {
             statusLine = tr("errors.rules-locked",
                 "Your administrator manages the routing rules on this computer, so they cannot be changed here.")
             return
@@ -5496,7 +5568,7 @@ ApplicationWindow {
             // "Add rule…" in the tray menu: the form the Add button opens. A
             // form already open is the user's work in progress and stays.
             requestSectionChange("rules")
-            if (allowUserRuleEdits === false) {
+            if (ruleEditsLocked) {
                 statusLine = tr("errors.rules-locked",
                     "Your administrator manages the routing rules on this computer, so they cannot be changed here.")
                 return
@@ -5655,6 +5727,93 @@ ApplicationWindow {
         return false
     }
 
+    /// Re-file the rule at `masterIndex` under the type its value is: the
+    /// "Move to" offer of a row refused where it stands, run only on the
+    /// user's click. The row is judged again under the new type, where its
+    /// value can still be wrong. `false` when the row has no such offer.
+    function moveRuleToType(masterIndex, quiet) {
+        if (masterIndex < 0 || masterIndex >= rulesModel.count) return false
+        var row = rulesModel.get(masterIndex)
+        if (!row || String(row.validationStatus || "") !== "error") return false
+        var type = Rules.misplacedTargetType(row.validationMessageKey)
+        if (type === "") return false
+        var id = String(row.id || "")
+        var value = String(row.matchValue || "")
+        rulesModel.set(masterIndex, {
+            ruleType: type,
+            ruleTypeTitle: ruleTypeLabel(type),
+            aceMatchValue: ruleEditSupport.aceLowerForSearch(value),
+            verify: Rules.rowIsVerify({ ruleType: type, targetRoute: row.targetRoute,
+                verify: row.verify, matchValue: value }),
+            validationStatus: "valid",
+            validationMessageKey: "",
+            validationMessageArgs: ({})
+        })
+        _refreshRowVerdict(masterIndex, id, type, value)
+        if (quiet !== true) {
+            rulesModelEdited()
+            _recomputeRulesDirty()
+            statusLine = tr("rules.move-to-type.done", "Rule moved to “{type}”.")
+                .replace("{type}", ruleTypeLabel(type))
+        }
+        return true
+    }
+    /// Every row the "Move to" offer stands on, moved at once: the "Move all"
+    /// of the rules list, run only on the user's click.
+    function moveMisplacedRules() {
+        var moved = 0
+        for (var i = 0; i < rulesModel.count; i += 1) {
+            if (moveRuleToType(i, true)) moved += 1
+        }
+        if (moved === 0) return 0
+        rulesModelEdited()
+        _recomputeRulesDirty()
+        statusLine = tr("rules.move-to-type.done-many", "{n} rule(s) moved to the type their value is.")
+            .replace("{n}", String(moved))
+        return moved
+    }
+    /// A row moved to another route is judged again: a deny or the additional
+    /// route may not name a program the system needs, the main route may. Only
+    /// a program's verdict depends on the route.
+    function rejudgeRowRoute(masterIndex) {
+        if (masterIndex < 0 || masterIndex >= rulesModel.count) return
+        var row = rulesModel.get(masterIndex)
+        if (!row || Rules.canonicalRuleTypeSlug(row.ruleType) !== "application") return
+        _refreshRowVerdict(masterIndex, String(row.id || ""), String(row.ruleType),
+            String(row.matchValue))
+    }
+    /// The launcher's verdict on one row's value, written back while that row
+    /// still holds the same rule, type and value.
+    function _refreshRowVerdict(masterIndex, ruleId, ruleType, value) {
+        if (!rpc || !rpc.bridgeAvailable
+                || typeof rpc.bridge.rpcRuleValueVerdict !== "function") {
+            return
+        }
+        // The row's route: a deny or the additional route on a system program
+        // is refused, the main route is not.
+        var current = masterIndex < rulesModel.count ? rulesModel.get(masterIndex) : null
+        var route = current ? String(current.targetRoute || "") : ""
+        var corr = rpc.bridge.rpcRuleValueVerdict(ruleType, value, route)
+        rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
+            if (!ok) {
+                console.log("local.rule-value-verdict failed:", code, msg)
+                return
+            }
+            if (masterIndex >= rulesModel.count) return
+            var row = rulesModel.get(masterIndex)
+            if (!row || String(row.id || "") !== ruleId || String(row.ruleType) !== ruleType
+                    || String(row.matchValue) !== value) {
+                return
+            }
+            rulesModel.set(masterIndex, {
+                validationStatus: String((payload && payload.status) || "valid"),
+                validationMessageKey: String((payload && payload["message-key"]) || ""),
+                validationMessageArgs: (payload && payload.args) ? payload.args : ({})
+            })
+            rulesModelEdited()
+        })
+    }
+
     function nextFreeRuleId() {
         return Rules.nextFreeRuleId(rulesModel, freeRulesMaxCount)
     }
@@ -5730,27 +5889,108 @@ ApplicationWindow {
         if (_trayAddRule) _finishTrayAddRule()
     }
 
-    /// Add the accepted lines of a pasted address list, each with the type
-    /// Rust sorted it into; route, comment and the enable toggle come from the
-    /// dialog.
-    function saveRuleList(entries) {
-        var drafts = []
-        for (var i = 0; i < entries.length; i += 1) {
-            var ruleType = String(entries[i]["rule-type"] || "")
-            drafts.push({
-                "rule-type": ruleType,
-                value: entries[i].value,
-                route: ruleDialog.localRoute,
-                comment: ruleDialog.localComment,
-                enabled: ruleDialog.localEnabled,
-                verify: Rules.rowIsVerify({ ruleType: ruleType,
-                    targetRoute: ruleDialog.localRoute, verify: ruleDialog.localVerify })
-            })
+    /// How many more rules the list takes; the bulk form marks the rest.
+    function bulkRuleRoom() {
+        return Math.max(0, freeRulesMaxCount - userRuleCount())
+    }
+    /// What a pasted list of rules settles (`Rules.planBulkRules`): its new
+    /// rules added and the rules it moves to their new route, all in one edit of
+    /// the list, so one apply sends them as a single revision. Lines that were
+    /// not taken go back into the form.
+    function saveBulkRules(plan) {
+        var rows = (plan && plan.rows) || []
+        var added = 0
+        var moved = 0
+        var capped = false
+        var userCount = userRuleCount()
+        // One pass over the list, not one per pasted line: a thousand lines
+        // against a full list would otherwise read it a thousand times.
+        var keys = {}
+        var byValue = {}
+        for (var k = 0; k < rulesModel.count; k += 1) {
+            var have = rulesModel.get(k)
+            keys[Rules.mergeKey(have)] = true
+            var same = Rules.canonicalRuleTypeSlug(have.ruleType) + "|"
+                + String(have.matchValue || "").toLowerCase()
+            if (!byValue[same]) byValue[same] = []
+            byValue[same].push(k)
         }
-        var added = addRuleDrafts(drafts)
-        if (!_trayAddRule) return
-        if (added > 0) _finishTrayAddRule()
-        else _trayAddRule = null
+        var nextId = parseInt(nextFreeRuleId().substring(2), 10)
+        for (var i = 0; i < rows.length; i += 1) {
+            var row = rows[i]
+            var form = { ruleType: row.type, value: row.value, route: row.route,
+                verify: row.verify, comment: row.comment, enabled: row.enabled }
+            if (row.action === "add") {
+                var item = ruleEditSupport.ruleRowFromForm(form,
+                    Rules.sequentialRuleId(Math.min(nextId, freeRulesMaxCount) - 1))
+                // A line of an `--- Auto` section stays app-authored, as an
+                // import keeps it, and outside the user's allowance.
+                var authored = String(row.originReason || "") !== ""
+                item.originReason = String(row.originReason || "")
+                item.originAnchor = String(row.originAnchor || "")
+                item.originAdded = String(row.originAdded || "")
+                if (keys[Rules.mergeKey(item)]) continue
+                if (!authored && userCount >= freeRulesMaxCount) {
+                    capped = true
+                    continue
+                }
+                keys[Rules.mergeKey(item)] = true
+                if (!authored) userCount += 1
+                nextId += 1
+                rulesModel.append(item)
+                // A new rule has no stored comment to clear.
+                if (item.comment !== "") _sidecarWriteCommentForRow(item)
+                added += 1
+            } else if (row.action === "move" && _moveRuleToRoute(row, byValue)) {
+                moved += 1
+            }
+        }
+        if (added + moved > 0) rulesModelEdited()
+        var status = tr("status.rules-list-added", "Rules added: {count}.")
+            .replace("{count}", String(added))
+        if (moved > 0) {
+            status += " " + tr("status.rules-list-moved", "Moved to the chosen route: {count}.")
+                .replace("{count}", String(moved))
+        }
+        if (capped) {
+            status += " " + tr("status.rules-limit-reached",
+                "Up to {max} active rules are supported.")
+                .replace("{max}", String(freeRulesMaxCount))
+        }
+        if (plan && plan.keep > 0) {
+            status += " " + tr("status.rules-list-left", "Left in the form to fix: {count}.")
+                .replace("{count}", String(plan.keep))
+        }
+        statusLine = status
+        _recomputeRulesDirty()
+        if (_trayAddRule) {
+            if (added + moved > 0) _finishTrayAddRule()
+            else _trayAddRule = null
+        }
+        if (plan && String(plan.remaining || "") !== "") {
+            ruleDialog.resumeBulk(plan.remaining)
+            ruleDialog.open()
+        }
+        return added + moved
+    }
+    /// The rule a bulk row found on another route, moved to the row's route
+    /// (`byValue`: list indices by folded type and value). Its comment is stored
+    /// by route, so it is written again under the new one.
+    function _moveRuleToRoute(row, byValue) {
+        var at = byValue[Rules.canonicalRuleTypeSlug(row.type) + "|"
+            + String(row.value).toLowerCase()] || []
+        for (var j = 0; j < at.length; j += 1) {
+            var r = rulesModel.get(at[j])
+            if (String(r.targetRoute) === row.route) continue
+            var verify = Rules.rowIsVerify({ ruleType: r.ruleType, targetRoute: row.route,
+                verify: r.verify, matchValue: r.matchValue })
+            rulesModel.set(at[j], { targetRoute: row.route, verify: verify })
+            rejudgeRowRoute(at[j])
+            var after = rulesModel.get(at[j])
+            if (String(after.comment || "") !== "") _sidecarWriteCommentForRow(after)
+            return true
+        }
+        return false
     }
 
     /// Add rules drafted outside the rule dialog, each `{ "rule-type", value,
@@ -6334,6 +6574,8 @@ ApplicationWindow {
                 return
             }
             console.time("[perf] _refreshRulesFromService populate")
+            var loadedBase = (p["base-revision"] !== undefined && p["base-revision"] !== null)
+                ? String(p["base-revision"]) : null
             // Suppress RulesSection's per-chunk rebuilds for the whole
             // clear+repopulate; see `rulesBulkLoading` doc comment above
             // `_appendRowsChunked`.
@@ -6362,6 +6604,8 @@ ApplicationWindow {
                 // service, so re-baseline the unsaved-changes signature too
                 // (also clears the dirty flag).
                 _captureRulesDirtyBaseline()
+                // The next write is built on exactly these rules.
+                rulesBaseRevision = loadedBase
                 // The model now mirrors the service exactly, so any offline
                 // preset import has been superseded — lift the anti-clobber
                 // guard (covers both an explicit user refetch and the
@@ -6769,7 +7013,7 @@ ApplicationWindow {
                 Pure.menuActionText(tr("action.export-settings", "Export settings..."), "Ctrl+Alt+S"),
                 Pure.menuActionText(exitAction.text, "Ctrl+Q")
             ])
-            ShortcutMenuItem { theme: uiTheme; labelText: tr("action.load-rule-list", "Load rule list..."); shortcutText: "Ctrl+O"; enabled: window.allowUserRuleEdits; onTriggered: openLoadRuleListWindow() }
+            ShortcutMenuItem { theme: uiTheme; labelText: tr("action.load-rule-list", "Load rule list..."); shortcutText: "Ctrl+O"; enabled: !window.ruleEditsLocked; onTriggered: openLoadRuleListWindow() }
             // Show WHAT is being exported, then ask where to put it.
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.export-current-rule-list", "Export current list..."); shortcutText: "Ctrl+Shift+S"; onTriggered: { rulesAction.trigger(); boundFilesController.exportCurrentRulesInteractive(null) } }
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.export-settings", "Export settings..."); shortcutText: "Ctrl+Alt+S"; onTriggered: settingsAction.trigger() }

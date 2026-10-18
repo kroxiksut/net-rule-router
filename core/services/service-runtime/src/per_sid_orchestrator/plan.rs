@@ -45,8 +45,8 @@ impl PerSidApplyOrchestrator {
                     self.clear_app_enforcement_status(sid);
                     self.clear_pending_vpn_clients(sid);
                     // policy gone ⇒ any block-all is disarming.
-                    self.note_block_all_state(sid, false);
-                    self.note_fail_closed_state(sid, false);
+                    let flushed = self.note_block_all_state(sid, false);
+                    self.note_fail_closed_state(sid, false, flushed);
                     // No policy ⇒ no kill-switch filters either; drop any stale
                     // entry so the registry never role-verifies a drop for a SID
                     // whose leak-guard is no longer armed.
@@ -88,8 +88,8 @@ impl PerSidApplyOrchestrator {
                     self.clear_app_enforcement_status(sid);
                     self.clear_pending_vpn_clients(sid);
                     // rules gone ⇒ any block-all is disarming.
-                    self.note_block_all_state(sid, false);
-                    self.note_fail_closed_state(sid, false);
+                    let flushed = self.note_block_all_state(sid, false);
+                    self.note_fail_closed_state(sid, false, flushed);
                     self.update_killswitch_registry(sid, KillswitchBlockIds::default());
                 }
                 return Ok(ComputedFilterSet::NoActiveRules);
@@ -104,10 +104,7 @@ impl PerSidApplyOrchestrator {
         if log_unresolved {
             self.note_cross_set_duplicates(sid, &rules.rule_book);
             let app_pattern = |r: &nrr_domain::canonical::CanonicalRule| -> Option<String> {
-                r.app_match.as_ref().map(|a| match &a.pattern {
-                    nrr_domain::canonical::CanonicalAppPattern::Exact(s)
-                    | nrr_domain::canonical::CanonicalAppPattern::Glob(s) => s.clone(),
-                })
+                r.app_match.as_ref().map(|a| a.pattern.as_str().to_string())
             };
             let primary_apps: Vec<String> = rules
                 .rule_book
@@ -414,13 +411,14 @@ impl PerSidApplyOrchestrator {
             .filter(|_| intent.publishes())
         {
             status.set_unresolved(sid, unresolved_apps.clone());
-            status.set_rule_conflicts(
-                sid,
-                crate::app_enforcement_status::rule_conflicts_from(
-                    &codegen_out.diagnostics,
-                    &rules.rule_book,
-                ),
+            let mut conflicts = crate::app_enforcement_status::rule_conflicts_from(
+                &codegen_out.diagnostics,
+                &rules.rule_book,
             );
+            conflicts.extend(crate::rule_conflicts::protected_rule_dtos(
+                &self.rules_provider.withheld_rules_for(sid),
+            ));
+            status.set_rule_conflicts(sid, conflicts);
         }
         timings.mark("codegen");
         let mut filters = codegen_out.filters;
@@ -1494,8 +1492,8 @@ impl PerSidApplyOrchestrator {
         // edge-triggered OS resolver-cache flush; a no-op
         // unless the block-all state changed since the previous compute.
         if intent.publishes() {
-            self.note_block_all_state(sid, block_all_armed);
-            self.note_fail_closed_state(sid, fail_closed_armed);
+            let flushed = self.note_block_all_state(sid, block_all_armed);
+            self.note_fail_closed_state(sid, fail_closed_armed, flushed);
             // Both postures cut at the packet layer, which has no user
             // condition — see `note_machine_wide_cut`.
             self.note_machine_wide_cut(sid, block_all_armed);

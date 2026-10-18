@@ -841,6 +841,7 @@ ColumnLayout {
                 TextEdit {
                     Layout.fillWidth: true
                     text: formatMessage(modelData)
+                    textFormat: TextEdit.PlainText
                     color: root.textColor
                     wrapMode: TextEdit.Wrap
                     readOnly: true

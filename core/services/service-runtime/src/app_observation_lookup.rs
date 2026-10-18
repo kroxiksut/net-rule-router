@@ -100,6 +100,12 @@ pub trait AppObservationLookup: Send + Sync {
     fn destination_used_outside(&self, _friendly: &[String], _ip: Ipv4Addr) -> bool {
         false
     }
+
+    /// `principal`'s own observations, where they are kept per user; `None`
+    /// means this lookup answers for everyone.
+    fn for_principal(&self, _principal: &str) -> Option<Arc<dyn AppObservationLookup>> {
+        None
+    }
 }
 
 /// File name of the running executable, lower-cased.
@@ -163,6 +169,9 @@ pub struct AppObservationStore {
     /// recorded, but only the ones an application rule names change a plan;
     /// counting the rest would make every browser tab look like new policy.
     watched: Mutex<Vec<String>>,
+    /// Set where each user's traffic follows their own routes: observations
+    /// then live in one store per user, and this one holds none itself.
+    per_principal: Option<PrincipalAppObservations>,
 }
 
 /// Sighting order of applications as a counter, so a sighting costs one map
@@ -221,7 +230,35 @@ impl AppObservationStore {
             app_cap_logged: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             watched: Mutex::new(Vec::new()),
+            per_principal: None,
         }
+    }
+
+    /// A store that keeps each user's observations apart (see
+    /// [`PrincipalAppObservations`]).
+    #[must_use]
+    pub fn per_principal() -> Self {
+        Self {
+            per_principal: Some(PrincipalAppObservations::new()),
+            ..Self::new()
+        }
+    }
+
+    /// The store a connection owned by `owner` is recorded in: this one, or,
+    /// kept per user, the owner's own. `None` for a connection whose owner is
+    /// unknown in a per-user store: attributed to nobody, it teaches nothing.
+    pub fn scope_for(self: &Arc<Self>, owner: Option<&str>) -> Option<Arc<Self>> {
+        match (self.per_principal.as_ref(), owner) {
+            (None, _) => Some(Arc::clone(self)),
+            (Some(stores), Some(owner)) if !owner.is_empty() => Some(stores.for_principal(owner)),
+            (Some(_), _) => None,
+        }
+    }
+
+    /// Whether observations are kept per user (see [`Self::per_principal`]).
+    #[must_use]
+    pub fn keeps_per_principal(&self) -> bool {
+        self.per_principal.is_some()
     }
 
     #[cfg(test)]
@@ -277,7 +314,8 @@ impl AppObservationStore {
     }
 
     pub fn record(&self, process_path: &str, ip: Ipv4Addr) -> bool {
-        if is_unroutable(ip) {
+        // Kept per user, an address is recorded through `scope_for`, never here.
+        if self.per_principal.is_some() || is_unroutable(ip) {
             return false;
         }
         let key = app_key(process_path);
@@ -366,7 +404,14 @@ impl AppObservationStore {
     /// Keys are the rule's own app pattern, which is exactly what
     /// [`ips_for_app`](AppObservationLookup::ips_for_app) is later queried with,
     /// so the set round-trips without re-deriving anything.
+    ///
+    /// Kept per user, remembered destinations are seeded into their owner's
+    /// store through [`scope_for`](Self::scope_for); here they have no owner
+    /// and teach nothing.
     pub fn seed_many(&self, pairs: &[(String, Ipv4Addr)]) -> usize {
+        if self.per_principal.is_some() {
+            return 0;
+        }
         pairs
             .iter()
             .filter(|(app, ip)| self.record(app, *ip))
@@ -382,6 +427,9 @@ impl AppObservationStore {
     /// one, and a pair withdrawn as collateral is no longer held, so it stays
     /// withdrawn. Returns how many pairs were refreshed.
     pub fn refresh_live(&self, live: &[LiveConnection]) -> usize {
+        if let Some(stores) = self.per_principal.as_ref() {
+            return stores.refresh_live(live);
+        }
         let now = (self.clock)();
         let mut refreshed: HashSet<(String, Ipv4Addr)> = HashSet::new();
         {
@@ -541,7 +589,11 @@ impl AppObservationStore {
     /// tell "nothing here is new" without reading it.
     #[must_use]
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Relaxed)
+        let own = self.generation.load(Ordering::Relaxed);
+        match self.per_principal.as_ref() {
+            Some(stores) => own.wrapping_add(stores.generation()),
+            None => own,
+        }
     }
 
     /// Whether `key` is a program some plan has asked about.
@@ -655,6 +707,11 @@ impl AppObservationLookup for AppObservationStore {
     fn destination_used_outside(&self, friendly: &[String], ip: Ipv4Addr) -> bool {
         AppObservationStore::destination_used_outside(self, friendly, ip)
     }
+
+    fn for_principal(&self, principal: &str) -> Option<Arc<dyn AppObservationLookup>> {
+        let stores = self.per_principal.as_ref()?;
+        Some(stores.for_principal(principal) as Arc<dyn AppObservationLookup>)
+    }
 }
 
 /// Does the rule pattern `pattern` name the observed process `key`?
@@ -712,6 +769,77 @@ fn is_unroutable(ip: Ipv4Addr) -> bool {
         ))
 }
 
+/// Most users a machine keeps separate observations for; past it the least
+/// recently created store gives way. Far above the people one machine serves.
+pub const PRINCIPAL_STORE_CAP: usize = 64;
+
+/// One [`AppObservationStore`] per user, for a platform that routes each
+/// user's traffic by their own table: an address one user's program used says
+/// nothing about another user's plan, and must not move their traffic.
+#[derive(Default)]
+pub struct PrincipalAppObservations {
+    stores: Mutex<Vec<(String, Arc<AppObservationStore>)>>,
+    /// Bumped when a store is created or dropped, so [`Self::generation`]
+    /// moves even when the stores' own counters sum to an earlier value.
+    membership: AtomicU64,
+}
+
+impl PrincipalAppObservations {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `principal`'s store, created on first use.
+    pub fn for_principal(&self, principal: &str) -> Arc<AppObservationStore> {
+        let mut stores = self.stores.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, store)) = stores.iter().find(|(p, _)| p == principal) {
+            return Arc::clone(store);
+        }
+        if stores.len() >= PRINCIPAL_STORE_CAP {
+            stores.remove(0);
+        }
+        let store = Arc::new(AppObservationStore::new());
+        stores.push((principal.to_owned(), Arc::clone(&store)));
+        self.membership.fetch_add(1, Ordering::Relaxed);
+        store
+    }
+
+    /// Every store made so far, by principal.
+    pub fn all(&self) -> Vec<(String, Arc<AppObservationStore>)> {
+        self.stores
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Moves whenever any user's store changes what a plan reads.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.all()
+            .iter()
+            .map(|(_, store)| store.generation())
+            .fold(self.membership.load(Ordering::Relaxed), u64::wrapping_add)
+    }
+
+    /// Restamp each user's destinations from the connections their own
+    /// programs hold open. A connection with no known owner restamps nothing.
+    pub fn refresh_live(&self, live: &[LiveConnection]) -> usize {
+        let mut refreshed = 0;
+        for (principal, store) in self.all() {
+            let mine: Vec<LiveConnection> = live
+                .iter()
+                .filter(|connection| connection.owner.as_deref() == Some(principal.as_str()))
+                .cloned()
+                .collect();
+            if !mine.is_empty() {
+                refreshed += store.refresh_live(&mine);
+            }
+        }
+        refreshed
+    }
+}
+
 /// Test-only [`AppObservationLookup`] backed by a pre-canned map. Always
 /// compiled (not `#[cfg(test)]`) so other crates' tests share the fixture.
 #[derive(Default)]
@@ -761,6 +889,65 @@ mod tests {
 
     fn addr(last: u8) -> Ipv4Addr {
         Ipv4Addr::new(203, 0, 113, last)
+    }
+
+    /// Kept per user, Alice's browser teaches Alice's plan only: Bob's rule
+    /// for the same program never sees her destinations.
+    #[test]
+    fn each_users_program_destinations_stay_in_that_users_plan() {
+        use super::{AppObservationLookup, AppObservationStore, LiveConnection};
+        use std::sync::Arc;
+        let store = Arc::new(AppObservationStore::per_principal());
+        let alice = store.scope_for(Some("uid:1000")).expect("owner known");
+        assert!(alice.record("/usr/bin/firefox", addr(10)));
+        // An owner the table could not name teaches nobody.
+        assert!(store.scope_for(None).is_none());
+        assert!(!store.record("/usr/bin/firefox", addr(11)));
+
+        let plan_of = |principal: &str| {
+            store
+                .for_principal(principal)
+                .expect("kept per user")
+                .ips_for_app("firefox")
+        };
+        assert_eq!(plan_of("uid:1000"), vec![addr(10)]);
+        assert!(
+            plan_of("uid:1001").is_empty(),
+            "another user's plan must not route Alice's destinations"
+        );
+
+        // A held connection refreshes its owner's destinations only.
+        let held = LiveConnection {
+            process_path: "/usr/bin/firefox".into(),
+            remote: addr(10),
+            owner: Some("uid:1001".into()),
+        };
+        assert_eq!(store.refresh_live(&[held]), 0);
+    }
+
+    /// Kept per user, a remembered destination with no owner teaches nobody,
+    /// not even a store made later.
+    #[test]
+    fn ownerless_seeds_reach_no_users_store() {
+        use super::{AppObservationLookup, AppObservationStore};
+        use std::sync::Arc;
+        let store = Arc::new(AppObservationStore::per_principal());
+        assert!(store.keeps_per_principal());
+        assert_eq!(store.seed_many(&[("firefox".to_string(), addr(10))]), 0);
+        let later = store.scope_for(Some("uid:1000")).expect("owner known");
+        assert!(later.ips_for_app("firefox").is_empty());
+        assert!(!later.keeps_per_principal());
+    }
+
+    /// The single shared store keeps today's behaviour: every scope is itself.
+    #[test]
+    fn a_shared_store_scopes_to_itself() {
+        use super::AppObservationStore;
+        use std::sync::Arc;
+        let store = Arc::new(AppObservationStore::new());
+        let scoped = store.scope_for(None).expect("shared");
+        assert!(Arc::ptr_eq(&store, &scoped));
+        assert!(super::AppObservationLookup::for_principal(store.as_ref(), "uid:1000").is_none());
     }
 
     fn friendly(names: &[&str]) -> Vec<String> {
@@ -1052,6 +1239,7 @@ mod tests {
         LiveConnection {
             process_path: process_path.to_string(),
             remote,
+            owner: None,
         }
     }
 

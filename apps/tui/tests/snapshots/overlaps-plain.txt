@@ -23,6 +23,7 @@ Notifications:
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the listed programs as your VPN, so leak protection keeps them working
+  p: confirm the suggested main connection; another one is chosen under Interfaces and routes
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Overlaps
@@ -46,11 +47,11 @@ Overlaps:
   4 overlap(s) not confirmed
   Show resolved: No
 Rules that cover the same sites:
-  1. ads.example.net (Domain) names the same sites as ads.example.net (Domain) on Primary. They are blocked: on a tie a block wins over a route.
-     Why it wins: A block wins a tie
+  1. ads.example.net (Domain) names the same sites as ads.example.net (Domain) on Primary. They are denied: on a tie a deny wins over a route.
+     Why it wins: A deny wins a tie
      Decision: Not confirmed
      The other rule names the same sites and never applies.
-     A block rule is part of this pair; change it in the rules list.
+     A deny rule is part of this pair; change it in the rules list.
   2. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Additional.
      Why it wins: Narrower rule
      Decision: Not confirmed
@@ -162,11 +163,11 @@ Overlaps:
   Rule changes take effect only after you review and apply them.
   Review and apply the change on screen 4, Rules.
 Rules that cover the same sites:
-  1. ads.example.net (Domain) names the same sites as ads.example.net (Domain) on Primary. They are blocked: on a tie a block wins over a route.
-     Why it wins: A block wins a tie
+  1. ads.example.net (Domain) names the same sites as ads.example.net (Domain) on Primary. They are denied: on a tie a deny wins over a route.
+     Why it wins: A deny wins a tie
      Decision: Confirmed
      The other rule names the same sites and never applies.
-     A block rule is part of this pair; change it in the rules list.
+     A deny rule is part of this pair; change it in the rules list.
   2. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Additional.
      Why it wins: Narrower rule
      Decision: Confirmed

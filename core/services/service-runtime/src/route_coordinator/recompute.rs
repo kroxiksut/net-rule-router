@@ -68,6 +68,8 @@ impl SecondaryRouteCoordinator {
                         sid = %sid,
                         "routing paused for this user (persist policy) — keeping /32 rule-routes, dropping overlays only",
                     );
+                    // Served alone: nobody else's tunnel carries them.
+                    self.note_traffic_carried(&[], &[]);
                     return self.reconciler.retain_rule_routes();
                 }
             }

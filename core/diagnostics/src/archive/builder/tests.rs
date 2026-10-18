@@ -158,7 +158,7 @@ fn archive_contains_no_raw_db_paths() {
     let mut zip = zip::ZipArchive::new(file).expect("parse zip");
     for i in 0..zip.len() {
         let entry = zip.by_index(i).expect("entry");
-        let name = entry.name();
+        let name = entry.name().expect("entry name");
         assert!(
             !name.ends_with(".db"),
             "archive must not contain .db files: {name}"
@@ -176,7 +176,7 @@ fn manifest_json_is_in_archive() {
     let file = std::fs::File::open(&dest).expect("open zip");
     let mut zip = zip::ZipArchive::new(file).expect("parse zip");
     let names: Vec<String> = (0..zip.len())
-        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
         .collect();
     assert!(
         names.contains(&"manifest.json".to_string()),
@@ -585,7 +585,7 @@ fn a_section_with_nothing_in_it_is_absent_rather_than_empty() {
     let file = std::fs::File::open(&dest).expect("open zip");
     let mut zip = zip::ZipArchive::new(file).expect("parse zip");
     let names: Vec<String> = (0..zip.len())
-        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
         .collect();
     assert!(
         !names.contains(&"audit_chain.ndjson".to_string()),
@@ -628,7 +628,7 @@ fn default_export_never_ships_the_raw_audit_chain() {
     let file = std::fs::File::open(&dest).expect("open zip");
     let mut zip = zip::ZipArchive::new(file).expect("parse zip");
     let names: Vec<String> = (0..zip.len())
-        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
         .collect();
     assert!(
         !names.contains(&"audit_chain.ndjson".to_string()),

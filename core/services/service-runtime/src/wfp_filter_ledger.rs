@@ -107,24 +107,42 @@ impl WfpFilterLedger {
     pub fn drain(&self) -> Vec<u64> {
         let mut written = self.written.lock().unwrap_or_else(|p| p.into_inner());
         written.clear();
-        let ids: Vec<u64> = match File::open(&self.path) {
-            Ok(f) => {
-                let mut set: BTreeSet<u64> = BTreeSet::new();
-                for line in BufReader::new(f).lines().map_while(Result::ok) {
-                    let t = line.trim();
-                    if !t.is_empty() {
-                        if let Ok(v) = t.parse::<u64>() {
-                            set.insert(v);
-                        }
-                    }
-                }
-                set.into_iter().collect()
-            }
-            Err(_) => Vec::new(),
-        };
+        let ids = read_ids(&self.path);
         // Truncate so the current process starts with a clean ledger.
         let _ = File::create(&self.path);
         ids
+    }
+
+    /// Every recorded id (deduped), leaving the file as it is: a start that
+    /// defers its predecessor's filters keeps them on disk until they are
+    /// settled, so a stop before then loses nothing.
+    pub fn read(&self) -> Vec<u64> {
+        let mut written = self.written.lock().unwrap_or_else(|p| p.into_inner());
+        let ids = read_ids(&self.path);
+        written.extend(ids.iter().copied());
+        ids
+    }
+
+    /// Make the file hold exactly `ids`: what is installed once inherited
+    /// filters are settled.
+    pub fn rewrite(&self, ids: &[u64]) {
+        let mut written = self.written.lock().unwrap_or_else(|p| p.into_inner());
+        let mut buf = String::with_capacity(ids.len() * 20);
+        for raw in ids {
+            let _ = writeln!(buf, "{raw}");
+        }
+        match std::fs::write(&self.path, buf) {
+            Ok(()) => {
+                written.clear();
+                written.extend(ids.iter().copied());
+            }
+            Err(e) => tracing::warn!(
+                target: "nrr::wfp-ledger",
+                msg_key = "wfpledger-rewrite-failed",
+                error = %e,
+                "ledger rewrite failed",
+            ),
+        }
     }
 
     /// Truncate the ledger — graceful stop already deleted the filters, so the
@@ -134,6 +152,19 @@ impl WfpFilterLedger {
         written.clear();
         let _ = File::create(&self.path);
     }
+}
+
+fn read_ids(path: &std::path::Path) -> Vec<u64> {
+    let Ok(f) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut set: BTreeSet<u64> = BTreeSet::new();
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
+        if let Ok(v) = line.trim().parse::<u64>() {
+            set.insert(v);
+        }
+    }
+    set.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -189,6 +220,23 @@ mod tests {
         // because the file it would be reaped from is empty now.
         ledger.record(&[id(10)]);
         assert_eq!(ledger.drain(), vec![10]);
+    }
+
+    #[test]
+    fn read_keeps_the_file_and_rewrite_replaces_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger = WfpFilterLedger::new(dir.path().join("wfp.ledger"));
+        ledger.record(&[id(10), id(20)]);
+
+        assert_eq!(ledger.read(), vec![10, 20]);
+        assert_eq!(ledger.read(), vec![10, 20], "a read truncates nothing");
+        ledger.record(&[id(20), id(30)]);
+        assert_eq!(ledger.read(), vec![10, 20, 30]);
+
+        ledger.rewrite(&[30]);
+        assert_eq!(ledger.read(), vec![30]);
+        ledger.record(&[id(10)]);
+        assert_eq!(ledger.drain(), vec![10, 30]);
     }
 
     #[test]

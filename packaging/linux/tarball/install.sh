@@ -6,9 +6,31 @@
 # Refuses on a machine where a package already installed NetRuleRouter: one
 # owner per install.
 #
-# Usage: sudo ./install.sh
+# Usage: sudo ./install.sh [--provision FILE] [--provision-secondary FILE]
+#                           [--provision-settings FILE] [--secondary-unset direct|block]
+#
+# The --provision options hand the service prepared files for an unattended
+# install: rules for the main and the additional route, a settings export, and
+# where additional-route rules go while no additional connection is chosen.
+# They are checked before anything is replaced and copied into
+# /etc/netrulerouter/provision, which the service applies once at its next
+# start. A refused file stops the install with the service binary's code
+# (10 main rules, 11 additional rules, 12 settings, 13 option, 14 staging).
 
 set -euo pipefail
+
+original_args=("$@")
+provision=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --provision) provision+=(--primary "${2:?--provision needs a file}"); shift 2 ;;
+    --provision-secondary) provision+=(--secondary "${2:?--provision-secondary needs a file}"); shift 2 ;;
+    --provision-settings) provision+=(--settings "${2:?--provision-settings needs a file}"); shift 2 ;;
+    --secondary-unset) provision+=(--secondary-unset "${2:?--secondary-unset needs direct or block}"); shift 2 ;;
+    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) echo "install.sh: unknown option $1" >&2; exit 2 ;;
+  esac
+done
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 tree="$here/root"
@@ -24,7 +46,7 @@ if [ "$(id -u)" -ne 0 ]; then
     echo "install.sh needs root, and sudo was not found. Re-run as root." >&2
     exit 1
   fi
-  exec sudo -- bash "${BASH_SOURCE[0]}" "$@"
+  exec sudo -- bash "${BASH_SOURCE[0]}" ${original_args[@]+"${original_args[@]}"}
 fi
 
 nrr_refuse_if_package_managed "upgrade or remove it with the package manager instead."
@@ -35,6 +57,17 @@ if [ ! -x "$payload/$NRR_SERVICE_EXE_NAME" ]; then
   exit 1
 fi
 nrr_pkg_assert_removable "$NRR_SERVICE_INSTALL_DIR"
+
+# Checked by this archive's own service binary before anything is replaced.
+if [ "${#provision[@]}" -gt 0 ]; then
+  nrr_cyan "==> check the prepared files"
+  check=0
+  "$payload/$NRR_SERVICE_EXE_NAME" provision-check "${provision[@]}" || check=$?
+  if [ "$check" -ne 0 ]; then
+    echo "install.sh: the prepared files were refused (code $check); nothing was installed." >&2
+    exit "$check"
+  fi
+fi
 
 # A running daemon would keep serving the files about to be replaced.
 if nrr_pkg_have_systemd && systemctl is-active --quiet "$NRR_UNIT_NAME"; then
@@ -74,6 +107,17 @@ if [ -d "$tree/usr/share/applications" ]; then
     install -D -m 0644 -T "$tree/usr/share/$relative" "/usr/share/$relative"
   done
   nrr_desktop_refresh_caches system /usr/share
+fi
+
+# Before the service starts, so its first start applies them.
+if [ "${#provision[@]}" -gt 0 ]; then
+  nrr_cyan "==> prepared files for the service"
+  stage=0
+  "$NRR_STAGED_SERVICE_BINARY" provision-stage "${provision[@]}" || stage=$?
+  if [ "$stage" -ne 0 ]; then
+    echo "install.sh: the prepared files could not be staged (code $stage)." >&2
+    exit "$stage"
+  fi
 fi
 
 nrr_cyan "==> register and start the service"

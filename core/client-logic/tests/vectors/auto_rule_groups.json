@@ -13,6 +13,29 @@
   },
   "cases": [
     {
+      "name": "a less certain offer carries its basis; an answered row never does",
+      "input": {
+        "candidates": [
+          { "id": "w1", "proposed-match": "login.site.test", "observations": 1, "signal": "brand-related", "less-certain": "brand-seen-once" },
+          { "id": "w2", "proposed-match": "cdn.site.test" }
+        ],
+        "dismissed": [
+          { "candidate-id": "d1", "anchor": "site.example", "proposed-match": "old.site.test", "dismissed-at-unix-ms": 9000 }
+        ],
+        "show-dismissed": true, "show-served": false, "query": "", "sort": "main-route"
+      }
+    },
+    {
+      "name": "an offer in another zone of the anchor's site carries that site",
+      "input": {
+        "candidates": [
+          { "id": "z1", "anchor": "www.example.com", "proposed-match": "example.net", "any-zone-site": "example" },
+          { "id": "z2", "anchor": "www.example.com", "proposed-match": "cdn.example.net" }
+        ],
+        "dismissed": [], "show-dismissed": false, "show-served": false, "query": "", "sort": "main-route"
+      }
+    },
+    {
       "name": "hosts of one domain group together; a stall sorts first",
       "input": {
         "candidates": [

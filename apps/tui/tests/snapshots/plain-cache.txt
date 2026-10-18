@@ -23,6 +23,7 @@ Notifications:
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the listed programs as your VPN, so leak protection keeps them working
+  p: confirm the suggested main connection; another one is chosen under Interfaces and routes
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Cache

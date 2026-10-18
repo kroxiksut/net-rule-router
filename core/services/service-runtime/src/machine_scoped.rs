@@ -14,7 +14,7 @@
 
 use nrr_shared::ipc::IpcOperationName;
 
-use crate::ipc::{IpcError, IpcErrorCode};
+use crate::ipc::IpcError;
 
 #[cfg(test)]
 mod gate_probes;
@@ -117,7 +117,11 @@ impl MachineScopedSetting {
             | Op::VerifyVerdictsList
             | Op::VerifyVerdictsAccept
             | Op::VerifyVerdictsDismiss
-            | Op::VpnGatewayCandidatesList => None,
+            | Op::VpnGatewayCandidatesList
+            | Op::RulesRecentChangesList
+            | Op::ConnHistoryList
+            | Op::ConnHistoryClear
+            | Op::ConnHistorySettingsSet => None,
         }
     }
 
@@ -166,20 +170,17 @@ pub fn machine_scoped_write_allowed<T: PartialEq>(
 /// stable part a client acts on: `Forbidden` means "an administrator could".
 #[must_use]
 pub fn machine_scoped_refusal(setting: MachineScopedSetting) -> IpcError {
-    IpcError {
-        code: IpcErrorCode::Forbidden,
-        message: format!(
-            "{} is shared by every user of this machine; changing it needs an \
-             administrator. Saving it unchanged is always allowed.",
-            setting.subject()
-        ),
-        diagnostics_id: None,
-    }
+    IpcError::needs_administrator(format_args!(
+        "{} is shared by every user of this machine; changing it needs an \
+         administrator. Saving it unchanged is always allowed.",
+        setting.subject()
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::IpcErrorCode;
 
     #[test]
     fn an_unchanged_value_saves_without_elevation() {
@@ -200,6 +201,29 @@ mod tests {
         assert_eq!(e.code, IpcErrorCode::Forbidden);
         assert!(e.message.contains("DoH/DoT resolver list"));
         assert!(e.message.contains("administrator"));
+    }
+
+    /// The router lifts a value-gated refusal only for operations the shared
+    /// list names, and clients budget for the password prompt by the same list.
+    #[test]
+    fn every_value_gated_operation_is_one_the_router_may_lift() {
+        for op in IpcOperationName::ALL {
+            if MachineScopedSetting::written_by(op).is_some() {
+                assert!(
+                    nrr_shared::ipc_transport::handler_may_need_administrator(op),
+                    "{}",
+                    op.slug()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_refusal_is_typed_as_needing_an_administrator() {
+        let e = machine_scoped_refusal(MachineScopedSetting::Retention);
+        assert!(nrr_shared::ipc_transport::is_needs_administrator(
+            &e.message
+        ));
     }
 
     #[test]

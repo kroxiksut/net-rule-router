@@ -747,6 +747,18 @@ impl<'c> RouteBindingsRepository<'c> {
             .map_err(|e| StorageError::Internal(format!("has policy: {e}")))
     }
 
+    /// Whether `sid` has bound at least one connection: the user's own act
+    /// that turns routing on for them.
+    pub fn has_binding_for_sid(&self, sid: &str) -> StorageResult<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM route_bindings WHERE sid = ?1)",
+                params![sid],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| StorageError::Internal(format!("has binding: {e}")))
+    }
+
     /// Whether any user has leak protection on — what a crashed service's
     /// cleanup asks before it lifts the blocks that protection holds.
     pub fn any_leak_guard_armed(&self) -> StorageResult<bool> {

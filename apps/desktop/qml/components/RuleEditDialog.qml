@@ -75,8 +75,8 @@ Dialog {
                 text: root.tr("action.ok", "OK")
                 // App rules ARE saveable now — they route the app's observed
                 // destinations via the secondary (app-routing via observation).
-                enabled: ruleDialog.listMode
-                    ? ruleDialog.acceptedListRows.length > 0
+                enabled: ruleDialog.bulkMode
+                    ? ruleDialog.bulkCanApply
                     : ruleDialog.isMatchValueValid(ruleDialog.localRuleType,
                         ruleDialog.localValue)
                 onClicked: ruleDialog.accept()
@@ -104,27 +104,36 @@ Dialog {
     // Enabled toggle in Add/Edit dialog. Default
     // true on Add; carries existing state on Edit.
     property bool localEnabled: true
-    // Grandfather flag: `block` is no longer an offerable route for new
-    // Free rules (it was removed). When Edit opens on a pre-existing block
-    // rule we keep the option in the target-route combo so saving doesn't
-    // silently downgrade it to `primary`. Latched in resetForEdit(), so the
-    // combo model stays stable for the whole dialog session.
-    property bool allowBlockRoute: false
-    // "Unsure" fits a domain or one address on a route, never a block.
+    // "Unsure" fits a domain or one address on a route, never a deny.
     readonly property bool verifyOffered: Rules.ruleTypeAllowsVerify(localRuleType)
-        && localRoute !== "block"
+        && localRoute !== "block" && !anyZoneValue
+    readonly property bool anyZoneValue: Rules.valueIsAnyZone(localValue)
+    // A deny where "Unsure" would otherwise fit: say why the box is off.
+    readonly property bool verifyRefusedByDeny: localRoute === "block"
+        && Rules.ruleTypeAllowsVerify(localRuleType) && !anyZoneValue
     // The one handler for this signal: QML refuses a second one and the whole
     // dialog — and with it the main window — then fails to load.
     onLocalRuleTypeChanged: {
         _requestVerdict()
         overlapTimer.restart()
     }
-    onLocalRouteChanged: { _syncRouteCombo(); overlapTimer.restart() }
+    onLocalRouteChanged: {
+        // The file cannot hold `!` and `?` together, so choosing a deny clears
+        // the tick instead of keeping it for a later route change.
+        if (localRoute === "block" && localVerify) {
+            localVerify = false
+            if (ruleVerifyCheck) ruleVerifyCheck.checked = false
+        }
+        _syncRouteCombo()
+        _requestVerdict()
+        overlapTimer.restart()
+        if (bulkMode) bulkPlanTimer.restart()
+    }
     onLocalEnabledChanged: overlapTimer.restart()
     // User input severs the combo's index binding, so it is kept in step by hand.
     function _syncRouteCombo() {
         if (!routeTargetCombo || !root) return
-        var roleOpts = root.routeRoleOptions(allowBlockRoute)
+        var roleOpts = root.routeRoleOptions()
         var rIdx = 0
         for (var i = 0; i < roleOpts.length; i += 1) {
             if (roleOpts[i].id === localRoute) { rIdx = i; break }
@@ -182,7 +191,6 @@ Dialog {
             localVerify = r.verify === true
             localComment = String(r.comment || "")
             localEnabled = (r.enabled === undefined) ? true : !!r.enabled
-            allowBlockRoute = (String(r.targetRoute || "") === "block")
         } else {
             localRuleType = firstAddableRuleType()
             localValue = ""
@@ -190,12 +198,16 @@ Dialog {
             localVerify = false
             localComment = ""
             localEnabled = true
-            allowBlockRoute = false
         }
-        listMode = false
-        listText = ""
-        if (listInput) listInput.text = ""
-        if (listModeCheck) listModeCheck.checked = false
+        bulkMode = false
+        bulkText = ""
+        bulkChoices = ({})
+        _bulkVerdicts = ({})
+        _bulkAsked = ({})
+        bulkPlan = _emptyBulkPlan
+        if (bulkInput) bulkInput.text = ""
+        if (oneRuleRadio) oneRuleRadio.checked = true
+        if (severalRulesRadio) severalRulesRadio.checked = false
         // Sync visible widgets to fresh local state. Bindings on `text` /
         // `currentIndex` / `checked` are broken by user input, so do this
         // directly.
@@ -237,6 +249,13 @@ Dialog {
     /// machine-wide subdomain setting folded in.
     function _coverageHint() {
         var v = String(localValue || "")
+        if (/\.\*$/.test(v)) {
+            var site = v.substring(0, v.length - 2)
+            site = site.indexOf("*.") === 0 ? site.substring(2) : site
+            return root.tr("dialog.rule.coverage-any-zone",
+                "Covers {host} in every zone ({host}.com, {host}.net and so on) with all subdomains. A rule naming the zone wins over it.")
+                .replace(/\{host\}/g, site)
+        }
         var bare = v.indexOf("*.") === 0 ? v.substring(2) : v
         if (v.indexOf("*.") === 0 || root.prefs.routeIncludeSubdomains !== false) {
             return root.tr("dialog.rule.coverage-with-subdomains",
@@ -277,28 +296,22 @@ Dialog {
         if (ruleType === "subnet") return new RegExp("^[0-9A-Fa-f.:/ ]{0,51}$")
         if (ruleType === "ip-range") return new RegExp("^[0-9A-Fa-f.: -]{0,93}$")
         if (ruleType === "zone" || ruleType === "domain") return new RegExp("^.{0,253}$")
-        if (ruleType === "application") return new RegExp("^.{0,260}$")
+        if (ruleType === "application") {
+            return new RegExp("^.{0," + Rules.ruleValueMaxLength(ruleType) + "}$")
+        }
         return new RegExp("^.*$")
     }
     function matchValueMaxLength(ruleType) {
-        if (ruleType === "zone" || ruleType === "domain") return 253
-        if (ruleType === "exact-ip")    return 45
-        if (ruleType === "subnet")      return 51
-        if (ruleType === "ip-range")    return 93
-        if (ruleType === "application") return 260
-        return 260
-    }
-    /// The address types a pasted list is sorted into.
-    function isAddressRuleType(ruleType) {
-        return ruleType === "exact-ip" || ruleType === "subnet" || ruleType === "ip-range"
+        return Rules.ruleValueMaxLength(ruleType)
     }
     // The verdict on the value on screen, asked of the launcher: the one the
     // rules table shows, which for a zone or domain is the service's own
     // import pipeline. `key` names the value it answers, so the answer to an
-    // earlier keystroke never gates a later one.
+    // earlier keystroke never gates a later one. The route is part of it: a
+    // deny or the additional route may not name a program the system needs.
     property var _verdict: ({ key: "", status: "", messageKey: "", args: ({}) })
     function _verdictKey(ruleType, raw) {
-        return String(ruleType || "") + "|" + String(raw || "").trim()
+        return String(ruleType || "") + "|" + String(raw || "").trim() + "|" + String(localRoute || "")
     }
     function _requestVerdict() {
         var type = localRuleType
@@ -308,7 +321,7 @@ Dialog {
             return
         }
         var key = _verdictKey(type, value)
-        var corr = root.rpc.bridge.rpcRuleValueVerdict(type, value)
+        var corr = root.rpc.bridge.rpcRuleValueVerdict(type, value, String(localRoute || ""))
         root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
             if (!ok) {
                 console.log("local.rule-value-verdict failed:", code, msg)
@@ -355,6 +368,28 @@ Dialog {
         return verdict === null ? fallback
             : verdictMessage(verdict.messageKey, verdict.args, fallback)
     }
+    /// The type the value on screen is, when its verdict says it belongs to
+    /// another one this form offers; "" otherwise.
+    function switchTypeTarget() {
+        var verdict = _verdictFor(localRuleType, localValue)
+        if (verdict === null || verdict.status !== "error") return ""
+        var target = Rules.misplacedTargetType(verdict.messageKey)
+        return target !== "" && target !== localRuleType && _typeOffered(target) ? target : ""
+    }
+    /// "Move to that type", on the user's click only.
+    function switchToType(target) {
+        if (target === "") return
+        localRuleType = target
+        if (ruleTypeCombo) {
+            for (var k = 0; k < root.ruleTypesModel.count; k += 1) {
+                if (root.ruleTypesModel.get(k).id === target) {
+                    ruleTypeCombo.currentIndex = k
+                    break
+                }
+            }
+        }
+        if (matchValueField) matchValueField.forceActiveFocus()
+    }
     function warningText() {
         var verdict = _verdictFor(localRuleType, localValue)
         return verdict === null ? ""
@@ -362,41 +397,231 @@ Dialog {
                 root.tr("rules.validation.warning", "Warning"))
     }
 
-    // ── A pasted list of addresses, subnets and ranges ──
-    // Rust sorts each line into its type and judges it as that type
-    // (`local.rule-values-classify`); the dialog only shows the answer.
-    property bool listMode: false
-    property string listText: ""
-    property var _listAnswer: ({ text: "", rows: [], truncated: false })
-    readonly property bool listAvailable: !!root && !!root.rpc && root.rpc.bridgeAvailable
-        && typeof root.rpc.bridge.rpcRuleValuesClassify === "function"
-    readonly property var listRows: _listAnswer.text === listText.trim() ? _listAnswer.rows : []
-    readonly property var acceptedListRows: {
+    // ── Several rules at once ──
+    // The text reads as a rules file (`Rules.planBulkRules`; the TUI runs its
+    // Rust twin), each row judged by the launcher, once for the whole paste.
+    // The route above applies to every line without its own `!`.
+    property bool bulkMode: false
+    property string bulkText: ""
+    /// By line number: `{ text, type, move }`, honoured while the line still
+    /// reads `text`, so an edit above it does not hand it to another line.
+    property var bulkChoices: ({})
+    /// Verdicts by `verdictKey`, kept across keystrokes.
+    property var _bulkVerdicts: ({})
+    /// Keys asked of the launcher and not answered yet.
+    property var _bulkAsked: ({})
+    readonly property var _emptyBulkPlan: ({ rows: [], lines: 0, excess: 0, bound: "",
+        add: 0, move: 0, keep: 0, drop: 0, remaining: "" })
+    property var bulkPlan: _emptyBulkPlan
+    readonly property int bulkPendingCount: {
+        var n = 0
+        for (var i = 0; i < bulkPlan.rows.length; i += 1) {
+            if (bulkPlan.rows[i].status === "pending") n += 1
+        }
+        return n
+    }
+    readonly property bool bulkCanApply: bulkPlan.add + bulkPlan.move > 0 && bulkPendingCount === 0
+    readonly property bool bulkAvailable: !!root && !!root.rpc && root.rpc.bridgeAvailable
+        && typeof root.rpc.bridge.rpcRuleValuesVerdicts === "function"
+    onBulkTextChanged: bulkPlanTimer.restart()
+    onBulkModeChanged: bulkPlanTimer.restart()
+    Timer {
+        id: bulkPlanTimer
+        interval: 200
+        repeat: false
+        onTriggered: ruleDialog._replanBulk()
+    }
+    function _typeOffered(type) {
+        for (var i = 0; i < root.ruleTypesModel.count; i += 1) {
+            if (root.ruleTypesModel.get(i).id === type) return true
+        }
+        return false
+    }
+    function _bulkExisting() {
         var out = []
-        for (var i = 0; i < listRows.length; i += 1) {
-            if (String(listRows[i].status) !== "error") out.push(listRows[i])
+        for (var i = 0; i < root.rulesModel.count; i += 1) {
+            var r = root.rulesModel.get(i)
+            out.push({ type: String(r.ruleType || ""), value: String(r.matchValue || ""),
+                route: String(r.targetRoute || "") })
         }
         return out
     }
-    function _requestListClassification() {
-        var text = listText.trim()
-        if (text === "" || !listAvailable) {
-            _listAnswer = { text: text, rows: [], truncated: false }
+    function _bulkLineText(lines, n) {
+        return n >= 1 && n <= lines.length ? String(lines[n - 1]).replace(/\r$/, "").trim() : ""
+    }
+    function _bulkLiveChoices() {
+        var lines = bulkText.split("\n")
+        var out = {}
+        for (var k in bulkChoices) {
+            var c = bulkChoices[k]
+            if (_bulkLineText(lines, parseInt(k, 10)) === c.text) out[k] = { type: c.type, move: c.move }
+        }
+        return out
+    }
+    function _replanBulk() {
+        if (!bulkMode || !root) {
+            bulkPlan = _emptyBulkPlan
             return
         }
-        var corr = root.rpc.bridge.rpcRuleValuesClassify(text)
+        var plan = Rules.planBulkRules({
+            text: bulkText,
+            route: localRoute,
+            os: String(root.platformProfile.os || ""),
+            apps: _typeOffered("application"),
+            existing: _bulkExisting(),
+            choices: _bulkLiveChoices(),
+            verdicts: _bulkVerdicts,
+            room: root.bulkRuleRoom()
+        })
+        // A new model scrolls a list back to its top; the reader stays put.
+        var y = bulkPreview ? bulkPreview.contentY : 0
+        bulkPlan = plan
+        if (bulkPreview) {
+            Qt.callLater(function() {
+                bulkPreview.contentY = Math.max(0, Math.min(y,
+                    bulkPreview.contentHeight - bulkPreview.height))
+            })
+        }
+        _askBulkVerdicts(plan)
+    }
+    function _askBulkVerdicts(plan) {
+        if (!bulkAvailable) return
+        var wanted = Rules.bulkPendingVerdicts(plan)
+        var asked = {}
+        for (var a in _bulkAsked) asked[a] = true
+        var values = []
+        for (var i = 0; i < wanted.length; i += 1) {
+            if (asked[wanted[i].key]) continue
+            asked[wanted[i].key] = true
+            values.push(wanted[i])
+        }
+        if (values.length === 0) return
+        _bulkAsked = asked
+        var query = []
+        for (var q = 0; q < values.length; q += 1) {
+            query.push({ "rule-type": values[q]["rule-type"], "match-value": values[q]["match-value"] })
+        }
+        var corr = root.rpc.bridge.rpcRuleValuesVerdicts(JSON.stringify(query))
         root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
+            var left = {}
+            for (var k in ruleDialog._bulkAsked) left[k] = true
+            for (var m = 0; m < values.length; m += 1) delete left[values[m].key]
+            ruleDialog._bulkAsked = left
             if (!ok) {
-                console.log("local.rule-values-classify failed:", code, msg)
+                console.log("local.rule-values-verdicts failed:", code, msg)
                 return
             }
-            ruleDialog._listAnswer = {
-                text: text,
-                rows: (payload && payload.rows) || [],
-                truncated: !!(payload && payload.truncated)
+            var got = (payload && payload.verdicts) || []
+            var next = {}
+            var kept = 0
+            for (var v in ruleDialog._bulkVerdicts) {
+                next[v] = ruleDialog._bulkVerdicts[v]
+                kept += 1
             }
+            // Typing leaves a verdict per keystroke behind; past a few
+            // thousand they are dropped and asked again when needed.
+            if (kept > 5000) next = {}
+            for (var n = 0; n < values.length && n < got.length; n += 1) {
+                next[values[n].key] = {
+                    status: String(got[n].status || ""),
+                    "message-key": String(got[n]["message-key"] || ""),
+                    args: got[n].args || ({})
+                }
+            }
+            ruleDialog._bulkVerdicts = next
+            ruleDialog._replanBulk()
         })
     }
+    /// The type picked on a preview row; picking it again takes it back.
+    function bulkChoose(row, type) {
+        var next = {}
+        for (var k in bulkChoices) next[k] = bulkChoices[k]
+        var key = String(row.line)
+        var current = next[key] && next[key].text === row.text ? next[key] : null
+        next[key] = {
+            text: row.text,
+            type: current && current.type === type ? "" : type,
+            move: current ? current.move === true : false
+        }
+        bulkChoices = next
+        _replanBulk()
+    }
+    function bulkSetMove(row, on) {
+        var next = {}
+        for (var k in bulkChoices) next[k] = bulkChoices[k]
+        var key = String(row.line)
+        var current = next[key] && next[key].text === row.text ? next[key] : null
+        next[key] = { text: row.text, type: current ? current.type : "", move: on === true }
+        bulkChoices = next
+        _replanBulk()
+    }
+    /// Back to "several rules" with `text` in the field: what an apply left.
+    function resumeBulk(text) {
+        bulkMode = true
+        if (oneRuleRadio) oneRuleRadio.checked = false
+        if (severalRulesRadio) severalRulesRadio.checked = true
+        bulkChoices = ({})
+        bulkText = String(text || "")
+        if (bulkInput) bulkInput.text = bulkText
+        _replanBulk()
+    }
+    function setBulkMode(on) {
+        if (on && bulkText === "" && String(localValue || "").trim() !== "") {
+            bulkText = String(localValue).trim()
+            if (bulkInput) bulkInput.text = bulkText
+        }
+        bulkMode = on
+        if (on && bulkInput) bulkInput.forceActiveFocus()
+    }
+    /// A verdict's arguments as they read: a route by the user's name for it.
+    function _bulkArgs(row) {
+        var out = {}
+        for (var k in (row.args || {})) out[k] = String(row.args[k])
+        if (out.route !== undefined) out.route = root.routeLabel(out.route)
+        return out
+    }
+    function bulkRowText(row) {
+        var parts = [row.type !== "" ? root.ruleTypeLabel(row.type)
+            : root.tr("dialog.rule.bulk.type-unknown", "Type not known")]
+        parts.push(row.route === "block" ? root.tr("label.block", "Denied") : root.routeLabel(row.route))
+        if (!row.enabled) parts.push(root.tr("label.disabled", "disabled"))
+        if (row.verify) parts.push(root.tr("rules.filter.route.unsure", "Unsure (?)"))
+        var status = row.status === "ok" && row.action === "add"
+            ? root.tr("dialog.rule.bulk.will-add", "will be added")
+            : verdictMessage(row.key, _bulkArgs(row), row.status === "error"
+                ? root.tr("rules.validation.error", "Error \u2014 rule is inactive")
+                : root.tr("rules.validation.warning", "Valid with warnings"))
+        return parts.join(", ") + " \u2014 " + status
+    }
+    function bulkMoveText(row) {
+        if (row.route === "block") return root.tr("tray.add-rule.deny-instead", "Deny instead")
+        if (row.otherRoute === "block") {
+            return root.tr("tray.add-rule.lift-deny", "Lift the deny, use this route")
+        }
+        return root.tr("tray.add-rule.move", "Move to this route")
+    }
+    function bulkSummaryText() {
+        var p = bulkPlan
+        var text = root.tr("dialog.rule.bulk.summary",
+            "To add: {add}. To move: {move}. Stay in the field: {keep}. Already in your rules: {drop}.")
+            .replace("{add}", String(p.add)).replace("{move}", String(p.move))
+            .replace("{keep}", String(p.keep)).replace("{drop}", String(p.drop))
+        if (bulkPendingCount > 0) {
+            text += " " + root.tr("dialog.rule.bulk.checking", "Checking: {count}.")
+                .replace("{count}", String(bulkPendingCount))
+        }
+        if (p.bound === "lines") {
+            text += " " + root.tr("dialog.rule.bulk.bound-lines",
+                "Only the first {max} lines are read; the other {count} stay in the field for the next round.")
+                .replace("{max}", String(p.lines)).replace("{count}", String(p.excess))
+        } else if (p.bound === "size") {
+            text += " " + root.tr("dialog.rule.bulk.bound-size",
+                "The text is longer than one round reads: the first {lines} lines are read, the other {count} stay in the field.")
+                .replace("{lines}", String(p.lines)).replace("{count}", String(p.excess))
+        }
+        return text
+    }
+
     // Which rules of the other route this one meets, said before it is saved:
     // the overlaps table then asks only about pairs nobody made on purpose.
     property var _overlapAnswer: ({ key: "", lines: [] })
@@ -407,7 +632,7 @@ Dialog {
     }
     function _requestOverlaps() {
         var value = String(localValue || "").trim()
-        if (listMode || value === "" || typeof root.candidateRouteOverlaps !== "function") return
+        if (bulkMode || value === "" || typeof root.candidateRouteOverlaps !== "function") return
         var editing = root.editingRule >= 0 && root.editingRule < root.rulesModel.count
         var key = _overlapKey()
         var row = {
@@ -417,7 +642,7 @@ Dialog {
             matchValue: value,
             targetRoute: localRoute,
             verify: Rules.rowIsVerify({ ruleType: localRuleType, targetRoute: localRoute,
-                verify: localVerify }),
+                verify: localVerify, matchValue: value }),
             comment: ""
         }
         root.candidateRouteOverlaps(editing ? root.editingRule : -1, row, function(pairs, candidate) {
@@ -444,43 +669,13 @@ Dialog {
         onTriggered: ruleDialog._requestOverlaps()
     }
 
-    // Typing a long list must not ask once per keystroke.
-    Timer {
-        id: listClassifyTimer
-        interval: 200
-        repeat: false
-        onTriggered: ruleDialog._requestListClassification()
-    }
-    onListTextChanged: listClassifyTimer.restart()
-    function listRowText(row) {
-        var status = String(row.status || "")
-        if (status === "valid") return root.ruleTypeLabel(String(row["rule-type"]))
-        var fallback = status === "error"
-            ? root.tr("rules.validation.error", "Error — rule is inactive")
-            : root.tr("rules.validation.warning", "Warning")
-        var message = verdictMessage(row["message-key"], row.args, fallback)
-        if (status === "error") return message
-        return root.ruleTypeLabel(String(row["rule-type"])) + " — " + message
-    }
-    function listSummaryText() {
-        var text = root.tr("rules.paste.summary", "To add: {accepted}. Not added: {rejected}.")
-            .replace("{accepted}", String(acceptedListRows.length))
-            .replace("{rejected}", String(listRows.length - acceptedListRows.length))
-        if (_listAnswer.truncated && listRows.length > 0) {
-            text += " " + root.tr("rules.paste.truncated",
-                "Only the first {count} lines were read.")
-                .replace("{count}", String(listRows.length))
-        }
-        return text
-    }
-
     onAccepted: {
-        if (listMode) {
-            if (acceptedListRows.length === 0) {
+        if (bulkMode) {
+            if (!bulkCanApply) {
                 open()
                 return
             }
-            root.saveRuleList(acceptedListRows)
+            root.saveBulkRules(bulkPlan)
             return
         }
         if (!isMatchValueValid(localRuleType, localValue)) {
@@ -506,10 +701,38 @@ Dialog {
             y: root.uiTheme.spacingMd
             width: formScroll.availableWidth - 2 * root.uiTheme.spacingMd
             spacing: root.uiTheme.spacingSm
-            Label { text: root.tr("label.rule-type", "Rule type"); color: root.textColor }
+            // One rule or a pasted list; an edited rule is always one.
+            RowLayout {
+                Layout.fillWidth: true
+                visible: root.editingRule < 0 && ruleDialog.bulkAvailable
+                spacing: root.uiTheme.spacingMd
+                ThemedRadioButton {
+                    id: oneRuleRadio
+                    theme: root.uiTheme
+                    checked: true
+                    text: root.uiRevision >= 0 ? root.tr("dialog.rule.mode.one", "One rule") : ""
+                    onToggled: if (checked) ruleDialog.setBulkMode(false)
+                    Accessible.name: text
+                }
+                ThemedRadioButton {
+                    id: severalRulesRadio
+                    theme: root.uiTheme
+                    text: root.uiRevision >= 0 ? root.tr("dialog.rule.mode.several", "Several rules") : ""
+                    onToggled: if (checked) ruleDialog.setBulkMode(true)
+                    Accessible.name: text
+                    Accessible.description: bulkLabel.text
+                }
+                Item { Layout.fillWidth: true }
+            }
+            Label {
+                visible: !ruleDialog.bulkMode
+                text: root.tr("label.rule-type", "Rule type")
+                color: root.textColor
+            }
             ThemedComboBox {
                 id: ruleTypeCombo
                 theme: root.uiTheme
+                visible: !ruleDialog.bulkMode
                 Layout.fillWidth: true
                 model: root.ruleTypesModel
                 textRole: "id"
@@ -518,8 +741,6 @@ Dialog {
                 displayText: root.uiRevision >= 0 && currentIndex >= 0 && currentIndex < root.ruleTypesModel.count
                     ? root.ruleTypeLabel(root.ruleTypesModel.get(currentIndex).id) : ""
                 popup.width: root.comboPopupWidth(ruleTypeCombo, root.ruleTypesModel, "id", function(item) { return root.ruleTypeLabel(item.id) })
-                // A pasted list takes each line's type from the line itself.
-                enabled: !ruleDialog.listMode
                 onActivated: ruleDialog.localRuleType = root.ruleTypesModel.get(currentIndex).id
                 // All rule types are selectable. `application` routes the app's
                 // OBSERVED destinations via the secondary (app-routing via
@@ -545,126 +766,157 @@ Dialog {
                     }
                 }
             }
-            CheckBox {
-                id: listModeCheck
-                visible: root.editingRule < 0 && ruleDialog.listAvailable
-                    && ruleDialog.isAddressRuleType(ruleDialog.localRuleType)
-                checked: ruleDialog.listMode
-                text: root.uiRevision >= 0
-                    ? root.tr("rules.paste.toggle", "Add a list of addresses, subnets and ranges")
-                    : ""
-                onToggled: {
-                    ruleDialog.listMode = checked
-                    if (checked) listInput.forceActiveFocus()
-                }
-                Accessible.role: Accessible.CheckBox
-                Accessible.name: text
-            }
             Label {
-                visible: ruleDialog.listMode
+                id: bulkLabel
+                visible: ruleDialog.bulkMode
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 wrapMode: Text.WordWrap
                 color: root.textColor
                 text: root.uiRevision >= 0
-                    ? root.tr("rules.paste.label",
-                        "One entry per line. Addresses, subnets and ranges can be mixed: each is added as its own type.")
+                    ? root.tr("dialog.rule.bulk.label",
+                        "One rule per line, as in a rules file: !value denies, ?value checks where it works, # value is kept switched off, and a line such as --- Windows gives the lines below it their type. Otherwise the type is read from the value.")
                     : ""
             }
             ScrollView {
-                id: listInputScroll
-                visible: ruleDialog.listMode
+                id: bulkInputScroll
+                visible: ruleDialog.bulkMode
                 Layout.fillWidth: true
-                Layout.preferredHeight: 120
+                Layout.preferredHeight: 140
                 clip: true
                 ThemedTextArea {
-                    id: listInput
+                    id: bulkInput
                     theme: root.uiTheme
                     wrapMode: TextArea.NoWrap
                     placeholderText: root.uiRevision >= 0
-                        ? root.tr("rules.placeholder.address-list",
-                            "192.0.2.10, 198.51.100.0/24, 203.0.113.5-203.0.113.40")
+                        ? root.tr("dialog.rule.bulk.placeholder",
+                            "example.com\n!ads.example.net\n192.0.2.0/24\n--- Windows\nbrowser.exe")
                         : ""
-                    onTextChanged: ruleDialog.listText = text
+                    onTextChanged: ruleDialog.bulkText = text
                     // Tab leaves the field, as in every other control of the form.
                     Keys.onTabPressed: function(event) {
-                        var next = listInput.nextItemInFocusChain(true)
+                        var next = bulkInput.nextItemInFocusChain(true)
                         if (next) next.forceActiveFocus(Qt.TabFocusReason)
                         event.accepted = true
                     }
                     Keys.onBacktabPressed: function(event) {
-                        var prev = listInput.nextItemInFocusChain(false)
+                        var prev = bulkInput.nextItemInFocusChain(false)
                         if (prev) prev.forceActiveFocus(Qt.BacktabFocusReason)
                         event.accepted = true
                     }
                     Accessible.role: Accessible.EditableText
-                    Accessible.name: listModeCheck.text
-                    Accessible.description: root.uiRevision >= 0
-                        ? root.tr("rules.paste.label",
-                            "One entry per line. Addresses, subnets and ranges can be mixed: each is added as its own type.")
-                        : ""
+                    Accessible.name: severalRulesRadio.text
+                    Accessible.description: bulkLabel.text
                 }
             }
             Label {
-                id: listSummary
-                visible: ruleDialog.listMode && ruleDialog.listRows.length > 0
+                id: bulkSummary
+                visible: ruleDialog.bulkMode
+                    && (ruleDialog.bulkPlan.rows.length > 0 || ruleDialog.bulkPlan.bound !== "")
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 wrapMode: Text.WordWrap
-                color: root.textColor
-                text: root.uiRevision >= 0 ? ruleDialog.listSummaryText() : ""
+                color: ruleDialog.bulkPlan.bound !== "" ? root.uiTheme.colorWarning : root.textColor
+                text: root.uiRevision >= 0 ? ruleDialog.bulkSummaryText() : ""
                 Accessible.role: Accessible.StaticText
                 Accessible.name: text
             }
-            ScrollView {
-                id: listPreview
-                visible: listSummary.visible
+            // A row per rule line. A list, not a column of every row: a paste of
+            // a thousand lines builds only the rows in view.
+            ListView {
+                id: bulkPreview
+                visible: ruleDialog.bulkMode && ruleDialog.bulkPlan.rows.length > 0
                 Layout.fillWidth: true
-                Layout.preferredHeight: Math.min(160, listPreviewColumn.implicitHeight)
+                Layout.preferredHeight: Math.min(220, Math.max(48, contentHeight))
                 clip: true
-                contentWidth: availableWidth
-                ColumnLayout {
-                    id: listPreviewColumn
-                    width: listPreview.availableWidth
+                spacing: 4
+                boundsBehavior: Flickable.StopAtBounds
+                model: ruleDialog.bulkPlan.rows
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                Accessible.role: Accessible.List
+                Accessible.name: bulkSummary.text
+                delegate: ColumnLayout {
+                    id: bulkRow
+                    required property var modelData
+                    width: ListView.view ? ListView.view.width - 12 : 0
                     spacing: 2
-                    Repeater {
-                        model: ruleDialog.listRows
-                        delegate: RowLayout {
-                            required property var modelData
+                    readonly property string status: String(modelData.status)
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: root.uiTheme.spacingSm
+                        Label {
+                            Layout.preferredWidth: 190
+                            Layout.alignment: Qt.AlignTop
+                            elide: Text.ElideMiddle
+                            textFormat: Text.PlainText
+                            color: root.textColor
+                            text: String(bulkRow.modelData.line) + ". "
+                                + Pure.displayText(bulkRow.modelData.text)
+                        }
+                        Label {
                             Layout.fillWidth: true
-                            spacing: root.uiTheme.spacingSm
-                            Label {
-                                Layout.preferredWidth: 200
-                                Layout.alignment: Qt.AlignTop
-                                elide: Text.ElideMiddle
-                                color: root.textColor
-                                text: String(modelData.value)
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                Layout.preferredWidth: 0
-                                wrapMode: Text.WordWrap
-                                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-                                color: String(modelData.status) === "error" ? root.uiTheme.colorDanger
-                                    : String(modelData.status) === "warning" ? root.uiTheme.colorWarning
-                                    : root.mutedTextColor
-                                text: root.uiRevision >= 0 ? ruleDialog.listRowText(modelData) : ""
-                                Accessible.role: Accessible.StaticText
-                                Accessible.name: String(modelData.value) + ": " + text
+                            Layout.preferredWidth: 0
+                            wrapMode: Text.WordWrap
+                            textFormat: Text.PlainText
+                            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                            color: bulkRow.status === "error" ? root.uiTheme.colorDanger
+                                : bulkRow.status === "warning" || bulkRow.status === "needs-type"
+                                    || bulkRow.status === "elsewhere" ? root.uiTheme.colorWarning
+                                : root.mutedTextColor
+                            text: root.uiRevision >= 0 ? ruleDialog.bulkRowText(bulkRow.modelData) : ""
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: String(bulkRow.modelData.line) + ". "
+                                + Pure.displayText(bulkRow.modelData.text) + ": " + text
+                        }
+                    }
+                    // The type a one-word value is, or the one a value out of
+                    // its section belongs to; and the move of a rule that stands
+                    // on another route. Each only on the user's click.
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.leftMargin: 190 + root.uiTheme.spacingSm
+                        visible: bulkRow.modelData.options.length > 0 || bulkRow.status === "elsewhere"
+                        spacing: root.uiTheme.spacingSm
+                        Repeater {
+                            model: bulkRow.modelData.options
+                            delegate: ThemedButton {
+                                required property var modelData
+                                theme: root.uiTheme
+                                highlighted: bulkRow.modelData.type === modelData
+                                text: root.uiRevision < 0 ? ""
+                                    : bulkRow.modelData.section !== ""
+                                    ? root.tr("rules.move-to-type.action", "Move to \u201c{type}\u201d")
+                                        .replace("{type}", root.ruleTypeLabel(modelData))
+                                    : root.ruleTypeLabel(modelData)
+                                onClicked: ruleDialog.bulkChoose(bulkRow.modelData, modelData)
+                                Accessible.name: text
+                                Accessible.description: bulkRow.modelData.section !== ""
+                                    ? root.tr("rules.move-to-type.tooltip",
+                                        "Give this rule the type its value is. The line moves to that section of the rules file.")
+                                    : ""
                             }
                         }
+                        CheckBox {
+                            visible: bulkRow.status === "elsewhere"
+                            checked: bulkRow.modelData.move === true
+                            text: root.uiRevision >= 0 ? ruleDialog.bulkMoveText(bulkRow.modelData) : ""
+                            onToggled: ruleDialog.bulkSetMove(bulkRow.modelData, checked)
+                            Accessible.role: Accessible.CheckBox
+                            Accessible.name: text
+                        }
+                        Item { Layout.fillWidth: true }
                     }
                 }
             }
             Label {
-                visible: !ruleDialog.listMode
+                visible: !ruleDialog.bulkMode
                 text: root.tr("label.match-value", "Match value")
                 color: root.textColor
             }
             ThemedTextField {
                 id: matchValueField
                 theme: root.uiTheme
-                visible: !ruleDialog.listMode
+                visible: !ruleDialog.bulkMode
                 Layout.fillWidth: true
                 text: ruleDialog.localValue
                 onTextChanged: {
@@ -710,7 +962,7 @@ Dialog {
             // is by name, so a full path is reduced to its basename.
             RowLayout {
                 Layout.fillWidth: true
-                visible: ruleDialog.localRuleType === "application"
+                visible: !ruleDialog.bulkMode && ruleDialog.localRuleType === "application"
                 ThemedButton {
                     theme: root.uiTheme
                     text: root.tr("action.browse", "Browse...")
@@ -736,7 +988,7 @@ Dialog {
             }
             Label {
                 Layout.fillWidth: true
-                visible: !ruleDialog.listMode
+                visible: !ruleDialog.bulkMode
                 wrapMode: Text.WordWrap
                 color: root.mutedTextColor
                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
@@ -750,14 +1002,17 @@ Dialog {
             // `application` rule type so it's contextual, not noise.
             Label {
                 Layout.fillWidth: true
-                visible: ruleDialog.localRuleType === "application"
+                visible: !ruleDialog.bulkMode && ruleDialog.localRuleType === "application"
                 wrapMode: Text.WordWrap
                 color: root.mutedTextColor
                 font.italic: true
                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                 text: root.uiRevision >= 0
-                    ? root.tr("rules.application-routing-note",
-                        "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe.")
+                    ? (ruleDialog.applicationPlatformKey() === "application-linux"
+                        ? root.tr("rules.application-routing-note-linux",
+                            "Routes everything this program connects to through the additional connection. NetRuleRouter learns the program's destinations by watching its connections, so routing fills in as it connects. Enter the process name, e.g. browser.")
+                        : root.tr("rules.application-routing-note",
+                            "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe."))
                     : ""
             }
             // Where a per-application block is not leak-proof, say so next to the
@@ -765,7 +1020,7 @@ Dialog {
             // the rule as a guarantee the platform cannot give.
             Label {
                 Layout.fillWidth: true
-                visible: ruleDialog.localRuleType === "application"
+                visible: !ruleDialog.bulkMode && ruleDialog.localRuleType === "application"
                     && !root.supports("perAppBlockLeakproof")
                 wrapMode: Text.WordWrap
                 color: root.uiTheme.colorWarning
@@ -785,7 +1040,7 @@ Dialog {
                 wrapMode: Text.WordWrap
                 color: root.mutedTextColor
                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-                visible: ruleDialog.localRuleType === "domain"
+                visible: !ruleDialog.bulkMode && ruleDialog.localRuleType === "domain"
                     && ruleDialog.localValue !== ""
                     && ruleDialog.isMatchValueValid(ruleDialog.localRuleType, ruleDialog.localValue)
                 text: root.uiRevision >= 0 ? ruleDialog._coverageHint() : ""
@@ -795,8 +1050,9 @@ Dialog {
             // service expands every bare domain anyway.
             CheckBox {
                 Layout.fillWidth: true
-                visible: ruleDialog.localRuleType === "domain"
+                visible: !ruleDialog.bulkMode && ruleDialog.localRuleType === "domain"
                     && root.prefs.routeIncludeSubdomains === false
+                    && !/\.\*$/.test(ruleDialog.localValue)
                 checked: ruleDialog.localValue.indexOf("*.") === 0
                 text: root.tr("dialog.rule.include-subdomains", "Include subdomains")
                 onToggled: {
@@ -812,9 +1068,31 @@ Dialog {
                 wrapMode: Text.WordWrap
                 color: root.uiTheme.colorDanger
                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-                visible: !ruleDialog.listMode && ruleDialog.localValue !== ""
+                visible: !ruleDialog.bulkMode && ruleDialog.localValue !== ""
                     && ruleDialog.isMatchValueRefused(ruleDialog.localRuleType, ruleDialog.localValue)
                 text: root.uiRevision >= 0 ? ruleDialog.refusalText() : ""
+            }
+            // The value is another type's: one click gives the rule that type.
+            RowLayout {
+                Layout.fillWidth: true
+                visible: !ruleDialog.bulkMode && ruleDialog.switchTypeTarget() !== ""
+                ThemedButton {
+                    theme: root.uiTheme
+                    text: root.uiRevision >= 0 && ruleDialog.switchTypeTarget() !== ""
+                        ? root.tr("rules.move-to-type.action", "Move to \u201c{type}\u201d")
+                            .replace("{type}", root.ruleTypeLabel(ruleDialog.switchTypeTarget()))
+                        : ""
+                    onClicked: ruleDialog.switchToType(ruleDialog.switchTypeTarget())
+                    ToolTip.visible: hovered && ToolTip.text !== ""
+                    ToolTip.delay: 400
+                    ToolTip.text: root.uiRevision >= 0
+                        ? root.tr("rules.move-to-type.tooltip",
+                            "Give this rule the type its value is. The line moves to that section of the rules file.")
+                        : ""
+                    Accessible.name: text
+                    Accessible.description: ToolTip.text
+                }
+                Item { Layout.fillWidth: true }
             }
             // Saveable, but not quite what was typed or not fully protected — a
             // wide network, host bits cleared, an unusual address.
@@ -823,7 +1101,7 @@ Dialog {
                 wrapMode: Text.WordWrap
                 color: root.uiTheme.colorWarning
                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-                visible: !ruleDialog.listMode && ruleDialog.localValue !== ""
+                visible: !ruleDialog.bulkMode && ruleDialog.localValue !== ""
                     && ruleDialog.isMatchValueWarned(ruleDialog.localRuleType, ruleDialog.localValue)
                 text: root.uiRevision >= 0 ? ruleDialog.warningText() : ""
                 Accessible.role: Accessible.StaticText
@@ -834,10 +1112,29 @@ Dialog {
                 id: routeTargetCombo
                 theme: root.uiTheme
                 Layout.fillWidth: true
-                model: root.routeRoleOptions(ruleDialog.allowBlockRoute)
+                model: root.routeRoleOptions()
                 textRole: "label"
                 valueRole: "id"
-                popup.width: root.comboPopupWidth(routeTargetCombo, model, "label", null)
+                // The open list spells out what a deny does; the closed box keeps
+                // the short word.
+                labelResolver: function(item) { return routeTargetCombo._spoken(item) }
+                function _spoken(item) {
+                    if (!item) return ""
+                    return String(item.description || "") !== "" ? item.description : item.label
+                }
+                readonly property var _current: currentIndex >= 0 && currentIndex < model.length
+                    ? model[currentIndex] : null
+                popup.width: root.comboPopupWidth(routeTargetCombo, model, "",
+                    function(item) { return routeTargetCombo._spoken(item) })
+                Accessible.name: root.uiRevision >= 0
+                    ? root.tr("label.target-route", "Target route") + ": "
+                        + routeTargetCombo._spoken(routeTargetCombo._current)
+                    : ""
+                Accessible.description: ""
+                ToolTip.visible: hovered && ToolTip.text !== ""
+                ToolTip.delay: 400
+                ToolTip.text: routeTargetCombo._current
+                    ? String(routeTargetCombo._current.description || "") : ""
                 onActivated: ruleDialog.localRoute = model[currentIndex].id
                 // A new model (the type changed) resets the index; put it back.
                 onModelChanged: Qt.callLater(ruleDialog._syncRouteCombo)
@@ -846,6 +1143,7 @@ Dialog {
             // missed click into a changed rule.
             RowLayout {
                 Layout.fillWidth: true
+                visible: !ruleDialog.bulkMode
                 CheckBox {
                     id: ruleVerifyCheck
                     enabled: ruleDialog.verifyOffered
@@ -867,10 +1165,18 @@ Dialog {
                 wrapMode: Text.WordWrap
                 color: root.mutedTextColor
                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-                visible: ruleDialog.verifyOffered && ruleDialog.localVerify
+                visible: !ruleDialog.bulkMode && (ruleDialog.anyZoneValue
+                    || ruleDialog.verifyRefusedByDeny
+                    || (ruleDialog.verifyOffered && ruleDialog.localVerify))
                 text: root.uiRevision >= 0
-                    ? root.tr("dialog.rule.verify-hint",
-                        "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule.")
+                    ? (ruleDialog.anyZoneValue
+                        ? root.tr("dialog.rule.verify-any-zone",
+                            "A site in every zone is not checked: the check needs one host.")
+                        : ruleDialog.verifyRefusedByDeny
+                        ? root.tr("dialog.rule.verify-deny",
+                            "A denied rule is not checked: its traffic goes through no connection.")
+                        : root.tr("dialog.rule.verify-hint",
+                            "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule."))
                     : ""
                 Accessible.role: Accessible.StaticText
                 Accessible.name: text
@@ -883,7 +1189,7 @@ Dialog {
                 textFormat: Text.PlainText
                 color: root.mutedTextColor
                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-                visible: !ruleDialog.listMode && text !== ""
+                visible: !ruleDialog.bulkMode && text !== ""
                     && ruleDialog.isMatchValueValid(ruleDialog.localRuleType, ruleDialog.localValue)
                 text: root.uiRevision >= 0 ? ruleDialog.overlapText() : ""
                 Accessible.role: Accessible.StaticText
@@ -891,6 +1197,7 @@ Dialog {
             }
             RowLayout {
                 Layout.fillWidth: true
+                visible: !ruleDialog.bulkMode
                 Label { text: root.tr("label.comment", "Comment"); color: root.textColor }
                 Item { Layout.fillWidth: true }
                 Label {
@@ -904,6 +1211,7 @@ Dialog {
             ThemedTextField {
                 id: ruleCommentField
                 theme: root.uiTheme
+                visible: !ruleDialog.bulkMode
                 Layout.fillWidth: true
                 text: ruleDialog.localComment
                 onTextChanged: {
@@ -929,6 +1237,7 @@ Dialog {
             RowLayout {
                 Layout.fillWidth: true
                 Layout.topMargin: root.uiTheme.spacingMd
+                visible: !ruleDialog.bulkMode
                 CheckBox {
                     id: ruleEnabledCheck
                     checked: ruleDialog.localEnabled
@@ -954,7 +1263,7 @@ Dialog {
                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                 visible: text !== ""
                 text: {
-                    if (root.uiRevision < 0) return ""
+                    if (root.uiRevision < 0 || ruleDialog.bulkMode) return ""
                     var rt = ruleDialog.localRuleType
                     if (rt !== "domain" && rt !== "suffix-domain") return ""
                     var val = String(ruleDialog.localValue || "").trim()
@@ -987,7 +1296,7 @@ Dialog {
                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                 visible: text !== ""
                 text: {
-                    if (root.uiRevision < 0) return ""
+                    if (root.uiRevision < 0 || ruleDialog.bulkMode) return ""
                     var rt = ruleDialog.localRuleType
                     if (rt !== "zone" && rt !== "domain" && rt !== "suffix-domain"
                             && rt !== "exact-fqdn") return ""

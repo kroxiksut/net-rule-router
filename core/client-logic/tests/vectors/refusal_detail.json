@@ -12,6 +12,9 @@
     { "name": "no network", "input": { "code": "network-covers-fake-ip-pool", "args": { "covers": "x" } }, "expected": null },
     { "name": "one network on both routes", "input": { "code": "network-on-both-routes", "args": { "network": "10.0.0.0/24" } },
       "expected": { "key": "errors.network-on-both-routes-named", "values": [["network", "10.0.0.0/24"]] } },
+    { "name": "one folder on both routes", "input": { "code": "folder-on-both-routes", "args": { "folder": "c:\\apps\\tool\\*" } },
+      "expected": { "key": "errors.folder-on-both-routes-named", "values": [["folder", "c:\\apps\\tool\\*"]] } },
+    { "name": "a folder refusal without its folder", "input": { "code": "folder-on-both-routes", "args": { "network": "10.0.0.0/8" } }, "expected": null },
     { "name": "no args", "input": { "code": "network-covers-link", "args": {} }, "expected": null },
     { "name": "another code", "input": { "code": "rule-cap-exceeded", "args": { "network": "10.0.0.0/8" } }, "expected": null },
     { "name": "empty network", "input": { "code": "network-covers-fake-ip-pool", "args": { "network": "" } }, "expected": null }

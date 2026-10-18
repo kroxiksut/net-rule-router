@@ -87,7 +87,7 @@ Developer automation, PowerShell and shell side by side: bootstrap, build, run, 
 A cargo workspace of its own (nightly, libFuzzer), excluded from the product workspace: one target per parser of bytes another party can shape, with synthetic seed inputs under `corpus/`. Run by `scripts/fuzz.sh`.
 
 ### .github/
-CI/CD workflow definitions (Windows and Linux quality gates)
+CI/CD workflow definitions (Windows and Linux quality gates, release by tag, CodeQL analysis started by hand) and `dependabot.yml` (monthly update PRs for Actions and crates)
 
 ## Workspace Root
 
@@ -96,6 +96,7 @@ Core configuration files:
 - `Cargo.toml` — Rust workspace manifest and build profiles
 - `Cargo.lock` — Dependency lock
 - `deny.toml` — Dependency/license policy, checked against the Windows, Linux and macOS dependency graphs
+- `osv-scanner.toml` — the advisory ignores of `deny.toml`, repeated for OSV-based scanners
 - `rust-toolchain.toml` — Rust version pin
 - `.env.example` — Non-secret environment placeholder
 - `.editorconfig` — Editor formatting

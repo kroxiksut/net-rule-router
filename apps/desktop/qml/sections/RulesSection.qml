@@ -26,6 +26,9 @@ ColumnLayout {
     /// same verdict roles as rows read back from the service, so one number
     /// covers both origins.
     property int invalidRuleCount: 0
+    // Rows refused because the value is another type's, as "value: from → to"
+    // lines for the "Move all" banner.
+    property var misplacedRules: []
     property string filterType: "all"
     property string filterRoute: "all"      // фильтр по маршруту
     /// Show only rules the service authored (they carry an origin tag; a rule
@@ -33,12 +36,187 @@ ColumnLayout {
     property bool filterAutoAddedOnly: false
     property string searchText: ""
 
+    // ── «Recent»: what the user changed lately, told by the service ──
+    // Asked for only while the filter is on; the service compares its stored
+    // revisions of the user's own rules. Rows match by type and value.
+    property bool filterRecent: false
+    /// "hour", "today" or "week".
+    property string recentPeriod: "today"
+    property bool recentLoading: false
+    /// Wire error code of the last read, "" when it answered.
+    property string recentFailure: ""
+    /// Rule key → { kind: "added" | "changed", at, tip }.
+    property var recentByKey: ({})
+    /// Replaced sets, newest first: { at, count, members: [table row] }.
+    property var recentReplaced: []
+    /// Rules that left the set: { at, row: table row, existsNow }.
+    property var recentDeleted: []
+    /// Unix seconds the stored history begins at when it is shorter than the
+    /// period, else 0.
+    property double recentHistoryStart: 0
+    property bool recentTruncated: false
+    /// Bumped on every display rebuild, so bindings that read the master
+    /// model (a restore button) re-evaluate.
+    property int modelRevision: 0
+
+    function _recentNow() { return Math.floor(Date.now() / 1000) }
+    function _recentOffset(at) { return -new Date(Number(at || 0) * 1000).getTimezoneOffset() }
+    function recentTimeText(at) {
+        var now = section._recentNow()
+        return Pure.recentChangeTime(at, section._recentOffset(at), now, section._recentOffset(now),
+            root.tr("rules.recent.yesterday", "yesterday {time}"))
+    }
+    function recentStampText(at) {
+        return Pure.recentChangeStamp(at, section._recentOffset(at))
+    }
+
+    /// The tooltip of a changed rule: what it was before, line by line.
+    function _recentPreviousText(row, previous) {
+        var lines = []
+        var was = String(previous["target-route"] || "")
+        if (was !== "" && was !== String(row.targetRoute || "")) {
+            lines.push(root.tr("rules.recent.previous-route", "Route: {from} \u2192 {to}")
+                .replace("{from}", root.routeLabel(was))
+                .replace("{to}", root.routeLabel(String(row.targetRoute || ""))))
+        }
+        if ((previous.enabled !== false) !== (row.enabled !== false)) {
+            lines.push(row.enabled !== false
+                ? root.tr("rules.recent.previous-off", "Was switched off")
+                : root.tr("rules.recent.previous-on", "Was switched on"))
+        }
+        if ((previous.verify === true) !== (row.verify === true)) {
+            lines.push(row.verify === true
+                ? root.tr("rules.recent.previous-sure", "Was without \u201c?\u201d")
+                : root.tr("rules.recent.previous-unsure", "Was marked \u201c?\u201d"))
+        }
+        return lines.join("\n")
+    }
+
+    /// Ask the service for the changes of the chosen period.
+    function refreshRecent() {
+        if (!section.filterRecent) return
+        if (!root.rpc || typeof root.rpc.rpcRulesRecentChangesList !== "function") {
+            section.recentFailure = "transport-disconnected"
+            return
+        }
+        var now = section._recentNow()
+        var since = Pure.recentPeriodSince(section.recentPeriod, now, section._recentOffset(now))
+        var corr = root.rpc.rpcRulesRecentChangesList(since)
+        if (!corr) {
+            section.recentFailure = "transport-disconnected"
+            return
+        }
+        section.recentLoading = true
+        var asked = section.recentPeriod
+        root.rpc.registerRpcCallback(corr, function(ok, payload, code) {
+            if (asked !== section.recentPeriod || !section.filterRecent) return
+            section.recentLoading = false
+            if (!ok || !payload) {
+                section.recentFailure = String(code || "unknown")
+                section._applyRecent(null)
+                return
+            }
+            section.recentFailure = ""
+            section._applyRecent(payload)
+        })
+    }
+
+    function _applyRecent(payload) {
+        var byKey = ({})
+        var replaced = []
+        var deleted = []
+        var changes = payload ? (payload.changes || []) : []
+        for (var i = 0; i < changes.length; i += 1) {
+            var ev = changes[i] || {}
+            var kind = String(ev.kind || "")
+            var at = Number(ev.at || 0)
+            if (kind === "replaced") {
+                var members = []
+                var wire = ev.members || []
+                for (var m = 0; m < wire.length; m += 1) members.push(root._serviceRuleRowToModelRow(wire[m]))
+                replaced.push({ at: at, count: Number(ev.count || 0), members: members })
+                continue
+            }
+            if (!ev.rule) continue
+            var row = root._serviceRuleRowToModelRow(ev.rule)
+            if (kind === "deleted") {
+                deleted.push({ at: at, row: row, existsNow: ev["exists-now"] === true })
+                continue
+            }
+            if (kind !== "added" && kind !== "changed") continue
+            var key = Rules.ruleValueKey(row)
+            if (byKey[key]) continue
+            byKey[key] = { kind: kind, at: at,
+                tip: kind === "changed" ? section._recentPreviousText(row, ev.previous || {}) : "" }
+        }
+        section.recentByKey = byKey
+        section.recentReplaced = replaced
+        section.recentDeleted = deleted
+        section.recentHistoryStart = payload ? Number(payload["history-starts-at"] || 0) : 0
+        section.recentTruncated = !!payload && payload.truncated === true
+        section.scheduleRebuild()
+    }
+
+    function _clearRecent() {
+        section.recentByKey = ({})
+        section.recentReplaced = []
+        section.recentDeleted = []
+        section.recentHistoryStart = 0
+        section.recentTruncated = false
+        section.recentFailure = ""
+        section.recentLoading = false
+    }
+
+    onFilterRecentChanged: {
+        if (section.filterRecent) section.refreshRecent()
+        else section._clearRecent()
+        section.scheduleRebuild()
+    }
+    onRecentPeriodChanged: section.refreshRecent()
+
+    /// A deleted rule can come back while nothing with its type and value is
+    /// in the list.
+    function recentRestorable(entry) {
+        if (!entry || section.rulesLocked || !root.rulesModel) return false
+        var key = Rules.ruleValueKey(entry.row)
+        for (var i = 0; i < root.rulesModel.count; i += 1) {
+            if (Rules.ruleValueKey(root.rulesModel.get(i)) === key) return false
+        }
+        return true
+    }
+
+    /// «Вернуть»: the rule goes back into the list as it was before it went —
+    /// route, switch, `?` and note — and reaches the service with the next
+    /// apply, like any edit.
+    function restoreRecentDeleted(entry) {
+        if (section._refuseWhenLocked()) return
+        if (!section.recentRestorable(entry)) return
+        if (typeof root.userRuleCount === "function"
+                && root.userRuleCount() >= root.freeRulesMaxCount) {
+            root.statusLine = root.tr("status.rules-limit-reached",
+                "Up to {max} active rules are supported.")
+                .replace("{max}", String(root.freeRulesMaxCount))
+            return
+        }
+        var row = {}
+        for (var f in entry.row) row[f] = entry.row[f]
+        row.id = root.nextFreeRuleId()
+        root.rulesModel.append(row)
+        if (String(row.comment || "") !== "" && typeof root._sidecarWriteCommentForRow === "function")
+            root._sidecarWriteCommentForRow(row)
+        root.rulesModelEdited()
+        if (typeof root._recomputeRulesDirty === "function") root._recomputeRulesDirty()
+        root.statusLine = root.tr("rules.recent.restored",
+                "Rule put back: {value}. Apply the changes to bring it into force.")
+            .replace("{value}", Pure.displayText(row.matchValue))
+    }
+
     /// True while an administrator has turned rule editing off for this
     /// machine. Everything that would change or push rules is disabled;
     /// viewing, searching, filtering and exporting stay available. The real
     /// refusal lives in the service — this only stops the user composing a
     /// change that is guaranteed to bounce.
-    readonly property bool rulesLocked: root.allowUserRuleEdits === false
+    readonly property bool rulesLocked: root.ruleEditsLocked === true
 
     /// Refuse a rule-changing action while the lock is on and say why.
     /// Returns true when the caller must stop. Every entry point that is not
@@ -204,12 +382,18 @@ ColumnLayout {
                 || !root.rulesModel) return
         var arr = []
         var invalid = 0
+        var misplaced = []
         var marked = false
         for (var i = 0; i < root.rulesModel.count; i += 1) {
             var entry = root.rulesModel.get(i)
             // Before the filter, deliberately: the count answers "how much of
             // my set will not apply", which the current filter must not change.
-            if (String(entry.validationStatus || "valid") === "error") invalid += 1
+            if (String(entry.validationStatus || "valid") === "error") {
+                invalid += 1
+                var movesTo = Rules.misplacedTargetType(entry.validationMessageKey)
+                if (movesTo !== "") misplaced.push(Pure.displayText(entry.matchValue) + ": "
+                    + root.ruleTypeLabel(entry.ruleType) + " \u2192 " + root.ruleTypeLabel(movesTo))
+            }
             if (String(entry.mainRoute || "") !== "") marked = true
             if (!section.passesFilter(entry)) continue
             var snapshot = {}
@@ -233,11 +417,23 @@ ColumnLayout {
             // masterId too only for display/debug.
             snapshot.masterId = String(entry.id || "")
             snapshot.masterIndex = i
+            // Every row carries the roles, so the model types them once.
+            var recent = section.filterRecent ? section.recentByKey[Rules.ruleValueKey(entry)] : null
+            snapshot.recentMark = recent ? recent.kind : ""
+            snapshot.recentAt = recent ? recent.at : 0
+            snapshot.recentTip = recent ? recent.tip : ""
             arr.push(snapshot)
         }
         section.invalidRuleCount = invalid
+        section.misplacedRules = misplaced
         section.mainRouteColumnVisible = marked || section.mainRouteCheckRan
-        arr.sort(compareRules)
+        // Newest first while «Recent» is on, whatever column the list sorts by.
+        if (section.filterRecent) {
+            arr.sort(function(a, b) { return (b.recentAt - a.recentAt) || compareRules(a, b) })
+        } else {
+            arr.sort(compareRules)
+        }
+        section.modelRevision += 1
         displayModel.clear()
         // Single append for the whole snapshot — see `_appendRowsChunked` in
         // Main.qml: the cost is the per-append countChanged, not the rows.
@@ -315,6 +511,8 @@ ColumnLayout {
             if (root && root.rulesBulkLoading === false) {
                 section.rebuildDisplay()
                 if (typeof root.refreshRulesOverlaps === "function") root.refreshRulesOverlaps()
+                // The set the service holds was read again: an apply may be in it.
+                section.refreshRecent()
             }
         }
         // A set was written into the folder from Settings. The folder PATH is
@@ -331,6 +529,7 @@ ColumnLayout {
     // comes back to this screen is cheap and covers it.
     onVisibleChanged: {
         if (!visible) return
+        section.refreshRecent()
         // Cheap local pass; the count drives the "Remove covered rules" button,
         // so it has to reflect the table the user is looking at right now.
         if (typeof root.refreshRulesOverlaps === "function") root.refreshRulesOverlaps()
@@ -531,13 +730,16 @@ ColumnLayout {
             // A block takes no `?`; it must not come back on a later move.
             if (target === "block" && root.rulesModel.get(indices[i]).verify === true)
                 root.rulesModel.setProperty(indices[i], "verify", false)
+            root.rejudgeRowRoute(indices[i])
         }
         section.scheduleRebuild()
         if (typeof root.setUnsavedChanges === "function") {
             root._recomputeRulesDirty()
         }
-        root.statusLine = root.tr("status.rules-bulk-moved",
-            "{n} rule(s) moved to {route}.")
+        root.statusLine = target === "block"
+            ? root.tr("status.rules-bulk-denied", "{n} rule(s) now deny their traffic.")
+                .replace("{n}", String(indices.length))
+            : root.tr("status.rules-bulk-moved", "{n} rule(s) moved to {route}.")
                 .replace("{n}", String(indices.length))
                 .replace("{route}", root.routeLabel(target))
     }
@@ -574,6 +776,7 @@ ColumnLayout {
             return false
         }
         if (filterAutoAddedOnly && String(item.originReason || "") === "") return false
+        if (filterRecent && !section.recentByKey[Rules.ruleValueKey(item)]) return false
         if (searchText !== "") {
             // The needle is normalized like a rule value too, for URL-shaped
             // text without a scheme (`site.com/page`), which the search box
@@ -1404,9 +1607,14 @@ ColumnLayout {
                         text: root.routeLabel("secondary")
                         onTriggered: section._bulkMoveSelectedToRoute("secondary")
                     }
-                    // "Move to block" removed: block became a unsupported action
-                    // (WFP block, not a hosts entry). Existing block rules from
-                    // imports still round-trip; they just can't be authored here.
+                    MenuItem {
+                        text: root.uiRevision >= 0 ? root.tr("rules.route.deny", "Deny") : ""
+                        Accessible.name: root.uiRevision >= 0
+                            ? root.tr("rules.route.deny-description",
+                                "Deny — never send through any connection")
+                            : ""
+                        onTriggered: section._bulkMoveSelectedToRoute("block")
+                    }
                 }
             }
             ThemedButton {
@@ -1496,7 +1704,7 @@ ColumnLayout {
                     return root.tr("rules.action.delete-single-body",
                         "Rule {id} ({value}) will be removed from this app. Apply the change to the service later via 'Save and review...'.")
                             .replace("{id}", String(row.id || ""))
-                            .replace("{value}", String(row.matchValue || ""))
+                            .replace("{value}", Pure.displayText(row.matchValue))
                 }
             }
             RowLayout {
@@ -1914,6 +2122,47 @@ ColumnLayout {
         }
     }
 
+    // Values written as another type's, an import's usual slip: what moving
+    // them would do, and one click that does it. The program never moves
+    // them on its own; each row also offers its own move, and leaving them
+    // keeps them as they are.
+    RowLayout {
+        Layout.fillWidth: true
+        visible: section.misplacedRules.length > 0
+        spacing: root.uiTheme.spacingSm
+        Label {
+            Layout.fillWidth: true
+            Layout.preferredWidth: 0
+            wrapMode: Text.Wrap
+            textFormat: Text.PlainText
+            color: root.uiTheme.colorDanger
+            text: root.uiRevision >= 0
+                ? root.tr("rules.move-to-type.count",
+                        "{n} rule(s) are not in their section: {rules}")
+                    .replace("{n}", String(section.misplacedRules.length))
+                    .replace("{rules}", Pure.listSummary(section.misplacedRules,
+                        root.tr("status.app-unresolved-more", "+{n} more")))
+                : ""
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
+        ThemedButton {
+            theme: root.uiTheme
+            Layout.fillWidth: false
+            text: root.uiRevision >= 0 ? root.tr("rules.move-to-type.move-all", "Move all") : ""
+            ToolTip.visible: hovered
+            ToolTip.delay: 400
+            ToolTip.text: root.uiRevision >= 0
+                ? root.tr("rules.move-to-type.move-all-tooltip",
+                    "Give each of these rules the type its value is. Nothing else changes.")
+                : ""
+            onClicked: root.moveMisplacedRules()
+            Accessible.role: Accessible.Button
+            Accessible.name: text
+            Accessible.description: ToolTip.text
+        }
+    }
+
     // Search row: live filtering + explicit Search button + leading magnifier
     // icon. Pulled out of the filter bar because the user explicitly asked
     // for a full-width search field that does not share its row with combo
@@ -2110,6 +2359,7 @@ ColumnLayout {
             function routeLabelFor(id) {
                 if (id === "all") return root.tr("rules.filter.route.all", "All routes")
                 if (id === "unsure") return root.tr("rules.filter.route.unsure", "Unsure (?)")
+                if (id === "block") return root.tr("rules.filter.route.denied", "Denied")
                 return root.routeLabel(id)
             }
             labelResolver: function(item) { return routeFilterCombo.routeLabelFor(item) }
@@ -2144,6 +2394,177 @@ ColumnLayout {
                 leftPadding: autoAddedFilterCheck.indicator.width + autoAddedFilterCheck.spacing
                 verticalAlignment: Text.AlignVCenter
             }
+        }
+        // «Recent»: what the user added, changed or deleted lately.
+        CheckBox {
+            id: recentFilterCheck
+            text: root.uiRevision >= 0 ? root.tr("rules.filter.recent.label", "Recent") : ""
+            checked: section.filterRecent
+            onToggled: section.filterRecent = checked
+            Accessible.name: text
+            Accessible.description: root.uiRevision >= 0
+                ? root.tr("rules.filter.recent.tooltip",
+                    "Show only the rules you added or changed lately, newest first, and the ones you deleted.")
+                : ""
+            ToolTip.visible: hovered && root.prefs.tooltipsEnabled
+            ToolTip.delay: 400
+            ToolTip.text: Accessible.description
+            contentItem: Text {
+                text: recentFilterCheck.text
+                color: root.textColor
+                leftPadding: recentFilterCheck.indicator.width + recentFilterCheck.spacing
+                verticalAlignment: Text.AlignVCenter
+            }
+        }
+        ThemedComboBox {
+            id: recentPeriodCombo
+            theme: root.uiTheme
+            visible: section.filterRecent
+            implicitWidth: 160
+            model: [ "hour", "today", "week" ]
+            function periodLabel(id) {
+                if (id === "hour") return root.tr("rules.filter.recent.hour", "Last hour")
+                if (id === "week") return root.tr("rules.filter.recent.week", "7 days")
+                return root.tr("rules.filter.recent.today", "Today")
+            }
+            labelResolver: function(item) { return recentPeriodCombo.periodLabel(item) }
+            currentIndex: 1
+            Accessible.name: root.uiRevision >= 0
+                ? root.tr("rules.filter.recent.period", "Period of recent changes") : ""
+            Component.onCompleted: recentPeriodCombo.displayText = recentPeriodCombo.periodLabel(recentPeriodCombo.model[recentPeriodCombo.currentIndex])
+            popup.width: root.comboPopupWidth(recentPeriodCombo, model, "",
+                function(item) { return recentPeriodCombo.periodLabel(item) })
+            onActivated: {
+                section.recentPeriod = model[currentIndex]
+                recentPeriodCombo.displayText = recentPeriodCombo.periodLabel(model[currentIndex])
+            }
+            Connections {
+                target: root
+                function onUiRevisionChanged() {
+                    if (!recentPeriodCombo) return
+                    recentPeriodCombo.displayText = recentPeriodCombo.periodLabel(recentPeriodCombo.model[recentPeriodCombo.currentIndex])
+                }
+            }
+        }
+    }
+
+    // What «Recent» found besides single rules: a replaced set, where the
+    // stored history starts, a failed read.
+    ColumnLayout {
+        id: recentPanel
+        Layout.fillWidth: true
+        visible: section.filterRecent
+        spacing: root.uiTheme.spacingXxs
+        Label {
+            Layout.fillWidth: true
+            visible: section.recentLoading
+            text: root.uiRevision >= 0 ? root.tr("rules.recent.loading", "Reading recent changes\u2026") : ""
+            color: root.mutedTextColor
+        }
+        Label {
+            Layout.fillWidth: true
+            visible: section.recentFailure !== ""
+            wrapMode: Text.WordWrap
+            text: root.uiRevision >= 0 && section.recentFailure !== ""
+                ? root.tr("rules.recent.failed", "Recent changes could not be read: {reason}")
+                    .replace("{reason}", root.ipcErrorLabel(section.recentFailure))
+                : ""
+            color: root.uiTheme.colorDanger
+            Accessible.role: Accessible.AlertMessage
+            Accessible.name: text
+        }
+        Label {
+            Layout.fillWidth: true
+            visible: !section.recentLoading && section.recentFailure === ""
+                && displayModel.count === 0 && section.recentReplaced.length === 0
+                && section.recentDeleted.length === 0
+            text: root.uiRevision >= 0
+                ? root.tr("rules.recent.none", "No changes in this period.") : ""
+            color: root.mutedTextColor
+        }
+        Repeater {
+            model: section.recentReplaced
+            delegate: ColumnLayout {
+                id: replacedEntry
+                required property var modelData
+                property bool expanded: false
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingXxs
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: root.uiRevision >= 0
+                            ? root.tr("rules.recent.replaced", "{time} \u00b7 Rule set replaced, rules in it: {count}")
+                                .replace("{time}", section.recentTimeText(replacedEntry.modelData.at))
+                                .replace("{count}", String(replacedEntry.modelData.count))
+                            : ""
+                        color: root.textColor
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: text
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        visible: replacedEntry.modelData.members.length > 0
+                        text: root.uiRevision >= 0
+                            ? (replacedEntry.expanded
+                                ? root.tr("action.hide-details", "Hide details")
+                                : root.tr("action.show-details", "Show details"))
+                            : ""
+                        Accessible.name: text
+                        onClicked: replacedEntry.expanded = !replacedEntry.expanded
+                    }
+                }
+                Repeater {
+                    model: replacedEntry.expanded ? replacedEntry.modelData.members : []
+                    delegate: Label {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        Layout.leftMargin: 28
+                        elide: Text.ElideRight
+                        textFormat: Text.PlainText
+                        text: root.uiRevision >= 0
+                            ? root.ruleTypeLabel(modelData.ruleType) + "  "
+                                + Pure.displayText(modelData.matchValue) + "  \u2192  "
+                                + root.routeLabel(String(modelData.targetRoute || ""))
+                            : ""
+                        color: root.mutedTextColor
+                    }
+                }
+                Label {
+                    Layout.leftMargin: 28
+                    visible: replacedEntry.expanded
+                        && replacedEntry.modelData.count > replacedEntry.modelData.members.length
+                    text: root.uiRevision >= 0
+                        ? root.tr("rules.recent.replaced-more", "and {count} more")
+                            .replace("{count}", String(replacedEntry.modelData.count
+                                - replacedEntry.modelData.members.length))
+                        : ""
+                    color: root.mutedTextColor
+                }
+            }
+        }
+        Label {
+            Layout.fillWidth: true
+            visible: section.recentHistoryStart > 0
+            wrapMode: Text.WordWrap
+            text: root.uiRevision >= 0 && section.recentHistoryStart > 0
+                ? root.tr("rules.recent.history-start",
+                    "History is kept from {time}; what changed before that cannot be shown.")
+                    .replace("{time}", section.recentStampText(section.recentHistoryStart))
+                : ""
+            color: root.mutedTextColor
+        }
+        Label {
+            Layout.fillWidth: true
+            visible: section.recentTruncated
+            wrapMode: Text.WordWrap
+            text: root.uiRevision >= 0
+                ? root.tr("rules.recent.truncated", "Only the latest changes are shown; choose a shorter period to see all of them.")
+                : ""
+            color: root.mutedTextColor
         }
     }
 
@@ -2636,7 +3057,9 @@ ColumnLayout {
                         Layout.alignment: Qt.AlignVCenter
                         // Coerce to String (see model.id above):
                         // silences the pooled-delegate undefined→QString flood.
-                        text: String(model.matchValue || "")
+                        // A preset or an application path is someone else's text.
+                        text: Pure.displayText(model.matchValue)
+                        textFormat: Text.PlainText
                         // Invalid rule values are highlighted in danger
                         // colour so the bad value itself stands out, not
                         // just the row border.
@@ -2748,8 +3171,9 @@ ColumnLayout {
                             if (root.uiRevision < 0) return ""
                             var ck = String(model.commentKey || "")
                             if (ck !== "") return root.tr(ck, String(model.comment || ""))
-                            return String(model.comment || "")
+                            return Pure.displayText(model.comment)
                         }
+                        textFormat: Text.PlainText
                         color: root.mutedTextColor
                         elide: Text.ElideRight
 
@@ -2793,6 +3217,80 @@ ColumnLayout {
                             }
                         }
                         return msg
+                    }
+                }
+                // A value spelled as another type's: offer to re-file it there.
+                // Only on this click: the program never moves a rule itself.
+                ThemedButton {
+                    id: moveToTypeButton
+                    readonly property string targetType: ruleDelegate.validationError
+                        ? Rules.misplacedTargetType(model.validationMessageKey) : ""
+                    readonly property string targetLabel: root.uiRevision >= 0
+                        ? root.ruleTypeLabel(targetType) : ""
+                    theme: root.uiTheme
+                    Layout.leftMargin: 28
+                    Layout.fillWidth: false
+                    visible: targetType !== ""
+                    text: root.uiRevision >= 0
+                        ? root.tr("rules.move-to-type.action", "Move to “{type}”")
+                            .replace("{type}", targetLabel)
+                        : ""
+                    Accessible.name: text
+                    Accessible.description: ToolTip.text
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 400
+                    ToolTip.text: root.uiRevision >= 0
+                        ? root.tr("rules.move-to-type.tooltip",
+                            "Give this rule the type its value is. The line moves to that section of the rules file.")
+                        : ""
+                    onClicked: root.moveRuleToType(model.masterIndex)
+                }
+                // «Recent»: added or changed, and when. A changed rule says what
+                // it was before on hover.
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 28
+                    spacing: root.uiTheme.spacingSm
+                    visible: String(model.recentMark || "") !== ""
+                    Rectangle {
+                        id: recentBadge
+                        readonly property bool changed: String(model.recentMark || "") === "changed"
+                        Layout.alignment: Qt.AlignVCenter
+                        radius: root.uiTheme.radiusSm
+                        color: "transparent"
+                        border.width: 1
+                        border.color: root.uiTheme.colorAccent
+                        implicitWidth: recentBadgeLabel.implicitWidth + root.uiTheme.spacingSm * 2
+                        implicitHeight: recentBadgeLabel.implicitHeight + root.uiTheme.spacingXxs * 2
+                        Label {
+                            id: recentBadgeLabel
+                            anchors.centerIn: parent
+                            text: root.uiRevision >= 0
+                                ? (recentBadge.changed
+                                    ? root.tr("rules.recent.changed", "changed")
+                                    : root.tr("rules.recent.added", "added"))
+                                : ""
+                            color: root.uiTheme.colorAccent
+                            font.pixelSize: Math.max(10, root.uiTheme.baseFontSizePx - 2)
+                        }
+                        HoverHandler { id: recentBadgeHover }
+                        ToolTip.visible: recentBadgeHover.hovered && String(model.recentTip || "") !== ""
+                        ToolTip.delay: 300
+                        ToolTip.text: String(model.recentTip || "")
+                    }
+                    Label {
+                        id: recentTimeLabel
+                        Layout.fillWidth: true
+                        Layout.alignment: Qt.AlignVCenter
+                        text: root.uiRevision >= 0 && Number(model.recentAt || 0) > 0
+                            ? section.recentTimeText(Number(model.recentAt)) : ""
+                        color: root.mutedTextColor
+                        font.pixelSize: Math.max(10, root.uiTheme.baseFontSizePx - 2)
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: root.uiRevision >= 0
+                            ? recentBadgeLabel.text + ", " + text
+                                + (String(model.recentTip || "") !== "" ? ". " + String(model.recentTip) : "")
+                            : ""
                     }
                 }
                 // App-authored rule badge. A rule NetRuleRouter added on the
@@ -2964,5 +3462,90 @@ ColumnLayout {
             }
         }
     }
+    }
+
+    // «Recent»: rules that left the set during the period, greyed, with when
+    // they went and «Вернуть», which puts the rule back as it was.
+    ColumnLayout {
+        id: recentDeletedGroup
+        Layout.fillWidth: true
+        visible: section.filterRecent && section.recentDeleted.length > 0
+        spacing: root.uiTheme.spacingXxs
+        Label {
+            Layout.fillWidth: true
+            text: root.uiRevision >= 0 ? root.tr("rules.recent.deleted-title", "Deleted") : ""
+            color: root.mutedTextColor
+            font.bold: true
+            Accessible.role: Accessible.Heading
+            Accessible.name: text
+        }
+        ListView {
+            id: recentDeletedList
+            Layout.fillWidth: true
+            Layout.preferredHeight: Math.min(contentHeight, 220)
+            clip: true
+            model: section.recentDeleted
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+            delegate: RowLayout {
+                id: deletedEntry
+                required property var modelData
+                width: ListView.view ? ListView.view.width : 0
+                spacing: root.uiTheme.spacingMd
+                opacity: 0.6
+                Label {
+                    Layout.preferredWidth: section.colTypeWidth
+                    text: root.uiRevision >= 0 ? root.ruleTypeLabel(deletedEntry.modelData.row.ruleType) : ""
+                    color: root.mutedTextColor
+                    elide: Text.ElideRight
+                }
+                Label {
+                    Layout.preferredWidth: section.colMatchWidth
+                    text: Pure.displayText(deletedEntry.modelData.row.matchValue)
+                    textFormat: Text.PlainText
+                    color: root.mutedTextColor
+                    elide: Text.ElideRight
+                }
+                Label {
+                    Layout.preferredWidth: section.colRouteWidth
+                    text: root.uiRevision >= 0
+                        ? root.routeLabel(String(deletedEntry.modelData.row.targetRoute || ""))
+                            + (deletedEntry.modelData.row.enabled === false
+                                ? ", " + root.tr("rules.recent.was-off", "switched off") : "")
+                        : ""
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: root.uiRevision >= 0
+                        ? root.tr("rules.recent.deleted-at", "deleted {time}")
+                            .replace("{time}", section.recentTimeText(deletedEntry.modelData.at))
+                        : ""
+                    color: root.mutedTextColor
+                    elide: Text.ElideRight
+                }
+                ThemedButton {
+                    theme: root.uiTheme
+                    readonly property bool restorable: section.modelRevision >= 0
+                        && section.recentRestorable(deletedEntry.modelData)
+                    enabled: restorable
+                    text: root.uiRevision >= 0 ? root.tr("rules.recent.restore", "Restore") : ""
+                    Accessible.name: root.uiRevision >= 0
+                        ? text + ": " + Pure.displayText(deletedEntry.modelData.row.matchValue) : ""
+                    Accessible.description: ToolTip.text
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 400
+                    ToolTip.text: root.uiRevision >= 0
+                        ? (restorable
+                            ? root.tr("rules.recent.restore-tooltip",
+                                "Put the rule back with the route, switch and note it had.")
+                            : root.tr("rules.recent.restore-present",
+                                "A rule with this type and value is already in the list."))
+                        : ""
+                    onClicked: section.restoreRecentDeleted(deletedEntry.modelData)
+                }
+            }
+        }
     }
 }

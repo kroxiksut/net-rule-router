@@ -1,8 +1,10 @@
 use super::{
     add_missing_baseline_coverage_warnings, build_effective_locale_bundles, bundled_locales_dir_in,
-    normalize_locale_id, read_locale_candidate, reject_fallback_cycles, require_metadata_string,
-    resolve_catalog_text, sorted_unique_descriptors, strip_utf8_bom, validate_candidate_root,
-    validate_cross_locale_rules, LocaleCandidate, LocaleDescriptor, LocaleLoadStatus, LocaleSource,
+    fill_candidate, normalize_locale_id, read_locale_candidate, reject_fallback_cycles,
+    require_metadata_string, resolve_catalog_text, sorted_unique_descriptors, strip_utf8_bom,
+    validate_candidate_root, validate_cross_locale_rules, LocaleCandidate, LocaleDescriptor,
+    LocaleLoadStatus, LocaleSource, MAX_LOCALE_FALLBACKS, MAX_LOCALE_FILE_BYTES,
+    MAX_LOCALE_KEY_BYTES, MAX_LOCALE_WARNINGS,
 };
 
 use serde_json::json;
@@ -446,6 +448,139 @@ fn shipped_locales_and_the_translator_example_pass_the_validator_clean() {
             path.display(),
             candidate.errors,
             candidate.warnings
+        );
+    }
+}
+
+fn locale_text(id: &str, fallbacks: &str, body: &str) -> String {
+    format!(
+        r#"{{"metadata": {{"language": "{id}", "label": "L", "nativeLabel": "L", "version": "1.0", "fallbacks": {fallbacks}}}, {body}}}"#
+    )
+}
+
+/// A file in the user's folder is anyone's bytes: past the bound it is not
+/// read, the refusal is reported, and the language keeps its bundled text.
+#[test]
+fn an_oversized_user_locale_is_refused_and_the_bundled_one_stays() {
+    let padding = "x".repeat(MAX_LOCALE_FILE_BYTES);
+    let body = format!(r#""menu": {{"file": "{padding}"}}"#);
+    let (_dir, path) = write_temp_locale(&locale_text("ru", r#"["en"]"#, &body));
+    let user = read_locale_candidate(&path, LocaleSource::User).expect("candidate");
+    assert_eq!(user.status(), LocaleLoadStatus::Rejected);
+    assert!(
+        user.errors.iter().any(|e| e.contains("larger than")),
+        "{:?}",
+        user.errors
+    );
+    assert!(user.entries.is_empty());
+
+    let bundled = candidate("ru", &["en"], &[("menu.file", "Файл")]);
+    let bundles = build_effective_locale_bundles(&[bundled, user]);
+    let ru = bundles.iter().find(|b| b.id == "ru").expect("ru stays");
+    assert_eq!(
+        ru.entries.get("menu.file").map(String::as_str),
+        Some("Файл")
+    );
+
+    // The bound itself is a size, not a guess from the file system: bytes
+    // handed over past it are refused the same way.
+    let mut subject = candidate("ru", &["en"], &[]);
+    subject.entries.clear();
+    fill_candidate(&mut subject, vec![b' '; MAX_LOCALE_FILE_BYTES + 1]);
+    assert_eq!(subject.status(), LocaleLoadStatus::Rejected);
+}
+
+#[test]
+fn a_locale_path_that_is_not_a_file_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ru.json");
+    std::fs::create_dir(&path).expect("directory named like a locale");
+    let subject = read_locale_candidate(&path, LocaleSource::User).expect("candidate");
+    assert_eq!(subject.status(), LocaleLoadStatus::Rejected);
+}
+
+/// Each bad key costs one warning line until the list is full; then one line
+/// says so. The good keys are kept either way.
+#[test]
+fn a_flood_of_bad_keys_cannot_grow_the_report() {
+    let bad: Vec<String> = (0..500).map(|i| format!(r#""Bad_{i}": "x""#)).collect();
+    let long_key = "k".repeat(MAX_LOCALE_KEY_BYTES);
+    let body = format!(
+        r#""menu": {{"file": "File", {}, "{long_key}": "x"}}"#,
+        bad.join(", ")
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&locale_text("ru", r#"["en"]"#, &body)).expect("fixture parses");
+    let mut subject = candidate("ru", &["en"], &[]);
+    subject.entries.clear();
+    validate_candidate_root(&parsed, &mut subject);
+    assert!(subject.errors.is_empty(), "{:?}", subject.errors);
+    assert_eq!(subject.warnings.len(), MAX_LOCALE_WARNINGS + 1);
+    assert_eq!(
+        subject.warnings.last().map(String::as_str),
+        Some("further warnings are not listed")
+    );
+    assert_eq!(
+        subject.entries.get("menu.file").map(String::as_str),
+        Some("File")
+    );
+    assert_eq!(
+        subject.entries.len(),
+        1,
+        "the over-long key is not admitted"
+    );
+}
+
+#[test]
+fn an_over_long_key_is_ignored_and_reported() {
+    let long_key = "k".repeat(MAX_LOCALE_KEY_BYTES);
+    let body = format!(r#""menu": {{"file": "File", "{long_key}": "x"}}"#);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&locale_text("ru", r#"["en"]"#, &body)).expect("fixture parses");
+    let mut subject = candidate("ru", &["en"], &[]);
+    subject.entries.clear();
+    validate_candidate_root(&parsed, &mut subject);
+    assert_eq!(subject.status(), LocaleLoadStatus::AcceptedWithWarnings);
+    assert_eq!(subject.entries.len(), 1);
+    assert!(
+        subject.warnings.iter().any(|w| w.contains("longer than")),
+        "{:?}",
+        subject.warnings
+    );
+}
+
+/// The fallback chain is metadata, and metadata this broken drops the file.
+#[test]
+fn a_fallback_list_past_the_bound_is_broken_metadata() {
+    let many: Vec<String> = (0..=MAX_LOCALE_FALLBACKS)
+        .map(|i| format!(r#""x{i}""#))
+        .collect();
+    let fallbacks = format!("[{}]", many.join(", "));
+    let parsed: serde_json::Value = serde_json::from_str(&locale_text(
+        "ru",
+        &fallbacks,
+        r#""menu": {"file": "File"}"#,
+    ))
+    .expect("fixture parses");
+    let mut subject = candidate("ru", &["en"], &[]);
+    subject.entries.clear();
+    validate_candidate_root(&parsed, &mut subject);
+    assert_eq!(subject.status(), LocaleLoadStatus::Rejected);
+}
+
+/// The bound must stay far above what ships, or a growing translation would
+/// one day drop a whole language.
+#[test]
+fn shipped_locales_stay_well_under_the_size_bound() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for name in ["locales/en.json", "locales/ru.json"] {
+        let len = std::fs::metadata(repo.join(name))
+            .expect("shipped locale")
+            .len();
+        let bound = u64::try_from(MAX_LOCALE_FILE_BYTES / 2).expect("fits");
+        assert!(
+            len < bound,
+            "{name} is {len} bytes, half the bound is {bound}"
         );
     }
 }

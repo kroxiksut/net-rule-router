@@ -31,17 +31,26 @@ pub const NRR_SIDECAR_PATH_ENV: &str = "NRR_SIDECAR_PATH";
 /// than reconstructing the filename themselves.
 const FILE_NAME: &str = "gui_metadata.db";
 
-/// Resolve the sidecar path, honouring the `NRR_SIDECAR_PATH` override.
+/// Resolve the sidecar path, honouring the `NRR_SIDECAR_PATH` override in a
+/// development build only: a release build never lets an environment variable
+/// choose the database it opens.
 ///
 /// Returns the override verbatim when set; otherwise delegates to
 /// [`resolve_default_path`], so every production open adopts a sidecar left in
 /// the roaming profile. The parent directory is ensured to exist as a side
 /// effect so callers can pass the returned path straight to `rusqlite::Connection::open`.
 pub fn resolve_path() -> SidecarResult<PathBuf> {
-    match env::var_os(NRR_SIDECAR_PATH_ENV) {
+    match override_from_env(cfg!(debug_assertions), || env::var_os(NRR_SIDECAR_PATH_ENV)) {
         Some(value) => resolve_path_with(Some(value), None),
         None => resolve_default_path(),
     }
+}
+
+fn override_from_env(
+    allow_env_overrides: bool,
+    read: impl FnOnce() -> Option<OsString>,
+) -> Option<OsString> {
+    allow_env_overrides.then(read).flatten()
 }
 
 /// Env-free resolver used by [`resolve_path`] and by tests that want
@@ -221,6 +230,13 @@ fn restrict_to_owner(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_release_build_ignores_the_override() {
+        let set = || Some(OsString::from("/elsewhere/gui_metadata.db"));
+        assert_eq!(override_from_env(false, set), None);
+        assert_eq!(override_from_env(true, set), set());
+    }
 
     #[test]
     fn override_value_wins_over_default() -> SidecarResult<()> {

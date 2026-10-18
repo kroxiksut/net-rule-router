@@ -1509,3 +1509,40 @@ pub const STATE_DB_V73_DDL: &[&str] = &[
     "ALTER TABLE secondary_block_policy ADD COLUMN forwarded_outage TEXT NOT NULL DEFAULT '' \
      CHECK(forwarded_outage IN ('', 'as-computer', 'unprotected'))",
 ];
+
+/// What the administrator chose at install time for the whole machine: where
+/// additional-route rules go while no additional connection is bound, and the
+/// behaviour mode a user's first saved policy starts from.
+pub const STATE_DB_V74_DDL: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS install_policy (id INTEGER PRIMARY KEY CHECK(id = 1), secondary_unset TEXT NOT NULL DEFAULT 'direct' CHECK(secondary_unset IN ('direct', 'block')), default_route_mode TEXT NOT NULL DEFAULT '' CHECK(default_route_mode IN ('', 'prefer-primary', 'prefer-secondary-when-available', 'strict-secondary-fail-closed')), updated_at INTEGER NOT NULL)",
+];
+
+/// Remembered application destinations get an owner: `sid` is the user whose
+/// program used the address, '' a machine-wide store that keeps no owner. The
+/// key gains it, so the table is rebuilt; every earlier row was written by a
+/// machine-wide store and keeps ''.
+pub const STATE_DB_V75_DDL: &[&str] = &[
+    "CREATE TABLE app_observed_destinations_v75 (
+    sid TEXT NOT NULL,
+    app_key TEXT NOT NULL COLLATE NOCASE,
+    ip TEXT NOT NULL,
+    learned_at INTEGER NOT NULL,
+    PRIMARY KEY (sid, app_key, ip)
+)",
+    "INSERT INTO app_observed_destinations_v75 (sid, app_key, ip, learned_at)
+     SELECT '', app_key, ip, learned_at FROM app_observed_destinations",
+    "DROP TABLE app_observed_destinations",
+    "ALTER TABLE app_observed_destinations_v75 RENAME TO app_observed_destinations",
+    "CREATE INDEX IF NOT EXISTS idx_app_observed_destinations_learned
+     ON app_observed_destinations(sid, app_key, learned_at DESC)",
+];
+
+/// Each user's connection-history choices. Kept here rather than beside the
+/// history, whose file is rebuilt when damaged: a rebuild must never turn a
+/// history the user switched off back on. No row means the defaults.
+pub const STATE_DB_V76_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS conn_history_prefs (
+    sid            TEXT    PRIMARY KEY,
+    enabled        INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+    retention_days INTEGER NOT NULL CHECK(retention_days BETWEEN 1 AND 30),
+    updated_at     INTEGER NOT NULL
+) WITHOUT ROWID"];

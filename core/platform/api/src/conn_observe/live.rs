@@ -18,6 +18,9 @@ pub struct LiveConnection {
     /// The owning program, as a path or a file name.
     pub process_path: String,
     pub remote: Ipv4Addr,
+    /// The account the socket belongs to (stored principal form), when the
+    /// table names one.
+    pub owner: Option<String>,
 }
 
 pub trait LiveConnectionSource: Send + Sync {

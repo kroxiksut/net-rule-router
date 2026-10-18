@@ -24,6 +24,7 @@ use nrr_shared::ip_block::{IpBlock, IpRange};
 enum Kind {
     ExactDomain,
     Subdomains,
+    AnyZone,
     ExactIp,
     Network,
     Zone,
@@ -54,6 +55,7 @@ fn kind_of(rule: &CanonicalRule) -> Kind {
     match &rule.address_match {
         Some(CanonicalAddressMatch::ExactFqdn(_)) => Kind::ExactDomain,
         Some(CanonicalAddressMatch::SuffixDomain(_)) => Kind::Subdomains,
+        Some(CanonicalAddressMatch::AnyZoneDomain(_)) => Kind::AnyZone,
         Some(CanonicalAddressMatch::ExactIp(_)) => Kind::ExactIp,
         Some(CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_)) => Kind::Network,
         Some(CanonicalAddressMatch::Zone(_)) => Kind::Zone,
@@ -68,6 +70,10 @@ fn engine_order() -> Vec<Kind> {
         rule(
             "s",
             Some(CanonicalAddressMatch::SuffixDomain("example.ru".into())),
+        ),
+        rule(
+            "w",
+            Some(CanonicalAddressMatch::AnyZoneDomain("example".into())),
         ),
         rule("i", Some(CanonicalAddressMatch::ExactIp(ADDRESS))),
         rule(
@@ -120,6 +126,8 @@ fn classify(entry: &str) -> Kind {
     let is_ip = |text: &str| text.trim().parse::<IpAddr>().is_ok();
     if example.ends_with(".exe") {
         Kind::Application
+    } else if example.ends_with(".*") {
+        Kind::AnyZone
     } else if example.starts_with("*.") {
         Kind::Subdomains
     } else if example.starts_with('.') || !example.contains('.') {
@@ -236,6 +244,7 @@ fn the_engine_runs_the_narrower_rule_first() {
         [
             Kind::ExactDomain,
             Kind::Subdomains,
+            Kind::AnyZone,
             Kind::ExactIp,
             Kind::Network,
             Kind::Zone,

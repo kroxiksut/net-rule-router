@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 8
 # name: CN Mainland Split - Primary Route
 # description: Mainland China and domestic ecosystem services routed to primary
 # author: NetRuleRouter contributors
@@ -31,8 +31,7 @@ cn              # КНР / People's Republic of China (.cn)
 *.ixigua.com  # ByteDance / Douyin ecosystem
 *.bytedance.com  # ByteDance / Douyin ecosystem
 
-*.bilibili.com  # Other major domestic platforms
-*.bilibili.tv  # Other major domestic platforms
+bilibili.*  # Other major domestic platforms
 *.jd.com  # Other major domestic platforms
 *.xiaomi.com  # Other major domestic platforms
 *.huawei.com  # Other major domestic platforms

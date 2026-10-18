@@ -47,14 +47,16 @@ Dialog {
                 ? root.tr("dialog.network-recovery.body-stop",
                     "The service will be stopped, and ended if it does not stop in "
                     + "half a minute; then the packet filters, DNS redirect and routes "
-                    + "it applied are removed. Connections open right now may drop, "
-                    + "and routing stays off until the service is started again. "
-                    + "Administrator rights are required.")
+                    + "it applied are removed, leak protection included. Connections "
+                    + "open right now may drop, and until the service is started again, "
+                    + "routing is off and sites meant for the additional adapter can go "
+                    + "over the main connection. Administrator rights are required.")
                 : root.tr("dialog.network-recovery.body",
                     "The packet filters, DNS redirect and routes the service applied "
-                    + "will be removed. Connections open right now may drop, and "
-                    + "routing stays off until the service applies its rules again. "
-                    + "Administrator rights are required.")
+                    + "will be removed, leak protection included. Connections open "
+                    + "right now may drop, and until the service applies its rules "
+                    + "again, routing is off and sites meant for the additional adapter "
+                    + "can go over the main connection. Administrator rights are required.")
         }
         RowLayout {
             Layout.fillWidth: true

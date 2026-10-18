@@ -13,6 +13,7 @@ use std::cell::OnceCell;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nrr_client_logic::adapters::{display_name, held_other_role, unroutable_reason};
 use nrr_client_logic::Route;
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc_payloads::{InterfaceRowDto, SnapshotInitialResponse};
 use nrr_shared::AppSection;
 use serde_json::Value;
@@ -221,7 +222,10 @@ pub fn snapshot_arrived(app: &mut AppState) {
         return;
     }
     app.wizard.decided = true;
-    let wanted = app.snapshot.as_ref().is_some_and(needs_setup);
+    // The baseline's editor has no routing of its own to set up: `sudo` has
+    // no policy, and opening the setup for it is what wrote root's rules over
+    // the baseline. `--wizard` still opens it, and its import lands there.
+    let wanted = app.snapshot.as_ref().is_some_and(needs_setup) && !app.rules.baseline;
     if wanted && app.screen == ScreenId::Status {
         app.open(ScreenId::Wizard);
     }
@@ -268,6 +272,7 @@ fn assigned(app: &AppState, route: Route) -> Option<String> {
         .find(|row| holds(row, route))
         .map(display_name)
         .or_else(|| binding(app, route).map(|b| b.display_name.clone()))
+        .map(|name| display_text(&name).into_owned())
 }
 
 fn pickable(app: &AppState) -> bool {
@@ -612,7 +617,7 @@ fn preview_files(app: &mut AppState, paths: [Option<std::path::PathBuf>; 2]) {
         app.wizard.outcome = Some(Outcome::NeedsService);
         return;
     }
-    let payload = import::payload(files[0].as_ref(), files[1].as_ref());
+    let payload = import::payload(files[0].as_ref(), files[1].as_ref(), app.rules.baseline);
     app.wizard.go(Step::Review);
     app.wizard.preview = None;
     app.wizard.busy = Some(Busy::Previewing);

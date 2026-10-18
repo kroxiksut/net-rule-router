@@ -91,7 +91,7 @@ ColumnLayout {
         var ip = String(entry["remote-ip"] || "")
         var port = Number(entry["remote-port"] || 0)
         var address = port > 0 ? (ip.indexOf(":") >= 0 ? "[" + ip + "]:" + port : ip + ":" + port) : ip
-        var name = String(entry.host || "") || String(entry["rule-host"] || "")
+        var name = Pure.displayText(String(entry.host || "") || String(entry["rule-host"] || ""))
         return name !== "" ? name + "  " + address : address
     }
 
@@ -222,10 +222,10 @@ ColumnLayout {
                     width: list.width
                     spacing: root.uiTheme.spacingMd
                     // No connection was made, so there is no program to name.
-                    readonly property string _process: modelData.unresolved ? "—" : String(modelData.process || "")
+                    readonly property string _process: modelData.unresolved ? "—" : Pure.displayText(modelData.process)
                     readonly property string _remote: modelData.unresolved
                         ? (root.uiRevision >= 0
-                            ? modelData.name + "  " + root.tr("diag.outage-blocks.unresolved", "did not resolve")
+                            ? Pure.displayText(modelData.name) + "  " + root.tr("diag.outage-blocks.unresolved", "did not resolve")
                             : "")
                         : section._remoteText(modelData)
                     readonly property string _attempts: String(modelData.attempts || 0)
@@ -242,7 +242,7 @@ ColumnLayout {
                         color: root.textColor
                         text: parent._process
                         ToolTip.visible: processHover.hovered && String(modelData["process-path"] || "") !== ""
-                        ToolTip.text: String(modelData["process-path"] || "")
+                        ToolTip.text: Pure.displayText(modelData["process-path"])
                         HoverHandler { id: processHover }
                     }
                     Label {

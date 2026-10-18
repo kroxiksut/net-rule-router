@@ -73,7 +73,8 @@ const SESSION_FLUSH_SECS: u32 = 1;
 /// Shared buffer of observations, drained by the consumer. The ETW
 /// callback (a C ABI fn with no closure capture) reaches it through the
 /// session context.
-type Buffer = Arc<Mutex<Vec<DnsObservation>>>;
+/// Each observation with the pid of the program that asked, named at drain.
+type Buffer = Arc<Mutex<Vec<(u32, DnsObservation)>>>;
 
 /// A running real-time ETW consumer for DNS-Client events. The session stops
 /// when this is dropped.
@@ -85,10 +86,26 @@ pub struct EtwDnsObserver {
 impl DnsObservationSource for EtwDnsObserver {
     fn drain(&self) -> Vec<DnsObservation> {
         self.report_losses();
-        match self.buffer.lock() {
+        let batch = match self.buffer.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(_) => Vec::new(),
-        }
+        };
+        // One token read per distinct program per drain, on the consumer's
+        // thread — never in the ETW callback.
+        let mut owners: std::collections::HashMap<u32, Option<String>> =
+            std::collections::HashMap::new();
+        batch
+            .into_iter()
+            .map(|(pid, mut observation)| {
+                if pid != 0 {
+                    observation.owner = owners
+                        .entry(pid)
+                        .or_insert_with(|| crate::win32_ffi::console_session::process_user_sid(pid))
+                        .clone();
+                }
+                observation
+            })
+            .collect()
     }
 }
 
@@ -158,7 +175,7 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
         return;
     }
     // Borrowed: the session owns the reference.
-    let Some(buffer) = callback_context::<Mutex<Vec<DnsObservation>>>(rec) else {
+    let Some(buffer) = callback_context::<Mutex<Vec<(u32, DnsObservation)>>>(rec) else {
         return;
     };
     let Some(observation) = user_data(rec).and_then(parse_query_completed) else {
@@ -168,7 +185,7 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
         // Bound the buffer so a runaway DNS storm between drains cannot
         // grow it without limit (the consumer drains every few seconds).
         if g.len() < 4096 {
-            g.push(observation);
+            g.push((rec.EventHeader.ProcessId, observation));
         }
     }
 }
@@ -205,6 +222,7 @@ fn parse_query_completed(bytes: &[u8]) -> Option<DnsObservation> {
     Some(DnsObservation {
         hostname: canonical_hostname((0..name_end).map(|i| units.at(i)), name_end),
         ipv4s,
+        owner: None,
     })
 }
 
@@ -375,6 +393,7 @@ mod tests {
             Some(DnsObservation {
                 hostname: canonical,
                 ipv4s,
+                owner: None,
             })
         }
     }
@@ -436,6 +455,7 @@ mod tests {
             Some(DnsObservation {
                 hostname: h.into(),
                 ipv4s,
+                owner: None,
             })
         };
         assert_eq!(got[0], obs("host.example.com", vec![ip(10), ip(11)]));

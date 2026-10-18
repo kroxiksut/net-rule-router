@@ -1279,6 +1279,61 @@ fn a_drop_whose_spec_id_fails_role_verification_still_reports_as_blocked_by_rule
 type AppVerdicts = Arc<Mutex<Vec<(String, bool)>>>;
 
 fn test_consumer_on_both_links() -> (ConnectionObservationConsumer, AppVerdicts) {
+    let seen: AppVerdicts = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let consumer = consumer_on_both_links().with_app_main_link(Arc::new(
+        move |_owner, program, _ip, stalled, _named| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((program.to_string(), stalled));
+        },
+    ));
+    (consumer, seen)
+}
+
+/// Each user's main-link connection is reported under its own account: a
+/// suggestion built from it reaches that user's tray, never the routing user's.
+#[test]
+fn main_link_outcomes_are_reported_under_the_connection_s_own_user() {
+    const ALICE: &str = "S-1-5-21-100-1001";
+    const BOB: &str = "S-1-5-21-100-1002";
+    type Owners = Arc<Mutex<Vec<Option<String>>>>;
+    let owners: Owners = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&owners);
+    let consumer = consumer_on_both_links().with_app_main_link(Arc::new(
+        move |owner, _program, _ip, _stalled, _named| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(owner.map(str::to_owned));
+        },
+    ));
+    let of = |sid: &str, port: u16, progress| {
+        let mut o = over_the_main_link(ConnectionVerdict::Unknown, progress);
+        o.local.set_port(port);
+        // Only the connect names its owner; the close carries none.
+        if progress == ConnectionProgress::Attempt {
+            o.user_sid = Some(sid.to_owned());
+        }
+        o
+    };
+    consumer.consume(
+        &[
+            of(BOB, 50_001, ConnectionProgress::Attempt),
+            of(BOB, 50_001, ConnectionProgress::ClosedInOrder),
+            of(ALICE, 50_002, ConnectionProgress::Attempt),
+            of(ALICE, 50_002, ConnectionProgress::ClosedInOrder),
+        ],
+        SystemTime::now(),
+    );
+    let owners = owners.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert_eq!(
+        owners,
+        vec![Some(BOB.to_owned()), Some(ALICE.to_owned())],
+        "a close is attributed to the user whose connect opened it"
+    );
+}
+
+fn consumer_on_both_links() -> ConnectionObservationConsumer {
     let adapter = |index, name: &str, ip: Ipv4Addr, gateway: Ipv4Addr| AdapterInfo {
         index,
         adapter_name: format!("{{{name}}}"),
@@ -1320,15 +1375,7 @@ fn test_consumer_on_both_links() -> (ConnectionObservationConsumer, AppVerdicts)
         Arc::new(|| false),
     ));
     let active_sid: ActiveSidFn = Arc::new(|| Some("S-1-5-21-TEST".to_string()));
-    let seen: AppVerdicts = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&seen);
-    let consumer = ConnectionObservationConsumer::new(api, coordinator, active_sid, false)
-        .with_app_main_link(Arc::new(move |program, _ip, stalled, _named| {
-            sink.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push((program.to_string(), stalled));
-        }));
-    (consumer, seen)
+    ConnectionObservationConsumer::new(api, coordinator, active_sid, false)
 }
 
 fn over_the_main_link(
@@ -1455,12 +1502,63 @@ fn consumer_reporting_splits() -> (ConnectionObservationConsumer, Arc<Mutex<Vec<
     let (consumer, _) = test_consumer_on_both_links();
     let split: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&split);
-    let consumer = consumer.with_app_additional_link(Arc::new(move |program| {
+    let consumer = consumer.with_app_additional_link(Arc::new(move |_owner, program| {
         sink.lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(program.to_string());
     }));
     (consumer, split)
+}
+
+/// A direct connection nobody resolved is reverse-looked-up only for a user
+/// who collects suggestions while their own traffic is on a routed site: with
+/// suggestions off not one query leaves the machine.
+#[test]
+fn with_suggestions_off_no_direct_connection_is_looked_up() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const ALICE: &str = "S-1-5-21-100-1001";
+    let run = |learns: bool| -> usize {
+        let queries = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&queries);
+        let consumer = consumer_on_both_links()
+            .with_companion_in_use(
+                Arc::new(|_: Ipv4Addr| None::<String>),
+                Arc::new(|_: Option<&str>, _: &str| {}),
+            )
+            .with_reverse_dns_learner(Arc::new(
+                move |_: Ipv4Addr, _: bool, _: ReverseLearnOrigin| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                },
+            ))
+            .with_primary_egress_learning(Arc::new(move |_owner: &str| learns));
+        let owned = |mut o: ConnectionObservation| {
+            o.user_sid = Some(ALICE.to_string());
+            o.verdict = ConnectionVerdict::Unknown;
+            o
+        };
+        let mut direct = owned(over_the_main_link(
+            ConnectionVerdict::Unknown,
+            ConnectionProgress::Attempt,
+        ));
+        direct.remote = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 77), 443));
+        consumer.consume(
+            &[
+                owned(over_the_additional_link(
+                    "browser.exe",
+                    ConnectionVerdict::Unknown,
+                )),
+                direct,
+            ],
+            SystemTime::now(),
+        );
+        queries.load(Ordering::SeqCst)
+    };
+    assert_eq!(run(false), 0, "suggestions off: no lookup at all");
+    assert_eq!(
+        run(true),
+        1,
+        "positive control: the same connection is looked up"
+    );
 }
 
 fn over_the_additional_link(process: &str, verdict: ConnectionVerdict) -> ConnectionObservation {

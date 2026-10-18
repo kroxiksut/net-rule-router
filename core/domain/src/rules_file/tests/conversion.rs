@@ -127,9 +127,9 @@ fn full_pipeline_parse_then_validate() {
 }
 
 /// The GUI writes its own preset files, so it declares the format version
-/// itself. A file it saves can carry version-4 constructs (`--- Auto`,
-/// `+block`) — a header claiming an older version tells the next reader
-/// they are not there.
+/// itself. A file it saves can carry the newest constructs (`--- Auto`, a
+/// `!` deny) — a header claiming an older version tells the next reader they
+/// are not there.
 #[test]
 fn the_gui_writes_the_current_preset_format_version() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

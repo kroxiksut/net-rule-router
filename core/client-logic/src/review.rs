@@ -84,6 +84,13 @@ fn refused_rule_values_text(summary: &ReviewSummaryResponse) -> String {
 /// carries it (`refusalDetail`); `None` sends the caller to the code's own text.
 pub fn refusal_detail(code: &str, args: &BTreeMap<String, String>) -> Option<RefusalDetail> {
     let field = |name: &str| args.get(name).cloned().unwrap_or_default();
+    let folder = field("folder");
+    if code == "folder-on-both-routes" && !folder.is_empty() {
+        return Some(RefusalDetail {
+            key: "errors.folder-on-both-routes-named".to_owned(),
+            values: vec![("folder".to_owned(), folder)],
+        });
+    }
     let network = field("network");
     if network.is_empty() {
         return None;

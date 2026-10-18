@@ -20,11 +20,25 @@ impl LogsClearHandler {
     }
 }
 
-impl IpcHandler for LogsClearHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for LogsClearHandler {
+    type Checked = LogsClearRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        serde_json::from_value(request.payload.clone()).map_err(|e| malformed("logs.clear", e))
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         const OP: &str = "logs.clear";
-        let req: LogsClearRequest =
-            serde_json::from_value(request.payload.clone()).map_err(|e| malformed(OP, e))?;
+        let req = req.into_inner();
         let facade_req = ClearLogsRequest {
             include_archives: req.include_archives,
             dry_run: req.dry_run,
@@ -82,11 +96,25 @@ impl CacheClearHandler {
     }
 }
 
-impl IpcHandler for CacheClearHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for CacheClearHandler {
+    type Checked = CacheClearRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        serde_json::from_value(request.payload.clone()).map_err(|e| malformed("cache.clear", e))
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         const OP: &str = "cache.clear";
-        let req: CacheClearRequest =
-            serde_json::from_value(request.payload.clone()).map_err(|e| malformed(OP, e))?;
+        let req = req.into_inner();
 
         // App SQLite cache — cleared / counted only when requested.
         let (resolutions_removed, negative_cache_removed) = if req.clear_app_cache {
@@ -190,21 +218,27 @@ impl CacheEntriesListHandler {
         self
     }
 
-    /// The active user's rule book plus the secondary-owned IPv4 set, or
-    /// `None` when the expectation deps are absent / no user is
-    /// routing-active. Built once per page request, never per row.
+    /// The viewer's rule book plus the secondary-owned IPv4 set, or `None`
+    /// when the expectation deps are absent or nobody can be named. The viewer
+    /// is the caller; a caller with no identity is judged by the routing user's
+    /// book. Built once per page request, never per row.
     ///
     /// NOTE: name matching uses the RAW rule book (no `include_subdomains`
     /// coverage expansion) — consistent with the conn-trace stamp; the
     /// IP-owner fallback catches shared-IP collateral either way.
     fn route_expectation(
         &self,
+        viewer: &str,
     ) -> Option<(
         crate::per_sid_orchestrator::ActiveRulesSnapshot,
         std::collections::HashSet<std::net::Ipv4Addr>,
     )> {
         let (rules, fqdn, active_sid) = self.expectation.as_ref()?;
-        let sid = active_sid()?;
+        let sid = if viewer.is_empty() {
+            active_sid()?
+        } else {
+            viewer.to_owned()
+        };
         let snapshot = rules.active_rules_for(&sid)?;
         let owned = build_secondary_ip_owners(&snapshot.rule_book.secondary, fqdn.as_ref())
             .into_keys()
@@ -214,7 +248,7 @@ impl CacheEntriesListHandler {
 }
 
 impl IpcHandler for CacheEntriesListHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         const OP: &str = "cache.entries.list";
         let req: CacheEntriesListRequest = if request.payload.is_null() {
             CacheEntriesListRequest::default()
@@ -238,26 +272,36 @@ impl IpcHandler for CacheEntriesListHandler {
             .map(|(o, _)| o.max(0) as u32)
             .unwrap_or(0);
 
-        let (rows, total_count) = {
+        // Rule-book + secondary-owned IPv4 set, built ONCE per page, from the
+        // CALLER's book: another user's rules would call their own sites leaks.
+        let expectation = self.route_expectation(ctx.caller_stored());
+        // The names on this machine are everybody's: an administrator sees
+        // them all, anyone else only the names their own rules cover.
+        let scoped = !ctx.caller_is_elevated;
+
+        let (rows, total_count, scoped_next) = {
             let cache = self
                 .cache
                 .lock()
                 .map_err(|e| internal(OP, format!("cache mutex poisoned: {e}")))?;
-            let rows = cache
-                .list_resolutions(offset, limit, req.query.trim())
-                .map_err(|e| internal(OP, format!("list_resolutions: {e}")))?;
-            // Live total so the GUI count reflects the REAL service cache, not a
-            // frozen cold-start snapshot (the mock backend reported a fixed 24
-            // when the GUI started before the service was up).
-            let total = cache.get_cache_stats().map(|s| s.resolution_count).ok();
-            (rows, total)
+            if scoped {
+                let book = expectation
+                    .as_ref()
+                    .filter(|_| !ctx.caller_stored().is_empty())
+                    .map(|(snapshot, _)| &snapshot.rule_book);
+                let (rows, next) = own_rows_page(&*cache, book, offset, limit, req.query.trim())
+                    .map_err(|e| internal(OP, format!("list_resolutions: {e}")))?;
+                (rows, None, next)
+            } else {
+                let rows = cache
+                    .list_resolutions(offset, limit, req.query.trim())
+                    .map_err(|e| internal(OP, format!("list_resolutions: {e}")))?;
+                // Live total so the GUI count reflects the REAL service cache,
+                // not a frozen cold-start snapshot.
+                let total = cache.get_cache_stats().map(|s| s.resolution_count).ok();
+                (rows, total, None)
+            }
         };
-
-        // Rule-book + secondary-owned IPv4 set, built ONCE per page.
-        // Stamps each row with where policy WOULD route the host: a secondary
-        // name-match (or secondary-owned IP — shared-IP collateral) wins over
-        // a primary name-match; no match leaves the field empty.
-        let expectation = self.route_expectation();
         let expected_route = |hostname: &str, ip: &str| -> String {
             let Some((snapshot, owned)) = expectation.as_ref() else {
                 return String::new();
@@ -292,7 +336,7 @@ impl IpcHandler for CacheEntriesListHandler {
 
         // The storage layer fetched `limit + 1` rows; the extra row (if
         // present) means another page exists. Keep only `limit` for display.
-        let has_more = rows.len() as u32 > limit;
+        let has_more = scoped_next.is_some() || (!scoped && rows.len() as u32 > limit);
         let items: Vec<CacheEntryDto> = rows
             .into_iter()
             .take(limit as usize)
@@ -318,13 +362,13 @@ impl IpcHandler for CacheEntriesListHandler {
             })
             .collect();
 
-        let next_cursor = if has_more {
-            Some(PageCursor::from_position(
+        let next_cursor = match scoped_next {
+            Some(position) => Some(PageCursor::from_position(i64::from(position), "cache")),
+            None if has_more => Some(PageCursor::from_position(
                 i64::from(offset) + i64::from(limit),
                 "cache",
-            ))
-        } else {
-            None
+            )),
+            None => None,
         };
 
         let response = CacheEntriesListResponse {
@@ -338,4 +382,52 @@ impl IpcHandler for CacheEntriesListHandler {
         };
         serialise(OP, &response)
     }
+}
+
+/// Rows read per storage query while looking for a caller's own names.
+const OWN_ROWS_CHUNK: u32 = 512;
+/// Rows looked at for one page of a caller's own names: past it the page is
+/// cut short and the cursor resumes from there.
+const OWN_ROWS_SCAN_CAP: u32 = 20_000;
+
+/// One page of the cached names `book` covers, from position `offset` on, and
+/// where the next page starts (`None` when nothing is left). Without a book
+/// nothing is the caller's, so the page is empty.
+fn own_rows_page(
+    cache: &(dyn CacheRepository + Send),
+    book: Option<&nrr_domain::canonical::CanonicalRuleBook>,
+    offset: u32,
+    limit: u32,
+    query: &str,
+) -> nrr_storage::error::StorageResult<(Vec<nrr_storage::dto::CacheEntryRow>, Option<u32>)> {
+    let Some(book) = book else {
+        return Ok((Vec::new(), None));
+    };
+    let covered = |row: &nrr_storage::dto::CacheEntryRow| {
+        let v4 = row.canonical_ip.parse::<std::net::Ipv4Addr>().ok();
+        rule_set_match_kind(&row.canonical_hostname, v4, &book.secondary).is_some()
+            || rule_set_match_kind(&row.canonical_hostname, v4, &book.primary).is_some()
+    };
+    let mut page = Vec::new();
+    let mut position = offset;
+    let end = offset.saturating_add(OWN_ROWS_SCAN_CAP);
+    while position < end {
+        let rows = cache.list_resolutions(position, OWN_ROWS_CHUNK, query)?;
+        let exhausted = rows.len() as u32 <= OWN_ROWS_CHUNK;
+        for row in rows.into_iter().take(OWN_ROWS_CHUNK as usize) {
+            if !covered(&row) {
+                position += 1;
+                continue;
+            }
+            if page.len() as u32 == limit {
+                return Ok((page, Some(position)));
+            }
+            page.push(row);
+            position += 1;
+        }
+        if exhausted {
+            return Ok((page, None));
+        }
+    }
+    Ok((page, Some(position)))
 }

@@ -220,14 +220,17 @@ fn parse_answer(line: &str) -> Option<(DnsObservation, Option<DnsObservation>)> 
         }
     }
 
+    // A reply on the wire names no program: the owner stays unknown.
     let answered = (final_name != queried).then_some(DnsObservation {
         hostname: final_name,
         ipv4s: final_ipv4s,
+        owner: None,
     });
     Some((
         DnsObservation {
             hostname: queried,
             ipv4s: queried_ipv4s,
+            owner: None,
         },
         answered,
     ))

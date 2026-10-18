@@ -66,6 +66,21 @@ Not allowed for translation values in schema v1:
 - Do not change placeholder count/order between locales unless call sites are updated together.
 - Locale strings should be plain text; HTML fragments or rich markup are out of schema v1 scope.
 
+## Size Limits
+
+A locale file anyone can drop into the user's locales folder is read with
+bounds, so a broken or hostile file costs nothing worse than its own language:
+
+- a file over 4 MiB, or one listing more than 16 fallback languages, is not
+  loaded, and the language falls back as for an unreadable file;
+- at most 50,000 keys are read, each at most 512 bytes long; extra or longer
+  keys fall back per key;
+- at most 256 locale files are read from one folder;
+- only a regular file is read (a pipe or a device named `.json` is refused).
+
+The loader in `shared/contracts/src/localization/` holds these numbers; this
+list mirrors it.
+
 ## Pluralization Strategy (v1)
 
 Schema v1 does not add a dedicated runtime plural resolver yet.

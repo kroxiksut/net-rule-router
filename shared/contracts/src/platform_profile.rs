@@ -147,6 +147,10 @@ pub struct PlatformSupports {
     /// `meta skuid` on every l4proto). Windows cannot: the packet layer forces
     /// `user_sid = None`, widening a per-user block system-wide (`false`).
     pub per_user_all_protocol_scoping: bool,
+    /// An application rule by path (a file, a folder, a folder with its
+    /// subfolders) is carried out. Mirrors `EnforcementCapabilities::
+    /// app_path_rules`; `false` everywhere until a platform walks folders.
+    pub app_path_rules: bool,
 }
 
 impl PlatformProfile {
@@ -201,12 +205,12 @@ impl PlatformProfile {
                 per_user_routing: false,
                 per_app_block_leakproof: true,
                 per_user_all_protocol_scoping: false,
+                app_path_rules: false,
             },
         }
     }
 
-    /// Linux (nftables / systemd / polkit). Per-process routing has no
-    /// analogue wired yet, so it reports `false`.
+    /// Linux (nftables / systemd / polkit).
     pub fn linux() -> Self {
         Self {
             os: "linux",
@@ -216,7 +220,10 @@ impl PlatformProfile {
             hosts_file_path: unix_hosts_path(),
             supports: PlatformSupports {
                 kill_switch: true,
-                app_routing: false,
+                // The daemon routes an application by the destinations it was
+                // seen using; `per_app_block_leakproof` below says what that
+                // cannot hold.
+                app_routing: true,
                 // The daemon reads what systemd-resolved answered; where
                 // resolved does not serve the machine, the log says so.
                 dns_observe: true,
@@ -253,6 +260,7 @@ impl PlatformProfile {
                 per_user_routing: true,
                 per_app_block_leakproof: false,
                 per_user_all_protocol_scoping: true,
+                app_path_rules: false,
             },
         }
     }
@@ -290,6 +298,7 @@ impl PlatformProfile {
                 per_user_routing: false,
                 per_app_block_leakproof: false,
                 per_user_all_protocol_scoping: false,
+                app_path_rules: false,
             },
         }
     }
@@ -351,6 +360,16 @@ mod tests {
         assert!(PlatformProfile::windows().supports.fake_ip);
         assert!(!PlatformProfile::linux().supports.fake_ip);
         assert!(!PlatformProfile::macos().supports.fake_ip);
+    }
+
+    /// Both services carry out application rules, so the window, the tray and
+    /// the terminal offer the type there; macOS has no backend for it yet.
+    #[test]
+    fn application_rules_are_offered_where_a_service_carries_them_out() {
+        assert!(PlatformProfile::windows().supports.app_routing);
+        assert!(PlatformProfile::linux().supports.app_routing);
+        assert!(!PlatformProfile::linux().supports.per_app_block_leakproof);
+        assert!(!PlatformProfile::macos().supports.app_routing);
     }
 
     /// The daemon applies a verbose window without the rest of the stability

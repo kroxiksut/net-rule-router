@@ -111,6 +111,8 @@ pub struct PlannedPolicy {
     /// state; a non-zero count is the visible sign that a secondary link is gone
     /// and its traffic is being blocked rather than leaking to the primary.
     pub fail_closed_blocks: usize,
+    /// The guard holds this principal's secondary traffic back, blocks or not.
+    pub guard_holding: bool,
 }
 
 /// What one pass did. Returned rather than only logged, so a test asserts the
@@ -180,6 +182,9 @@ pub struct PrincipalEnforcementCycle {
     /// not treat a rule host as covered while it is armed — today the rule
     /// hostname seeder's retry pacing. `None` leaves them on calm pacing.
     fail_closed_posture: Option<crate::app_enforcement_status::FailClosedPostureStatus>,
+    /// The OS resolver cache, flushed when that posture changes: answers
+    /// cached on the other side of the change would outlive it.
+    dns_cache_control: Option<Arc<dyn nrr_platform_api::DnsCacheControlPort>>,
     /// Plans the platform refused persistently, with its reason. Only touched
     /// under the pass lock.
     refused: Mutex<Option<(Vec<EnforcementPlan>, String)>>,
@@ -288,17 +293,16 @@ fn route_delta(old: &EnforcementPlan, new: &EnforcementPlan) -> (usize, usize) {
 }
 
 /// Whether this plan asks for something the packet layer will apply to the
-/// WHOLE machine.
-///
-/// The packet layer carries no user context (`FWPM_CONDITION_ALE_USER_ID` exists
-/// only on the ALE layers), so a block emitted there is machine-wide no matter
-/// whose plan produced it. `AllPackets` coverage on a Block is exactly that
-/// shape.
-fn plan_cuts_machine_wide(plan: &EnforcementPlan) -> bool {
+/// WHOLE machine: an `AllPackets` block, on a platform whose packet layer
+/// carries no user (WFP: `FWPM_CONDITION_ALE_USER_ID` exists only on the ALE
+/// layers).
+fn plan_cuts_machine_wide(plan: &EnforcementPlan, packet_blocks_scoped: bool) -> bool {
     use nrr_platform_api::enforcement::{Coverage, Verdict};
-    plan.flows
-        .iter()
-        .any(|f| f.verdict == Verdict::Block && f.coverage == Coverage::AllPackets)
+    !packet_blocks_scoped
+        && plan
+            .flows
+            .iter()
+            .any(|f| f.verdict == Verdict::Block && f.coverage == Coverage::AllPackets)
 }
 
 impl PrincipalEnforcementCycle {
@@ -314,6 +318,7 @@ impl PrincipalEnforcementCycle {
             routes: None,
             events: None,
             fail_closed_posture: None,
+            dns_cache_control: None,
             last_applied: Mutex::new(None),
             refused: Mutex::new(None),
             retry_requested: AtomicBool::new(false),
@@ -356,6 +361,19 @@ impl PrincipalEnforcementCycle {
         board: crate::app_enforcement_status::RouteEnforcementStatus,
     ) -> Self {
         self.channel_status = Some(crate::channel_status::ChannelStatusPublisher::new(board));
+        self
+    }
+
+    /// Offer the sole default-route holder to a principal who bound nothing.
+    /// After [`Self::with_enforcement_status`], whose publisher it extends.
+    #[must_use]
+    pub fn with_primary_suggestion(
+        mut self,
+        suggest: crate::channel_status::PrimarySuggestionFn,
+    ) -> Self {
+        self.channel_status = self
+            .channel_status
+            .map(|publisher| publisher.with_primary_suggestion(suggest));
         self
     }
 
@@ -423,6 +441,16 @@ impl PrincipalEnforcementCycle {
         status: crate::app_enforcement_status::FailClosedPostureStatus,
     ) -> Self {
         self.fail_closed_posture = Some(status);
+        self
+    }
+
+    /// Flush the OS resolver cache as the guard takes hold or lets go.
+    #[must_use]
+    pub fn with_dns_cache_control(
+        mut self,
+        control: Arc<dyn nrr_platform_api::DnsCacheControlPort>,
+    ) -> Self {
+        self.dns_cache_control = Some(control);
         self
     }
 
@@ -536,7 +564,10 @@ impl PrincipalEnforcementCycle {
         let mut unprotected: Vec<String> = Vec::new();
         let mut wants_machine_wide_cut: std::collections::BTreeMap<String, bool> =
             std::collections::BTreeMap::new();
+        let packet_blocks_scoped = self.enforcer.packet_blocks_follow_the_principal();
         let mut guarded = 0usize;
+        let mut holding = std::collections::BTreeSet::new();
+        let mut flush_os_dns = false;
         // Principals whose inputs could not be read this pass. Their last plan
         // is carried forward; with none to carry, the pass changes nothing.
         let mut held_back: Vec<String> = Vec::new();
@@ -550,6 +581,14 @@ impl PrincipalEnforcementCycle {
                         .as_deref()
                         .and_then(|plans| plans.iter().find(|p| p.principal == *principal))
                         .cloned();
+                    // A carried plan carries its posture too.
+                    if self
+                        .fail_closed_posture
+                        .as_ref()
+                        .is_some_and(|p| p.armed_for(principal.as_stored()))
+                    {
+                        holding.insert(principal.as_stored().to_owned());
+                    }
                     match previous {
                         Some(plan) => plans.push(plan),
                         None => {
@@ -575,9 +614,12 @@ impl PrincipalEnforcementCycle {
             // because somebody ELSE asked for it.
             wants_machine_wide_cut.insert(
                 principal.as_stored().to_owned(),
-                plan_cuts_machine_wide(&planned.plan),
+                plan_cuts_machine_wide(&planned.plan, packet_blocks_scoped),
             );
             guarded += planned.fail_closed_blocks;
+            if planned.guard_holding {
+                holding.insert(principal.as_stored().to_owned());
+            }
             plans.push(planned.plan);
         }
 
@@ -586,6 +628,7 @@ impl PrincipalEnforcementCycle {
 
         // Recorded before the enforcer runs, which may read it.
         self.route_owner.record(owner.as_ref());
+        self.route_owner.record_served(&active);
 
         // Planning above is not instant, and a stop can land inside it.
         if crate::teardown_in_progress() {
@@ -661,7 +704,7 @@ impl PrincipalEnforcementCycle {
                     self.notify_coverage(&unprotected, &wants_machine_wide_cut);
                 }
                 if let Some(posture) = self.fail_closed_posture.as_ref() {
-                    posture.set(guarded > 0);
+                    flush_os_dns = posture.set_holding(std::mem::take(&mut holding));
                 }
                 let installed = Arc::new(plans);
                 if let Some(previous) = last.replace(Arc::clone(&installed)) {
@@ -701,6 +744,11 @@ impl PrincipalEnforcementCycle {
             }
         };
         drop(last);
+        // Outside the pass lock: `resolvectl` may take seconds, and a DNS
+        // query waiting on the pass would spend its budget on it.
+        if flush_os_dns {
+            self.flush_os_dns_cache();
+        }
         if let Some((previous, installed)) = replaced {
             if let CycleOutcome::Applied { delta, .. } = &mut outcome {
                 *delta = Some(describe_change(&previous, &installed));
@@ -1030,6 +1078,25 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
     }
 }
 
+impl PrincipalEnforcementCycle {
+    /// An address cached while the tunnel was up would carry a rule host over
+    /// the main link once it is down (an address the census spared is not
+    /// blocked), and a refusal cached while it was down would outlive it.
+    fn flush_os_dns_cache(&self) {
+        let Some(control) = self.dns_cache_control.as_ref() else {
+            return;
+        };
+        if let Err(e) = control.flush_resolver_cache() {
+            tracing::warn!(
+                target: "nrr::enforcement",
+                msg_key = "persid-posture-dns-flush-link-edge-failed",
+                error = %e,
+                "OS DNS resolver cache flush failed as the additional link went down or came back — cached answers outlive the change until their TTL expires",
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1100,7 +1167,13 @@ mod tests {
             routes: Vec::new(),
             policy_rules: Vec::new(),
         };
-        assert!(!plan_cuts_machine_wide(&ale_only));
+        assert!(!plan_cuts_machine_wide(&ale_only, false));
+
+        // Where every packet rule carries its owner, nobody else loses anything.
+        let mut all_packets = ale_only;
+        all_packets.flows[0].coverage = Coverage::AllPackets;
+        assert!(plan_cuts_machine_wide(&all_packets, false));
+        assert!(!plan_cuts_machine_wide(&all_packets, true));
     }
     use super::*;
     use nrr_platform_api::active_principals::ActivePrincipalError;
@@ -1170,6 +1243,7 @@ mod tests {
                 },
                 protection_complete: true,
                 fail_closed_blocks: 0,
+                guard_holding: false,
             })
         }
     }
@@ -1943,6 +2017,7 @@ mod tests {
                     },
                     protection_complete: true,
                     fail_closed_blocks: 0,
+                    guard_holding: false,
                 })
             }
         }
@@ -2164,6 +2239,7 @@ mod tests {
                     },
                     protection_complete: true,
                     fail_closed_blocks: 0,
+                    guard_holding: false,
                 })
             }
         }
@@ -2322,11 +2398,11 @@ mod tests {
             assert_eq!(
                 links,
                 vec![
-                    (RouteTableRef::Tagged(1), TUN),
+                    (RouteTableRef::Tagged(1), ETH),
                     (RouteTableRef::Tagged(1000), TUN),
                     (RouteTableRef::Tagged(1001), ETH),
                 ],
-                "each user's own route, the seat user's for the system",
+                "each user's own route, the earlier sign-in's for the system",
             );
         }
 
@@ -2337,8 +2413,12 @@ mod tests {
                 present(1001, false, Some(10)),
             ]);
             assert!(matches!(r.cycle.tick(), CycleOutcome::Applied { .. }));
-            assert_eq!(r.shared_host_links(), vec![TUN], "the seat user's route");
-            assert_eq!(r.owner_uid(), Some(1000));
+            assert_eq!(
+                r.shared_host_links(),
+                vec![ETH],
+                "the earlier sign-in's route, though the other user is at the seat"
+            );
+            assert_eq!(r.owner_uid(), Some(1001));
             assert_eq!(
                 r.enforcer.calls(),
                 vec![vec!["unix:uid:1000".to_owned(), "unix:uid:1001".to_owned()]],
@@ -2353,7 +2433,7 @@ mod tests {
             assert_eq!(
                 r.shared_host_links(),
                 vec![ETH],
-                "the table follows the seat"
+                "the seat moving changes nothing"
             );
             assert_eq!(r.owner_uid(), Some(1001));
         }
@@ -2396,8 +2476,9 @@ mod tests {
             assert_eq!(r.owner_uid(), None);
         }
 
-        /// Switching the seat between two signed-in users leaves the present
-        /// set as it was; the owner is what moved.
+        /// Between two users who signed in at the same moment the seat decides
+        /// the owner. Switching it leaves the present set as it was; the owner
+        /// is what moved, and the pass must not skip that.
         #[test]
         fn a_seat_switch_is_not_skipped_as_unchanged() {
             let Rig {
@@ -2406,7 +2487,7 @@ mod tests {
                 table,
                 enforcer,
             } = rig(vec![
-                present(1000, true, Some(50)),
+                present(1000, true, Some(10)),
                 present(1001, false, Some(10)),
             ]);
             let r = Rig {
@@ -2424,7 +2505,7 @@ mod tests {
             ));
 
             r.seat(vec![
-                present(1000, false, Some(50)),
+                present(1000, false, Some(10)),
                 present(1001, true, Some(10)),
             ]);
             assert!(!matches!(

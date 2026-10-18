@@ -7,7 +7,13 @@ use crate::i18n::{key, Key};
 
 pub const ROUTE_PRIMARY: Key = key("label.primary", "Primary");
 pub const ROUTE_SECONDARY: Key = key("label.secondary", "Additional");
-pub const ROUTE_BLOCK: Key = key("label.block", "Block");
+pub const ROUTE_BLOCK: Key = key("label.block", "Denied");
+pub const FILTER_DENIED: Key = key("rules.filter.route.denied", "Denied");
+pub const ROUTE_DENY: Key = key("rules.route.deny", "Deny");
+pub const ROUTE_DENY_DESCRIPTION: Key = key(
+    "rules.route.deny-description",
+    "Deny — never send through any connection",
+);
 pub const ROUTE_UNSURE: Key = key("rules.filter.route.unsure", "Unsure (?)");
 pub const ROUTE_ALL: Key = key("rules.filter.route.all", "All routes");
 pub const ROUTE_FILTER: Key = key("rules.filter.route.label", "Route");
@@ -41,6 +47,28 @@ pub const VERIFY: Key = key("dialog.rule.verify", "Unsure — check where it wor
 pub const VERIFY_HINT: Key = key(
     "dialog.rule.verify-hint",
     "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule.",
+);
+pub const VERIFY_ANY_ZONE: Key = key(
+    "dialog.rule.verify-any-zone",
+    "A site in every zone is not checked: the check needs one host.",
+);
+pub const VERIFY_DENY: Key = key(
+    "dialog.rule.verify-deny",
+    "A denied rule is not checked: its traffic goes through no connection.",
+);
+pub const APP_NOT_LEAKPROOF: Key = key(
+    "rules.application-not-leakproof",
+    "On this system an application rule is not airtight: connections the app makes before it is recognised can still get through.",
+);
+/// What an application rule does, in the words of the window's form for this
+/// platform: Windows names the program by its executable, Linux by process.
+pub const APP_ROUTING_NOTE: Key = key(
+    "rules.application-routing-note",
+    "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe.",
+);
+pub const APP_ROUTING_NOTE_LINUX: Key = key(
+    "rules.application-routing-note-linux",
+    "Routes everything this program connects to through the additional connection. NetRuleRouter learns the program's destinations by watching its connections, so routing fills in as it connects. Enter the process name, e.g. browser.",
 );
 pub const VERDICTS_TITLE: Key = key(
     "notifications.verify-verdicts.title",
@@ -307,6 +335,16 @@ pub const OLD_FILES_KEPT: Key = key(
     "The files they were linked to before stay where they were: {dir}",
 );
 pub const MY_RULES: Key = key("rules.sets.my-rules", "My rules");
+
+/// The syntax hint a written rules file opens with, a key per line; the keys
+/// and their English live with the writer.
+pub fn file_hint_keys() -> Vec<Key> {
+    nrr_client_logic::rules_table::RULES_FILE_HINT_KEYS
+        .iter()
+        .map(|&(id, en)| key(id, en))
+        .collect()
+}
+
 pub const SETTINGS_NOT_WRITTEN: Key = key(
     "tui.rules.settings-not-written",
     "Your settings file was not updated: {error}",
@@ -410,6 +448,14 @@ pub const HELP_RELOAD: Key = key(
     "tui.rules.help.reload",
     "r: show the rules the service applies, dropping the changes on screen",
 );
+pub const HELP_BOOK: Key = key(
+    "tui.rules.help.book",
+    "b: switch between your own rules and the baseline every user without rules of their own follows; the title says which is on screen",
+);
+pub const HELP_MOVE_TO_TYPE: Key = key(
+    "tui.rules.help.move-to-type",
+    "Shift+T: give the chosen rule the type its value is, when the value belongs to another type. Shift+M: do it for every such rule",
+);
 pub const HELP_VERDICTS: Key = key(
     "tui.rules.help.verdicts",
     "m: move the rules that work only on the other route there for good. n: not now",
@@ -457,6 +503,10 @@ pub const PLAIN_VERDICTS: Key = key(
 pub const PLAIN_RELOAD: Key = key(
     "tui.rules.plain.reload",
     "r: show the rules the service applies",
+);
+pub const PLAIN_BOOK: Key = key(
+    "tui.rules.plain.book",
+    "b: switch between your own rules and the baseline",
 );
 
 // ── The main-route check ─────────────────────────────────────────────────────
@@ -530,7 +580,31 @@ pub const TITLE_BASELINE: Key = key(
 );
 pub const BASELINE_NOTE: Key = key(
     "tui.rules.baseline-note",
-    "Running as root: these rules are the baseline every user without rules of their own follows, as Set as baseline does in the window.",
+    "These rules are the baseline every user without rules of their own follows, as Set as baseline does in the window. b switches to your own rules.",
+);
+pub const BOOK_BASELINE: Key = key(
+    "tui.rules.book.baseline",
+    "Now showing the baseline. Applying changes it for every user without rules of their own.",
+);
+pub const BOOK_OWN: Key = key("tui.rules.book.own", "Now showing your own rules.");
+pub const BOOK_DIRTY: Key = key(
+    "tui.rules.book.dirty",
+    "Apply the changes on screen, or drop them with r, before switching between your rules and the baseline.",
+);
+pub const OWN_RULES_ONLY: Key = key(
+    "tui.rules.book.own-only",
+    "This changes your own rules, and the baseline is on screen. Press b to switch to your rules first.",
+);
+/// The chosen row's offer when its value is another type's.
+pub const MOVE_TO_TYPE: Key = key("tui.rules.move-to-type", "Shift+T: move it to “{type}”");
+/// The rules whose value is another type's, above the list.
+pub const MISPLACED_COUNT: Key = key(
+    "rules.move-to-type.count",
+    "{n} rule(s) are not in their section: {rules}",
+);
+pub const MOVE_ALL_TO_TYPE: Key = key(
+    "tui.rules.move-all-to-type",
+    "Shift+M: move them all to the type their value is",
 );
 
 pub const UNRECOGNIZED: Key = key(
@@ -618,15 +692,164 @@ pub const PLAIN_GATEWAY: Key = key(
     "v: add a rule for a VPN's gateway",
 );
 
+// ── Several rules at once ────────────────────────────────────────────────────────
+
+pub const MODE_SEVERAL: Key = key("dialog.rule.mode.several", "Several rules");
+pub const BULK_LABEL: Key = key(
+    "dialog.rule.bulk.label",
+    "One rule per line, as in a rules file: !value denies, ?value checks where it works, # value is kept switched off, and a line such as --- Windows gives the lines below it their type. Otherwise the type is read from the value.",
+);
+pub const BULK_SUMMARY: Key = key(
+    "dialog.rule.bulk.summary",
+    "To add: {add}. To move: {move}. Stay in the field: {keep}. Already in your rules: {drop}.",
+);
+pub const BULK_BOUND_LINES: Key = key(
+    "dialog.rule.bulk.bound-lines",
+    "Only the first {max} lines are read; the other {count} stay in the field for the next round.",
+);
+pub const BULK_BOUND_SIZE: Key = key(
+    "dialog.rule.bulk.bound-size",
+    "The text is longer than one round reads: the first {lines} lines are read, the other {count} stay in the field.",
+);
+pub const BULK_TYPE_UNKNOWN: Key = key("dialog.rule.bulk.type-unknown", "Type not known");
+pub const BULK_WILL_ADD: Key = key("dialog.rule.bulk.will-add", "will be added");
+pub const MOVE_TO_TYPE_ACTION: Key = key("rules.move-to-type.action", "Move to “{type}”");
+pub const MOVE_HERE: Key = key("tray.add-rule.move", "Move to this route");
+pub const DENY_INSTEAD: Key = key("tray.add-rule.deny-instead", "Deny instead");
+pub const LIFT_DENY: Key = key("tray.add-rule.lift-deny", "Lift the deny, use this route");
+pub const LIST_ADDED: Key = key("status.rules-list-added", "Rules added: {count}.");
+pub const LIST_MOVED: Key = key(
+    "status.rules-list-moved",
+    "Moved to the chosen route: {count}.",
+);
+pub const LIST_LEFT: Key = key(
+    "status.rules-list-left",
+    "Left in the form to fix: {count}.",
+);
+pub const BULK_TEXT: Key = key(
+    "tui.rules.bulk.text",
+    "Rules, one per line ({count} lines):",
+);
+pub const BULK_MORE_ABOVE: Key = key("tui.rules.bulk.more-above", "{count} more lines above");
+pub const BULK_HINT: Key = key(
+    "tui.rules.bulk.hint",
+    "Tab: next part. In the text Enter starts a new line; the preview follows each finished line. In the preview: t picks a type, m moves a rule found on another route. Ctrl+S: add. F2: one rule. Esc: cancel.",
+);
+pub const BULK_TYPE_KEY: Key = key("tui.rules.bulk.type-key", "t: {choices}");
+pub const BULK_MOVE_KEY: Key = key("tui.rules.bulk.move-key", "m: {tick} {move}");
+pub const BULK_NOT_ADDED: Key = key("tui.rules.bulk.not-added", "Not added");
+pub const BULK_CHOOSE: Key = key("tui.rules.bulk.choose", "Your choice");
+pub const PLAIN_BULK_TEXT: Key = key(
+    "tui.rules.bulk.plain-text",
+    "Type or paste the rules, one per line; an empty line ends the text. ! cancels.",
+);
+pub const PLAIN_BULK_ROWS: Key = key(
+    "tui.rules.bulk.plain-rows",
+    "y: add them. +: type more lines. c: start the text over. t, a line number and an option number: pick a type, for example t 3 1. m and a line number: move that rule or not. > and <: more rows. ! cancels.",
+);
+pub const SEVERAL_OPTION: Key = key("tui.rules.several-option", "Several rules at once (F2)");
+pub const FORM_SWITCH_TYPE: Key = key(
+    "tui.rules.form-switch-type",
+    "Ctrl+T, or !t in line mode: move it to “{type}”",
+);
+pub const HELP_BULK: Key = key(
+    "tui.rules.help.bulk",
+    "Shift+A: add several rules at once, typed or pasted as lines of a rules file. F2 in the add form does the same",
+);
+pub const PLAIN_BULK: Key = key("tui.rules.plain.bulk", "A: add several rules at once");
+pub const PLAIN_MOVE_TO_TYPE: Key = key(
+    "tui.rules.plain.move-to-type",
+    "T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule",
+);
+
+// ── «Recent» ─────────────────────────────────────────────────────────────────
+
+pub const RECENT: Key = key("rules.filter.recent.label", "Recent");
+pub const RECENT_HOUR: Key = key("rules.filter.recent.hour", "Last hour");
+pub const RECENT_TODAY: Key = key("rules.filter.recent.today", "Today");
+pub const RECENT_WEEK: Key = key("rules.filter.recent.week", "7 days");
+pub const RECENT_YESTERDAY: Key = key("rules.recent.yesterday", "yesterday {time}");
+pub const RECENT_ADDED: Key = key("rules.recent.added", "added");
+pub const RECENT_CHANGED: Key = key("rules.recent.changed", "changed");
+pub const RECENT_PREVIOUS_ROUTE: Key =
+    key("rules.recent.previous-route", "Route: {from} \u{2192} {to}");
+pub const RECENT_PREVIOUS_OFF: Key = key("rules.recent.previous-off", "Was switched off");
+pub const RECENT_PREVIOUS_ON: Key = key("rules.recent.previous-on", "Was switched on");
+pub const RECENT_PREVIOUS_SURE: Key = key(
+    "rules.recent.previous-sure",
+    "Was without \u{201c}?\u{201d}",
+);
+pub const RECENT_PREVIOUS_UNSURE: Key = key(
+    "rules.recent.previous-unsure",
+    "Was marked \u{201c}?\u{201d}",
+);
+pub const RECENT_LOADING: Key = key("rules.recent.loading", "Reading recent changes\u{2026}");
+pub const RECENT_FAILED: Key = key(
+    "rules.recent.failed",
+    "Recent changes could not be read: {reason}",
+);
+pub const RECENT_NONE: Key = key("rules.recent.none", "No changes in this period.");
+pub const RECENT_REPLACED: Key = key(
+    "rules.recent.replaced",
+    "{time} \u{b7} Rule set replaced, rules in it: {count}",
+);
+pub const RECENT_REPLACED_MORE: Key = key("rules.recent.replaced-more", "and {count} more");
+pub const RECENT_DELETED_TITLE: Key = key("rules.recent.deleted-title", "Deleted");
+pub const RECENT_DELETED_AT: Key = key("rules.recent.deleted-at", "deleted {time}");
+pub const RECENT_WAS_OFF: Key = key("rules.recent.was-off", "switched off");
+pub const RECENT_PRESENT_NOTE: Key = key(
+    "rules.recent.restore-present",
+    "A rule with this type and value is already in the list.",
+);
+pub const RECENT_RESTORED: Key = key(
+    "rules.recent.restored",
+    "Rule put back: {value}. Apply the changes to bring it into force.",
+);
+pub const RECENT_HISTORY_START: Key = key(
+    "rules.recent.history-start",
+    "History is kept from {time}; what changed before that cannot be shown.",
+);
+pub const RECENT_TRUNCATED: Key = key(
+    "rules.recent.truncated",
+    "Only the latest changes are shown; choose a shorter period to see all of them.",
+);
+pub const RECENT_OFF: Key = key("tui.rules.recent-off", "Off: all rules");
+pub const RECENT_QUESTION: Key = key("tui.rules.recent-question", "Show the rules changed:");
+pub const RECENT_PRESENT: Key = key("tui.rules.recent-present", "already in the list");
+pub const RECENT_RESTORE_HINT: Key = key(
+    "tui.rules.recent-restore-hint",
+    "U: put a deleted rule back; in line mode U and its number, for example U 1.",
+);
+pub const RECENT_NOTHING_DELETED: Key = key(
+    "tui.rules.recent-nothing-deleted",
+    "No deleted rules to put back. Shift+R shows the recent changes.",
+);
+pub const RESTORE_QUESTION: Key = key("tui.rules.restore-question", "Which rule to put back?");
+pub const HELP_RECENT: Key = key(
+    "tui.rules.help.recent",
+    "Shift+R: recent changes \u{2014} the rules added or changed in the last hour, today or 7 days, newest first, and the deleted ones. Shift+U: put a deleted rule back",
+);
+pub const PLAIN_RECENT: Key = key(
+    "tui.rules.plain.recent",
+    "R: recent changes. U: put a deleted rule back",
+);
+
 /// Every key above, for the test that holds both locale files to them.
 #[cfg(test)]
 pub const ALL: &[Key] = &[
     TITLE_BASELINE,
     BASELINE_NOTE,
+    BOOK_BASELINE,
+    BOOK_OWN,
+    BOOK_DIRTY,
+    OWN_RULES_ONLY,
     UNRECOGNIZED,
     ROUTE_PRIMARY,
     ROUTE_SECONDARY,
     ROUTE_BLOCK,
+    FILTER_DENIED,
+    ROUTE_DENY,
+    ROUTE_DENY_DESCRIPTION,
     ROUTE_UNSURE,
     ROUTE_ALL,
     ROUTE_FILTER,
@@ -648,6 +871,11 @@ pub const ALL: &[Key] = &[
     ENABLED_OFF,
     VERIFY,
     VERIFY_HINT,
+    VERIFY_ANY_ZONE,
+    VERIFY_DENY,
+    APP_NOT_LEAKPROOF,
+    APP_ROUTING_NOTE,
+    APP_ROUTING_NOTE_LINUX,
     VERDICTS_TITLE,
     VERDICTS_BODY,
     VERDICTS_ITEM,
@@ -772,7 +1000,12 @@ pub const ALL: &[Key] = &[
     HELP_FILES,
     HELP_FOLDER,
     HELP_RELOAD,
+    HELP_BOOK,
     HELP_VERDICTS,
+    HELP_MOVE_TO_TYPE,
+    MOVE_TO_TYPE,
+    MISPLACED_COUNT,
+    MOVE_ALL_TO_TYPE,
     HELP_FORM,
     PLAIN_ADD,
     PLAIN_EDIT,
@@ -785,6 +1018,7 @@ pub const ALL: &[Key] = &[
     PLAIN_FILES,
     PLAIN_FOLDER,
     PLAIN_RELOAD,
+    PLAIN_BOOK,
     PLAIN_VERDICTS,
     MAIN_ROUTE_COLUMN,
     MAIN_ROUTE_ANSWERED,
@@ -829,4 +1063,64 @@ pub const ALL: &[Key] = &[
     GATEWAY_NONE_FOUND,
     HELP_GATEWAY,
     PLAIN_GATEWAY,
+    MODE_SEVERAL,
+    BULK_LABEL,
+    BULK_SUMMARY,
+    BULK_BOUND_LINES,
+    BULK_BOUND_SIZE,
+    BULK_TYPE_UNKNOWN,
+    BULK_WILL_ADD,
+    MOVE_TO_TYPE_ACTION,
+    MOVE_HERE,
+    DENY_INSTEAD,
+    LIFT_DENY,
+    LIST_ADDED,
+    LIST_MOVED,
+    LIST_LEFT,
+    BULK_TEXT,
+    BULK_MORE_ABOVE,
+    BULK_HINT,
+    BULK_TYPE_KEY,
+    BULK_MOVE_KEY,
+    BULK_NOT_ADDED,
+    BULK_CHOOSE,
+    PLAIN_BULK_TEXT,
+    PLAIN_BULK_ROWS,
+    SEVERAL_OPTION,
+    FORM_SWITCH_TYPE,
+    HELP_BULK,
+    PLAIN_BULK,
+    PLAIN_MOVE_TO_TYPE,
+    RECENT,
+    RECENT_HOUR,
+    RECENT_TODAY,
+    RECENT_WEEK,
+    RECENT_YESTERDAY,
+    RECENT_ADDED,
+    RECENT_CHANGED,
+    RECENT_PREVIOUS_ROUTE,
+    RECENT_PREVIOUS_OFF,
+    RECENT_PREVIOUS_ON,
+    RECENT_PREVIOUS_SURE,
+    RECENT_PREVIOUS_UNSURE,
+    RECENT_LOADING,
+    RECENT_FAILED,
+    RECENT_NONE,
+    RECENT_REPLACED,
+    RECENT_REPLACED_MORE,
+    RECENT_DELETED_TITLE,
+    RECENT_DELETED_AT,
+    RECENT_WAS_OFF,
+    RECENT_PRESENT_NOTE,
+    RECENT_RESTORED,
+    RECENT_HISTORY_START,
+    RECENT_TRUNCATED,
+    RECENT_OFF,
+    RECENT_QUESTION,
+    RECENT_PRESENT,
+    RECENT_RESTORE_HINT,
+    RECENT_NOTHING_DELETED,
+    RESTORE_QUESTION,
+    HELP_RECENT,
+    PLAIN_RECENT,
 ];

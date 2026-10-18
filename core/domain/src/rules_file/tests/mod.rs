@@ -61,43 +61,112 @@ example.com
     assert_eq!(shared.rules.len(), 1, "the GUI parser must see it too");
 }
 
-/// `?` (check where it works) is read the same way by both parsers:
-/// on host-name and exact-IP lines only, enabled or not, and a line also carrying
-/// `+block` is no rule for either of them.
+/// `?` (check where it works) and `!` (deny) are read the same way by both
+/// parsers: `?` on host-name and exact-IP lines only, `!` everywhere, enabled
+/// or not; a line carrying both, a detached mark or the retired `+block`
+/// suffix keeps it in the value for validation to refuse.
 #[test]
-fn both_parsers_agree_on_the_verify_prefix() {
+fn both_parsers_agree_on_the_value_marks() {
     let text = "--- Domains
 ?accounts.example.com
 ?*.mail.example
 # ?off.example.com
 plain.example.com
 ? spaced.example.com
-?both.example.com +block
+?!both.example.com
+!?both.example.net
+!ads.example.com
+# !off-ads.example.com
+! spaced-ads.example.com
+retired.example.com +block
+# retired-off.example.com +block
 --- Auto
 ?learned.example.com  # auto:user-confirmed anchor:learned.example.com added:2026-01-01
+--- Zones
+!example
+--- CIDR
+!10.0.0.0/8
 --- IP
 ?192.0.2.10
+!192.0.2.11
 ";
     let outcome = parse_rules_file(text);
-    let mut service: Vec<(String, bool, bool)> = outcome
+    let mut service: Vec<(String, bool, bool, bool)> = outcome
         .parsed
         .sections
         .iter()
         .flat_map(|s| &s.entries)
-        .map(|e| (e.match_value.clone(), e.enabled, e.verify_primary))
+        .map(|e| {
+            (
+                e.match_value.clone(),
+                e.enabled,
+                e.verify_primary,
+                e.blocked,
+            )
+        })
         .collect();
-    let mut gui: Vec<(String, bool, bool)> = nrr_shared::preset_parser::parse_canonical_rules(text)
+    let mut gui: Vec<(String, bool, bool, bool)> =
+        nrr_shared::preset_parser::parse_canonical_rules(text)
+            .rules
+            .into_iter()
+            .map(|r| (r.match_value, r.enabled, r.verify_primary, r.blocked))
+            .collect();
+    service.sort();
+    gui.sort();
+    assert_eq!(service, gui);
+    // Positive controls: each mark was actually read somewhere.
+    let has =
+        |v: &str, enabled, verify, deny| service.contains(&(v.to_string(), enabled, verify, deny));
+    assert!(has("accounts.example.com", true, true, false));
+    assert!(has("192.0.2.10", true, true, false));
+    assert!(has("ads.example.com", true, false, true));
+    assert!(has("off-ads.example.com", false, false, true));
+    assert!(has("192.0.2.11", true, false, true));
+    assert!(has("example", true, false, true));
+    assert!(has("10.0.0.0/8", true, false, true));
+    assert!(has("?!both.example.com", true, false, false));
+    assert!(has("!?both.example.net", true, false, false));
+    assert!(has("! spaced-ads.example.com", true, false, false));
+    assert!(has("retired.example.com +block", true, false, false));
+    assert!(has("retired-off.example.com +block", false, false, false));
+}
+
+/// `+children` comes off by one shared reading, before a `#` line is judged:
+/// `# codex.exe +children` is a disabled rule on both sides, not a note.
+#[test]
+fn both_parsers_read_the_children_flag_the_same() {
+    let app = if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else {
+        "MacOS"
+    };
+    let text = format!(
+        "--- {app}\ncodex.exe +children  # assistant\n# codex.exe +children\n\
+         !tool.exe +children\n# !old.exe +children\n# see notes +children\n\
+         --- Domains\nexample.com +children\n# off.example.com +children\n"
+    );
+    let mut service: Vec<(String, bool, bool)> = parse_rules_file(&text)
+        .parsed
+        .sections
+        .iter()
+        .flat_map(|s| &s.entries)
+        .map(|e| (e.match_value.clone(), e.enabled, e.blocked))
+        .collect();
+    let shared = nrr_shared::preset_parser::parse_canonical_rules(&text);
+    let mut gui: Vec<(String, bool, bool)> = shared
         .rules
-        .into_iter()
-        .map(|r| (r.match_value, r.enabled, r.verify_primary))
+        .iter()
+        .map(|r| (r.match_value.clone(), r.enabled, r.blocked))
         .collect();
     service.sort();
     gui.sort();
     assert_eq!(service, gui);
-    // Positive control: the prefix was actually read somewhere.
-    assert!(service.contains(&("accounts.example.com".to_string(), true, true)));
-    assert!(service.contains(&("192.0.2.10".to_string(), true, true)));
-    assert!(!service.iter().any(|(v, ..)| v.contains("both.example.com")));
+    assert_eq!(gui.len(), 6, "{gui:?}");
+    assert!(gui.contains(&("codex.exe".to_owned(), false, false)));
+    assert!(gui.contains(&("old.exe".to_owned(), false, true)));
+    assert!(shared.rules.iter().all(|r| r.children));
 }
 use super::*;
 
@@ -151,5 +220,6 @@ mod canonical;
 mod conversion;
 mod model;
 mod parsing;
+mod syntax_hint;
 mod verify_primary;
 mod writing;

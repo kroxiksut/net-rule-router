@@ -9,7 +9,8 @@ use super::*;
 /// spaces, and calling it prose loses the rule outright when the GUI rewrites
 /// the file from its parsed model. The exception is a program IMAGE name, not
 /// any file name: `# see readme.txt` or `# note v1.2` reads as a file name too,
-/// and taking it for a rule writes the note back out as a rule line.
+/// and taking it for a rule writes the note back out as a rule line. A path
+/// rule is the other application exception (see `names_a_place`).
 ///
 /// The network forms are the other exception: an enabled line may space out
 /// `10.0.0.5 - 10.0.0.40` or `10.0.0.0 / 8`, and unticking it must not turn
@@ -18,12 +19,21 @@ use super::*;
 /// One predicate for both parsers of this format, so the two cannot disagree
 /// about which lines survive a round-trip.
 pub fn is_disabled_rule_value(rule_type: ParsedRuleType, value: &str) -> bool {
+    // A deny in the retired spelling stays a rule, so validation can say how
+    // it is written now instead of the line vanishing as prose.
+    let head;
+    let value = if carries_retired_block_flag(value) {
+        head = without_retired_block_flag(value);
+        head.as_str()
+    } else {
+        value
+    };
     if looks_like_a_rule_value(value) {
         return true;
     }
     let value = value.trim();
     match rule_type {
-        ParsedRuleType::Application => names_a_program_image(value),
+        ParsedRuleType::Application => names_a_program_image(value) || names_a_place(value),
         ParsedRuleType::Subnet => crate::ip_block::IpBlock::parse(value).is_some(),
         // Both bounds addresses, any family: the validator settles the rest,
         // as it does for the enabled line.
@@ -91,6 +101,18 @@ fn names_a_program_image(value: &str) -> bool {
     })
 }
 
+/// A spaced path rule: one starting at a drive or a share (a note seldom
+/// does), or at `/` and ending as a folder does (`/`, `/*`). Folder names
+/// carry spaces (`Program Files`), and calling such a line prose loses the
+/// rule when the file is written back.
+fn names_a_place(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let drive = matches!(bytes, [letter, b':', b'\\' | b'/', ..] if letter.is_ascii_alphabetic());
+    let share = value.starts_with("\\\\");
+    let unix_folder = value.starts_with('/') && (value.ends_with('/') || value.ends_with("/*"));
+    drive || share || unix_folder
+}
+
 /// Parse one rule line. Returns `None` when the line is blank, a free
 /// comment, or otherwise rejected by the docs/en/rules-file-format.md rules.
 pub(super) fn parse_rule_line(
@@ -137,28 +159,17 @@ pub(super) fn parse_rule_line(
         None => (body, ""),
     };
 
-    let match_value = match_value.trim();
+    // Words rejoined and the flag taken off before the disabled-rule check,
+    // which would read `exe +children` as a file extension and drop the rule.
+    let (match_value, children) = split_children_flag(match_value);
     let comment = comment.trim();
 
-    // Strip the `+block` flag (docs/en/rules-file-format.md Blocking destinations) BEFORE the single-token
-    // check below, so a disabled blocked rule (`# ads.example.com +block`) is
-    // not misread as multi-word free text. Kept in lockstep with the domain
-    // parser in `nrr_domain::rules_file::extract_rule_flags`.
-    let (match_value, blocked) = extract_block_flag(match_value);
     // `?` is read where values are host names or single addresses; elsewhere
     // it stays part of the value for validation to judge. Same reading as
     // `nrr_domain::rules_file`.
     let reads_verify = matches!(rule_type, ParsedRuleType::Domain | ParsedRuleType::ExactIp);
-    let (match_value, verify_primary) = if reads_verify {
-        let (rest, verify) = split_verify_primary(&match_value);
-        if verify {
-            (rest.to_string(), true)
-        } else {
-            (match_value, false)
-        }
-    } else {
-        (match_value, false)
-    };
+    let (match_value, markers) = split_rule_markers(&match_value, reads_verify);
+    let match_value = match_value.to_string();
 
     if match_value.is_empty() {
         return None;
@@ -173,25 +184,19 @@ pub(super) fn parse_rule_line(
         true
     };
 
-    // "Check where it works" and "drop it" contradict each other; the line is
-    // refused rather than one of them guessed.
-    if verify_primary && blocked {
-        return None;
-    }
-
-    // In the app-authored section the leading `auto:` / `anchor:` / `added:`
-    // tokens are provenance, not label text — lift them into typed fields so
-    // the GUI shows the note, not the machinery. A line without the tokens
-    // keeps its comment verbatim and stays an ordinary rule (the domain parser
-    // additionally raises a warning; this one has no warning channel).
-    let (comment, origin) = if is_auto_section(section_name) {
-        match crate::auto_rule::parse_provenance_comment(comment) {
-            Some(provenance) => (provenance.note.unwrap_or_default(), Some(provenance.origin)),
-            None => (comment.to_string(), None),
-        }
-    } else {
-        (comment.to_string(), None)
-    };
+    // In the app-authored section, and on a program line (an app-authored
+    // program rule keeps its section), the leading `auto:` / `anchor:` /
+    // `added:` tokens are provenance, not label text. A line without them
+    // keeps its comment verbatim and stays an ordinary rule.
+    let (comment, origin) =
+        if is_auto_section(section_name) || rule_type == ParsedRuleType::Application {
+            match crate::auto_rule::parse_provenance_comment(comment) {
+                Some(provenance) => (provenance.note.unwrap_or_default(), Some(provenance.origin)),
+                None => (comment.to_string(), None),
+            }
+        } else {
+            (comment.to_string(), None)
+        };
 
     Some(ParsedRule {
         id_hint,
@@ -200,36 +205,156 @@ pub(super) fn parse_rule_line(
         section_name: section_name.to_string(),
         match_value,
         comment,
-        blocked,
-        verify_primary,
+        blocked: markers.deny,
+        verify_primary: markers.verify,
+        children,
         origin,
         line_number,
     })
 }
 
-/// Per-rule `+block` flag token (docs/en/rules-file-format.md Blocking destinations). Placed after the match
-/// value and before any inline `#`; mirrors the `+children` convention.
-pub(super) const BLOCK_FLAG: &str = "+block";
+/// Per-rule child-process flag (docs/en/rules-file-format.md Child process
+/// tracking): a word after the value, before any inline `#`. Both parsers take
+/// it off in every section through [`split_children_flag`]; nothing acts on it
+/// yet, the matcher has no process tree to follow.
+pub const CHILDREN_FLAG: &str = "+children";
 
-/// Splits a match value into its head (the actual match value) and the parsed
-/// `+block` flag. The first whitespace-separated token is always the match
-/// value; a subsequent `+block` token is consumed and reported as
-/// `blocked = true`. Non-flag trailing tokens are preserved so the caller can
-/// still diagnose accidental whitespace. Mirrors
-/// `nrr_domain::rules_file::extract_rule_flags` exactly (strict-vs-lenient
-/// lockstep: both parsers must agree, or the GUI would block while the service
-/// routes).
-pub(super) fn extract_block_flag(value: &str) -> (String, bool) {
-    let mut blocked = false;
-    let mut kept: Vec<&str> = Vec::new();
+/// `value` with its words rejoined by one space and every [`CHILDREN_FLAG`]
+/// after the first word taken off, and whether there was one. Any other later
+/// word, the retired `+block` among them, stays for validation to judge.
+#[must_use]
+pub fn split_children_flag(value: &str) -> (String, bool) {
+    let mut out = String::with_capacity(value.len());
+    let mut children = false;
     for (idx, token) in value.split_whitespace().enumerate() {
-        if idx > 0 && token == BLOCK_FLAG {
-            blocked = true;
-        } else {
-            kept.push(token);
+        if idx > 0 && token == CHILDREN_FLAG {
+            children = true;
+            continue;
         }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(token);
     }
-    (kept.join(" "), blocked)
+    (out, children)
+}
+
+/// The value a rules table keeps for a parsed rule: `value`, with ` +children`
+/// after a program's name when its line carried the flag, so a file written
+/// back from the table keeps it. Elsewhere the flag means nothing and is gone,
+/// as the service reads it.
+#[must_use]
+pub fn stored_rule_value(rule_type: ParsedRuleType, value: &str, children: bool) -> String {
+    if children && rule_type == ParsedRuleType::Application {
+        format!("{value} {CHILDREN_FLAG}")
+    } else {
+        value.to_owned()
+    }
+}
+
+/// A table's value without the flag [`stored_rule_value`] keeps on it: what
+/// the service matches, as the file reader hands it over.
+#[must_use]
+pub fn without_children_flag(value: &str) -> std::borrow::Cow<'_, str> {
+    let (bare, children) = split_children_flag(value);
+    if children {
+        std::borrow::Cow::Owned(bare)
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
+}
+
+/// Starts every line of the syntax hint a writer puts at the top of a file.
+/// Never localized. Both parsers skip such a line wherever it stands, so an
+/// example in the hint is never a rule and the next write never doubles it.
+/// After `#` comes `:`, which no rule value starts with.
+pub const SYNTAX_HINT_PREFIX: &str = "#:";
+
+/// Whether `line` belongs to the syntax hint ([`SYNTAX_HINT_PREFIX`]).
+#[must_use]
+pub fn is_syntax_hint_line(line: &str) -> bool {
+    line.trim_start().starts_with(SYNTAX_HINT_PREFIX)
+}
+
+/// Prefix that denies a rule's traffic (docs/en/rules-file-format.md Blocking
+/// destinations), in any section of either file. It sits right before the
+/// value, after a `# ` disable prefix: `# !example.com`.
+pub const DENY_PREFIX: char = '!';
+
+/// Splits the `!` prefix off a value: `!example.com` reads as
+/// `("example.com", true)`. A bare `!` or `! example.com` is not the prefix and
+/// stays in the value, for validation to refuse.
+#[must_use]
+pub fn split_deny(value: &str) -> (&str, bool) {
+    match value.strip_prefix(DENY_PREFIX) {
+        Some(rest) if rest.starts_with(|c: char| !c.is_whitespace()) => (rest, true),
+        _ => (value, false),
+    }
+}
+
+/// The marks read before a rule value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuleMarkers {
+    /// `!`: the matching traffic is dropped.
+    pub deny: bool,
+    /// `?`: check where it works.
+    pub verify: bool,
+    /// Both were written (`!?x`, `?!x`). A check never applies to a deny, so
+    /// neither is taken and the value keeps both for validation to refuse.
+    pub contradictory: bool,
+}
+
+/// The `!` and `?` marks of `value`, read the one way both parsers share;
+/// `reads_verify` is set where `?` means "check where it works".
+#[must_use]
+pub fn split_rule_markers(value: &str, reads_verify: bool) -> (&str, RuleMarkers) {
+    let (rest, deny) = split_deny(value);
+    let (rest, verify) = if reads_verify {
+        split_verify_primary(rest)
+    } else {
+        (rest, false)
+    };
+    if verify && (deny || rest.starts_with(DENY_PREFIX)) {
+        let markers = RuleMarkers {
+            contradictory: true,
+            ..RuleMarkers::default()
+        };
+        return (value, markers);
+    }
+    let markers = RuleMarkers {
+        deny,
+        verify,
+        contradictory: false,
+    };
+    (rest, markers)
+}
+
+/// The suffix a deny was written with before the `!` prefix. It is never read
+/// as a deny, nor dropped: an unknown token silently skipped would turn the
+/// deny into a route, so it stays in the value and validation refuses the line
+/// with a hint at the new spelling.
+pub const RETIRED_BLOCK_FLAG: &str = "+block";
+
+/// Whether `value` carries [`RETIRED_BLOCK_FLAG`] after its first word.
+#[must_use]
+pub fn carries_retired_block_flag(value: &str) -> bool {
+    value
+        .split_whitespace()
+        .skip(1)
+        .any(|token| token == RETIRED_BLOCK_FLAG)
+}
+
+/// `value` without its [`RETIRED_BLOCK_FLAG`] tokens, words rejoined by one
+/// space.
+#[must_use]
+pub fn without_retired_block_flag(value: &str) -> String {
+    value
+        .split_whitespace()
+        .enumerate()
+        .filter(|(idx, token)| *idx == 0 || *token != RETIRED_BLOCK_FLAG)
+        .map(|(_, token)| token)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Prefix that marks a domain or exact-IP rule "check where it works"

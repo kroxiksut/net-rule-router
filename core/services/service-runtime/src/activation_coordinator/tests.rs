@@ -1691,6 +1691,34 @@ fn an_activation_waits_for_the_one_in_flight_and_is_refused_past_the_wait() {
     assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
 }
 
+/// A reset to the baseline is a rules write like an activation: it waits for
+/// the one in flight rather than deleting under it.
+#[test]
+fn a_reset_to_baseline_waits_for_the_activation_in_flight() {
+    let mut fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    fx.coordinator.activation_wait = std::time::Duration::from_millis(20);
+
+    let held = fx
+        .coordinator
+        .activation_gate
+        .enter(std::time::Duration::ZERO)
+        .expect("free");
+    assert_eq!(
+        fx.coordinator
+            .reset_principal_to_baseline("S-1-5-21-A", "c")
+            .unwrap_err(),
+        PolicyError::ActivationBusy
+    );
+
+    drop(held);
+    assert_eq!(
+        fx.coordinator
+            .reset_principal_to_baseline("S-1-5-21-A", "c")
+            .expect("resets"),
+        0
+    );
+}
+
 /// Records what a reader on its own connection to the state database sees of
 /// the revision being applied, at the moment each dispatch runs.
 struct OverlayProbe {

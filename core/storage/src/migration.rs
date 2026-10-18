@@ -1,5 +1,4 @@
-//! Migration catalogues of the three service databases and the connection
-//! factory.
+//! Migration catalogues of the service databases and the connection factory.
 //!
 //! # Connection lifecycle
 //!
@@ -29,6 +28,7 @@ use crate::backup::{backup_database, BackupReason};
 use crate::dto::{MigrationSummary, SchemaVerification};
 use crate::error::{StorageError, StorageResult};
 use crate::repository::MigrationRunner;
+use crate::schema::CONN_HISTORY_DB_V1_DDL;
 use crate::schema::{
     CACHE_DB_V1_DDL, CACHE_DB_V2_DDL, CACHE_DB_V3_DDL, CACHE_DB_V4_DDL, STATE_DB_V10_DDL,
     STATE_DB_V11_DDL, STATE_DB_V12_DDL, STATE_DB_V13_DDL, STATE_DB_V14_DDL, STATE_DB_V15_DDL,
@@ -44,8 +44,9 @@ use crate::schema::{
     STATE_DB_V57_DDL, STATE_DB_V58_DDL, STATE_DB_V59_DDL, STATE_DB_V5_DDL, STATE_DB_V60_DDL,
     STATE_DB_V61_DDL, STATE_DB_V62_DDL, STATE_DB_V63_DDL, STATE_DB_V64_DDL, STATE_DB_V65_DDL,
     STATE_DB_V66_DDL, STATE_DB_V67_DDL, STATE_DB_V68_DDL, STATE_DB_V69_DDL, STATE_DB_V6_DDL,
-    STATE_DB_V70_DDL, STATE_DB_V71_DDL, STATE_DB_V72_DDL, STATE_DB_V73_DDL, STATE_DB_V7_DDL,
-    STATE_DB_V8_DDL, STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL, TRAFFIC_DB_V2_DDL,
+    STATE_DB_V70_DDL, STATE_DB_V71_DDL, STATE_DB_V72_DDL, STATE_DB_V73_DDL, STATE_DB_V74_DDL,
+    STATE_DB_V75_DDL, STATE_DB_V76_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL, STATE_DB_V9_DDL,
+    TRAFFIC_DB_V1_DDL, TRAFFIC_DB_V2_DDL,
 };
 
 /// One versioned step; the catalogues below append, never edit.
@@ -645,7 +646,30 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         name: "add_forwarded_outage",
         stmts: STATE_DB_V73_DDL,
     },
+    MigrationDef {
+        version: 74,
+        name: "add_install_policy",
+        stmts: STATE_DB_V74_DDL,
+    },
+    MigrationDef {
+        version: 75,
+        name: "app_destinations_by_principal",
+        stmts: STATE_DB_V75_DDL,
+    },
+    MigrationDef {
+        version: 76,
+        name: "add_conn_history_prefs",
+        stmts: STATE_DB_V76_DDL,
+    },
 ];
+
+// nrr_conn_history.db. Rebuildable and versioned on its own, like the traffic
+// DB: a damaged file costs history, never state.
+pub(crate) const CONN_HISTORY_MIGRATIONS: &[MigrationDef] = &[MigrationDef {
+    version: 1,
+    name: "initial_conn_history_schema",
+    stmts: CONN_HISTORY_DB_V1_DDL,
+}];
 
 // ── Required schema elements — used by verify_schema ─────────────────────────
 
@@ -691,6 +715,11 @@ const TRAFFIC_REQUIRED_TABLES: &[&str] = &[
 // query the traffic store runs, so there are no secondary indexes to verify.
 const TRAFFIC_REQUIRED_INDEXES: &[&str] = &[];
 
+const CONN_HISTORY_REQUIRED_TABLES: &[&str] =
+    &["schema_migrations", "conn_history", "conn_history_removed"];
+
+const CONN_HISTORY_REQUIRED_INDEXES: &[&str] = &["idx_conn_history_hour"];
+
 const STATE_REQUIRED_TABLES: &[&str] = &[
     "schema_migrations",
     "route_bindings",
@@ -734,6 +763,10 @@ const STATE_REQUIRED_TABLES: &[&str] = &[
     "refusing_anchors",
     // State DB v57 — notices raised with nobody listening.
     "block_notice_journal",
+    // State DB v74 — the administrator's install-time choices.
+    "install_policy",
+    // State DB v76 — each user's connection-history choices.
+    "conn_history_prefs",
 ];
 
 const STATE_REQUIRED_INDEXES: &[&str] = &[
@@ -899,6 +932,53 @@ pub fn open_traffic_connection_or_rebuild(path: &Path) -> StorageResult<TrafficD
     })
 }
 
+// ── Rebuildable connection-history DB ────────────────────────────────────────
+
+fn open_conn_history_connection_once(path: &Path) -> StorageResult<Connection> {
+    let conn = open_connection(path)?;
+    // A history the user clears must not linger in freed pages, and a lost
+    // last commit costs a minute of history, so full fsync buys nothing.
+    let _: rusqlite::Result<()> =
+        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA secure_delete = ON;");
+    let runner = SqliteMigrationRunner::for_conn_history_db(conn);
+    runner.run_pending_migrations()?;
+    Ok(runner.into_connection())
+}
+
+/// Opens `nrr_conn_history.db`, deleting and recreating it once when the
+/// first attempt fails; [`TrafficDbOpen::rebuilt_reason`] says why. A file
+/// from a newer build is refused, not erased, as for the traffic ledger.
+pub fn open_conn_history_connection_or_rebuild(path: &Path) -> StorageResult<TrafficDbOpen> {
+    let first_error = match open_conn_history_connection_once(path) {
+        Ok(connection) => {
+            return Ok(TrafficDbOpen {
+                connection,
+                rebuilt_reason: None,
+            });
+        }
+        Err(e @ StorageError::UnsupportedSchemaVersion { .. }) => return Err(e),
+        Err(e) => e,
+    };
+    rebuild_conn_history_db(path, &first_error.to_string())
+}
+
+/// Deletes `nrr_conn_history.db` with its sidecars and creates it empty. For a
+/// file found damaged while in use; the caller must have dropped its own
+/// connection first, or the delete fails on Windows.
+pub fn rebuild_conn_history_db(path: &Path, reason: &str) -> StorageResult<TrafficDbOpen> {
+    remove_database_files(path).map_err(|io| {
+        StorageError::StorageUnavailable(format!(
+            "delete for rebuild of {} failed: {io} (original failure: {reason})",
+            path.display()
+        ))
+    })?;
+    let connection = open_conn_history_connection_once(path)?;
+    Ok(TrafficDbOpen {
+        connection,
+        rebuilt_reason: Some(reason.to_string()),
+    })
+}
+
 // ── SqliteMigrationRunner ─────────────────────────────────────────────────────
 
 /// Idempotent migration runner for a single SQLite database.
@@ -947,6 +1027,17 @@ impl SqliteMigrationRunner {
             migrations: TRAFFIC_MIGRATIONS,
             required_tables: TRAFFIC_REQUIRED_TABLES,
             required_indexes: TRAFFIC_REQUIRED_INDEXES,
+            snapshot_first: false,
+        }
+    }
+
+    /// Migration runner for the connection-history DB (`nrr_conn_history.db`).
+    pub fn for_conn_history_db(conn: Connection) -> Self {
+        Self {
+            conn: RefCell::new(conn),
+            migrations: CONN_HISTORY_MIGRATIONS,
+            required_tables: CONN_HISTORY_REQUIRED_TABLES,
+            required_indexes: CONN_HISTORY_REQUIRED_INDEXES,
             snapshot_first: false,
         }
     }

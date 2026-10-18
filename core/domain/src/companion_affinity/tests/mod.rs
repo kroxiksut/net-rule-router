@@ -26,4 +26,5 @@ mod bounds_and_order;
 mod delivery_names;
 mod lifecycle;
 mod proposal;
+mod review_bar;
 mod windows_and_suffixes;

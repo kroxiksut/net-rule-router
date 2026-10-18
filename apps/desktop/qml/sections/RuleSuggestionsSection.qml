@@ -356,10 +356,10 @@ ColumnLayout {
         })
     }
 
-    function _acceptIds(ids) {
+    function _acceptIds(ids, asAnyZone) {
         if (!ids || ids.length === 0) return
         section._rememberScrollPosition()
-        root.autoRuleSuggestionsController.acceptAutoRuleCandidates(ids)
+        root.autoRuleSuggestionsController.acceptAutoRuleCandidates(ids, asAnyZone === true)
     }
     function _dismissIds(ids) {
         if (!ids || ids.length === 0) return
@@ -402,6 +402,27 @@ ColumnLayout {
         }
         return parts.join(" · ")
     }
+    /// The mark an offer carries when it rests on less than the service would
+    /// add on its own, with the basis it does rest on. Such an offer is only
+    /// ever asked: it is never added automatically.
+    function _lessCertainText(host) {
+        var slug = String((host || {}).lessCertain || "")
+        if (slug === "") return ""
+        var mark = root.tr("rules.suggestions.inbox.less-certain", "less certain")
+        var basis = root.tr("rules.suggestions.less-certain." + slug, "")
+            .replace("{site}", Pure.displayText(host.anchor || ""))
+        return basis !== "" ? mark + ": " + basis : mark
+    }
+    /// The same mark on the domain row, which stays visible while the hosts
+    /// are collapsed: the first pending host that carries one speaks for it.
+    function _groupLessCertainText(group) {
+        var hosts = (group && group.hosts) || []
+        for (var i = 0; i < hosts.length; i += 1) {
+            if (hosts[i].status === "pending" && String(hosts[i].lessCertain || "") !== "")
+                return section._lessCertainText(hosts[i])
+        }
+        return ""
+    }
     /// How far the rule reaches versus how far the evidence goes.
     ///
     /// Every offer is written as `*.x`, so accepting one routes names nobody
@@ -412,14 +433,14 @@ ColumnLayout {
         var scope = host.isApp === true
             ? root.tr("rules.suggestions.inbox.reach-app",
                 "The rule sends every connection of {app} through the additional route.")
-                .replace("{app}", String(host.domain || host.match || ""))
+                .replace("{app}", Pure.displayText(host.domain || host.match || ""))
             : root.tr("rules.suggestions.inbox.reach",
                 "The rule covers every name under {domain}.")
-                .replace("{domain}", String(host.match || ""))
+                .replace("{domain}", Pure.displayText(host.match))
         var members = host.observedMembers || []
         if (members.length === 0) return scope
         var shownCount = Math.min(members.length, section.membersShownInReach)
-        var shown = members.slice(0, shownCount).join(", ")
+        var shown = Pure.displayTextList(members.slice(0, shownCount)).join(", ")
         if (members.length > shownCount) {
             shown += " " + root.tr("rules.suggestions.inbox.reach-more", "+{count} more")
                 .replace("{count}", String(members.length - shownCount))
@@ -699,7 +720,7 @@ ColumnLayout {
                 elide: Text.ElideRight
                 color: root.textColor
                 text: root.tr("rules.suggestions.inbox.filter-active", "Showing only what {name} needs")
-                    .replace("{name}", section.consumerFilter)
+                    .replace("{name}", Pure.displayText(section.consumerFilter))
             }
             CheckBox {
                 visible: section.consumerFilter !== ""
@@ -851,10 +872,11 @@ ColumnLayout {
                                     wrapMode: Text.Wrap
                                     font.bold: true
                                     color: root.textColor
+                                    textFormat: Text.PlainText
                                     text: modelData.isApp === true
                                         ? root.tr("rules.suggestions.inbox.app-group", "Application {name}")
-                                            .replace("{name}", modelData.domain)
-                                        : modelData.domain
+                                            .replace("{name}", Pure.displayText(modelData.domain))
+                                        : Pure.displayText(modelData.domain)
                                 }
                                 Label {
                                     Layout.fillWidth: true
@@ -870,6 +892,17 @@ ColumnLayout {
                                             ? " · " + root.tr("rules.suggestions.table.status-dismissed", "Dismissed")
                                                 + " (" + modelData.dismissedIds.length + ")"
                                             : "")
+                                }
+                                Label {
+                                    Layout.fillWidth: true
+                                    wrapMode: Text.Wrap
+                                    font.pixelSize: 12
+                                    color: root.textColor
+                                    textFormat: Text.PlainText
+                                    text: section._groupLessCertainText(modelData)
+                                    visible: text !== ""
+                                    Accessible.role: Accessible.StaticText
+                                    Accessible.name: text
                                 }
 
                                 // Who needs it. Each site is a button: pressing
@@ -895,7 +928,7 @@ ColumnLayout {
                                                 id: consumerButton
                                                 theme: root.uiTheme
                                                 font.pixelSize: 12
-                                                text: String(modelData.hostname || "")
+                                                text: Pure.displayText(modelData.hostname)
                                                     + (section._isPrimaryConsumer(modelData)
                                                         ? " · " + root.tr(
                                                             "rules.suggestions.inbox.consumer-on-primary",
@@ -960,6 +993,26 @@ ColumnLayout {
                                     Accessible.name: text
                                     onClicked: section._acceptIds(modelData.pendingIds)
                                 }
+                                // The same site in another zone: one `site.*` rule
+                                // covers this zone and every other.
+                                ThemedButton {
+                                    id: anyZoneButton
+                                    readonly property string site: Pure.autoRuleGroupAnyZoneSite(modelData)
+                                    theme: root.uiTheme
+                                    visible: modelData.pendingIds.length > 0 && site !== ""
+                                    text: root.uiRevision >= 0
+                                        ? root.tr("rules.suggestions.inbox.add-any-zone", "Add {site}.*")
+                                            .replace("{site}", site)
+                                        : ""
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: root.tr("rules.suggestions.inbox.any-zone",
+                                        "The same site in another zone: it can be added as {site}.* instead, every zone at once.")
+                                        .replace("{site}", site)
+                                    Accessible.role: Accessible.Button
+                                    Accessible.name: text
+                                    Accessible.description: ToolTip.text
+                                    onClicked: section._acceptIds(modelData.pendingIds, true)
+                                }
                                 ThemedButton {
                                     theme: root.uiTheme
                                     visible: modelData.pendingIds.length > 0
@@ -1012,8 +1065,9 @@ ColumnLayout {
                                             Layout.fillWidth: true
                                             wrapMode: Text.Wrap
                                             color: root.textColor
-                                            text: modelData.matchKind === "suffix"
-                                                ? "*." + modelData.match : modelData.match
+                                            textFormat: Text.PlainText
+                                            text: Pure.displayText(modelData.matchKind === "suffix"
+                                                ? "*." + modelData.match : modelData.match)
                                         }
                                         Label {
                                             color: root.mutedTextColor
@@ -1042,6 +1096,15 @@ ColumnLayout {
                                         font.pixelSize: 12
                                         color: root.mutedTextColor
                                         text: section._ownershipText(modelData)
+                                        visible: text !== ""
+                                    }
+                                    Label {
+                                        Layout.fillWidth: true
+                                        wrapMode: Text.Wrap
+                                        font.pixelSize: 12
+                                        color: root.textColor
+                                        textFormat: Text.PlainText
+                                        text: section._lessCertainText(modelData)
                                         visible: text !== ""
                                     }
                                     Label {

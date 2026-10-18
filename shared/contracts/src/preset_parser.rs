@@ -23,14 +23,20 @@
 //!   round-trip semantics in the QML parser).
 //! * Multi-word `# free text` is a documentation comment — skipped
 //!   and not round-tripped through `rules`.
-//! * A `+block` flag token after the match value (before any inline `#`)
-//!   marks the rule as a hard block: matching traffic is dropped and the
-//!   containing file (primary/secondary) is irrelevant for enforcement.
-//!   See docs/en/rules-file-format.md Blocking destinations. Mirrors the documented `+children` convention.
+//! * A `!` right before the match value (after a `# ` disable prefix) marks
+//!   the rule as a hard block: matching traffic is dropped and the containing
+//!   file (primary/secondary) is irrelevant for enforcement. See
+//!   docs/en/rules-file-format.md Blocking destinations. The retired `+block`
+//!   suffix is left in the value for validation to refuse.
+//! * `+children` after the value moves into [`ParsedRule::children`] before a
+//!   `#` line is judged rule or prose ([`split_children_flag`], shared with
+//!   the service's reader).
 //! * The first unescaped `#` past the value content starts an inline
 //!   comment that becomes the rule's `comment` field.
 //! * Lines preceding any `--- ` header are file-level prelude and are
 //!   silently dropped (header preservation is out of scope for v1).
+//! * A line starting with `#:` is the writer's syntax hint and is skipped
+//!   wherever it stands ([`SYNTAX_HINT_PREFIX`]).
 //!
 //! ## Output shape
 //!

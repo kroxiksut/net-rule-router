@@ -164,6 +164,36 @@ pub fn default_block_exemptions_v6(
         .collect()
 }
 
+/// The v6 permits for somebody else's tunnels — the twin of the v4
+/// `foreign_tunnel_egress`. `packet` adds the packet-layer half, which only a
+/// blanket cut has a block at.
+#[must_use]
+pub fn foreign_tunnel_egress_v6(
+    sid: &str,
+    luids: &[u64],
+    own: u64,
+    packet: bool,
+) -> Vec<WfpFilterSpec> {
+    let layers: &[WfpLayerKey] = if packet {
+        &[
+            WfpLayerKey::AleAuthConnectV6,
+            WfpLayerKey::OutboundIpPacketV6,
+        ]
+    } else {
+        &[WfpLayerKey::AleAuthConnectV6]
+    };
+    luids
+        .iter()
+        .copied()
+        .filter(|luid| *luid != 0 && *luid != own)
+        .flat_map(|luid| {
+            layers
+                .iter()
+                .map(move |layer| egress_permit_v6(sid, *layer, luid))
+        })
+        .collect()
+}
+
 /// Permit for traffic egressing the tunnel, on a v6 layer.
 fn egress_permit_v6(sid: &str, layer: WfpLayerKey, secondary_luid: u64) -> WfpFilterSpec {
     let is_packet = matches!(layer, WfpLayerKey::OutboundIpPacketV6);

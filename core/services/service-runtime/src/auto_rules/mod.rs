@@ -51,12 +51,13 @@ use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleBook};
 use nrr_domain::companion_affinity::{
     registrable_domain, CandidateExclusions, CoActivityKind, CompanionAffinityConfig,
     CompanionAffinityLedger, CompanionEvidenceSnapshot, CompanionProposal, CompanionSignal,
-    PrimaryBehavior, PrimaryHealthEvent,
+    LessCertainBasis, PrimaryBehavior, PrimaryHealthEvent, ProposalUse,
 };
 use nrr_shared::ipc_payloads::is_self_signed_signal;
 use nrr_shared::ipc_payloads::{
     AutoRuleCandidateDto, AutoRuleConsumerDto, AutoRuleDismissedEntryDto, StatusUpdateEvent,
-    AUTO_RULE_MATCH_KIND_EXACT, AUTO_RULE_MATCH_KIND_SUFFIX, AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
+    AUTO_RULE_LESS_CERTAIN_BRAND_SEEN_ONCE, AUTO_RULE_MATCH_KIND_EXACT,
+    AUTO_RULE_MATCH_KIND_SUFFIX, AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
     AUTO_RULE_PRIMARY_BEHAVIOR_STALLS, AUTO_RULE_SIGNAL_BRAND_RELATED,
     AUTO_RULE_SIGNAL_CO_ACTIVITY, AUTO_RULE_SIGNAL_DELIVERY_NAME,
     AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED, AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER,
@@ -641,10 +642,41 @@ fn to_candidate(proposal: &CompanionProposal, id: String) -> PendingCandidate {
             served_by_main_link: false,
             third_party: None,
             secondary_reach: None,
+            any_zone_site: nrr_domain::companion_affinity::site_shared_across_zones(
+                &proposal.anchor_hostname,
+                proposal.proposed.value(),
+            )
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default(),
+            less_certain: proposal
+                .less_certain
+                .map_or("", less_certain_slug)
+                .to_string(),
         },
         route: proposal.route,
         match_kind: AuthoredMatchKind::SuffixDomain,
     }
+}
+
+/// The evidence bar for a principal's mode: `auto` writes without asking, so
+/// it gets the unattended bar; anything a person answers may show less.
+fn proposal_use(mode: AutoRulesMode) -> ProposalUse {
+    match mode {
+        AutoRulesMode::Auto => ProposalUse::AuthoredUnasked,
+        AutoRulesMode::Suggest | AutoRulesMode::Off => ProposalUse::OfferedForReview,
+    }
+}
+
+/// Wire slug for why an offer is less certain.
+fn less_certain_slug(basis: LessCertainBasis) -> &'static str {
+    match basis {
+        LessCertainBasis::BrandSeenOnce => AUTO_RULE_LESS_CERTAIN_BRAND_SEEN_ONCE,
+    }
+}
+
+/// An offer only a person may take: never written unasked, whatever the mode.
+fn is_less_certain(dto: &AutoRuleCandidateDto) -> bool {
+    !dto.less_certain.is_empty()
 }
 
 /// Orders one candidate's consumers: `winner` (the anchor that signs the
@@ -813,12 +845,21 @@ fn primary_behavior_slug(behavior: PrimaryBehavior) -> &'static str {
 /// has a window open next to everything the user browses and ties on affinity
 /// with the site that genuinely pulled the host. Naming the wrong site is not
 /// cosmetic — the user judges the offer by the site it claims to belong to.
+///
+/// Full evidence from any site comes first of all: an address one site
+/// supports fully must not be shown, or kept from `auto`, as less certain
+/// because another site saw it once.
 fn explains_better(
     pulled: f64,
     candidate: &AutoRuleCandidateDto,
     held_pulled: f64,
     held: &AutoRuleCandidateDto,
 ) -> bool {
+    match (is_less_certain(candidate), is_less_certain(held)) {
+        (false, true) => return true,
+        (true, false) => return false,
+        _ => {}
+    }
     match pulled.partial_cmp(&held_pulled) {
         Some(std::cmp::Ordering::Greater) => true,
         Some(std::cmp::Ordering::Less) => false,
@@ -874,10 +915,11 @@ fn candidate_id(sid: &str, match_kind: &str, value: &str) -> String {
 /// (merging fresh evidence in) and startup hydration (a durable set that
 /// might have grown past a since-lowered cap while the service was down).
 fn sort_and_cap(entry: &mut Vec<PendingCandidate>, sid: &str) {
+    // Less certain offers last, so the cap drops them before any certain one.
     entry.sort_by(|a, b| {
-        b.dto
-            .affinity
-            .total_cmp(&a.dto.affinity)
+        is_less_certain(&a.dto)
+            .cmp(&is_less_certain(&b.dto))
+            .then_with(|| b.dto.affinity.total_cmp(&a.dto.affinity))
             .then_with(|| {
                 b.dto
                     .observations

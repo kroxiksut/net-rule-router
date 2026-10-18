@@ -34,7 +34,7 @@ use nrr_service_runtime::{
     HealthReporter, IpcAuditEmitter, IpcClientProfile, IpcErrorCode, IpcHandlerDeps,
     IpcHandlerRegistry, IpcOperationClass, IpcOperationName, IpcRequestContext, IpcRequestEnvelope,
     IpcRouter, MutationExecutor, MutationOutcome, MutationTokenStore, NoopIpcAuditEmitter,
-    OperationError, OperationStatusStore, PolicyManager, RulesSnapshotProvider,
+    OperationError, OperationStatusStore, PolicyManager, PrecheckCoverage, RulesSnapshotProvider,
     ServiceHealthSeverity, ServicePolicyState, ServiceRuntimeState, StoredMutation,
     IPC_PROTOCOL_VERSION,
 };
@@ -134,7 +134,7 @@ impl MutationExecutor for FakeExecutor {
             rule_count: 1,
         }))
     }
-    fn safe_disable(&self, reason: &str) -> MutationOutcome {
+    fn safe_disable(&self, _principal: &str, reason: &str) -> MutationOutcome {
         MutationOutcome::Completed(serde_json::json!({
             "safe-disabled": true,
             "reason": reason,
@@ -177,8 +177,8 @@ impl MutationExecutor for RollbackRecorder {
     ) -> Result<Option<RollbackTargetDto>, OperationError> {
         FakeExecutor.rollback_target(principal, target)
     }
-    fn safe_disable(&self, reason: &str) -> MutationOutcome {
-        FakeExecutor.safe_disable(reason)
+    fn safe_disable(&self, principal: &str, reason: &str) -> MutationOutcome {
+        FakeExecutor.safe_disable(principal, reason)
     }
 }
 
@@ -227,7 +227,7 @@ impl MutationExecutor for FailingExecutor {
     ) -> Result<Option<RollbackTargetDto>, OperationError> {
         FakeExecutor.rollback_target(principal, target)
     }
-    fn safe_disable(&self, _reason: &str) -> MutationOutcome {
+    fn safe_disable(&self, _principal: &str, _reason: &str) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
             args: Default::default(),
             code: "safe-disable.rejected.test".into(),
@@ -406,6 +406,7 @@ fn deps_full(
                 active_revision_id: None,
                 unrecognized: 0,
                 main_route_pending: 0,
+                base_revision: None,
             },
         }),
         Arc::new(FakeDiagnostics::healthy()),
@@ -784,15 +785,11 @@ fn unprivileged_gui_ctx() -> IpcRequestContext {
 fn production_handlers_register_every_operation_in_catalog() {
     let router = make_router(deps_default());
 
-    /// `IpcOperationName::ALL` is 35 operations. `REAL` lists the 30 that
-    /// return `ok` under the `deps_default()` bundle. The remaining 5 are
-    /// dependency-gated handlers that fall back to `UnimplementedHandler`
-    /// (RecoveryRequired) when their provider/writer/archive dir is not wired
-    /// — `DiagnosticsExportArchive` and `ServiceStabilityConfig` Get/Set among
-    /// them; their fully-wired path is exercised by `cross_cutting_4b4.rs`.
-    /// `ExplainGet` stays in `REAL` (depends only on `deps.diagnostics`, always
-    /// wired). `LogsClear` is real too (DiagnosticsFacade::clear_logs).
-    const REAL: [IpcOperationName; 33] = [
+    /// `REAL` lists the operations that return `ok` under `deps_default()`.
+    /// Every other one is dependency-gated and falls back to
+    /// `UnimplementedHandler` (RecoveryRequired) when its provider is not
+    /// wired; the fully-wired paths are exercised by `cross_cutting_4b4.rs`.
+    const REAL: [IpcOperationName; 34] = [
         // Always registered: with no inspector wired it reports the
         // attribution-only assets, which is a valid answer, not a degraded one.
         IpcOperationName::ThirdPartyComponentsList,
@@ -816,6 +813,8 @@ fn production_handlers_register_every_operation_in_catalog() {
         IpcOperationName::AuditList,
         IpcOperationName::SecurityAlertsList,
         IpcOperationName::RulesList,
+        // Reads the caller's own revisions through `deps.rules`, always wired.
+        IpcOperationName::RulesRecentChangesList,
         IpcOperationName::RoutePolicyUpdate,
         IpcOperationName::MigrationStatusGet,
         IpcOperationName::MigrationMarkComplete,
@@ -1891,4 +1890,119 @@ fn snapshot_initial_bundles_health_adapters_and_diagnostics() {
     assert!(parsed.diagnostics.overall_healthy);
     assert_eq!(parsed.active_alerts_count, 0);
     assert_eq!(parsed.active_revision_id.as_deref(), Some("rev-init"));
+}
+
+// ── Validated before audited ─────────────────────────────────────────────────
+
+/// Mutating operations still on the old path: audited first, validated by the
+/// handler afterwards. It only shrinks; an operation leaves it by being split
+/// into precheck and execute.
+const KNOWN_GAPS: &[IpcOperationName] = &[];
+
+/// Whether any request to `op` is of a mutating class. A dry run is the only
+/// payload that makes a mutating operation a read, so asking without one
+/// covers every operation that can ever change state.
+fn can_mutate(op: IpcOperationName) -> bool {
+    [
+        serde_json::json!({}),
+        serde_json::json!({ "dry-run": false }),
+    ]
+    .iter()
+    .any(|payload| canonical_operation_class(op, payload).is_mutating())
+}
+
+/// Every operation that can change state has its payload checked before the
+/// router writes an audit record for it, except those still listed in
+/// [`KNOWN_GAPS`] — and a listed one that has been converted must leave it.
+#[test]
+fn every_mutating_operation_is_checked_before_it_is_audited() {
+    let mut registry = IpcHandlerRegistry::default();
+    register_production_handlers(&mut registry, deps_default());
+    for gap in KNOWN_GAPS {
+        assert!(can_mutate(*gap), "{} never mutates", gap.slug());
+    }
+    for op in IpcOperationName::ALL {
+        if !can_mutate(op) {
+            continue;
+        }
+        let expected = if KNOWN_GAPS.contains(&op) {
+            PrecheckCoverage::Transitional
+        } else {
+            PrecheckCoverage::Prechecked
+        };
+        assert_eq!(registry.coverage(op), Some(expected), "{}", op.slug());
+    }
+}
+
+#[derive(Default)]
+struct CountingAudit(std::sync::atomic::AtomicUsize);
+
+impl CountingAudit {
+    fn records(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl IpcAuditEmitter for CountingAudit {
+    fn record_request(
+        &self,
+        _request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> Result<(), String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Through the production handlers: a payload the handler refuses comes back
+/// as that refusal with no audit record, and an accepted one is recorded once.
+#[test]
+fn a_refused_mutation_is_not_audited_and_an_accepted_one_is_audited_once() {
+    let audit = Arc::new(CountingAudit::default());
+    let mut registry = IpcHandlerRegistry::default();
+    register_production_handlers(&mut registry, deps_default());
+    let router = IpcRouter::new(registry, audit.clone(), 8);
+
+    for payload in [
+        serde_json::json!({ "paused": "yes" }),
+        serde_json::json!({}),
+        serde_json::json!([1, 2, 3]),
+    ] {
+        let resp = router.dispatch(
+            read_envelope(IpcOperationName::RoutingPauseToggle, payload.clone()),
+            elevated_gui_ctx(),
+        );
+        assert_eq!(
+            resp.error.map(|e| e.code),
+            Some(IpcErrorCode::MalformedRequest),
+            "{payload}"
+        );
+    }
+    // A confirm whose token nobody issued is refused before the audit too.
+    let resp = router.dispatch(
+        mutation_confirm_envelope(
+            serde_json::json!({
+                "mutation-kind": "rules-update",
+                "payload": {},
+                "dry-run": false,
+            }),
+            "mut-tok-forged",
+        ),
+        elevated_gui_ctx(),
+    );
+    assert_eq!(
+        resp.error.map(|e| e.code),
+        Some(IpcErrorCode::ConfirmationUnknown)
+    );
+    assert_eq!(audit.records(), 0, "a refused request leaves no record");
+
+    let resp = router.dispatch(
+        read_envelope(
+            IpcOperationName::RoutingPauseToggle,
+            serde_json::json!({ "paused": true }),
+        ),
+        elevated_gui_ctx(),
+    );
+    assert!(resp.ok, "{:?}", resp.error);
+    assert_eq!(audit.records(), 1);
 }

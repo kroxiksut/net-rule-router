@@ -32,8 +32,13 @@ pub struct Preview {
 }
 
 /// The import's payload, kept for the confirmation: it must match the dry run
-/// byte for byte, or the token does not fit.
-pub fn payload(primary: Option<&RulesFile>, secondary: Option<&RulesFile>) -> Value {
+/// byte for byte, or the token does not fit. `baseline`: the set the Rules
+/// screen edits is the administrator's baseline, and the import lands there.
+pub fn payload(
+    primary: Option<&RulesFile>,
+    secondary: Option<&RulesFile>,
+    baseline: bool,
+) -> Value {
     let request = PresetImportPayload {
         primary_bytes_b64: primary.map(|f| f.base64.clone()),
         secondary_bytes_b64: secondary.map(|f| f.base64.clone()),
@@ -43,7 +48,11 @@ pub fn payload(primary: Option<&RulesFile>, secondary: Option<&RulesFile>) -> Va
         correlation_id: Some(correlation_id("first-run")),
         ..PresetImportPayload::default()
     };
-    serde_json::to_value(request).unwrap_or(Value::Null)
+    let mut payload = serde_json::to_value(request).unwrap_or(Value::Null);
+    if let (true, Some(fields)) = (baseline, payload.as_object_mut()) {
+        fields.insert("admin-baseline".into(), Value::Bool(true));
+    }
+    payload
 }
 
 fn correlation_id(what: &str) -> String {

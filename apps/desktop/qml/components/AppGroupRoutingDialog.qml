@@ -2,6 +2,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import "../lib/pure.js" as Pure
 
 // App/device group routing.
 //
@@ -301,7 +302,8 @@ Window {
                                     wrapMode: Text.WordWrap
                                     font.bold: true
                                     color: root.ownerRoot ? root.ownerRoot.textColor : "white"
-                                    text: String(modelData.displayName || "")
+                                    textFormat: Text.PlainText
+                                    text: Pure.displayText(modelData.displayName)
                                 }
                                 // State badge (running / installed / system component).
                                 Rectangle {
@@ -332,7 +334,8 @@ Window {
                                 font.pixelSize: (root.ownerRoot
                                     ? root.ownerRoot.uiTheme.baseFontSizePx : 13) - 1
                                 color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
-                                text: String(modelData.exePath || "")
+                                textFormat: Text.PlainText
+                                text: Pure.displayText(modelData.exePath)
                             }
                         }
 

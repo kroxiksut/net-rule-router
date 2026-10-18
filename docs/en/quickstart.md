@@ -83,19 +83,21 @@ routing does not apply.
 ## Rules: how it works
 
 A rule says: "this traffic → through that route". Traffic can be described
-six ways, listed here from the strongest rule to the weakest:
+seven ways, listed here from the strongest rule to the weakest:
 
 | Type | Example | Matches |
 |-----|--------|---------|
 | Exact domain | `api.example.com` | only this host |
 | Domain with subdomains | `*.example.com` | the domain and all subdomains |
+| Site in every zone | `example.*` | `example.com`, `example.net`, `example.co.uk`… with subdomains |
 | Exact IP | `203.0.113.7`, `2001:db8::7` | only that address |
 | Network or range | `10.0.0.0/8`, `192.0.2.10-192.0.2.40` | every address in it |
 | Domain zone | `.ru` | all domains in the zone |
-| Application | `chrome.exe` | all traffic from that process |
+| Application | `chrome.exe`, `C:\Apps\Tool\*` | that program wherever it is installed, or every program in that folder |
 
 The narrower rule wins: a site's own name beats its address, an address beats
-the network around it, a network beats the zone. A rule names either an address or an
+the network around it, a network beats the zone. A rule that names the zone
+(`example.by`) beats `example.*` for that zone. A rule names either an address or an
 application: a rule that limits an address to one application cannot be
 carried out yet, so the service refuses it.
 

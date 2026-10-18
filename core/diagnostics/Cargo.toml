@@ -28,7 +28,7 @@ sha2       = "0.10"
 # Seals a chain restart with the service's key.
 hmac       = "0.12"
 tempfile   = "3"
-zip        = "2"
+zip        = { version = "9", default-features = false, features = ["deflate"] }
 # Local wall-clock timestamps for zip entry mtimes. `chrono::Local::now()` is
 # used instead of the `time` crate's `OffsetDateTime::now_local()`, which is
 # gated behind an unsound "local-offset" feature that can fail

@@ -5,8 +5,11 @@
 //! on `r`; it never refreshes by itself, so a row is not pulled from under
 //! someone reading it.
 
+use std::borrow::Cow;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use nrr_ipc_client::IpcClient;
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     ConnTraceOutageBlocksRequest, ConnTraceOutageBlocksResponse, OutageBlockDto,
@@ -129,7 +132,7 @@ impl Screen for OutageScreen {
             .unwrap_or_default();
         let mut list = Vec::new();
         if count > 0 {
-            list.push(ViewLine::new(vec![Segment::strong(header(texts))]));
+            list.push(ViewLine::new(vec![Segment::accent(header(texts))]));
             list.extend(page_lines(texts, pager, count, false, |index| {
                 state
                     .row(index)
@@ -319,14 +322,15 @@ fn row_text(texts: &Texts, row: Row<'_>) -> String {
 /// The name with the word that says why it has no address — never a colour
 /// alone, so plain mode and a screen reader carry it too.
 fn unresolved_text(texts: &Texts, n: &OutageUnresolvedNameDto) -> String {
-    format!("{} · {}", n.name, texts.get(keys::OUTAGE_UNRESOLVED))
+    let name = display_text(&n.name);
+    format!("{name} · {}", texts.get(keys::OUTAGE_UNRESOLVED))
 }
 
-fn process(e: &OutageBlockDto) -> &str {
+fn process(e: &OutageBlockDto) -> Cow<'_, str> {
     if e.process.is_empty() {
-        "—"
+        "—".into()
     } else {
-        e.process.as_str()
+        display_text(&e.process)
     }
 }
 
@@ -343,6 +347,7 @@ fn remote_text(e: &OutageBlockDto) -> String {
     } else {
         e.host.as_str()
     };
+    let name = display_text(name);
     if name.is_empty() {
         address
     } else {
@@ -362,10 +367,11 @@ fn detail_lines(texts: &Texts, row: Row<'_>) -> Vec<ViewLine> {
             ];
         }
     };
-    let mut lines = vec![field(texts, keys::COL_PROCESS, process(e))];
+    let mut lines = vec![field(texts, keys::COL_PROCESS, &process(e))];
     if !e.process_path.is_empty() {
+        let path = display_text(&e.process_path);
         lines.push(ViewLine::text(
-            texts.fill(keys::TRACE_PATH, &[("path", &e.process_path)]),
+            texts.fill(keys::TRACE_PATH, &[("path", &path)]),
         ));
     }
     lines.push(field(texts, keys::COL_REMOTE, &remote_text(e)));

@@ -57,7 +57,7 @@ pub struct ParsedRule {
     /// Inline comment text after the first `#` in the value line;
     /// trimmed; empty when no inline comment was present.
     pub comment: String,
-    /// Whether the line carried the per-rule `+block` flag (docs/en/rules-file-format.md Blocking destinations):
+    /// Whether the value carried the `!` prefix (docs/en/rules-file-format.md Blocking destinations):
     /// matching traffic is dropped (hard WFP block) and the containing file
     /// (primary/secondary) is irrelevant for enforcement. `#[serde(default)]`
     /// so the field is optional across the `preset.parse` RPC wire.
@@ -68,6 +68,11 @@ pub struct ParsedRule {
     /// either file.
     #[serde(default)]
     pub verify_primary: bool,
+    /// Whether the value carried `+children` (docs/en/rules-file-format.md
+    /// Child process tracking), taken off `match_value` as the service's reader
+    /// takes it off.
+    #[serde(default)]
+    pub children: bool,
     /// Provenance of an app-authored rule — `Some` only for entries in the
     /// `--- Auto` section (docs/en/rules-file-format.md App-authored rules). The structured tokens are
     /// removed from `comment`, which keeps only the free text that followed
@@ -79,6 +84,14 @@ pub struct ParsedRule {
     /// when the caller wants to surface "rule R-0042 came from
     /// line 123".
     pub line_number: usize,
+}
+
+impl ParsedRule {
+    /// What a rules table stores for this rule ([`stored_rule_value`]).
+    #[must_use]
+    pub fn stored_value(&self) -> String {
+        stored_rule_value(self.rule_type, &self.match_value, self.children)
+    }
 }
 
 /// Coarse rule type derived from the section header.

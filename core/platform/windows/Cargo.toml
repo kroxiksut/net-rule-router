@@ -124,6 +124,10 @@ windows = { version = "0.58", features = [
     # ControlTraceW) + TDH event parsing (TdhGetProperty) to read the
     # QueryName + QueryResults of event 3008 (DNS query completed).
     "Win32_System_Diagnostics_Etw",
+    # SetErrorMode: the GUI launcher spawns its Qt host with loader error boxes
+    # suppressed, so a missing DLL is its own message instead of the system's
+    # (loader_failure).
+    "Win32_System_Diagnostics_Debug",
     # CreateToolhelp32Snapshot: parent pids of running processes, for naming who
     # launched a blocked program when its parent started before the recorder.
     "Win32_System_Diagnostics_ToolHelp",

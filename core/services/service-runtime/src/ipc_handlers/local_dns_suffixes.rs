@@ -14,7 +14,8 @@ use nrr_shared::ipc_payloads::{
 use nrr_shared::local_dns_suffixes::{covered_hosts, normalize_list};
 
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 use crate::ipc_handlers::providers::RoutePolicyWriteError;
 use crate::machine_scoped::{
@@ -134,8 +135,33 @@ impl LocalDnsSuffixesSetHandler {
     }
 }
 
-impl IpcHandler for LocalDnsSuffixesSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl LocalDnsSuffixesSetHandler {
+    /// Shared by every user of this machine: a non-elevated caller may still
+    /// save it back unchanged.
+    fn gate(&self, wanted: &[String], ctx: &IpcRequestContext) -> Result<(), IpcError> {
+        let mut current_sorted = self.store.get_all().map_err(map_write_error)?;
+        current_sorted.sort_unstable();
+        let mut wanted_sorted = wanted.to_vec();
+        wanted_sorted.sort_unstable();
+        if machine_scoped_write_allowed(&wanted_sorted, &current_sorted, ctx.caller_is_elevated) {
+            Ok(())
+        } else {
+            Err(machine_scoped_refusal(
+                MachineScopedSetting::LocalDnsSuffixes,
+            ))
+        }
+    }
+}
+
+impl CheckedIpcHandler for LocalDnsSuffixesSetHandler {
+    /// The normalised list.
+    type Checked = Vec<String>;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
         let req: LocalDnsSuffixesSetRequest = serde_json::from_value(request.payload.clone())
             .map_err(|e| IpcError {
                 code: IpcErrorCode::MalformedRequest,
@@ -155,18 +181,18 @@ impl IpcHandler for LocalDnsSuffixesSetHandler {
             ),
             diagnostics_id: None,
         })?;
-        // Shared by every user of this machine: a non-elevated caller may
-        // still save it back unchanged.
-        let current = self.store.get_all().map_err(map_write_error)?;
-        let mut current_sorted = current;
-        current_sorted.sort_unstable();
-        let mut wanted_sorted = wanted.clone();
-        wanted_sorted.sort_unstable();
-        if !machine_scoped_write_allowed(&wanted_sorted, &current_sorted, ctx.caller_is_elevated) {
-            return Err(machine_scoped_refusal(
-                MachineScopedSetting::LocalDnsSuffixes,
-            ));
-        }
+        self.gate(&wanted, ctx)?;
+        Ok(wanted)
+    }
+
+    fn execute(
+        &self,
+        wanted: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        // The stored list may have moved since the precheck compared with it.
+        self.gate(&wanted, ctx)?;
         let stored = self.store.replace_all(&wanted).map_err(map_write_error)?;
         serialise(
             "dns.local-suffixes.set",

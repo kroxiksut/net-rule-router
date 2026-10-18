@@ -371,6 +371,14 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         Verdict::Bounded("one boot step under a budget"),
     ),
     (
+        "windows-service/src/runtime_deps/boot_budgets.rs",
+        "nrr-wfp-open",
+        1,
+        Verdict::Invisible(
+            "ends when the engine answers or a stop begins; until then Apply reads degraded",
+        ),
+    ),
+    (
         "windows-service/src/runtime_deps/build.rs",
         "nrr-fakeip-watchdog",
         1,

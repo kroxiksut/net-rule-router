@@ -13,6 +13,14 @@
   Complete removal erases the service's data and that of the user running msiexec;
   other Windows accounts' data is listed in the log, never deleted.
 
+  Unattended install with prepared files (checked, then copied into the service's
+  protected data folder before it first starts; the path itself is not kept):
+    msiexec /i <package.msi> /qn PROVISION=<rules for the main route>
+            PROVISION_SECONDARY=<rules for the additional route>
+            PROVISION_SETTINGS=<settings export> SECONDARY_UNSET=direct|block
+  A file that is refused fails the installation (msiexec exit 1603); the reason,
+  with the service binary's own code 10-14, is in the verbose log (/l*v).
+
   Service and data steps run through scripts\setup-actions.ps1, which reuses the
   console and the user scripts; the package registers no service itself.
 -->
@@ -44,6 +52,10 @@
 
     <Property Id="REMOVEALLDATA" Secure="yes" />
     <Property Id="REMOVEAUDIT" Secure="yes" />
+    <Property Id="PROVISION" Secure="yes" />
+    <Property Id="PROVISION_SECONDARY" Secure="yes" />
+    <Property Id="PROVISION_SETTINGS" Secure="yes" />
+    <Property Id="SECONDARY_UNSET" Secure="yes" />
 
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
@@ -70,6 +82,13 @@
                  Sequence="execute" Before="NrrRegisterRollback"
                  Condition="NOT (REMOVE~=&quot;ALL&quot;) AND WIX_UPGRADE_DETECTED"
                  Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action Rollback -Upgrade" />
+
+    <!-- Provision: the files are checked and staged by the installed service
+         binary before Register starts it. One argument carries all four
+         values, so an unset property never leaves a parameter without one. -->
+    <SetProperty Id="NrrProvision" Sequence="execute" Before="NrrProvision"
+                 Condition="NOT (REMOVE~=&quot;ALL&quot;) AND (PROVISION OR PROVISION_SECONDARY OR PROVISION_SETTINGS OR SECONDARY_UNSET)"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action Provision -ProvisionSpec &quot;primary=[PROVISION]|secondary=[PROVISION_SECONDARY]|settings=[PROVISION_SETTINGS]|secondary-unset=[SECONDARY_UNSET]&quot;" />
 
     <!-- Unregister: the service is already stopped (ServiceControl below); the
          files are still there. An upgrade keeps the registration. -->
@@ -100,6 +119,9 @@
 
     <CustomAction Id="NrrRegister" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+    <!-- A refused file fails the installation: that is the administrator's signal. -->
+    <CustomAction Id="NrrProvision" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="NrrRegisterRollback" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   DllEntry="WixQuietExec" Execute="rollback" Impersonate="no" Return="ignore" />
     <!-- A failed step must never trap the program on the machine. -->
@@ -116,7 +138,9 @@
       <Custom Action="NrrMarkStop" Before="StopServices" Condition="Installed" />
       <Custom Action="NrrRegisterRollback" Before="NrrRegister"
               Condition="NOT (REMOVE~=&quot;ALL&quot;)" />
-      <Custom Action="NrrRegister" After="InstallFiles"
+      <Custom Action="NrrProvision" After="InstallFiles"
+              Condition="NOT (REMOVE~=&quot;ALL&quot;) AND (PROVISION OR PROVISION_SECONDARY OR PROVISION_SETTINGS OR SECONDARY_UNSET)" />
+      <Custom Action="NrrRegister" After="NrrProvision"
               Condition="NOT (REMOVE~=&quot;ALL&quot;)" />
       <Custom Action="NrrRemoveUserData" After="StopServices"
               Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND REMOVEALLDATA=&quot;1&quot;" />

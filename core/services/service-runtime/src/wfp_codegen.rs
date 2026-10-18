@@ -958,6 +958,8 @@ fn emit_for_address_match(
         CanonicalAddressMatch::ExactIp(addr) if !ctx.families.admits(*addr) => {}
         // Networks are emitted by `emit_network_filters`, never as hosts.
         CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_) => {}
+        // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
+        CanonicalAddressMatch::AnyZoneDomain(_) => {}
         CanonicalAddressMatch::ExactIp(addr) => {
             let addr = *addr;
             if steerable(None, addr) {
@@ -1166,6 +1168,9 @@ fn emit_for_app_match(
 ) {
     let pattern_str = match &app.pattern {
         CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.clone(),
+        // TODO: a path rule is enforced once the platform can list the
+        // programs of a folder; until then it emits nothing.
+        CanonicalAppPattern::Path(_) => return,
     };
     // The per-process filter (app-id condition). For a route rule this is a
     // Permit (the app is explicitly allowed and the kill-switch's

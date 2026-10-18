@@ -25,6 +25,8 @@ const PURGED_TABLES: &[&str] = &[
     "local_network_rules",
     "refusing_anchors",
     "block_notice_journal",
+    "app_observed_destinations",
+    "conn_history_prefs",
 ];
 
 /// Principals this database holds ANY state for, excluding the shared
@@ -249,6 +251,18 @@ mod tests {
             params![sid],
         )
         .expect("block_notice_journal");
+        conn.execute(
+            "INSERT INTO app_observed_destinations (sid, app_key, ip, learned_at)
+             VALUES (?1, 'firefox', '203.0.113.1', 1)",
+            params![sid],
+        )
+        .expect("app_observed_destinations");
+        conn.execute(
+            "INSERT INTO conn_history_prefs (sid, enabled, retention_days, updated_at)
+             VALUES (?1, 0, 3, 1)",
+            params![sid],
+        )
+        .expect("conn_history_prefs");
     }
 
     fn row_count(conn: &Connection, table: &str, sid: &str) -> i64 {

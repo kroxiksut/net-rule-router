@@ -6,6 +6,14 @@
 ;
 ; Service and data steps run through scripts\setup-actions.ps1, which reuses the
 ; console and the user scripts; nothing here registers or removes anything itself.
+;
+; Unattended install with prepared files (full paths):
+;   Setup.exe /VERYSILENT /SUPPRESSMSGBOXES /PROVISION=<rules for the main route>
+;     /PROVISION_SECONDARY=<rules> /PROVISION_SETTINGS=<settings export>
+;     /SECONDARY_UNSET=direct|block
+; The files are checked before anything is installed: a refused one ends Setup
+; with exit code 7, the service binary's own code (10-14) in the setup log. A
+; file that fails when it is copied after the install ends with that code itself.
 
 ; The architecture identifiers used below arrived in 6.3.
 #if VER < EncodeVer(6,3,0) || VER >= EncodeVer(7,0,0)
@@ -85,6 +93,10 @@ english.ServiceStopFailed=The NetRuleRouter background service did not stop, so 
 russian.ServiceStopFailed=Фоновая служба NetRuleRouter не остановилась, поэтому её файлы нельзя заменить. Перезагрузите Windows и запустите установку снова.
 english.ServiceRegisterFailed=NetRuleRouter is installed, but its background service could not be registered or started. Open NetRuleRouter to see what is wrong, or run "nrr-cli diag doctor" in the installation folder. Details: %1
 russian.ServiceRegisterFailed=NetRuleRouter установлена, но её фоновую службу не удалось зарегистрировать или запустить. Откройте NetRuleRouter, чтобы увидеть причину, или выполните "nrr-cli diag doctor" в папке установки. Подробности: %1
+english.ProvisionRefused=A file given to Setup was refused (code %1), so nothing was installed. The reason is in the setup log.
+russian.ProvisionRefused=Файл, переданный установке, отклонён (код %1), поэтому ничего не установлено. Причина указана в журнале установки.
+english.ProvisionNotStaged=NetRuleRouter is installed, but the files given to Setup could not be prepared for the service (code %1). Details: %2
+russian.ProvisionNotStaged=NetRuleRouter установлена, но переданные установке файлы не удалось подготовить для службы (код %1). Подробности: %2
 english.UninstallModeTitle=How should NetRuleRouter be removed?
 russian.UninstallModeTitle=Как удалить NetRuleRouter?
 english.UninstallModeText=Either way the background service is removed and the network settings it changed are put back.
@@ -112,6 +124,8 @@ Source: "setup-actions.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 ; Extracted to {tmp} to stop the service before any file is replaced.
 Source: "setup-actions.ps1"; Flags: dontcopy
 Source: "{#PackageDir}\scripts\lib\service-paths.ps1"; Flags: dontcopy
+; Checks prepared files before anything is installed.
+Source: "{#PackageDir}\nrr-service.exe"; Flags: dontcopy
 
 #if Variant == "full"
 [Icons]
@@ -124,6 +138,57 @@ Filename: "{app}\NetRuleRouter.exe"; Description: "{cm:LaunchApp}"; Flags: posti
 [Code]
 var
   RemoveData, RemoveAudit: Boolean;
+  { The service binary's code when staging the prepared files failed; 0 otherwise. }
+  ProvisionExitCode: Integer;
+
+{ /NAME=value from the command line, '' when absent. }
+function SetupParam(const Name: String): String;
+begin
+  Result := Trim(ExpandConstant('{param:' + Name + '|}'));
+end;
+
+function HasProvisioning(): Boolean;
+begin
+  Result := (SetupParam('PROVISION') <> '') or (SetupParam('PROVISION_SECONDARY') <> '') or
+    (SetupParam('PROVISION_SETTINGS') <> '') or (SetupParam('SECONDARY_UNSET') <> '');
+end;
+
+{ The provision verbs' options for what was given. }
+function ProvisionOptions(): String;
+begin
+  Result := '';
+  if SetupParam('PROVISION') <> '' then
+    Result := Result + ' --primary ' + AddQuotes(SetupParam('PROVISION'));
+  if SetupParam('PROVISION_SECONDARY') <> '' then
+    Result := Result + ' --secondary ' + AddQuotes(SetupParam('PROVISION_SECONDARY'));
+  if SetupParam('PROVISION_SETTINGS') <> '' then
+    Result := Result + ' --settings ' + AddQuotes(SetupParam('PROVISION_SETTINGS'));
+  if SetupParam('SECONDARY_UNSET') <> '' then
+    Result := Result + ' --secondary-unset ' + AddQuotes(SetupParam('SECONDARY_UNSET'));
+end;
+
+{ The same values as setup-actions.ps1 -ProvisionSpec takes them. }
+function ProvisionSpec(): String;
+begin
+  Result := 'primary=' + SetupParam('PROVISION') + '|secondary=' + SetupParam('PROVISION_SECONDARY') +
+    '|settings=' + SetupParam('PROVISION_SETTINGS') + '|secondary-unset=' + SetupParam('SECONDARY_UNSET');
+end;
+
+{ Checked by the service binary itself, before a single file is replaced. }
+function CheckProvisioning(): Integer;
+var
+  Code: Integer;
+begin
+  Result := 0;
+  if not HasProvisioning() then
+    Exit;
+  ExtractTemporaryFile('nrr-service.exe');
+  if not Exec(ExpandConstant('{tmp}\nrr-service.exe'), 'provision-check' + ProvisionOptions(),
+      '', SW_HIDE, ewWaitUntilTerminated, Code) then
+    Code := 14;
+  Log(Format('nrr-service provision-check: exit %d', [Code]));
+  Result := Code;
+end;
 
 function ActionLog(): String;
 begin
@@ -145,8 +210,16 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Refused: Integer;
 begin
   Result := '';
+  Refused := CheckProvisioning();
+  if Refused <> 0 then
+  begin
+    Result := FmtMessage(CustomMessage('ProvisionRefused'), [IntToStr(Refused)]);
+    Exit;
+  end;
   ExtractTemporaryFile('setup-actions.ps1');
   ExtractTemporaryFile('service-paths.ps1');
   if RunAction(ExpandConstant('{tmp}\setup-actions.ps1'), '-Action Stop') <> 0 then
@@ -155,10 +228,27 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if CurStep = ssPostInstall then
-    if RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), '-Action Register') <> 0 then
-      SuppressibleMsgBox(FmtMessage(CustomMessage('ServiceRegisterFailed'), [ActionLog()]),
-        mbError, MB_OK, IDOK);
+  if CurStep <> ssPostInstall then
+    Exit;
+  { Staged before the service starts, so its first start applies them. }
+  if HasProvisioning() then
+  begin
+    ProvisionExitCode := RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'),
+      '-Action Provision -ProvisionSpec "' + ProvisionSpec() + '"');
+    if ProvisionExitCode <> 0 then
+      SuppressibleMsgBox(FmtMessage(CustomMessage('ProvisionNotStaged'),
+        [IntToStr(ProvisionExitCode), ActionLog()]), mbError, MB_OK, IDOK);
+  end;
+  if RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), '-Action Register') <> 0 then
+    SuppressibleMsgBox(FmtMessage(CustomMessage('ServiceRegisterFailed'), [ActionLog()]),
+      mbError, MB_OK, IDOK);
+end;
+
+{ A batch that installed the program but not its prepared files must not read
+  that as success. }
+function GetCustomSetupExitCode(): Integer;
+begin
+  Result := ProvisionExitCode;
 end;
 
 { /NAME or /NAME=1 on the uninstaller's command line. }

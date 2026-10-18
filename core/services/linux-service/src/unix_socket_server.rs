@@ -68,9 +68,9 @@ use nrr_service_runtime::ipc_push::{
     adopt_subscription, flush_push_frames, SubscriptionChange, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
 };
 use nrr_service_runtime::{
-    AcceptError, AcceptErrorCategory, AcceptOutcome, EventBus, IpcAcceptor, IpcBindError, IpcError,
-    IpcErrorCode, IpcRequestContext, IpcRequestEnvelope, IpcResponseEnvelope, IpcRouter, IpcServer,
-    UserPrincipal,
+    AcceptError, AcceptErrorCategory, AcceptOutcome, CallerProcess, EventBus, IpcAcceptor,
+    IpcBindError, IpcError, IpcErrorCode, IpcRequestContext, IpcRequestEnvelope,
+    IpcResponseEnvelope, IpcRouter, IpcServer, UserPrincipal,
 };
 use nrr_shared::ipc::IpcClientProfile;
 use nrr_shared::ipc_wire::{read_frame, write_frame};
@@ -522,7 +522,10 @@ fn handle_connection(
                     // this platform an ordinary user cannot elevate a client,
                     // and being authorized for the one action is how they get
                     // to do privileged work at all.
-                    caller_pid: u32::try_from(identity.pid).ok(),
+                    caller_pid: u32::try_from(identity.pid).ok().map(|pid| CallerProcess {
+                        pid,
+                        start_time: identity.start_time,
+                    }),
                 };
                 let response = router.dispatch(request, ctx);
                 match adopt_subscription(&mut subscription_id, &response, event_bus.as_deref()) {

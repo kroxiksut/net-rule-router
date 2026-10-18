@@ -201,6 +201,43 @@ pub fn match_suffix_domain(hostname: &str, label: &str) -> bool {
     hostname == label || match_zone(hostname, label)
 }
 
+// ── match_any_zone_domain ─────────────────────────────────────────────────────
+
+/// The `base.<zone>` an `AnyZoneDomain(base)` rule (written `base.*`) stands
+/// for at `hostname`, or `None` when it does not cover it. At that host the
+/// rule IS `*.base.<zone>`, so the decision engine, the DNS gate and every
+/// enforcement fan-out treat it as that suffix rule.
+///
+/// The zone is the host's public suffix as [`registrable_domain`] reads it, so
+/// the site sits right before it: `example.*` covers `www.example.co.uk`, and
+/// never `example.com.attacker.net`, whose site is `attacker`.
+///
+/// [`registrable_domain`]: crate::companion_affinity::registrable_domain
+///
+/// # Examples
+///
+/// ```
+/// use nrr_domain::decision_matching::match_any_zone_domain;
+///
+/// assert_eq!(match_any_zone_domain("example.com", "example"), Some("example.com"));
+/// assert_eq!(match_any_zone_domain("www.example.co.uk", "example"), Some("example.co.uk"));
+/// assert_eq!(match_any_zone_domain("example.com.attacker.net", "example"), None);
+/// assert_eq!(match_any_zone_domain("notexample.com", "example"), None);
+/// ```
+pub fn match_any_zone_domain<'h>(hostname: &'h str, base: &str) -> Option<&'h str> {
+    if base.is_empty() {
+        return None;
+    }
+    let registrable = crate::companion_affinity::registrable_domain(hostname)?;
+    let (_, zone) = registrable.split_once('.')?;
+    let site_end = hostname.len().checked_sub(zone.len() + 1)?;
+    let site = &hostname[..site_end];
+    if !match_suffix_domain(site, base) {
+        return None;
+    }
+    Some(&hostname[site_end - base.len()..])
+}
+
 // ── MatchClass ────────────────────────────────────────────────────────────────
 
 /// The match class (tier) that produced a candidate rule.
@@ -242,7 +279,7 @@ pub enum MatchClass {
 /// | `Zone`       | Number of DNS labels (`corp.intra` = 2)       |
 /// | `ExactIp`    | Always 1 (the tier holds nothing else)        |
 /// | `Subnet`     | Prefix length of the matching block           |
-/// | `Application` | Exact name = 2, glob pattern = 1             |
+/// | `Application` | Path > exact name > folder (by depth) > glob |
 /// | `Default`    | Always 0                                      |
 ///
 /// Within a tier, if two candidates have **equal** specificity but belong to
@@ -272,11 +309,23 @@ impl SpecificityScore {
     /// wins. Zones are scored by [`Self::label_count`] like any other domain.
     pub const SINGLE: Self = Self(1);
 
-    /// Fixed score of 2 — used for exact application name match.
-    pub const APP_EXACT: Self = Self(2);
+    /// One program by its full path: the narrowest application rule.
+    pub const APP_FILE: Self = Self(1_001);
 
-    /// Fixed score of 1 — used for application glob match.
+    /// An exact application name: below a full path, above every folder.
+    pub const APP_EXACT: Self = Self(1_000);
+
+    /// An application name glob: the widest application rule.
     pub const APP_GLOB: Self = Self(1);
+
+    /// A folder rule `depth` segments below the root, between an exact name
+    /// and a glob: a deeper folder wins, and at one depth "this folder only"
+    /// beats "with subfolders".
+    pub fn app_folder(depth: usize, with_subfolders: bool) -> Self {
+        let depth = depth.min(nrr_shared::app_path::MAX_PATH_SEGMENTS);
+        let depth = u32::try_from(depth).unwrap_or(u32::MAX / 4);
+        Self(2 + 2 * depth + u32::from(!with_subfolders))
+    }
 
     /// Fixed score of 0 — used for the default fallback tier.
     pub const DEFAULT: Self = Self(0);
@@ -604,6 +653,13 @@ mod tests {
     #[test]
     fn specificity_constants_ordered() {
         assert!(SpecificityScore::APP_EXACT > SpecificityScore::APP_GLOB);
+        assert!(SpecificityScore::APP_FILE > SpecificityScore::APP_EXACT);
+        let deepest = nrr_shared::app_path::MAX_PATH_SEGMENTS;
+        assert!(SpecificityScore::APP_EXACT > SpecificityScore::app_folder(deepest, false));
+        assert!(SpecificityScore::app_folder(usize::MAX, false) < SpecificityScore::APP_EXACT);
+        assert!(SpecificityScore::app_folder(0, true) > SpecificityScore::APP_GLOB);
+        assert!(SpecificityScore::app_folder(2, true) > SpecificityScore::app_folder(1, false));
+        assert!(SpecificityScore::app_folder(1, false) > SpecificityScore::app_folder(1, true));
         assert!(SpecificityScore::SINGLE > SpecificityScore::DEFAULT);
         assert_eq!(SpecificityScore::SINGLE, SpecificityScore(1));
     }

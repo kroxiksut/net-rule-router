@@ -167,15 +167,15 @@ fn candidate_outside_any_window_is_not_tracked() {
 
 #[test]
 fn a_brand_related_companion_is_proposed_once_the_relation_repeats() {
-    // A brand-related subdomain generalizes to its domain; a candidate that
-    // IS the domain has no subdomain to generalize from and stays exact.
+    // A brand-related host earns itself: one subdomain never widens to its
+    // domain (a look-alike apex is what a hostile page registers).
     // `ab` is two letters: the relation holds, the reach does not — see
     // `a_short_brand_token_earns_the_host_but_not_the_apex`.
     for (anchor, candidate, expected) in [
         (
             "web.chatapp.example",
             "crashlogs.chatapp.test",
-            "chatapp.test",
+            "crashlogs.chatapp.test",
         ),
         ("ab.example", "login.ab.test", "login.ab.test"),
         ("clipfeed.test", "clipfeedv.test", "clipfeedv.test"),

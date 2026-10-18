@@ -64,6 +64,10 @@ pub const APP_GROUP: Key = key("rules.suggestions.inbox.app-group", "Application
 pub const STATUS_PENDING: Key = key("rules.suggestions.table.status-pending", "Pending");
 pub const STATUS_DISMISSED: Key = key("rules.suggestions.table.status-dismissed", "Dismissed");
 pub const NEEDED_BY: Key = key("rules.suggestions.inbox.needed-by", "Needed by:");
+pub const ANY_ZONE: Key = key(
+    "rules.suggestions.inbox.any-zone",
+    "The same site in another zone: it can be added as {site}.* instead, every zone at once.",
+);
 pub const MORE: Key = key("rules.suggestions.inbox.reach-more", "+{count} more");
 pub const REACH: Key = key(
     "rules.suggestions.inbox.reach",
@@ -132,6 +136,13 @@ pub const SIGNALS: [Key; 6] = [
         "connections to it kept failing on the main route and none went through",
     ),
 ];
+
+pub const LESS_CERTAIN: Key = key("rules.suggestions.inbox.less-certain", "less certain");
+/// What a less certain offer rests on, one per `AUTO_RULE_LESS_CERTAIN_SLUGS`.
+pub const LESS_CERTAIN_BASES: [Key; 1] = [key(
+    "rules.suggestions.less-certain.brand-seen-once",
+    "named like {site}, seen once",
+)];
 
 pub const CHECK_BUSY: Key = key(
     "rules.suggestions.inbox.action-check-main-route-busy",
@@ -215,6 +226,10 @@ pub const HELP_KEYS: &[Key] = &[
         "a: add the chosen item to the additional route",
     ),
     key(
+        "tui.suggestions.help.any-zone",
+        "z: add the chosen item as its site in every zone (site.*), when it names one",
+    ),
+    key(
         "tui.suggestions.help.never",
         "n: do not suggest the chosen item again",
     ),
@@ -244,6 +259,10 @@ pub const PLAIN_KEYS: &[Key] = &[
     key(
         "tui.suggestions.plain.add",
         "a and an item number, for example a 2: add that item to the additional route",
+    ),
+    key(
+        "tui.suggestions.plain.any-zone",
+        "z and an item number: add that item as its site in every zone",
     ),
     key(
         "tui.suggestions.plain.never",
@@ -296,6 +315,7 @@ pub fn all() -> Vec<Key> {
         STATUS_PENDING,
         STATUS_DISMISSED,
         NEEDED_BY,
+        ANY_ZONE,
         MORE,
         REACH,
         REACH_APP,
@@ -308,6 +328,7 @@ pub fn all() -> Vec<Key> {
         OWNERSHIP_OWN_NAME,
         OBSERVATIONS,
         AFFINITY,
+        LESS_CERTAIN,
         CHECK_BUSY,
         CHECK_STARTED,
         CHECK_NOTHING,
@@ -331,6 +352,7 @@ pub fn all() -> Vec<Key> {
         CANCELLED,
     ];
     keys.extend(SIGNALS);
+    keys.extend(LESS_CERTAIN_BASES);
     keys.extend_from_slice(HELP_KEYS);
     keys.extend_from_slice(PLAIN_KEYS);
     keys

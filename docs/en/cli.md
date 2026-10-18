@@ -95,7 +95,8 @@ Flags:
 | Flag | Verb | Meaning |
 |------|------|---------|
 | `--start-mode=<auto\|on-demand>` | `install` | Start with the operating system (default), or when the application is launched |
-| `--purge` | `uninstall` | Also delete the service-owned data directory. Your rule files are kept either way |
+| `--purge` | `uninstall` | Also delete the service-owned data directory, except the security audit trail. Your rule files are kept either way |
+| `--purge-audit` | `uninstall` | Only with `--purge`: delete the security audit trail as well |
 | `--confirm` | `reset-network` | Required. Without it the command explains what it would drop and refuses |
 | `--stop-service` | `reset-network` | Stop a running service first (ending it if it hangs), then reset |
 | `--tail=<N>` | `diag logs` | How many of the newest lines to print. Default 50, maximum 2000 |

@@ -78,9 +78,10 @@
 //!
 //! 1. **Brand relation** — the candidate carries the anchor's brand token or
 //!    vice versa (`web.chatapp.example` and `static.chatapp.test`, `ab.example` and
-//!    `login.ab.test`, `clipfeed.test` and `clipfeedv.test`). Shared branding is a
-//!    statement of ownership, so a single co-occurrence is enough and no
-//!    temporal threshold applies.
+//!    `login.ab.test`, `clipfeed.test` and `clipfeedv.test`). A shared name is
+//!    what a hostile page can choose, so it opens the tier and independent
+//!    windows decide it. Where a person reviews the offer ([`ProposalUse`]), a
+//!    single window is offered too, marked [`LessCertainBasis::BrandSeenOnce`].
 //! 2. **Delivery name** — the name matches a delivery-endpoint mask
 //!    ([`DELIVERY_NAME_MASKS`]) or an explicit shard label
 //!    (`rr5---sn-…`), AND the anchor dominates the candidate's attributions
@@ -93,18 +94,18 @@
 //!    threshold this tier is close to inert by design; it is the conservative
 //!    fallback, not the workhorse.
 //!
-//! Tiers 2 and 3 are additionally held to **sub-resource, not neighbour in
-//! time**: both rest on the assumption that the anchor is the page doing the
-//! fetching, and the ledger checks it. The most recent page-shaped hostname is
-//! remembered, and an attributed observation made while a DIFFERENT site's page
-//! was loading counts against the pair; once most of them do, the pair is not
-//! proposed. Without this, a rule host left open in one tab collects the CDN of
-//! whatever the user visited next. Brand relation is exempt — a shared name
-//! states ownership whatever was on screen.
+//! Every tier is additionally held to **sub-resource, not neighbour in time**:
+//! each rests on the anchor being the page doing the fetching, and the ledger
+//! checks it. The most recent page-shaped hostname is remembered, and an
+//! attributed observation made while a DIFFERENT site's page was loading counts
+//! against the pair; once most of them do, the pair is not proposed. Without
+//! this, a rule host left open in one tab collects the CDN of whatever the user
+//! visited next.
 //!
 //! Qualifying subdomains of one registrable domain generalize into a single
-//! suffix proposal (see [`registrable_domain`]): immediately for a brand or
-//! delivery name, and from two distinct subdomains for co-activity alone.
+//! suffix proposal (see [`registrable_domain`]): immediately for a delivery
+//! apex, otherwise from two named subdomains. A less certain member never
+//! widens anything — it is offered as the one host it is.
 //!
 //! # Input expectations
 //!
@@ -259,13 +260,9 @@ pub const DEFAULT_EVIDENCE_TTL_MS: u64 = 86_400_000;
 /// flip it never entered.
 pub const DEFAULT_ATTRIBUTION_TIE_MS: u64 = 2_000;
 
-/// Distinct proper subdomains of one registrable domain required before
-/// co-activity evidence alone generalizes into a single suffix proposal. One
-/// subdomain that merely loaded alongside the anchor proves nothing about its
-/// siblings; two independent ones strongly suggest the whole domain serves it.
-///
-/// Brand-related and delivery names bypass this: their name is itself the
-/// evidence, so one is enough.
+/// Distinct named subdomains of one registrable domain required before they
+/// generalize into a single suffix proposal: one subdomain proves nothing about
+/// its siblings. A delivery apex bypasses this — its own name is the evidence.
 const SUFFIX_MIN_DISTINCT_SUBDOMAINS: usize = 2;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
@@ -547,6 +544,30 @@ pub enum CompanionSignal {
     CoActivity,
 }
 
+/// Who acts on the proposals — the one thing the evidence bar depends on.
+///
+/// The bar is a single rule with this as its parameter, never two copies: a
+/// person reading an offer can weigh a thinner basis that an unattended writer
+/// must not act on, and nothing else differs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProposalUse {
+    /// Written into the rules without asking: every tier at full strength.
+    #[default]
+    AuthoredUnasked,
+    /// Shown to a person who decides: a brand relation seen in one window is
+    /// offered as well, marked [`LessCertainBasis::BrandSeenOnce`].
+    OfferedForReview,
+}
+
+/// Why an offer is less certain than an unattended rule would need — shown to
+/// the person deciding as the basis of the offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LessCertainBasis {
+    /// Named like the site and seen beside it in one window only. A hostile
+    /// page can produce exactly this, which is why it is only ever asked.
+    BrandSeenOnce,
+}
+
 /// One companion proposal: "this hostname/domain appears to belong to that
 /// rule host — consider routing it the same way".
 ///
@@ -592,6 +613,10 @@ pub struct CompanionProposal {
     /// confirming an offer and confirming a guess. Empty for an exact host,
     /// which covers itself and nothing else.
     pub observed_members: Vec<String>,
+    /// `Some` when the offer rests on less than an unattended rule needs; only
+    /// [`ProposalUse::OfferedForReview`] produces one, and always as an exact
+    /// host.
+    pub less_certain: Option<LessCertainBasis>,
 }
 
 mod name_shapes;

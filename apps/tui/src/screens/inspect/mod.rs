@@ -200,7 +200,7 @@ fn page_lines(
         .map(|i| {
             let text = format!("{}. {}", i + 1, row(i));
             if i == pager.selected {
-                ViewLine::new(vec![Segment::strong(format!("> {text}"))])
+                ViewLine::new(vec![Segment::selected(format!("> {text}"))])
             } else {
                 ViewLine::text(format!("  {text}"))
             }

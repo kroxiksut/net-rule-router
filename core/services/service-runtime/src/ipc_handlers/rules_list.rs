@@ -37,7 +37,9 @@ impl IpcHandler for RulesListHandler {
         // caller SID maps to the baseline partition. Without this, a user
         // who applied rules under their own SID saw an empty table because
         // the listing read the baseline partition.
-        let principal = if ctx.caller_stored().is_empty() {
+        // The baseline on request: every user falls back to it, so reading it
+        // shows nobody's own rules.
+        let principal = if req.baseline || ctx.caller_stored().is_empty() {
             nrr_storage::BASELINE_PRINCIPAL.to_string()
         } else {
             ctx.caller_stored().to_string()
@@ -100,6 +102,51 @@ mod tests {
         }
     }
 
+    /// Remembers whose rules were asked for.
+    #[derive(Default)]
+    struct WhoseRules(Mutex<Option<String>>);
+
+    impl RulesSnapshotProvider for WhoseRules {
+        fn rules_snapshot(&self, _route_filter: RulesRouteFilter) -> RulesListResponse {
+            serde_json::from_value(serde_json::json!({ "rows": [], "supported-rule-types": [] }))
+                .expect("an empty listing")
+        }
+
+        fn rules_snapshot_for(
+            &self,
+            route_filter: RulesRouteFilter,
+            principal: &str,
+        ) -> RulesListResponse {
+            *self.0.lock().expect("lock") = Some(principal.to_owned());
+            self.rules_snapshot(route_filter)
+        }
+    }
+
+    /// The terminal shows the set it writes: the caller's own rules, or the
+    /// baseline when it edits that.
+    #[test]
+    fn the_baseline_is_read_when_asked_for_and_the_callers_own_rules_otherwise() {
+        let provider = Arc::new(WhoseRules::default());
+        let h = RulesListHandler::new(provider.clone());
+        let user = IpcRequestContext {
+            caller_principal: Some(nrr_domain::user_principal::UserPrincipal::from_linux_uid(
+                1000,
+            )),
+            ..ctx()
+        };
+        h.handle(&req(serde_json::json!({})), &user).expect("own");
+        assert_eq!(
+            provider.0.lock().expect("lock").as_deref(),
+            Some(user.caller_stored())
+        );
+        h.handle(&req(serde_json::json!({ "baseline": true })), &user)
+            .expect("baseline");
+        assert_eq!(
+            provider.0.lock().expect("lock").as_deref(),
+            Some(nrr_storage::BASELINE_PRINCIPAL)
+        );
+    }
+
     #[test]
     fn returns_rule_rows_from_provider() {
         let provider = Arc::new(FakeRules {
@@ -109,6 +156,7 @@ mod tests {
                 active_revision_id: Some("rev-1".into()),
                 unrecognized: 0,
                 main_route_pending: 0,
+                base_revision: None,
             }),
             last_filter: Mutex::new(None),
         });
@@ -128,6 +176,7 @@ mod tests {
                 active_revision_id: None,
                 unrecognized: 0,
                 main_route_pending: 0,
+                base_revision: None,
             }),
             last_filter: Mutex::new(None),
         });
@@ -150,6 +199,7 @@ mod tests {
                 active_revision_id: None,
                 unrecognized: 0,
                 main_route_pending: 0,
+                base_revision: None,
             }),
             last_filter: Mutex::new(None),
         });

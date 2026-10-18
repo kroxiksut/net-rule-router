@@ -84,6 +84,30 @@ pub fn production_logs_dir() -> Option<PathBuf> {
     }
 }
 
+/// Where an administrator's install-time files wait for the service's first
+/// start: `<data root>\provision` on Windows, where the installer copies them,
+/// and `/etc/<product>/provision` elsewhere, where a package or a script
+/// places them. Root/administrators only on both; the service refuses a
+/// folder or file anyone else could have written.
+pub fn production_provision_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        production_data_root().map(|root| root.join("provision"))
+    }
+    #[cfg(all(unix, not(windows)))]
+    {
+        Some(
+            PathBuf::from("/etc")
+                .join(product_dir_leaf())
+                .join("provision"),
+        )
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        None
+    }
+}
+
 /// The elevation broker's lifecycle log, in the production logs directory. The
 /// service ships it in the diagnostic archive.
 pub const BROKER_LOG_FILE: &str = "nrr-broker.log";

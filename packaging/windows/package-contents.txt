@@ -1,0 +1,52 @@
+# What every Windows package must carry, relative to its folder.
+# scripts\package-windows.ps1 checks the package folder against it, and
+# scripts\check-windows-package.ps1 the zip and the MSI (msiexec /a: unpacked,
+# never installed). A missing path fails either.
+#
+# Added from the checkout without being listed: every file of locales\ and
+# presets\ (all), every QML file of apps\desktop\qml (full).
+# package-windows.ps1 refuses to run when an executable, its symbols or a user
+# script it ships is not listed here.
+#
+# Line: <set> <path>. Sets: all (both variants), full (window and tray),
+# installer (only what the MSI and EXE add).
+
+all        nrr-service.exe
+all        nrr_service.pdb
+all        nrr-cli.exe
+all        nrr_cli.pdb
+all        nrr-tui.exe
+all        nrr_tui.pdb
+all        wintun.dll
+all        vcruntime140.dll
+all        msvcp140.dll
+all        configs\doh-dot-resolvers.seed.json
+all        assets\icons\app\app.ico
+all        scripts\reset-network.ps1
+all        scripts\service-status.ps1
+all        scripts\uninstall-service.ps1
+all        scripts\purge-data.ps1
+all        scripts\lib\service-paths.ps1
+all        README.txt
+all        README.ru.txt
+all        build-info.json
+
+full       NetRuleRouter.exe
+full       NetRuleRouter.pdb
+full       NetRuleRouterTray.exe
+full       NetRuleRouterTray.pdb
+full       nrr_qt_native_host.exe
+full       Qt6Core.dll
+full       Qt6Quick.dll
+# The two image decoders the app needs; without them every icon or the
+# window icon goes blank.
+full       imageformats\qsvg.dll
+full       imageformats\qico.dll
+full       qml\QtQuick
+full       apps\desktop\qml\Main.qml
+full       apps\desktop\qml\Tray.qml
+full       assets\icons\ui\apply.svg
+full       assets\images\logo\logo-lockup-stacked.png
+full       configs\presets\builtin-demo\rules_primary.txt
+
+installer  scripts\setup-actions.ps1

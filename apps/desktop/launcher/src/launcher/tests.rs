@@ -357,3 +357,20 @@ fn a_live_owner_earns_the_long_activation_wait() {
 
     let _ = std::fs::remove_file(&lock);
 }
+
+/// A scripted run's self-closing timer is a development aid: a release build
+/// starts the window it would start anyway, whatever the environment says.
+#[test]
+fn a_release_build_ignores_the_auto_close_variable() {
+    let set = || Some(" 1500 ".to_owned());
+    assert_eq!(super::auto_close_argument(false, set), None);
+    assert_eq!(
+        super::auto_close_argument(true, set).as_deref(),
+        Some("--nrr-auto-close-ms=1500")
+    );
+    assert_eq!(
+        super::auto_close_argument(true, || Some("0".to_owned())),
+        None
+    );
+    assert_eq!(super::auto_close_argument(true, || None), None);
+}

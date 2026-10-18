@@ -2,7 +2,7 @@
 
 use nrr_shared::auto_rule::{AutoRuleReason, RuleOrigin};
 use nrr_shared::ipc_payloads::RuleRowEntry;
-use nrr_shared::preset_parser::ParsedRule;
+use nrr_shared::preset_parser::{without_children_flag, ParsedRule};
 use nrr_shared::rules_json::{AddressMatchDto, AppMatchDto, AppPatternDto, RuleDto};
 
 use super::{RowOrigin, RuleRow, RuleType, TargetRoute};
@@ -59,6 +59,7 @@ pub fn rule_row_to_wire_dto(
     let mut app_match = None;
     let address_match = match &row.rule_type {
         RuleType::ExactFqdn => Some(AddressMatchDto::ExactFqdn { value }),
+        RuleType::SuffixDomain if value.ends_with(".*") => Some(host_match(value)),
         RuleType::SuffixDomain => Some(AddressMatchDto::SuffixDomain {
             suffix: value.strip_prefix("*.").unwrap_or(&value).to_owned(),
         }),
@@ -76,8 +77,14 @@ pub fn rule_row_to_wire_dto(
         }),
         RuleType::IpRange => Some(ip_range(&value)),
         RuleType::Application => {
-            // A `*` makes it a pattern, exactly as the preset parser reads it.
-            let pattern = if value.contains('*') {
+            // `+children` stays in the file, not in the name the service matches.
+            let value = without_children_flag(&value).into_owned();
+            // A separator makes it a path, which the service reads in its
+            // platform's spelling; otherwise a `*` makes it a pattern, exactly
+            // as the preset parser reads it.
+            let pattern = if value.contains(['\\', '/']) {
+                AppPatternDto::Path { value }
+            } else if value.contains('*') {
                 AppPatternDto::Glob { value }
             } else {
                 AppPatternDto::Exact { value }
@@ -121,9 +128,15 @@ pub fn rule_row_to_wire_dto(
     }
 }
 
-/// A `domain` value: `*.` marks a suffix, anything else is one exact name.
-/// Reading it as exact regardless would leave `*.x` a literal no host matches.
+/// A `domain` value: `x.*` (or `*.x.*`) is the site in every zone, `*.`
+/// marks a suffix, anything else is one exact name. Reading it as exact
+/// regardless would leave `*.x` a literal no host matches.
 fn host_match(value: String) -> AddressMatchDto {
+    if let Some(base) = value.strip_suffix(".*") {
+        return AddressMatchDto::AnyZoneDomain {
+            base: base.strip_prefix("*.").unwrap_or(base).to_owned(),
+        };
+    }
     if let Some(suffix) = value.strip_prefix("*.") {
         return AddressMatchDto::SuffixDomain {
             suffix: suffix.to_owned(),
@@ -195,7 +208,7 @@ pub fn drift_row_from_service_wire(entry: &RuleRowEntry) -> RuleRow {
 }
 
 /// The target a `preset.parse` rule takes when read from the rules file of
-/// `file` (`parsedRuleTargetRoute`): `+block`, or the file's own route.
+/// `file` (`parsedRuleTargetRoute`): a `!` deny, or the file's own route.
 pub fn parsed_rule_target_route(rule: &ParsedRule, file: Route) -> TargetRoute {
     if rule.blocked {
         TargetRoute::Block

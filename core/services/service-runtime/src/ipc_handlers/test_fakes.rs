@@ -404,7 +404,8 @@ impl MutationExecutor for FakeMutationExecutor {
         }))
     }
 
-    fn safe_disable(&self, reason: &str) -> MutationOutcome {
+    fn safe_disable(&self, principal: &str, reason: &str) -> MutationOutcome {
+        *self.last_principal.lock().unwrap() = Some(principal.to_string());
         self.safe_disable_count.fetch_add(1, Ordering::Relaxed);
         *self.last_safe_disable_reason.lock().unwrap() = Some(reason.to_string());
         if let Some(err) = self.fail_with.clone() {
@@ -448,6 +449,7 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
                 active_revision_id: None,
                 unrecognized: 0,
                 main_route_pending: 0,
+                base_revision: None,
             }),
             last_filter: Mutex::new(None),
         }),

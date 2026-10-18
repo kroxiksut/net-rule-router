@@ -132,6 +132,23 @@ pub struct IpcError {
     pub diagnostics_id: Option<String>,
 }
 
+impl IpcError {
+    /// A handler's refusal of something only an administrator may do. Typed by
+    /// its leading slug, so the router can ask the platform authority and run
+    /// the request again with rights, and a Windows client's broker sees an
+    /// ordinary `Forbidden`.
+    pub fn needs_administrator(detail: impl std::fmt::Display) -> Self {
+        Self {
+            code: IpcErrorCode::Forbidden,
+            message: format!(
+                "{}: {detail}",
+                nrr_shared::ipc_transport::NEEDS_ADMINISTRATOR_SLUG
+            ),
+            diagnostics_id: None,
+        }
+    }
+}
+
 // ── Envelopes ────────────────────────────────────────────────────────────────
 
 /// Caller-side context the transport injects into every request.
@@ -151,12 +168,20 @@ pub struct IpcRequestContext {
     /// Linux transport uses `UserPrincipal::from_linux_uid`. Storage stays
     /// string-keyed via [`UserPrincipal::as_stored`] (see [`Self::caller_stored`]).
     pub caller_principal: Option<UserPrincipal>,
-    /// The caller's process id, when the transport can name it. Needed only to
-    /// ask an external authority about the caller — polkit identifies a subject
-    /// by pid and start time, and a pid alone would let a recycled number answer
-    /// for somebody else, which is why the mechanism reads the start time itself
-    /// rather than taking it from here.
-    pub caller_pid: Option<u32>,
+    /// The caller's process, when the transport can name it. Needed only to
+    /// ask an external authority about the caller.
+    pub caller_pid: Option<CallerProcess>,
+}
+
+/// The connecting process as the transport saw it at accept. polkit names a
+/// subject by pid AND start time: a pid alone could be recycled and answer for
+/// somebody else, and a start time read later, at the check, would only narrow
+/// that window. Read while the peer holds its end open, it closes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallerProcess {
+    pub pid: u32,
+    /// `None` when it could not be read; the authority is then never asked.
+    pub start_time: Option<u64>,
 }
 
 impl IpcRequestContext {
@@ -281,9 +306,9 @@ impl IpcResponseEnvelope {
 // ── Audit hook ───────────────────────────────────────────────────────────────
 
 /// Trait the IPC layer calls before executing a privileged mutation
-/// request. The audit emitter must persist the event durably; failure
-/// should propagate as `IpcErrorCode::Internal` so the mutation does
-/// not run silently.
+/// request, once its handler's precheck has accepted it. The audit emitter
+/// must persist the event durably; failure should propagate as
+/// `IpcErrorCode::Internal` so the mutation does not run silently.
 ///
 /// `Send + Sync` is required because the named-pipe IPC server shares the
 /// audit emitter across worker threads via `Arc`.
@@ -315,8 +340,12 @@ impl IpcAuditEmitter for NoopAuditEmitter {
 /// return the payload (or error).
 pub type HandlerOutcome = Result<serde_json::Value, IpcError>;
 
-/// Per-operation handler. The router looks one up by `IpcOperationName`
-/// after envelope validation.
+/// Per-operation handler for an operation that never changes state. The router
+/// looks one up by `IpcOperationName` after envelope validation.
+///
+/// A mutating operation implements [`CheckedIpcHandler`] instead; registered
+/// through [`IpcHandlerRegistry::register`], a mutating request to it is
+/// refused before anything is audited or run.
 ///
 /// `Send + Sync` is required because the named-pipe IPC server dispatches
 /// requests from multiple worker threads concurrently.
@@ -324,11 +353,121 @@ pub trait IpcHandler: Send + Sync {
     fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome;
 }
 
+/// A handler whose request is validated before it is audited.
+///
+/// The audit trail records requests the service admitted. A payload that does
+/// not decode, or that its handler would refuse anyway, must not leave a record
+/// of a mutation that never happened: refusals cost the caller nothing, and a
+/// loop of them would push the genuine history out of a size-capped trail. So
+/// the router runs [`Self::precheck`] first, audits only what it accepted, and
+/// hands [`Self::execute`] nothing but the checked value.
+pub trait CheckedIpcHandler: Send + Sync {
+    /// The decoded, validated request.
+    type Checked: 'static;
+
+    /// Decode and validate. Bounded, and changes nothing the request is about:
+    /// it may read the state a check compares against, and may spend a one-shot
+    /// confirmation token, which a refused confirm burns anyway. A refusal here
+    /// goes back to the caller with no audit record.
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError>;
+
+    /// Act on a request that passed [`Self::precheck`] and has been audited.
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome;
+}
+
+/// A request value its handler's precheck produced. Only this module builds
+/// one, so `execute` is unreachable with a payload nobody checked.
+pub struct Prechecked<T>(T);
+
+impl<T> Prechecked<T> {
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> std::ops::Deref for Prechecked<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+/// Direct calls (composition, unit tests) run precheck then execute with no
+/// audit, exactly what calling the handler did before the split. The router
+/// never takes this path for a checked handler.
+impl<H: CheckedIpcHandler> IpcHandler for H {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+        let checked = Prechecked(self.precheck(request, ctx)?);
+        self.execute(checked, request, ctx)
+    }
+}
+
+/// The work a handler has left once its request was accepted.
+type PreparedRun<'a> = Box<dyn FnOnce() -> HandlerOutcome + 'a>;
+
+/// Object-safe face of [`CheckedIpcHandler`] for the registry.
+trait ErasedCheckedHandler: Send + Sync {
+    fn prepare<'a>(
+        &'a self,
+        request: &'a IpcRequestEnvelope,
+        ctx: &'a IpcRequestContext,
+    ) -> Result<PreparedRun<'a>, IpcError>;
+}
+
+impl<H: CheckedIpcHandler> ErasedCheckedHandler for H {
+    fn prepare<'a>(
+        &'a self,
+        request: &'a IpcRequestEnvelope,
+        ctx: &'a IpcRequestContext,
+    ) -> Result<PreparedRun<'a>, IpcError> {
+        let checked = Prechecked(self.precheck(request, ctx)?);
+        Ok(Box::new(move || self.execute(checked, request, ctx)))
+    }
+}
+
+/// How a registered handler meets the "validated before audited" rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrecheckCoverage {
+    /// Registered with [`IpcHandlerRegistry::register`]: right for an
+    /// operation that never mutates; a mutating request to it is refused.
+    ReadOnly,
+    /// Registered with [`IpcHandlerRegistry::register_checked`].
+    Prechecked,
+    /// Registered with [`IpcHandlerRegistry::register_transitional`]: audited,
+    /// then validated by the handler, as every mutation once was.
+    Transitional,
+}
+
+enum RegisteredHandler {
+    ReadOnly(Box<dyn IpcHandler>),
+    Checked(Box<dyn ErasedCheckedHandler>),
+    Transitional(Box<dyn IpcHandler>),
+}
+
+impl RegisteredHandler {
+    fn coverage(&self) -> PrecheckCoverage {
+        match self {
+            Self::ReadOnly(_) => PrecheckCoverage::ReadOnly,
+            Self::Checked(_) => PrecheckCoverage::Prechecked,
+            Self::Transitional(_) => PrecheckCoverage::Transitional,
+        }
+    }
+}
+
 /// Registry of `IpcOperationName -> handler`. Cheap O(N) lookup over a
-/// `Vec` because the catalogue is tiny (<20 operations).
+/// `Vec` because the catalogue is small.
 #[derive(Default)]
 pub struct IpcHandlerRegistry {
-    entries: Vec<(IpcOperationName, Box<dyn IpcHandler>)>,
+    entries: Vec<(IpcOperationName, RegisteredHandler)>,
 }
 
 impl IpcHandlerRegistry {
@@ -338,15 +477,84 @@ impl IpcHandlerRegistry {
         }
     }
 
+    /// A handler for an operation that never mutates.
     pub fn register<H: IpcHandler + 'static>(&mut self, op: IpcOperationName, handler: H) {
-        self.entries.push((op, Box::new(handler)));
+        self.entries
+            .push((op, RegisteredHandler::ReadOnly(Box::new(handler))));
     }
 
-    fn find(&self, op: IpcOperationName) -> Option<&dyn IpcHandler> {
+    /// A handler whose requests are validated before they are audited.
+    pub fn register_checked<H: CheckedIpcHandler + 'static>(
+        &mut self,
+        op: IpcOperationName,
+        handler: H,
+    ) {
+        self.entries
+            .push((op, RegisteredHandler::Checked(Box::new(handler))));
+    }
+
+    /// A mutating handler not yet split into precheck and execute: audited
+    /// first, as before. Every use is listed in the production coverage test.
+    pub fn register_transitional<H: IpcHandler + 'static>(
+        &mut self,
+        op: IpcOperationName,
+        handler: H,
+    ) {
+        self.entries
+            .push((op, RegisteredHandler::Transitional(Box::new(handler))));
+    }
+
+    /// How `op`'s handler is registered, or `None` when it has none.
+    pub fn coverage(&self, op: IpcOperationName) -> Option<PrecheckCoverage> {
+        self.find(op).map(RegisteredHandler::coverage)
+    }
+
+    fn find(&self, op: IpcOperationName) -> Option<&RegisteredHandler> {
         self.entries
             .iter()
             .find(|(name, _)| *name == op)
-            .map(|(_, h)| h.as_ref())
+            .map(|(_, h)| h)
+    }
+}
+
+/// How many precheck refusals reach the operational log per window. A refused
+/// request costs its sender nothing, so an uncapped loop of them would rotate
+/// the log away just as it once flooded the audit trail.
+const REFUSAL_LOG_PER_WINDOW: u32 = 20;
+const REFUSAL_LOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Default)]
+struct RefusalLogBudget {
+    window: Mutex<RefusalLogWindow>,
+}
+
+#[derive(Default)]
+struct RefusalLogWindow {
+    started: Option<std::time::Instant>,
+    logged: u32,
+    suppressed: u64,
+}
+
+impl RefusalLogBudget {
+    /// `Some(n)` when this refusal may be logged, `n` being how many were
+    /// dropped since the last one that was; `None` when it is over budget.
+    fn admit(&self, now: std::time::Instant) -> Option<u64> {
+        // A poisoned lock costs the cap, never the line.
+        let Ok(mut w) = self.window.lock() else {
+            return Some(0);
+        };
+        if w.started
+            .is_none_or(|s| now.duration_since(s) >= REFUSAL_LOG_WINDOW)
+        {
+            w.started = Some(now);
+            w.logged = 0;
+        }
+        if w.logged >= REFUSAL_LOG_PER_WINDOW {
+            w.suppressed = w.suppressed.saturating_add(1);
+            return None;
+        }
+        w.logged += 1;
+        Some(std::mem::take(&mut w.suppressed))
     }
 }
 
@@ -440,6 +648,16 @@ pub struct IpcRouter {
     /// elevation. Absent on a platform where the caller elevates itself before
     /// connecting — there the answer is already in `caller_is_elevated`.
     authority: Option<Arc<dyn nrr_platform_api::authorization::AuthorizationPort>>,
+    refusal_log: RefusalLogBudget,
+}
+
+/// How far a request got through the router.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// Answered by the router or the handler, as before the precheck existed.
+    Answered,
+    /// Refused by its handler's precheck: nothing audited, nothing run.
+    RefusedByPrecheck,
 }
 
 impl IpcRouter {
@@ -453,66 +671,81 @@ impl IpcRouter {
             audit,
             authority: None,
             queue: MutationQueue::new(mutation_queue_capacity),
+            refusal_log: RefusalLogBudget::default(),
         }
     }
 
-    /// Ask the platform's authority about this caller and this class.
+    /// Ask the platform's authority whether this caller may take `action`.
     ///
-    /// The message on a refusal is the whole user-facing value of the check: an
-    /// administrator who is simply not allowed, a user with no authentication
-    /// agent to prompt them, and a machine with no authority at all need three
-    /// different things done about it.
-    fn authorize(&self, class: IpcOperationClass, ctx: &IpcRequestContext) -> AuthorizationOutcome {
+    /// The refusal begins with a slug naming the outcome, because the remedy
+    /// differs: an administrator who is not allowed, a caller nobody can prompt
+    /// (a terminal starts its own agent then), and a machine with no authority
+    /// at all (a terminal is told to start elevated).
+    fn authorize(
+        &self,
+        action: Option<&'static str>,
+        what: &str,
+        ctx: &IpcRequestContext,
+    ) -> AuthorizationOutcome {
         use nrr_platform_api::authorization::{AuthorizationDecision, AuthorizationSubject};
-        use nrr_shared::ipc_transport::TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG;
+        use nrr_shared::ipc_transport::{
+            ELEVATION_AGENT_MISSING_CLIENT_SLUG, ELEVATION_DECLINED_CLIENT_SLUG,
+            ELEVATION_UNAVAILABLE_CLIENT_SLUG, TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG,
+        };
         use nrr_shared::product_identity::BinaryRole;
 
-        // A terminal may be an SSH session with no agent to answer a prompt, so
-        // it is never asked: started elevated, or told how to be.
-        if ctx.client_profile == IpcClientProfile::Tui {
-            return AuthorizationOutcome::Refused(format!(
-                "{TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG}: {} needs an administrator; start {} \
+        let terminal = ctx.client_profile == IpcClientProfile::Tui;
+        let start_elevated = || {
+            AuthorizationOutcome::Refused(format!(
+                "{TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG}: {what} needs an administrator; start {} \
                  elevated (sudo, or an administrator terminal)",
-                class.slug(),
                 BinaryRole::Tui.unix_file_name(),
-            ));
-        }
-
+            ))
+        };
         let Some(authority) = self.authority.as_ref() else {
+            if terminal {
+                return start_elevated();
+            }
             return AuthorizationOutcome::Refused("operation requires an elevated client".into());
         };
-        let (Some(action), Some(pid)) = (class.authorization_action(), ctx.caller_pid) else {
-            return AuthorizationOutcome::Refused(
+        let unidentified = || {
+            AuthorizationOutcome::Refused(
                 "operation requires elevation and this caller cannot be identified".into(),
-            );
+            )
         };
-        let uid = ctx
+        let (Some(action), Some(process)) = (action, ctx.caller_pid) else {
+            return unidentified();
+        };
+        // Never a default uid: 0 would ask polkit about root.
+        let Some(uid) = ctx
             .caller_principal
             .as_ref()
-            .and_then(|p| p.as_unix_uid())
-            .unwrap_or(0);
-        let subject = AuthorizationSubject {
-            pid,
-            uid,
-            // The mechanism reads the start time itself: it is the half of the
-            // identity that makes the pid unambiguous, and taking it from a
-            // caller-supplied context would defeat that.
-            start_time: None,
+            .and_then(UserPrincipal::as_unix_uid)
+        else {
+            return unidentified();
         };
-        // An interactive client can be prompted; a background or console caller
-        // cannot, and popping a password dialog at one would be a prompt nobody
-        // is sitting in front of.
+        let subject = AuthorizationSubject {
+            pid: process.pid,
+            uid,
+            start_time: process.start_time,
+        };
+        // The window and the terminal have a person in front of them; the tray
+        // and the console do not, and a prompt there would wait for nobody.
         let interactive = ctx.client_profile.may_prompt_for_elevation();
         match authority.authorize(subject, action, interactive) {
             AuthorizationDecision::Allowed => AuthorizationOutcome::Granted,
             AuthorizationDecision::Denied => AuthorizationOutcome::Refused(format!(
-                "not authorized for {action}: an administrator may grant it"
+                "{ELEVATION_DECLINED_CLIENT_SLUG}: not authorized for {action}: an administrator \
+                 may grant it"
             )),
             AuthorizationDecision::NeedsInteraction => AuthorizationOutcome::Refused(format!(
-                "{action} needs confirmation, and no authentication agent is available in this session"
+                "{ELEVATION_AGENT_MISSING_CLIENT_SLUG}: {action} needs confirmation, and no \
+                 authentication agent answers for this caller"
             )),
+            AuthorizationDecision::Unavailable if terminal => start_elevated(),
             AuthorizationDecision::Unavailable => AuthorizationOutcome::Refused(format!(
-                "{action} could not be checked: no authorization service answered"
+                "{ELEVATION_UNAVAILABLE_CLIENT_SLUG}: {action} could not be checked: no \
+                 authorization service answered"
             )),
         }
     }
@@ -592,7 +825,7 @@ impl IpcRouter {
             has_token = request.confirmation_token.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
             "ipc request received",
         );
-        let response = self.dispatch_inner(request, ctx);
+        let (response, disposition) = self.dispatch_inner(request, ctx);
         let dur_us = dispatch_started.elapsed().as_micros() as u64;
         if response.ok {
             tracing::debug!(
@@ -604,22 +837,29 @@ impl IpcRouter {
                 "ipc request ok",
             );
         } else {
-            let (code, msg) = response
-                .error
-                .as_ref()
-                .map(|e| (format!("{:?}", e.code), e.message.clone()))
-                .unwrap_or_else(|| ("Unknown".into(), String::new()));
-            tracing::warn!(
-                target: "nrr::ipc::dispatch",
-                msg_key = "ipc-request-failed",
-                request_id = %response.request_id,
-                op = op_slug,
-                class = ?class,
-                duration_us = dur_us,
-                error_code = %code,
-                error_message = %msg,
-                "ipc request failed",
-            );
+            let suppressed = match disposition {
+                Disposition::Answered => Some(0),
+                Disposition::RefusedByPrecheck => self.refusal_log.admit(std::time::Instant::now()),
+            };
+            if let Some(suppressed) = suppressed {
+                let (code, msg) = response
+                    .error
+                    .as_ref()
+                    .map(|e| (format!("{:?}", e.code), e.message.clone()))
+                    .unwrap_or_else(|| ("Unknown".into(), String::new()));
+                tracing::warn!(
+                    target: "nrr::ipc::dispatch",
+                    msg_key = "ipc-request-failed",
+                    request_id = %response.request_id,
+                    op = op_slug,
+                    class = ?class,
+                    duration_us = dur_us,
+                    error_code = %code,
+                    error_message = %msg,
+                    refusals_not_logged = suppressed,
+                    "ipc request failed",
+                );
+            }
         }
         response
     }
@@ -628,6 +868,78 @@ impl IpcRouter {
         &self,
         request: IpcRequestEnvelope,
         ctx: IpcRequestContext,
+    ) -> (IpcResponseEnvelope, Disposition) {
+        let mut disposition = Disposition::Answered;
+        // Kept only where the service itself could lift a handler's refusal.
+        let retry = (self.authority.is_some()
+            && !ctx.caller_is_elevated
+            && nrr_shared::ipc_transport::handler_may_need_administrator(request.operation))
+        .then(|| (request.clone(), ctx.clone()));
+        let response = self.admit_and_run(request, ctx, &mut disposition);
+        let Some((request, ctx)) = retry else {
+            return (response, disposition);
+        };
+        // Only a precheck refusal: nothing ran, nothing was audited, no
+        // confirmation token was spent, so running it again is the same request.
+        let needs_administrator = disposition == Disposition::RefusedByPrecheck
+            && response.error.as_ref().is_some_and(|e| {
+                e.code == IpcErrorCode::Forbidden
+                    && nrr_shared::ipc_transport::is_needs_administrator(&e.message)
+            });
+        if !needs_administrator {
+            return (response, disposition);
+        }
+        self.run_authorized(request, ctx)
+    }
+
+    /// The service's twin of the Windows broker: a handler refused a value only
+    /// an administrator may set, so the authority is asked (with a prompt, for
+    /// a client that has a person in front of it) and, on a yes, the request
+    /// runs again with rights. The caller stays who they are: only the
+    /// elevation flag changes, never the principal the request belongs to.
+    fn run_authorized(
+        &self,
+        request: IpcRequestEnvelope,
+        ctx: IpcRequestContext,
+    ) -> (IpcResponseEnvelope, Disposition) {
+        let op = request.operation;
+        let action = nrr_shared::ipc_transport::needs_administrator_action(op);
+        match self.authorize(Some(action), op.slug(), &ctx) {
+            AuthorizationOutcome::Granted => {
+                tracing::info!(
+                    target: "nrr::ipc::dispatch",
+                    op = op.slug(),
+                    action,
+                    caller = %ctx.caller_stored(),
+                    "authorized by the platform authority; running the request with rights",
+                );
+                let elevated = IpcRequestContext {
+                    caller_is_elevated: true,
+                    ..ctx
+                };
+                let mut disposition = Disposition::Answered;
+                let response = self.admit_and_run(request, elevated, &mut disposition);
+                (response, disposition)
+            }
+            AuthorizationOutcome::Refused(message) => (
+                IpcResponseEnvelope::err(
+                    &request,
+                    IpcError {
+                        code: IpcErrorCode::Forbidden,
+                        message,
+                        diagnostics_id: None,
+                    },
+                ),
+                Disposition::Answered,
+            ),
+        }
+    }
+
+    fn admit_and_run(
+        &self,
+        request: IpcRequestEnvelope,
+        ctx: IpcRequestContext,
+        disposition: &mut Disposition,
     ) -> IpcResponseEnvelope {
         // Derived, never accepted — see `dispatch`.
         let class = canonical_operation_class(request.operation, &request.payload);
@@ -739,7 +1051,7 @@ impl IpcRouter {
         //    "yes" gets through: "could not ask" and "no agent available" are
         //    refusals with different advice, never permission.
         if class.requires_elevation() && !ctx.caller_is_elevated {
-            match self.authorize(class, &ctx) {
+            match self.authorize(class.authorization_action(), class.slug(), &ctx) {
                 AuthorizationOutcome::Granted => {}
                 AuthorizationOutcome::Refused(message) => {
                     return IpcResponseEnvelope::err(
@@ -754,7 +1066,62 @@ impl IpcRouter {
             }
         }
 
-        // 4. Audit privileged mutations *before* execution.
+        // 5. Mutation queue (only for mutating ops). Claimed before the
+        //    precheck, which may spend a confirmation token: a request turned
+        //    away as busy keeps its token, and is not recorded either.
+        let _slot = if class.is_mutating() {
+            match self.queue.try_enter(&request.request_id) {
+                Ok(guard) => Some(guard),
+                Err(e) => return IpcResponseEnvelope::err(&request, e),
+            }
+        } else {
+            None
+        };
+
+        // 6. The handler, and its verdict on the payload. Only a request that
+        //    passed it goes on to the audit and execution: a refusal here
+        //    leaves no record of a mutation that never ran.
+        let Some(handler) = self.registry.find(request.operation) else {
+            return IpcResponseEnvelope::err(
+                &request,
+                IpcError {
+                    code: IpcErrorCode::MalformedRequest,
+                    message: format!("operation {} has no handler", request.operation.slug()),
+                    diagnostics_id: None,
+                },
+            );
+        };
+        let run: PreparedRun<'_> = match handler {
+            RegisteredHandler::Checked(h) => match h.prepare(&request, &ctx) {
+                Ok(run) => run,
+                Err(error) => {
+                    *disposition = Disposition::RefusedByPrecheck;
+                    return IpcResponseEnvelope::err(&request, error);
+                }
+            },
+            // Fails closed: a mutation whose handler cannot check it first
+            // neither runs unaudited nor writes a record before it is checked.
+            RegisteredHandler::ReadOnly(_) if class.is_mutating() => {
+                return IpcResponseEnvelope::err(
+                    &request,
+                    IpcError {
+                        code: IpcErrorCode::Internal,
+                        message: format!(
+                            "operation {op} changes state and its handler has no precheck",
+                            op = request.operation.slug()
+                        ),
+                        diagnostics_id: None,
+                    },
+                );
+            }
+            RegisteredHandler::ReadOnly(h) | RegisteredHandler::Transitional(h) => {
+                let (request, ctx) = (&request, &ctx);
+                Box::new(move || h.handle(request, ctx))
+            }
+        };
+
+        // 7. Audit privileged mutations *before* execution; a failed write
+        //    is a refusal, so an unaudited mutation never runs.
         if class.is_mutating() {
             if let Err(e) = self.audit.record_request(&request, &ctx) {
                 return IpcResponseEnvelope::err(
@@ -768,32 +1135,8 @@ impl IpcRouter {
             }
         }
 
-        // 5. Mutation queue (only for mutating ops).
-        let _slot = if class.is_mutating() {
-            match self.queue.try_enter(&request.request_id) {
-                Ok(guard) => Some(guard),
-                Err(e) => return IpcResponseEnvelope::err(&request, e),
-            }
-        } else {
-            None
-        };
-
-        // 6. Handler dispatch.
-        let handler = match self.registry.find(request.operation) {
-            Some(h) => h,
-            None => {
-                return IpcResponseEnvelope::err(
-                    &request,
-                    IpcError {
-                        code: IpcErrorCode::MalformedRequest,
-                        message: format!("operation {} has no handler", request.operation.slug()),
-                        diagnostics_id: None,
-                    },
-                );
-            }
-        };
-
-        match handler.handle(&request, &ctx) {
+        // 8. Execution.
+        match run() {
             Ok(payload) => IpcResponseEnvelope::ok_payload(&request, payload),
             Err(error) => IpcResponseEnvelope::err(&request, error),
         }
@@ -857,8 +1200,21 @@ mod tests {
     }
 
     struct EchoHandler;
-    impl IpcHandler for EchoHandler {
-        fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    impl CheckedIpcHandler for EchoHandler {
+        type Checked = ();
+        fn precheck(
+            &self,
+            _request: &IpcRequestEnvelope,
+            _ctx: &IpcRequestContext,
+        ) -> Result<(), IpcError> {
+            Ok(())
+        }
+        fn execute(
+            &self,
+            _checked: Prechecked<()>,
+            request: &IpcRequestEnvelope,
+            _ctx: &IpcRequestContext,
+        ) -> HandlerOutcome {
             Ok(serde_json::json!({ "echo": request.operation.slug() }))
         }
     }
@@ -866,10 +1222,207 @@ mod tests {
     fn make_router() -> IpcRouter {
         let mut reg = IpcHandlerRegistry::new();
         reg.register(IpcOperationName::ServiceHealthGet, EchoHandler);
-        reg.register(IpcOperationName::MutationSubmit, EchoHandler);
-        reg.register(IpcOperationName::RollbackRequest, EchoHandler);
+        reg.register_checked(IpcOperationName::MutationSubmit, EchoHandler);
+        reg.register_checked(IpcOperationName::RollbackRequest, EchoHandler);
         reg.register(IpcOperationName::InterfacesRefreshRequest, EchoHandler);
         IpcRouter::new(reg, Arc::new(NoopAuditEmitter), 1)
+    }
+
+    /// Counts audit records.
+    #[derive(Default)]
+    struct CountingAudit {
+        records: AtomicUsize,
+    }
+    impl IpcAuditEmitter for CountingAudit {
+        fn record_request(
+            &self,
+            _r: &IpcRequestEnvelope,
+            _c: &IpcRequestContext,
+        ) -> Result<(), String> {
+            self.records.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Accepts only `{"value": <u8>}` and notes, when it runs, how many audit
+    /// records existed at that moment.
+    struct StrictHandler {
+        audit: Arc<CountingAudit>,
+        records_seen_at_execute: Arc<Mutex<Vec<usize>>>,
+    }
+    impl CheckedIpcHandler for StrictHandler {
+        type Checked = u8;
+        fn precheck(
+            &self,
+            request: &IpcRequestEnvelope,
+            _ctx: &IpcRequestContext,
+        ) -> Result<u8, IpcError> {
+            request
+                .payload
+                .get("value")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u8::try_from(v).ok())
+                .ok_or_else(|| IpcError {
+                    code: IpcErrorCode::MalformedRequest,
+                    message: "value must be a u8".into(),
+                    diagnostics_id: None,
+                })
+        }
+        fn execute(
+            &self,
+            checked: Prechecked<u8>,
+            _request: &IpcRequestEnvelope,
+            _ctx: &IpcRequestContext,
+        ) -> HandlerOutcome {
+            if let Ok(mut seen) = self.records_seen_at_execute.lock() {
+                seen.push(self.audit.records.load(Ordering::SeqCst));
+            }
+            Ok(serde_json::json!({ "value": *checked }))
+        }
+    }
+
+    fn strict_router() -> (IpcRouter, Arc<CountingAudit>, Arc<Mutex<Vec<usize>>>) {
+        let audit = Arc::new(CountingAudit::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = IpcHandlerRegistry::new();
+        reg.register_checked(
+            IpcOperationName::RoutingPauseToggle,
+            StrictHandler {
+                audit: Arc::clone(&audit),
+                records_seen_at_execute: Arc::clone(&seen),
+            },
+        );
+        (IpcRouter::new(reg, audit.clone(), 1), audit, seen)
+    }
+
+    fn user_config_request(payload: serde_json::Value) -> IpcRequestEnvelope {
+        IpcRequestEnvelope {
+            payload,
+            ..req(
+                IpcOperationName::RoutingPauseToggle,
+                IpcOperationClass::UserScopedConfiguration,
+                IPC_PROTOCOL_VERSION,
+                None,
+            )
+        }
+    }
+
+    /// A payload its handler refuses is answered with that refusal and leaves
+    /// no audit record: the trail holds requests the service admitted, not
+    /// whatever a caller chose to send.
+    #[test]
+    fn a_request_its_precheck_refuses_is_never_audited() {
+        let (router, audit, seen) = strict_router();
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({ "value": "x" }),
+            serde_json::json!({ "value": 300 }),
+        ] {
+            let r = router.dispatch(user_config_request(payload.clone()), elevated_gui());
+            assert_eq!(
+                r.error.map(|e| e.code),
+                Some(IpcErrorCode::MalformedRequest),
+                "{payload}"
+            );
+        }
+        assert_eq!(audit.records.load(Ordering::SeqCst), 0);
+        assert!(seen.lock().map(|s| s.is_empty()).unwrap_or(false));
+    }
+
+    /// An accepted request is recorded exactly once, and the record exists
+    /// before the handler acts.
+    #[test]
+    fn an_accepted_mutation_is_audited_once_before_it_runs() {
+        let (router, audit, seen) = strict_router();
+        let r = router.dispatch(
+            user_config_request(serde_json::json!({ "value": 7 })),
+            elevated_gui(),
+        );
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(audit.records.load(Ordering::SeqCst), 1);
+        assert_eq!(seen.lock().map(|s| s.clone()).unwrap_or_default(), vec![1]);
+    }
+
+    /// A mutating operation registered without a precheck fails closed: it
+    /// neither runs nor writes a record ahead of a check.
+    #[test]
+    fn a_mutation_registered_without_a_precheck_is_refused_unaudited() {
+        struct Plain;
+        impl IpcHandler for Plain {
+            fn handle(&self, _r: &IpcRequestEnvelope, _c: &IpcRequestContext) -> HandlerOutcome {
+                Ok(serde_json::json!({ "ran": true }))
+            }
+        }
+        let audit = Arc::new(CountingAudit::default());
+        let mut reg = IpcHandlerRegistry::new();
+        reg.register(IpcOperationName::RoutingPauseToggle, Plain);
+        let router = IpcRouter::new(reg, audit.clone(), 1);
+        let r = router.dispatch(
+            user_config_request(serde_json::json!({ "value": 1 })),
+            elevated_gui(),
+        );
+        assert_eq!(r.error.map(|e| e.code), Some(IpcErrorCode::Internal));
+        assert_eq!(audit.records.load(Ordering::SeqCst), 0);
+    }
+
+    /// The transitional path keeps the old order: audited, then handled.
+    #[test]
+    fn a_transitional_handler_is_still_audited_before_it_runs() {
+        struct Plain(Arc<CountingAudit>);
+        impl IpcHandler for Plain {
+            fn handle(&self, _r: &IpcRequestEnvelope, _c: &IpcRequestContext) -> HandlerOutcome {
+                Ok(serde_json::json!({ "records": self.0.records.load(Ordering::SeqCst) }))
+            }
+        }
+        let audit = Arc::new(CountingAudit::default());
+        let mut reg = IpcHandlerRegistry::new();
+        reg.register_transitional(
+            IpcOperationName::RoutingPauseToggle,
+            Plain(Arc::clone(&audit)),
+        );
+        assert_eq!(
+            reg.coverage(IpcOperationName::RoutingPauseToggle),
+            Some(PrecheckCoverage::Transitional)
+        );
+        let router = IpcRouter::new(reg, audit.clone(), 1);
+        let r = router.dispatch(user_config_request(serde_json::json!({})), elevated_gui());
+        assert_eq!(r.payload, Some(serde_json::json!({ "records": 1 })));
+    }
+
+    /// A dry run is a read: prechecked and run, never audited.
+    #[test]
+    fn a_checked_handler_serving_a_read_is_not_audited() {
+        let audit = Arc::new(CountingAudit::default());
+        let mut reg = IpcHandlerRegistry::new();
+        reg.register_checked(IpcOperationName::MutationSubmit, EchoHandler);
+        let router = IpcRouter::new(reg, audit.clone(), 1);
+        let request = IpcRequestEnvelope {
+            payload: serde_json::json!({ "dry-run": true }),
+            ..req(
+                IpcOperationName::MutationSubmit,
+                IpcOperationClass::ReadSnapshot,
+                IPC_PROTOCOL_VERSION,
+                None,
+            )
+        };
+        let r = router.dispatch(request, elevated_gui());
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(audit.records.load(Ordering::SeqCst), 0);
+    }
+
+    /// Precheck refusals reach the log up to the budget per window; the rest
+    /// are counted and reported on the next line that is written.
+    #[test]
+    fn precheck_refusals_are_logged_within_a_budget() {
+        let budget = RefusalLogBudget::default();
+        let t0 = std::time::Instant::now();
+        for _ in 0..REFUSAL_LOG_PER_WINDOW {
+            assert_eq!(budget.admit(t0), Some(0));
+        }
+        assert_eq!(budget.admit(t0), None);
+        assert_eq!(budget.admit(t0), None);
+        assert_eq!(budget.admit(t0 + REFUSAL_LOG_WINDOW), Some(2));
+        assert_eq!(budget.admit(t0 + REFUSAL_LOG_WINDOW), Some(0));
     }
 
     #[test]
@@ -1076,7 +1629,7 @@ mod tests {
             }
         }
         let mut reg = IpcHandlerRegistry::new();
-        reg.register(IpcOperationName::MutationSubmit, EchoHandler);
+        reg.register_checked(IpcOperationName::MutationSubmit, EchoHandler);
         let audit = Arc::new(FailingAudit {
             count: AtomicUsize::new(0),
         });
@@ -1201,7 +1754,10 @@ mod tests {
                 client_profile: IpcClientProfile::GuiInteractive,
                 caller_is_elevated: false,
                 caller_principal: Some(UserPrincipal::from_linux_uid(1000)),
-                caller_pid: Some(4321),
+                caller_pid: Some(CallerProcess {
+                    pid: 4321,
+                    start_time: Some(1),
+                }),
             };
             router.dispatch(baseline_rollback_request(), ctx)
         };
@@ -1232,13 +1788,15 @@ mod tests {
         }
     }
 
-    /// The terminal is never put in front of the authority: unelevated, it is
-    /// refused with the slug that names the remedy, even where the authority
-    /// would have said yes; elevated (`sudo nrr-tui`), it passes.
+    /// The terminal asks the authority like the window does (it answers the
+    /// prompt with its own agent); only where nobody can be asked at all is it
+    /// told to start elevated. Elevated (`sudo nrr-tui`), it passes.
     #[test]
-    fn a_terminal_needs_to_be_started_elevated_and_is_never_prompted() {
+    fn a_terminal_is_asked_and_told_to_start_elevated_only_without_an_authority() {
         use nrr_platform_api::authorization::{AuthorizationDecision, FixedAuthority};
-        use nrr_shared::ipc_transport::TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG;
+        use nrr_shared::ipc_transport::{
+            ELEVATION_AGENT_MISSING_CLIENT_SLUG, TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG,
+        };
 
         let tui = |elevated: bool| {
             let uid = if elevated { 0 } else { 1000 };
@@ -1246,13 +1804,39 @@ mod tests {
                 client_profile: IpcClientProfile::Tui,
                 caller_is_elevated: elevated,
                 caller_principal: Some(UserPrincipal::from_linux_uid(uid)),
-                caller_pid: Some(4321),
+                caller_pid: Some(CallerProcess {
+                    pid: 4321,
+                    start_time: Some(1),
+                }),
             }
         };
-        let allowing = Arc::new(FixedAuthority(AuthorizationDecision::Allowed));
-        for router in [make_router().with_authority(allowing), make_router()] {
-            let refused = router.dispatch(baseline_rollback_request(), tui(false));
-            let error = refused.error.expect("an unelevated terminal is refused");
+        let passes = |response: IpcResponseEnvelope| {
+            response
+                .error
+                .is_none_or(|e| e.code != IpcErrorCode::Forbidden)
+        };
+        let refusal = |router: &IpcRouter| {
+            router
+                .dispatch(baseline_rollback_request(), tui(false))
+                .error
+                .expect("refused")
+        };
+        let authority = |decision| make_router().with_authority(Arc::new(FixedAuthority(decision)));
+
+        assert!(passes(
+            authority(AuthorizationDecision::Allowed)
+                .dispatch(baseline_rollback_request(), tui(false))
+        ));
+        let no_agent = refusal(&authority(AuthorizationDecision::NeedsInteraction));
+        assert!(
+            no_agent
+                .message
+                .starts_with(ELEVATION_AGENT_MISSING_CLIENT_SLUG),
+            "{}",
+            no_agent.message
+        );
+        for router in [authority(AuthorizationDecision::Unavailable), make_router()] {
+            let error = refusal(&router);
             assert_eq!(error.code, IpcErrorCode::Forbidden);
             assert!(
                 error
@@ -1261,13 +1845,226 @@ mod tests {
                 "{}",
                 error.message
             );
-
-            let root = router.dispatch(baseline_rollback_request(), tui(true));
             assert!(
-                root.error.is_none_or(|e| e.code != IpcErrorCode::Forbidden),
+                passes(router.dispatch(baseline_rollback_request(), tui(true))),
                 "an elevated terminal passes the elevation gate"
             );
         }
+    }
+
+    /// Refuses a change unless the caller is elevated, like a setting the whole
+    /// machine shares, and counts the runs that had the rights.
+    struct MachineValueHandler {
+        elevated_runs: Arc<AtomicUsize>,
+    }
+    impl CheckedIpcHandler for MachineValueHandler {
+        type Checked = ();
+        fn precheck(
+            &self,
+            _request: &IpcRequestEnvelope,
+            ctx: &IpcRequestContext,
+        ) -> Result<(), IpcError> {
+            if ctx.caller_is_elevated {
+                Ok(())
+            } else {
+                Err(IpcError::needs_administrator(
+                    "the test setting is the machine's",
+                ))
+            }
+        }
+        fn execute(
+            &self,
+            _checked: Prechecked<()>,
+            _request: &IpcRequestEnvelope,
+            ctx: &IpcRequestContext,
+        ) -> HandlerOutcome {
+            if ctx.caller_is_elevated {
+                self.elevated_runs.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    fn machine_value_router(
+        authority: Option<Arc<dyn nrr_platform_api::authorization::AuthorizationPort>>,
+    ) -> (IpcRouter, Arc<AtomicUsize>) {
+        let elevated_runs = Arc::new(AtomicUsize::new(0));
+        let mut reg = IpcHandlerRegistry::new();
+        reg.register_checked(
+            IpcOperationName::TrafficStatsSet,
+            MachineValueHandler {
+                elevated_runs: Arc::clone(&elevated_runs),
+            },
+        );
+        let router = IpcRouter::new(reg, Arc::new(NoopAuditEmitter), 1);
+        let router = match authority {
+            Some(authority) => router.with_authority(authority),
+            None => router,
+        };
+        (router, elevated_runs)
+    }
+
+    fn machine_value_request() -> IpcRequestEnvelope {
+        let payload = serde_json::json!({});
+        IpcRequestEnvelope {
+            operation_class: canonical_operation_class(IpcOperationName::TrafficStatsSet, &payload),
+            payload,
+            ..req(
+                IpcOperationName::TrafficStatsSet,
+                IpcOperationClass::UserScopedConfiguration,
+                IPC_PROTOCOL_VERSION,
+                None,
+            )
+        }
+    }
+
+    fn linux_gui_user() -> IpcRequestContext {
+        IpcRequestContext {
+            client_profile: IpcClientProfile::GuiInteractive,
+            caller_is_elevated: false,
+            caller_principal: Some(UserPrincipal::from_linux_uid(1000)),
+            caller_pid: Some(CallerProcess {
+                pid: 4321,
+                start_time: Some(9),
+            }),
+        }
+    }
+
+    /// The service's twin of the broker: a value only an administrator may set
+    /// is asked about and, on a yes, run again with rights for the same user.
+    #[test]
+    fn a_machine_value_is_run_with_rights_once_the_authority_allows_it() {
+        let authority = Arc::new(RecordingAuthority::default());
+        let (router, elevated_runs) = machine_value_router(Some(
+            authority.clone() as Arc<dyn nrr_platform_api::authorization::AuthorizationPort>
+        ));
+        let response = router.dispatch(machine_value_request(), linux_gui_user());
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(elevated_runs.load(Ordering::SeqCst), 1);
+        let asked = authority.0.lock().expect("lock").clone();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].uid, 1000);
+    }
+
+    /// Each outcome of the question reaches the client as its own code, and
+    /// nothing runs; without an authority the handler's own refusal stands, for
+    /// the Windows broker to lift.
+    #[test]
+    fn a_refused_machine_value_names_why_and_runs_nothing() {
+        use nrr_platform_api::authorization::{AuthorizationDecision, FixedAuthority};
+        use nrr_shared::ipc_transport::{
+            forbidden_client_code, is_needs_administrator, ELEVATION_AGENT_MISSING_CLIENT_SLUG,
+            ELEVATION_DECLINED_CLIENT_SLUG, ELEVATION_UNAVAILABLE_CLIENT_SLUG,
+        };
+
+        for (decision, code) in [
+            (
+                AuthorizationDecision::Denied,
+                ELEVATION_DECLINED_CLIENT_SLUG,
+            ),
+            (
+                AuthorizationDecision::NeedsInteraction,
+                ELEVATION_AGENT_MISSING_CLIENT_SLUG,
+            ),
+            (
+                AuthorizationDecision::Unavailable,
+                ELEVATION_UNAVAILABLE_CLIENT_SLUG,
+            ),
+        ] {
+            let (router, elevated_runs) =
+                machine_value_router(Some(Arc::new(FixedAuthority(decision))
+                    as Arc<dyn nrr_platform_api::authorization::AuthorizationPort>));
+            let error = router
+                .dispatch(machine_value_request(), linux_gui_user())
+                .error
+                .expect("refused");
+            assert_eq!(error.code, IpcErrorCode::Forbidden);
+            assert_eq!(forbidden_client_code(&error.message), code, "{decision:?}");
+            assert_eq!(elevated_runs.load(Ordering::SeqCst), 0);
+        }
+
+        let (router, _) = machine_value_router(None);
+        let error = router
+            .dispatch(machine_value_request(), linux_gui_user())
+            .error
+            .expect("refused");
+        assert!(is_needs_administrator(&error.message), "{}", error.message);
+    }
+
+    /// Remembers the subjects it was asked about and allows them.
+    #[derive(Default)]
+    struct RecordingAuthority(
+        std::sync::Mutex<Vec<nrr_platform_api::authorization::AuthorizationSubject>>,
+    );
+
+    impl nrr_platform_api::authorization::AuthorizationPort for RecordingAuthority {
+        fn authorize(
+            &self,
+            subject: nrr_platform_api::authorization::AuthorizationSubject,
+            _action: &str,
+            _allow_interaction: bool,
+        ) -> nrr_platform_api::authorization::AuthorizationDecision {
+            if let Ok(mut asked) = self.0.lock() {
+                asked.push(subject);
+            }
+            nrr_platform_api::authorization::AuthorizationDecision::Allowed
+        }
+    }
+
+    /// The start time the transport read at accept is what polkit is asked
+    /// with; without it the Linux authority answers "could not ask" to every
+    /// GUI request.
+    #[test]
+    fn the_authority_is_asked_with_the_start_time_read_at_accept() {
+        let authority = Arc::new(RecordingAuthority::default());
+        let router = make_router().with_authority(authority.clone());
+        let ctx = IpcRequestContext {
+            client_profile: IpcClientProfile::GuiInteractive,
+            caller_is_elevated: false,
+            caller_principal: Some(UserPrincipal::from_linux_uid(1000)),
+            caller_pid: Some(CallerProcess {
+                pid: 4321,
+                start_time: Some(987_654),
+            }),
+        };
+        let _ = router.dispatch(baseline_rollback_request(), ctx);
+        let asked = authority.0.lock().expect("lock").clone();
+        assert_eq!(
+            asked,
+            vec![nrr_platform_api::authorization::AuthorizationSubject {
+                pid: 4321,
+                uid: 1000,
+                start_time: Some(987_654),
+            }]
+        );
+    }
+
+    /// A caller with no unix identity is refused without asking: a default uid
+    /// of 0 would have asked polkit about root.
+    #[test]
+    fn a_caller_without_a_unix_uid_is_refused_unasked() {
+        let authority = Arc::new(RecordingAuthority::default());
+        let router = make_router().with_authority(authority.clone());
+        for principal in [
+            None,
+            UserPrincipal::from_windows_sid("S-1-5-21-1-2-3-1001").ok(),
+        ] {
+            let ctx = IpcRequestContext {
+                client_profile: IpcClientProfile::GuiInteractive,
+                caller_is_elevated: false,
+                caller_principal: principal,
+                caller_pid: Some(CallerProcess {
+                    pid: 4321,
+                    start_time: Some(1),
+                }),
+            };
+            let error = router
+                .dispatch(baseline_rollback_request(), ctx)
+                .error
+                .expect("refused");
+            assert_eq!(error.code, IpcErrorCode::Forbidden);
+        }
+        assert!(authority.0.lock().expect("lock").is_empty());
     }
 
     /// Without an authority the router behaves exactly as it did before one
@@ -1279,7 +2076,10 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: false,
             caller_principal: Some(UserPrincipal::from_linux_uid(1000)),
-            caller_pid: Some(4321),
+            caller_pid: Some(CallerProcess {
+                pid: 4321,
+                start_time: Some(1),
+            }),
         };
 
         let response = router.dispatch(baseline_rollback_request(), ctx);

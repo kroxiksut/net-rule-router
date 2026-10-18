@@ -167,11 +167,11 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
                 Err(err) => report_failure("install", &err, ctx, "install"),
             }
         }),
-        Command::Uninstall { purge } => with_port(exe, "uninstall", |port| {
-            let spec = if purge {
-                ServiceUninstallSpec::purge_data()
-            } else {
-                ServiceUninstallSpec::keep_data()
+        Command::Uninstall { purge, purge_audit } => with_port(exe, "uninstall", |port| {
+            let spec = match (purge, purge_audit) {
+                (true, true) => ServiceUninstallSpec::purge_data_and_audit(),
+                (true, false) => ServiceUninstallSpec::purge_data(),
+                (false, _) => ServiceUninstallSpec::keep_data(),
             };
             match port.uninstall(&spec) {
                 Ok(report) => {
@@ -179,6 +179,14 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
                     println!(
                         "  service data:      {}",
                         if report.data_removed {
+                            "deleted"
+                        } else {
+                            "kept"
+                        }
+                    );
+                    println!(
+                        "  audit trail:       {}",
+                        if report.data_removed && purge_audit {
                             "deleted"
                         } else {
                             "kept"
@@ -192,10 +200,10 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
                     "uninstall",
                     &err,
                     ctx,
-                    if purge {
-                        "uninstall --purge"
-                    } else {
-                        "uninstall"
+                    match (purge, purge_audit) {
+                        (true, true) => "uninstall --purge --purge-audit",
+                        (true, false) => "uninstall --purge",
+                        (false, _) => "uninstall",
                     },
                 ),
             }

@@ -33,7 +33,7 @@ fn only_the_rule_dialog_save_notes_an_own_edit() {
         "a rule saved from the dialog must settle the exceptions it makes"
     );
     assert!(
-        !function_body(&main, "saveRuleList").contains("noteOwnEdit"),
+        !function_body(&main, "saveBulkRules").contains("noteOwnEdit"),
         "a pasted list is not an exception the user wrote one by one"
     );
     assert_eq!(

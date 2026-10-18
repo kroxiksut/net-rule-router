@@ -9,8 +9,8 @@ mod js_harness;
 
 use js_harness::{arg, check, check_cases, lit, load_vectors, merged, text, Case, JsLib};
 use nrr_client_logic::auto_rules::{
-    count_dismissed_hosts, count_served_by_main_link, count_shown_pending_hosts, filter_by_status,
-    filter_served_by_main_link, group_rows, main_route_rank, registrable_domain,
+    any_zone_site, count_dismissed_hosts, count_served_by_main_link, count_shown_pending_hosts,
+    filter_by_status, filter_served_by_main_link, group_rows, main_route_rank, registrable_domain,
     rows_shown_by_default, search, sort_groups, SortMode, SuggestionGroup, SuggestionHost,
 };
 use nrr_shared::ipc_payloads::{AutoRuleCandidateDto, AutoRuleDismissedEntryDto};
@@ -66,6 +66,14 @@ fn host_shape(host: &SuggestionHost) -> Value {
     }
     out.insert("observedMembers".into(), json!(host.observed_members));
     out.insert("timestampMs".into(), Value::from(host.timestamp_ms));
+    out.insert(
+        "anyZoneSite".into(),
+        Value::from(host.any_zone_site.as_str()),
+    );
+    out.insert(
+        "lessCertain".into(),
+        Value::from(host.less_certain.as_str()),
+    );
     Value::Object(out)
 }
 
@@ -80,6 +88,7 @@ fn group_shape(group: &SuggestionGroup) -> Value {
         "latestMs": group.latest_ms,
         "rank": main_route_rank(group),
         "shownPending": count_shown_pending_hosts(group),
+        "anyZoneSite": any_zone_site(group),
     })
 }
 
@@ -95,7 +104,8 @@ const PIPELINE: &str = "(function (c, d, showDismissed, showServed, query, sort)
         groups: shown.map(function (g) { return { \
             domain: g.domain, isApp: g.isApp, hosts: g.hosts, pendingIds: g.pendingIds, \
             dismissedIds: g.dismissedIds, consumers: g.consumers, latestMs: g.latestMs, \
-            rank: autoRuleGroupMainRouteRank(g), shownPending: countShownPendingAutoRuleHosts(g) \
+            rank: autoRuleGroupMainRouteRank(g), shownPending: countShownPendingAutoRuleHosts(g), \
+            anyZoneSite: autoRuleGroupAnyZoneSite(g) \
         } }) \
     } })";
 

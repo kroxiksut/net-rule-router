@@ -61,7 +61,13 @@ const START_MODE_FLAG: FlagSpec = FlagSpec {
 const PURGE_FLAG: FlagSpec = FlagSpec {
     name: "purge",
     value: None,
-    summary: "also delete the service-owned data directory (user rule files are kept)",
+    summary: "also delete the service-owned data (user rule files and the audit trail are kept)",
+};
+
+const PURGE_AUDIT_FLAG: FlagSpec = FlagSpec {
+    name: "purge-audit",
+    value: None,
+    summary: "with --purge: delete the audit trail too",
 };
 
 const CONFIRM_FLAG: FlagSpec = FlagSpec {
@@ -129,7 +135,7 @@ pub static VERBS: &[VerbSpec] = &[
     VerbSpec {
         name: "uninstall",
         summary: "Deregister the service",
-        flags: &[PURGE_FLAG, ELEVATE_FLAG],
+        flags: &[PURGE_FLAG, PURGE_AUDIT_FLAG, ELEVATE_FLAG],
         privilege: Privilege::Administrator,
         subverbs: &[],
     },
@@ -408,7 +414,7 @@ mod tests {
     fn the_console_accepts_exactly_this_surface() {
         const SURFACE: &[(&str, &[&str])] = &[
             ("install", &["start-mode", "elevate"]),
-            ("uninstall", &["purge", "elevate"]),
+            ("uninstall", &["purge", "purge-audit", "elevate"]),
             ("start", &["elevate"]),
             ("stop", &["elevate"]),
             ("restart", &["elevate"]),

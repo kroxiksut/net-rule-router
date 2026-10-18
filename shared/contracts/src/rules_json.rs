@@ -92,11 +92,12 @@ pub use crate::auto_rule::RuleOrigin as RuleOriginDto;
 /// any struct in this module changes in a way that could break
 /// content-hash idempotency or codec round-trips.
 ///
-/// Cumulative: 2 added subnets and ranges, 3 the `verify-primary` action. A
+/// Cumulative: 2 added subnets and ranges, 3 the `verify-primary` action, 4
+/// the any-zone domain, 5 the application path. A
 /// book is written at the lowest version its content needs, so its bytes and
 /// content hash stay what they were; a reader accepts any version and keeps
 /// the kinds it does not know.
-pub const RULES_JSON_SCHEMA_VERSION: u16 = 3;
+pub const RULES_JSON_SCHEMA_VERSION: u16 = 5;
 
 /// Versioned canonical envelope for the rules of a single revision.
 ///
@@ -257,6 +258,12 @@ pub enum AddressMatchDto {
         /// The suffix without the `*.` prefix.
         suffix: String,
     },
+    /// A site in every zone, with its subdomains: `"example"` renders as
+    /// `example.*`. Always lowercase, no wildcards.
+    AnyZoneDomain {
+        /// The site name without `.*`.
+        base: String,
+    },
     /// Zone (TLD or internal domain suffix), e.g. `"ru"`, `"intra"`.
     /// Always lowercase, leading dot stripped.
     Zone {
@@ -291,6 +298,7 @@ impl AddressMatchDto {
         match self {
             Self::ExactFqdn { .. } => "exact-fqdn",
             Self::SuffixDomain { .. } => "suffix-domain",
+            Self::AnyZoneDomain { .. } => "any-zone-domain",
             Self::Zone { .. } => "zone",
             Self::ExactIpv4 { .. } => "exact-ipv4",
             Self::ExactIpv6 { .. } => "exact-ipv6",
@@ -310,6 +318,7 @@ impl AddressMatchDto {
         match self {
             Self::ExactFqdn { value } => Cow::Borrowed(value),
             Self::SuffixDomain { suffix } => Cow::Borrowed(suffix),
+            Self::AnyZoneDomain { base } => Cow::Borrowed(base),
             Self::Zone { name } => Cow::Borrowed(name),
             Self::ExactIpv4 { address } | Self::ExactIpv6 { address } => Cow::Borrowed(address),
             Self::Subnet { network } => Cow::Borrowed(network),
@@ -322,9 +331,10 @@ impl AddressMatchDto {
     /// fields are wrong), or no kind slug at all: a broken payload rather than
     /// a newer one.
     pub fn is_malformed(&self) -> bool {
-        const KNOWN: [&str; 7] = [
+        const KNOWN: [&str; 8] = [
             "exact-fqdn",
             "suffix-domain",
+            "any-zone-domain",
             "zone",
             "exact-ipv4",
             "exact-ipv6",
@@ -335,10 +345,15 @@ impl AddressMatchDto {
             && (KNOWN.contains(&self.kind()) || !is_slug(self.kind()))
     }
 
-    /// The kinds the subnet-and-range format added; a book without them is
-    /// written at schema 1, byte for byte as before.
-    pub fn needs_schema_2(&self) -> bool {
-        matches!(self, Self::Subnet { .. } | Self::IpRange { .. })
+    /// The schema this kind needs: 2 for the subnet-and-range kinds, 4 for the
+    /// any-zone domain, 1 otherwise — so a book without them is written byte
+    /// for byte as before.
+    pub fn schema_needed(&self) -> u16 {
+        match self {
+            Self::Subnet { .. } | Self::IpRange { .. } => 2,
+            Self::AnyZoneDomain { .. } => 4,
+            _ => 1,
+        }
     }
 }
 
@@ -367,6 +382,13 @@ pub enum AppPatternDto {
         /// The glob pattern.
         value: String,
     },
+    /// A program by where it lives, spelled as the rules file spells it: a
+    /// file, a folder with its trailing separator, a folder with its
+    /// subfolders ending in `*` ([`crate::app_path::AppPath`]).
+    Path {
+        /// The path.
+        value: String,
+    },
     /// A kind this build does not know, kept verbatim. A newer build may have
     /// written it; the rule is stored and re-sent unchanged, never applied.
     #[serde(untagged)]
@@ -377,7 +399,7 @@ impl AppPatternDto {
     /// The pattern text; empty for a kind this build does not know.
     pub fn value(&self) -> &str {
         match self {
-            Self::Exact { value } | Self::Glob { value } => value,
+            Self::Exact { value } | Self::Glob { value } | Self::Path { value } => value,
             Self::Unrecognized(_) => "",
         }
     }
@@ -424,8 +446,8 @@ pub fn required_schema_version(dto: &CanonicalRulesJsonV1) -> u16 {
             Some(AddressMatchDto::Unrecognized(_)) => {
                 return RULES_JSON_SCHEMA_VERSION.max(dto.schema_version)
             }
-            Some(m) if m.needs_schema_2() => needed = needed.max(2),
-            _ => {}
+            Some(m) => needed = needed.max(m.schema_needed()),
+            None => {}
         }
         match rule.action {
             RuleAction::Unrecognized(_) => {
@@ -433,6 +455,13 @@ pub fn required_schema_version(dto: &CanonicalRulesJsonV1) -> u16 {
             }
             RuleAction::VerifyPrimary => needed = needed.max(3),
             RuleAction::Route | RuleAction::Block => {}
+        }
+        if rule
+            .app_match
+            .as_ref()
+            .is_some_and(|m| matches!(m.pattern, AppPatternDto::Path { .. }))
+        {
+            needed = needed.max(5);
         }
     }
     needed
@@ -537,6 +566,7 @@ pub fn first_forbidden_field_text(dto: &CanonicalRulesJsonV1) -> Option<Forbidde
         let address = rule.address_match.as_ref().is_some_and(|m| match m {
             AddressMatchDto::ExactFqdn { value } => bad(value),
             AddressMatchDto::SuffixDomain { suffix } => bad(suffix),
+            AddressMatchDto::AnyZoneDomain { base } => bad(base),
             AddressMatchDto::Zone { name } => bad(name),
             AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address } => {
                 bad(address)
@@ -614,6 +644,14 @@ fn fold_rule(rule: &mut RuleDto) {
         fold_address_match(address);
     }
     if let Some(app) = rule.app_match.as_mut() {
+        let folded_path = match &app.pattern {
+            AppPatternDto::Path { value } => fold_app_path(value),
+            _ => None,
+        };
+        if let Some(folded) = folded_path {
+            app.pattern = folded;
+            return;
+        }
         match &mut app.pattern {
             // A comparison needs one representative per match class, not the
             // stored spelling: every matcher treats `x` and `x.exe` alike, so
@@ -628,10 +666,40 @@ fn fold_rule(rule: &mut RuleDto) {
             AppPatternDto::Glob { value } => {
                 *value = crate::app_identity::canonical_glob_process_pattern(value)
             }
-            // Compared as the newer build wrote it.
-            AppPatternDto::Unrecognized(_) => {}
+            // Compared as the newer build wrote it; a path left as sent.
+            AppPatternDto::Path { .. } | AppPatternDto::Unrecognized(_) => {}
         }
     }
+}
+
+/// A path pattern the way the service stores it, case folded: the fold has no
+/// platform, so the style is read from the spelling, and folding the case of a
+/// Linux path only joins spellings no one tells apart in a drift hash. One the
+/// service would read as a name instead (a relative path, a Unix name holding
+/// a backslash) folds as the name it keeps. `None` leaves the value as sent.
+fn fold_app_path(value: &str) -> Option<AppPatternDto> {
+    use crate::app_path::{AppPath, PathStyle};
+    let trimmed = value.trim();
+    let style = if trimmed.starts_with('/') {
+        PathStyle::MacOS
+    } else {
+        PathStyle::Windows
+    };
+    if let Ok(path) = AppPath::parse(trimmed, style) {
+        return Some(AppPatternDto::Path {
+            value: path.as_str().to_string(),
+        });
+    }
+    if trimmed.contains('*') {
+        return None;
+    }
+    Some(AppPatternDto::Exact {
+        value: crate::app_identity::canonical_exact_process_name(
+            trimmed,
+            crate::app_identity::ExecutableNaming::WindowsExe,
+        )
+        .0,
+    })
 }
 
 /// An address the way the service stores it: IPv4-mapped forms are their IPv4
@@ -646,6 +714,7 @@ fn fold_address_match(address: &mut AddressMatchDto) {
     if let Some(name) = folded_rule_name(address) {
         if let AddressMatchDto::ExactFqdn { value: written }
         | AddressMatchDto::SuffixDomain { suffix: written }
+        | AddressMatchDto::AnyZoneDomain { base: written }
         | AddressMatchDto::Zone { name: written } = address
         {
             *written = name;
@@ -704,6 +773,7 @@ pub fn folded_rule_name(address: &AddressMatchDto) -> Option<String> {
     match address {
         AddressMatchDto::ExactFqdn { value } => Some(fold_host(value)),
         AddressMatchDto::SuffixDomain { suffix } => Some(fold_suffix(suffix)),
+        AddressMatchDto::AnyZoneDomain { base } => Some(fold_any_zone(base)),
         AddressMatchDto::Zone { name } => Some(fold_suffix(name)),
         AddressMatchDto::ExactIpv4 { .. }
         | AddressMatchDto::ExactIpv6 { .. }
@@ -728,6 +798,13 @@ fn fold_suffix(raw: &str) -> String {
     stripped.strip_prefix('.').unwrap_or(stripped).to_string()
 }
 
+/// [`fold_host`] plus the `*.` and `.*` spellings of an any-zone base.
+fn fold_any_zone(raw: &str) -> String {
+    let host = fold_host(raw);
+    let base = host.strip_suffix(".*").unwrap_or(&host);
+    base.strip_prefix("*.").unwrap_or(base).to_string()
+}
+
 /// Order key for a folded rule: the routing it describes, nothing else. NUL
 /// separates the parts because an application pattern may contain spaces.
 ///
@@ -750,6 +827,7 @@ fn comparison_key(rule: &RuleDto) -> String {
             let (k, v) = match &app.pattern {
                 AppPatternDto::Exact { value } => ("app:exact", value.as_str()),
                 AppPatternDto::Glob { value } => ("app:glob", value.as_str()),
+                AppPatternDto::Path { value } => ("app:path", value.as_str()),
                 AppPatternDto::Unrecognized(_) => ("app:unrecognized", ""),
             };
             (k, v, app.include_child_processes)
@@ -837,6 +915,59 @@ mod tests {
             to_canonical_string(&typed).expect("typed"),
             to_canonical_string(&validated).expect("validated")
         );
+    }
+
+    /// A path as typed and as the service stores it fold to one form; a value
+    /// the service reads as a name folds as that name.
+    #[test]
+    fn path_spellings_fold_to_the_stored_form() {
+        let folded = |pattern: AppPatternDto| {
+            let mut rule = sample_app_rule("r-1", "unused.exe", false);
+            if let Some(app) = rule.app_match.as_mut() {
+                app.pattern = pattern;
+            }
+            let mut dto = CanonicalRulesJsonV1 {
+                schema_version: RULES_JSON_SCHEMA_VERSION,
+                primary: vec![rule],
+                secondary: vec![],
+            };
+            fold_for_comparison(&mut dto);
+            to_canonical_string(&dto).expect("canonical")
+        };
+        let path = |value: &str| AppPatternDto::Path {
+            value: value.into(),
+        };
+        for (typed, stored) in [
+            (path(r"C:/Apps/Tool"), path(r"c:\apps\tool\")),
+            (path(r"C:\Apps\Tool\*"), path(r"c:\apps\tool\*")),
+            (path(r"C:\Apps\Tool.EXE"), path(r"c:\apps\tool.exe")),
+            (path("/opt/App/"), path("/opt/App/")),
+            (
+                path(r"odd\name"),
+                AppPatternDto::Exact {
+                    value: "name".into(),
+                },
+            ),
+        ] {
+            assert_eq!(folded(typed.clone()), folded(stored), "{typed:?}");
+        }
+        assert_ne!(folded(path(r"C:\Apps\")), folded(path(r"C:\Apps\*")));
+    }
+
+    #[test]
+    fn a_path_rule_needs_schema_five_and_nothing_else_does() {
+        let mut dto = CanonicalRulesJsonV1 {
+            schema_version: 1,
+            primary: vec![sample_app_rule("r-1", "cloud.exe", false)],
+            secondary: vec![],
+        };
+        assert_eq!(required_schema_version(&dto), 1);
+        if let Some(app) = dto.primary[0].app_match.as_mut() {
+            app.pattern = AppPatternDto::Path {
+                value: r"c:\apps\".into(),
+            };
+        }
+        assert_eq!(required_schema_version(&dto), 5);
     }
 
     /// Each pair: as a client may send it, as the service stores it.
@@ -1026,7 +1157,7 @@ mod tests {
 
     #[test]
     fn a_book_of_the_older_kinds_needs_schema_one_only() {
-        assert_eq!(RULES_JSON_SCHEMA_VERSION, 3);
+        assert_eq!(RULES_JSON_SCHEMA_VERSION, 5);
         let mut dto = CanonicalRulesJsonV1 {
             schema_version: 2,
             primary: vec![sample_exact_fqdn("r-1", "api.example.com")],
@@ -1037,6 +1168,11 @@ mod tests {
             network: "10.0.0.0/8".into(),
         });
         assert_eq!(required_schema_version(&dto), 2);
+        dto.secondary = vec![sample_exact_fqdn("r-2", "x.example")];
+        dto.secondary[0].address_match = Some(AddressMatchDto::AnyZoneDomain {
+            base: "example".into(),
+        });
+        assert_eq!(required_schema_version(&dto), 4);
     }
 
     #[test]

@@ -1,0 +1,28 @@
+# NetRuleRouter rules file - version 9
+#: value +children  the app and the programs it starts
+--- Windows
+codex.exe +children  # assistant
+# codex.exe +children
+# Adobe Reader.exe +children
+# see notes +children
+!tool.exe +children
+# !old.exe +children
+tool.exe +childern
+--- Linux
+codex +children
+# codex +children
+--- Domains
+example.com +children
+# off.example.com +children
+?check.example
+# ?off-check.example  # note
+--- domains
+again.example
+--- Ranges
+# 192.0.2.1 - 192.0.2.9
+--- CIDR
+# 10.0.0.0 / 8
+--- Auto
+learned.example  # auto:user-confirmed anchor:learned.example added:2026-01-01
+--- Custom
+# kept.example

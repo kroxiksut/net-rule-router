@@ -167,7 +167,7 @@ fn run_state_migrations_empty_db() {
     // + v48 (auto_rule_dismissals.dto_json — the refused offer, kept verbatim)
     // + v49 (block_notice_mutes table — durable "do not show" choices)
     // + v50 (isp_block_candidates_enabled on service_stability_config)
-    assert_eq!(s.to_version, 73);
+    assert_eq!(s.to_version, 76);
     assert_eq!(
         s.migrations_applied,
         [
@@ -244,6 +244,9 @@ fn run_state_migrations_empty_db() {
             "add_doh_lockdown_auto",
             "add_local_dns_suffixes",
             "add_forwarded_outage",
+            "add_install_policy",
+            "app_destinations_by_principal",
+            "add_conn_history_prefs",
         ]
     );
 }
@@ -255,8 +258,8 @@ fn state_migration_idempotent() {
 
     runner.run_pending_migrations().expect("first run");
     let s = runner.run_pending_migrations().expect("second run");
-    assert_eq!(s.from_version, 73);
-    assert_eq!(s.to_version, 73);
+    assert_eq!(s.from_version, 76);
+    assert_eq!(s.to_version, 76);
     assert!(s.migrations_applied.is_empty());
 }
 
@@ -349,8 +352,8 @@ fn verify_state_schema_after_migration() {
 
     let v = runner.verify_schema().expect("verify");
     assert!(v.is_ok(), "state schema verification failed: {v:?}");
-    // through v73 (add_forwarded_outage)
-    assert_eq!(v.version, 73);
+    // through v76 (add_conn_history_prefs)
+    assert_eq!(v.version, 76);
 }
 
 #[test]
@@ -531,8 +534,16 @@ fn shipped_state_checksums_are_unchanged() {
             (71, "6f293118d0e60ed3"),
             (72, "7ab90024670f8e0e"),
             (73, "cc82674acb6316ff"),
+            (74, "42c87cddcd988877"),
+            (75, "dfa2c31391bb2ddf"),
+            (76, "855bba352ad44570"),
         ],
     );
+}
+
+#[test]
+fn shipped_conn_history_checksums_are_unchanged() {
+    assert_checksums(CONN_HISTORY_MIGRATIONS, &[(1, "97e0b0093353de15")]);
 }
 
 #[test]
@@ -859,6 +870,62 @@ fn traffic_db_garbage_file_is_deleted_and_rebuilt() {
     assert_eq!(version, TRAFFIC_MIGRATIONS.len() as u32);
 }
 
+// ── connection-history DB — its own catalogue, rebuilt when damaged ────────
+
+#[test]
+fn conn_history_db_opens_clean_with_its_own_schema_and_secure_delete() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("nrr_conn_history.db");
+    let opened = open_conn_history_connection_or_rebuild(&path).expect("open");
+    assert!(opened.rebuilt_reason.is_none());
+    let version = read_schema_version(&opened.connection).expect("version");
+    assert_eq!(version, CONN_HISTORY_MIGRATIONS.len() as u32);
+    let secure: i64 = opened
+        .connection
+        .query_row("PRAGMA secure_delete", [], |r| r.get(0))
+        .expect("pragma");
+    assert_eq!(secure, 1, "a cleared history must not linger in free pages");
+    let runner = SqliteMigrationRunner::for_conn_history_db(opened.connection);
+    assert!(runner.verify_schema().expect("verify").is_ok());
+}
+
+#[test]
+fn conn_history_db_garbage_file_is_deleted_and_rebuilt() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("nrr_conn_history.db");
+    std::fs::write(&path, b"this is not a sqlite database").expect("write garbage");
+    std::fs::write(sidecar_path(&path, "-wal"), b"stale wal").expect("write sidecar");
+
+    let opened = open_conn_history_connection_or_rebuild(&path).expect("rebuild open");
+    assert!(opened.rebuilt_reason.is_some(), "garbage file must rebuild");
+    let version = read_schema_version(&opened.connection).expect("version");
+    assert_eq!(version, CONN_HISTORY_MIGRATIONS.len() as u32);
+}
+
+#[test]
+fn conn_history_db_from_a_newer_build_is_refused_not_erased() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("nrr_conn_history.db");
+    {
+        let opened = open_conn_history_connection_or_rebuild(&path).expect("open");
+        opened
+            .connection
+            .execute(
+                "INSERT INTO schema_migrations
+                     (version, name, applied_at, checksum, app_version)
+                     VALUES (99, 'from_the_future', 0, 'aaaaaaaaaaaaaaaa', '99.0')",
+                [],
+            )
+            .expect("future version");
+    }
+    let outcome = open_conn_history_connection_or_rebuild(&path).err();
+    assert!(
+        matches!(outcome, Some(StorageError::UnsupportedSchemaVersion { .. })),
+        "a newer schema must be refused, got: {outcome:?}"
+    );
+    assert!(path.exists(), "a newer file is never deleted");
+}
+
 /// The path every installed user takes: a v1 traffic ledger gains the
 /// answers table WITHOUT losing a day of history. Editing v1 in place would
 /// have failed its checksum and rebuilt the file instead — erasing exactly
@@ -920,7 +987,7 @@ fn upgrade_state_db_from_v1_to_v2() {
 
     let summary = runner.run_pending_migrations().expect("upgrade v1→latest");
     assert_eq!(summary.from_version, 1);
-    assert_eq!(summary.to_version, 73);
+    assert_eq!(summary.to_version, 76);
     assert_eq!(
         summary.migrations_applied,
         [
@@ -996,6 +1063,9 @@ fn upgrade_state_db_from_v1_to_v2() {
             "add_doh_lockdown_auto",
             "add_local_dns_suffixes",
             "add_forwarded_outage",
+            "add_install_policy",
+            "app_destinations_by_principal",
+            "add_conn_history_prefs",
         ]
     );
 
@@ -1033,7 +1103,7 @@ fn upgrade_state_db_from_v2_to_v3() {
 
     let summary = runner.run_pending_migrations().expect("upgrade v2→latest");
     assert_eq!(summary.from_version, 2);
-    assert_eq!(summary.to_version, 73);
+    assert_eq!(summary.to_version, 76);
     assert_eq!(
         summary.migrations_applied,
         [
@@ -1108,6 +1178,9 @@ fn upgrade_state_db_from_v2_to_v3() {
             "add_doh_lockdown_auto",
             "add_local_dns_suffixes",
             "add_forwarded_outage",
+            "add_install_policy",
+            "app_destinations_by_principal",
+            "add_conn_history_prefs",
         ]
     );
 
@@ -1117,4 +1190,53 @@ fn upgrade_state_db_from_v2_to_v3() {
         .query_row("SELECT COUNT(*) FROM security_alerts", [], |r| r.get(0))
         .expect("security_alerts table must exist after v3");
     assert_eq!(count, 0, "fresh security_alerts table must be empty");
+}
+
+/// Remembered destinations from before the owner column survive the upgrade,
+/// owned by nobody: no user's store may be seeded from them.
+#[test]
+fn remembered_destinations_upgrade_without_an_owner() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let before = STATE_MIGRATIONS
+        .iter()
+        .position(|m| m.name == "app_destinations_by_principal")
+        .expect("the owner migration is catalogued");
+    {
+        let older = state_runner_stopped_at(&dir, before);
+        older
+            .run_pending_migrations()
+            .expect("migrate to the previous version");
+        let conn = older.into_connection();
+        conn.execute(
+            "INSERT INTO app_observed_destinations (app_key, ip, learned_at)
+             VALUES ('messenger', '203.0.113.1', 1000), ('chat', '203.0.113.2', 2000)",
+            [],
+        )
+        .expect("rows an earlier build wrote");
+    }
+
+    let current = state_runner(&dir);
+    current.run_pending_migrations().expect("upgrade");
+    assert!(current.verify_schema().expect("verify").is_ok());
+    let conn = current.into_connection();
+    let mut stmt = conn
+        .prepare("SELECT sid, app_key, ip, learned_at FROM app_observed_destinations ORDER BY ip")
+        .expect("prepare");
+    let rows: Vec<(String, String, String, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .expect("query")
+        .collect::<rusqlite::Result<_>>()
+        .expect("rows");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                String::new(),
+                "messenger".into(),
+                "203.0.113.1".into(),
+                1000
+            ),
+            (String::new(), "chat".into(), "203.0.113.2".into(), 2000),
+        ]
+    );
 }

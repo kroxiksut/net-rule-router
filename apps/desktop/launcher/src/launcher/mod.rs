@@ -4,7 +4,8 @@
 //! single-instance lock, emit the QML context JSON in-process, spawn exactly
 //! one C++ Qt host child, stream its stdout/stderr while it runs (persisting
 //! each `NRR_PREFS_JSON:` payload through the debounced writer), clean up
-//! temporaries, and propagate the child exit code.
+//! temporaries, say so when the host could not load its libraries, and
+//! propagate the child exit code.
 
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -26,6 +27,7 @@ use crate::user_settings_bridge::UserSettingsMirror;
 mod child_process;
 mod context;
 mod diag_log;
+mod host_start_failure;
 mod resolve;
 mod single_instance;
 
@@ -36,7 +38,7 @@ pub use resolve::resolve_native_host_executable;
 pub(crate) use resolve::sibling_service_binary;
 pub use single_instance::{BuildMismatchNote, SingleInstanceGuard};
 
-use child_process::{apply_no_window, spawn_line_reader};
+use child_process::{apply_no_window, spawn_line_reader, spawn_stderr_reader};
 use context::{cleanup_temp_leftovers, emit_context, take_tray_status_argument};
 use diag_log::{diag_log_path, rotate_session_log, surface_tag};
 use resolve::{resolve_native_icon_path, resolve_qml_path};
@@ -333,12 +335,10 @@ fn run_primary(
     if let Some(icon_path) = resolve_native_icon_path() {
         host_arguments.push(format!("--nrr-app-icon={}", icon_path.display()));
     }
-    if let Ok(raw_ms) = env::var("NRR_QML_AUTOCLOSE_MS") {
-        if let Ok(parsed_ms) = raw_ms.trim().parse::<u64>() {
-            if parsed_ms > 0 {
-                host_arguments.push(format!("--nrr-auto-close-ms={parsed_ms}"));
-            }
-        }
+    if let Some(argument) = auto_close_argument(cfg!(debug_assertions), || {
+        env::var("NRR_QML_AUTOCLOSE_MS").ok()
+    }) {
+        host_arguments.push(argument);
     }
 
     // In a cargo tree the Qt host lives deep under `target/<profile>/build/…`,
@@ -368,7 +368,12 @@ fn run_primary(
         tag,
         &format!("NRR_LAUNCHER[primary] spawning host args={host_arguments:?}"),
     );
-    let mut child = match command.spawn() {
+    // Only for the spawn: the host inherits the mode, the launcher keeps its own.
+    let spawned = {
+        let _loader_ui = host_start_failure::suppress_loader_error_ui();
+        command.spawn()
+    };
+    let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
             diag_log(
@@ -421,9 +426,10 @@ fn run_primary(
         }
     };
 
-    let (sender, receiver) = mpsc::channel::<String>();
+    let (sender, receiver) = mpsc::channel::<child_process::ChildLine>();
+    let stderr_tail = host_start_failure::StderrTail::shared();
     spawn_line_reader(stdout, sender.clone());
-    spawn_line_reader(stderr, sender);
+    spawn_stderr_reader(stderr, sender, std::sync::Arc::clone(&stderr_tail));
 
     // One service connection per lane (see `RpcLane`), each opened by the first
     // request that needs it: a session that never exports an archive never
@@ -440,6 +446,10 @@ fn run_primary(
     // dispatcher then relays through the broker (one UAC, reused for the
     // rest of the session). The broker dies with this launcher.
     let broker_handle = nrr_broker::new_handle();
+
+    // Read before the writer takes the preferences: a host that never started
+    // is answered in the language this session opened with.
+    let language = preferences.language.clone();
 
     // Preference snapshots go to disk while the session runs, coalesced, so a
     // force-killed GUI loses at most the last fraction of a second of changes
@@ -482,54 +492,46 @@ fn run_primary(
         // keeps the loop out of that branch and would otherwise starve a write
         // that is already due.
         prefs_writer.flush_if_due(Instant::now());
-        // Anchored, like the RPC marker one file over. Searching anywhere in
-        // the line meant any output that merely CONTAINED the marker — a rule
-        // name echoed by a `console.log`, a truncated last line from a killed
-        // host — was read as a preferences snapshot.
-        if let Some(rest) = line.strip_prefix(PREFS_MARKER) {
-            let value = rest.trim();
-            if !value.is_empty() {
-                // The archive path needs one field of this payload and must not
-                // race the debounced file write for it, so it gets an in-memory
-                // copy as the payload goes by.
-                crate::archive_localize::observe_prefs_payload(value);
-                prefs_writer.observe(value, Instant::now());
+        match child_process::host_message(&line) {
+            child_process::HostMessage::Prefs(value) => {
+                if !value.is_empty() {
+                    // The archive path needs one field of this payload and must
+                    // not race the debounced file write for it, so it gets an
+                    // in-memory copy as the payload goes by.
+                    crate::archive_localize::observe_prefs_payload(value);
+                    prefs_writer.observe(value, Instant::now());
+                }
             }
-            continue;
-        }
-        // RPC bridge dispatch. Each request is handled on its own
-        // short-lived worker thread (the IPC call blocks; we must not
-        // stall PREFS_JSON or shutdown handling).
-        if line.starts_with(nrr_shared::launcher_rpc::RPC_REQUEST_MARKER) {
-            if let Some(stdin) = child_stdin.as_ref() {
-                let lane = crate::rpc_dispatcher::request_lane(&line);
-                let (client, connect_budget) =
-                    lane_clients.client_for(lane, Instant::now(), || {
-                        std::sync::Arc::new(nrr_ipc_client::ServiceIpcClient::start())
-                            as std::sync::Arc<dyn nrr_ipc_client::IpcClient>
-                    });
-                let _ = crate::rpc_dispatcher::spawn_dispatch_worker(
-                    line.clone(),
-                    client,
-                    std::sync::Arc::clone(&sidecar_handle),
-                    std::sync::Arc::clone(&broker_handle),
-                    std::sync::Arc::clone(stdin),
-                    connect_budget,
-                    config.surface.client_profile(),
-                );
-            } else {
-                diag_log(
-                    tag,
-                    "nrr-launcher: dropping RPC request — child stdin unavailable",
-                );
+            // Each request runs on its own short-lived worker: the IPC call
+            // blocks, and preferences and shutdown must not wait on it.
+            child_process::HostMessage::Rpc(request) => {
+                if let Some(stdin) = child_stdin.as_ref() {
+                    let lane = crate::rpc_dispatcher::request_lane(request);
+                    let (client, connect_budget) =
+                        lane_clients.client_for(lane, Instant::now(), || {
+                            std::sync::Arc::new(nrr_ipc_client::ServiceIpcClient::start())
+                                as std::sync::Arc<dyn nrr_ipc_client::IpcClient>
+                        });
+                    let _ = crate::rpc_dispatcher::spawn_dispatch_worker(
+                        request.to_owned(),
+                        client,
+                        std::sync::Arc::clone(&sidecar_handle),
+                        std::sync::Arc::clone(&broker_handle),
+                        std::sync::Arc::clone(stdin),
+                        connect_budget,
+                        config.surface.client_profile(),
+                    );
+                } else {
+                    diag_log(
+                        tag,
+                        "nrr-launcher: dropping RPC request — child stdin unavailable",
+                    );
+                }
             }
-            continue;
+            // Qt messages, QML console.log and `NRR_HOST_*` markers reach the
+            // per-surface log, which outlives a launcher spawned detached.
+            child_process::HostMessage::Log(text) => diag_log(tag, &format!("child: {text}")),
         }
-        // Forward all other child output (Qt warnings/criticals, QML console.log,
-        // diagnostic markers) to the per-surface log file (and to stderr for
-        // console-launched runs). Needed so `NRR_HOST_*` host markers survive
-        // when the launcher itself was spawned detached.
-        diag_log(tag, &format!("child: {line}"));
     }
     diag_log(
         tag,
@@ -564,6 +566,14 @@ fn run_primary(
 
     let _ = fs::remove_file(&context_file);
 
+    if let Some(failure) = host_start_failure::host_exit_failure(exit_status.code(), &stderr_tail) {
+        diag_log(
+            tag,
+            &format!("NRR_LAUNCHER[primary] host could not load its libraries: {failure:?}"),
+        );
+        host_start_failure::tell_user(&failure, &language, &log_path);
+    }
+
     let raw_code = exit_status.code().unwrap_or(1);
     let truncated: u8 = match u8::try_from(raw_code) {
         Ok(value) => value,
@@ -571,6 +581,23 @@ fn run_primary(
         Err(_) => 1,
     };
     ExitCode::from(truncated)
+}
+
+/// The host's self-closing timer for a scripted run, from `NRR_QML_AUTOCLOSE_MS`.
+/// A development build only: in a release build an environment variable never
+/// shapes the window a user gets.
+fn auto_close_argument(
+    allow_env_overrides: bool,
+    read: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let ms = allow_env_overrides
+        .then(read)
+        .flatten()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|ms| *ms > 0)?;
+    Some(format!("--nrr-auto-close-ms={ms}"))
 }
 
 /// How long a duplicate launch waits for the primary to consume the activation

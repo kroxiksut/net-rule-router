@@ -95,7 +95,7 @@ pub fn forwarded_guard_filters(
             out
         }
     };
-    onto_forwarding_path(out)
+    WfpFilterSpec::onto_forwarding_path(out)
 }
 
 /// The owner's blanket block, for what the machine forwards: the tunnel is gone
@@ -126,29 +126,9 @@ pub fn forwarded_block_all_filters(
     exemptions.known_direct_ips.sort_unstable();
     exemptions.known_direct_ips.dedup();
     let seed = forwarded_seed(owner);
-    onto_forwarding_path(fail_closed_block_all_filters(
+    WfpFilterSpec::onto_forwarding_path(fail_closed_block_all_filters(
         &seed,
         &exemptions,
         KillSwitchProtocols::ALL,
     ))
-}
-
-/// The connect half of each filter, moved onto the forwarding layers. The
-/// layers below it repeat a destination per protocol, which the forwarding
-/// path cannot tell apart; a port or user condition does not exist there.
-fn onto_forwarding_path(mut out: Vec<WfpFilterSpec>) -> Vec<WfpFilterSpec> {
-    out.retain(|spec| spec.layer.supports_ale_scoping());
-    for spec in &mut out {
-        spec.layer = if spec.layer.is_v6() {
-            WfpLayerKey::IpForwardV6
-        } else {
-            WfpLayerKey::IpForwardV4
-        };
-        spec.user_sid = None;
-        spec.ip_protocol = None;
-        spec.remote_port = None;
-    }
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|spec| seen.insert(spec.id));
-    out
 }

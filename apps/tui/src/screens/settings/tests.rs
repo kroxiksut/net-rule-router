@@ -409,3 +409,66 @@ fn the_service_section_offers_network_recovery_in_both_states() {
     assert!(stopped.contains("reset-network --confirm"), "{stopped}");
     assert!(!stopped.contains("--stop-service"), "{stopped}");
 }
+
+fn history_service() -> FakeService {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::ConnHistoryList,
+        json!({
+            "page": { "items": [], "next_cursor": null, "total_count": null, "stale": false },
+            "enabled": true, "retention-days": 7, "max-retention-days": 30, "available": true,
+            "removed": 0, "skipped": 0
+        }),
+    );
+    fake.answer(
+        IpcOperationName::ConnHistorySettingsSet,
+        json!({ "enabled": false, "retention-days": 7 }),
+    );
+    fake.answer(IpcOperationName::ConnHistoryClear, json!({ "erased": 4 }));
+    fake
+}
+
+#[test]
+fn the_connection_history_is_switched_kept_and_cleared_from_logs() {
+    let fake = history_service();
+    let mut app = on_settings();
+    answer(&mut app, "c6");
+    drain(&mut app, &fake);
+    assert_eq!(fake.sent(IpcOperationName::ConnHistoryList).len(), 1);
+
+    let keep = row_of(&app, Category::Logs, ItemId::HistoryEnabled);
+    answer(&mut app, &format!("i{keep}"));
+    drain(&mut app, &fake);
+    assert_eq!(
+        fake.sent(IpcOperationName::ConnHistorySettingsSet),
+        vec![json!({ "enabled": false })],
+        "only the switch travels"
+    );
+
+    let days = row_of(&app, Category::Logs, ItemId::HistoryRetention);
+    answer(&mut app, &format!("i{days} 31"));
+    drain(&mut app, &fake);
+    assert_eq!(
+        fake.sent(IpcOperationName::ConnHistorySettingsSet).len(),
+        1,
+        "a period past the longest is refused before it is sent"
+    );
+    answer(&mut app, &format!("i{days} 3"));
+    drain(&mut app, &fake);
+    assert_eq!(
+        fake.sent(IpcOperationName::ConnHistorySettingsSet)[1],
+        json!({ "retention-days": 3 })
+    );
+
+    let clear = row_of(&app, Category::Logs, ItemId::HistoryClear);
+    answer(&mut app, &format!("i{clear}"));
+    drain(&mut app, &fake);
+    assert!(
+        fake.sent(IpcOperationName::ConnHistoryClear).is_empty(),
+        "erasing asks first"
+    );
+    answer(&mut app, "y");
+    drain(&mut app, &fake);
+    assert_eq!(fake.sent(IpcOperationName::ConnHistoryClear).len(), 1);
+    assert!(said(&app).contains('4'), "{}", said(&app));
+}

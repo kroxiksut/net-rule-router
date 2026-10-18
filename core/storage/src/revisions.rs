@@ -72,6 +72,17 @@ pub struct VerifiedHistoryEntry {
     pub verification: crate::revision_hmac::HmacVerification,
 }
 
+/// When and how a revision came into force, without its rules blob: the
+/// listing a reader walks before fetching only the blobs it needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnforcedRevisionStamp {
+    pub revision_id: String,
+    pub content_hash: String,
+    pub source: RulesRevisionSource,
+    /// Unix epoch seconds.
+    pub activated_at: i64,
+}
+
 /// One row from the `active_revision_pointer` singleton table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveRevisionPointer {

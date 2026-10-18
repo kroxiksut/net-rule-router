@@ -8,14 +8,38 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# Third-party actions are pinned to commits: this job signs nothing, but what
-# it builds is what users install.
+# Third-party actions are pinned to commits: what this workflow builds is what
+# users install. Only `attest` may sign and only `release` may write.
 permissions:
   contents: read
 
 jobs:
+  # Nothing is built unless the tag names the workspace version, every action
+  # is pinned to a commit and CI on the tagged commit is green.
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Self-test the guard
+        run: bash scripts/tests/release-guard/run.sh
+
+      - name: Release guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=()
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tag=(--tag "$GITHUB_REF_NAME"); fi
+          bash scripts/release-guard.sh --sha "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" "${tag[@]}"
+
   windows:
     name: windows-${{ matrix.arch }} (${{ matrix.variant }})
+    needs: guard
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -88,6 +112,14 @@ jobs:
           powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 `
             -Arch ${{ matrix.arch }} -OutputRoot "$env:RUNNER_TEMP\dist" -Zip -Installers -Force @variant
 
+      # The MSI is unpacked (msiexec /a), never installed: the service would
+      # change the runner's own network.
+      - name: Check the package contents
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\scripts\check-windows-package.ps1 `
+            -Dist "$env:RUNNER_TEMP\dist" -Variant ${{ matrix.variant }}
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-${{ matrix.arch }}-${{ matrix.variant }}
@@ -99,6 +131,7 @@ jobs:
 
   linux:
     name: linux-${{ matrix.arch }} (${{ matrix.variant }})
+    needs: guard
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -146,17 +179,30 @@ jobs:
         with:
           persist-credentials: false
 
+      # rustup-init by version and hash, not `curl | sh`: the release job must
+      # not run a script the server can change under the same URL.
       - name: Install Rust
         run: |
+          case "${{ matrix.arch }}" in
+            x86_64)  sum=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c ;;
+            aarch64) sum=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;;
+          esac
+          curl -sSfo rustup-init "https://static.rust-lang.org/rustup/archive/1.28.2/${{ matrix.arch }}-unknown-linux-gnu/rustup-init"
+          echo "$sum  rustup-init" | sha256sum -c -
+          chmod +x rustup-init
           channel="$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)"
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$channel"
+          ./rustup-init -y --profile minimal --default-toolchain "$channel"
+          rm rustup-init
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # package-linux.sh checks every package against
+      # packaging/linux/package-contents.txt. The headless binaries must run on
+      # glibc 2.28, the floor the supported systems share.
       - name: Package
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           args="--build --out $RUNNER_TEMP/packages"
-          [ "${{ matrix.variant }}" = headless ] && args="--headless $args"
+          [ "${{ matrix.variant }}" = headless ] && args="--headless --max-glibc 2.28 $args"
           bash scripts/package-linux.sh $args
           mkdir -p "$RUNNER_TEMP/keep"
           cd "$RUNNER_TEMP/packages"
@@ -169,8 +215,28 @@ jobs:
           path: ${{ runner.temp }}/keep/*
           if-no-files-found: error
 
-  release:
+  # A signed statement per file, kept by GitHub, that this workflow built it
+  # from the tagged commit: `gh attestation verify` checks a download without
+  # trusting the release page. The only job that may sign.
+  attest:
     needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: artifacts/*
+
+  release:
+    needs: [windows, linux, attest]
     runs-on: ubuntu-latest
     # The only job that writes, and it runs no third-party code.
     permissions:

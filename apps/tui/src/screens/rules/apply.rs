@@ -17,6 +17,7 @@ use nrr_ipc_client::{ipc_error_to_wire, ipc_operation_timeout, IpcClient, IpcCli
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     OperationStatusResponse, ReviewRiskLevel, ReviewSummaryResponse, RulesListResponse,
+    BASE_REVISION_KEY,
 };
 use nrr_shared::rules_json::{
     to_canonical_string, CanonicalRulesJsonV1, RULES_JSON_SCHEMA_VERSION,
@@ -93,6 +94,9 @@ pub struct Pending {
     /// Committed to the administrator's baseline (`admin-baseline`), which
     /// the service accepts only from an elevated caller.
     pub admin_baseline: bool,
+    /// The rules the screen was built from (`base-revision`); the service
+    /// refuses the write when they changed since. `None` writes unchecked.
+    pub base_revision: Option<String>,
 }
 
 /// Rules as the canonical rules-json (`_buildRulesJsonFromModel`): a rule
@@ -115,8 +119,12 @@ pub fn book_of<'a>(rules: impl IntoIterator<Item = &'a RuleRow>) -> CanonicalRul
     book
 }
 
-/// The rows on screen as one rules payload.
-pub fn pending_from(table: &Table, admin_baseline: bool) -> Option<Pending> {
+/// The rows on screen as one rules payload, built on the rules named `base`.
+pub fn pending_from(
+    table: &Table,
+    admin_baseline: bool,
+    base_revision: Option<&str>,
+) -> Option<Pending> {
     let rules_json = to_canonical_string(&book_of(table.rules())).ok()?;
     let content_hash = format!("{:x}", Sha256::digest(rules_json.as_bytes()));
     Some(Pending {
@@ -124,6 +132,7 @@ pub fn pending_from(table: &Table, admin_baseline: bool) -> Option<Pending> {
         content_hash,
         correlation_id: correlation_id("tui-apply"),
         admin_baseline,
+        base_revision: base_revision.map(str::to_owned),
     })
 }
 
@@ -155,6 +164,9 @@ fn submit(
     });
     if pending.admin_baseline {
         request["payload"]["admin-baseline"] = Value::Bool(true);
+    }
+    if let Some(base) = &pending.base_revision {
+        request["payload"][BASE_REVISION_KEY] = Value::from(base.as_str());
     }
     // The client lifts this to the envelope, where the dispatcher reads it.
     if let Some(token) = token {
@@ -211,18 +223,27 @@ pub enum Previewed {
 /// How an apply ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Finished {
-    Applied,
+    /// `base`: the rules now in force, as the answer names them; `None` when
+    /// it did not say.
+    Applied {
+        base: Option<String>,
+    },
     /// The token died before the confirm: the review is out of date.
     Expired,
     UacDeclined,
     Failed(Failure),
 }
 
-pub fn load_job() -> Job {
-    Box::new(|client: &dyn IpcClient| {
+/// Reads the set the screen edits: the caller's own, or the baseline.
+pub fn load_job(baseline: bool) -> Job {
+    Box::new(move |client: &dyn IpcClient| {
         let op = IpcOperationName::RulesList;
         let result = client
-            .call(op, json!({}), ipc_operation_timeout(op))
+            .call(
+                op,
+                json!({ "baseline": baseline }),
+                ipc_operation_timeout(op),
+            )
             .map_err(|e| Failure::of(&e))
             .and_then(|v| {
                 serde_json::from_value::<RulesListResponse>(v)
@@ -307,7 +328,14 @@ fn confirm(client: &dyn IpcClient, pending: &Pending, token: &str) -> Finished {
         })
         .flatten();
     match operation_outcome(status.as_ref()) {
-        Some(Outcome::Applied) => Finished::Applied,
+        Some(Outcome::Applied) => Finished::Applied {
+            base: status
+                .as_ref()
+                .and_then(|s| s.result.as_ref())
+                .and_then(|r| r.get(BASE_REVISION_KEY))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        },
         Some(Outcome::Failed(code)) => Finished::Failed(Failure::Code {
             code,
             args: status
@@ -333,7 +361,7 @@ fn settle_by_preview(client: &dyn IpcClient, pending: &Pending) -> Finished {
     match summary {
         Err(failure) => Finished::Failed(failure),
         Ok((summary, _)) => match preview_outcome(&summary, review_summary_is_empty) {
-            Outcome::Applied => Finished::Applied,
+            Outcome::Applied => Finished::Applied { base: None },
             Outcome::Failed(code) => Finished::Failed(Failure::code(&code)),
         },
     }

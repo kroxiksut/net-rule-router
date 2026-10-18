@@ -22,10 +22,10 @@ use nrr_client_logic::route_policy;
 use nrr_ipc_client::IpcClientError;
 use nrr_platform_api::service_control::ServiceStatusReport;
 use nrr_shared::ipc_payloads::{
-    BlockNoticeMuteDto, BlockNoticeMuteScopeDto, LocalDnsSuffixesGetResponse,
-    LocalNetworksGetResponse, LogRetentionConfigDto, LogRetentionConfigSetRequest,
-    RetentionSettingsDto, RetentionSettingsSetRequest, StorageUsageDto, TrafficStatsGetResponse,
-    TrafficStatsSettingsDto,
+    BlockNoticeMuteDto, BlockNoticeMuteScopeDto, ConnHistoryListResponse,
+    LocalDnsSuffixesGetResponse, LocalNetworksGetResponse, LogRetentionConfigDto,
+    LogRetentionConfigSetRequest, RetentionSettingsDto, RetentionSettingsSetRequest,
+    StorageUsageDto, TrafficStatsGetResponse, TrafficStatsSettingsDto,
 };
 use nrr_shared::ipc_transport::IpcErrorCode;
 use nrr_shared::platform_profile::{PlatformProfile, PlatformSupports};
@@ -96,15 +96,17 @@ pub struct Failure {
 impl Failure {
     pub fn from_ipc(error: &IpcClientError) -> Self {
         let (slug, detail) = nrr_ipc_client::ipc_error_to_wire(error);
-        // The terminal never elevates, so a refusal for want of rights is
-        // always answered with how to start it with them.
-        let elevation = matches!(
-            error,
-            IpcClientError::ServerError {
-                code: IpcErrorCode::Forbidden,
-                ..
-            }
-        );
+        // A plain refusal for want of rights is answered with how to start the
+        // terminal with them; the authority's own outcome (declined, nobody to
+        // prompt, no authority) keeps its words.
+        let elevation = slug == IpcErrorCode::Forbidden.client_slug()
+            && matches!(
+                error,
+                IpcClientError::ServerError {
+                    code: IpcErrorCode::Forbidden,
+                    ..
+                }
+            );
         Self {
             slug: slug.to_owned(),
             elevation,
@@ -197,6 +199,8 @@ pub struct Data {
     pub log_retention: Loadable<LogRetentionConfigDto>,
     pub storage: Loadable<StorageUsageDto>,
     pub traffic: Loadable<TrafficStatsGetResponse>,
+    /// The caller's own connection-history choices.
+    pub conn_history: Loadable<ConnHistoryListResponse>,
     pub service: Loadable<ServiceInfo>,
 }
 
@@ -433,7 +437,7 @@ impl Screen for SettingsScreen {
 /// The row with the cursor: `>` and bold, so it never rests on colour.
 fn marked(cursor: bool, text: String) -> Segment {
     if cursor {
-        Segment::strong(format!("> {text}"))
+        Segment::selected(format!("> {text}"))
     } else {
         Segment::plain(format!("  {text}"))
     }
@@ -524,7 +528,7 @@ fn detail_lines(app: &AppState, item: &Item, focused: bool, texts: &Texts) -> Ve
                     let mark = if i == *option { '>' } else { ' ' };
                     let line = format!("    {mark} {}. {}", i + 1, o.label.resolve(texts));
                     if i == *option {
-                        ViewLine::new(vec![Segment::strong(line)])
+                        ViewLine::new(vec![Segment::selected(line)])
                     } else {
                         ViewLine::text(line)
                     }
@@ -914,6 +918,8 @@ fn load(app: &mut AppState) {
             }
             queue.push(jobs::load_storage());
             queue.push(jobs::load_retention());
+            s.data.conn_history.start();
+            queue.push(jobs::load_conn_history());
         }
         Category::Traffic => {
             s.data.traffic.start();
@@ -1125,6 +1131,13 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
         (ItemId::TrafficReset, Input::Run) => {
             Some(jobs::clear_traffic(app.settings.clock.local_day()))
         }
+        (ItemId::HistoryEnabled, Input::Toggle) => {
+            Some(jobs::set_conn_history(Some(toggled), None))
+        }
+        (ItemId::HistoryRetention, Input::Number(n)) => {
+            Some(jobs::set_conn_history(None, u32::try_from(n).ok()))
+        }
+        (ItemId::HistoryClear, Input::Run) => Some(jobs::clear_conn_history()),
         // The form and the terminal's own settings change here and now.
         (ItemId::MuteScope, Input::Pick(slug)) => {
             let form = &mut app.settings.mute_form;

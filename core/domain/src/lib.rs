@@ -50,6 +50,7 @@ pub mod preset_canonicalize;
 pub mod preset_contract;
 pub mod preset_ux;
 pub mod preset_validation;
+pub mod protected_places;
 pub mod ptr_names;
 pub mod review;
 pub mod revision;
@@ -179,6 +180,10 @@ pub enum AddressMatch {
     /// Matches the apex itself and any subdomain at any depth.
     /// File syntax: `*.example.com` — stored without the `*.` prefix.
     SuffixDomain(String),
+    /// Matches the site in every zone, with its subdomains: `example` covers
+    /// `example.com`, `www.example.co.uk`. File syntax: `example.*` (or
+    /// `*.example.*`) — stored without the wildcards.
+    AnyZoneDomain(String),
     /// Matches all hosts in a TLD or internal domain zone, e.g. `ru`, `intra`.
     Zone(String),
     /// Matches one exact address.
@@ -190,6 +195,26 @@ pub enum AddressMatch {
 }
 
 impl AddressMatch {
+    /// A `--- Domains` value as written: `x` exact, `*.x` with subdomains,
+    /// `x.*` or `*.x.*` in every zone. The one reading of that grammar.
+    pub fn from_domain_value(value: &str) -> Self {
+        if let Some(base) = value.strip_suffix(".*") {
+            return Self::AnyZoneDomain(base.strip_prefix("*.").unwrap_or(base).to_string());
+        }
+        match value.strip_prefix("*.") {
+            Some(label) => Self::SuffixDomain(label.to_string()),
+            None => Self::ExactFqdn(value.to_string()),
+        }
+    }
+
+    /// The name a `--- Domains` value carries, its wildcards off.
+    pub fn domain_value_name(value: &str) -> &str {
+        match value.strip_suffix(".*") {
+            Some(base) => base.strip_prefix("*.").unwrap_or(base),
+            None => value.strip_prefix("*.").unwrap_or(value),
+        }
+    }
+
     /// Returns the address value as a user-facing string.
     ///
     /// `SuffixDomain` is rendered with the `*.` prefix restored.
@@ -197,6 +222,7 @@ impl AddressMatch {
         match self {
             Self::ExactFqdn(label) => label.clone(),
             Self::SuffixDomain(label) => format!("*.{label}"),
+            Self::AnyZoneDomain(base) => format!("{base}.*"),
             Self::Zone(name) => name.clone(),
             Self::ExactIp(text) | Self::Subnet(text) | Self::IpRange(text) => text.clone(),
         }
@@ -210,7 +236,8 @@ impl AddressMatch {
 /// time as too broad.
 ///
 /// Matching is case-insensitive on Windows; patterns are stored lowercase.
-/// Only the process **filename** is matched, not the full path.
+/// Either variant written with a path separator is read as a path (a file, a
+/// folder or a folder with its subfolders) by the validation pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AppMatchPattern {
     /// Exact process filename (e.g. `chrome.exe`).
@@ -230,7 +257,7 @@ impl AppMatchPattern {
 
 /// Application-based match condition for a routing rule.
 ///
-/// Matches traffic by process filename — either an exact name or a glob pattern.
+/// Matches traffic by process — an exact name, a glob pattern or a path.
 ///
 /// # Subprocess tracking
 ///

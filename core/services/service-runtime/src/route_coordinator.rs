@@ -300,6 +300,9 @@ pub struct SecondaryRouteCoordinator {
     /// Who the enumerations listed, so one that misses a user does not
     /// unserve them at once (see [`served::DEPARTURE_GRACE`]).
     signed_in_memory: Mutex<served::SignedInMemory>,
+    /// When each signed-in user signed in (Unix ms), where the platform says:
+    /// the earlier one keeps a contested route, across service restarts too.
+    sign_in_times: Mutex<HashMap<String, u64>>,
     /// Which link the last pass's table sends each named destination through,
     /// and for whom.
     merged_view: Mutex<Arc<merge::MergedRouteView>>,

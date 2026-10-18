@@ -36,6 +36,14 @@ pub fn default_block_exemptions(
         out.push(exempt_subnet(sid, *net, *prefix, weight));
         weight += 1;
     }
+    // The default block names no destination, so it cuts a corporate tunnel
+    // like everything else no rule named.
+    out.extend(foreign_tunnel_egress(
+        sid,
+        &exemptions.foreign_tunnel_luids,
+        exemptions.secondary_luid,
+        &mut weight,
+    ));
     out
 }
 
@@ -153,6 +161,57 @@ pub(super) fn exempt_egress(sid: &str, secondary_luid: u64, weight: u64) -> WfpF
         remote_subnet_v6: None,
         ip_protocol: None,
     }
+}
+
+/// The tunnels the user runs beside ours that a permit is owed to: `luids`
+/// minus the unusable zero and our own, whose permit is its own field's.
+fn foreign_luids(luids: &[u64], own: u64) -> impl Iterator<Item = u64> + '_ {
+    luids
+        .iter()
+        .copied()
+        .filter(move |luid| *luid != 0 && *luid != own)
+}
+
+/// ALE permits for what leaves through somebody else's tunnel — see
+/// [`FailClosedExemptions::foreign_tunnel_luids`]. One per tunnel, by egress.
+pub(super) fn foreign_tunnel_egress(
+    sid: &str,
+    luids: &[u64],
+    own: u64,
+    weight: &mut u64,
+) -> Vec<WfpFilterSpec> {
+    foreign_luids(luids, own)
+        .map(|luid| {
+            let spec = exempt_egress(sid, luid, *weight);
+            *weight += 1;
+            spec
+        })
+        .collect()
+}
+
+/// The transport-layer twins of [`foreign_tunnel_egress`], for the named
+/// packet blocks: a ping or a GRE keepalive into the corporate network is that
+/// tunnel's traffic too.
+pub(super) fn foreign_tunnel_packet_egress(
+    sid: &str,
+    luids: &[u64],
+    own: u64,
+    weight: &mut u64,
+) -> Vec<WfpFilterSpec> {
+    foreign_luids(luids, own)
+        .map(|luid| {
+            let spec = packet_egress_permit(
+                sid,
+                WfpLayerKey::OutboundTransportV4,
+                DestScope::All,
+                None,
+                luid,
+                *weight,
+            );
+            *weight += 1;
+            spec
+        })
+        .collect()
 }
 
 /// Exemption permit for a remote subnet (loopback / link-local / LAN).

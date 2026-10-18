@@ -345,6 +345,7 @@ mod tests {
                 None => 4,
                 Some(CanonicalAddressMatch::Subnet(_)) => 5,
                 Some(CanonicalAddressMatch::IpRange(_)) => 6,
+                Some(CanonicalAddressMatch::AnyZoneDomain(_)) => 7,
             })
             .collect();
         assert!(
@@ -612,7 +613,7 @@ mod tests {
                     errors.iter().all(|e| matches!(
                         e,
                         ValidationError::InvalidIpAddress { .. }
-                            | ValidationError::WrongAddressSection { .. }
+                            | ValidationError::WrongSection { .. }
                     )),
                     "{value}: {errors:?}"
                 ),

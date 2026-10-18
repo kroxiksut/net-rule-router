@@ -1,7 +1,7 @@
 //! The screens, in the order of the design's table. The map follows the GUI's
 //! sections, so one piece of advice from the documentation works in both.
 
-mod binding;
+pub(crate) mod binding;
 mod choice;
 pub mod inspect;
 pub mod interfaces;

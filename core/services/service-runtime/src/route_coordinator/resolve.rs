@@ -150,6 +150,21 @@ impl SecondaryRouteCoordinator {
         self.resolve_from(sid, None)
     }
 
+    /// The sole default-route holder, by the name the interfaces list shows,
+    /// from the pass's `reading` or the live machine.
+    fn primary_suggestion(&self, reading: Option<&MachineReading>) -> Option<String> {
+        let live;
+        let adapters = match reading {
+            Some(reading) => reading.adapters_or_error().ok()?,
+            None => {
+                live = self.api.get_adapter_infos().ok()?;
+                live.as_slice()
+            }
+        };
+        let routes = self.routes_of(reading)?;
+        crate::routing_setup::primary_suggestion(adapters, &routes)
+    }
+
     /// [`Self::resolve`] against a pass's `reading`, or the live machine when
     /// there is none.
     pub(super) fn resolve_from(
@@ -169,8 +184,10 @@ impl SecondaryRouteCoordinator {
             }
             // From outside this is indistinguishable from a working product: the
             // service runs, the tray is green, and nothing is routed — without
-            // this push the user has no way to see it.
-            self.publish_enforcement_status(sid, "no-policy", "", Vec::new());
+            // this push the user has no way to see it. It names the connection
+            // to confirm as main when the route table points at exactly one.
+            let suggestion = self.primary_suggestion(reading);
+            self.publish_enforcement_status(sid, "no-policy", "", suggestion.into_iter().collect());
             return RouteResolution {
                 mode: RouteBehaviorMode::PreferPrimary,
                 primary: None,

@@ -8,7 +8,8 @@
 //! 3. ExactIp, Subnet / Zone (tiers 3a/3b) — order per [`ZonePriorityPolicy`]
 //!    (default: addresses first; an exact address before any network, then the
 //!    longest prefix)
-//! 4. Application — process name / glob (address-less rules only)
+//! 4. Application — full path, exact name, folder (deeper first; "this folder
+//!    only" before "with subfolders"), name glob (address-less rules only)
 //! 5. Default — behavior-mode fallback, no rule matched
 //!
 //! Public entry point: [`match_rules`].
@@ -32,12 +33,14 @@ use std::net::IpAddr;
 use nrr_shared::{RouteBehaviorMode, RouteRole};
 
 use crate::canonical::{
-    CanonicalAddressMatch, CanonicalAppPattern, CanonicalRule, CanonicalRuleBook, RuleAction,
+    AppPathKind, CanonicalAddressMatch, CanonicalAppPattern, CanonicalRule, CanonicalRuleBook,
+    RuleAction,
 };
 use crate::decision_lookup::LookupResult;
 use crate::decision_matching::{
-    match_suffix_domain, match_zone, AppFilterResult, ConflictMarker, MatchClass, NoMatchReason,
-    RequestedRouteDecision, RuleMatchCandidate, SpecificityScore, ZonePriorityPolicy,
+    match_any_zone_domain, match_suffix_domain, match_zone, AppFilterResult, ConflictMarker,
+    MatchClass, NoMatchReason, RequestedRouteDecision, RuleMatchCandidate, SpecificityScore,
+    ZonePriorityPolicy,
 };
 use crate::decision_normalization::{
     NormalizedAppIdentity, NormalizedDecisionInput, NormalizedHostname, NormalizedIp,
@@ -220,6 +223,23 @@ fn collect_suffix_domain(
                     ));
                 }
             }
+            // `base.*` is `*.base.<zone>` at this host, unless a rule names
+            // that suffix outright: a rule written with its zone is the
+            // narrower one.
+            if let Some(CanonicalAddressMatch::AnyZoneDomain(base)) = &rule.address_match {
+                if let Some(named) = match_any_zone_domain(hostname, base) {
+                    if !rule_book.names_suffix_outright(named) {
+                        out.push(make_candidate(
+                            &rule.id,
+                            role,
+                            MatchClass::SuffixDomain,
+                            SpecificityScore::label_count(named),
+                            eval_app_filter(rule, app_identity),
+                            rule.action,
+                        ));
+                    }
+                }
+            }
         }
     }
     out
@@ -335,17 +355,12 @@ fn collect_application(
             let Some(app_match) = &rule.app_match else {
                 continue; // invariant: at least one of address_match/app_match is Some
             };
-            let specificity = match &app_match.pattern {
-                CanonicalAppPattern::Exact(_) => SpecificityScore::APP_EXACT,
-                CanonicalAppPattern::Glob(_) => SpecificityScore::APP_GLOB,
-            };
-            let matched = app_pattern_matches(&app_match.pattern, &app_identity.process_name);
             // TODO: `include_child_processes` requires a process-tree
             // snapshot (parent PID -> process name) that the matcher is never
             // given. The pure-domain layer cannot synthesise it; the caller
             // must supply it before this branch can fire. Today only the
             // current process identity is matched.
-            if matched {
+            if let Some(specificity) = app_match_specificity(&app_match.pattern, app_identity) {
                 out.push(make_candidate(
                     &rule.id,
                     role,
@@ -488,26 +503,46 @@ fn eval_app_filter(
     let Some(identity) = app_identity else {
         return AppFilterResult::NotMatched;
     };
-    let matched = app_pattern_matches(&app_match.pattern, &identity.process_name);
-    if matched {
+    if app_match_specificity(&app_match.pattern, identity).is_some() {
         AppFilterResult::Matched
     } else {
         AppFilterResult::NotMatched
     }
 }
 
-/// Does `pattern` name the observed process?
+/// How specifically `pattern` names the observed process; `None` when it
+/// does not.
 ///
-/// Both sides go through the one match key, so the `.exe` spelling — appended
-/// to the observed name on every OS, to a Windows exact rule, never to a glob —
-/// cannot decide the answer: `*torrent` names `qbittorrent.exe`, and a rule
-/// stored as `firefox.exe` still matches a Linux process with no suffix.
-fn app_pattern_matches(pattern: &CanonicalAppPattern, process_name: &str) -> bool {
-    let observed = nrr_shared::app_identity::app_match_key(process_name);
+/// Names go through the one match key on both sides, so the `.exe` spelling —
+/// appended to the observed name on every OS, to a Windows exact rule, never
+/// to a glob — cannot decide the answer: `*torrent` names `qbittorrent.exe`,
+/// and a rule stored as `firefox.exe` still matches a Linux process with no
+/// suffix. A path is matched against the image path, so a process whose path
+/// the caller does not know is named by name rules only.
+fn app_match_specificity(
+    pattern: &CanonicalAppPattern,
+    identity: &NormalizedAppIdentity,
+) -> Option<SpecificityScore> {
+    use nrr_shared::app_identity::app_match_key;
     match pattern {
-        CanonicalAppPattern::Exact(p) => nrr_shared::app_identity::app_match_key(p) == observed,
+        CanonicalAppPattern::Exact(p) => {
+            let named = app_match_key(p) == app_match_key(&identity.process_name);
+            named.then_some(SpecificityScore::APP_EXACT)
+        }
         CanonicalAppPattern::Glob(p) => {
-            nrr_shared::glob::glob_match(&nrr_shared::app_identity::app_match_key(p), &observed)
+            let observed = app_match_key(&identity.process_name);
+            nrr_shared::glob::glob_match(&app_match_key(p), &observed)
+                .then_some(SpecificityScore::APP_GLOB)
+        }
+        CanonicalAppPattern::Path(path) => {
+            let image = identity.original_path.as_deref()?;
+            match path.match_image(image)? {
+                AppPathKind::File => Some(SpecificityScore::APP_FILE),
+                AppPathKind::Folder => Some(SpecificityScore::app_folder(path.depth(), false)),
+                AppPathKind::FolderTree => Some(SpecificityScore::app_folder(path.depth(), true)),
+                // `match_image` answers how it matched, never "undecided".
+                AppPathKind::FileOrFolder => None,
+            }
         }
     }
 }

@@ -329,27 +329,43 @@ impl OutageBlocks {
 pub struct OutageUnresolvedNames {
     outages: std::sync::Arc<OutageBlocks>,
     principal: crate::supervised_runtime::ActiveRoutingSidFn,
+    /// The users whose rules name a host; each gets it in their own list.
+    owners: Option<HostOwnersFn>,
 }
+
+/// The served users whose rules name a host.
+pub type HostOwnersFn = std::sync::Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 
 impl OutageUnresolvedNames {
     pub fn new(
         outages: std::sync::Arc<OutageBlocks>,
         principal: crate::supervised_runtime::ActiveRoutingSidFn,
     ) -> Self {
-        Self { outages, principal }
+        Self {
+            outages,
+            principal,
+            owners: None,
+        }
+    }
+
+    /// File a host under the users whose rules name it, not the routing user.
+    #[must_use]
+    pub fn with_host_owners(mut self, owners: HostOwnersFn) -> Self {
+        self.owners = Some(owners);
+        self
     }
 }
 
 impl crate::dns_resolver::UnresolvedRuleHostObserver for OutageUnresolvedNames {
     fn note_unresolved(&self, hostname: &str) {
-        let Some(sid) = (self.principal)() else {
-            return;
+        let owners = match self.owners.as_ref() {
+            Some(owners) => owners(hostname),
+            None => (self.principal)().into_iter().collect(),
         };
-        self.outages.record_unresolved(
-            &sid,
-            hostname,
-            crate::conn_observation_consumer::now_unix_ms(),
-        );
+        let now = crate::conn_observation_consumer::now_unix_ms();
+        for sid in &owners {
+            self.outages.record_unresolved(sid, hostname, now);
+        }
     }
 }
 

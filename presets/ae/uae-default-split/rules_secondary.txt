@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 8
 # name: AE UAE Default Split - Secondary Route
 # description: Foreign social, messaging, AI, and related apps routed to secondary
 # author: NetRuleRouter contributors
@@ -8,13 +8,12 @@
 # Keep empty to avoid over-broad routing by TLD
 
 --- Domains
-*.facebook.com  # Meta ecosystem
+facebook.*  # Meta ecosystem
 *.fb.com  # Meta ecosystem
 *.messenger.com  # Meta ecosystem
 *.instagram.com  # Meta ecosystem
 *.cdninstagram.com  # Meta ecosystem
 *.fbcdn.net  # Meta ecosystem
-*.facebook.net  # Meta ecosystem
 *.fbsbx.com  # Meta ecosystem
 *.threads.net  # Meta ecosystem
 *.threads.com  # Meta ecosystem
@@ -57,11 +56,9 @@ redd.it  # Discord and community platforms
 *.sc-cdn.net  # Professional and streaming social platforms
 *.bsky.app  # Professional and streaming social platforms
 
-*.telegram.org  # Foreign messengers and communication tools
+telegram.*  # Foreign messengers and communication tools
 *.t.me  # Foreign messengers and communication tools
-*.telegram.me  # Foreign messengers and communication tools
-*.whatsapp.com  # Foreign messengers and communication tools
-*.whatsapp.net  # Foreign messengers and communication tools
+whatsapp.*  # Foreign messengers and communication tools
 *.signal.org  # Foreign messengers and communication tools
 *.signal.me  # Foreign messengers and communication tools
 *.viber.com  # Foreign messengers and communication tools
@@ -76,6 +73,9 @@ redd.it  # Discord and community platforms
 
 *.openai.com  # Foreign AI and developer AI ecosystems
 *.chatgpt.com  # Foreign AI and developer AI ecosystems
+*.oaistatic.com  # Foreign AI and developer AI ecosystems
+*.oaistatsig.com  # Foreign AI and developer AI ecosystems
+*.oaiusercontent.com  # Foreign AI and developer AI ecosystems
 *.z.ai  # Foreign AI and developer AI ecosystems
 *.anthropic.com  # Foreign AI and developer AI ecosystems
 *.claude.ai  # Foreign AI and developer AI ecosystems

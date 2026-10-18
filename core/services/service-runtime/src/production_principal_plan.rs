@@ -67,6 +67,11 @@ pub struct PlanCoverage {
     /// Per-destination fail-closed blocks in this plan. Non-zero only while the
     /// secondary is gone AND the user armed the leak-guard.
     pub fail_closed_blocks: usize,
+    /// The secondary is gone and the user's leak-guard holds its traffic back,
+    /// whether or not any destination needed a block: with every known address
+    /// spared, a cold cache or the blanket block, the count above is zero
+    /// while a rule host's name must still not be asked of the main link.
+    pub guard_holding: bool,
     /// Route intents planned — what actually steers traffic onto the secondary.
     pub route_intents: usize,
     /// Whether the plan's protection matches what the user's settings ask for.
@@ -341,10 +346,15 @@ impl ProductionPrincipalPlanSource {
         // while the tunnel is down reads what was noted here.
         self.remember_tunnel_servers(&policy);
         self.warn_too_wide_local_networks(stored, &policy);
+        // Where observations are kept per user, this user's programs alone
+        // decide where their application rules send traffic.
+        let own_observations = self.app_observations.for_principal(stored);
         let input = PlannerInput {
             fqdn_cache: self.fqdn_cache.as_ref(),
             app_resolver: self.app_resolver.as_ref(),
-            app_observations: self.app_observations.as_ref(),
+            app_observations: own_observations
+                .as_deref()
+                .unwrap_or(self.app_observations.as_ref()),
             zone_priority_over_ip: policy.zone_priority_over_ip,
             app_rules_take_all_addresses: policy.app_rules_take_all_addresses,
             secondary_ip_denylist: &secondary_ip_denylist,
@@ -513,9 +523,12 @@ impl ProductionPrincipalPlanSource {
             ),
         );
 
+        let guard_holding = !availability.secondary
+            && (block_all_armed || (policy.kill_switch_enabled && policy.kill_switch_fail_closed));
         let coverage = PlanCoverage {
             rule_driven_flows,
             fail_closed_blocks,
+            guard_holding,
             route_intents: routes.len(),
             kill_switch_complete: !wants_block_all(&policy, behavior_mode) || block_all_armed,
         };
@@ -574,7 +587,12 @@ impl ProductionPrincipalPlanSource {
         );
         let conflicts = planned
             .map(|(report, book)| {
-                crate::rule_conflicts::rule_conflict_dtos(&report.conflicts, book)
+                let mut conflicts =
+                    crate::rule_conflicts::rule_conflict_dtos(&report.conflicts, book);
+                conflicts.extend(crate::rule_conflicts::protected_rule_dtos(
+                    &self.rules.withheld_rules_for(principal),
+                ));
+                conflicts
             })
             .unwrap_or_default();
         if !status.set_rule_conflicts(principal, conflicts) {
@@ -1440,6 +1458,7 @@ impl PrincipalPlanSource for ProductionPrincipalPlanSource {
                 plan,
                 protection_complete: coverage.kill_switch_complete,
                 fail_closed_blocks: coverage.fail_closed_blocks,
+                guard_holding: coverage.guard_holding,
             })
     }
 
@@ -2147,6 +2166,18 @@ mod tests {
 
         assert_eq!(coverage.fail_closed_blocks, 0);
         assert_eq!(blocks_on(&plan, SECONDARY_HOST), 0);
+        assert!(!coverage.guard_holding);
+    }
+
+    /// The guard holds with nothing to block — every address spared, a cold
+    /// cache: a rule host's name must still not be asked of the main link.
+    #[test]
+    fn a_lost_secondary_holds_even_with_no_destination_to_block() {
+        // Mode B: an empty book still plans, which is the zero-block case.
+        let (_, coverage) = plan(NoRulesButBound, Policy::prefer_secondary(), false);
+
+        assert_eq!(coverage.fail_closed_blocks, 0);
+        assert!(coverage.guard_holding);
     }
 
     /// The whole point: the tunnel is gone, so the addresses it carried are
@@ -2178,6 +2209,7 @@ mod tests {
 
         assert_eq!(coverage.fail_closed_blocks, 0);
         assert_eq!(blocks_on(&plan, SECONDARY_HOST), 0);
+        assert!(!coverage.guard_holding);
     }
 
     /// A blanket block with nothing underneath it takes the machine off its own
@@ -2884,6 +2916,10 @@ mod tests {
         assert_eq!(
             coverage.fail_closed_blocks, 0,
             "the per-IP guard duplicated the block-all"
+        );
+        assert!(
+            coverage.guard_holding,
+            "no block counted, but the guard holds"
         );
         assert!(coverage.kill_switch_complete);
         assert!(

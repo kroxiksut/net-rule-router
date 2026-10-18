@@ -74,6 +74,12 @@ pub trait RuleHostOracle: Send + Sync {
 /// without one reports "not blocking" and keeps the historic fail-open.
 pub trait LeakGuardPosture: Send + Sync {
     fn blocking(&self) -> bool;
+
+    /// Whether the guard holds for `hostname`: with several users served,
+    /// only the guard of a user whose rule names the host withholds it.
+    fn blocking_for_host(&self, _hostname: &str) -> bool {
+        self.blocking()
+    }
 }
 
 /// Any `bool`-yielding closure is a posture — lets the composition root hand in
@@ -707,6 +713,16 @@ pub struct AnswerHold {
 /// diverge by a whole apply cycle. See [`crate::enforced_addresses`].
 pub trait EnforcedAddressView: Send + Sync {
     fn is_enforced(&self, ip: Ipv4Addr) -> bool;
+
+    /// The addresses of `answered` not yet carried for every user whose rule
+    /// names `hostname`.
+    fn unenforced_for_host(&self, _hostname: &str, answered: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+        answered
+            .iter()
+            .copied()
+            .filter(|ip| !self.is_enforced(*ip))
+            .collect()
+    }
 }
 
 /// View for callers with no enforcement of their own (tests, platforms without

@@ -85,17 +85,20 @@ QString NrrNativeBridge::rpcRulesOverlaps(const QString &rulesJson, bool include
     return emitRpcRequest(QStringLiteral("local.rules-overlaps"), obj);
 }
 
-QString NrrNativeBridge::rpcRuleValueVerdict(const QString &ruleType, const QString &matchValue) {
+QString NrrNativeBridge::rpcRuleValueVerdict(const QString &ruleType, const QString &matchValue,
+                                             const QString &route) {
     QJsonObject obj;
     obj.insert(QStringLiteral("rule-type"), ruleType);
     obj.insert(QStringLiteral("match-value"), matchValue);
+    if (!route.isEmpty())
+        obj.insert(QStringLiteral("route"), route);
     return emitRpcRequest(QStringLiteral("local.rule-value-verdict"), obj);
 }
 
-QString NrrNativeBridge::rpcRuleValuesClassify(const QString &text) {
+QString NrrNativeBridge::rpcRuleValuesVerdicts(const QString &valuesJson) {
     QJsonObject obj;
-    obj.insert(QStringLiteral("text"), text);
-    return emitRpcRequest(QStringLiteral("local.rule-values-classify"), obj);
+    obj.insert(QStringLiteral("values-json"), valuesJson);
+    return emitRpcRequest(QStringLiteral("local.rule-values-verdicts"), obj);
 }
 
 QString NrrNativeBridge::rpcVpnDiscover() {

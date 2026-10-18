@@ -82,6 +82,12 @@ fn main() -> ExitCode {
         Command::AfterCrash => run_after_crash(),
         #[cfg(target_os = "linux")]
         Command::PackageFiles => install::write_package_files(args.get(1).map(String::as_str)),
+        #[cfg(target_os = "linux")]
+        Command::ProvisionCheck => provision_exit(
+            nrr_service_runtime::provisioning::cli::run_check(args.get(1..).unwrap_or(&[])),
+        ),
+        #[cfg(target_os = "linux")]
+        Command::ProvisionStage => provision_stage(args.get(1..).unwrap_or(&[])),
         #[cfg(not(target_os = "linux"))]
         Command::Run
         | Command::Install
@@ -90,7 +96,9 @@ fn main() -> ExitCode {
         | Command::Cleanup
         | Command::StopAndCleanup
         | Command::AfterCrash
-        | Command::PackageFiles => {
+        | Command::PackageFiles
+        | Command::ProvisionCheck
+        | Command::ProvisionStage => {
             eprintln!(
                 "the `run`, `install`, `uninstall` and `cleanup` verbs run only on Linux \
                  (this is the systemd daemon entrypoint)"
@@ -100,7 +108,8 @@ fn main() -> ExitCode {
         Command::Unknown(verb) => {
             eprintln!(
                 "unknown subcommand `{verb}`; expected one of: \
-                 run, install, uninstall, status, cleanup, package-files, help"
+                 run, install, uninstall, status, cleanup, package-files, \
+                 provision-check, provision-stage, help"
             );
             ExitCode::from(2)
         }
@@ -159,6 +168,30 @@ fn run_after_crash() -> ExitCode {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn provision_exit((code, message): (u8, String)) -> ExitCode {
+    if code == nrr_service_runtime::provisioning::exit::OK {
+        println!("{message}");
+    } else {
+        eprintln!("{message}");
+    }
+    ExitCode::from(code)
+}
+
+/// Root only: the folder is root's, and the service refuses anything else.
+#[cfg(target_os = "linux")]
+fn provision_stage(args: &[String]) -> ExitCode {
+    use nrr_service_runtime::provisioning::{cli, exit};
+    if !nrr_platform_linux::elevation::running_as_root() {
+        eprintln!("provision-stage needs root (sudo {DAEMON_NAME} provision-stage ...)");
+        return ExitCode::from(exit::STAGE_FAILED);
+    }
+    let Some(dir) = nrr_platform_api::paths::production_provision_dir() else {
+        return ExitCode::from(exit::STAGE_FAILED);
+    };
+    provision_exit(cli::run_stage(args, &dir))
+}
+
 /// Undo what a dead daemon left behind; [`cleanup`] owns the exit codes.
 #[cfg(target_os = "linux")]
 fn run_cleanup(stop_first: bool) -> ExitCode {
@@ -188,6 +221,10 @@ fn print_usage() {
          \x20   cleanup      Undo the network state a stopped service left behind (requires root)\n\
          \x20   package-files DIR\n\
          \x20                Write the unit and the files beside it a package ships, under DIR\n\
+         \x20   provision-check [--primary F] [--secondary F] [--settings F] [--secondary-unset direct|block]\n\
+         \x20                Check files for an unattended install; nothing is written\n\
+         \x20   provision-stage (the same options)\n\
+         \x20                Check them and place them for the next service start (requires root)\n\
          \x20   help         Show this help"
     );
 }

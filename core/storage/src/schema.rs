@@ -208,6 +208,8 @@ mod traffic_ddl;
 pub use traffic_ddl::*;
 mod state_ddl;
 pub use state_ddl::*;
+mod conn_history_ddl;
+pub use conn_history_ddl::*;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

@@ -108,8 +108,7 @@ if (-not $isAdmin) {
 $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($existing -and $existing.Status -ne 'Stopped') {
     Write-Host "==> stopping $serviceName" -ForegroundColor Cyan
-    Set-NrrDeliberateStop
-    Stop-Service -Name $serviceName -Force
+    $null = Stop-NrrServiceDeliberately -Name $serviceName
     (Get-Service -Name $serviceName).WaitForStatus('Stopped', '00:00:30')
 }
 

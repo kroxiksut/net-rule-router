@@ -730,6 +730,11 @@ GroupBox {
             }
         }
 
+        // The user's own connection history.
+        ConnHistorySettings {
+            root: group.root
+        }
+
         // Retention controls
         GroupBox {
             title: root.tr("diag.retention.section-title", "Retention settings")

@@ -781,3 +781,133 @@ fn a_time_today_is_a_clock_time_and_another_day_carries_its_date() {
     );
     assert_eq!(super::clock_time_at(0, NOON), "—");
 }
+
+/// A program named to fool the terminal and the eye: OSC 52 would write the
+/// viewer's clipboard, U+202E turns `gnp.exe` into `exe.png`.
+const HOSTILE_PROCESS: &str = "gnp\u{202E}.exe\u{1b}]52;c;aGk=\u{7}";
+
+fn hostile_trace() -> FakeService {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::ConnTraceEntriesList,
+        json!({
+            "page": {
+                "items": [trace_row(
+                    HOSTILE_PROCESS,
+                    "203.0.113.7:443",
+                    "primary",
+                    "permit",
+                    &["exa\u{200B}mple.test"],
+                )],
+                "next_cursor": null,
+                "total_count": 1,
+                "stale": false
+            },
+            "redacted": false,
+            "observer-active": true,
+            "gui-stream-enabled": true
+        }),
+    );
+    fake
+}
+
+#[test]
+fn a_hostile_process_name_is_shown_with_dots_and_never_reaches_the_terminal() {
+    use nrr_shared::display_text::needs_substitute;
+
+    let fake = hostile_trace();
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Trace);
+    let picture = render(&app, 100, 40);
+    for line in picture.lines() {
+        assert!(!line.chars().any(needs_substitute), "{line:?}");
+    }
+    assert!(picture.contains("gnp·.exe·]52;c;aGk=·"), "{picture}");
+    assert!(picture.contains("exa·mple.test"), "{picture}");
+
+    let plain = transcript_with(&fake, &["7"]);
+    for line in plain.lines() {
+        assert!(!line.chars().any(needs_substitute), "{line:?}");
+    }
+    assert!(plain.contains("gnp·.exe·]52;c;aGk=·"), "{plain}");
+}
+
+fn history_row(process: &str, ip: &str, attempts: u64) -> Value {
+    json!({
+        "process": process,
+        "process-path": "",
+        "host": "site.example",
+        "remote-ip": ip,
+        "route": "secondary",
+        "verdict": "permit",
+        "blocked-by": "",
+        "block-reason": "",
+        "first-seen-ms": NOON - 3_600_000,
+        "last-seen-ms": NOON,
+        "attempts": attempts
+    })
+}
+
+fn history_service(removed: u64) -> FakeService {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::ConnHistoryList,
+        json!({
+            "page": {
+                "items": [
+                    history_row("browser.exe", "203.0.113.70", 12),
+                    history_row("mail.exe", "203.0.113.80", 1)
+                ],
+                "next_cursor": null, "total_count": null, "stale": false
+            },
+            "enabled": true, "retention-days": 7, "max-retention-days": 30,
+            "available": true, "removed": removed, "skipped": 0
+        }),
+    );
+    fake
+}
+
+#[test]
+fn h_swaps_in_the_kept_history_and_t_walks_its_periods() {
+    let fake = history_service(3);
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Trace);
+    key(&mut app, KeyCode::Char('h'));
+    settle(&mut app, &fake);
+    let picture = render(&app, 140, 40);
+    assert!(picture.contains("History: Last hour"), "{picture}");
+    assert!(picture.contains("Attempts: 12"), "{picture}");
+    assert!(
+        picture.contains("3 older entries were removed"),
+        "{picture}"
+    );
+    assert!(
+        !picture.contains("203.0.113.1:443"),
+        "the latest connections are not mixed in:\n{picture}"
+    );
+
+    key(&mut app, KeyCode::Char('t'));
+    settle(&mut app, &fake);
+    assert!(render(&app, 140, 40).contains("History: Today"));
+    let sent = fake.sent(IpcOperationName::ConnHistoryList);
+    assert_eq!(sent.len(), 2);
+    assert_ne!(
+        sent[0]["from-unix-ms"], sent[1]["from-unix-ms"],
+        "each period asks from its own start"
+    );
+
+    key(&mut app, KeyCode::Char('h'));
+    settle(&mut app, &fake);
+    let picture = render(&app, 140, 40);
+    assert!(!picture.contains("History:"), "{picture}");
+    assert!(picture.contains("Shown: 12 of 14."), "{picture}");
+}
+
+#[test]
+fn line_mode_reads_the_history_of_a_period() {
+    let fake = history_service(0);
+    let text = transcript_with(&fake, &["7", "h week", "d 1"]);
+    assert!(text.contains("History: Last 7 days"), "{text}");
+    assert!(text.contains("12 times"), "{text}");
+    assert_eq!(fake.sent(IpcOperationName::ConnHistoryList).len(), 1);
+}

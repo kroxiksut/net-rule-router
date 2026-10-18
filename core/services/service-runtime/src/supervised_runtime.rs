@@ -91,6 +91,21 @@ const CONN_OBSERVER_STOP_BUDGET: Duration = Duration::from_secs(10);
 /// teardown latch already stops it from applying anything.
 const REARM_STOP_BUDGET: Duration = Duration::from_secs(3);
 
+/// Budget for writing the connection history folded since the last tick. A
+/// write that hangs must not hold the stop; losing that minute is what a crash
+/// costs anyway.
+const CONN_HISTORY_STOP_BUDGET: Duration = Duration::from_secs(3);
+
+/// Write the last minute of connection history, within its budget. Run once
+/// the observers and the tasks have stopped, so nothing is folded after it.
+fn flush_conn_history_at_stop(history: Option<&Arc<crate::conn_history::ConnHistory>>) {
+    if let Some(history) = history.cloned() {
+        teardown_step("conn-history-flush", CONN_HISTORY_STOP_BUDGET, move || {
+            history.flush_pending();
+        });
+    }
+}
+
 /// Run one teardown step off-thread and wait at most `budget` for it.
 ///
 /// Every OS-facing step here can park indefinitely (an NRPT restore, a cancel
@@ -285,6 +300,9 @@ pub struct SupervisedRuntimeDeps {
     /// the first apply; this field only drives the periodic write-back. `None`
     /// when the state DB isn't available; the tick is then not spawned.
     pub app_destination_memory: Option<Arc<crate::app_destination_memory::AppDestinationMemory>>,
+    /// Each user's connection history, written back once a minute. `None`
+    /// when no trace feeds it; the tick is then not spawned.
+    pub conn_history: Option<Arc<crate::conn_history::ConnHistory>>,
     /// External-address notice for the additional link. `None` when
     /// the route path isn't available (nothing to resolve a link from) or no
     /// event bus is wired; the tick is then not spawned.
@@ -978,6 +996,9 @@ pub fn run_supervised_runtime(
                 "teardown step finished",
             );
         }
+        // After the filters: a stop that runs short of time spends it on the
+        // network, not on history.
+        flush_conn_history_at_stop(deps.conn_history.as_ref());
 
         teardown_done.store(true, Ordering::Relaxed);
     });
@@ -1484,6 +1505,21 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
                 msg_key = "supervised-spawn-app-destination-flush-tick-failed",
                 error = %e,
                 "spawn app-destination-flush-tick failed",
+            );
+        }
+    }
+
+    // conn-history-flush-tick. Writes the history the trace folded since the
+    // last tick; Optional — a lost tick costs a minute of history.
+    if let Some(history) = deps.conn_history.as_ref() {
+        if let Err(e) = supervisor.spawn(crate::service_tasks::build_conn_history_flush_task(
+            Arc::clone(history),
+        )) {
+            tracing::warn!(
+                target: "nrr::supervisor",
+                msg_key = "supervised-spawn-conn-history-flush-tick-failed",
+                error = %e,
+                "spawn conn-history-flush-tick failed",
             );
         }
     }

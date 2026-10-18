@@ -186,15 +186,18 @@ fn main() -> std::process::ExitCode {
             // removing the service leaves %ProgramData%\NetRuleRouter\ alone)
             // to `purge_data()`, which is the application-removal path the
             // installer drives. Same spelling as the console's `--purge`.
-            let purge = args.iter().skip(2).any(|a| {
-                let lower = a.trim_start_matches('-').to_ascii_lowercase();
-                lower == "purge"
-            });
+            let has = |name: &str| {
+                args.iter()
+                    .skip(2)
+                    .any(|a| a.trim_start_matches('-').eq_ignore_ascii_case(name))
+            };
+            // The audit trail goes only when named, as with the console.
+            let (purge, purge_audit) = (has("purge"), has("purge-audit"));
             use nrr_service_runtime::UninstallConfig;
-            let config = if purge {
-                UninstallConfig::purge_data()
-            } else {
-                UninstallConfig::keep_data()
+            let config = match (purge, purge_audit) {
+                (true, true) => UninstallConfig::purge_data_and_audit(),
+                (true, false) => UninstallConfig::purge_data(),
+                (false, _) => UninstallConfig::keep_data(),
             };
             match scm::uninstall_service_with_config(&config) {
                 Ok(outcome) => {
@@ -264,6 +267,14 @@ fn main() -> std::process::ExitCode {
             print_status_banner();
             std::process::ExitCode::SUCCESS
         }
+        // Install-time files: checked with no side effect, or checked and
+        // staged for the next start. The installers run these before the
+        // service starts; the exit codes are `provisioning::exit`.
+        "provision-check" => provision_exit(nrr_service_runtime::provisioning::cli::run_check(
+            args.get(2..).unwrap_or(&[]),
+        )),
+        #[cfg(windows)]
+        "provision-stage" => provision_stage(args.get(2..).unwrap_or(&[])),
         // Disaster-recovery offline reset without the service running; see
         // `runtime_deps::offline_reset` for why each piece it strips can
         // otherwise lock the machine off the network. Requires elevation.
@@ -317,11 +328,38 @@ fn main() -> std::process::ExitCode {
             eprintln!(
                 "unknown subcommand `{mode}`; expected one of: \
                  install, uninstall, start, stop, restart, status, console, cleanup, \
-                 set-start-auto, set-start-demand, query-start-mode, update"
+                 set-start-auto, set-start-demand, query-start-mode, update, \
+                 provision-check, provision-stage"
             );
             std::process::ExitCode::from(2)
         }
     }
+}
+
+fn provision_exit((code, message): (u8, String)) -> std::process::ExitCode {
+    if code == nrr_service_runtime::provisioning::exit::OK {
+        println!("{message}");
+    } else {
+        eprintln!("{message}");
+    }
+    std::process::ExitCode::from(code)
+}
+
+/// The data tree is locked down first: under `%ProgramData%` any account may
+/// create it before the service ever ran, and the staged files must not be
+/// writable by anyone but administrators.
+#[cfg(windows)]
+fn provision_stage(args: &[String]) -> std::process::ExitCode {
+    use nrr_service_runtime::provisioning::{cli, exit};
+    if let Err(e) = lock_down_data_tree() {
+        eprintln!("the service data folder could not be secured: {e}");
+        return std::process::ExitCode::from(exit::STAGE_FAILED);
+    }
+    let Some(dir) = nrr_platform_api::paths::production_provision_dir() else {
+        eprintln!("PROGRAMDATA is not set; nowhere to stage the files");
+        return std::process::ExitCode::from(exit::STAGE_FAILED);
+    };
+    provision_exit(cli::run_stage(args, &dir))
 }
 
 /// Best-effort service access grants; a refusal is reported, never fatal.
@@ -612,12 +650,6 @@ fn run_console() -> std::process::ExitCode {
     // A blocking outcome walks the runtime straight to `RecoveryRequired`;
     // a stale marker only adds a warning to the health card.
     recovery_outcome.record_in(&mut artifacts.report);
-
-    // The blocks a hard-killed prior instance left behind: stripped before
-    // deps are built only when nobody has leak protection on; otherwise they
-    // hold until the first pass adopts them (`lifecycle_matrix`).
-    #[cfg(windows)]
-    runtime_deps::strip_orphaned_block_filters_standalone();
 
     // Supervised runtime: builds a HealthAggregator, ServiceSupervisor,
     // and spawns the canonical task set (adapter

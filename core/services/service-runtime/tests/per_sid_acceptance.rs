@@ -40,6 +40,7 @@ use nrr_storage::migration::SqliteMigrationRunner;
 use nrr_storage::repository::MigrationRunner;
 use nrr_storage::BASELINE_PRINCIPAL;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
 const SID_A: &str = "S-1-5-21-1111-2222-3333-1001";
 const SID_B: &str = "S-1-5-21-1111-2222-3333-1002";
@@ -99,7 +100,7 @@ fn canonical_rules(tag: &str) -> String {
         to_canonical_string, AddressMatchDto, CanonicalRulesJsonV1, RuleDto,
     };
     // Schema 1: a book of the older kinds is stored at 1, so the payload is
-    // already canonical and keeps the hash the test names.
+    // already canonical and is stored as sent.
     to_canonical_string(&CanonicalRulesJsonV1 {
         schema_version: 1,
         primary: vec![RuleDto {
@@ -116,6 +117,15 @@ fn canonical_rules(tag: &str) -> String {
         secondary: vec![],
     })
     .expect("serialise canonical rules")
+}
+
+/// The hash the service gives `tag`'s rules: its own over the stored bytes,
+/// whatever the client sent.
+fn hash_of(tag: &str) -> Option<String> {
+    Some(format!(
+        "{:x}",
+        Sha256::digest(canonical_rules(tag).as_bytes())
+    ))
 }
 
 fn commit_rules(exec: &ProductionMutationExecutor, principal: &str, tag: &str) {
@@ -173,15 +183,15 @@ fn two_principals_commit_independently_and_stay_isolated() {
     commit_rules(&exec, SID_B, "beta");
 
     // Each principal owns exactly its own active revision.
-    assert_eq!(active_hash(&coord, SID_A).as_deref(), Some("hash-alpha"));
-    assert_eq!(active_hash(&coord, SID_B).as_deref(), Some("hash-beta"));
+    assert_eq!(active_hash(&coord, SID_A), hash_of("alpha"));
+    assert_eq!(active_hash(&coord, SID_B), hash_of("beta"));
     // The baseline was never written by a user-scoped commit.
     assert_eq!(active_hash(&coord, BASELINE_PRINCIPAL), None);
 
     // B re-edits — A is untouched (isolation).
     commit_rules(&exec, SID_B, "beta2");
-    assert_eq!(active_hash(&coord, SID_B).as_deref(), Some("hash-beta2"));
-    assert_eq!(active_hash(&coord, SID_A).as_deref(), Some("hash-alpha"));
+    assert_eq!(active_hash(&coord, SID_B), hash_of("beta2"));
+    assert_eq!(active_hash(&coord, SID_A), hash_of("alpha"));
 }
 
 #[test]
@@ -204,7 +214,7 @@ fn fresh_principal_reads_through_to_baseline_then_diverges_on_edit() {
 
     // The principal edits → it diverges (own revision overrides baseline).
     commit_rules(&exec, SID_FRESH, "mine");
-    assert_eq!(active_hash(&coord, SID_FRESH).as_deref(), Some("hash-mine"));
+    assert_eq!(active_hash(&coord, SID_FRESH), hash_of("mine"));
     assert_eq!(
         resolved_rule_id(&provider, SID_FRESH).as_deref(),
         Some("r-mine")
@@ -241,10 +251,7 @@ fn admin_baseline_edit_reaches_non_diverged_users_only() {
 
     // Admin updates the baseline.
     commit_rules(&exec, BASELINE_PRINCIPAL, "base2");
-    assert_eq!(
-        active_hash(&coord, BASELINE_PRINCIPAL).as_deref(),
-        Some("hash-base2")
-    );
+    assert_eq!(active_hash(&coord, BASELINE_PRINCIPAL), hash_of("base2"));
 
     // Non-diverged fresh principal sees the new baseline...
     assert_eq!(

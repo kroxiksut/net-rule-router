@@ -68,7 +68,10 @@ impl ExplainGetHandler {
     ///   pinned/blocked, under smart they are exempted (host works, leak
     ///   possible). Returns `(slug, shared_ip_count, total_ip_count)`; the
     ///   counts are non-zero only for the collateral slugs.
-    fn enforcement_verdict(&self, hostname: &str, route: &str) -> (String, u32, u32) {
+    ///
+    /// Judged by `viewer`'s own settings (the routing user's when empty):
+    /// another user's switch says nothing about the viewer's traffic.
+    fn enforcement_verdict(&self, viewer: &str, hostname: &str, route: &str) -> (String, u32, u32) {
         let none = (String::new(), 0, 0);
         let Some((policy, fqdn, active_sid)) = self.enforcement.as_ref() else {
             return none;
@@ -77,8 +80,13 @@ impl ExplainGetHandler {
         if hostname.is_empty() || route == "blocked" {
             return none;
         }
-        let Some(sid) = active_sid() else {
-            return none;
+        let sid = if viewer.is_empty() {
+            match active_sid() {
+                Some(sid) => sid,
+                None => return none,
+            }
+        } else {
+            viewer.to_owned()
         };
         let Some(dto) = policy.get_for_sid(&sid) else {
             return none;
@@ -199,7 +207,8 @@ impl IpcHandler for ExplainGetHandler {
         // verdict, so "primary" never hides "but block-all will drop this".
         if let ExplainQuery::Synthetic { input_sample } = &query {
             if let Some(host) = input_sample.hostname.as_deref() {
-                let (slug, shared, total) = self.enforcement_verdict(host, &compact.route);
+                let (slug, shared, total) =
+                    self.enforcement_verdict(ctx.caller_stored(), host, &compact.route);
                 compact.enforcement = slug;
                 compact.enforcement_shared_ips = shared;
                 compact.enforcement_total_ips = total;

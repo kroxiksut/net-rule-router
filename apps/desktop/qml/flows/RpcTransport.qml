@@ -159,7 +159,8 @@ QtObject {
     }
 
     // A confirmed mutation's `ok` only says it was accepted; the verdict is on
-    // its operation record. `done("")` once it completed, `done(code, args)`
+    // its operation record. `done("", null, result)` once it completed (the
+    // record's `result`, null when settled without it), `done(code, args)`
     // when it failed, `args` being that failure's own values (or null). A record this account cannot read (another administrator
     // confirmed it) is judged by `settleByState(done)` from what the service
     // holds now.
@@ -176,6 +177,7 @@ QtObject {
             var failure = Pure.operationOutcome(ok, status)
             if (failure === transport.securityAlertGateCode) transport.securityAlertGateHit()
             if (failure === null) settleByState(done)
+            else if (failure === "") done("", null, (status && status.result) || null)
             else done(failure, Pure.operationFailureArgs(status))
         })
     }
@@ -214,6 +216,30 @@ QtObject {
     function rpcVpnDiscover() {
         return (bridgeAvailable && typeof bridge.rpcVpnDiscover === "function")
             ? bridge.rpcVpnDiscover()
+            : ""
+    }
+    // The caller's own recent rule changes since `since` (Unix seconds).
+    function rpcRulesRecentChangesList(since) {
+        return (bridgeAvailable && typeof bridge.rpcRulesRecentChangesList === "function")
+            ? bridge.rpcRulesRecentChangesList(Math.floor(Number(since || 0)))
+            : ""
+    }
+    // The caller's kept connection history: `{ "from-unix-ms", "pagination" }`.
+    function rpcConnHistoryList(payload) {
+        return (bridgeAvailable && typeof bridge.rpcConnHistoryList === "function")
+            ? bridge.rpcConnHistoryList(payload || {})
+            : ""
+    }
+    // Erase the caller's own connection history.
+    function rpcConnHistoryClear() {
+        return (bridgeAvailable && typeof bridge.rpcConnHistoryClear === "function")
+            ? bridge.rpcConnHistoryClear()
+            : ""
+    }
+    // The caller's own choices: `{ "enabled", "retention-days" }`, either optional.
+    function rpcConnHistorySettingsSet(payload) {
+        return (bridgeAvailable && typeof bridge.rpcConnHistorySettingsSet === "function")
+            ? bridge.rpcConnHistorySettingsSet(payload || {})
             : ""
     }
     // Where one program connected lately, for the VPN-gateway helper.

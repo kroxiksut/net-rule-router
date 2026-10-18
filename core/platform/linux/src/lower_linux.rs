@@ -276,13 +276,29 @@ pub fn lower_scoped_with(
         );
     }
 
+    let mut forward = crate::nft_merge::fold_into_sets(prune_unreachable(forward));
+    if !forward.is_empty() {
+        // The forward hook sees both directions. A reply to a flow a container
+        // was allowed to open (local network, a primary host, its DNS) comes
+        // back addressed to the container, which no exemption names; the
+        // original direction stays judged, so nothing leaves that was held.
+        forward.insert(
+            0,
+            NftRule {
+                matches: vec![NftMatch::CtReply],
+                verdict: NftVerdict::Accept,
+                comment: "forwarded-reply".to_owned(),
+            },
+        );
+    }
+
     LoweredPlan {
         ruleset: NftRuleset {
             family: NftFamily::Inet,
             table: NRR_TABLE.to_owned(),
             chain: NRR_CHAIN.to_owned(),
             rules,
-            forward: crate::nft_merge::fold_into_sets(prune_unreachable(forward)),
+            forward,
         },
         unsupported,
     }
@@ -1263,8 +1279,14 @@ mod tests {
             "{:?}",
             lowered.ruleset.rules
         );
-        assert_eq!(lowered.ruleset.forward.len(), 1);
-        let fwd = &lowered.ruleset.forward[0];
+        assert_eq!(lowered.ruleset.forward.len(), 2);
+        let reply = &lowered.ruleset.forward[0];
+        assert_eq!(
+            (reply.matches.as_slice(), reply.verdict),
+            (&[NftMatch::CtReply][..], NftVerdict::Accept),
+            "replies to an allowed flow come back first"
+        );
+        let fwd = &lowered.ruleset.forward[1];
         assert_eq!(fwd.verdict, NftVerdict::Drop);
         assert!(
             fwd.matches
@@ -1306,7 +1328,7 @@ mod tests {
             "{:?}",
             lowered.ruleset.rules
         );
-        let fwd = &lowered.ruleset.forward;
+        let fwd = &lowered.ruleset.forward[1..];
         assert_eq!(fwd.len(), 2, "{fwd:?}");
         assert_eq!(fwd[0].verdict, NftVerdict::Accept);
         assert!(fwd[0]

@@ -41,6 +41,7 @@ fn rule(
         comment: comment.to_string(),
         blocked: false,
         verify_primary: false,
+        children: false,
         line_number: line,
         origin: None,
     }
@@ -94,6 +95,40 @@ browser.exe
         .map(|r| (r.match_value.as_str(), r.enabled))
         .collect();
     assert_eq!(values, vec![("My Tool.EXE", false), ("browser.exe", true)]);
+}
+
+/// Folder names carry spaces: a disabled path rule stays a rule, a note that
+/// merely mentions a folder stays a note.
+#[test]
+fn a_disabled_spaced_path_is_a_rule_not_prose() {
+    let result = parse_canonical_rules(&format!(
+        "--- {NATIVE_APP}
+# C:\\Program Files\\Example App\\*
+# C:\\Program Files\\Example App
+# \\\\server\\share\\Example App\\
+# /opt/Example App/
+# /opt/Example App/*
+# /opt is where it lives
+# see C:\\Temp
+browser.exe
+"
+    ));
+    let values: Vec<&str> = result
+        .rules
+        .iter()
+        .map(|r| r.match_value.as_str())
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            "C:\\Program Files\\Example App\\*",
+            "C:\\Program Files\\Example App",
+            "\\\\server\\share\\Example App\\",
+            "/opt/Example App/",
+            "/opt/Example App/*",
+            "browser.exe",
+        ]
+    );
 }
 
 /// An enabled network line may be spaced out; unticking it must keep the rule.
@@ -184,8 +219,8 @@ fn multi_word_comment_is_dropped_not_disabled_rule() {
 }
 
 #[test]
-fn block_flag_marks_rule_blocked_and_strips_token() {
-    let result = parse_canonical_rules("--- Domains\nads.example.com +block\n");
+fn deny_prefix_marks_rule_blocked_and_is_stripped() {
+    let result = parse_canonical_rules("--- Domains\n!ads.example.com\n");
     assert_eq!(result.rules.len(), 1);
     let r = &result.rules[0];
     assert!(r.enabled);
@@ -194,8 +229,8 @@ fn block_flag_marks_rule_blocked_and_strips_token() {
 }
 
 #[test]
-fn block_flag_with_inline_comment() {
-    let result = parse_canonical_rules("--- Domains\nads.example.com +block  # tracker\n");
+fn deny_prefix_with_inline_comment() {
+    let result = parse_canonical_rules("--- Domains\n!ads.example.com  # tracker\n");
     assert_eq!(result.rules.len(), 1);
     let r = &result.rules[0];
     assert!(r.blocked);
@@ -204,21 +239,204 @@ fn block_flag_with_inline_comment() {
 }
 
 #[test]
-fn disabled_block_rule_is_not_mistaken_for_free_comment() {
-    // `# value +block` must parse as a disabled blocked rule, not prose.
-    let result = parse_canonical_rules("--- Domains\n# ads.example.com +block\n");
-    assert_eq!(result.rules.len(), 1);
-    let r = &result.rules[0];
-    assert!(!r.enabled);
-    assert!(r.blocked);
-    assert_eq!(r.match_value, "ads.example.com");
+fn disabled_deny_goes_after_the_hash() {
+    let result = parse_canonical_rules("--- Domains\n# !ads.example.com\n#!off.example.com\n");
+    let read: Vec<_> = result
+        .rules
+        .iter()
+        .map(|r| (r.match_value.as_str(), r.enabled, r.blocked))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("ads.example.com", false, true),
+            ("off.example.com", false, true),
+        ]
+    );
 }
 
 #[test]
-fn no_block_flag_leaves_rule_unblocked() {
+fn no_deny_prefix_leaves_rule_unblocked() {
     let result = parse_canonical_rules("--- Domains\nexample.com\n");
     assert_eq!(result.rules.len(), 1);
     assert!(!result.rules[0].blocked);
+}
+
+/// Every rule section takes `!`, in either file: the parser has no notion of
+/// which file it reads.
+#[test]
+fn every_rule_section_takes_the_deny_prefix() {
+    let text = format!(
+        "--- Zones\n!example\n--- Domains\n!*.metrics.example\n!site.*\n\
+         --- IP\n!192.0.2.7\n--- CIDR\n!10.0.0.0/8\n--- Ranges\n!10.0.0.5-10.0.0.40\n\
+         --- {NATIVE_APP}\n!telemetry.exe\n--- Auto\n!tracker.example.net  # auto:user-confirmed anchor:example.com added:2026-02-02\n"
+    );
+    let result = parse_canonical_rules(&text);
+    let read: Vec<_> = result
+        .rules
+        .iter()
+        .map(|r| (r.rule_type, r.match_value.as_str(), r.blocked))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            (ParsedRuleType::Zone, "example", true),
+            (ParsedRuleType::Domain, "*.metrics.example", true),
+            (ParsedRuleType::Domain, "site.*", true),
+            (ParsedRuleType::ExactIp, "192.0.2.7", true),
+            (ParsedRuleType::Subnet, "10.0.0.0/8", true),
+            (ParsedRuleType::IpRange, "10.0.0.5-10.0.0.40", true),
+            (ParsedRuleType::Application, "telemetry.exe", true),
+            (ParsedRuleType::Domain, "tracker.example.net", true),
+        ]
+    );
+    assert!(result.rules[7].origin.is_some(), "provenance still read");
+}
+
+/// `!` must touch the value; a detached or doubled one stays in it, for
+/// validation to refuse, and is no deny.
+#[test]
+fn a_detached_or_doubled_deny_mark_stays_in_the_value() {
+    for (line, value) in [
+        ("! example.com", "! example.com"),
+        ("!!example.com", "!example.com"),
+    ] {
+        let result = parse_canonical_rules(&format!("--- Domains\n{line}\n"));
+        assert_eq!(result.rules.len(), 1, "{line:?}");
+        assert_eq!(result.rules[0].match_value, value, "{line:?}");
+    }
+    let spaced = parse_canonical_rules("--- Domains\n! example.com\n");
+    assert!(!spaced.rules[0].blocked);
+}
+
+/// The retired suffix is no deny and is not dropped: dropped, the line would
+/// silently become a route.
+#[test]
+fn the_retired_block_suffix_stays_in_the_value() {
+    let result = parse_canonical_rules(
+        "--- Domains\nads.example.com +block  # tracker\n# off.example.com +block\n",
+    );
+    let read: Vec<_> = result
+        .rules
+        .iter()
+        .map(|r| (r.match_value.as_str(), r.enabled, r.blocked))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("ads.example.com +block", true, false),
+            ("off.example.com +block", false, false),
+        ]
+    );
+    assert!(carries_retired_block_flag(&result.rules[0].match_value));
+    assert_eq!(
+        without_retired_block_flag(&result.rules[0].match_value),
+        "ads.example.com"
+    );
+}
+
+#[test]
+fn the_retired_block_suffix_is_only_a_later_word() {
+    assert!(carries_retired_block_flag("a.example +block"));
+    assert!(carries_retired_block_flag("codex.exe +children +block"));
+    assert!(!carries_retired_block_flag("+block"));
+    assert!(!carries_retired_block_flag("a.example +blocked"));
+    assert!(!carries_retired_block_flag(""));
+}
+
+#[test]
+fn deny_with_child_tracking_carries_the_flag_beside_the_value() {
+    let text = format!("--- {NATIVE_APP}\n!codex.exe +children\n");
+    let result = parse_canonical_rules(&text);
+    assert_eq!(result.rules.len(), 1);
+    assert!(result.rules[0].blocked);
+    assert!(result.rules[0].children);
+    assert_eq!(result.rules[0].match_value, "codex.exe");
+    assert_eq!(result.rules[0].stored_value(), "codex.exe +children");
+}
+
+/// The documented example, on and off: `# codex.exe +children` used to read
+/// as a note about a file with the extension `exe +children` and was lost.
+#[test]
+fn the_children_flag_is_taken_off_before_a_disabled_line_is_judged() {
+    let text = format!(
+        "--- {NATIVE_APP}\ncodex.exe +children  # assistant\n# codex.exe +children\n\
+         # Adobe Reader.exe +children\n# see notes +children\ncodex.exe +childern\n"
+    );
+    let result = parse_canonical_rules(&text);
+    let read: Vec<_> = result
+        .rules
+        .iter()
+        .map(|r| {
+            (
+                r.match_value.as_str(),
+                r.enabled,
+                r.children,
+                r.comment.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("codex.exe", true, true, "assistant"),
+            ("codex.exe", false, true, ""),
+            ("Adobe Reader.exe", false, true, ""),
+            // A typo is no flag: it stays for validation to refuse.
+            ("codex.exe +childern", true, false, ""),
+        ]
+    );
+}
+
+#[test]
+fn split_children_flag_reads_only_a_later_word() {
+    assert_eq!(
+        split_children_flag("codex.exe  +children"),
+        ("codex.exe".to_owned(), true)
+    );
+    assert_eq!(
+        split_children_flag("+children"),
+        ("+children".to_owned(), false)
+    );
+    assert_eq!(
+        split_children_flag("codex.exe +children +block"),
+        ("codex.exe +block".to_owned(), true)
+    );
+    assert_eq!(
+        split_children_flag("a.exe +childrenx"),
+        ("a.exe +childrenx".to_owned(), false)
+    );
+    assert_eq!(split_children_flag(""), (String::new(), false));
+    assert_eq!(without_children_flag("codex.exe +children"), "codex.exe");
+    assert_eq!(
+        without_children_flag("Adobe  Reader.exe"),
+        "Adobe  Reader.exe"
+    );
+}
+
+/// A table keeps the flag on a program only: in any other section the service
+/// reads it and drops it, and so does the table.
+#[test]
+fn the_stored_value_keeps_the_flag_on_a_program_only() {
+    let text =
+        format!("--- Domains\nexample.com +children\n--- {NATIVE_APP}\ntool.exe +children\n");
+    let stored: Vec<_> = parse_canonical_rules(&text)
+        .rules
+        .iter()
+        .map(ParsedRule::stored_value)
+        .collect();
+    assert_eq!(stored, ["example.com", "tool.exe +children"]);
+}
+
+#[test]
+fn the_children_flag_travels_as_a_field_an_older_peer_may_omit() {
+    let text = format!("--- {NATIVE_APP}\ncodex.exe +children\n");
+    let result = parse_canonical_rules(&text);
+    let mut json = serde_json::to_value(&result.rules[0]).expect("serialize");
+    assert_eq!(json["children"], serde_json::Value::Bool(true));
+    json.as_object_mut().expect("object").remove("children");
+    let back: ParsedRule = serde_json::from_value(json).expect("deserialize");
+    assert!(!back.children);
 }
 
 #[test]
@@ -248,21 +466,69 @@ plain.example.com
     assert_eq!(result.rules[0].comment, "sign-in");
 }
 
+/// A check never applies to a deny: neither mark is taken and the value keeps
+/// both, so the row shows an error and the line survives a rewrite as written.
 #[test]
-fn verify_prefix_with_block_flag_is_no_rule() {
+fn verify_and_deny_together_take_neither_mark() {
     let result = parse_canonical_rules(
         "--- Domains
-?both.example.com +block
-# ?off.example.com +block
+?!both.example.com
+# !?off.example.com
 kept.example.com
+--- IP
+!?192.0.2.7
 ",
     );
-    let values: Vec<_> = result
+    let read: Vec<_> = result
         .rules
         .iter()
-        .map(|r| r.match_value.as_str())
+        .map(|r| {
+            (
+                r.match_value.as_str(),
+                r.enabled,
+                r.blocked,
+                r.verify_primary,
+            )
+        })
         .collect();
-    assert_eq!(values, ["kept.example.com"]);
+    assert_eq!(
+        read,
+        [
+            ("?!both.example.com", true, false, false),
+            ("!?off.example.com", false, false, false),
+            ("kept.example.com", true, false, false),
+            ("!?192.0.2.7", true, false, false),
+        ]
+    );
+}
+
+#[test]
+fn split_rule_markers_reads_each_mark_where_it_belongs() {
+    fn read(value: &str, verify: bool) -> (&str, bool, bool, bool) {
+        let (rest, m) = split_rule_markers(value, verify);
+        (rest, m.deny, m.verify, m.contradictory)
+    }
+    assert_eq!(read("!a.example", true), ("a.example", true, false, false));
+    assert_eq!(read("?a.example", true), ("a.example", false, true, false));
+    assert_eq!(
+        read("?a.example", false),
+        ("?a.example", false, false, false)
+    );
+    assert_eq!(
+        read("!?a.example", true),
+        ("!?a.example", false, false, true)
+    );
+    assert_eq!(
+        read("?!a.example", true),
+        ("?!a.example", false, false, true)
+    );
+    // Where `?` is not read, `!?x` is a deny of a bad value.
+    assert_eq!(
+        read("!?a.example", false),
+        ("?a.example", true, false, false)
+    );
+    assert_eq!(read("!", true), ("!", false, false, false));
+    assert_eq!(read("", true), ("", false, false, false));
 }
 
 #[test]
@@ -862,10 +1128,93 @@ fn disabled_auto_rule_keeps_its_provenance() {
     );
 }
 
+/// A program rule the application wrote keeps its own section, and its
+/// provenance is read there, as the service's parser reads it.
+#[test]
+fn an_app_authored_program_rule_keeps_its_provenance() {
+    let result = parse_canonical_rules(&format!(
+        "--- {NATIVE_APP}\nclient.exe  # auto:vpn-client-bootstrap anchor:vpn.example added:2026-07-31 tunnel\nmine.exe  # my note\n",
+    ));
+    assert_eq!(result.rules.len(), 2);
+    assert_eq!(result.rules[0].rule_type, ParsedRuleType::Application);
+    assert_eq!(result.rules[0].comment, "tunnel");
+    assert_eq!(
+        result.rules[0]
+            .origin
+            .as_ref()
+            .map(|o| o.reason().as_slug()),
+        Some("vpn-client-bootstrap")
+    );
+    assert_eq!(result.rules[1].origin, None);
+    assert_eq!(result.rules[1].comment, "my note");
+}
+
 #[test]
 fn user_authored_rules_carry_no_origin_and_no_extra_wire_field() {
     let result = parse_canonical_rules("--- Domains\nexample.com  # vendor\n");
     assert_eq!(result.rules[0].origin, None);
     let json = serde_json::to_string(&result.rules[0]).expect("serialize");
     assert!(!json.contains("origin"), "got {json}");
+}
+
+/// The writer's syntax hint is never content: not a rule where it stands in a
+/// section, not carried through a passthrough block, whatever its examples
+/// say. The user's own comment beside it is kept.
+#[test]
+fn syntax_hint_lines_are_skipped_wherever_they_stand() {
+    let text = format!(
+        "# NetRuleRouter preset \u{2014} version 9\n\
+         #: # value  rule kept but turned off  # example.com\n\
+         #: !value  deny  !ads.example.net\n\
+         \n\
+         --- Domains\n\
+         #:example.com\n\
+         #: !ads.example.net\n\
+           #: # off.example.com\n\
+         # kept.example.com\n\
+         live.example.com\n\
+         --- {NATIVE_APP}\n\
+         #:client.exe\n\
+         #: Adobe Reader.exe\n\
+         --- Ports\n\
+         # my note\n\
+         #: value  # note\n\
+         443\n"
+    );
+    let result = parse_canonical_rules(&text);
+    let read: Vec<_> = result
+        .rules
+        .iter()
+        .map(|r| (r.match_value.as_str(), r.enabled, r.blocked))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("kept.example.com", false, false),
+            ("live.example.com", true, false),
+        ]
+    );
+    assert_eq!(result.passthrough.len(), 1);
+    assert_eq!(result.passthrough[0].raw_text, "# my note\n443\n");
+}
+
+#[test]
+fn a_comment_without_the_hint_prefix_is_read_as_before() {
+    assert!(!is_syntax_hint_line("# example.com"));
+    assert!(!is_syntax_hint_line("## notes"));
+    assert!(!is_syntax_hint_line("example.com  #: note"));
+    assert!(is_syntax_hint_line("  #: --- Name"));
+    let result = parse_canonical_rules("--- Domains\n# example.com\nexample.net  #: a note\n");
+    let read: Vec<_> = result
+        .rules
+        .iter()
+        .map(|r| (r.match_value.as_str(), r.enabled, r.comment.as_str()))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("example.com", false, ""),
+            ("example.net", true, ": a note"),
+        ]
+    );
 }

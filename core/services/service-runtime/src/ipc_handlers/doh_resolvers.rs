@@ -10,7 +10,8 @@
 use std::sync::Arc;
 
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 use crate::ipc_handlers::payloads::{
     DohResolverEntryDto, DohResolversGetResponse, DohResolversSetRequest, DohResolversSetResponse,
@@ -68,8 +69,34 @@ impl DohResolversSetHandler {
     }
 }
 
-impl IpcHandler for DohResolversSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl DohResolversSetHandler {
+    /// The list is shared by every user of this machine. A non-elevated caller
+    /// may still SAVE it - clients read-modify-write the whole settings page -
+    /// as long as the list comes back unchanged.
+    fn gate(&self, req: &DohResolversSetRequest, ctx: &IpcRequestContext) -> Result<(), IpcError> {
+        let current = self.store.get_all().map_err(map_write_error)?;
+        if crate::machine_scoped::machine_scoped_write_allowed(
+            &req.resolvers,
+            &current,
+            ctx.caller_is_elevated,
+        ) {
+            Ok(())
+        } else {
+            Err(crate::machine_scoped::machine_scoped_refusal(
+                crate::machine_scoped::MachineScopedSetting::DohResolvers,
+            ))
+        }
+    }
+}
+
+impl CheckedIpcHandler for DohResolversSetHandler {
+    type Checked = DohResolversSetRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
         let req: DohResolversSetRequest =
             serde_json::from_value(request.payload.clone()).map_err(|e| IpcError {
                 code: IpcErrorCode::MalformedRequest,
@@ -92,19 +119,18 @@ impl IpcHandler for DohResolversSetHandler {
                 });
             }
         }
-        // The list is shared by every user of this machine. A non-elevated
-        // caller may still SAVE it - clients read-modify-write the whole
-        // settings page - as long as the list comes back unchanged.
-        let current = self.store.get_all().map_err(map_write_error)?;
-        if !crate::machine_scoped::machine_scoped_write_allowed(
-            &req.resolvers,
-            &current,
-            ctx.caller_is_elevated,
-        ) {
-            return Err(crate::machine_scoped::machine_scoped_refusal(
-                crate::machine_scoped::MachineScopedSetting::DohResolvers,
-            ));
-        }
+        self.gate(&req, ctx)?;
+        Ok(req)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        // The stored list may have moved since the precheck compared with it.
+        self.gate(&req, ctx)?;
         match self.store.replace_all(&req.resolvers) {
             Ok(stored) => {
                 // The resolver set feeds the DoH-lockdown blocks — recompile a

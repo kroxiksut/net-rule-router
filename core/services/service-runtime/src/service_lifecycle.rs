@@ -71,6 +71,8 @@ pub struct UninstallConfig {
     /// `remove_service_owned_data` is `true`. Rule files belong to the user,
     /// not the service, and must never be silently deleted.
     pub preserve_user_rule_files: bool,
+    /// When `true`, the audit trail is removed with the data; never by default.
+    pub remove_audit_trail: bool,
 }
 
 impl UninstallConfig {
@@ -81,6 +83,7 @@ impl UninstallConfig {
         Self {
             remove_service_owned_data: false,
             preserve_user_rule_files: true,
+            remove_audit_trail: false,
         }
     }
 
@@ -91,6 +94,15 @@ impl UninstallConfig {
         Self {
             remove_service_owned_data: true,
             preserve_user_rule_files: true,
+            remove_audit_trail: false,
+        }
+    }
+
+    /// [`Self::purge_data`], the audit trail included: only on explicit request.
+    pub fn purge_data_and_audit() -> Self {
+        Self {
+            remove_audit_trail: true,
+            ..Self::purge_data()
         }
     }
 
@@ -100,6 +112,7 @@ impl UninstallConfig {
     pub fn port_spec(&self) -> ServiceUninstallSpec {
         ServiceUninstallSpec {
             remove_service_owned_data: self.remove_service_owned_data,
+            remove_audit_trail: self.remove_service_owned_data && self.remove_audit_trail,
         }
     }
 }

@@ -24,8 +24,8 @@ fn parse_disabled_rule_via_comment_prefix() {
 }
 
 #[test]
-fn parse_block_flag_sets_blocked_and_strips_token() {
-    let input = "--- Domains\nads.example.com +block  # tracker\n# off.example.com +block\n";
+fn parse_deny_prefix_sets_blocked_and_strips_the_mark() {
+    let input = "--- Domains\n!ads.example.com  # tracker\n# !off.example.com\n";
     let outcome = parse_rules_file(input);
     let domains = outcome.parsed.entries_for(RulesFileSection::Domains);
     let active = domains
@@ -41,6 +41,58 @@ fn parse_block_flag_sets_blocked_and_strips_token() {
         .expect("disabled blocked rule");
     assert!(!disabled.enabled);
     assert!(disabled.blocked);
+}
+
+/// Every rule section takes `!`, and every one of them converts to a block.
+#[test]
+fn every_section_takes_the_deny_prefix() {
+    let input = "\
+--- Zones
+!example
+--- Domains
+!*.metrics.example
+!site.*
+--- IP
+!192.0.2.7
+--- CIDR
+!10.0.0.0/8
+--- Ranges
+!10.0.0.5-10.0.0.40
+--- Windows
+!telemetry.exe
+--- Auto
+!tracker.example.net  # auto:user-confirmed anchor:example.com added:2026-02-02
+";
+    let outcome = parse_rules_file(input);
+    let read: Vec<(RulesFileSection, &str, bool)> = outcome
+        .parsed
+        .sections
+        .iter()
+        .flat_map(|s| {
+            s.entries
+                .iter()
+                .map(move |e| (s.section, e.match_value.as_str(), e.blocked))
+        })
+        .collect();
+    assert_eq!(
+        read,
+        [
+            (RulesFileSection::Zones, "example", true),
+            (RulesFileSection::Domains, "*.metrics.example", true),
+            (RulesFileSection::Domains, "site.*", true),
+            (RulesFileSection::Ip, "192.0.2.7", true),
+            (RulesFileSection::Cidr, "10.0.0.0/8", true),
+            (RulesFileSection::Ranges, "10.0.0.5-10.0.0.40", true),
+            (RulesFileSection::Windows, "telemetry.exe", true),
+            (RulesFileSection::Auto, "tracker.example.net", true),
+        ]
+    );
+    let set = rules_file_to_route_rule_set(&outcome.parsed, HostPlatform::Windows, false);
+    assert_eq!(set.rules.len(), 8);
+    assert!(set
+        .rules
+        .iter()
+        .all(|r| r.action == crate::RuleAction::Block));
 }
 
 /// `+children` is documented in the rules-file format and nothing in the
@@ -61,16 +113,14 @@ fn the_children_flag_is_consumed_instead_of_corrupting_the_value() {
     assert!(!entry.blocked);
     assert_eq!(entry.inline_comment.as_deref(), Some("AI assistant"));
 
-    // Both documented flags on one line, in either order.
-    for line in ["codex.exe +children +block", "codex.exe +block +children"] {
-        let parsed = parse_rules_file(&format!("--- Windows\n{line}\n")).parsed;
-        let entry = parsed
-            .entries_for(RulesFileSection::Windows)
-            .iter()
-            .find(|e| e.match_value == "codex.exe")
-            .unwrap_or_else(|| panic!("value survives for {line:?}"));
-        assert!(entry.blocked, "{line:?} keeps its block flag");
-    }
+    // A deny with child tracking: `!` before, `+children` after.
+    let parsed = parse_rules_file("--- Windows\n!codex.exe +children\n").parsed;
+    let entry = parsed
+        .entries_for(RulesFileSection::Windows)
+        .iter()
+        .find(|e| e.match_value == "codex.exe")
+        .expect("value survives with both marks");
+    assert!(entry.blocked);
 
     // Negative control: a trailing token that is NOT a documented flag
     // still reaches the value, so the semantic validator can complain
@@ -82,16 +132,109 @@ fn the_children_flag_is_consumed_instead_of_corrupting_the_value() {
         .any(|e| e.match_value.contains("+childern")));
 }
 
+/// The retired suffix is neither a deny nor dropped: skipped, the line would
+/// become a route. It stays in the value, enabled or not, and the per-row
+/// verdict names the new spelling.
 #[test]
-fn block_flag_round_trips_through_write_and_parse() {
-    let input = "--- Domains\nads.example.com +block  # tracker\n";
+fn the_retired_block_suffix_is_a_line_error_not_a_route() {
+    let input = "--- Domains\nads.example.com +block  # tracker\n# off.example.com +block\n\
+                 --- Windows\ncodex.exe +children +block\n";
+    let outcome = parse_rules_file(input);
+    let read: Vec<(&str, bool, bool)> = outcome
+        .parsed
+        .sections
+        .iter()
+        .flat_map(|s| &s.entries)
+        .map(|e| (e.match_value.as_str(), e.enabled, e.blocked))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("ads.example.com +block", true, false),
+            ("off.example.com +block", false, false),
+            ("codex.exe +block", true, false),
+        ]
+    );
+    for (kind, value, hint) in [
+        ("domain", "ads.example.com +block", "!ads.example.com"),
+        ("application", "codex.exe +block", "!codex.exe"),
+    ] {
+        let verdict = crate::rule_value_validation::validate_rule_value(kind, value);
+        assert!(verdict.is_error(), "{value}");
+        assert_eq!(
+            verdict.message_key(),
+            "rules.validation.match-value-invalid.retired-block-flag",
+            "{value}"
+        );
+        assert_eq!(
+            verdict.args().get("value").map(String::as_str),
+            Some(hint),
+            "{value}"
+        );
+    }
+    // Spaces are legal in an application name: the import pipeline must not
+    // take this one for a route to a process called `codex.exe +block`.
+    let set = rules_file_to_route_rule_set(&outcome.parsed, HostPlatform::Windows, false);
+    assert!(set
+        .rules
+        .iter()
+        .all(|r| r.action == crate::RuleAction::Route));
+    let mut warnings = Vec::new();
+    assert!(crate::validation::canonical_app_pattern(
+        "codex.exe +block",
+        false,
+        HostPlatform::Windows,
+        &crate::RuleId("r-0".into()),
+        &mut warnings,
+    )
+    .is_err());
+}
+
+/// `!` must touch the value, and a check never applies to a deny: both stay
+/// in the value and the per-row verdict refuses them.
+#[test]
+fn a_detached_deny_mark_or_one_beside_a_check_is_a_line_error() {
+    for (line, value) in [
+        ("! example.com", "! example.com"),
+        ("!!example.com", "!example.com"),
+        ("?!example.com", "?!example.com"),
+        ("!?example.com", "!?example.com"),
+    ] {
+        let outcome = parse_rules_file(&format!("--- Domains\n{line}\n"));
+        let entries = outcome.parsed.entries_for(RulesFileSection::Domains);
+        assert_eq!(entries.len(), 1, "{line:?}");
+        assert_eq!(entries[0].match_value, value, "{line:?}");
+        assert!(!entries[0].verify_primary, "{line:?}");
+        let verdict = crate::rule_value_validation::validate_rule_value("domain", value);
+        assert_eq!(
+            verdict.message_key(),
+            "rules.validation.match-value-invalid.deny-mark",
+            "{line:?}"
+        );
+    }
+    // A spaced mark on an application line is no exact name of a process.
+    let verdict =
+        crate::rule_value_validation::validate_rule_value("application", "! telemetry.exe");
+    assert_eq!(
+        verdict.message_key(),
+        "rules.validation.match-value-invalid.deny-mark"
+    );
+}
+
+#[test]
+fn deny_prefix_round_trips_through_write_and_parse() {
+    let input = "--- Domains\n!ads.example.com  # tracker\n# !off.example.com\n\
+                 --- Windows\n!codex.exe +children\n";
     let parsed = parse_rules_file(input).parsed;
     let written = write_rules_file(&parsed, &[], None);
     assert!(
-        written.contains("ads.example.com +block"),
-        "writer must emit the +block flag, got:\n{written}"
+        written.contains("\n!ads.example.com  # tracker\n# !off.example.com\n"),
+        "writer must put `!` right before the value, got:\n{written}"
     );
+    assert!(written.contains("\n!codex.exe\n"), "got:\n{written}");
+    assert!(!written.contains("+block"), "got:\n{written}");
     let reparsed = parse_rules_file(&written).parsed;
+    assert_eq!(reparsed, parsed);
     let e = reparsed
         .entries_for(RulesFileSection::Domains)
         .iter()
@@ -103,8 +246,8 @@ fn block_flag_round_trips_through_write_and_parse() {
 }
 
 #[test]
-fn block_flag_maps_to_domain_rule_block_action() {
-    let input = "--- Domains\nads.example.com +block\nrouted.example.com\n";
+fn deny_prefix_maps_to_domain_rule_block_action() {
+    let input = "--- Domains\n!ads.example.com\nrouted.example.com\n";
     let parsed = parse_rules_file(input).parsed;
     let set = rules_file_to_route_rule_set(&parsed, HostPlatform::Windows, false);
     let blocked = set
@@ -185,25 +328,39 @@ fn parse_windows_disabled_entry() {
 /// The toggle in the GUI writes `# <value>` and the file is rewritten from
 /// the parsed model, so a value dropped here is a rule deleted for good.
 ///
-/// Written against the HOST's own application section: whether a commented
-/// line with a space is a disabled rule or prose is decided per rule kind,
-/// and only the running platform's section counts as one. Hardcoding
-/// `--- Windows` made this fail under Linux for a reason that has nothing to
-/// do with what it asserts — the same trap
-/// `compiled_platform_matches_the_build_target` documents.
+/// Every application section, whatever host reads it: a file written on one
+/// OS is read on another, and its sections must survive there unchanged.
 #[test]
 fn a_disabled_program_name_with_a_space_survives_the_round_trip() {
-    let section = match HostPlatform::compiled() {
-        HostPlatform::Windows => RulesFileSection::Windows,
-        HostPlatform::Linux => RulesFileSection::Linux,
-        HostPlatform::MacOS => RulesFileSection::MacOS,
-    };
-    let file = format!("--- {}\n# Adobe Reader.exe\nbrowser.exe\n", section.name());
-    let outcome = parse_rules_file(&file);
-    let apps = outcome.parsed.entries_for(section);
-    assert_eq!(apps.len(), 2, "{apps:?}");
-    assert_eq!(apps[0].match_value, "Adobe Reader.exe");
-    assert!(!apps[0].enabled);
+    for section in [
+        RulesFileSection::Windows,
+        RulesFileSection::Linux,
+        RulesFileSection::MacOS,
+    ] {
+        let file = format!("--- {}\n# Adobe Reader.exe\nbrowser.exe\n", section.name());
+        let outcome = parse_rules_file(&file);
+        let apps = outcome.parsed.entries_for(section);
+        assert_eq!(apps.len(), 2, "{section}: {apps:?}");
+        assert_eq!(apps[0].match_value, "Adobe Reader.exe");
+        assert!(!apps[0].enabled);
+    }
+}
+
+/// A disabled path with a space in another OS's section is a rule, not prose:
+/// how a line reads is the section's, never the host's.
+#[test]
+fn a_disabled_spaced_path_survives_in_every_app_section() {
+    for (section, path) in [
+        (RulesFileSection::Windows, "C:\\Program Files\\Other App\\"),
+        (RulesFileSection::Linux, "/opt/Other App/"),
+        (RulesFileSection::MacOS, "/Applications/Other App/"),
+    ] {
+        let parsed = parse_rules_file(&format!("--- {}\n# {path}\n", section.name())).parsed;
+        let apps = parsed.entries_for(section);
+        assert_eq!(apps.len(), 1, "{section}: {apps:?}");
+        assert_eq!(apps[0].match_value, path);
+        assert!(!apps[0].enabled);
+    }
 }
 
 /// A note that happens to end in a file name is still a note, and saving the

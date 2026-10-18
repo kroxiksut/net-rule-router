@@ -1,0 +1,18 @@
+# NetRuleRouter rules file — version 10
+--- Windows
+C:\Apps\Tool\tool.exe
+C:\Apps\Tool
+C:\Apps\Tool\
+C:/Apps/Tool/*
+!C:\Program Files\Example App\* +children
+# C:\Program Files\Other App\
+\\server\share\tools\
+\\?\C:\Apps\long\run.exe
+C:\*
+C:\Apps\*.exe
+C:\*\tool.exe
+C:\Apps\..\Windows\
+C:\Apps\a:b\
+Apps\tool.exe
+C:Apps\tool.exe
+nord*

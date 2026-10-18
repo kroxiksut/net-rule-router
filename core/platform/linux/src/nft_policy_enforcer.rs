@@ -269,6 +269,11 @@ fn bounded_detail(detail: &str) -> String {
 }
 
 impl PolicyEnforcer for NftPolicyEnforcer {
+    // Every rule of a plan matches its owner's uid, packet blocks included.
+    fn packet_blocks_follow_the_principal(&self) -> bool {
+        true
+    }
+
     fn enforce(&self, plans: &[EnforcementPlan]) -> Result<ApplyReport, EnforcementFailure> {
         let started = Instant::now();
         let lowered = self.lower(plans)?;

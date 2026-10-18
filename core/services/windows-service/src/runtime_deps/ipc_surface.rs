@@ -127,6 +127,13 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
     > = Some(Arc::new(
         nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing::new(1000),
     ));
+    // Each user's connection history, folded from the rows the trace sees.
+    if let Some(ring) = conn_trace_ring.as_ref() {
+        ring.attach_history(nrr_service_runtime::conn_history::open_for_service(
+            artifacts.topology.conn_history_db_path.clone(),
+            settings_conn.clone(),
+        ));
+    }
     if let (Some(ring), Some(cache)) = (conn_trace_ring.as_ref(), cache_store.as_ref()) {
         ring.attach_namer(Arc::new(
             nrr_service_runtime::conn_trace_names::ConnTraceNamer::production(Arc::clone(cache))
@@ -638,11 +645,15 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
             as Arc<dyn nrr_service_runtime::ipc_handlers::providers::LinkProviderWriter>);
         // Wire the full-reset auxiliary-state purger, same shape as the
         // route-policy writer above.
-        deps = deps.with_principal_data_purger(Arc::new(
+        // A full reset erases the user's connection history too.
+        let mut purger =
             nrr_service_runtime::production_handlers_misc::ProductionPrincipalDataPurger::new(
                 Arc::clone(conn),
-            ),
-        )
+            );
+        if let Some(ring) = conn_trace_ring.as_ref() {
+            purger = purger.with_conn_history(Arc::clone(ring));
+        }
+        deps = deps.with_principal_data_purger(Arc::new(purger)
             as Arc<dyn nrr_service_runtime::ipc_handlers::providers::PrincipalDataPurger>);
         // Wire the shared DoH resolver baseline store so
         // `doh.resolvers.get` / `doh.resolvers.set` resolve to real handlers.

@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use nrr_shared::platform_profile::PlatformProfile;
 use nrr_storage::autostart_state::AutostartStateRecord;
 use nrr_storage::doh_lockdown::DohResolverEntry;
+use nrr_storage::install_policy::InstallPolicy;
 use nrr_storage::log_retention_config::LogRetentionConfig;
 use nrr_storage::pause_state::RoutingPauseRecord;
 use nrr_storage::policy_settings::ApplyFailurePolicyRecord;
@@ -161,6 +162,13 @@ fn stored_fields() -> Vec<(&'static str, Vec<&'static str>)> {
                 auto_rules_mode,
                 auto_rules_eager_delivery_names,
                 binding_source,
+            }),
+        ),
+        (
+            "InstallPolicy",
+            fields_of!(InstallPolicy {
+                secondary_unset,
+                default_route_mode,
             }),
         ),
         (
@@ -319,6 +327,7 @@ const LNX_AUTOSTART: Link = (
     "core/services/linux-service/src/ipc_deps.rs",
     "ProductionAutostart::new(",
 );
+const MISC_HANDLERS: &str = "core/services/service-runtime/src/production_handlers_misc.rs";
 const WIN_IPC_SURFACE: &str = "core/services/windows-service/src/runtime_deps/ipc_surface.rs";
 const LNX_IPC_DEPS: &str = "core/services/linux-service/src/ipc_deps.rs";
 const WIN_STORAGE_READS: &str = "core/services/windows-service/src/runtime_deps/storage_reads.rs";
@@ -887,6 +896,31 @@ fn settings() -> Vec<Setting> {
                 ),
             ]),
         },
+        // ── InstallPolicy (machine-wide, written at the first start) ──
+        Setting {
+            store: "InstallPolicy",
+            field: "secondary_unset",
+            windows: Read(vec![
+                (MISC_HANDLERS, "fn secondary_unset_blocks("),
+                WIN_POLICY_SOURCE,
+            ]),
+            linux: Read(vec![
+                (MISC_HANDLERS, "fn secondary_unset_blocks("),
+                LNX_POLICY_SOURCE,
+            ]),
+        },
+        Setting {
+            store: "InstallPolicy",
+            field: "default_route_mode",
+            windows: Read(vec![
+                (MISC_HANDLERS, "fn apply_install_default_mode("),
+                (WIN_IPC_SURFACE, "ProductionRoutePolicyWriter::new("),
+            ]),
+            linux: Read(vec![
+                (MISC_HANDLERS, "fn apply_install_default_mode("),
+                (LNX_IPC_DEPS, "ProductionRoutePolicyWriter::new("),
+            ]),
+        },
     ]
 }
 
@@ -1012,11 +1046,6 @@ enum Cap {
     Backed(Vec<Link>),
     /// The flag is `false` and nothing claims otherwise.
     NotOffered,
-    /// The flag is `false`, yet the daemon runs the mechanism.
-    GapHidden {
-        reason: &'static str,
-        present: Vec<Link>,
-    },
 }
 
 struct Capability {
@@ -1045,15 +1074,10 @@ fn capabilities() -> Vec<Capability> {
                     "fieldKey: FWPM_CONDITION_ALE_APP_ID",
                 ),
             ]),
-            linux: GapHidden {
-                reason: "the daemon observes which program opens each connection and routes \
-                         application rules by what it saw, but the flag hides the application \
-                         rule type in the window, the tray and the console",
-                present: vec![(
-                    LNX_RUNTIME_DEPS,
-                    "conn_observe::ProcfsConnectionObserver::new()",
-                )],
-            },
+            linux: Backed(vec![(
+                LNX_RUNTIME_DEPS,
+                "conn_observe::ProcfsConnectionObserver::new()",
+            )]),
         },
         Capability {
             key: "dnsObserve",
@@ -1193,6 +1217,11 @@ fn capabilities() -> Vec<Capability> {
                 "core/platform/windows/src/win32_ffi/wfp_filter.rs",
                 "fieldKey: FWPM_CONDITION_ALE_APP_ID",
             )]),
+            linux: NotOffered,
+        },
+        Capability {
+            key: "appPathRules",
+            windows: NotOffered,
             linux: NotOffered,
         },
         Capability {
@@ -1492,22 +1521,6 @@ fn every_capability_flag_matches_what_the_service_wires() {
                         problems.push(format!(
                             "{what} ({os:?}) is true with no mechanism named — name it"
                         ));
-                    }
-                }
-                Cap::GapHidden { reason, present } => {
-                    if on {
-                        problems.push(format!(
-                            "{what} ({os:?}) was a listed gap ({reason}) and is now true: \
-                             replace the entry with Backed"
-                        ));
-                    }
-                    for (file, needle) in present {
-                        if !found(file, needle) {
-                            problems.push(format!(
-                                "{what} ({os:?}) is listed as hidden though wired ({reason}), \
-                                 but `{needle}` left `{file}`: update the entry"
-                            ));
-                        }
                     }
                 }
             }

@@ -104,6 +104,8 @@ struct FakePolicy {
     by_sid: Mutex<std::collections::HashMap<String, String>>,
     primary_by_sid: Mutex<std::collections::HashMap<String, String>>,
     secondary_names: Mutex<std::collections::HashMap<String, String>>,
+    modes:
+        Mutex<std::collections::HashMap<String, crate::per_sid_orchestrator::PerSidBehaviorMode>>,
 }
 impl FakePolicy {
     fn new() -> Self {
@@ -111,7 +113,12 @@ impl FakePolicy {
             by_sid: Mutex::new(std::collections::HashMap::new()),
             primary_by_sid: Mutex::new(std::collections::HashMap::new()),
             secondary_names: Mutex::new(std::collections::HashMap::new()),
+            modes: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+    /// `sid`'s behaviour mode; unset is the default, mode A.
+    fn set_mode(&self, sid: &str, mode: crate::per_sid_orchestrator::PerSidBehaviorMode) {
+        self.modes.lock().unwrap().insert(sid.to_string(), mode);
     }
     fn bind_secondary(&self, sid: &str, stable_id: &str) {
         self.by_sid
@@ -176,7 +183,13 @@ impl RoutePolicySource for FakePolicy {
                 user_confirmed: true,
                 known_stable_ids: Vec::new(),
             }),
-            mode: crate::per_sid_orchestrator::PerSidBehaviorMode::PreferPrimary,
+            mode: self
+                .modes
+                .lock()
+                .unwrap()
+                .get(sid)
+                .copied()
+                .unwrap_or(crate::per_sid_orchestrator::PerSidBehaviorMode::PreferPrimary),
             block_secondary_when_unavailable: false,
             kill_switch_fail_closed: true,
             kill_switch_protocols: 0x7F,

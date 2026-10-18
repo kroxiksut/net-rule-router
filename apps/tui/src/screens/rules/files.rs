@@ -91,11 +91,17 @@ pub fn set_exists(dir: &Path) -> bool {
         .any(|route| dir.join(file_name(route)).exists())
 }
 
-/// Both files from the rows on screen, as the GUI writes them.
-pub fn write_set(dir: &Path, table: &Table, exported_at: &str) -> Result<(), (PathBuf, String)> {
+/// Both files from the rows on screen, as the GUI writes them. `hint` is the
+/// translated syntax hint the files open with.
+pub fn write_set(
+    dir: &Path,
+    table: &Table,
+    hint: &[String],
+    exported_at: &str,
+) -> Result<(), (PathBuf, String)> {
     std::fs::create_dir_all(dir).map_err(|e| (dir.to_path_buf(), e.to_string()))?;
     for route in Route::ALL {
-        write_route(&dir.join(file_name(route)), route, table, exported_at)?;
+        write_route(&dir.join(file_name(route)), route, table, hint, exported_at)?;
     }
     Ok(())
 }
@@ -105,6 +111,7 @@ pub fn write_route(
     path: &Path,
     route: Route,
     table: &Table,
+    hint: &[String],
     exported_at: &str,
 ) -> Result<(), (PathBuf, String)> {
     let rows: Vec<RuleRow> = table.rows.iter().map(|r| r.rule.clone()).collect();
@@ -113,6 +120,7 @@ pub fn write_route(
         exported_at,
         passthrough: &table.passthrough[route_index(route)],
         os: PlatformProfile::current().os,
+        syntax_hint: hint,
     };
     std::fs::write(path, build_rules_file_text(&rows, route, &options))
         .map_err(|e| (path.to_path_buf(), e.to_string()))
@@ -234,4 +242,77 @@ pub fn user_sets(root: &Path) -> Vec<Preset> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::Scratch;
+    use nrr_client_logic::rules_table::{TargetRoute, RULES_FILE_HINT_KEYS};
+
+    /// The terminal writes the syntax hint the GUI writes, in the reader's
+    /// language, and reads it back as nothing.
+    #[test]
+    fn a_written_file_opens_with_the_hint_and_reads_back_without_it() {
+        let dir = Scratch::new("files-hint");
+        let mut app = crate::state::AppState::new(crate::screens::ScreenId::Rules, false);
+        super::super::on_texts(&mut app, &crate::testing::texts_en());
+        assert_eq!(app.rules.file_hint.len(), RULES_FILE_HINT_KEYS.len());
+        let hint = &app.rules.file_hint;
+        let written = write_set(dir.path(), &app.rules.table, hint, "2026-01-01T00:00:00Z");
+        written.expect("write");
+        let path = dir.path().join(file_name(Route::Primary));
+        let text = std::fs::read_to_string(path).expect("read");
+        assert!(text.contains("\n\n#: --- Name"), "{text}");
+        let set = read_set(dir.path()).expect("read back");
+        assert!(set.rows.is_empty(), "{:?}", set.rows);
+        assert!(set.passthrough.iter().all(BTreeMap::is_empty));
+    }
+
+    /// The terminal reads a deny the GUI way and writes it back as `!value`;
+    /// a line in the retired spelling is no block and its verdict says so.
+    #[test]
+    fn a_deny_reads_as_a_block_and_is_written_back_before_the_value() {
+        let dir = Scratch::new("files-deny");
+        std::fs::write(
+            dir.path().join(file_name(Route::Primary)),
+            "--- Domains\n!ads.example\n# !off.example\nkept.example\nold.example +block\n",
+        )
+        .expect("write");
+        let set = read_set(dir.path()).expect("read");
+        let read: Vec<_> = set
+            .rows
+            .iter()
+            .map(|r| (r.match_value.as_str(), r.enabled, r.target_route.clone()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("ads.example", true, TargetRoute::Block),
+                ("off.example", false, TargetRoute::Block),
+                ("kept.example", true, TargetRoute::Primary),
+                ("old.example +block", true, TargetRoute::Primary),
+            ]
+        );
+        let row = &set.rows[3];
+        let retired = super::super::table::Verdict::of(&row.rule_type, &row.match_value);
+        assert_eq!(
+            retired.message_key,
+            "rules.validation.match-value-invalid.retired-block-flag"
+        );
+
+        let options = RulesFileOptions {
+            include_comments: true,
+            exported_at: "2026-01-01T00:00:00Z",
+            passthrough: &BTreeMap::new(),
+            os: "windows",
+            syntax_hint: &[],
+        };
+        let secondary = build_rules_file_text(&set.rows, Route::Secondary, &options);
+        assert!(
+            secondary.contains("\n!ads.example\n# !off.example\n"),
+            "{secondary}"
+        );
+        assert!(!secondary.contains("+block"), "{secondary}");
+    }
 }

@@ -392,7 +392,7 @@ fn process_name_exact_uppercased_lowercased() {
     let mut warnings = Vec::new();
     let result = normalize_app_match(
         &app,
-        ExecutableNaming::WindowsExe,
+        HostPlatform::Windows,
         &RuleId("r-1".to_string()),
         &mut warnings,
     )
@@ -411,7 +411,7 @@ fn process_name_exact_missing_exe_gets_appended_with_warning() {
     let mut warnings = Vec::new();
     let result = normalize_app_match(
         &app,
-        ExecutableNaming::WindowsExe,
+        HostPlatform::Windows,
         &RuleId("r-1".to_string()),
         &mut warnings,
     )
@@ -474,85 +474,154 @@ fn unix_rules_keep_their_names_and_raise_no_suffix_warning() {
     }
 }
 
+/// A value with a separator names a program by where it lives; the file
+/// name alone is no longer what is kept.
 #[test]
-fn a_unix_path_is_still_reduced_to_its_file_name() {
-    let app = AppMatch {
-        pattern: AppMatchPattern::Exact("/usr/bin/Chat-Desktop".to_string()),
-        include_child_processes: false,
-        windows_service_name: None,
-    };
-    let mut warnings = Vec::new();
-    let result = normalize_app_match(
-        &app,
-        ExecutableNaming::AsNamed,
-        &RuleId("r-1".to_string()),
-        &mut warnings,
-    )
-    .expect("Exact pattern must normalize successfully");
-    assert_eq!(result.pattern.as_str(), "chat-desktop");
-    assert!(warnings
-        .iter()
-        .all(|w| matches!(w, ValidationWarning::ProcessNameContainedPath { .. })));
+fn a_value_with_a_separator_is_a_path() {
+    use nrr_shared::app_path::AppPathKind;
+    for (raw, platform, kind, text) in [
+        (
+            r"C:\Program Files\Chrome.exe",
+            HostPlatform::Windows,
+            AppPathKind::File,
+            r"c:\program files\chrome.exe",
+        ),
+        (
+            "C:/Program Files/firefox.exe",
+            HostPlatform::Windows,
+            AppPathKind::File,
+            r"c:\program files\firefox.exe",
+        ),
+        (
+            r"C:\Temp",
+            HostPlatform::Windows,
+            AppPathKind::Folder,
+            r"c:\temp\",
+        ),
+        (
+            r"C:\Temp\",
+            HostPlatform::Windows,
+            AppPathKind::Folder,
+            r"c:\temp\",
+        ),
+        (
+            r"C:\Temp\*",
+            HostPlatform::Windows,
+            AppPathKind::FolderTree,
+            r"c:\temp\*",
+        ),
+        (
+            "/usr/bin/Chat-Desktop",
+            HostPlatform::Linux,
+            AppPathKind::FileOrFolder,
+            "/usr/bin/Chat-Desktop",
+        ),
+        (
+            "/opt/App/",
+            HostPlatform::Linux,
+            AppPathKind::Folder,
+            "/opt/App/",
+        ),
+        (
+            "/Applications/App.app/*",
+            HostPlatform::MacOS,
+            AppPathKind::FolderTree,
+            "/applications/app.app/*",
+        ),
+    ] {
+        let app = AppMatch {
+            pattern: AppMatchPattern::Exact(raw.to_string()),
+            include_child_processes: false,
+            windows_service_name: None,
+        };
+        let mut warnings = Vec::new();
+        let result = normalize_app_match(&app, platform, &RuleId("r-1".to_string()), &mut warnings)
+            .unwrap_or_else(|e| panic!("{raw}: {e}"));
+        let path = result
+            .pattern
+            .path()
+            .unwrap_or_else(|| panic!("{raw}: not a path"));
+        assert_eq!((path.kind(), path.as_str()), (kind, text), "{raw}");
+        assert!(warnings.is_empty(), "{raw}: {warnings:?}");
+    }
 }
 
 #[test]
-fn process_name_exact_windows_path_stripped_with_warning() {
-    let app = AppMatch {
-        pattern: AppMatchPattern::Exact(r"C:\Program Files\chrome.exe".to_string()),
-        include_child_processes: false,
-        windows_service_name: None,
-    };
-    let mut warnings = Vec::new();
-    let result = normalize_app_match(
-        &app,
-        ExecutableNaming::WindowsExe,
-        &RuleId("r-1".to_string()),
-        &mut warnings,
-    )
-    .expect("Exact pattern must normalize successfully");
-    assert_eq!(result.pattern.as_str(), "chrome.exe");
-    assert!(warnings
-        .iter()
-        .any(|w| matches!(w, ValidationWarning::ProcessNameContainedPath { .. })));
+fn a_path_that_names_no_program_is_refused_with_its_reason() {
+    use nrr_shared::app_path::AppPathError;
+    for (raw, platform, problem) in [
+        (
+            r"C:\Games\*.exe",
+            HostPlatform::Windows,
+            AppPathError::StarNotLast,
+        ),
+        (
+            r"C:\*\steam.exe",
+            HostPlatform::Windows,
+            AppPathError::StarNotLast,
+        ),
+        ("/opt/*/bin", HostPlatform::Linux, AppPathError::StarNotLast),
+        (
+            r"Games\app.exe",
+            HostPlatform::Windows,
+            AppPathError::NotAbsolute,
+        ),
+        ("bin/app", HostPlatform::Linux, AppPathError::NotAbsolute),
+        (
+            r"C:\Games\..\Windows\",
+            HostPlatform::Windows,
+            AppPathError::Malformed,
+        ),
+    ] {
+        let result = canonical_app_pattern(
+            raw,
+            raw.contains('*'),
+            platform,
+            &RuleId("r-1".to_string()),
+            &mut Vec::new(),
+        );
+        let refused = matches!(
+            &result,
+            Err(ValidationError::AppPathInvalid { problem: p, .. }) if *p == problem
+        );
+        assert!(refused, "{raw}: {result:?}");
+    }
 }
 
+/// On Linux and macOS a backslash is part of a file name, not a separator.
 #[test]
-fn process_name_exact_double_slash_path_stripped() {
-    let app = AppMatch {
-        pattern: AppMatchPattern::Exact("//C//Program Files//chrome.exe".to_string()),
-        include_child_processes: false,
-        windows_service_name: None,
-    };
-    let mut warnings = Vec::new();
-    let result = normalize_app_match(
-        &app,
-        ExecutableNaming::WindowsExe,
+fn a_backslash_is_no_separator_on_unix() {
+    let result = canonical_app_pattern(
+        r"odd\name",
+        false,
+        HostPlatform::Linux,
         &RuleId("r-1".to_string()),
-        &mut warnings,
+        &mut Vec::new(),
     )
-    .expect("Exact pattern must normalize successfully");
-    assert_eq!(result.pattern.as_str(), "chrome.exe");
-    assert!(warnings
-        .iter()
-        .any(|w| matches!(w, ValidationWarning::ProcessNameContainedPath { .. })));
+    .expect("a name");
+    assert!(result.path().is_none(), "{result:?}");
 }
 
+/// A file read with paths keeps the rest when one of them names nothing.
 #[test]
-fn process_name_exact_forward_slash_path_stripped() {
-    let app = AppMatch {
-        pattern: AppMatchPattern::Exact("C:/Program Files/firefox.exe".to_string()),
-        include_child_processes: false,
-        windows_service_name: None,
-    };
-    let mut warnings = Vec::new();
-    let result = normalize_app_match(
-        &app,
-        ExecutableNaming::WindowsExe,
-        &RuleId("r-1".to_string()),
-        &mut warnings,
-    )
-    .expect("Exact pattern must normalize successfully");
-    assert_eq!(result.pattern.as_str(), "firefox.exe");
+fn a_broken_path_in_a_file_drops_only_its_rule() {
+    let config = config_with_rules(
+        Some(primary()),
+        None,
+        RouteBehaviorMode::PreferPrimary,
+        vec![
+            app_rule("r-1", r"C:\Games\*.exe"),
+            app_rule("r-2", "chrome.exe"),
+        ],
+        vec![],
+    );
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
+    let profile = outcome.profile().expect("accepted");
+    assert_eq!(profile.rule_book.primary.len(), 1);
+    assert!(outcome
+        .warnings()
+        .iter()
+        .any(|w| matches!(w, ValidationWarning::AppPatternRefusedDropped { .. })));
 }
 
 #[test]
@@ -565,7 +634,7 @@ fn process_name_glob_is_lowercased() {
     let mut warnings = Vec::new();
     let result = normalize_app_match(
         &app,
-        ExecutableNaming::WindowsExe,
+        HostPlatform::Windows,
         &RuleId("r-1".to_string()),
         &mut warnings,
     )
@@ -584,7 +653,7 @@ fn process_name_glob_bare_star_is_rejected() {
     let mut warnings = Vec::new();
     let result = normalize_app_match(
         &app,
-        ExecutableNaming::WindowsExe,
+        HostPlatform::Windows,
         &RuleId("r-1".to_string()),
         &mut warnings,
     );
@@ -594,8 +663,8 @@ fn process_name_glob_bare_star_is_rejected() {
     ));
 }
 
-/// The matcher drops the directory and `.exe` before comparing, so these
-/// name every process just as a bare `*` does.
+/// The matcher drops the directory and `.exe` before comparing, so a name
+/// mask read the stored way names every process just as a bare `*` does.
 #[test]
 fn process_name_glob_that_reduces_to_a_bare_star_is_rejected() {
     for pattern in [
@@ -607,7 +676,7 @@ fn process_name_glob_that_reduces_to_a_bare_star_is_rejected() {
         r"C:\Games\**.exe",
     ] {
         for naming in [ExecutableNaming::WindowsExe, ExecutableNaming::AsNamed] {
-            let result = canonical_app_pattern(
+            let result = canonical_name_pattern(
                 pattern,
                 true,
                 naming,
@@ -623,7 +692,7 @@ fn process_name_glob_that_reduces_to_a_bare_star_is_rejected() {
     // Something left after the reduction still narrows the match.
     for pattern in [r"C:\Games\*game*.exe", "/opt/*torrent", r"C:\*\steam.exe"] {
         assert!(
-            canonical_app_pattern(
+            canonical_name_pattern(
                 pattern,
                 true,
                 ExecutableNaming::WindowsExe,
@@ -634,6 +703,49 @@ fn process_name_glob_that_reduces_to_a_bare_star_is_rejected() {
             "{pattern}"
         );
     }
+    // A rule value with no separator is still judged as a mask.
+    for pattern in ["*.exe", "**"] {
+        assert!(matches!(
+            canonical_app_pattern(
+                pattern,
+                true,
+                HostPlatform::Windows,
+                &RuleId("r-1".to_string()),
+                &mut Vec::new(),
+            ),
+            Err(ValidationError::AppGlobTooWide { .. })
+        ));
+    }
+}
+
+#[test]
+fn the_same_folder_in_the_same_form_on_both_routes_is_a_tie() {
+    let book = |primary_value: &str, secondary_value: &str| {
+        let config = config_with_rules(
+            Some(primary()),
+            Some(secondary()),
+            RouteBehaviorMode::PreferPrimary,
+            vec![app_rule("r-1", primary_value)],
+            vec![app_rule("r-2", secondary_value)],
+        );
+        validate_and_canonicalize(&config, HostPlatform::Windows)
+            .profile()
+            .expect("accepted")
+            .rule_book
+            .clone()
+    };
+    assert_eq!(
+        folders_on_both_routes(&book(r"C:\Apps\Tool\", r"c:\apps\tool")),
+        vec![r"c:\apps\tool\".to_string()]
+    );
+    assert_eq!(
+        folders_on_both_routes(&book(r"C:\Apps\Tool\*", r"C:\Apps\Tool\*")),
+        vec![r"c:\apps\tool\*".to_string()]
+    );
+    // Another form, another folder or a file is not the same rule.
+    assert!(folders_on_both_routes(&book(r"C:\Apps\Tool\", r"C:\Apps\Tool\*")).is_empty());
+    assert!(folders_on_both_routes(&book(r"C:\Apps\Tool\", r"C:\Apps\")).is_empty());
+    assert!(folders_on_both_routes(&book(r"C:\Apps\tool.exe", r"C:\Apps\tool.exe")).is_empty());
 }
 
 #[test]
@@ -646,7 +758,7 @@ fn process_name_glob_accepted_no_exe_appended() {
     let mut warnings = Vec::new();
     let result = normalize_app_match(
         &app,
-        ExecutableNaming::WindowsExe,
+        HostPlatform::Windows,
         &RuleId("r-1".to_string()),
         &mut warnings,
     )
@@ -726,7 +838,7 @@ fn duplicate_within_set_deduplicated_with_warning() {
 
 /// Two rules over the same destination that say OPPOSITE things are not
 /// duplicates. Folding them dropped one instruction and reported it as a
-/// removed duplicate, so a `+block` next to a plain route silently lost the
+/// removed duplicate, so a deny next to a plain route silently lost the
 /// block (or the route, depending on which came first).
 #[test]
 fn a_rule_and_its_opposite_over_the_same_destination_both_survive() {
@@ -848,9 +960,11 @@ fn canonical_profile_rules_are_in_canonical_order() {
         .iter()
         .map(|r| match &r.address_match {
             Some(CanonicalAddressMatch::Zone(_)) => "zone",
-            Some(CanonicalAddressMatch::ExactFqdn(_) | CanonicalAddressMatch::SuffixDomain(_)) => {
-                "domain"
-            }
+            Some(
+                CanonicalAddressMatch::ExactFqdn(_)
+                | CanonicalAddressMatch::SuffixDomain(_)
+                | CanonicalAddressMatch::AnyZoneDomain(_),
+            ) => "domain",
             Some(CanonicalAddressMatch::ExactIp(_)) => "ip",
             Some(CanonicalAddressMatch::Subnet(_)) => "subnet",
             Some(CanonicalAddressMatch::IpRange(_)) => "ip-range",
@@ -1260,4 +1374,34 @@ fn one_network_routed_on_both_routes_is_a_tie_and_a_block_is_not() {
     assert!(
         networks_on_both_routes(&book(network("R-0002", subnet("10.0.0.0/25"), route))).is_empty()
     );
+}
+
+/// A path has a bound of its own: a deep folder spelled in Cyrillic outgrows
+/// a name's 260 bytes and still is a rule, up to its own limit.
+#[test]
+fn a_path_is_bounded_by_its_own_limit_and_a_name_by_the_shorter_one() {
+    use nrr_shared::app_path::MAX_PATH_VALUE_BYTES;
+    let canonical = |raw: &str| {
+        canonical_app_pattern(
+            raw,
+            false,
+            HostPlatform::Linux,
+            &RuleId("r-1".to_string()),
+            &mut Vec::new(),
+        )
+    };
+    let deep = format!("/opt/{}/", "папка/".repeat(40));
+    assert!(deep.len() > crate::preset_validation::MAX_MATCH_VALUE_LEN);
+    assert!(canonical(&deep).is_ok(), "{} bytes", deep.len());
+    let at_limit = format!("/{}", "a".repeat(MAX_PATH_VALUE_BYTES - 1));
+    assert!(canonical(&at_limit).is_ok());
+    let past_limit = format!("/{}", "a".repeat(MAX_PATH_VALUE_BYTES));
+    assert!(matches!(
+        canonical(&past_limit),
+        Err(ValidationError::AppNameInvalid { .. })
+    ));
+    assert!(matches!(
+        canonical(&"a".repeat(crate::preset_validation::MAX_MATCH_VALUE_LEN + 1)),
+        Err(ValidationError::AppNameInvalid { .. })
+    ));
 }

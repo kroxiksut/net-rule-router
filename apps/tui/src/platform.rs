@@ -1,6 +1,7 @@
 //! The one place this crate knows which operating system it is on. It only
 //! picks implementations of platform ports; every decision codes against them.
 
+use nrr_platform_api::authorization::TerminalPromptAgent;
 use nrr_platform_api::service_control::ServiceControlPort;
 use nrr_platform_api::system_locale::SystemLocalePort;
 
@@ -49,6 +50,19 @@ pub fn edits_baseline() -> bool {
 #[cfg(not(target_os = "linux"))]
 pub fn edits_baseline() -> bool {
     false
+}
+
+/// polkit's text agent, so a password the service could not ask for anywhere
+/// else is typed here.
+#[cfg(target_os = "linux")]
+pub fn terminal_prompt_agent() -> Option<Box<dyn TerminalPromptAgent>> {
+    Some(Box::new(nrr_platform_linux::polkit::PkttyAgent))
+}
+
+/// Elsewhere the terminal is started elevated instead.
+#[cfg(not(target_os = "linux"))]
+pub fn terminal_prompt_agent() -> Option<Box<dyn TerminalPromptAgent>> {
+    None
 }
 
 /// The host's display-language probe.

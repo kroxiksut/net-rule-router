@@ -1,4 +1,4 @@
-# NetRuleRouter preset — version 1
+# NetRuleRouter preset — version 8
 # name: Access to RU from abroad — Secondary
 # description: Russian zones, services and apps routed through a secondary route with an exit in Russia
 # author: NetRuleRouter contributors
@@ -32,8 +32,7 @@ su  # Историческая зона СССР (.su)
 *.vkuseraudio.net
 *.webmoney.com
 *.ya.cc
-*.yandex.com
-*.yandex.net
+yandex.*
 *.yandexcloud.net
 *.yastatic.net
 *.zvuk.com

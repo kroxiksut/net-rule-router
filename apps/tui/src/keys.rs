@@ -45,6 +45,10 @@ pub const TERMINAL_FAILED: Key = key(
     "tui.startup.terminal-failed",
     "Could not prepare the terminal: {error}",
 );
+pub const PASSWORD_PROMPT: Key = key(
+    "tui.elevation.password-prompt",
+    "This change needs an administrator's password. Type it below; the screen comes back once it is answered.",
+);
 
 // ── Connection to the service ────────────────────────────────────────────────
 
@@ -91,11 +95,11 @@ pub const FIX_INSTALL: Key = key(
 pub const FIX_START: Key = key("tui.connection.fix-start", "To start it, run: {command}");
 pub const FIX_RESTORE_NETWORK: Key = key(
     "tui.connection.fix-restore-network",
-    "To restore the network, run: {command}",
+    "To restore the network, run: {command} (leak protection stays off until the service applies its rules again)",
 );
 pub const FIX_STOP_AND_RESTORE_NETWORK: Key = key(
     "tui.connection.fix-stop-and-restore-network",
-    "To stop the service and restore the network, run: {command}",
+    "To stop the service and restore the network, run: {command} (leak protection stays off until the service is started again)",
 );
 pub const VERSIONS: Key = key(
     "tui.connection.versions",
@@ -207,6 +211,14 @@ pub const ENF_NO_POLICY_TITLE: Key = key(
 pub const ENF_NO_POLICY_BODY: Key = key(
     "notifications.enforcement.no-policy.body",
     "The service has no routing settings for you yet, so nothing is being routed. Choose the main and additional connections.",
+);
+pub const ENF_SUGGEST_TITLE: Key = key(
+    "notifications.enforcement.no-policy.suggest-title",
+    "Confirm your main connection: {name}",
+);
+pub const ENF_SUGGEST_BODY: Key = key(
+    "notifications.enforcement.no-policy.suggest-body",
+    "Nothing is routed until you confirm it. Rules for the additional connection wait until you choose one.",
 );
 pub const ENF_PRIMARY_DOWN_TITLE: Key = key(
     "notifications.enforcement.primary-down.title",
@@ -419,6 +431,22 @@ pub const ROUTES_HELD_CLEARED: Key = key(
     "notifications.routes-held.cleared",
     "Addresses from your rules follow your own route again.",
 );
+pub const TRAFFIC_CARRIED_TITLE: Key = key(
+    "notifications.traffic-carried.title",
+    "Your traffic goes through another user's tunnel",
+);
+pub const TRAFFIC_CARRIED_BODY: Key = key(
+    "notifications.traffic-carried.body",
+    "Another user of this computer signed in earlier and sends all their traffic through the tunnel \"{link}\". This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.",
+);
+pub const TRAFFIC_CARRIED_BODY_UNNAMED: Key = key(
+    "notifications.traffic-carried.body-unnamed",
+    "Another user of this computer signed in earlier and sends all their traffic through their tunnel. This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.",
+);
+pub const TRAFFIC_CARRIED_CLEARED: Key = key(
+    "notifications.traffic-carried.cleared",
+    "Your traffic no longer goes through another user's tunnel.",
+);
 
 // ── Keys and help ────────────────────────────────────────────────────────────
 
@@ -472,6 +500,7 @@ pub const ALL: &[Key] = &[
     UNKNOWN_OPTION,
     MISSING_VALUE,
     TERMINAL_FAILED,
+    PASSWORD_PROMPT,
     SERVICE_LABEL,
     LINK_CONNECTED,
     LINK_CONNECTING,
@@ -529,6 +558,8 @@ pub const ALL: &[Key] = &[
     ENF_NO_WAY_OUT_BODY,
     ENF_NO_POLICY_TITLE,
     ENF_NO_POLICY_BODY,
+    ENF_SUGGEST_TITLE,
+    ENF_SUGGEST_BODY,
     ENF_PRIMARY_DOWN_TITLE,
     ENF_PRIMARY_DOWN_BODY,
     ENF_SECONDARY_DOWN_TITLE,
@@ -549,6 +580,8 @@ pub const ALL: &[Key] = &[
     VPN_TRUST_DONE,
     VPN_TRUST_FAILED,
     crate::vpn_trust::HELP,
+    crate::primary_suggestion::HELP,
+    crate::primary_suggestion::AMBIGUOUS,
     NOTICES_TITLE,
     NOTICES_EMPTY,
     LEVEL_WARNING,
@@ -562,6 +595,10 @@ pub const ALL: &[Key] = &[
     ROUTES_HELD_TITLE,
     ROUTES_HELD_BODY,
     ROUTES_HELD_CLEARED,
+    TRAFFIC_CARRIED_TITLE,
+    TRAFFIC_CARRIED_BODY,
+    TRAFFIC_CARRIED_BODY_UNNAMED,
+    TRAFFIC_CARRIED_CLEARED,
     BLOCK_NOTICE_TITLE,
     BLOCK_NOTICE_BODY,
     BLOCK_NOTICE_APP_UNKNOWN,

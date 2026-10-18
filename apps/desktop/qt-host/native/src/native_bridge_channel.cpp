@@ -52,8 +52,10 @@ QString NrrNativeBridge::emitRpcRequest(const QString &operation, const QJsonObj
     envelope.insert(QStringLiteral("correlation-id"), correlationId);
     envelope.insert(QStringLiteral("operation"), operation);
     envelope.insert(QStringLiteral("payload"), payload);
-    const QByteArray serialized =
-        QJsonDocument(envelope).toJson(QJsonDocument::Compact);
+    // Compact JSON escapes line breaks inside strings; the replace keeps one
+    // request to one line even if that ever changed.
+    QByteArray serialized = QJsonDocument(envelope).toJson(QJsonDocument::Compact);
+    serialized.replace('\n', ' ').replace('\r', ' ');
     std::fputs("NRR_IPC_REQUEST:", stdout);
     std::fwrite(serialized.constData(), 1,
                 static_cast<size_t>(serialized.size()), stdout);

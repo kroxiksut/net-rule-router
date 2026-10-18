@@ -18,6 +18,14 @@ Item {
     Component.onCompleted: {
         var tip = shaper.ToolTip.toolTip
         if (!tip) return
+        // Tips show paths and program names other parties choose: plain text,
+        // so a name that starts with `<` is shown, not read as markup.
+        var plain = function() {
+            if (tip.contentItem && tip.contentItem.textFormat !== undefined)
+                tip.contentItem.textFormat = Text.PlainText
+        }
+        plain()
+        tip.contentItemChanged.connect(plain)
         metrics.font = Qt.binding(function() { return tip.font })
         tip.implicitWidth = Qt.binding(function() {
             var natural = Math.max(tip.implicitBackgroundWidth + tip.leftInset + tip.rightInset,

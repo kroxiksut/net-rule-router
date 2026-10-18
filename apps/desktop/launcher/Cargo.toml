@@ -60,7 +60,7 @@ thiserror = "1"
 # Archive localization: copy the service-built diagnostic zip into the
 # user's %TEMP%\NetRuleRouter and append the GUI-side launcher logs into the
 # copy. Same major as nrr-diagnostics.
-zip = "2"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # Local wall-clock timestamps for the zip entries `archive_localize` appends
 # (launcher logs, service log tail) — same rationale and version band as
 # `nrr-diagnostics`' own zip-entry stamping. `time::now_local` is unsound in

@@ -50,7 +50,41 @@ const MAX_WAIT_HINT: Duration = Duration::from_secs(120);
 const UNINSTALL_STOP_BUDGET: Duration = Duration::from_secs(10);
 
 /// Subdirectories of the service-owned data root that install creates.
-const DATA_SUBDIRS: &[&str] = &["", "logs", "audit", "backup"];
+const DATA_SUBDIRS: &[&str] = &[
+    "",
+    "logs",
+    nrr_platform_api::service_control::AUDIT_SUBDIR,
+    "backup",
+];
+
+/// Delete the data tree at `root`; without `with_audit` the audit trail and the
+/// root holding it stay.
+fn remove_data_tree(root: &std::path::Path, with_audit: bool) -> Result<(), ServiceControlError> {
+    let failed = |path: &std::path::Path, e: std::io::Error| ServiceControlError::Mechanism {
+        detail: format!("remove data {}: {e}", path.display()),
+    };
+    if with_audit {
+        return std::fs::remove_dir_all(root).map_err(|e| failed(root, e));
+    }
+    let entries = std::fs::read_dir(root).map_err(|e| failed(root, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| failed(root, e))?;
+        if entry
+            .file_name()
+            .eq_ignore_ascii_case(nrr_platform_api::service_control::AUDIT_SUBDIR)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if entry.file_type().map_err(|e| failed(&path, e))?.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.map_err(|e| failed(&path, e))?;
+    }
+    Ok(())
+}
 
 /// How long an install that updates the protected copy waits for the service
 /// to stop (past it, nothing is replaced), and then for it to start again.
@@ -97,17 +131,51 @@ const DELIBERATE_STOP_MARKER: &str = "deliberate-stop";
 /// silence a later unasked one.
 const DELIBERATE_STOP_FRESHNESS: Duration = Duration::from_secs(120);
 
+/// The marker path, only while the data root is a real directory a trusted
+/// account owns: anyone may create folders in ProgramData, and a planted root
+/// or a link in it would steer an elevated write onto another file.
 fn deliberate_stop_marker() -> Option<PathBuf> {
-    service_data_root()
-        .ok()
-        .map(|root| root.join(DELIBERATE_STOP_MARKER))
+    let root = service_data_root().ok()?;
+    let meta = std::fs::symlink_metadata(&root).ok()?;
+    let is_link =
+        std::os::windows::fs::MetadataExt::file_attributes(&meta) & REPARSE_POINT_ATTRIBUTE != 0;
+    if !meta.is_dir() || is_link {
+        return None;
+    }
+    if !crate::trusted_location::owner_is_trusted(&root).unwrap_or(false) {
+        return None;
+    }
+    Some(root.join(DELIBERATE_STOP_MARKER))
 }
 
-/// Say that the next stop is wanted and must not be undone by a restart.
+/// `FILE_ATTRIBUTE_REPARSE_POINT`: a junction or symbolic link.
+const REPARSE_POINT_ATTRIBUTE: u32 = 0x400;
+
+/// Say that the next stop is wanted and must not be undone by a restart. The
+/// file is created anew, never opened through whatever already has its name.
 fn mark_deliberate_stop() {
-    if let Some(path) = deliberate_stop_marker() {
-        let _ = std::fs::write(path, b"");
+    let Some(path) = deliberate_stop_marker() else {
+        return;
+    };
+    let Some(program_data) = crate::system_shell::program_data_directory() else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    let _ = crate::pinned_file::create_new(&program_data, &path);
+}
+
+/// Ask SCM for a wanted stop. A refused request (a service still starting
+/// accepts no control) takes its mark back: left behind, it would excuse the
+/// next stop nobody asked for and keep the service down.
+fn stop_deliberately(service: &windows_service::service::Service) -> windows_service::Result<()> {
+    mark_deliberate_stop();
+    let asked = service.stop().map(drop);
+    if asked.is_err() {
+        if let Some(path) = deliberate_stop_marker() {
+            let _ = std::fs::remove_file(path);
+        }
     }
+    asked
 }
 
 /// Whether the stop under way was asked for by one of our own verbs. Consumes
@@ -334,8 +402,7 @@ impl ServiceControlPort for WindowsServiceControl {
             // accept control right now, or one this caller may not stop, never
             // reaches STOPPED, and waiting out the full budget to discover that
             // just turns a clear refusal into a timeout.
-            mark_deliberate_stop();
-            if service.stop().is_ok() {
+            if stop_deliberately(&service).is_ok() {
                 stopped = wait_for_stopped(&service, UNINSTALL_STOP_BUDGET).is_ok();
             } else {
                 // The request itself was refused. It can still be mid-stop from
@@ -381,9 +448,7 @@ impl ServiceControlPort for WindowsServiceControl {
         let data_removed = if spec.remove_service_owned_data {
             let root = service_data_root()?;
             if root.exists() {
-                std::fs::remove_dir_all(&root).map_err(|e| ServiceControlError::Mechanism {
-                    detail: format!("remove data dir {}: {e}", root.display()),
-                })?;
+                remove_data_tree(&root, spec.remove_audit_trail)?;
                 true
             } else {
                 false
@@ -479,8 +544,7 @@ impl ServiceControlPort for WindowsServiceControl {
             return Ok(());
         }
 
-        mark_deliberate_stop();
-        let _ = service.stop();
+        let _ = stop_deliberately(&service);
         wait_for_stopped(&service, timeout)
     }
 
@@ -610,43 +674,83 @@ fn open_manager(access: ServiceManagerAccess) -> Result<ServiceManager, ServiceC
     ServiceManager::local_computer(None::<&str>, access).map_err(map_service_error)
 }
 
-/// Absolute path of the service-owned data root.
-/// The service data root, refused unless it lies under `%ProgramData%` as the
-/// shell registers it. The path is built from an environment string, and an
-/// install elevated on a user's behalf carries that user's environment.
+/// The service data root under `%ProgramData%` as the shell registers it. The
+/// storage layer resolves the same tree from an environment string, and an
+/// install elevated on a user's behalf carries that user's environment: a root
+/// the two disagree on is refused rather than touched.
 fn service_data_root() -> Result<PathBuf, ServiceControlError> {
-    let root = nrr_storage::resolve_storage_topology(&StorageProfile::ProductionService)
+    let program_data = program_data()?;
+    let root = program_data.join(nrr_platform_api::paths::product_dir_leaf());
+    let resolved = nrr_storage::resolve_storage_topology(&StorageProfile::ProductionService)
         .map(|topology| topology.data_dir)
         .map_err(|e| ServiceControlError::Mechanism {
             detail: format!("resolve storage topology: {e}"),
         })?;
-    ensure_under_program_data(&root)?;
+    if !same_lexical_path(&resolved, &root) {
+        return Err(ServiceControlError::InvalidState {
+            detail: format!(
+                "data directory {} is not {}; refusing to touch it",
+                resolved.display(),
+                root.display()
+            ),
+        });
+    }
+    ensure_under(&root, &program_data)?;
     Ok(root)
 }
 
+fn program_data() -> Result<PathBuf, ServiceControlError> {
+    crate::system_shell::program_data_directory().ok_or_else(|| ServiceControlError::Mechanism {
+        detail: "cannot resolve the ProgramData folder".to_string(),
+    })
+}
+
 fn ensure_under_program_data(root: &Path) -> Result<(), ServiceControlError> {
-    let program_data = crate::system_shell::program_data_directory().ok_or_else(|| {
-        ServiceControlError::Mechanism {
-            detail: "cannot resolve the ProgramData folder".to_string(),
+    ensure_under(root, &program_data()?)
+}
+
+/// Lexically, and again through the file system where the root exists: a link
+/// anywhere on the way would point the tree outside `ProgramData`.
+fn ensure_under(root: &Path, program_data: &Path) -> Result<(), ServiceControlError> {
+    let refuse = || ServiceControlError::InvalidState {
+        detail: format!(
+            "data directory {} is not under {}; refusing to touch it",
+            root.display(),
+            program_data.display()
+        ),
+    };
+    if !is_within(root, program_data) {
+        return Err(refuse());
+    }
+    if let (Ok(real_root), Ok(real_base)) = (
+        std::fs::canonicalize(root),
+        std::fs::canonicalize(program_data),
+    ) {
+        if !is_within(&real_root, &real_base) {
+            return Err(refuse());
         }
-    })?;
-    if !is_within(root, &program_data) {
-        return Err(ServiceControlError::InvalidState {
-            detail: format!(
-                "data directory {} is not under {}; refusing to touch it",
-                root.display(),
-                program_data.display()
-            ),
-        });
     }
     Ok(())
 }
 
 /// Component-wise and case-insensitive: a folder inside `ProgramData` is
-/// within it, a sibling whose name merely starts the same is not.
+/// within it, a sibling whose name merely starts the same is not. A `..` is
+/// refused outright: only the file system resolves it, so a lexical match
+/// says nothing about where it leads.
 fn is_within(path: &Path, base: &Path) -> bool {
+    use std::path::Component;
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return false;
+    }
     let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
     lower(path).starts_with(lower(base))
+}
+
+fn same_lexical_path(a: &Path, b: &Path) -> bool {
+    is_within(a, b) && is_within(b, a)
 }
 
 /// Who besides SYSTEM, Administrators and TrustedInstaller could change
@@ -1255,5 +1359,34 @@ mod tests {
         assert!(is_within(&PathBuf::from("base").join("Product"), &base));
         assert!(!is_within(&PathBuf::from("BaseX").join("Product"), &base));
         assert!(!is_within(&PathBuf::from("Other").join("Base"), &base));
+    }
+
+    /// `PROGRAMDATA=C:\ProgramData\..\Users\Victim` would put the purge and
+    /// the lock-down on a folder outside ProgramData.
+    #[test]
+    fn a_path_climbing_out_with_dot_dot_is_not_within() {
+        let base = PathBuf::from(r"C:\ProgramData");
+        for climbing in [
+            r"C:\ProgramData\..\Users\Victim\NetRuleRouter",
+            r"C:\ProgramData\NetRuleRouter\..\..\Windows",
+            r"C:\ProgramData\.\NetRuleRouter\..",
+        ] {
+            assert!(!is_within(Path::new(climbing), &base), "{climbing}");
+        }
+        assert!(is_within(Path::new(r"C:\ProgramData\NetRuleRouter"), &base));
+        assert!(same_lexical_path(
+            Path::new(r"c:\programdata\netrulerouter"),
+            Path::new(r"C:\ProgramData\NetRuleRouter")
+        ));
+    }
+
+    #[test]
+    fn a_root_outside_program_data_is_refused_before_anything_is_touched() {
+        let base = PathBuf::from(r"C:\ProgramData");
+        let outside = Path::new(r"C:\ProgramData\..\Users\Victim\NetRuleRouter");
+        assert!(matches!(
+            ensure_under(outside, &base),
+            Err(ServiceControlError::InvalidState { .. })
+        ));
     }
 }

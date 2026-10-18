@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use crate::browser_history_seeder::BrowserHistorySeeder;
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 use crate::ipc_handlers::payloads::SeedFromBrowserHistoryResponse;
 
@@ -25,19 +26,39 @@ impl SeedFromBrowserHistoryHandler {
     }
 }
 
-impl IpcHandler for SeedFromBrowserHistoryHandler {
-    fn handle(&self, _request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        // The consent covers the consenting user's own history; with no
-        // identity there is no profile it could honestly apply to.
-        let sid = ctx.caller_stored();
-        if sid.is_empty() {
-            return Err(IpcError {
-                code: IpcErrorCode::Unauthorized,
-                message: "this request carries no user identity, so there is no history to read"
-                    .to_string(),
-                diagnostics_id: None,
-            });
-        }
+/// The consent covers the consenting user's own history; with no identity
+/// there is no profile it could honestly apply to.
+fn consenting_sid(ctx: &IpcRequestContext) -> Result<&str, IpcError> {
+    let sid = ctx.caller_stored();
+    if sid.is_empty() {
+        return Err(IpcError {
+            code: IpcErrorCode::Unauthorized,
+            message: "this request carries no user identity, so there is no history to read"
+                .to_string(),
+            diagnostics_id: None,
+        });
+    }
+    Ok(sid)
+}
+
+impl CheckedIpcHandler for SeedFromBrowserHistoryHandler {
+    type Checked = ();
+
+    fn precheck(
+        &self,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<(), IpcError> {
+        consenting_sid(ctx).map(|_| ())
+    }
+
+    fn execute(
+        &self,
+        _checked: Prechecked<()>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        let sid = consenting_sid(ctx)?;
         let response = match self.seeder.try_begin(sid) {
             None => SeedFromBrowserHistoryResponse {
                 started: false,
@@ -70,7 +91,7 @@ impl IpcHandler for SeedFromBrowserHistoryHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{IpcOperationClass, IPC_PROTOCOL_VERSION};
+    use crate::ipc::{IpcHandler, IpcOperationClass, IPC_PROTOCOL_VERSION};
     use crate::per_sid_orchestrator::{ActiveRulesSnapshot, RulesProvider};
     use nrr_domain::canonical::{CanonicalRuleBook, CanonicalRuleSet};
     use nrr_domain::user_principal::UserPrincipal;

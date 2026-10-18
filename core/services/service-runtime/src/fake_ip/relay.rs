@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use nrr_platform_api::fake_ip::{FakeIpAllocator, FakeIpScope, FakeIpVerdict};
+use nrr_platform_api::fake_ip::{FakeIpAllocator, FakeIpScope, FakeIpVerdict, FlowTransport};
 use nrr_shared::RouteRole;
 
 use super::dialer::UpstreamTarget;
@@ -35,6 +35,63 @@ pub trait UpstreamAddressResolver: Send + Sync {
 /// verdict, injected so the relay never re-implements policy.
 pub trait RouteSelector: Send + Sync {
     fn route_for(&self, hostname: &str) -> RouteRole;
+
+    /// The route `principal`'s own rule book gives `hostname`; `None` when
+    /// that book blocks it.
+    fn route_for_principal(&self, _principal: &str, hostname: &str) -> Option<RouteRole> {
+        Some(self.route_for(hostname))
+    }
+}
+
+/// Whose flow this is, as far as carrying it goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FlowOwner {
+    /// The user the shared DNS answers were given for: the only one served,
+    /// or a machine service account, which follows that user.
+    RoutingUser,
+    /// Another served user, whose own book and links the flow takes.
+    Principal(String),
+    /// Nobody the relay may carry it for.
+    Refused(&'static str),
+}
+
+/// Who opened a relayed flow. The relay's dial is the service's own traffic
+/// and passes every user's filters, so carrying another user's flow by the
+/// routing user's rules would let one user's traffic leave by another's.
+pub trait FlowOwners: Send + Sync {
+    /// `transport` is `None` for traffic no socket table lists (an echo).
+    fn owner_of(
+        &self,
+        client: SocketAddr,
+        destination: SocketAddr,
+        transport: Option<FlowTransport>,
+    ) -> FlowOwner;
+}
+
+/// Why [`RelayCore::for_owner`] refused a flow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerRefusal {
+    pub hostname: String,
+    pub reason: &'static str,
+}
+
+impl From<OwnerRefusal> for RelayDecision {
+    fn from(refusal: OwnerRefusal) -> Self {
+        Self::OwnerRefused {
+            hostname: refusal.hostname,
+            reason: refusal.reason,
+        }
+    }
+}
+
+/// One user's machine: every flow is the routing user's, at no cost.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RoutingUserOnly;
+
+impl FlowOwners for RoutingUserOnly {
+    fn owner_of(&self, _: SocketAddr, _: SocketAddr, _: Option<FlowTransport>) -> FlowOwner {
+        FlowOwner::RoutingUser
+    }
 }
 
 /// Could `ip` be a single host that owns a flow?
@@ -85,6 +142,12 @@ pub enum RelayDecision {
         hostname: String,
         reason: &'static str,
     },
+    /// The flow's owner could not be read, is not served, or blocks the host
+    /// in their own book.
+    OwnerRefused {
+        hostname: String,
+        reason: &'static str,
+    },
 }
 
 impl RelayDecision {
@@ -98,6 +161,7 @@ impl RelayDecision {
             Self::UnmappedFakeAddress => "unmapped-fake-address",
             Self::NoUpstreamAddress { .. } => "no-upstream-address",
             Self::OutOfScope { .. } => "out-of-scope",
+            Self::OwnerRefused { .. } => "owner-refused",
         }
     }
 }
@@ -119,6 +183,7 @@ pub struct RelayCore {
     /// never ride the tunnel. Inert by default — see
     /// [`super::vpn_client_bypass`].
     vpn_bypass: Arc<dyn super::vpn_client_bypass::VpnClientFlowBypass>,
+    owners: Arc<dyn FlowOwners>,
     /// Hand a hostname with no cached address to the dialer to resolve, instead
     /// of refusing the flow. Off unless the composition wired a resolver into
     /// the dialer — otherwise the flow would only fail later and less clearly.
@@ -138,6 +203,7 @@ impl RelayCore {
             resolver,
             routes,
             vpn_bypass: Arc::new(super::vpn_client_bypass::NoVpnClientBypass),
+            owners: Arc::new(RoutingUserOnly),
             resolve_at_dial: false,
         }
     }
@@ -154,6 +220,11 @@ impl RelayCore {
     /// Same, for a core already owned by the stack.
     pub fn set_dial_time_resolution(&mut self, enabled: bool) {
         self.resolve_at_dial = enabled;
+    }
+
+    /// Read who owns each flow, for a machine serving several users.
+    pub fn set_flow_owners(&mut self, owners: Arc<dyn FlowOwners>) {
+        self.owners = owners;
     }
 
     /// Wire the confirmed-VPN-client bypass. Builder-style; the default never
@@ -263,22 +334,7 @@ impl RelayCore {
             return RelayDecision::NoUpstreamAddress { hostname };
         }
 
-        let mut route = self.routes.route_for(&hostname);
-        // A confirmed VPN client's own flow leaves over the PRIMARY link. Its
-        // traffic IS the tunnel's transport, so carrying it over the secondary
-        // routes the tunnel through itself: while the adapter is coming up the
-        // dialer refuses the dial (it would otherwise leak via the primary) and
-        // the client's own probes fail on every reconnect. The lookup is skipped
-        // entirely unless the secondary was selected — the override cannot
-        // change a flow that already leaves over the primary — and unless the
-        // user has actually confirmed a client (see `vpn_client_bypass`).
-        if route == RouteRole::Secondary
-            && self
-                .vpn_bypass
-                .owned_by_confirmed_client(source, destination)
-        {
-            route = RouteRole::Primary;
-        }
+        let route = self.unless_vpn_client(self.routes.route_for(&hostname), source, destination);
         RelayDecision::Relay {
             target: UpstreamTarget {
                 hostname: hostname.clone(),
@@ -286,9 +342,72 @@ impl RelayCore {
                 fallbacks,
                 port: destination.port(),
                 route,
+                owner: None,
             },
             hostname,
         }
+    }
+
+    /// A confirmed VPN client's own flow leaves over the PRIMARY link. Its
+    /// traffic IS the tunnel's transport, so carrying it over the secondary
+    /// routes the tunnel through itself: while the adapter is coming up the
+    /// dialer refuses the dial (it would otherwise leak via the primary) and
+    /// the client's own probes fail on every reconnect. The lookup is skipped
+    /// unless the secondary was selected and a client was confirmed.
+    fn unless_vpn_client(
+        &self,
+        route: RouteRole,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> RouteRole {
+        if route == RouteRole::Secondary
+            && self
+                .vpn_bypass
+                .owned_by_confirmed_client(source, destination)
+        {
+            RouteRole::Primary
+        } else {
+            route
+        }
+    }
+
+    /// `target` as the owner of the flow from `client` to `destination` may
+    /// take it: unchanged for the routing user, re-routed by another served
+    /// user's own book and bound to their links, or refused. Asked once per
+    /// new flow, after [`Self::decide`], which stays free of the lookup.
+    pub fn for_owner(
+        &self,
+        mut target: UpstreamTarget,
+        client: SocketAddr,
+        destination: SocketAddr,
+        transport: Option<FlowTransport>,
+    ) -> Result<UpstreamTarget, OwnerRefusal> {
+        let principal = match self.owners.owner_of(client, destination, transport) {
+            FlowOwner::RoutingUser => return Ok(target),
+            FlowOwner::Principal(principal) => principal,
+            FlowOwner::Refused(reason) => {
+                return Err(OwnerRefusal {
+                    hostname: target.hostname,
+                    reason,
+                })
+            }
+        };
+        // The in-tunnel rescue carries a literal private address no book
+        // names; it keeps its route, on the owner's links.
+        if target.hostname.parse::<IpAddr>().is_err() {
+            let Some(route) = self
+                .routes
+                .route_for_principal(&principal, &target.hostname)
+            else {
+                return Err(OwnerRefusal {
+                    hostname: target.hostname,
+                    reason: "owner-blocks-host",
+                });
+            };
+            target.route = self.unless_vpn_client(route, client, destination);
+        }
+        target.owner = Some(principal);
+        Ok(target)
     }
 }
 
@@ -352,7 +471,6 @@ impl RouteSelector for FixedRouteSelector {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::fake_ip::flow::{FlowKey, FlowProtocol};
@@ -679,5 +797,78 @@ mod tests {
             }
             other => panic!("expected out-of-scope, got {other:?}"),
         }
+    }
+
+    /// Routes by whose book is asked: "S-1-5-21-2" sends the host over the
+    /// secondary, "S-1-5-21-3" blocks it, the routing user takes the primary.
+    struct PerUserRoutes;
+
+    impl RouteSelector for PerUserRoutes {
+        fn route_for(&self, _hostname: &str) -> RouteRole {
+            RouteRole::Primary
+        }
+
+        fn route_for_principal(&self, principal: &str, _hostname: &str) -> Option<RouteRole> {
+            match principal {
+                "S-1-5-21-2" => Some(RouteRole::Secondary),
+                _ => None,
+            }
+        }
+    }
+
+    struct OwnersByPort;
+
+    impl FlowOwners for OwnersByPort {
+        fn owner_of(
+            &self,
+            client: SocketAddr,
+            _: SocketAddr,
+            _: Option<FlowTransport>,
+        ) -> FlowOwner {
+            match client.port() {
+                50001 => FlowOwner::RoutingUser,
+                50002 => FlowOwner::Principal("S-1-5-21-2".into()),
+                50003 => FlowOwner::Principal("S-1-5-21-3".into()),
+                _ => FlowOwner::Refused("owner-unknown"),
+            }
+        }
+    }
+
+    /// Two users reach the same virtual address: each flow leaves by its own
+    /// owner's book and links, one blocked in its owner's book is refused, and
+    /// one nobody can be named for is refused, never carried by another's rules.
+    #[test]
+    fn each_users_flow_is_carried_by_that_users_own_book() {
+        let (allocator, fake) = allocator_with("shared.example");
+        let mut relay = RelayCore::new(
+            allocator,
+            FakeIpScope::enabled(Vec::<String>::new()),
+            Arc::new(StaticUpstreamResolver::new().with("shared.example", &[ip("203.0.113.10")])),
+            Arc::new(PerUserRoutes),
+        );
+        relay.set_flow_owners(Arc::new(OwnersByPort));
+        let destination = SocketAddr::new(fake, 443);
+        let RelayDecision::Relay { target, .. } = relay.decide(&packet(destination, true)) else {
+            panic!("the routing user's decision relays the flow");
+        };
+        let client = |port: u16| SocketAddr::new(ip("10.0.0.2"), port);
+        let carried = |port| {
+            relay.for_owner(
+                target.clone(),
+                client(port),
+                destination,
+                Some(FlowTransport::Tcp),
+            )
+        };
+
+        let routing = carried(50001).expect("the routing user's flow");
+        assert_eq!((routing.route, routing.owner), (RouteRole::Primary, None));
+
+        let other = carried(50002).expect("the second user's flow");
+        assert_eq!(other.route, RouteRole::Secondary);
+        assert_eq!(other.owner.as_deref(), Some("S-1-5-21-2"));
+
+        assert!(matches!(carried(50003), Err(OwnerRefusal { .. })));
+        assert!(matches!(carried(50009), Err(OwnerRefusal { .. })));
     }
 }

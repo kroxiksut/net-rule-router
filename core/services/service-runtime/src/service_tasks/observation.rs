@@ -191,7 +191,10 @@ pub fn fold_observations(wiring: &AppObservationWiring) -> usize {
             continue;
         };
         if let std::net::IpAddr::V4(ip) = observation.remote.ip() {
-            if wiring.store.record(path, ip) {
+            let Some(store) = wiring.store.scope_for(observation.user_sid.as_deref()) else {
+                continue;
+            };
+            if store.record(path, ip) {
                 learnt += 1;
             }
         }

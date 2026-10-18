@@ -273,6 +273,11 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             count: 2,
             sample: vec!["198.51.100.1".into(), "203.0.113.0/24".into()],
         },
+        StatusUpdateEvent::TrafficCarriedByAnotherUser {
+            sid: "S-1-5-21".into(),
+            carried: true,
+            link: "Example Tunnel".into(),
+        },
         StatusUpdateEvent::RuleDuplicatesDetected {
             sid: "S-1-5-21".into(),
             count: 2,
@@ -304,6 +309,7 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             role: "secondary".into(),
             candidates: vec!["Tunnel".into()],
             since_unix_ms: Some(1),
+            quiet: false,
         },
     ]
 }
@@ -456,6 +462,16 @@ fn push_event_keys_the_ui_reads_are_stable() {
     assert_eq!(held["count"], 2);
     assert_eq!(held["sample"][0], "198.51.100.1");
 
+    let carried = serde_json::to_value(StatusUpdateEvent::TrafficCarriedByAnotherUser {
+        sid: "S-1-5-21".into(),
+        carried: true,
+        link: "Example Tunnel".into(),
+    })
+    .expect("serialise");
+    assert_eq!(carried["type"], "traffic-carried-by-another-user");
+    assert_eq!(carried["carried"], true);
+    assert_eq!(carried["link"], "Example Tunnel");
+
     let alerts = serde_json::to_value(StatusUpdateEvent::SecurityAlertsChanged).expect("serialise");
     assert_eq!(
         alerts,
@@ -470,6 +486,17 @@ fn routes_held_by_another_user_reaches_only_its_own_user() {
         sid: "S-1-5-21-1".into(),
         count: 1,
         sample: Vec::new(),
+    };
+    assert_eq!(event.addressee(), Some("S-1-5-21-1"));
+}
+
+/// Whose tunnel carries a user's traffic is that user's news alone.
+#[test]
+fn traffic_carried_by_another_user_reaches_only_its_own_user() {
+    let event = StatusUpdateEvent::TrafficCarriedByAnotherUser {
+        sid: "S-1-5-21-1".into(),
+        carried: true,
+        link: String::new(),
     };
     assert_eq!(event.addressee(), Some("S-1-5-21-1"));
 }
@@ -827,6 +854,8 @@ fn auto_rule_candidate_dto_uses_the_kebab_wire_names_the_tray_reads() {
         served_by_main_link: false,
         third_party: Some(false),
         secondary_reach: None,
+        any_zone_site: String::new(),
+        less_certain: String::new(),
     };
     let json = serde_json::to_value(&dto).expect("serialise");
     for key in [
@@ -876,6 +905,8 @@ fn auto_rule_candidate_signal_is_additive_in_both_directions() {
         served_by_main_link: false,
         third_party: None,
         secondary_reach: None,
+        any_zone_site: String::new(),
+        less_certain: String::new(),
     };
     let json = serde_json::to_value(&dto).expect("serialise");
     let keys: Vec<&String> = json.as_object().expect("object").keys().collect::<Vec<_>>();
@@ -903,6 +934,34 @@ fn auto_rule_candidate_signal_is_additive_in_both_directions() {
     dto.signal = AUTO_RULE_SIGNAL_CO_ACTIVITY.into();
     let json = serde_json::to_value(&dto).expect("serialise");
     assert_eq!(json["signal"], AUTO_RULE_SIGNAL_CO_ACTIVITY);
+}
+
+/// An offer on full evidence leaves the mark off the wire, a less certain one
+/// carries it under the kebab name both clients read, and a message from a
+/// peer that predates the field parses as "certain".
+#[test]
+fn auto_rule_candidate_less_certain_is_additive_and_pinned() {
+    assert_eq!(AUTO_RULE_LESS_CERTAIN_SLUGS, ["brand-seen-once"]);
+    let mut dto: AutoRuleCandidateDto = serde_json::from_value(serde_json::json!({
+        "id": "arc-1",
+        "anchor": "site.example",
+        "proposed-match": "login.site.test",
+        "match-kind": AUTO_RULE_MATCH_KIND_SUFFIX,
+        "route": "secondary",
+        "affinity": 1.0,
+        "first-seen-unix-ms": 1,
+        "last-seen-unix-ms": 2,
+    }))
+    .expect("a peer without the field still parses");
+    assert!(dto.less_certain.is_empty());
+    let json = serde_json::to_value(&dto).expect("serialise");
+    assert!(json.get("less-certain").is_none(), "{json}");
+
+    dto.less_certain = AUTO_RULE_LESS_CERTAIN_BRAND_SEEN_ONCE.into();
+    let json = serde_json::to_value(&dto).expect("serialise");
+    assert_eq!(json["less-certain"], AUTO_RULE_LESS_CERTAIN_BRAND_SEEN_ONCE);
+    let back: AutoRuleCandidateDto = serde_json::from_value(json).expect("deserialise");
+    assert_eq!(back, dto);
 }
 
 /// The badge slugs are a cross-process contract with the tray/GUI text and

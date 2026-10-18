@@ -22,6 +22,7 @@ Notifications:
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the listed programs as your VPN, so leak protection keeps them working
+  p: confirm the suggested main connection; another one is chosen under Interfaces and routes
 Type a screen number, h for help or q to quit, then press Enter.
 Service: OK
 Routing state: Routing active
@@ -52,9 +53,13 @@ Commands on this screen:
   i: import files. x: export files. p: load a country rule set
   o: choose the folder with your rule sets
   r: show the rules the service applies
+  b: switch between your own rules and the baseline
   m: move the rules that work only on the other route. n: not now
   c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
   v: add a rule for a VPN's gateway
+  A: add several rules at once
+  T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
+  R: recent changes. U: put a deleted rule back
 Type a screen number, h for help or q to quit, then press Enter.
 Help — Rules:
   A number: open that screen
@@ -73,9 +78,13 @@ Commands on this screen:
   i: import files. x: export files. p: load a country rule set
   o: choose the folder with your rule sets
   r: show the rules the service applies
+  b: switch between your own rules and the baseline
   m: move the rules that work only on the other route. n: not now
   c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
   v: add a rule for a VPN's gateway
+  A: add several rules at once
+  T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
+  R: recent changes. U: put a deleted rule back
 Screens:
   1. Status
   2. First run
@@ -109,7 +118,11 @@ Commands on this screen:
   i: import files. x: export files. p: load a country rule set
   o: choose the folder with your rule sets
   r: show the rules the service applies
+  b: switch between your own rules and the baseline
   m: move the rules that work only on the other route. n: not now
   c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
   v: add a rule for a VPN's gateway
+  A: add several rules at once
+  T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
+  R: recent changes. U: put a deleted rule back
 Type a screen number, h for help or q to quit, then press Enter.

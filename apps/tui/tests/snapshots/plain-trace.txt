@@ -23,6 +23,7 @@ Notifications:
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the listed programs as your VPN, so leak protection keeps them working
+  p: confirm the suggested main connection; another one is chosen under Interfaces and routes
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -40,6 +41,7 @@ Commands on this screen:
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
   o: what was blocked while the additional route was down
+  h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
 Type a screen number, h for help or q to quit, then press Enter.
 Connection trace: Shown: 12 of 14.
 Connections: > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
@@ -94,6 +96,7 @@ Commands on this screen:
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
   o: what was blocked while the additional route was down
+  h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -121,6 +124,7 @@ Commands on this screen:
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
   o: what was blocked while the additional route was down
+  h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -156,6 +160,7 @@ Commands on this screen:
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
   o: what was blocked while the additional route was down
+  h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -191,6 +196,7 @@ Commands on this screen:
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
   o: what was blocked while the additional route was down
+  h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Diagnostics and logs
@@ -231,4 +237,4 @@ Audit trail: Rows 1–1 of 1.
 Audit trail: audit-2026-10-06.ndjson
 Audit trail: a: Acknowledge
 Explain sample: site.example  →  Additional — Allowed
-Explain sample: Blocked by an address rule: this name resolves to a blocked address (203.0.113.2)
+Explain sample: Denied by an address rule: this name resolves to a denied address (203.0.113.2)

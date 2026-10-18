@@ -1,0 +1,8 @@
+--- Domains
+chrome.exe
+192.0.2.7
+--- Windows
+telegram
+codex.exe +children
+--- Linux
+firefox

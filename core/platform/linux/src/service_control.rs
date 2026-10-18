@@ -76,6 +76,9 @@ pub trait SystemdOps {
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     /// Remove a directory tree. Absence is success.
     fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
+    /// What `path` holds, each entry with whether it is a directory. Absence
+    /// is an empty list.
+    fn list_dir(&self, path: &Path) -> io::Result<Vec<(PathBuf, bool)>>;
     /// Point `link` at `target`, replacing a link already there so a repeat
     /// install is not an error.
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()>;
@@ -114,6 +117,21 @@ impl SystemdOps for FsOps {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    fn list_dir(&self, path: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            // Not following links: a link to a directory is removed as a file.
+            out.push((entry.path(), entry.file_type()?.is_dir()));
+        }
+        Ok(out)
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
@@ -497,6 +515,40 @@ fn unit_config(spec: &ServiceInstallSpec) -> SystemdServiceConfig {
     cfg
 }
 
+/// The unit runs its binary as root, so the binary and every directory above it
+/// must be out of reach of other accounts: whoever can replace the file runs as
+/// root at the next start. A development build registers its build output, as
+/// on Windows, and says so.
+fn binary_location_refusal(
+    binary: &std::path::Path,
+    untrusted_writer: impl FnOnce(&std::path::Path) -> Result<Option<String>, String>,
+    development_build: bool,
+) -> Result<(), ServiceControlError> {
+    let problem = match untrusted_writer(binary) {
+        Ok(None) => return Ok(()),
+        Ok(Some(why)) => why,
+        Err(e) => format!("cannot tell who can change {}: {e}", binary.display()),
+    };
+    if development_build {
+        tracing::warn!(
+            target: "nrr::service-control",
+            problem = %problem,
+            "registering a service binary other accounts can change: development build only",
+        );
+        return Ok(());
+    }
+    Err(ServiceControlError::Mechanism {
+        detail: format!(
+            "the service would run as root from {}, but {problem}. Copy the binary to {}/ and install it from there; scripts/install-service.sh does this.",
+            binary.display(),
+            crate::systemd::installed_daemon_path()
+                .parent()
+                .unwrap_or(std::path::Path::new("/usr/libexec"))
+                .display(),
+        ),
+    })
+}
+
 /// The neutral start mode, in systemd's terms.
 fn activation_for(start_mode: ServiceStartMode) -> UnitActivation {
     match start_mode {
@@ -544,6 +596,11 @@ impl ServiceControlPort for LinuxServiceControl {
                 ),
             });
         }
+        binary_location_refusal(
+            &spec.binary_path,
+            crate::trusted_location::untrusted_writer,
+            cfg!(debug_assertions),
+        )?;
         let plan = plan_install(&unit_config(spec), activation_for(spec.start_mode));
         self.execute_install_plan(&plan)?;
         Ok(ServiceInstallReport {
@@ -589,12 +646,27 @@ impl ServiceControlPort for LinuxServiceControl {
             });
         }
         // Only the two directories the unit itself provisions. User rule files
-        // live outside them and are never touched.
-        for dir in [state_dir(), log_dir()] {
-            self.ops
-                .remove_dir_all(&dir)
-                .map_err(|e| classify_io_failure(&e, "removing the service data directory"))?;
+        // live outside them and are never touched; the audit trail inside the
+        // state directory stays unless it was asked for by name.
+        let failed = |e: io::Error| classify_io_failure(&e, "removing the service data directory");
+        if spec.remove_audit_trail {
+            self.ops.remove_dir_all(&state_dir()).map_err(failed)?;
+        } else {
+            for (path, is_dir) in self.ops.list_dir(&state_dir()).map_err(failed)? {
+                if path
+                    .file_name()
+                    .is_some_and(|name| name == nrr_platform_api::service_control::AUDIT_SUBDIR)
+                {
+                    continue;
+                }
+                if is_dir {
+                    self.ops.remove_dir_all(&path).map_err(failed)?;
+                } else {
+                    self.ops.remove_file(&path).map_err(failed)?;
+                }
+            }
         }
+        self.ops.remove_dir_all(&log_dir()).map_err(failed)?;
         Ok(ServiceUninstallReport {
             data_removed: true,
             machine_state_cleared,
@@ -779,6 +851,28 @@ mod tests {
     // Test assertions panic on infallible fixtures by design.
     #![allow(clippy::expect_used)]
     use super::*;
+
+    /// A binary another account could replace is refused in a release build,
+    /// with the way out named; a closed location passes; a development build
+    /// registers its build output anyway.
+    #[test]
+    fn a_binary_others_could_replace_is_not_registered_to_run_as_root() {
+        let binary = std::path::Path::new("/tmp/nrr-serviced");
+        let open = |_: &std::path::Path| Ok(Some("/tmp is writable by group or others".to_owned()));
+        let refused = binary_location_refusal(binary, open, false);
+        match refused {
+            Err(ServiceControlError::Mechanism { detail }) => {
+                assert!(detail.contains("/tmp/nrr-serviced"), "{detail}");
+                assert!(detail.contains("/usr/libexec"), "{detail}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let unreadable = |_: &std::path::Path| Err("permission denied".to_owned());
+        assert!(binary_location_refusal(binary, unreadable, false).is_err());
+        assert!(binary_location_refusal(binary, open, true).is_ok());
+        let closed = |_: &std::path::Path| Ok(None);
+        assert!(binary_location_refusal(binary, closed, false).is_ok());
+    }
     use nrr_platform_api::service_control::RecoveryPolicy;
     use std::cell::RefCell;
 
@@ -864,6 +958,14 @@ mod tests {
                 .borrow_mut()
                 .push(format!("remove-tree {}", path.display()));
             Ok(())
+        }
+        fn list_dir(&self, path: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+            // A state directory as the service leaves it.
+            Ok(vec![
+                (path.join("audit"), true),
+                (path.join("backup"), true),
+                (path.join("nrr_service_state.db"), false),
+            ])
         }
         fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
             self.ops
@@ -1301,7 +1403,7 @@ mod tests {
     fn a_purging_uninstall_deletes_only_the_directories_the_unit_provisions() {
         let (port, journal) = port_over(vec![("show", ok(&show_running()))]);
         let report = port
-            .uninstall(&ServiceUninstallSpec::purge_data())
+            .uninstall(&ServiceUninstallSpec::purge_data_and_audit())
             .expect("uninstall");
         assert!(report.data_removed);
         let trees: Vec<String> = recorded(&journal)
@@ -1315,6 +1417,24 @@ mod tests {
                 "remove-tree /var/log/netrulerouter".to_string(),
             ]
         );
+    }
+
+    /// The audit trail is the record of what was done here: a purge removes
+    /// everything around it and leaves it, unless it was asked for by name.
+    #[test]
+    fn a_purge_keeps_the_audit_trail_unless_asked() {
+        let (port, journal) = port_over(vec![("show", ok(&show_running()))]);
+        port.uninstall(&ServiceUninstallSpec::purge_data())
+            .expect("uninstall");
+        let removed: Vec<String> = recorded(&journal)
+            .into_iter()
+            .filter(|o| o.starts_with("remove"))
+            .filter(|o| o.contains("/var/lib/netrulerouter") || o.contains("/var/log/"))
+            .collect();
+        assert!(removed.iter().all(|o| !o.contains("/audit")), "{removed:?}");
+        assert!(removed.contains(&"remove-tree /var/lib/netrulerouter/backup".to_string()));
+        assert!(removed.contains(&"remove /var/lib/netrulerouter/nrr_service_state.db".to_string()));
+        assert!(removed.contains(&"remove-tree /var/log/netrulerouter".to_string()));
     }
 
     /// A container or WSL without systemd: the bus error contains "No such file

@@ -1,8 +1,7 @@
 // Writing a rules file back out, preserving unsupported sections.
 
-use super::parse::BLOCK_FLAG;
 use super::*;
-use nrr_shared::preset_parser::{neutralize_field, VERIFY_PRIMARY_PREFIX};
+use nrr_shared::preset_parser::{neutralize_field, DENY_PREFIX, VERIFY_PRIMARY_PREFIX};
 
 /// Serialises a [`RulesFileParsed`] (and optional unsupported sections) back to
 /// canonical rules-file text.
@@ -112,7 +111,7 @@ pub fn write_rules_file_with_passthrough(
         out.push_str(section.name());
         out.push('\n');
         for entry in *entries {
-            write_entry_line(&mut out, entry, section.is_app_authored());
+            write_entry_line(&mut out, entry, section.carries_provenance());
         }
     }
 
@@ -155,11 +154,12 @@ pub fn write_rules_file_with_passthrough(
 /// - Active rule: `value` or `value  # comment`.
 /// - Disabled rule: `# value` or `# value  # comment`.
 /// - "Check where it works": `?value`, or `# ?value` when disabled.
+/// - Deny: `!value`, or `# !value` when disabled. A deny takes no `?`.
 ///
 /// The two-space separator before the inline `#` mirrors the canonical form
 /// shown in docs/en/rules-file-format.md Complete example examples.
 ///
-/// `emit_origin` is set for the app-authored section only. Its provenance
+/// `emit_origin` is set for the sections that carry provenance. Its
 /// tokens are rendered from the entry's typed fields and precede the free-text
 /// note, so a hand-edited file is normalised to canonical token order:
 /// `value  # auto:<slug> anchor:<host> added:<date> <note>`.
@@ -167,14 +167,13 @@ fn write_entry_line(out: &mut String, entry: &RulesFileEntry, emit_origin: bool)
     if !entry.enabled {
         out.push_str("# ");
     }
-    if entry.verify_primary {
+    // The parser reads `!` and `?` together as neither, so a deny wins.
+    if entry.blocked {
+        out.push(DENY_PREFIX);
+    } else if entry.verify_primary {
         out.push(VERIFY_PRIMARY_PREFIX);
     }
     out.push_str(&neutralize_field(&entry.match_value));
-    if entry.blocked {
-        out.push(' ');
-        out.push_str(BLOCK_FLAG);
-    }
     let provenance = if emit_origin {
         entry
             .origin

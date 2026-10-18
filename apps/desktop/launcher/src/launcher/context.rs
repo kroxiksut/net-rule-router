@@ -84,9 +84,26 @@ fn emit_main_gui_context(
         &backend_bundle.status,
         backend_bundle.service_started,
         &crate::rpc_dispatcher::host_answer_deadlines(),
+        machine_files(),
     )?;
 
     Ok(context_path)
+}
+
+/// This OS's answer to "did an administrator place this file".
+fn machine_files() -> &'static dyn nrr_platform_api::admin_authored::AdminAuthoredFiles {
+    #[cfg(windows)]
+    {
+        &nrr_platform_windows::trusted_location::WindowsAdminAuthoredFiles
+    }
+    #[cfg(target_os = "linux")]
+    {
+        &nrr_platform_linux::trusted_location::LinuxAdminAuthoredFiles
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        &nrr_platform_api::admin_authored::TrustNothing
+    }
 }
 
 fn emit_tray_context(

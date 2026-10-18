@@ -18,7 +18,9 @@ use nrr_shared::rules_json::RuleAction;
 
 use crate::Route;
 
-pub use file_text::{build_rules_file_text, RulesFileOptions, PRESET_FORMAT_VERSION};
+pub use file_text::{
+    build_rules_file_text, RulesFileOptions, PRESET_FORMAT_VERSION, RULES_FILE_HINT_KEYS,
+};
 pub use main_route::{main_route_check_hosts, main_route_rank};
 pub use search::{normalize_host_input, row_matches_search, search_box_text};
 pub use wire::{
@@ -31,7 +33,7 @@ pub use wire::{
 pub enum TargetRoute {
     Primary,
     Secondary,
-    /// Drop the traffic; kept in the secondary file as `+block`.
+    /// Drop the traffic; kept in the secondary file as `!value`.
     Block,
     /// A slug this build does not know, kept verbatim. It belongs to no file.
     Other(String),
@@ -177,6 +179,12 @@ impl RuleType {
     }
 }
 
+/// `x.*` (`valueIsAnyZone`): a site in every zone names no single host, so
+/// "check where it works" has nothing to check.
+pub fn value_is_any_zone(value: &str) -> bool {
+    value.trim().ends_with(".*")
+}
+
 /// Provenance of a rule the application authored on the user's behalf.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RowOrigin {
@@ -214,7 +222,8 @@ impl RuleRow {
     }
 
     /// The `?` this row actually carries (`rowIsVerify`): a route rule of a
-    /// type that takes it. A block or another type drops it.
+    /// type that takes it. A block, another type or a site in every zone
+    /// drops it.
     pub fn is_verify(&self) -> bool {
         self.verify
             && matches!(
@@ -222,6 +231,7 @@ impl RuleRow {
                 TargetRoute::Primary | TargetRoute::Secondary
             )
             && self.rule_type.allows_verify()
+            && !value_is_any_zone(&self.match_value)
     }
 
     /// The per-rule wire action.
@@ -244,6 +254,16 @@ impl RuleRow {
             self.rule_type.canonical_slug(),
             self.match_value.to_lowercase(),
             self.target_route.as_str()
+        )
+    }
+
+    /// The rule apart from its route (`ruleValueKey`): folded type and
+    /// lower-cased value, as recent changes and an undo match rules.
+    pub fn value_key(&self) -> String {
+        format!(
+            "{}|{}",
+            self.rule_type.canonical_slug(),
+            self.match_value.to_lowercase()
         )
     }
 

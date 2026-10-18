@@ -81,6 +81,9 @@ pub struct UpstreamTarget {
     pub port: u16,
     /// Route the policy picked for this hostname.
     pub route: RouteRole,
+    /// The served user whose links carry the flow, when it is not the
+    /// routing user's.
+    pub owner: Option<String>,
 }
 
 impl UpstreamTarget {
@@ -93,6 +96,7 @@ impl UpstreamTarget {
             address: Some(address),
             fallbacks: Vec::new(),
             route,
+            owner: None,
         }
     }
 
@@ -253,6 +257,17 @@ pub enum SourceBindDecision {
 /// a snapshot taken at stack start would go stale mid-session.
 pub trait RelaySourceAddrs: Send + Sync {
     fn decide(&self, route: RouteRole, remote: &SocketAddr) -> SourceBindDecision;
+
+    /// [`Self::decide`] for a flow `owner` opened: that user's links. A
+    /// policy that resolves links per user must override this.
+    fn decide_for(
+        &self,
+        _owner: Option<&str>,
+        route: RouteRole,
+        remote: &SocketAddr,
+    ) -> SourceBindDecision {
+        self.decide(route, remote)
+    }
 }
 
 /// Fixed per-role source addresses; roles without one stay [`Unbound`]
@@ -392,9 +407,14 @@ impl SystemRelayDialer {
         self
     }
 
-    fn decide(&self, route: RouteRole, address: &SocketAddr) -> SourceBindDecision {
+    fn decide(
+        &self,
+        owner: Option<&str>,
+        route: RouteRole,
+        address: &SocketAddr,
+    ) -> SourceBindDecision {
         match self.live.as_ref() {
-            Some(live) => live.decide(route, address),
+            Some(live) => live.decide_for(owner, route, address),
             None => self.fixed.decide(route, address),
         }
     }
@@ -449,12 +469,13 @@ impl SystemRelayDialer {
     /// One TCP connect to one address, waiting at most `timeout`.
     fn connect_one(
         &self,
+        owner: Option<&str>,
         route: RouteRole,
         address: SocketAddr,
         timeout: Duration,
     ) -> Result<TcpStream, RelayError> {
         let started = Instant::now();
-        let bind = self.bind_address_for(route, &address)?;
+        let bind = self.bind_address_for(owner, route, &address)?;
         // `std` can neither bind nor mark a socket before connect; `socket2` can.
         let socket = socket2::Socket::new(
             socket2::Domain::for_address(address),
@@ -476,10 +497,11 @@ impl SystemRelayDialer {
     /// silently ignoring it would leak via the default route instead.
     fn bind_address_for(
         &self,
+        owner: Option<&str>,
         route: RouteRole,
         address: &SocketAddr,
     ) -> Result<Option<SocketAddr>, RelayError> {
-        match self.decide(route, address) {
+        match self.decide(owner, route, address) {
             SourceBindDecision::Unbound => Ok(None),
             SourceBindDecision::Refuse { reason } => {
                 Err(RelayError::SourcePolicyRefused { reason })
@@ -574,7 +596,7 @@ impl RelayDialer for SystemRelayDialer {
         };
         // The same source steering a connection to this name gets, so the
         // probe crosses the link the rules picked — or is refused with it.
-        let source = match self.bind_address_for(target.route, &address)? {
+        let source = match self.bind_address_for(target.owner.as_deref(), target.route, &address)? {
             Some(bind) => match bind.ip() {
                 IpAddr::V4(v4) => Some(v4),
                 IpAddr::V6(_) => None,
@@ -608,7 +630,7 @@ impl RelayDialer for SystemRelayDialer {
                 break;
             }
             let timeout = attempt_timeout(index, candidates.len(), left);
-            match self.connect_one(target.route, address, timeout) {
+            match self.connect_one(target.owner.as_deref(), target.route, address, timeout) {
                 Ok(stream) => {
                     connected = Some((address, stream));
                     break;
@@ -659,7 +681,10 @@ impl RelayDialer for SystemRelayDialer {
 
     fn connect_udp(&self, target: &UpstreamTarget) -> Result<Box<dyn RelayDatagram>, RelayError> {
         let address = self.dial_address(target)?;
-        let bind: SocketAddr = match (self.bind_address_for(target.route, &address)?, address) {
+        let bind: SocketAddr = match (
+            self.bind_address_for(target.owner.as_deref(), target.route, &address)?,
+            address,
+        ) {
             (Some(bind), _) => bind,
             (None, SocketAddr::V4(_)) => SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0),
             (None, SocketAddr::V6(_)) => SocketAddr::new(IpAddr::from([0u16; 8]), 0),
@@ -1084,6 +1109,7 @@ mod tests {
             fallbacks: Vec::new(),
             port,
             route: RouteRole::Primary,
+            owner: None,
         }
     }
 

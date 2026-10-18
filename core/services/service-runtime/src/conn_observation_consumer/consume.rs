@@ -104,7 +104,11 @@ impl ConnectionObservationConsumer {
             // connection never comes up, so waiting for an establishment to
             // confirm that somebody went there waits forever — the whole point
             // is that they went and it did not work.
-            self.confirm_placeholder_use(obs.remote.ip(), obs.observed_unix_ms.unwrap_or(now_ms));
+            self.confirm_placeholder_use(
+                obs.remote.ip(),
+                obs.observed_unix_ms.unwrap_or(now_ms),
+                obs.user_sid.as_deref(),
+            );
             let (primary_ifindex, secondary_ifindex) = if self.owner_scoped {
                 self.owner_links(&mut owner_links, obs.user_sid.as_deref(), now_ms)
             } else {
@@ -328,13 +332,28 @@ impl ConnectionObservationConsumer {
             // and waiting for a failure would mean waiting for a timeout that
             // may never come. The pin comes off and the owner does not relearn
             // it this session.
-            if let Some(store) = self.app_observations.as_ref() {
+            // Kept per user where routes are: the owner's own store.
+            if let Some(store) = self
+                .app_observations
+                .as_ref()
+                .and_then(|store| store.scope_for(rec.user_sid.as_deref()))
+            {
                 if let (Some(path), IpAddr::V4(rip)) =
                     (rec.process_path.as_deref(), rec.remote.ip())
                 {
                     let this_app = crate::app_observation_lookup::app_key(path);
+                    // Who the remembered rows of this store belong to.
+                    let per_user = self
+                        .app_observations
+                        .as_ref()
+                        .is_some_and(|root| root.keeps_per_principal());
+                    let persisted_owner = if per_user {
+                        rec.user_sid.as_deref()
+                    } else {
+                        None
+                    };
                     for owner in collateral_pin_owners(
-                        store,
+                        &store,
                         &this_app,
                         crate::app_observation_lookup::own_process_key(),
                         &routed_apps,
@@ -344,7 +363,7 @@ impl ConnectionObservationConsumer {
                         if store.retract(&owner, rip) {
                             summary.app_ips_retracted += 1;
                             if let Some(forget) = self.app_destination_forget.as_ref() {
-                                forget(&owner, rip);
+                                forget(persisted_owner, &owner, rip);
                             }
                             tracing::info!(
                                 target: "nrr::conn-trace",
@@ -371,10 +390,7 @@ impl ConnectionObservationConsumer {
             // anything — it only counts inside an open anchor window — so the
             // observer stays a reporter of facts.
             if rec.egress.role == EgressRole::Secondary {
-                *self
-                    .last_secondary_at
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+                self.note_owner_on_secondary(rec.user_sid.as_deref());
                 // Same outcome filter as the main-link half: only what the stack
                 // established went over the link.
                 if establishes {
@@ -382,7 +398,7 @@ impl ConnectionObservationConsumer {
                 }
             }
             if rec.egress.role == EgressRole::Primary {
-                self.note_companion_in_use(rec.remote.ip());
+                self.note_companion_in_use(rec.remote.ip(), rec.user_sid.as_deref());
                 self.remember_program(&rec, rec.observed_unix_ms.unwrap_or(now_ms));
             }
             // Did the user go there, or did a page take them there? Measured

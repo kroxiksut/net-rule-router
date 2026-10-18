@@ -37,10 +37,10 @@ GroupBox {
         var kind = String(scope.kind || "all")
         if (kind === "host")
             return root.tr("settings.block-notices.mutes.row-host", "Host: {name}")
-                .replace("{name}", String(scope.host || ""))
+                .replace("{name}", Pure.displayText(scope.host))
         if (kind === "app")
             return root.tr("settings.block-notices.mutes.row-app", "Application: {name}")
-                .replace("{name}", String(scope.app || ""))
+                .replace("{name}", Pure.displayText(scope.app))
         if (kind === "reason")
             return root.tr("settings.block-notices.mutes.row-reason", "Reason: {name}")
                 .replace("{name}", root.tr("block-reason." + String(scope.reason || ""),
@@ -238,13 +238,13 @@ GroupBox {
         anchors.left: parent.left
         anchors.right: parent.right
         spacing: root.uiTheme.spacingSm
-        // Everything the tray may raise, under one heading and one master
-        // switch — a user who wants fewer interruptions should not have to
-        // hunt for the kinds one screen at a time.
+        // Everything the tray and this window may raise, under one heading
+        // and one master switch — a user who wants fewer interruptions should
+        // not have to hunt for the kinds one screen at a time.
         Label {
             Layout.fillWidth: true
             Layout.topMargin: root.uiTheme.spacingSm
-            text: root.tr("settings.group.tray-notifications", "Tray notifications")
+            text: root.tr("notifications.title", "Notifications")
             color: root.textColor
             font.bold: true
         }
@@ -453,6 +453,7 @@ GroupBox {
                         Layout.fillWidth: true
                         color: root.textColor
                         elide: Text.ElideRight
+                        textFormat: Text.PlainText
                         text: group._blockNoticeMuteScopeLabel(blockNoticeMuteRow.modelData)
                     }
                     Label {

@@ -9,6 +9,7 @@
 use nrr_shared::diagnostics_dto::DiagnosticsStatusDto;
 use nrr_shared::ipc_payloads::{
     EnforcementStatusDto, RoutesHeldDto, SnapshotInitialResponse, StatusUpdateEvent,
+    TrafficCarriedDto,
 };
 use serde_json::{json, Value};
 
@@ -61,12 +62,14 @@ fn reports_round_trip_under_their_wire_key() {
                 role: "secondary".into(),
                 candidates: Vec::new(),
                 since_unix_ms: None,
+                quiet: false,
             },
             EnforcementStatusDto {
                 status: "adapter-gone".into(),
                 role: "primary".into(),
                 candidates: vec!["Ethernet".into()],
                 since_unix_ms: None,
+                quiet: false,
             },
         ]
     );
@@ -84,6 +87,7 @@ fn a_report_has_the_push_events_shape() {
         role: "secondary".into(),
         candidates: vec!["Example Tunnel".into(), "Example Tunnel".into()],
         since_unix_ms: Some(1_700_000_000_000),
+        quiet: false,
     };
     let mut pushed = serde_json::to_value(&event).unwrap_or_else(|e| panic!("{e}"));
     let fields = pushed
@@ -96,6 +100,7 @@ fn a_report_has_the_push_events_shape() {
         role: "secondary".into(),
         candidates: vec!["Example Tunnel".into(), "Example Tunnel".into()],
         since_unix_ms: Some(1_700_000_000_000),
+        quiet: false,
     };
     assert_eq!(
         serde_json::to_value(&report).unwrap_or_else(|e| panic!("{e}")),
@@ -110,6 +115,7 @@ fn since_travels_under_its_kebab_key_and_is_left_off_when_unknown() {
         role: "secondary".into(),
         candidates: Vec::new(),
         since_unix_ms: Some(1_700_000_000_000),
+        quiet: false,
     };
     let wire = serde_json::to_value(&report).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(wire["since-unix-ms"], 1_700_000_000_000_i64);
@@ -122,6 +128,27 @@ fn since_travels_under_its_kebab_key_and_is_left_off_when_unknown() {
     };
     let wire = serde_json::to_value(&unknown).unwrap_or_else(|e| panic!("{e}"));
     assert!(wire.get("since-unix-ms").is_none(), "{wire}");
+}
+
+#[test]
+fn quiet_travels_only_when_set_and_an_older_report_reads_as_loud() {
+    let report = EnforcementStatusDto {
+        status: "secondary-down".into(),
+        role: "secondary".into(),
+        candidates: Vec::new(),
+        since_unix_ms: None,
+        quiet: true,
+    };
+    let wire = serde_json::to_value(&report).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(wire["quiet"], true);
+    let loud = EnforcementStatusDto {
+        quiet: false,
+        ..report
+    };
+    let wire = serde_json::to_value(&loud).unwrap_or_else(|e| panic!("{e}"));
+    assert!(wire.get("quiet").is_none(), "{wire}");
+    let back: EnforcementStatusDto = serde_json::from_value(wire).unwrap_or_else(|e| panic!("{e}"));
+    assert!(!back.quiet);
 }
 
 /// A push from a service that predates the field still decodes.
@@ -177,6 +204,48 @@ fn routes_held_by_another_user_is_optional_and_shaped_like_its_push() {
     fields.remove("sid");
     assert_eq!(
         serde_json::to_value(&held).unwrap_or_else(|e| panic!("{e}")),
+        pushed
+    );
+}
+
+/// Traffic carried through another user's tunnel: absent while it is not, and
+/// shaped like the push so the client feeds both to one handler.
+#[test]
+fn traffic_carried_by_another_user_is_optional_and_shaped_like_its_push() {
+    let older = parse(snapshot_without_enforcement());
+    assert_eq!(older.traffic_carried_by_another_user, None);
+    let wire = serde_json::to_value(&older).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        wire.get("traffic-carried-by-another-user").is_none(),
+        "{wire}"
+    );
+
+    let mut v = snapshot_without_enforcement();
+    v["traffic-carried-by-another-user"] = json!({ "carried": true, "link": "Example Tunnel" });
+    let carried = parse(v)
+        .traffic_carried_by_another_user
+        .unwrap_or_else(|| panic!("the report must decode"));
+    assert_eq!(
+        carried,
+        TrafficCarriedDto {
+            carried: true,
+            link: "Example Tunnel".into(),
+        }
+    );
+
+    let mut pushed = serde_json::to_value(StatusUpdateEvent::TrafficCarriedByAnotherUser {
+        sid: "S-1-5-21-0".into(),
+        carried: true,
+        link: "Example Tunnel".into(),
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    let fields = pushed
+        .as_object_mut()
+        .unwrap_or_else(|| panic!("an event is an object"));
+    fields.remove("type");
+    fields.remove("sid");
+    assert_eq!(
+        serde_json::to_value(&carried).unwrap_or_else(|e| panic!("{e}")),
         pushed
     );
 }

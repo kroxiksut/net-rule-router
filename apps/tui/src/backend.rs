@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
+use nrr_platform_api::authorization::TerminalPromptAgent;
 use nrr_platform_api::service_control::ServiceControlPort;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
@@ -15,6 +16,7 @@ use nrr_shared::ipc_payloads::{
 };
 use serde_json::Value;
 
+use crate::elevation_prompt::{PromptRequest, PromptingClient};
 use crate::link::{tui_command, Link};
 
 /// How often the connection is re-checked while it is settled. The design's
@@ -112,16 +114,31 @@ pub type RegistrationProbe = fn() -> Option<Box<dyn ServiceControlPort>>;
 pub struct Backend {
     commands: Sender<Command>,
     jobs: Sender<Job>,
+    prompts: Receiver<PromptRequest>,
 }
 
 impl Backend {
+    #[cfg(test)]
     pub fn spawn(
         client: Arc<dyn IpcClient>,
         probe: RegistrationProbe,
         events: Sender<BackendEvent>,
     ) -> std::io::Result<Self> {
+        Self::spawn_with_prompt_agent(client, probe, events, None)
+    }
+
+    /// [`Self::spawn`], with the agent that asks an administrator's password
+    /// in this terminal when the service could ask nobody. The screen is
+    /// handed over through [`Self::take_prompt_request`].
+    pub fn spawn_with_prompt_agent(
+        client: Arc<dyn IpcClient>,
+        probe: RegistrationProbe,
+        events: Sender<BackendEvent>,
+        agent: Option<Box<dyn TerminalPromptAgent>>,
+    ) -> std::io::Result<Self> {
         let (jobs, queue) = std::sync::mpsc::channel::<Job>();
-        let job_client = client.clone();
+        let (prompt_tx, prompts) = std::sync::mpsc::channel();
+        let job_client = PromptingClient::new(client.clone(), agent, prompt_tx);
         let job_events = events.clone();
         // Ends when the backend is dropped and the queue closes.
         let _jobs = thread::Builder::new()
@@ -129,7 +146,7 @@ impl Backend {
             .spawn(move || {
                 while let Ok(job) = queue.recv() {
                     if job_events
-                        .send(BackendEvent::Reply(job(&*job_client)))
+                        .send(BackendEvent::Reply(job(&job_client)))
                         .is_err()
                     {
                         return;
@@ -140,7 +157,16 @@ impl Backend {
         let _detached = thread::Builder::new()
             .name("nrr-tui-backend".into())
             .spawn(move || run(&client, probe, &events, &inbox))?;
-        Ok(Self { commands, jobs })
+        Ok(Self {
+            commands,
+            jobs,
+            prompts,
+        })
+    }
+
+    /// A job waiting for the screen to type a password in, if one is.
+    pub fn take_prompt_request(&self) -> Option<PromptRequest> {
+        self.prompts.try_recv().ok()
     }
 
     pub fn send(&self, command: Command) {

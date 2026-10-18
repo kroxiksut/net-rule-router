@@ -92,5 +92,9 @@ fuzz_target!(|data: &[u8]| {
         TrafficStatsSetRequest,
         TrafficHistoryMergeSetRequest,
         VpnGatewayCandidatesRequest,
+        RulesRecentChangesRequest,
+        ConnHistoryListRequest,
+        ConnHistoryClearRequest,
+        ConnHistorySettingsSetRequest,
     );
 });

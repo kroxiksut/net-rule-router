@@ -25,6 +25,9 @@
 #   ./scripts/package-linux.sh --build               # build first (needs Qt 6.6+ for the GUI)
 #   ./scripts/package-linux.sh --headless --build    # no GUI, no Qt (the glibc 2.28 baseline)
 #   ./scripts/package-linux.sh --formats deb,tar --out /tmp/nrr-packages
+#
+# Every package is checked against packaging/linux/package-contents.txt once
+# built; a missing file fails the run.
 
 set -euo pipefail
 
@@ -34,6 +37,8 @@ repo_root="$(cd "$script_dir/.." && pwd)"
 . "$script_dir/lib/service-paths.sh"
 # shellcheck source=lib/desktop-paths.sh
 . "$script_dir/lib/desktop-paths.sh"
+# shellcheck source=lib/workspace-version.sh
+. "$script_dir/lib/workspace-version.sh"
 
 usage() {
   cat <<'EOF'
@@ -47,6 +52,8 @@ Usage: package-linux.sh [options]
   --out DIR            output directory (default: <cargo target dir>/packages)
   --maintainer TEXT    Maintainer of the .deb and Packager of the .rpm (default:
                        $NRR_PACKAGE_MAINTAINER, else "NetRuleRouter <fmalkov91@gmail.com>")
+  --max-glibc X.Y      fail when the service, nrr-cli or nrr-tui need a glibc newer
+                       than X.Y (the release passes 2.28 for the headless build)
 EOF
 }
 
@@ -62,6 +69,7 @@ arch=""
 release="1"
 out_dir=""
 maintainer="${NRR_PACKAGE_MAINTAINER:-NetRuleRouter <fmalkov91@gmail.com>}"
+max_glibc=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -77,6 +85,8 @@ while [ "$#" -gt 0 ]; do
     --out=*) out_dir="${1#--out=}"; shift ;;
     --maintainer) maintainer="${2:-}"; shift 2 ;;
     --maintainer=*) maintainer="${1#--maintainer=}"; shift ;;
+    --max-glibc) max_glibc="${2:-}"; shift 2 ;;
+    --max-glibc=*) max_glibc="${1#--max-glibc=}"; shift ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "unknown argument: $1" >&2
@@ -102,6 +112,9 @@ done
 case "$release" in
   ''|*[!0-9]*) die "--release must be a number, got '$release'" ;;
 esac
+if [ -n "$max_glibc" ] && ! printf '%s' "$max_glibc" | grep -Eq '^[0-9]+\.[0-9]+$'; then
+  die "--max-glibc takes a version like 2.28, got '$max_glibc'"
+fi
 
 # ── Architecture ─────────────────────────────────────────────────────────────
 
@@ -133,7 +146,7 @@ missing=()
 need_tool() {
   command -v "$1" >/dev/null 2>&1 || missing+=("$1 - $2")
 }
-for tool in tar gzip sha256sum find sort awk sed install; do
+for tool in tar gzip sha256sum find sort comm awk sed install; do
   need_tool "$tool" "coreutils/findutils/tar/gzip/sed/gawk from the distribution"
 done
 need_tool readelf "Debian/Ubuntu/Astra: apt install binutils; RHEL-like/RED OS: dnf install binutils"
@@ -143,6 +156,7 @@ if [ "$want_deb" -eq 1 ]; then
 fi
 if [ "$want_rpm" -eq 1 ]; then
   need_tool rpmbuild "Debian/Ubuntu/Astra: apt install rpm; RHEL-like/RED OS: dnf install rpm-build"
+  need_tool rpm "Debian/Ubuntu/Astra: apt install rpm; RHEL-like/RED OS: dnf install rpm"
 fi
 if [ "$do_build" -eq 1 ]; then
   need_tool cargo "install Rust through rustup (see docs/en/building-linux.md)"
@@ -156,13 +170,7 @@ fi
 
 # ── Version and revision ─────────────────────────────────────────────────────
 
-# The workspace version, read without cargo so a machine with only the
-# binaries can still package them.
-version="$(awk '
-  { sub(/\r$/, "") }
-  /^\[/ { in_package = ($0 == "[workspace.package]"); next }
-  in_package && $1 == "version" { v = $0; sub(/^[^"]*"/, "", v); sub(/".*$/, "", v); print v; exit }
-' "$repo_root/Cargo.toml")"
+version="$(nrr_workspace_version "$repo_root/Cargo.toml")"
 [ -n "$version" ] || die "no version in [workspace.package] of $repo_root/Cargo.toml"
 case "$version" in
   [0-9]*) ;;
@@ -191,6 +199,118 @@ if command -v git >/dev/null 2>&1 && git -C "$repo_root" rev-parse --git-dir >/d
 fi
 : "${SOURCE_DATE_EPOCH:=$(date +%s)}"
 export SOURCE_DATE_EPOCH
+
+# ── Contents check ───────────────────────────────────────────────────────────
+
+contents_manifest="$repo_root/packaging/linux/package-contents.txt"
+
+manifest_lines() {
+  sed -e 's/\r$//' -e 's/#.*//' -e '/^[[:space:]]*$/d' "$contents_manifest"
+}
+
+# Read before the build, so a typo fails in seconds.
+[ -f "$contents_manifest" ] || die "missing $contents_manifest"
+while read -r set path rest; do
+  case "$set" in
+    base|service|gui|archive) ;;
+    *) die "$contents_manifest: unknown set '$set'" ;;
+  esac
+  [ -n "$path" ] && [ -z "$rest" ] || die "$contents_manifest: expected '<set> <path>', got '$set $path $rest'"
+  rest="${path//@libexec@/}"
+  case "${rest//@unitdir@/}" in
+    *@*) die "$contents_manifest: unknown token in '$path'" ;;
+  esac
+done < <(manifest_lines)
+
+# The files of a checkout directory a payload copy takes, relative to it.
+payload_files() {
+  local rel="$1" list file
+  if command -v git >/dev/null 2>&1 && git -C "$repo_root" rev-parse --git-dir >/dev/null 2>&1; then
+    list="$(git -C "$repo_root" ls-files -- "$rel")" || return 1
+    while IFS= read -r file; do
+      if [ -n "$file" ] && [ -f "$repo_root/$file" ]; then
+        printf '%s\n' "${file#"$rel"/}"
+      fi
+    done <<<"$list"
+  else
+    (cd "$repo_root/$rel" && find . -type f -printf '%P\n')
+  fi
+}
+
+# The paths a package of the sets $2... must hold; $1 is its unit directory.
+expected_paths() {
+  local unit_dir="$1" set listed path name size lines
+  shift
+  lines="$(manifest_lines)" || return 1
+  for set in "$@"; do
+    case "$set" in
+      base)
+        printf '%s\n' "$libexec/$NRR_SERVICE_EXE_NAME"
+        for name in "${NRR_CONSOLE_EXE_NAMES[@]}"; do
+          printf '%s\n' "$libexec/$name" "$NRR_COMMAND_LINK_DIR/$name"
+        done
+        name="$(payload_files locales)" || return 1
+        printf '%s\n' "$name" | sed -e '/^$/d' -e "s|^|$libexec/locales/|"
+        name="$(payload_files presets)" || return 1
+        printf '%s\n' "$name" | sed -e '/^$/d' -e "s|^|$libexec/presets/|"
+        ;;
+      service)
+        printf '%s\n' "$unit_dir/$NRR_UNIT_NAME" "$libexec/$NRR_SERVICE_ALIAS_NAME" \
+          "$NRR_LOGROTATE_CONFIG" "$NRR_POLKIT_POLICY"
+        ;;
+      gui)
+        for name in "$NRR_DESKTOP_GUI_ID" "$NRR_DESKTOP_TRAY_ID"; do
+          printf '%s\n' "$libexec/$name" "$NRR_COMMAND_LINK_DIR/$name" "/usr/share/applications/$name.desktop"
+        done
+        for size in "${NRR_DESKTOP_ICON_SIZES[@]}"; do
+          printf '%s\n' "/usr/share/icons/hicolor/${size}x${size}/apps/$NRR_DESKTOP_ICON_NAME.png"
+        done
+        name="$(payload_files apps/desktop/qml)" || return 1
+        printf '%s\n' "$name" | sed -e '/^$/d' -e "s|^|$libexec/apps/desktop/qml/|"
+        ;;
+    esac
+    while read -r listed path; do
+      [ "$listed" = "$set" ] || continue
+      path="${path//@libexec@/$libexec}"
+      printf '%s\n' "${path//@unitdir@/$unit_dir}"
+    done <<<"$lines"
+  done
+}
+
+# Fails when the listing $2 (one path per line) lacks a path of $3.
+require_contents() {
+  local artifact="$1" missing
+  missing="$(printf '%s\n' "$3" | LC_ALL=C sort -u |
+    LC_ALL=C comm -23 - <(printf '%s\n' "$2" | LC_ALL=C sort -u))"
+  [ -z "$missing" ] ||
+    die "$artifact lacks files packaging/linux/package-contents.txt requires:
+$missing"
+  nrr_gray "    $artifact: contents checked"
+}
+
+# A .deb or .rpm of package $2 holding the sets $4...; $3 is its unit directory.
+check_package() {
+  local file="$1" package="$2" unit_dir="$3" listing expected
+  shift 3
+  case "$file" in
+    *.deb) listing="$(dpkg-deb --fsys-tarfile "$file" | tar -tf - | sed -e 's|^\./|/|' -e 's|/$||')" ;;
+    *.rpm) listing="$(rpm -qlp "$file")" ;;
+  esac || die "could not list the files of $file"
+  expected="$(expected_paths "$unit_dir" "$@")" || die "could not work out what $file must hold"
+  require_contents "$(basename "$file")" "$listing" "$expected
+/usr/share/doc/$package/copyright"
+}
+
+# An archive whose top folder is $2, holding the sets $3... under root/.
+check_tarball() {
+  local file="$1" stem="$2" listing top expected
+  shift 2
+  listing="$(tar -tzf "$file" | sed -e "s|^$stem/||" -e 's|/$||')" || die "could not list the files of $file"
+  top="$(expected_paths "" archive)" || die "could not work out what $file must hold"
+  expected="$(expected_paths "" "$@")" || die "could not work out what $file must hold"
+  require_contents "$(basename "$file")" "$listing" "$top
+$(printf '%s\n' "$expected" | sed 's|^|root|')"
+}
 
 # ── Build ────────────────────────────────────────────────────────────────────
 
@@ -270,6 +390,15 @@ glibc_base="$(glibc_floor "${base_elves[@]}")"
 glibc_gui=""
 if [ "$headless" -eq 0 ]; then
   glibc_gui="$(glibc_floor "${gui_elves[@]}")"
+fi
+# Asserted, not only measured: a binary needing a newer glibc than promised
+# installs on the old systems and then fails to start.
+if [ -n "$max_glibc" ]; then
+  [ -n "$glibc_base" ] ||
+    die "could not measure the glibc the service, nrr-cli and nrr-tui need (readelf found no GLIBC_ versions), so --max-glibc $max_glibc cannot be checked"
+  if [ "$(printf '%s\n%s\n' "$max_glibc" "$glibc_base" | sort -V | tail -n 1)" != "$max_glibc" ]; then
+    die "the service, nrr-cli and nrr-tui need glibc $glibc_base, newer than the allowed $max_glibc: build them on a system whose glibc is $max_glibc or older"
+  fi
 fi
 
 # ── Output ───────────────────────────────────────────────────────────────────
@@ -546,6 +675,11 @@ build_deb() {
   dpkg-deb --root-owner-group -Zxz --build "$root" "$file" >/dev/null
   artifacts+=("$(basename "$file")")
   nrr_green "    $(basename "$file")"
+  if [ "$package" = "$base_name" ]; then
+    check_package "$file" "$package" "$unit_dir" base service
+  else
+    check_package "$file" "$package" "$unit_dir" gui
+  fi
 }
 
 if [ "$want_deb" -eq 1 ]; then
@@ -670,6 +804,11 @@ fi'
   [ -f "$out_dir/$file" ] || die "rpmbuild did not produce $out_dir/$file"
   artifacts+=("$file")
   nrr_green "    $file"
+  if [ "$package" = "$base_name" ]; then
+    check_package "$out_dir/$file" "$package" "${NRR_PACKAGE_UNIT_FILES[0]%/*}" base service
+  else
+    check_package "$out_dir/$file" "$package" "${NRR_PACKAGE_UNIT_FILES[0]%/*}" gui
+  fi
 }
 
 if [ "$want_rpm" -eq 1 ]; then
@@ -781,6 +920,8 @@ if [ "$want_tar" -eq 1 ]; then
   build_tarball "$NRR_PRODUCT_NAME_UNIX-headless-$version-linux-$arch" \
     "without the GUI (service, nrr-cli, nrr-tui)" "без GUI (служба, nrr-cli, nrr-tui)" \
     "" "" "$glibc_base" "$base_root"
+  check_tarball "$out_dir/$NRR_PRODUCT_NAME_UNIX-headless-$version-linux-$arch.tar.gz" \
+    "$NRR_PRODUCT_NAME_UNIX-headless-$version-linux-$arch" base
   if [ "$headless" -eq 0 ]; then
     newest_glibc="$(printf '%s\n%s\n' "$glibc_base" "$glibc_gui" | sort -V | tail -n 1)"
     build_tarball "$NRR_PRODUCT_NAME_UNIX-$version-linux-$arch" \
@@ -788,6 +929,8 @@ if [ "$want_tar" -eq 1 ]; then
       "; for the GUI, Qt 6.6 or newer with Qt Quick Controls, Layouts, Dialogs and Qt.labs.platform" \
       "; для GUI - Qt 6.6 или новее с Qt Quick Controls, Layouts, Dialogs и Qt.labs.platform" \
       "$newest_glibc" "$base_root" "$gui_root"
+    check_tarball "$out_dir/$NRR_PRODUCT_NAME_UNIX-$version-linux-$arch.tar.gz" \
+      "$NRR_PRODUCT_NAME_UNIX-$version-linux-$arch" base gui
   fi
 fi
 

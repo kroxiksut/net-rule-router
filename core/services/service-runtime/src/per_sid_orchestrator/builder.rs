@@ -337,6 +337,16 @@ impl PerSidApplyOrchestrator {
             .any(|armed| *armed)
     }
 
+    /// [`Self::any_fail_closed_armed`] for one SID: a rule host's answer is
+    /// withheld only while the guard of a user whose rule names it holds.
+    pub fn fail_closed_armed_for(&self, sid: &str) -> bool {
+        self.fail_closed_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(sid)
+            .is_some_and(|armed| *armed)
+    }
+
     /// Fake-IP: wire the LIVE fake-IP context provider,
     /// consulted on every compute, so the per-SID codegen suppresses
     /// fake-routed hosts' real `/32` permits, permits the fake pool, and
@@ -423,9 +433,9 @@ impl PerSidApplyOrchestrator {
         event
     }
 
-    /// wire the on-disk filter-id ledger so
-    /// installed ids are persisted and a hard-killed prior instance's orphans
-    /// can be reaped by id at the next start (see [`Self::cleanup_persisted_orphans`]).
+    /// Wire the on-disk filter-id ledger, so a hard-killed prior instance's
+    /// filters can be settled by id at the next start (see
+    /// [`Self::defer_orphans_to_first_pass`]).
     pub fn with_filter_ledger(
         mut self,
         ledger: Arc<crate::wfp_filter_ledger::WfpFilterLedger>,

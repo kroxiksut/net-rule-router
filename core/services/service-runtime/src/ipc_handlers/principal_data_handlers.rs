@@ -6,7 +6,8 @@
 use nrr_shared::ipc_payloads::{PrincipalDataCountResponse, PrincipalDataPurgeRequest};
 
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 use crate::ipc_handlers::providers::{PrincipalDataPurger, RoutePolicyWriteError};
 
@@ -49,9 +50,15 @@ impl PrincipalDataPurgeHandler {
     }
 }
 
-impl IpcHandler for PrincipalDataPurgeHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let sid = principal(ctx)?;
+impl CheckedIpcHandler for PrincipalDataPurgeHandler {
+    type Checked = PrincipalDataPurgeRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        principal(ctx)?;
         // An absent payload is the plain "reset my own data" call and keeps the
         // defaults. A payload that is PRESENT but unreadable is not: silently
         // defaulting it turned "erase my rules history too" into a purge that
@@ -65,17 +72,25 @@ impl IpcHandler for PrincipalDataPurgeHandler {
                 diagnostics_id: None,
             })?
         };
+        // Erasing other users' routing is an administrative act. The elevation
+        // check is here rather than in the catalog because the SAME operation
+        // is the ordinary, non-elevated self-reset.
+        if req.all_principals && !ctx.caller_is_elevated {
+            return Err(IpcError::needs_administrator(
+                "clearing every user's data needs administrator approval",
+            ));
+        }
+        Ok(req)
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        let sid = principal(ctx)?;
         let response = if req.all_principals {
-            // Erasing other users' routing is an administrative act. The
-            // elevation check is here rather than in the catalog because the
-            // SAME operation is the ordinary, non-elevated self-reset.
-            if !ctx.caller_is_elevated {
-                return Err(IpcError {
-                    code: IpcErrorCode::Forbidden,
-                    message: "clearing every user's data needs administrator approval".to_string(),
-                    diagnostics_id: None,
-                });
-            }
             self.purger
                 .purge_all_principals(req.include_rules_history)
                 .map_err(map_write_error)?

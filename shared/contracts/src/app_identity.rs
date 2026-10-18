@@ -1,7 +1,9 @@
 //! One spelling of an application's identity, for every path that handles one.
 //!
-//! A rule may be typed with or without a path, in any case, and on Windows
-//! with or without `.exe`, so the same application has many spellings. Every
+//! A name may be typed in any case, and on Windows with or without `.exe`, so
+//! the same application has many spellings. A rule value with a path is read
+//! by [`crate::app_path`]; only names stored before paths existed, and names
+//! the OS reports, still arrive here with one. Every
 //! producer of a `CanonicalAppPattern` has to reduce them to one — a validated
 //! rule book, a decoded revision, an imported preset — and when one of them
 //! skipped it, two representations of the same rule set met in a diff that

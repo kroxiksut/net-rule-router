@@ -12,11 +12,16 @@
 //! - [`review`] — a rules change's preview, refusal and outcome.
 //! - [`route_policy`] — the full-replacement `route.policy.update` request.
 //! - [`rules_overlaps`] — overlaps the user made on purpose.
+//! - [`rule_value_class`] — what kind of rule a value is, and the section a
+//!   value written under the wrong one belongs in.
+//! - [`recent_changes`] — the «Recent» filter's periods and times.
 //! - [`rule_sets`] — the user's rule-set folder and the set moving into it.
 //! - [`restore`] — the user's recorded settings brought back to a service
 //!   that lost them.
 //! - [`adapters`] — which adapter may take which route.
 //! - [`auto_rules`] — suggested addresses grouped, filtered and sorted.
+//! - [`bulk_rules`] — many rules pasted into the Add form at once, line by
+//!   line.
 //! - [`block_notices`] — the summary of blocks kept while no surface was
 //!   open.
 //! - [`conn_trace`] — the connection trace's view filters.
@@ -36,16 +41,19 @@
 pub mod adapters;
 pub mod auto_rules;
 pub mod block_notices;
+pub mod bulk_rules;
 pub mod conn_trace;
 pub mod diagnostics;
 pub mod forwarded;
 mod js;
 pub mod notice_mutes;
 pub mod placeholders;
+pub mod recent_changes;
 pub mod restore;
 pub mod review;
 pub mod route_policy;
 pub mod rule_sets;
+pub mod rule_value_class;
 pub mod rules_overlaps;
 pub mod rules_table;
 pub mod stability;

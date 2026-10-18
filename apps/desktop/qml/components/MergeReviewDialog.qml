@@ -113,7 +113,7 @@ Dialog {
         // Shared wording with the review diff — one "disabled" text app-wide.
         if (side.enabled === false) parts.push(tr("label.disabled", "disabled"))
         if (String(side.action) === "block")
-            parts.push(tr("dialog.merge.badge-block", "Block"))
+            parts.push(tr("dialog.merge.badge-block", "Denied"))
         if (side.comment && String(side.comment) !== "") parts.push("“" + String(side.comment) + "”")
         return parts.join(" · ")
     }
@@ -335,7 +335,7 @@ Dialog {
                             Label {
                                 id: blockBadgeF
                                 anchors.centerIn: parent
-                                text: dialog.tr("dialog.merge.badge-block", "Block")
+                                text: dialog.tr("dialog.merge.badge-block", "Denied")
                                 font.pixelSize: 10
                                 color: "white"
                             }
@@ -387,7 +387,7 @@ Dialog {
                             Label {
                                 id: blockBadgeS
                                 anchors.centerIn: parent
-                                text: dialog.tr("dialog.merge.badge-block", "Block")
+                                text: dialog.tr("dialog.merge.badge-block", "Denied")
                                 font.pixelSize: 10
                                 color: "white"
                             }

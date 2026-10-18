@@ -837,6 +837,11 @@ pub enum StatusUpdateEvent {
         /// `candidates` change; absent from a service that predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since_unix_ms: Option<i64>,
+        /// The additional route has not been up since the service started and
+        /// the start-up wait is not over: a state to show, not news to announce.
+        /// The same status arrives again without it once the wait ends.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        quiet: bool,
     },
     /// Some of this SID's routed destinations are held by another signed-in
     /// user's routing: the machine has one route table, and the user served
@@ -850,6 +855,19 @@ pub enum StatusUpdateEvent {
         /// network with its prefix.
         #[serde(default)]
         sample: Vec<String>,
+    },
+    /// What this SID's rules do not route leaves through another signed-in
+    /// user's tunnel: that user was served first and sends everything through
+    /// it, and the machine has one route table. Names the connection, never
+    /// the user. Published on change; `carried = false` ends it, and the
+    /// standing value rides `SnapshotInitialResponse::traffic_carried_by_another_user`.
+    TrafficCarriedByAnotherUser {
+        sid: String,
+        carried: bool,
+        /// The carrying connection's name as the interfaces list shows it;
+        /// empty when the service could not read it.
+        #[serde(default)]
+        link: String,
     },
     /// The local resolver ended without handing the system DNS back, so name
     /// resolution on this machine may fail until the network is restored.
@@ -886,6 +904,7 @@ impl StatusUpdateEvent {
             | Self::VerifyVerdictsChanged { sid, .. }
             | Self::EnforcementStatusChanged { sid, .. }
             | Self::RoutesHeldByAnotherUser { sid, .. }
+            | Self::TrafficCarriedByAnotherUser { sid, .. }
             | Self::AutostartStateChanged { sid, .. } => Some(sid.as_str()),
             // The baseline carries no SID and reaches everyone.
             Self::RevisionStatusChanged { sid, .. } | Self::MutationProgress { sid, .. } => {
@@ -1074,6 +1093,11 @@ pub struct SnapshotInitialResponse {
     /// Wire key: `routes-held-by-another-user`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routes_held_by_another_user: Option<RoutesHeldDto>,
+    /// The caller's standing `TrafficCarriedByAnotherUser` report, for a
+    /// client that connects after the push. Absent while their traffic takes
+    /// their own route. Wire key: `traffic-carried-by-another-user`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_carried_by_another_user: Option<TrafficCarriedDto>,
     /// The caller's programs named like a VPN client that leak protection does
     /// not trust by place, awaiting confirmation as the link provider — the
     /// standing twin of `VpnClientAwaitingConfirmation`. Wire key:
@@ -1091,6 +1115,16 @@ pub struct RoutesHeldDto {
     pub sample: Vec<String>,
 }
 
+/// The payload of [`StatusUpdateEvent::TrafficCarriedByAnotherUser`] without
+/// the SID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TrafficCarriedDto {
+    pub carried: bool,
+    #[serde(default)]
+    pub link: String,
+}
+
 /// One role's standing enforcement report: the payload of the last
 /// [`StatusUpdateEvent::EnforcementStatusChanged`] for it, without the SID.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1103,6 +1137,9 @@ pub struct EnforcementStatusDto {
     /// When this status began (wall clock, UTC ms); see the push's field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since_unix_ms: Option<i64>,
+    /// See the push's field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet: bool,
 }
 
 /// One rule enforced differently from how it reads: because of another rule
@@ -1131,9 +1168,15 @@ pub struct RuleConflictDto {
     /// (`block-leaks-shared-address` only).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub via_host: String,
-    /// The application the rule names (`unsupported-rule-shape` only).
+    /// The application the rule names (`unsupported-rule-shape`,
+    /// `protected-target`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub app: String,
+    /// Why a protected rule is not applied, as the slug of
+    /// `nrr_domain::protected_places::ProtectionReason` (`protected-target`
+    /// only).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1152,6 +1195,10 @@ pub enum RuleConflictKind {
     /// so it covers its whole network and they lose to it. `ip` is empty and
     /// `count` zero.
     NetworkCarvingOverCap,
+    /// A stored rule denies a program the system needs, or sends it over the
+    /// additional route, so it is not applied; `reason` says which protection.
+    /// `ip` is empty and `count` zero.
+    ProtectedTarget,
 }
 
 /// Compact summary of a revision row surfaced in
@@ -1193,6 +1240,10 @@ mod suggestions;
 pub use suggestions::*;
 mod vpn_gateways;
 pub use vpn_gateways::*;
+mod recent_changes;
+pub use recent_changes::*;
+mod conn_history;
+pub use conn_history::*;
 // ── Serde defaults shared by more than one payload group ─────────────────
 //
 // A default named by two groups belongs to neither: a child module cannot

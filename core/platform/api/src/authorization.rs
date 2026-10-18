@@ -72,6 +72,21 @@ pub trait AuthorizationPort: Send + Sync {
     ) -> AuthorizationDecision;
 }
 
+/// Lets a terminal answer the authority's password prompt for its own process
+/// when nothing in its session would (an SSH login, a console without a
+/// desktop). While the agent runs it owns the controlling terminal.
+pub trait TerminalPromptAgent: Send + Sync {
+    /// Start answering for this process. `Err` says why it could not, and the
+    /// caller tells the user how else to get the rights.
+    fn start(&self) -> Result<Box<dyn PromptAgentSession>, String>;
+}
+
+/// A running prompt agent; dropping it stops the agent.
+pub trait PromptAgentSession: Send {
+    /// Whether the agent is still there to answer.
+    fn is_running(&mut self) -> bool;
+}
+
 /// The answer on a platform with no authority wired: nothing is authorized
 /// here, and the caller falls back to whatever it did before one existed.
 #[derive(Debug, Default, Clone, Copy)]

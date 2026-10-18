@@ -53,7 +53,7 @@ const CLIENTS_POLICY_SURFACES: [IpcClientProfile; 3] = [
     IpcClientProfile::Tui,
 ];
 
-const IPC_OPERATION_CATALOG: [IpcOperationSpec; 76] = [
+const IPC_OPERATION_CATALOG: [IpcOperationSpec; 80] = [
     IpcOperationSpec {
         name: IpcOperationName::ContractNegotiate,
         class: IpcInteractionClass::HealthCheck,
@@ -368,23 +368,22 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 76] = [
     },
     IpcOperationSpec {
         name: IpcOperationName::LogsClear,
-        // Maintenance command — deletes rotated operational log files.
-        // Audit trail is never affected. Not the tray (tray has
-        // no UX for it).
+        // Deletes every user's and the service's operational logs, so it needs
+        // an administrator. Audit trail is never affected. Not the tray.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_AND_TUI,
-        requires_service_mutation_privilege: false,
+        requires_service_mutation_privilege: true,
     },
     IpcOperationSpec {
         name: IpcOperationName::CacheClear,
-        // Maintenance command — clears the FQDN/IP resolution cache
-        // (rebuildable DB). Audit / service-state DBs are never affected.
+        // Clears the machine's FQDN/IP resolution cache (rebuildable DB), so it
+        // needs an administrator. Audit / service-state DBs are never affected.
         // Not the tray.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_AND_TUI,
-        requires_service_mutation_privilege: false,
+        requires_service_mutation_privilege: true,
     },
     IpcOperationSpec {
         name: IpcOperationName::CacheEntriesList,
@@ -691,6 +690,41 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 76] = [
         // In-memory read of the connection trace, scoped to the caller. Not
         // the tray: the rule is added in the window or the terminal.
         class: IpcInteractionClass::Query,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    // ── Recent rule changes ─────────────────────────────────────
+    IpcOperationSpec {
+        name: IpcOperationName::RulesRecentChangesList,
+        // The caller's own revisions, compared on demand. The window and the
+        // terminal show it; the tray undoes its own add from what it sent.
+        class: IpcInteractionClass::Query,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    // ── Connection history ──────────────────────────────────────
+    IpcOperationSpec {
+        name: IpcOperationName::ConnHistoryList,
+        // The caller's own history, read when the panel asks. Not the tray.
+        class: IpcInteractionClass::Query,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::ConnHistoryClear,
+        // Erases the caller's OWN history — user-scoped, no elevation.
+        class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::ConnHistorySettingsSet,
+        // The caller's OWN on/off and period — user-scoped, no elevation.
+        class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,

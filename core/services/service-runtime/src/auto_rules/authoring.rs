@@ -39,6 +39,8 @@ pub enum AuthoredMatchKind {
     SuffixDomain,
     /// A whole program: every connection it opens.
     Application,
+    /// A site in every zone (`value.*`); `value` is the site, `example`.
+    AnyZoneSite,
 }
 
 /// One rule to author.
@@ -182,7 +184,9 @@ impl AutoRuleAuthor for ProductionAutoRuleAuthor {
         // moment their own rule set comes into existence, seeded from the
         // baseline rather than from nothing.
         // The stored book: the enforcement read adds subdomain twins that
-        // would be written back as rules the user never wrote.
+        // would be written back as rules the user never wrote. Its name first,
+        // so a write landing in between refuses this one rather than being lost.
+        let base = self.rules.base_revision_for(principal);
         let snapshot = self.rules.stored_rules_for(principal).ok_or_else(|| {
             AuthorError::new(
                 "no-active-revision",
@@ -209,7 +213,7 @@ impl AutoRuleAuthor for ProductionAutoRuleAuthor {
         }
         evict_over_budget(&mut book, budget, principal);
 
-        self.submit(principal, book, correlation_id)?;
+        self.submit(principal, book, base.as_deref(), correlation_id)?;
         // Strictly after the executor returns: it applies the policy
         // synchronously, so tearing down any earlier would have the
         // application reconnect over the route still in force.
@@ -236,23 +240,26 @@ impl AutoRuleAuthor for ProductionAutoRuleAuthor {
         if let Some(e) = self.executor.closed_gate(MutationKind::RulesUpdate, false) {
             return Err(AuthorError::new(&e.code, e.message));
         }
+        let base = self.rules.base_revision_for(principal);
         let Some(snapshot) = self.rules.stored_rules_for(principal) else {
             return Ok(false);
         };
         let Some(book) = edit(&snapshot.rule_book) else {
             return Ok(false);
         };
-        self.submit(principal, book, correlation_id)?;
+        self.submit(principal, book, base.as_deref(), correlation_id)?;
         Ok(true)
     }
 }
 
 impl ProductionAutoRuleAuthor {
-    /// Encode, hash and hand `book` to the executor as `principal`'s new rules.
+    /// Encode, hash and hand `book` to the executor as `principal`'s new rules,
+    /// built from the rules named `base`.
     fn submit(
         &self,
         principal: &str,
         book: CanonicalRuleBook,
+        base: Option<&str>,
         correlation_id: &str,
     ) -> Result<(), AuthorError> {
         let content = RulesRevisionContent::new(book);
@@ -264,13 +271,20 @@ impl ProductionAutoRuleAuthor {
         hasher.update(rules_json.as_bytes());
         let content_hash = format!("{:x}", hasher.finalize());
 
+        let mut payload = serde_json::json!({
+            "rules-json": rules_json,
+            "content-hash": content_hash,
+            "correlation-id": correlation_id,
+        });
+        if let (Some(base), Some(fields)) = (base, payload.as_object_mut()) {
+            fields.insert(
+                nrr_shared::ipc_payloads::BASE_REVISION_KEY.to_owned(),
+                serde_json::Value::from(base),
+            );
+        }
         let stored = StoredMutation {
             kind: MutationKind::RulesUpdate,
-            payload: serde_json::json!({
-                "rules-json": rules_json,
-                "content-hash": content_hash,
-                "correlation-id": correlation_id,
-            }),
+            payload,
             correlation_id: Some(correlation_id.to_string()),
             issuer_sid: principal.to_string(),
             // Authored on behalf of an ordinary user, never with elevation:
@@ -339,13 +353,18 @@ fn hosts_to_refresh(landed: &[&AuthoredRule]) -> Vec<RoutedHost> {
     let mut seen_anchor = HashSet::new();
     for rule in landed {
         let routed = match rule.match_kind {
-            AuthoredMatchKind::ExactHost => RoutedHost::Exact(rule.value.clone()),
-            AuthoredMatchKind::SuffixDomain => RoutedHost::Suffix(rule.value.clone()),
+            AuthoredMatchKind::ExactHost => Some(RoutedHost::Exact(rule.value.clone())),
+            AuthoredMatchKind::SuffixDomain => Some(RoutedHost::Suffix(rule.value.clone())),
             // A program has no host to refresh; its next connection takes the rule.
             AuthoredMatchKind::Application => continue,
+            // Its zones are what the cache saw: the anchor's teardown brings
+            // them back through the rule.
+            AuthoredMatchKind::AnyZoneSite => None,
         };
-        if seen_routed.insert(rule.value.clone()) {
-            hosts.push(routed);
+        if let Some(routed) = routed {
+            if seen_routed.insert(rule.value.clone()) {
+                hosts.push(routed);
+            }
         }
         // Named as an anchor even when a rule routes it too: the anchor is
         // torn down on a shared address, a routed host is not.
@@ -370,6 +389,12 @@ fn already_covered(set: &CanonicalRuleSet, rule: &AuthoredRule) -> bool {
         .filter(|r| r.enabled && r.app_match.is_none())
         .any(
             |existing| match (&existing.address_match, rule.match_kind) {
+                (
+                    Some(CanonicalAddressMatch::AnyZoneDomain(site)),
+                    AuthoredMatchKind::AnyZoneSite,
+                ) => site == &rule.value,
+                // Nothing narrower than the site in every zone covers it.
+                (_, AuthoredMatchKind::AnyZoneSite) => false,
                 (Some(CanonicalAddressMatch::ExactFqdn(host)), AuthoredMatchKind::ExactHost) => {
                     host == &rule.value
                 }
@@ -396,6 +421,7 @@ fn append_rule(
     let address_match = match rule.match_kind {
         AuthoredMatchKind::ExactHost => CanonicalAddressMatch::ExactFqdn(rule.value.clone()),
         AuthoredMatchKind::SuffixDomain => CanonicalAddressMatch::SuffixDomain(rule.value.clone()),
+        AuthoredMatchKind::AnyZoneSite => CanonicalAddressMatch::AnyZoneDomain(rule.value.clone()),
         AuthoredMatchKind::Application => return append_app_rule(book, rule, reason, added),
     };
     let set = match rule.route {
@@ -471,6 +497,7 @@ fn auto_rule_id(route: RouteRole, address_match: &CanonicalAddressMatch) -> Stri
     let (kind, value) = match address_match {
         CanonicalAddressMatch::ExactFqdn(v) => ("exact", v.as_str()),
         CanonicalAddressMatch::SuffixDomain(v) => ("suffix", v.as_str()),
+        CanonicalAddressMatch::AnyZoneDomain(v) => ("any-zone", v.as_str()),
         CanonicalAddressMatch::Zone(v) => ("zone", v.as_str()),
         // Never produced by a companion suggestion; folded in so the helper
         // stays total rather than growing a panic path.
@@ -599,6 +626,37 @@ mod tests {
             "2026-08-01"
         ));
         assert_eq!(book.secondary.len(), 1);
+    }
+
+    #[test]
+    fn the_site_in_every_zone_is_written_once_and_refreshes_its_anchor() {
+        let site = AuthoredRule {
+            route: RouteRole::Secondary,
+            match_kind: AuthoredMatchKind::AnyZoneSite,
+            value: "example".to_string(),
+            anchor: "www.example.com".to_string(),
+        };
+        let mut book = empty_book();
+        assert!(append_rule(
+            &mut book,
+            &site,
+            &AutoRuleReason::UserConfirmed,
+            "2026-10-16"
+        ));
+        assert_eq!(
+            book.secondary.rules()[0].address_match,
+            Some(CanonicalAddressMatch::AnyZoneDomain("example".into()))
+        );
+        assert!(!append_rule(
+            &mut book,
+            &site,
+            &AutoRuleReason::UserConfirmed,
+            "2026-10-16"
+        ));
+        assert_eq!(
+            hosts_to_refresh(&[&site]),
+            vec![RoutedHost::Anchor("www.example.com".into())]
+        );
     }
 
     fn suffix(value: &str) -> AuthoredRule {
@@ -866,8 +924,8 @@ mod tests {
         > {
             self.inner.rollback_target(principal, target)
         }
-        fn safe_disable(&self, reason: &str) -> MutationOutcome {
-            self.inner.safe_disable(reason)
+        fn safe_disable(&self, principal: &str, reason: &str) -> MutationOutcome {
+            self.inner.safe_disable(principal, reason)
         }
     }
 

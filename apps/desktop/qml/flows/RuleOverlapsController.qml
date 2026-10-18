@@ -121,7 +121,7 @@ QtObject {
         var typeLabel = root.ruleTypeLabel(
             type === "exact-fqdn" || type === "suffix-domain" ? "domain" : type)
         return root.tr("rules.overlaps.rule", "{value} ({type})")
-            .replace("{value}", type === "suffix-domain" ? "*." + value : value)
+            .replace("{value}", Pure.displayText(type === "suffix-domain" ? "*." + value : value))
             .replace("{type}", typeLabel)
     }
     function routeText(side, candidate) {
@@ -136,7 +136,7 @@ QtObject {
     function explain(overlap, candidate) {
         var sentence = overlap["block-wins-tie"] === true
             ? root.tr("rules.overlaps.block-tie",
-                "{winner} names the same sites as {loser} on {loser-route}. They are blocked: on a tie a block wins over a route.")
+                "{winner} names the same sites as {loser} on {loser-route}. They are denied: on a tie a deny wins over a route.")
             : String(overlap.kind) === "duplicate"
             ? root.tr("rules.overlaps.duplicate",
                 "{winner} is set on both routes. It goes over {winner-route}: on a tie the main route wins.")
@@ -169,8 +169,11 @@ QtObject {
         if (at < 0) return
         if (String(overlap.kind) === "duplicate")
             root.rulesModel.setProperty(at, "enabled", false)
-        else
+        else {
             root.rulesModel.setProperty(at, "targetRoute", String(overlap.loser.route))
+            // The tray hosts this controller too and keeps no verdicts.
+            if (typeof root.rejudgeRowRoute === "function") root.rejudgeRowRoute(at)
+        }
         root.rulesModelEdited()
         root._recomputeRulesDirty()
         root.statusLine = root.tr("rules.preview-notice",

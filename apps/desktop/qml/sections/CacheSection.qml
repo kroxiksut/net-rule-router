@@ -55,6 +55,7 @@ ScrollView {
     // the window; it is bounded, wrapped anywhere and clamped inside instead.
     component TruncatedCellLabel: Label {
         id: cell
+        textFormat: Text.PlainText
         elide: Text.ElideRight
         Accessible.role: Accessible.StaticText
         Accessible.name: cell.text
@@ -1493,7 +1494,7 @@ ScrollView {
                                 Layout.fillWidth: true
                                 Layout.preferredWidth: section._cacheColHostW
                                 Layout.minimumWidth: section._cacheColHostMinW
-                                text: String((cacheRowItem._g && cacheRowItem._g.hostname) || "—")
+                                text: Pure.displayText((cacheRowItem._g && cacheRowItem._g.hostname) || "—")
                                 color: root.textColor
                                 // Keeps the registrable domain visible.
                                 elide: Text.ElideMiddle

@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 8
 # name: CN Mainland Split - Secondary Route
 # description: Foreign social, messaging, developer, and AI services routed to secondary
 # author: NetRuleRouter contributors
@@ -8,13 +8,12 @@
 # Keep empty to avoid over-broad routing by TLD
 
 --- Domains
-*.facebook.com  # Meta ecosystem
+facebook.*  # Meta ecosystem
 *.fb.com  # Meta ecosystem
 *.messenger.com  # Meta ecosystem
 *.instagram.com  # Meta ecosystem
 *.cdninstagram.com  # Meta ecosystem
 *.fbcdn.net  # Meta ecosystem
-*.facebook.net  # Meta ecosystem
 *.fbsbx.com  # Meta ecosystem
 *.threads.net  # Meta ecosystem
 *.threads.com  # Meta ecosystem
@@ -59,11 +58,9 @@ redd.it  # Community and professional platforms
 *.sc-cdn.net  # Streaming and social
 *.bsky.app  # Streaming and social
 
-*.telegram.org  # Foreign messengers and communication tools
+telegram.*  # Foreign messengers and communication tools
 *.t.me  # Foreign messengers and communication tools
-*.telegram.me  # Foreign messengers and communication tools
-*.whatsapp.com  # Foreign messengers and communication tools
-*.whatsapp.net  # Foreign messengers and communication tools
+whatsapp.*  # Foreign messengers and communication tools
 *.signal.org  # Foreign messengers and communication tools
 *.signal.me  # Foreign messengers and communication tools
 *.viber.com  # Foreign messengers and communication tools
@@ -76,6 +73,9 @@ redd.it  # Community and professional platforms
 
 *.openai.com  # Foreign AI and developer AI ecosystems
 *.chatgpt.com  # Foreign AI and developer AI ecosystems
+*.oaistatic.com  # Foreign AI and developer AI ecosystems
+*.oaistatsig.com  # Foreign AI and developer AI ecosystems
+*.oaiusercontent.com  # Foreign AI and developer AI ecosystems
 *.z.ai  # Foreign AI and developer AI ecosystems
 *.anthropic.com  # Foreign AI and developer AI ecosystems
 *.claude.ai  # Foreign AI and developer AI ecosystems

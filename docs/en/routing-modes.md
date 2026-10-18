@@ -13,11 +13,12 @@ what combining them gets you that no single switch does alone.
 They are not equally optional, and the difference matters more than any single
 setting on this page:
 
-- **fake-IP is not a preference.** It is the only switch that separates two
-  sites sharing one server address, and on any realistic rule set — anything
-  covering a large platform or a big CDN — that sharing is guaranteed. Leave it
-  on. Turning it off means accepting that some sites will not work while others
-  are routed.
+- **fake-IP is off by default, and it is the switch that matters most.** It is
+  the only one that separates two sites sharing one server address, and on any
+  realistic rule set — anything covering a large platform or a big CDN — that
+  sharing is common. Without it, a site you did not route can follow one you
+  did, or the other way round. It is available on Windows; Linux decides per
+  address for now.
 - **DNS through the tunnel** and **Fast DNS answers** are genuine choices. Both
   are useful, neither is required, and the sections below say exactly what you
   gain and give up either way.

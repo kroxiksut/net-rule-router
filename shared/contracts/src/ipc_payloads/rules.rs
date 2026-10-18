@@ -16,6 +16,10 @@ pub enum RulesRouteFilter {
 pub struct RulesListRequest {
     #[serde(default)]
     pub route: RulesRouteFilter,
+    /// The administrator's baseline instead of the caller's own rules: the
+    /// set a writer that sends `admin-baseline` changes.
+    #[serde(default)]
+    pub baseline: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,7 +40,22 @@ pub struct RulesListResponse {
     /// above zero instead of guessing how long the check takes.
     #[serde(default)]
     pub main_route_pending: u32,
+    /// The rules these rows were read from, as a writer names them back under
+    /// [`BASE_REVISION_KEY`]; `""` when there were none. Absent when the read
+    /// failed: nothing to build on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_revision: Option<String>,
 }
+
+/// The `rules-update` / `preset-import` payload member naming the rules the
+/// write was built from (a `rules.list` [`RulesListResponse::base_revision`]).
+/// The service refuses the write with [`RULES_CHANGED_ELSEWHERE`] when the
+/// rules in force are no longer those; without it the write replaces whatever
+/// is in force.
+pub const BASE_REVISION_KEY: &str = "base-revision";
+
+/// The refusal of a write built from rules that changed since.
+pub const RULES_CHANGED_ELSEWHERE: &str = "rules-changed-elsewhere";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

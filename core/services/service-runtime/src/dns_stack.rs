@@ -26,6 +26,9 @@ use crate::production_rules_provider::ProductionRulesProvider;
 
 type Flag = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// A posture read for one user (stored principal form).
+pub type PrincipalFlag = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// What the OS supplies. Everything else about the resolver is the same on
 /// every platform.
 #[derive(Clone)]
@@ -58,12 +61,18 @@ pub struct DnsStackInputs {
     pub settings_conn: Arc<Mutex<Connection>>,
     pub cache: Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>,
     pub active_sid: crate::supervised_runtime::ActiveRoutingSidFn,
+    /// Every served user, routing user first. Absent answers by the routing
+    /// user's book alone.
+    pub served_sids: Option<crate::dns_resolver_ports::ResolverPrincipalsFn>,
     pub recompute_hook: crate::supervised_runtime::RouteRecomputeHook,
     pub known_direct: Option<Arc<crate::known_direct::KnownDirectRegistry>>,
     pub block_all_armed: Option<Flag>,
     /// "Is the guard blocking an unresolved additional link?" — wider than
     /// `block_all_armed`. Absent keeps the fail-open on a missed deadline.
     pub fail_closed_armed: Option<Flag>,
+    /// The same posture per user. With it a rule host is withheld only while
+    /// the guard of a user whose rule names it holds.
+    pub fail_closed_armed_for: Option<PrincipalFlag>,
     pub fake_assembly: Option<Arc<crate::fake_ip::FakeIpAssembly>>,
     pub fake_ip_running: Option<Flag>,
     /// "Can the relay carry a scope host right now?"
@@ -267,7 +276,13 @@ fn build_dns_resolver_instance(
             &inputs.settings_conn,
         )))
     };
-    let oracle = Arc::new(ActiveRuleHostOracle::new(rules(), Arc::clone(active_sid)));
+    let principals = inputs.served_sids.clone().unwrap_or_else(|| {
+        crate::dns_resolver_ports::principals_of_routing_user(Arc::clone(active_sid))
+    });
+    let oracle = Arc::new(
+        ActiveRuleHostOracle::new(rules(), Arc::clone(active_sid))
+            .with_served(Arc::clone(&principals)),
+    );
     // Rule hosts go straight to the upstream over a raw socket: the system
     // resolver would honour the very redirect installed here and loop back.
     let mut direct_upstream =
@@ -303,14 +318,14 @@ fn build_dns_resolver_instance(
     let first_contact: Option<crate::dns_resolver_ports::FirstContactFn> =
         match inputs.route_coordinator.clone() {
             Some(coordinator) => {
-                let sid = Arc::clone(active_sid);
+                let served = Arc::clone(&principals);
                 Some(Arc::new(move |addresses: &[std::net::Ipv4Addr]| {
                     let addresses: Vec<std::net::IpAddr> = addresses
                         .iter()
                         .copied()
                         .map(std::net::IpAddr::V4)
                         .collect();
-                    sid().map_or(0, |sid| coordinator.route_first_contact(&sid, &addresses))
+                    route_first_contact_for_each(&coordinator, &served(), &addresses)
                 }))
             }
             None => inputs.first_contact.clone(),
@@ -318,14 +333,14 @@ fn build_dns_resolver_instance(
     let first_contact_v6: Option<crate::dns_resolver_ports::FirstContactV6Fn> =
         match inputs.route_coordinator.clone() {
             Some(coordinator) => {
-                let sid = Arc::clone(active_sid);
+                let served = Arc::clone(&principals);
                 Some(Arc::new(move |addresses: &[std::net::Ipv6Addr]| {
                     let addresses: Vec<std::net::IpAddr> = addresses
                         .iter()
                         .copied()
                         .map(std::net::IpAddr::V6)
                         .collect();
-                    sid().map_or(0, |sid| coordinator.route_first_contact(&sid, &addresses))
+                    route_first_contact_for_each(&coordinator, &served(), &addresses)
                 }))
             }
             None => inputs.first_contact_v6.clone(),
@@ -339,18 +354,21 @@ fn build_dns_resolver_instance(
     let reconciler = Arc::new(reconciler);
     // Replies for non-rule hosts are filtered against the secondary-pinned set,
     // so a shared-CDN host gets addresses that stay on the primary path.
-    let secondary_owned = Arc::new(crate::dns_resolver_ports::ActiveSecondaryOwnedIps::new(
-        rules(),
-        Arc::clone(active_sid),
-        Arc::new(crate::fqdn_cache_lookup::SqliteFqdnCacheLookup::new(
-            Arc::clone(&inputs.cache),
-            nrr_domain::decision_lookup::FreshnessThresholds::default_production(),
-        )),
-    ));
+    let secondary_owned = Arc::new(
+        crate::dns_resolver_ports::ActiveSecondaryOwnedIps::new(
+            rules(),
+            Arc::clone(active_sid),
+            Arc::new(crate::fqdn_cache_lookup::SqliteFqdnCacheLookup::new(
+                Arc::clone(&inputs.cache),
+                nrr_domain::decision_lookup::FreshnessThresholds::default_production(),
+            )),
+        )
+        .with_served(Arc::clone(&principals)),
+    );
 
     let private_resolvers = private_resolvers_from(Arc::clone(&platform.system_dns));
     let mut listener = DnsInterceptListener::new(
-        oracle,
+        Arc::clone(&oracle) as Arc<dyn crate::dns_resolver::RuleHostOracle>,
         upstream,
         sink,
         Arc::clone(&reconciler) as Arc<dyn crate::dns_resolver::SyncReconciler>,
@@ -364,7 +382,8 @@ fn build_dns_resolver_instance(
     // What the machine actually enforces, so the answer gate stops reading the
     // FQDN cache as proof that an address is carried.
     .with_enforced_view(Arc::new(
-        crate::dns_resolver_ports::ActiveSidEnforcedAddresses::new(Arc::clone(active_sid)),
+        crate::dns_resolver_ports::ActiveSidEnforcedAddresses::new(Arc::clone(active_sid))
+            .with_host_owners(Arc::clone(&oracle)),
     ));
     listener = listener.with_private_resolvers(private_resolvers);
     let suffixes = crate::short_name_suffixes::global_user_short_name_suffixes();
@@ -402,7 +421,15 @@ fn build_dns_resolver_instance(
     });
     // Withhold a rule-host answer whose enforcement missed its deadline while
     // the guard blocks an unresolved link — handing it over is the leak.
-    if let Some(armed) = inputs.fail_closed_armed.clone() {
+    if let Some(armed_for) = inputs.fail_closed_armed_for.clone() {
+        listener = listener.with_leak_guard_posture(Arc::new(
+            crate::dns_resolver_ports::HostOwnersLeakGuard::new(
+                Arc::clone(&oracle),
+                Arc::clone(&principals),
+                armed_for,
+            ),
+        ));
+    } else if let Some(armed) = inputs.fail_closed_armed.clone() {
         listener = listener.with_leak_guard_posture(Arc::new(move || armed()));
     }
     // A site that failed before any connection still belongs in the outage
@@ -412,7 +439,11 @@ fn build_dns_resolver_instance(
             crate::outage_blocks::OutageUnresolvedNames::new(
                 Arc::clone(outages),
                 Arc::clone(active_sid),
-            ),
+            )
+            .with_host_owners({
+                let oracle = Arc::clone(&oracle);
+                Arc::new(move |hostname: &str| oracle.owners_of(hostname))
+            }),
         ));
     }
     // Fake-IP is wired regardless of its toggle: the live `running` gate, not a
@@ -499,6 +530,20 @@ fn build_dns_resolver_instance(
     } else {
         service
     })
+}
+
+/// First-contact routes for each served user: each installs only the
+/// addresses its own book routes, so a host one user names reaches only that
+/// user's link. Asked per rule-host answer that brings an unrouted address.
+fn route_first_contact_for_each(
+    coordinator: &crate::route_coordinator::SecondaryRouteCoordinator,
+    served: &[String],
+    addresses: &[std::net::IpAddr],
+) -> usize {
+    served
+        .iter()
+        .map(|sid| coordinator.route_first_contact(sid, addresses))
+        .sum()
 }
 
 /// The routing principal's short-name domain, from the snapshot the settings

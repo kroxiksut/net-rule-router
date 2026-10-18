@@ -1088,6 +1088,50 @@ fn activating_a_rule_change_flushes_the_os_dns_cache() {
     );
 }
 
+/// The tunnel coming back ends the per-host guard: names it refused meanwhile
+/// must resolve now, not when the OS lets the failure expire.
+#[test]
+fn the_additional_link_coming_back_flushes_os_dns_cache_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let source = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
+    let flusher = Arc::new(nrr_platform_api::MockDnsCacheControl::new());
+    let link_up = Arc::new(AtomicBool::new(false));
+    let up = Arc::clone(&link_up);
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        cache,
+        Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_kill_switch_resolver(Arc::new(move |_, _| {
+        up.load(Ordering::SeqCst).then(full_ks_resolution)
+    }))
+    .with_dns_cache_control(Arc::clone(&flusher) as Arc<dyn nrr_platform_api::DnsCacheControlPort>);
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 9)));
+    source.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    let down = flusher.flush_count();
+    link_up.store(true, Ordering::SeqCst);
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    assert_eq!(
+        flusher.flush_count(),
+        down + 1,
+        "the link coming back flushes once"
+    );
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    assert_eq!(
+        flusher.flush_count(),
+        down + 1,
+        "a steady link does not flush"
+    );
+}
+
 #[test]
 fn block_all_arming_edge_flushes_os_dns_cache_once_per_transition() {
     // the OS resolver-cache flush fires exactly

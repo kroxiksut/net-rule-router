@@ -9,8 +9,8 @@
 //!
 //! Pure and total: no I/O, no clock, ordering fully determined by the inputs.
 
-use crate::canonical::{CanonicalAddressMatch, CanonicalRuleSet};
-use crate::decision_matching::{match_suffix_domain, match_zone};
+use crate::canonical::{CanonicalAddressMatch, CanonicalRule, CanonicalRuleSet};
+use crate::decision_matching::{match_any_zone_domain, match_suffix_domain, match_zone};
 
 /// Strength of a rule set's claim on one hostname. Ordered least to most
 /// specific, so `Ord` answers "whose claim wins" directly.
@@ -42,25 +42,35 @@ pub fn match_specificity(hostname: &str, set: &CanonicalRuleSet) -> Option<Match
     set.rules()
         .iter()
         .filter(|rule| rule.enabled)
-        .filter_map(|rule| match &rule.address_match {
-            Some(CanonicalAddressMatch::ExactFqdn(name)) if name == hostname => {
-                Some(MatchSpecificity::ExactFqdn)
-            }
-            Some(CanonicalAddressMatch::SuffixDomain(label))
-                if match_suffix_domain(hostname, label) =>
-            {
-                Some(MatchSpecificity::SuffixDomain {
-                    label_len: label.len(),
-                })
-            }
-            Some(CanonicalAddressMatch::Zone(label)) if match_zone(hostname, label) => {
-                Some(MatchSpecificity::Zone {
-                    label_len: label.len(),
-                })
-            }
-            _ => None,
-        })
+        .filter_map(|rule| rule_match_specificity(hostname, rule))
         .max()
+}
+
+/// One rule's claim on `hostname`, enabled or not; `None` when it does not
+/// match by name.
+pub fn rule_match_specificity(hostname: &str, rule: &CanonicalRule) -> Option<MatchSpecificity> {
+    match &rule.address_match {
+        Some(CanonicalAddressMatch::ExactFqdn(name)) if name == hostname => {
+            Some(MatchSpecificity::ExactFqdn)
+        }
+        Some(CanonicalAddressMatch::SuffixDomain(label))
+            if match_suffix_domain(hostname, label) =>
+        {
+            Some(MatchSpecificity::SuffixDomain {
+                label_len: label.len(),
+            })
+        }
+        Some(CanonicalAddressMatch::AnyZoneDomain(base)) => match_any_zone_domain(hostname, base)
+            .map(|named| MatchSpecificity::SuffixDomain {
+                label_len: named.len(),
+            }),
+        Some(CanonicalAddressMatch::Zone(label)) if match_zone(hostname, label) => {
+            Some(MatchSpecificity::Zone {
+                label_len: label.len(),
+            })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

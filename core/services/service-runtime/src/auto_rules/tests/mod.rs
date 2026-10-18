@@ -145,6 +145,9 @@ impl AutoRuleAuthor for RecordingAuthor {
                     AuthoredMatchKind::SuffixDomain => {
                         Some(CanonicalAddressMatch::SuffixDomain(rule.value.clone()))
                     }
+                    AuthoredMatchKind::AnyZoneSite => {
+                        Some(CanonicalAddressMatch::AnyZoneDomain(rule.value.clone()))
+                    }
                     AuthoredMatchKind::Application => None,
                 },
                 app_match: matches!(rule.match_kind, AuthoredMatchKind::Application).then(|| {
@@ -430,6 +433,8 @@ fn main_link_dto(
         served_by_main_link: false,
         third_party: None,
         secondary_reach: None,
+        any_zone_site: String::new(),
+        less_certain: String::new(),
     }
 }
 /// A realistic wall-clock instant — a monotonic "since start" value could never
@@ -441,6 +446,7 @@ fn wall_clock() -> SystemTime {
 mod accept_dismiss;
 mod consumers;
 mod durability;
+mod less_certain;
 mod main_link_works;
 mod offer_signals;
 mod proposal;

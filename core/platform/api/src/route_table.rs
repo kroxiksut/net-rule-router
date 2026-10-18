@@ -71,6 +71,16 @@ pub trait RouteTablePort: Send + Sync {
         self.interactive_user_sid().into_iter().collect()
     }
 
+    /// [`Self::interactive_user_sids`], each with when the user signed in
+    /// (Unix ms), where the platform reports it. Who signed in first keeps a
+    /// contested route, so the order must survive a service restart.
+    fn interactive_user_sign_ins(&self) -> Vec<(String, Option<u64>)> {
+        self.interactive_user_sids()
+            .into_iter()
+            .map(|sid| (sid, None))
+            .collect()
+    }
+
     /// Resolve an interface index to the stable 64-bit interface identity the
     /// enforcement layer pins an egress condition on.
     ///

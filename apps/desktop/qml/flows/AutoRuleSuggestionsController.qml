@@ -80,9 +80,12 @@ QtObject {
     /// user has to reload it for the new route to show.
     property bool autoRuleReloadHint: false
 
-    function acceptAutoRuleCandidates(ids) {
+    /// `asAnyZone` takes each offer that names a site in another zone as that
+    /// site in every zone (`site.*`) instead of the one name offered.
+    function acceptAutoRuleCandidates(ids, asAnyZone) {
         if (!ids || ids.length === 0 || !root.bridgeAvailable) return
-        var corr = root.rpc.rpcAutoRuleCandidatesAccept({ "ids": ids })
+        var corr = root.rpc.rpcAutoRuleCandidatesAccept(
+            { "ids": ids, "as-any-zone": asAnyZone === true })
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
             if (!ok) {
                 console.log("auto-rule accept failed:", code, msg)

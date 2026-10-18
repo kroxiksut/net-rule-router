@@ -1,0 +1,1121 @@
+{
+  "description": "rules.js planBulkRules / nrr_client_logic::bulk_rules::plan_bulk_rules: what pasting rules-file lines into the Add form does with each line. `expected` is a digest of the plan; the whole plan is also compared JS against Rust.",
+  "cases": [
+    {
+      "name": "plain values name their own type",
+      "input": {
+        "text": "example.com\n*.example.net\nexample.*\n192.0.2.7\n198.51.100.0/24\n192.0.2.10-192.0.2.40\n*.ru\nchrome.exe\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "domain|example.com": {
+            "status": "valid"
+          },
+          "domain|*.example.net": {
+            "status": "valid"
+          },
+          "domain|example.*": {
+            "status": "valid"
+          },
+          "exact-ip|192.0.2.7": {
+            "status": "valid"
+          },
+          "subnet|198.51.100.0/24": {
+            "status": "valid"
+          },
+          "ip-range|192.0.2.10-192.0.2.40": {
+            "status": "valid"
+          },
+          "zone|*.ru": {
+            "status": "valid"
+          },
+          "application|chrome.exe": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain ok add primary on - - - - - example.com",
+          "2 domain ok add primary on - - - - - *.example.net",
+          "3 domain ok add primary on - - - - - example.*",
+          "4 exact-ip ok add primary on - - - - - 192.0.2.7",
+          "5 subnet ok add primary on - - - - - 198.51.100.0/24",
+          "6 ip-range ok add primary on - - - - - 192.0.2.10-192.0.2.40",
+          "7 zone ok add primary on - - - - - *.ru",
+          "8 application ok add primary on - - - - - chrome.exe"
+        ],
+        "lines": 8,
+        "excess": 0,
+        "bound": "",
+        "counts": "8/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "deny, check, turned off and notes",
+      "input": {
+        "text": "!ads.example.net  # ads\n?mail.example.com\n# old.example.com\n# !gone.example.org\n# just a note here\n## heading\n#: hint line\n",
+        "route": "secondary",
+        "os": "windows",
+        "verdicts": {
+          "domain|ads.example.net": {
+            "status": "valid"
+          },
+          "domain|mail.example.com": {
+            "status": "valid"
+          },
+          "domain|old.example.com": {
+            "status": "valid"
+          },
+          "domain|gone.example.org": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain ok add block on - - - - #ads ads.example.net",
+          "2 domain ok add secondary on ? - - - - mail.example.com",
+          "3 domain ok add secondary off - - - - - old.example.com",
+          "4 domain ok add block off - - - - - gone.example.org"
+        ],
+        "lines": 7,
+        "excess": 0,
+        "bound": "",
+        "counts": "4/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "one word asks for its type",
+      "input": {
+        "text": "telegram\ncorp-internal\n# todo\n",
+        "route": "primary",
+        "os": "windows",
+        "choices": {
+          "2": {
+            "type": "zone"
+          }
+        },
+        "verdicts": {
+          "zone|corp-internal": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 - needs-type keep primary on - rules.paste.needs-type - - - telegram",
+          "2 zone ok add primary on - - - - - corp-internal"
+        ],
+        "lines": 3,
+        "excess": 0,
+        "bound": "",
+        "counts": "1/0/1/0",
+        "remaining": "telegram"
+      }
+    },
+    {
+      "name": "one word where no application routing",
+      "input": {
+        "text": "telegram\nchrome.exe\n",
+        "route": "primary",
+        "os": "windows",
+        "apps": false,
+        "choices": {
+          "1": {
+            "type": "application"
+          }
+        },
+        "verdicts": {
+          "application|chrome.exe": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 - needs-type keep primary on - rules.paste.needs-type - - - telegram",
+          "2 application error keep primary on - rules.paste.apps-unsupported - - - chrome.exe"
+        ],
+        "lines": 2,
+        "excess": 0,
+        "bound": "",
+        "counts": "0/0/2/0",
+        "remaining": "telegram\nchrome.exe"
+      }
+    },
+    {
+      "name": "a section decides one word",
+      "input": {
+        "text": "--- Zones\ncorp-internal\n--- Windows\ntelegram\n",
+        "route": "secondary",
+        "os": "windows",
+        "verdicts": {
+          "zone|corp-internal": {
+            "status": "valid"
+          },
+          "application|telegram": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 zone ok add secondary on - - - - - corp-internal",
+          "4 application ok add secondary on - - - - - telegram"
+        ],
+        "lines": 4,
+        "excess": 0,
+        "bound": "",
+        "counts": "2/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "a value out of its section names the right one",
+      "input": {
+        "text": "--- Domains\nchrome.exe\n192.0.2.7\n--- IP\nexample.com\n",
+        "route": "primary",
+        "os": "windows",
+        "choices": {
+          "2": {
+            "type": "application"
+          },
+          "3": {
+            "type": "zone"
+          }
+        },
+        "verdicts": {
+          "application|chrome.exe": {
+            "status": "valid"
+          },
+          "domain|chrome.exe": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.is-application"
+          },
+          "domain|192.0.2.7": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.is-exact-ip"
+          },
+          "exact-ip|example.com": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.is-domain"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 application ok add primary on - - - - - chrome.exe",
+          "3 domain error keep primary on - rules.validation.match-value-invalid.is-exact-ip - - - 192.0.2.7",
+          "5 exact-ip error keep primary on - rules.validation.match-value-invalid.is-domain - - - example.com"
+        ],
+        "lines": 5,
+        "excess": 0,
+        "bound": "",
+        "counts": "1/0/2/0",
+        "remaining": "--- Domains\n192.0.2.7\n--- IP\nexample.com"
+      }
+    },
+    {
+      "name": "a section not applied here",
+      "input": {
+        "text": "--- Linux\nfirefox\n# firefox-esr\n--- Geo\nXX\n",
+        "route": "primary",
+        "os": "windows"
+      },
+      "expected": {
+        "rows": [
+          "2 - error keep primary on - rules.paste.section-not-applied section=Linux - - firefox",
+          "5 - error keep primary on - rules.paste.section-not-applied section=Geo - - XX"
+        ],
+        "lines": 5,
+        "excess": 0,
+        "bound": "",
+        "counts": "0/0/2/0",
+        "remaining": "--- Linux\nfirefox\n--- Geo\nXX"
+      }
+    },
+    {
+      "name": "the linux application section",
+      "input": {
+        "text": "--- Linux\norg.example.app\ndeploy.sh\n*.example.com\n",
+        "route": "primary",
+        "os": "linux",
+        "verdicts": {
+          "application|org.example.app": {
+            "status": "valid"
+          },
+          "application|deploy.sh": {
+            "status": "valid"
+          },
+          "application|*.example.com": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.is-domain"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 application ok add primary on - - - - - org.example.app",
+          "3 application ok add primary on - - - - - deploy.sh",
+          "4 application error keep primary on - rules.validation.match-value-invalid.is-domain - - - *.example.com"
+        ],
+        "lines": 4,
+        "excess": 0,
+        "bound": "",
+        "counts": "2/0/1/0",
+        "remaining": "--- Linux\n*.example.com"
+      }
+    },
+    {
+      "name": "the macos application section",
+      "input": {
+        "text": "--- MacOS\ncom.example.app\n--- Windows\nx.exe\n",
+        "route": "primary",
+        "os": "macos",
+        "verdicts": {
+          "application|com.example.app": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 application ok add primary on - - - - - com.example.app",
+          "4 - error keep primary on - rules.paste.section-not-applied section=Windows - - x.exe"
+        ],
+        "lines": 4,
+        "excess": 0,
+        "bound": "",
+        "counts": "1/0/1/0",
+        "remaining": "--- Windows\nx.exe"
+      }
+    },
+    {
+      "name": "children is read after any value, as the file reader reads it, and kept on a program only",
+      "input": {
+        "text": "codex.exe +children\nexample.com +children\n",
+        "route": "secondary",
+        "os": "windows",
+        "verdicts": {
+          "application|codex.exe +children": {
+            "status": "valid"
+          },
+          "domain|example.com": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 application ok add secondary on - - - - - codex.exe +children",
+          "2 domain ok add secondary on - - - - - example.com"
+        ],
+        "lines": 2,
+        "excess": 0,
+        "bound": "",
+        "counts": "2/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "check only before a domain or an address",
+      "input": {
+        "text": "?10.0.0.0/8\n?192.0.2.7\n?example.*\n",
+        "route": "secondary",
+        "os": "windows",
+        "verdicts": {
+          "exact-ip|192.0.2.7": {
+            "status": "valid"
+          },
+          "domain|example.*": {
+            "status": "valid"
+          },
+          "subnet|?10.0.0.0/8": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.subnet"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 subnet error keep secondary on - rules.validation.match-value-invalid.subnet - - - ?10.0.0.0/8",
+          "2 exact-ip ok add secondary on ? - - - - 192.0.2.7",
+          "3 domain ok add secondary on ? - - - - example.*"
+        ],
+        "lines": 3,
+        "excess": 0,
+        "bound": "",
+        "counts": "2/0/1/0",
+        "remaining": "?10.0.0.0/8"
+      }
+    },
+    {
+      "name": "deny and check never together",
+      "input": {
+        "text": "!?example.com\n?!example.com\n# !?x.example\n--- Domains\n?!example.net\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "domain|!?example.com": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.deny-mark"
+          },
+          "domain|!?x.example": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.deny-mark"
+          },
+          "domain|?!example.net": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.deny-mark"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain error keep primary on - rules.validation.match-value-invalid.deny-mark - - - !?example.com",
+          "2 - error keep primary on - rules.paste.unrecognized - - - ?!example.com",
+          "3 domain error keep primary off - rules.validation.match-value-invalid.deny-mark - - - !?x.example",
+          "5 domain error keep primary on - rules.validation.match-value-invalid.deny-mark - - - ?!example.net"
+        ],
+        "lines": 5,
+        "excess": 0,
+        "bound": "",
+        "counts": "0/0/4/0",
+        "remaining": "!?example.com\n?!example.com\n# !?x.example\n--- Domains\n?!example.net"
+      }
+    },
+    {
+      "name": "deny chosen above drops a check",
+      "input": {
+        "text": "?example.com\nexample.org\n",
+        "route": "block",
+        "os": "windows",
+        "verdicts": {
+          "domain|example.com": {
+            "status": "valid"
+          },
+          "domain|example.org": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain warning add block on - dialog.rule.verify-deny - - - example.com",
+          "2 domain ok add block on - - - - - example.org"
+        ],
+        "lines": 2,
+        "excess": 0,
+        "bound": "",
+        "counts": "2/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "the service verdicts, error and warning",
+      "input": {
+        "text": "300.1.1.1\n198.51.100.9/24\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "exact-ip|300.1.1.1": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.exact-ip-octet-out-of-range",
+            "args": {
+              "octet": "300",
+              "position": 1
+            }
+          },
+          "subnet|198.51.100.9/24": {
+            "status": "warning",
+            "message-key": "rules.validation.match-value-warning.subnet-host-bits",
+            "args": {
+              "network": "198.51.100.0/24"
+            }
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 exact-ip error keep primary on - rules.validation.match-value-invalid.exact-ip-octet-out-of-range octet=300,position=1 - - 300.1.1.1",
+          "2 subnet warning add primary on - rules.validation.match-value-warning.subnet-host-bits network=198.51.100.0/24 - - 198.51.100.9/24"
+        ],
+        "lines": 2,
+        "excess": 0,
+        "bound": "",
+        "counts": "1/0/1/0",
+        "remaining": "300.1.1.1"
+      }
+    },
+    {
+      "name": "no verdict yet",
+      "input": {
+        "text": "example.com\n192.0.2.7\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "exact-ip|192.0.2.7": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain pending keep primary on - rules.paste.pending - - - example.com",
+          "2 exact-ip ok add primary on - - - - - 192.0.2.7"
+        ],
+        "lines": 2,
+        "excess": 0,
+        "bound": "",
+        "counts": "1/0/1/0",
+        "remaining": "example.com"
+      }
+    },
+    {
+      "name": "duplicates in the text and in the rules",
+      "input": {
+        "text": "example.com\nexample.org\nEXAMPLE.org\n",
+        "route": "primary",
+        "os": "windows",
+        "existing": [
+          {
+            "type": "suffix-domain",
+            "value": "Example.COM",
+            "route": "primary"
+          }
+        ],
+        "verdicts": {
+          "domain|example.com": {
+            "status": "valid"
+          },
+          "domain|example.org": {
+            "status": "valid"
+          },
+          "domain|EXAMPLE.org": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain duplicate drop primary on - rules.paste.already-present - - - example.com",
+          "2 domain ok add primary on - - - - - example.org",
+          "3 domain duplicate drop primary on - rules.paste.same-as-line line=2 - - EXAMPLE.org"
+        ],
+        "lines": 3,
+        "excess": 0,
+        "bound": "",
+        "counts": "1/0/0/2",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "the same rule on another route",
+      "input": {
+        "text": "example.com\nads.example.net\nexample.org\n!example.org\n",
+        "route": "primary",
+        "os": "windows",
+        "existing": [
+          {
+            "type": "domain",
+            "value": "example.com",
+            "route": "secondary"
+          },
+          {
+            "type": "domain",
+            "value": "ads.example.net",
+            "route": "block"
+          }
+        ],
+        "choices": {
+          "2": {
+            "move": true
+          }
+        },
+        "verdicts": {
+          "domain|example.com": {
+            "status": "valid"
+          },
+          "domain|ads.example.net": {
+            "status": "valid"
+          },
+          "domain|example.org": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain elsewhere keep primary on - rules.paste.on-other-route route=secondary - - example.com",
+          "2 domain elsewhere move primary on - rules.paste.already-denied - - - ads.example.net",
+          "3 domain ok add primary on - - - - - example.org",
+          "4 domain error keep block on - rules.paste.conflicts-with-line line=3 - - example.org"
+        ],
+        "lines": 4,
+        "excess": 0,
+        "bound": "",
+        "counts": "1/1/2/0",
+        "remaining": "example.com\n!example.org"
+      }
+    },
+    {
+      "name": "a deny takes over a route rule",
+      "input": {
+        "text": "example.com\n",
+        "route": "block",
+        "os": "windows",
+        "existing": [
+          {
+            "type": "domain",
+            "value": "example.com",
+            "route": "primary"
+          }
+        ],
+        "choices": {
+          "1": {
+            "move": true
+          }
+        },
+        "verdicts": {
+          "domain|example.com": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain elsewhere move block on - rules.paste.on-other-route route=primary - - example.com"
+        ],
+        "lines": 1,
+        "excess": 0,
+        "bound": "",
+        "counts": "0/1/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "the rule limit",
+      "input": {
+        "text": "a.example\nb.example\nc.example\n",
+        "route": "primary",
+        "os": "windows",
+        "room": 1,
+        "existing": [
+          {
+            "type": "domain",
+            "value": "c.example",
+            "route": "secondary"
+          }
+        ],
+        "choices": {
+          "3": {
+            "move": true
+          }
+        },
+        "verdicts": {
+          "domain|a.example": {
+            "status": "valid"
+          },
+          "domain|b.example": {
+            "status": "valid"
+          },
+          "domain|c.example": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain ok add primary on - - - - - a.example",
+          "2 domain error keep primary on - rules.paste.over-limit - - - b.example",
+          "3 domain elsewhere move primary on - rules.paste.on-other-route route=secondary - - c.example"
+        ],
+        "lines": 3,
+        "excess": 0,
+        "bound": "",
+        "counts": "1/1/1/0",
+        "remaining": "b.example"
+      }
+    },
+    {
+      "name": "a URL is no rule value",
+      "input": {
+        "text": "https://www.Example.com/path?q=1\n--- Zones\nhttps://corp.example/\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "zone|https://corp.example/": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.zone"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 - error keep primary on - rules.paste.unrecognized - - - https://www.Example.com/path?q=1",
+          "3 zone error keep primary on - rules.validation.match-value-invalid.zone - - - https://corp.example/"
+        ],
+        "lines": 3,
+        "excess": 0,
+        "bound": "",
+        "counts": "0/0/2/0",
+        "remaining": "https://www.Example.com/path?q=1\n--- Zones\nhttps://corp.example/"
+      }
+    },
+    {
+      "name": "control characters and an overlong line",
+      "input": {
+        "text": "exa\u0007mple.com\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        "route": "primary",
+        "os": "windows"
+      },
+      "expected": {
+        "rows": [
+          "1 - error keep primary on - rules.paste.control-character - - - ",
+          "2 - error keep primary on - rules.paste.too-long max=1024 - - ",
+          "3 - needs-type keep primary on - rules.paste.needs-type - - - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ],
+        "lines": 3,
+        "excess": 0,
+        "bound": "",
+        "counts": "0/0/3/0",
+        "remaining": "exa\u0007mple.com\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    {
+      "name": "a comment over the limit",
+      "input": {
+        "text": "example.com # xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nexample.org # \ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "domain|example.com": {
+            "status": "valid"
+          },
+          "domain|example.org": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain error keep primary on - rules.paste.comment-too-long max=200 - #xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx example.com",
+          "2 domain ok add primary on - - - - #\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00 example.org"
+        ],
+        "lines": 2,
+        "excess": 0,
+        "bound": "",
+        "counts": "1/0/1/0",
+        "remaining": "example.com # xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+    },
+    {
+      "name": "what stays keeps its section",
+      "input": {
+        "text": "bad value here\nexample.com\n--- Domains\n192.0.2.7\nok.example\n--- Windows\nexample.com\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "domain|ok.example": {
+            "status": "valid"
+          },
+          "domain|example.com": {
+            "status": "valid"
+          },
+          "domain|192.0.2.7": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.is-exact-ip"
+          },
+          "application|example.com": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.is-domain"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 - error keep primary on - rules.paste.unrecognized - - - bad value here",
+          "2 domain ok add primary on - - - - - example.com",
+          "4 domain error keep primary on - rules.validation.match-value-invalid.is-exact-ip - - - 192.0.2.7",
+          "5 domain ok add primary on - - - - - ok.example",
+          "7 application error keep primary on - rules.validation.match-value-invalid.is-domain - - - example.com"
+        ],
+        "lines": 7,
+        "excess": 0,
+        "bound": "",
+        "counts": "2/0/3/0",
+        "remaining": "bad value here\n--- Domains\n192.0.2.7\n--- Windows\nexample.com"
+      }
+    },
+    {
+      "name": "a byte order mark and windows line ends",
+      "input": {
+        "text": "\ufeffexample.com\r\n--- Domains  \r\nexample.org\r\n",
+        "route": "secondary",
+        "os": "windows",
+        "verdicts": {
+          "domain|example.com": {
+            "status": "valid"
+          },
+          "domain|example.org": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain ok add secondary on - - - - - example.com",
+          "3 domain ok add secondary on - - - - - example.org"
+        ],
+        "lines": 3,
+        "excess": 0,
+        "bound": "",
+        "counts": "2/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "the retired block flag",
+      "input": {
+        "text": "example.com +block\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "domain|example.com +block": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid.retired-block-flag",
+            "args": {
+              "value": "!example.com"
+            }
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain error keep primary on - rules.validation.match-value-invalid.retired-block-flag value=!example.com - - example.com +block"
+        ],
+        "lines": 1,
+        "excess": 0,
+        "bound": "",
+        "counts": "0/0/1/0",
+        "remaining": "example.com +block"
+      }
+    },
+    {
+      "name": "the app-authored section keeps its provenance",
+      "input": {
+        "text": "--- Auto\nstale.example.net  # auto:user-confirmed anchor:example.com added:2026-01-05 kept\nplain.example.net # just a note\n# off.example.net # auto:site-companion\n",
+        "route": "primary",
+        "os": "windows",
+        "room": 0,
+        "verdicts": {
+          "domain|stale.example.net": {
+            "status": "valid"
+          },
+          "domain|plain.example.net": {
+            "status": "valid"
+          },
+          "domain|off.example.net": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 domain ok add primary on - - - user-confirmed/example.com/2026-01-05 #kept stale.example.net",
+          "3 domain error keep primary on - rules.paste.over-limit - - #just a note plain.example.net",
+          "4 domain ok add primary off - - - site-companion// - off.example.net"
+        ],
+        "lines": 4,
+        "excess": 0,
+        "bound": "",
+        "counts": "2/0/1/0",
+        "remaining": "--- Auto\nplain.example.net # just a note"
+      }
+    },
+    {
+      "name": "an app-authored program rule keeps its provenance in its own section",
+      "input": {
+        "text": "--- Windows\nclient.exe  # auto:vpn-client-bootstrap anchor:vpn.example added:2026-01-01 note\nmine.exe  # auto:user-confirmed\n",
+        "route": "primary",
+        "os": "windows",
+        "room": 0,
+        "verdicts": {
+          "application|client.exe": {
+            "status": "valid"
+          },
+          "application|mine.exe": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 application ok add primary on - - - vpn-client-bootstrap/vpn.example/2026-01-01 #note client.exe",
+          "3 application ok add primary on - - - user-confirmed// - mine.exe"
+        ],
+        "lines": 3,
+        "excess": 0,
+        "bound": "",
+        "counts": "2/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "nothing to read",
+      "input": {
+        "text": "\n\n   \n\t\n",
+        "route": "primary",
+        "os": "windows"
+      },
+      "expected": {
+        "rows": [],
+        "lines": 4,
+        "excess": 0,
+        "bound": "",
+        "counts": "0/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "an empty text",
+      "input": {
+        "text": "",
+        "route": "primary",
+        "os": "windows"
+      },
+      "expected": {
+        "rows": [],
+        "lines": 0,
+        "excess": 0,
+        "bound": "",
+        "counts": "0/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "a spaced path turned off is a rule, a note naming a folder is not",
+      "input": {
+        "text": "--- Windows\n# C:\\Program Files\\Example App\\*\n# see C:\\Temp\n# \\\\server\\share\\Example App\\\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "application|C:\\Program Files\\Example App\\*": {
+            "status": "valid"
+          },
+          "application|\\\\server\\share\\Example App\\": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 application ok add primary off - - - - - C:\\Program Files\\Example App\\*",
+          "4 application ok add primary off - - - - - \\\\server\\share\\Example App\\"
+        ],
+        "lines": 4,
+        "excess": 0,
+        "bound": "",
+        "counts": "2/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "a spaced program and network turned off",
+      "input": {
+        "text": "--- Windows\n# Adobe Reader.exe\n# see readme.txt\n--- CIDR\n# 10.0.0.0 / 8\n# 10.0.0.0 / 99\n# 01.0.0.0 / 8\n# 2001:db8:: / 48\n--- Ranges\n# 10.0.0.5 - 10.0.0.40\n# 10.0.0.5 - nothing\n# ::1 - ::ffff:10.0.0.1\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "application|Adobe Reader.exe": {
+            "status": "valid"
+          },
+          "subnet|10.0.0.0 / 8": {
+            "status": "valid"
+          },
+          "subnet|2001:db8:: / 48": {
+            "status": "valid"
+          },
+          "ip-range|10.0.0.5 - 10.0.0.40": {
+            "status": "valid"
+          },
+          "ip-range|::1 - ::ffff:10.0.0.1": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 application ok add primary off - - - - - Adobe Reader.exe",
+          "5 subnet ok add primary off - - - - - 10.0.0.0 / 8",
+          "8 subnet ok add primary off - - - - - 2001:db8:: / 48",
+          "10 ip-range ok add primary off - - - - - 10.0.0.5 - 10.0.0.40",
+          "12 ip-range ok add primary off - - - - - ::1 - ::ffff:10.0.0.1"
+        ],
+        "lines": 12,
+        "excess": 0,
+        "bound": "",
+        "counts": "5/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "a turned-off program with +children is a disabled rule, as the file reads it",
+      "input": {
+        "text": "--- Windows\n# codex.exe +children\n# codex.exe\ntool.exe +children\n# see notes +children\n",
+        "route": "secondary",
+        "os": "windows",
+        "verdicts": {
+          "application|codex.exe": {
+            "status": "valid"
+          },
+          "application|codex.exe +children": {
+            "status": "valid"
+          },
+          "application|tool.exe +children": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 application ok add secondary off - - - - - codex.exe +children",
+          "3 application ok add secondary off - - - - - codex.exe",
+          "4 application ok add secondary on - - - - - tool.exe +children"
+        ],
+        "lines": 5,
+        "excess": 0,
+        "bound": "",
+        "counts": "3/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "a check mark where the type reads none stays in the value",
+      "input": {
+        "text": "--- Windows\n?x.exe\n--- Domains\n?mail.example.com\nmail.example.com\n",
+        "route": "secondary",
+        "os": "windows",
+        "verdicts": {
+          "application|?x.exe": {
+            "status": "valid"
+          },
+          "domain|mail.example.com": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 application ok add secondary on - - - - - ?x.exe",
+          "4 domain ok add secondary on - - - - - mail.example.com",
+          "5 domain duplicate drop secondary on - rules.paste.same-as-line line=4 - - mail.example.com"
+        ],
+        "lines": 5,
+        "excess": 0,
+        "bound": "",
+        "counts": "2/0/0/1",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "a section not applied here keeps its notes out",
+      "input": {
+        "text": "--- Linux\n# firefox\nfirefox\n",
+        "route": "primary",
+        "os": "windows"
+      },
+      "expected": {
+        "rows": [
+          "3 - error keep primary on - rules.paste.section-not-applied section=Linux - - firefox"
+        ],
+        "lines": 3,
+        "excess": 0,
+        "bound": "",
+        "counts": "0/0/1/0",
+        "remaining": "--- Linux\nfirefox"
+      }
+    },
+    {
+      "name": "values that name no type",
+      "input": {
+        "text": "script.ps1\nexample.com/page\n!\n! example.com\n",
+        "route": "primary",
+        "os": "windows"
+      },
+      "expected": {
+        "rows": [
+          "1 - error keep primary on - rules.paste.unrecognized - - - script.ps1",
+          "2 - error keep primary on - rules.paste.unrecognized - - - example.com/page",
+          "3 - error keep primary on - rules.paste.unrecognized - - - !",
+          "4 - error keep primary on - rules.paste.unrecognized - - - ! example.com"
+        ],
+        "lines": 4,
+        "excess": 0,
+        "bound": "",
+        "counts": "0/0/4/0",
+        "remaining": "script.ps1\nexample.com/page\n!\n! example.com"
+      }
+    },
+    {
+      "name": "a header that is no header",
+      "input": {
+        "text": "---  Domains\n--- \n----- Domains\nexample.com\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "domain|example.com": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 - error keep primary on - rules.paste.unrecognized - - - --- Domains",
+          "2 - error keep primary on - rules.paste.unrecognized - - - ---",
+          "3 - error keep primary on - rules.paste.unrecognized - - - ----- Domains",
+          "4 domain ok add primary on - - - - - example.com"
+        ],
+        "lines": 4,
+        "excess": 0,
+        "bound": "",
+        "counts": "1/0/3/0",
+        "remaining": "---  Domains\n---\n----- Domains"
+      }
+    },
+    {
+      "name": "section names in any ascii case",
+      "input": {
+        "text": "--- DOMAINS\nexample.com\n--- cidr\n10.0.0.0/8\n--- windows\nx.exe\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "domain|example.com": {
+            "status": "valid"
+          },
+          "subnet|10.0.0.0/8": {
+            "status": "valid"
+          },
+          "application|x.exe": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 domain ok add primary on - - - - - example.com",
+          "4 subnet ok add primary on - - - - - 10.0.0.0/8",
+          "6 application ok add primary on - - - - - x.exe"
+        ],
+        "lines": 6,
+        "excess": 0,
+        "bound": "",
+        "counts": "3/0/0/0",
+        "remaining": ""
+      }
+    }
+  ]
+}

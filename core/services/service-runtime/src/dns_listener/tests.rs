@@ -193,6 +193,45 @@ fn a_rule_host_leaving_over_ipv6_is_reported_once() {
     );
 }
 
+/// While the guard holds, no record type of a rule host is asked of the main
+/// link: a forwarded AAAA brings back the CNAME chain, whose target no rule
+/// names, and an HTTPS record carries address hints. Other names, and the same
+/// names once the tunnel is back, are relayed as before.
+#[test]
+fn a_held_rule_host_is_not_asked_of_the_main_link_in_any_record_type() {
+    let holding = Arc::new(AtomicBool::new(true));
+    let posture = Arc::clone(&holding);
+    let l = listener(
+        &["assistant.example"],
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
+    )
+    .with_fake_ip(std::sync::Arc::new(CarriesOnV4(false)))
+    .with_leak_guard_posture(Arc::new(move || posture.load(Ordering::Relaxed)));
+
+    for qtype in [QTYPE_AAAA, QTYPE_HTTPS] {
+        match l.answer_query(&query("assistant.example", qtype)) {
+            ListenerAction::Respond(bytes) => {
+                assert_eq!(bytes[3] & 0x0F, RCODE_SERVFAIL, "qtype {qtype}: SERVFAIL");
+            }
+            other => panic!("qtype {qtype}: expected SERVFAIL, got {other:?}"),
+        }
+        assert_eq!(
+            l.answer_query(&query("vk.example", qtype)),
+            ListenerAction::Forward,
+            "qtype {qtype}: a name no rule claims is relayed"
+        );
+    }
+
+    holding.store(false, Ordering::Relaxed);
+    for qtype in [QTYPE_AAAA, QTYPE_HTTPS] {
+        assert_eq!(
+            l.answer_query(&query("assistant.example", qtype)),
+            ListenerAction::Forward,
+            "qtype {qtype}: relayed again once the guard lets go"
+        );
+    }
+}
+
 fn resolved6(ips: &[std::net::Ipv6Addr]) -> ResolvedAddresses {
     ResolvedAddresses {
         addresses: ips.iter().copied().map(IpAddr::V6).collect(),
@@ -1364,6 +1403,24 @@ fn a_saturated_rule_host_lane_answers_from_the_cache() {
             }
         }
         other => panic!("expected a response built from the cache, got {other:?}"),
+    }
+}
+
+/// While the guard holds, a cached address is not handed out either: one the
+/// census spared would carry the connection over the main link.
+#[test]
+fn a_saturated_lane_withholds_the_cache_while_the_guard_holds() {
+    let l = saturated_listener(&[Ipv4Addr::new(203, 0, 113, 7)])
+        .with_leak_guard_posture(Arc::new(|| true));
+    let _held: Vec<_> = (0..MAX_CONCURRENT_RULE_HOST_RESOLVES)
+        .map(|_| l.rule_host_lane.enter(Duration::ZERO).expect("slot"))
+        .collect();
+
+    match l.answer_query(&query("routed.example", QTYPE_A)) {
+        ListenerAction::Respond(bytes) => {
+            assert_eq!(bytes[3] & 0x0F, RCODE_SERVFAIL, "SERVFAIL rcode");
+        }
+        other => panic!("expected SERVFAIL, got {other:?}"),
     }
 }
 

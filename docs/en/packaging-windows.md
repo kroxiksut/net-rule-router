@@ -200,6 +200,14 @@ That is roughly 37 MB out of a 134 MB full deployment.
 Use `-Full` when a Qt problem is suspected and you want the untouched runtime
 to compare against.
 
+## If the window does not start
+
+When part of the installation is missing, for example a Qt library was deleted
+or a copy was not finished, `NetRuleRouter.exe` and `NetRuleRouterTray.exe` show
+their own message instead of a system error: the installation is incomplete,
+reinstall the program. The message names the log file with the details,
+`%TEMP%\NetRuleRouter\launcher-main.log` (or `launcher-tray.log` for the tray).
+
 ## Requirements on the build machine
 
 - Rust toolchain and `cargo` on `PATH`

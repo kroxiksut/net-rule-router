@@ -136,7 +136,8 @@ impl AutoRulesEngine {
                             "hosts that are no longer rules stopped counting as sites to learn around",
                         );
                     }
-                    l.ledger.proposals(now_ms.max(0) as u64, &exclusions)
+                    l.ledger
+                        .proposals_for(now_ms.max(0) as u64, &exclusions, proposal_use(mode))
                 }
                 None => Vec::new(),
             }

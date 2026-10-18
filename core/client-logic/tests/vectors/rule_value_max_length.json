@@ -1,0 +1,15 @@
+{
+  "description": "rules.js ruleValueMaxLength / nrr_client_logic::rule_value_class::rule_value_max_length: the most characters the rule form takes for a type; an application may be a path",
+  "cases": [
+    { "name": "zone", "input": { "type": "zone" }, "expected": 253 },
+    { "name": "domain", "input": { "type": "domain" }, "expected": 253 },
+    { "name": "exact ip", "input": { "type": "exact-ip" }, "expected": 45 },
+    { "name": "exact ipv4", "input": { "type": "exact-ipv4" }, "expected": 45 },
+    { "name": "exact ipv6", "input": { "type": "exact-ipv6" }, "expected": 45 },
+    { "name": "subnet", "input": { "type": "subnet" }, "expected": 51 },
+    { "name": "range", "input": { "type": "ip-range" }, "expected": 93 },
+    { "name": "application takes a path", "input": { "type": "application" }, "expected": 1024 },
+    { "name": "a type this build does not know", "input": { "type": "ports" }, "expected": 260 },
+    { "name": "no type", "input": { "type": "" }, "expected": 260 }
+  ]
+}

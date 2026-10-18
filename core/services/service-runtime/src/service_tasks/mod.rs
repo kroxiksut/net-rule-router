@@ -205,6 +205,13 @@ pub const TASK_ID_APP_DESTINATION_FLUSH: &str = "app-destination-flush-tick";
 /// learned destinations, slow enough to be invisible.
 pub const APP_DESTINATION_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Connection-history write-back — task id.
+pub const TASK_ID_CONN_HISTORY_FLUSH: &str = "conn-history-flush-tick";
+
+/// How often the folded connection history is written: one transaction a
+/// minute, never one per connection. A crash loses at most this much history.
+pub const CONN_HISTORY_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+
 // ── Health aggregator ────────────────────────────────────────────────────────
 
 /// Periodic snapshot recompute. Cheap — `HealthAggregator::snapshot()`

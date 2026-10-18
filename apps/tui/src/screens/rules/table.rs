@@ -8,7 +8,9 @@ use nrr_client_logic::rules_table::{
     RowOrigin, RuleRow, RuleType, TargetRoute,
 };
 use nrr_client_logic::Route;
-use nrr_domain::rule_value_validation::validate_rule_value;
+use nrr_domain::rule_value_validation::{
+    validate_rule_value, validate_rule_value_for, RuleEffect, RuleValueValidation,
+};
 use nrr_shared::ipc_payloads::RuleRowEntry;
 use nrr_shared::rules_json::FREE_MAX_RULES;
 
@@ -36,7 +38,29 @@ pub struct Verdict {
 
 impl Verdict {
     pub fn of(rule_type: &RuleType, value: &str) -> Self {
-        let judged = validate_rule_value(&rule_type.canonical_slug(), value);
+        Self::from_judged(&validate_rule_value(&rule_type.canonical_slug(), value))
+    }
+
+    /// The verdict for a rule on `route`: a deny or the additional route may
+    /// not name a program the system needs, as the GUI's dialog and table say.
+    pub fn for_route(rule_type: &RuleType, value: &str, route: &TargetRoute) -> Self {
+        let effect = match route {
+            TargetRoute::Primary => Some(RuleEffect::PrimaryRoute),
+            TargetRoute::Secondary => Some(RuleEffect::SecondaryRoute),
+            TargetRoute::Block => Some(RuleEffect::Deny),
+            TargetRoute::Other(_) => None,
+        };
+        match effect {
+            Some(effect) => Self::from_judged(&validate_rule_value_for(
+                &rule_type.canonical_slug(),
+                value,
+                effect,
+            )),
+            None => Self::of(rule_type, value),
+        }
+    }
+
+    fn from_judged(judged: &RuleValueValidation) -> Self {
         let status = if judged.is_error() {
             VerdictStatus::Error
         } else if judged.is_warning() {
@@ -74,7 +98,7 @@ impl Row {
         } else {
             rule.match_value.to_lowercase()
         };
-        let verdict = Verdict::of(&rule.rule_type, &rule.match_value);
+        let verdict = Verdict::for_route(&rule.rule_type, &rule.match_value, &rule.target_route);
         Self {
             rule,
             service_id: None,
@@ -147,7 +171,7 @@ impl RouteFilter {
             Self::All => text::ROUTE_ALL,
             Self::Primary => text::ROUTE_PRIMARY,
             Self::Secondary => text::ROUTE_SECONDARY,
-            Self::Block => text::ROUTE_BLOCK,
+            Self::Block => text::FILTER_DENIED,
             Self::Unsure => text::ROUTE_UNSURE,
         }
     }
@@ -221,6 +245,9 @@ pub struct Table {
     /// Sections of the last imported files this build does not apply, per
     /// route file, written back on export.
     pub passthrough: [BTreeMap<String, String>; 2],
+    /// «Recent» while it is on: only the rules changed lately are shown,
+    /// newest first.
+    pub recent: Option<super::recent::Recent>,
 }
 
 impl Table {
@@ -234,9 +261,18 @@ impl Table {
             .filter(|(_, row)| {
                 self.filter.passes(&row.rule)
                     && row_matches_search(&row.rule, &row.ace_lower, &self.search)
+                    && self
+                        .recent
+                        .as_ref()
+                        .is_none_or(|recent| recent.at_of(&row.rule).is_some())
             })
             .map(|(i, _)| i)
             .collect();
+        if let Some(recent) = &self.recent {
+            // Newest first, whatever the order chosen.
+            shown.sort_by_key(|&i| std::cmp::Reverse(recent.at_of(&self.rows[i].rule)));
+            return shown;
+        }
         if self.sort == SortMode::MainRoute {
             // Stable: equal verdicts keep the value order, as the GUI's sort.
             shown.sort_by_cached_key(|&i| {
@@ -272,6 +308,7 @@ impl Table {
         if !self.visible().contains(&master) {
             self.filter = RouteFilter::All;
             self.search.clear();
+            self.recent = None;
         }
         if let Some(at) = self.visible().iter().position(|&i| i == master) {
             self.cursor = at;
@@ -423,12 +460,18 @@ impl Table {
         let Some(at) = self.find(bucket, id) else {
             return false;
         };
-        let rule = &mut self.rows[at].rule;
-        // A block takes no `?`; it must not come back on a later move.
+        let row = &mut self.rows[at];
+        // A deny takes no `?`; it must not come back on a later move.
         if to == TargetRoute::Block {
-            rule.verify = false;
+            row.rule.verify = false;
         }
-        rule.target_route = to;
+        row.rule.target_route = to;
+        // The route decides whether a program the rule names is protected.
+        row.verdict = Verdict::for_route(
+            &row.rule.rule_type,
+            &row.rule.match_value,
+            &row.rule.target_route,
+        );
         true
     }
 
@@ -452,7 +495,7 @@ pub fn row_from_parsed(rule: &nrr_shared::preset_parser::ParsedRule, file: Route
     let match_value = if rule_type.is_hostlike() {
         ace::decode(&rule.match_value)
     } else {
-        rule.match_value.clone()
+        rule.stored_value()
     };
     RuleRow {
         id: String::new(),

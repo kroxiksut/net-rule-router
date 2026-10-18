@@ -30,6 +30,27 @@ pub trait FlowOwnerLookup: Send + Sync {
     /// determined. Must not block for more than a moment — callers may invoke it
     /// off the hot path, but it should never hang.
     fn owner_image_name(&self, local: SocketAddr, remote: SocketAddr) -> Option<String>;
+
+    /// The account that owns the client end of a relayed flow: the user SID
+    /// string on Windows. `local` is the client's own endpoint, `remote` the
+    /// virtual address it dialled; a datagram socket is matched on `local`
+    /// alone. `None` when the owner cannot be read — callers that need it
+    /// refuse the flow rather than guess.
+    fn owner_principal(
+        &self,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        _transport: FlowTransport,
+    ) -> Option<String> {
+        None
+    }
+}
+
+/// Which connection table a flow's owner is read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FlowTransport {
+    Tcp,
+    Udp,
 }
 
 /// The default lookup: never resolves an owner. Used on platforms with no
@@ -55,6 +76,7 @@ pub struct MockFlowOwnerLookup {
 #[derive(Debug, Default)]
 struct MockInner {
     entries: Vec<(SocketAddr, SocketAddr, String)>,
+    principals: Vec<(SocketAddr, FlowTransport, String)>,
     calls: u32,
 }
 
@@ -70,7 +92,15 @@ impl MockFlowOwnerLookup {
         inner.entries.push((local, remote, image.to_string()));
     }
 
-    /// Number of `owner_image_name` calls served so far.
+    /// Register the account reported as owning the client endpoint `local`.
+    pub fn set_principal(&self, local: SocketAddr, transport: FlowTransport, principal: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner
+            .principals
+            .push((local, transport, principal.to_string()));
+    }
+
+    /// Number of `owner_image_name` and `owner_principal` calls served so far.
     #[must_use]
     pub fn call_count(&self) -> u32 {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).calls
@@ -86,6 +116,21 @@ impl FlowOwnerLookup for MockFlowOwnerLookup {
             .iter()
             .find(|(l, r, _)| *l == local && *r == remote)
             .map(|(_, _, image)| image.clone())
+    }
+
+    fn owner_principal(
+        &self,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        transport: FlowTransport,
+    ) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.calls += 1;
+        inner
+            .principals
+            .iter()
+            .find(|(l, t, _)| *l == local && *t == transport)
+            .map(|(_, _, principal)| principal.clone())
     }
 }
 

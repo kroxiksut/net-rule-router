@@ -190,6 +190,11 @@ impl IpcHandler for SnapshotInitialHandler {
         } else {
             self.route_enforcement.routes_held(ctx.caller_stored())
         };
+        let traffic_carried_by_another_user = if ctx.caller_stored().is_empty() {
+            None
+        } else {
+            self.route_enforcement.traffic_carried(ctx.caller_stored())
+        };
         // The caller's own: a client waits for the user who can confirm it.
         let pending_vpn_clients = if ctx.caller_stored().is_empty() {
             Vec::new()
@@ -217,6 +222,7 @@ impl IpcHandler for SnapshotInitialHandler {
             rule_conflicts,
             enforcement_status,
             routes_held_by_another_user,
+            traffic_carried_by_another_user,
             pending_vpn_clients,
         };
         serde_json::to_value(resp).map_err(|e| IpcError {
@@ -393,6 +399,7 @@ mod tests {
             host: "a.example".into(),
             via_host: String::new(),
             app: String::new(),
+            reason: String::new(),
         };
         let unsupported = RuleConflictDto {
             kind: RuleConflictKind::UnsupportedRuleShape,
@@ -404,6 +411,7 @@ mod tests {
             host: String::new(),
             via_host: String::new(),
             app: "app.exe".into(),
+            reason: String::new(),
         };
         let app_enforcement = AppEnforcementStatus::new();
         app_enforcement.set_rule_conflicts(
@@ -463,6 +471,7 @@ mod tests {
             role: role.into(),
             candidates: candidates.iter().map(|c| (*c).to_string()).collect(),
             since_unix_ms: Some(1_000),
+            quiet: false,
         };
         let board = crate::app_enforcement_status::RouteEnforcementStatus::new();
         board.record_at(
@@ -568,5 +577,60 @@ mod tests {
         assert!(resp.get("routes-held-by-another-user").is_none());
         let anonymous = h.handle(&req(), &ctx()).unwrap();
         assert!(anonymous.get("routes-held-by-another-user").is_none());
+    }
+
+    /// A client that connects after its traffic began riding another user's
+    /// tunnel learns it here — its own report only.
+    #[test]
+    fn surfaces_only_the_callers_traffic_carried_by_another_user() {
+        use nrr_domain::user_principal::UserPrincipal;
+        use nrr_shared::ipc_payloads::TrafficCarriedDto;
+        let caller = UserPrincipal::from_linux_uid(1000);
+        let other = UserPrincipal::from_linux_uid(1001);
+        let board = crate::app_enforcement_status::RouteEnforcementStatus::new();
+        let carried = TrafficCarriedDto {
+            carried: true,
+            link: "Example Tunnel".into(),
+        };
+        board.record_traffic_carried(caller.as_stored(), carried.clone());
+        let h = SnapshotInitialHandler::new(
+            Arc::new(FakeHealth {
+                state: ServiceRuntimeState::Running,
+                severity: ServiceHealthSeverity::Ok,
+            }),
+            Arc::new(FakePolicy { revision: None }),
+            Arc::new(FakeAdapters::empty()),
+            Arc::new(FakeDiagnostics::healthy()),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRoutePolicy::default()),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeApplyFailurePolicy),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRoutingPause),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeAutostart),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRetention),
+            AppEnforcementStatus::new(),
+            crate::app_enforcement_status::SharedIpExemptionStatus::new(),
+            crate::app_enforcement_status::BlockAllPostureStatus::new(),
+        )
+        .with_route_enforcement_status(board);
+
+        let own = IpcRequestContext {
+            caller_principal: Some(caller),
+            ..ctx()
+        };
+        let resp = h.handle(&req(), &own).unwrap();
+        assert_eq!(
+            resp["traffic-carried-by-another-user"]["link"],
+            "Example Tunnel"
+        );
+        let parsed: SnapshotInitialResponse = serde_json::from_value(resp).unwrap();
+        assert_eq!(parsed.traffic_carried_by_another_user, Some(carried));
+
+        let theirs = IpcRequestContext {
+            caller_principal: Some(other),
+            ..ctx()
+        };
+        let resp = h.handle(&req(), &theirs).unwrap();
+        assert!(resp.get("traffic-carried-by-another-user").is_none());
+        let anonymous = h.handle(&req(), &ctx()).unwrap();
+        assert!(anonymous.get("traffic-carried-by-another-user").is_none());
     }
 }

@@ -16,7 +16,7 @@ pub struct MutableNoticeKind {
 }
 
 /// Mirrors `NoticeKind` in `nrr-domain`, which refuses any other slug.
-pub const MUTABLE_NOTICE_KINDS: [MutableNoticeKind; 8] = [
+pub const MUTABLE_NOTICE_KINDS: [MutableNoticeKind; 9] = [
     MutableNoticeKind {
         slug: "block-notice-backlog",
         title_key: "notifications.block-notice.backlog.title",
@@ -56,6 +56,11 @@ pub const MUTABLE_NOTICE_KINDS: [MutableNoticeKind; 8] = [
         slug: "routes-held",
         title_key: "notifications.routes-held.title",
         title_en: "Some addresses follow another user's route",
+    },
+    MutableNoticeKind {
+        slug: "traffic-carried",
+        title_key: "notifications.traffic-carried.title",
+        title_en: "Your traffic goes through another user's tunnel",
     },
 ];
 

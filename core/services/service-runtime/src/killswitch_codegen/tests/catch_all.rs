@@ -51,6 +51,43 @@ fn a_foreign_tunnel_keeps_carrying_its_own_traffic_under_the_block_all() {
     assert!(!strict_permits.contains(&FOREIGN));
 }
 
+/// Every block a blanket posture emits spares the corporate tunnel, not just
+/// the v4 connect layer: the tunnel-up catch-all used to carry no permit at
+/// all, and both postures cut its ping and its IPv6.
+#[test]
+fn both_blanket_postures_spare_a_foreign_tunnel_on_every_layer_they_block() {
+    const FOREIGN: u64 = 0x00AB_CDEF_0000_0002;
+    let exemptions = FailClosedExemptions {
+        foreign_tunnel_luids: vec![FOREIGN],
+        ..FailClosedExemptions::default()
+    };
+    let resolution = full_resolution();
+    let up = catch_all_kill_switch_filters(
+        "S-1-5-21-F",
+        &resolution,
+        &exemptions,
+        KillSwitchProtocols::ALL,
+    );
+    let down = fail_closed_block_all_filters("S-1-5-21-F", &exemptions, KillSwitchProtocols::ALL);
+    for (posture, filters) in [("tunnel up", &up), ("tunnel down", &down)] {
+        for layer in [
+            WfpLayerKey::AleAuthConnectV4,
+            WfpLayerKey::OutboundTransportV4,
+            WfpLayerKey::AleAuthConnectV6,
+            WfpLayerKey::OutboundIpPacketV6,
+        ] {
+            assert!(
+                filters.iter().any(|f| f.layer == layer
+                    && f.action == WfpAction::Permit
+                    && f.local_interface_luid == Some(FOREIGN)),
+                "{posture}: no permit for the foreign tunnel at {layer:?}",
+            );
+        }
+    }
+    let ids: std::collections::HashSet<u64> = up.iter().map(|f| f.id.raw).collect();
+    assert_eq!(ids.len(), up.len(), "the permits keep distinct ids");
+}
+
 /// Our own additional route is already permitted by its own field; listing it
 /// twice would emit two filters with the same purpose and different ids.
 #[test]

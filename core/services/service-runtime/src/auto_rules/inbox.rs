@@ -148,6 +148,9 @@ impl AutoRulesEngine {
             // where traffic goes: leaving it "pinned as if accepted" routed a
             // host the user reaches perfectly well on the main link.
             .filter(|c| !settled_by_the_main_link(&c.dto))
+            // Nor one resting on a single look-alike sighting: until a person
+            // says yes, it must not move traffic a hostile page could name.
+            .filter(|c| !is_less_certain(&c.dto))
             .any(|c| {
                 let m = c.dto.proposed_match.trim_matches('.').to_ascii_lowercase();
                 if m.is_empty() {
@@ -171,10 +174,14 @@ impl AutoRulesEngine {
     /// failing the call: the set is in-memory and may have been recomputed
     /// between the list and the answer, and refusing the whole batch over one
     /// stale id would lose the user's decision about the others.
+    ///
+    /// `as_any_zone` writes each offer that names a site in another zone
+    /// (`any-zone-site`) as that site in every zone instead.
     pub fn accept(
         &self,
         sid: &str,
         ids: &[String],
+        as_any_zone: bool,
         now: SystemTime,
     ) -> Result<ActionSummary, AuthorError> {
         let (selected, unknown) = self.take_selected(sid, ids, unix_ms(now));
@@ -197,7 +204,14 @@ impl AutoRulesEngine {
         })?;
         let rules: Vec<AuthoredRule> = selected
             .iter()
-            .map(PendingCandidate::authored_rule)
+            .map(|candidate| {
+                let mut rule = candidate.authored_rule();
+                if as_any_zone && !candidate.dto.any_zone_site.is_empty() {
+                    rule.match_kind = AuthoredMatchKind::AnyZoneSite;
+                    rule.value = candidate.dto.any_zone_site.clone();
+                }
+                rule
+            })
             .collect();
         let correlation = format!("auto-rules-accept-{}", unix_ms(now));
         match author.author_with_outcome(

@@ -18,6 +18,12 @@
 #               the installing user
 #   Rollback    a failed install: stop the service; after a fresh install
 #               (no -Upgrade) also unregister it
+#   Provision   files in place, before Register: hand -Primary, -Secondary,
+#               -Settings and -SecondaryUnset to `nrr-service provision-stage`,
+#               which checks the files and copies them into the service's
+#               protected data folder; nothing named means nothing to do. The
+#               exit code is the service binary's (10-14 a refused file or
+#               option, see its provision-check verb)
 #
 # Never interactive: installers run it hidden, and the MSI runs it as SYSTEM.
 # Exit code 0 means every step succeeded; 2 that removal succeeded but other
@@ -26,7 +32,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Stop', 'MarkStop', 'Register', 'Unregister', 'RemoveUserData', 'Rollback')]
+    [ValidateSet('Stop', 'MarkStop', 'Register', 'Unregister', 'RemoveUserData', 'Rollback', 'Provision')]
     [string] $Action,
 
     [Parameter()]
@@ -39,7 +45,27 @@ param(
     [switch] $Upgrade,
 
     [Parameter()]
-    [string] $LogPath
+    [string] $LogPath,
+
+    # Provision only. Empty means not given: an unset MSI property arrives so.
+    [Parameter()]
+    [string] $Primary,
+
+    [Parameter()]
+    [string] $Secondary,
+
+    [Parameter()]
+    [string] $Settings,
+
+    [Parameter()]
+    [string] $SecondaryUnset,
+
+    # The same four as one argument, `primary=<path>|secondary=<path>|
+    # settings=<path>|secondary-unset=<value>`: an installer always passes it
+    # whole, so an unset value never leaves a parameter without its argument.
+    # A Windows path cannot hold `|`.
+    [Parameter()]
+    [string] $ProvisionSpec
 )
 
 $ErrorActionPreference = 'Stop'
@@ -212,6 +238,31 @@ switch ($Action) {
     }
     'RemoveUserData' {
         if ((Invoke-UserScript 'purge-data.ps1' @{ Yes = $true; UserOnly = $true }) -ne 0) { $exitCode = 1 }
+    }
+    'Provision' {
+        foreach ($item in ($ProvisionSpec -split '\|')) {
+            $key, $value = $item -split '=', 2
+            switch ($key.Trim().ToLowerInvariant()) {
+                'primary' { if (-not $Primary) { $Primary = $value } }
+                'secondary' { if (-not $Secondary) { $Secondary = $value } }
+                'settings' { if (-not $Settings) { $Settings = $value } }
+                'secondary-unset' { if (-not $SecondaryUnset) { $SecondaryUnset = $value } }
+            }
+        }
+        $stage = @()
+        foreach ($pair in @(@('--primary', $Primary), @('--secondary', $Secondary),
+                @('--settings', $Settings), @('--secondary-unset', $SecondaryUnset))) {
+            if ($pair[1] -and $pair[1].Trim()) { $stage += @($pair[0], $pair[1].Trim()) }
+        }
+        if ($stage.Count -eq 0) { break }
+        $service = Join-Path $installDir 'nrr-service.exe'
+        if (-not (Test-Path -LiteralPath $service)) {
+            Write-Host "    $service is missing"
+            $exitCode = 14
+            break
+        }
+        Write-Host "==> nrr-service provision-stage $($stage -join ' ')"
+        $exitCode = Invoke-NativeCommand -FilePath $service -ArgumentList (@('provision-stage') + $stage)
     }
     'Rollback' {
         $null = Stop-NrrService

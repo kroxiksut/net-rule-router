@@ -21,6 +21,10 @@ QtObject {
     /// The dry-run / confirm half, shared with the tray (`RulesSubmitter`).
     property var submitter: RulesSubmitter {
         rpc: reviewFlowController.root ? reviewFlowController.root.rpc : null
+        baseRevision: reviewFlowController.root ? reviewFlowController.root.rulesBaseRevision : null
+        onBaseRevisionMoved: function(base) {
+            if (reviewFlowController.root) reviewFlowController.root.rulesBaseRevision = base
+        }
     }
 
     /// `origin` names the CALLER, and it travels all the way to the service as
@@ -130,7 +134,8 @@ QtObject {
                     correlationId: r.state.correlationId,
                     summary: r.summary,
                     confirmationToken: "",
-                    adminBaseline: false
+                    adminBaseline: false,
+                    baseRevision: r.state.baseRevision
                 }
                 _completeRulesActivation(r.payload)
             })
@@ -231,7 +236,8 @@ QtObject {
             correlationId: sent.correlationId,
             summary: null,
             confirmationToken: "",
-            adminBaseline: sent.adminBaseline
+            adminBaseline: sent.adminBaseline,
+            baseRevision: sent.baseRevision
         }
         root._activeReviewKind = "rules-update"
     }

@@ -62,11 +62,12 @@ pub use lifecycle::{
 };
 pub use production_ports::{
     CacheUpstreamResolver, CompositeFlowObserver, ConfirmedNameResolver, FlowActivityObserver,
-    RuleBookRouteSelector,
+    RuleBookRouteSelector, ServedFlowOwners, ServedPrincipalsFn,
 };
 pub use relay::{
-    FixedRouteSelector, RelayCore, RelayDecision, RouteSelector, StaticUpstreamResolver,
-    UpstreamAddressResolver, DEFAULT_SESSION_IDLE_MS,
+    FixedRouteSelector, FlowOwner, FlowOwners, OwnerRefusal, RelayCore, RelayDecision,
+    RouteSelector, RoutingUserOnly, StaticUpstreamResolver, UpstreamAddressResolver,
+    DEFAULT_SESSION_IDLE_MS,
 };
 pub use rule_networks::{
     global_rule_networks, ActivePrincipalNetworks, AdditionalNetworkOwner, RuleNetworkCell,

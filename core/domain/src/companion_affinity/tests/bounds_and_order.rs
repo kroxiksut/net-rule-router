@@ -147,7 +147,9 @@ fn a_stronger_signal_outranks_a_higher_affinity() {
             start,
             "web.chatapp.example",
             SECONDARY,
-            &["helper.other", "crashlogs.chatapp.test"],
+            // The brand host first: fetched after `helper.other`, a page of
+            // its own, it would be that page's.
+            &["crashlogs.chatapp.test", "helper.other"],
         );
     }
     // A second site pulls the brand-related host too, diluting its affinity
@@ -168,7 +170,7 @@ fn a_stronger_signal_outranks_a_higher_affinity() {
     assert_eq!(
         shape,
         vec![
-            ("chatapp.test", CompanionSignal::BrandRelated),
+            ("crashlogs.chatapp.test", CompanionSignal::BrandRelated),
             ("helper.other", CompanionSignal::CoActivity),
         ]
     );

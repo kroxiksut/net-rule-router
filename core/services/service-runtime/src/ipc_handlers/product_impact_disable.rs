@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use nrr_shared::ipc::IpcOperationName;
 
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcOperationClass, IpcRequestContext,
-    IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcOperationClass,
+    IpcRequestContext, IpcRequestEnvelope, Prechecked,
 };
 use crate::ipc_handlers::mutation_token_store::{
     MutationTokenStore, StoredMutation, DEFAULT_MUTATION_TOKEN_TTL,
@@ -62,8 +62,25 @@ impl ProductImpactDisableTemporaryHandler {
     }
 }
 
-impl IpcHandler for ProductImpactDisableTemporaryHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+/// A safe-disable request its precheck accepted.
+pub enum CheckedSafeDisable {
+    DryRun(ProductImpactDisableRequest),
+    /// The token is spent; the reason is the one that was reviewed, and the
+    /// routing paused is that of whoever ran the dry-run.
+    Confirm {
+        reason: String,
+        principal: String,
+    },
+}
+
+impl CheckedIpcHandler for ProductImpactDisableTemporaryHandler {
+    type Checked = CheckedSafeDisable;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
         let body: ProductImpactDisableRequest = serde_json::from_value(request.payload.clone())
             .map_err(|e| IpcError {
                 code: IpcErrorCode::MalformedRequest,
@@ -72,9 +89,33 @@ impl IpcHandler for ProductImpactDisableTemporaryHandler {
             })?;
 
         if body.dry_run {
-            self.handle_dry_run(request, body, ctx)
+            if request.operation_class != IpcOperationClass::ReadSnapshot {
+                return Err(IpcError {
+                    code: IpcErrorCode::MalformedRequest,
+                    message: format!(
+                        "product-impact.disable.temporary dry-run requires operation_class = read-snapshot; got {:?}",
+                        request.operation_class
+                    ),
+                    diagnostics_id: None,
+                });
+            }
+            Ok(CheckedSafeDisable::DryRun(body))
         } else {
-            self.handle_confirm(request, body, ctx)
+            self.precheck_confirm(request, body, ctx)
+        }
+    }
+
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        match checked.into_inner() {
+            CheckedSafeDisable::DryRun(body) => self.handle_dry_run(body, ctx),
+            CheckedSafeDisable::Confirm { reason, principal } => {
+                self.handle_confirm(&reason, &principal, ctx)
+            }
         }
     }
 }
@@ -82,21 +123,9 @@ impl IpcHandler for ProductImpactDisableTemporaryHandler {
 impl ProductImpactDisableTemporaryHandler {
     fn handle_dry_run(
         &self,
-        request: &IpcRequestEnvelope,
         body: ProductImpactDisableRequest,
         ctx: &IpcRequestContext,
     ) -> HandlerOutcome {
-        if request.operation_class != IpcOperationClass::ReadSnapshot {
-            return Err(IpcError {
-                code: IpcErrorCode::MalformedRequest,
-                message: format!(
-                    "product-impact.disable.temporary dry-run requires operation_class = read-snapshot; got {:?}",
-                    request.operation_class
-                ),
-                diagnostics_id: None,
-            });
-        }
-
         // Safe-disable is intentionally classified `High` — the GUI's
         // review surface should treat it as a destructive change.
         let summary = ReviewSummaryResponse {
@@ -140,12 +169,13 @@ impl ProductImpactDisableTemporaryHandler {
         })
     }
 
-    fn handle_confirm(
+    /// Spends the token, refused or not, and checks it against the request.
+    fn precheck_confirm(
         &self,
         request: &IpcRequestEnvelope,
         body: ProductImpactDisableRequest,
         ctx: &IpcRequestContext,
-    ) -> HandlerOutcome {
+    ) -> Result<CheckedSafeDisable, IpcError> {
         if request.operation_class != IpcOperationClass::SafeDisable {
             return Err(IpcError {
                 code: IpcErrorCode::MalformedRequest,
@@ -153,6 +183,16 @@ impl ProductImpactDisableTemporaryHandler {
                     "product-impact.disable.temporary confirm requires operation_class = safe-disable; got {:?}",
                     request.operation_class
                 ),
+                diagnostics_id: None,
+            });
+        }
+
+        // It pauses the caller's own routing; with no caller there is nobody
+        // to pause, and nobody else's routing is the caller's to lift.
+        if ctx.caller_stored().is_empty() {
+            return Err(IpcError {
+                code: IpcErrorCode::Unauthorized,
+                message: "product-impact.disable.temporary needs the caller's identity".into(),
                 diagnostics_id: None,
             });
         }
@@ -168,15 +208,23 @@ impl ProductImpactDisableTemporaryHandler {
             })?;
 
         let now = Instant::now();
+        // An elevated confirm may be an administrator answering a standard
+        // account's prompt: it is that account's dry-run, and its routing.
         let stored = self
             .token_store
-            .consume_for(
+            .consume_for_confirmer(
                 token,
                 IpcOperationName::ProductImpactDisableTemporary,
                 ctx.caller_stored(),
+                ctx.caller_is_elevated,
                 now,
             )
             .map_err(IpcError::from)?;
+        let principal = if stored.issuer_sid.is_empty() {
+            ctx.caller_stored().to_owned()
+        } else {
+            stored.issuer_sid.clone()
+        };
 
         let stored_reason = stored
             .payload
@@ -196,11 +244,22 @@ impl ProductImpactDisableTemporaryHandler {
                 diagnostics_id: None,
             });
         }
+        Ok(CheckedSafeDisable::Confirm {
+            reason: stored_reason,
+            principal,
+        })
+    }
 
+    fn handle_confirm(
+        &self,
+        stored_reason: &str,
+        principal: &str,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         let op_id = self
             .operation_store
             .enqueue_for(crate::ipc_handlers::operation_status_store::owner_of(ctx));
-        let outcome = self.executor.safe_disable(&stored_reason);
+        let outcome = self.executor.safe_disable(principal, stored_reason);
         match outcome {
             MutationOutcome::Completed(result) => {
                 self.operation_store
@@ -227,7 +286,7 @@ impl ProductImpactDisableTemporaryHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::IPC_PROTOCOL_VERSION;
+    use crate::ipc::{IpcHandler, IPC_PROTOCOL_VERSION};
     use crate::ipc_handlers::operation_status_store::OperationState;
     use crate::ipc_handlers::test_fakes::FakeMutationExecutor;
     use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
@@ -236,7 +295,9 @@ mod tests {
         IpcRequestContext {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: true,
-            caller_principal: None,
+            caller_principal: Some(nrr_domain::user_principal::UserPrincipal::from_linux_uid(
+                1000,
+            )),
             caller_pid: None,
         }
     }
@@ -339,6 +400,84 @@ mod tests {
             *exec.last_safe_disable_reason.lock().unwrap(),
             Some("investigating routing anomaly".to_string())
         );
+        // The caller's own routing, not the machine's.
+        assert_eq!(
+            exec.last_principal.lock().unwrap().as_deref(),
+            Some(ctx().caller_stored())
+        );
+    }
+
+    /// A standard account runs the dry-run; the confirm arrives elevated under
+    /// the administrator who answered the prompt. It pauses the account's own
+    /// routing. An unelevated stranger with the token is still refused.
+    #[test]
+    fn an_elevated_confirm_by_another_principal_pauses_the_dry_runs_owner() {
+        let user = IpcRequestContext {
+            caller_is_elevated: false,
+            ..ctx()
+        };
+        let as_principal = |uid: u32, elevated: bool| IpcRequestContext {
+            caller_is_elevated: elevated,
+            caller_principal: Some(nrr_domain::user_principal::UserPrincipal::from_linux_uid(
+                uid,
+            )),
+            ..ctx()
+        };
+        let dry_run = |h: &ProductImpactDisableTemporaryHandler| -> String {
+            let dry: ProductImpactDisableDryRunResponse = serde_json::from_value(
+                h.handle(
+                    &dry_run_envelope(serde_json::json!({ "reason": "r", "dry-run": true })),
+                    &user,
+                )
+                .expect("dry-run"),
+            )
+            .expect("parse");
+            dry.confirmation_token
+        };
+        let confirm = serde_json::json!({ "reason": "r", "dry-run": false });
+
+        let (h, _tokens, _ops, exec) = make_handler();
+        let token = dry_run(&h);
+        h.handle(
+            &confirm_envelope(confirm.clone(), &token),
+            &as_principal(0, true),
+        )
+        .expect("an administrator confirms the account's dry-run");
+        assert_eq!(exec.safe_disable_count(), 1);
+        assert_eq!(
+            exec.last_principal.lock().unwrap().as_deref(),
+            Some(user.caller_stored())
+        );
+
+        let token = dry_run(&h);
+        let err = h
+            .handle(
+                &confirm_envelope(confirm, &token),
+                &as_principal(1001, false),
+            )
+            .expect_err("a stranger's confirm");
+        assert_eq!(err.code, IpcErrorCode::ConfirmationUnknown);
+        assert_eq!(exec.safe_disable_count(), 1);
+    }
+
+    #[test]
+    fn confirm_without_a_caller_pauses_nobody() {
+        let (h, _tokens, _ops, exec) = make_handler();
+        let anonymous = IpcRequestContext {
+            caller_principal: None,
+            ..ctx()
+        };
+        let err = h
+            .handle(
+                &confirm_envelope(
+                    serde_json::json!({ "reason": "x", "dry-run": false }),
+                    "any-token",
+                ),
+                &anonymous,
+            )
+            .expect_err("no caller, no pause");
+        assert_eq!(err.code, IpcErrorCode::Unauthorized);
+        assert_eq!(exec.safe_disable_count(), 0);
     }
 
     #[test]
@@ -380,14 +519,18 @@ mod tests {
         assert_eq!(err.code, IpcErrorCode::MalformedRequest);
     }
 
+    /// An unelevated caller: an elevated one may confirm another account's
+    /// dry-run, see the test above.
     fn ctx_sid(sid: &str) -> IpcRequestContext {
         IpcRequestContext {
+            caller_is_elevated: false,
             caller_principal: crate::UserPrincipal::from_windows_sid(sid).ok(),
             ..ctx()
         }
     }
 
-    /// The token is the reviewing principal's; another one cannot spend it.
+    /// The token is the reviewing principal's; another unelevated one cannot
+    /// spend it.
     #[test]
     fn confirm_refuses_a_token_issued_to_another_principal() {
         let (h, _tokens, _ops, exec) = make_handler();

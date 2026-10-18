@@ -737,6 +737,9 @@ impl ProductionRulesApplyDispatcher {
                 snapshot.rule_book = snapshot.rule_book.with_subdomain_coverage();
             }
         }
+        // As the provider's enforcement read: a protected rule carried over
+        // from the book in force is not applied.
+        snapshot.rule_book = crate::protected_rules::withhold(snapshot.rule_book).0;
         Some(snapshot)
     }
 }

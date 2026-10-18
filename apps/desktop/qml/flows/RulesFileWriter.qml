@@ -9,6 +9,16 @@ QtObject {
 
     /// RpcTransport instance; the passthrough sections come from the sidecar.
     property var rpc: null
+    /// The owner window, for its `tr()`: the syntax hint is written in the
+    /// language of the moment of writing. English without one.
+    property var textSource: null
+
+    /// The translated syntax-hint lines for the file's header.
+    function hintLines() {
+        var source = writer.textSource
+        return Rules.rulesFileHintLines(source && typeof source.tr === "function"
+            ? function(key, fallback) { return source.tr(key, fallback) } : null)
+    }
 
     readonly property bool canWrite: typeof nrrNativeBridge !== "undefined"
         && nrrNativeBridge !== null
@@ -63,7 +73,7 @@ QtObject {
         }
         readPassthroughSections(route, function(sections) {
             var text = Rules.buildCanonicalRulesText(
-                rows, route, sections, !!includeComments, os)
+                rows, route, sections, !!includeComments, os, writer.hintLines())
             if (writer.fileHoldsText(path, text)) {
                 finish(true, false)
                 return

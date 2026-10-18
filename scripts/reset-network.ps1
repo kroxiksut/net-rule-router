@@ -98,8 +98,7 @@ if (-not $isAdmin) {
 }
 
 Write-Host "==> sc stop $NrrServiceName (best-effort)" -ForegroundColor Cyan
-Set-NrrDeliberateStop
-$null = Invoke-NativeCommand -FilePath (Get-SystemTool 'sc.exe') -ArgumentList @('stop', $NrrServiceName) -Quiet
+$null = Stop-NrrServiceDeliberately
 Start-Sleep -Seconds 2
 
 # ── Step 1-2: a binary that can run `cleanup` ────────────────────────────────

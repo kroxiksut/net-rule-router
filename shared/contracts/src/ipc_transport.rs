@@ -287,6 +287,100 @@ pub const ACTION_DISABLE_PROTECTION: &str = "netrulerouter.disable-protection";
 /// because it destroys history rather than changing policy, and an
 /// administrator may well take a different view of the two.
 pub const ACTION_CLEAR_SHARED_DATA: &str = "netrulerouter.clear-shared-data";
+/// Changing a setting every user of the machine shares (retention, DoH, the
+/// rules lock and the like) through an operation that otherwise needs no
+/// rights: its handler refuses the changed value, and the service asks this.
+pub const ACTION_CHANGE_MACHINE_SETTINGS: &str = "netrulerouter.change-machine-settings";
+
+/// Every action the service may ask the platform authority about.
+pub const AUTHORIZATION_ACTIONS: [&str; 4] = [
+    ACTION_EDIT_BASELINE,
+    ACTION_DISABLE_PROTECTION,
+    ACTION_CLEAR_SHARED_DATA,
+    ACTION_CHANGE_MACHINE_SETTINGS,
+];
+
+/// The action that lifts a handler's [`NEEDS_ADMINISTRATOR_SLUG`] refusal of
+/// `op`.
+pub const fn needs_administrator_action(op: IpcOperationName) -> &'static str {
+    match op {
+        IpcOperationName::PrincipalDataPurge => ACTION_CLEAR_SHARED_DATA,
+        // Clearing an alert that adopts other users' rows.
+        IpcOperationName::MutationSubmit => ACTION_EDIT_BASELINE,
+        _ => ACTION_CHANGE_MACHINE_SETTINGS,
+    }
+}
+
+/// A handler refused a value only an administrator may set. Its `Forbidden`
+/// message begins with this slug. Where the service has an authority to ask
+/// (Linux) it lifts the refusal itself; elsewhere the client's broker does.
+pub const NEEDS_ADMINISTRATOR_SLUG: &str = "needs-administrator";
+/// The authority would ask for a password and nobody can be asked: no
+/// authentication agent answers for the caller.
+pub const ELEVATION_AGENT_MISSING_CLIENT_SLUG: &str = "elevation-agent-missing";
+/// No authorization service answered at all.
+pub const ELEVATION_UNAVAILABLE_CLIENT_SLUG: &str = "elevation-unavailable";
+
+/// The client error code of a `Forbidden` refusal: the elevation gate's own
+/// outcome when `message` begins with one (`<slug>: …`, written from these
+/// constants), plain `forbidden` otherwise.
+pub fn forbidden_client_code(message: &str) -> &'static str {
+    [
+        ELEVATION_DECLINED_CLIENT_SLUG,
+        ELEVATION_AGENT_MISSING_CLIENT_SLUG,
+        ELEVATION_UNAVAILABLE_CLIENT_SLUG,
+    ]
+    .into_iter()
+    .find(|slug| {
+        message
+            .strip_prefix(slug)
+            .is_some_and(|rest| rest.starts_with(':'))
+    })
+    .unwrap_or(IpcErrorCode::Forbidden.client_slug())
+}
+
+/// Operations whose handler refuses some values unless the caller is an
+/// administrator, with [`NEEDS_ADMINISTRATOR_SLUG`]: the settings every user
+/// shares, erasing every user's data, clearing an alert on others' behalf.
+pub const fn handler_may_need_administrator(op: IpcOperationName) -> bool {
+    matches!(
+        op,
+        IpcOperationName::DohResolversSet
+            | IpcOperationName::LocalDnsSuffixesSet
+            | IpcOperationName::RetentionSettingsSet
+            | IpcOperationName::LogRetentionConfigSet
+            | IpcOperationName::ApplyFailurePolicySet
+            | IpcOperationName::ServiceStabilityConfigSet
+            | IpcOperationName::TrafficStatsSet
+            | IpcOperationName::PrincipalDataPurge
+            | IpcOperationName::MutationSubmit
+    )
+}
+
+/// Whether answering `op` with some payload may need an administrator: its
+/// class does, for some payload, or its handler does for some values. Where
+/// the service asks the authority itself, the answer then waits for a person.
+pub fn may_ever_need_administrator(op: IpcOperationName) -> bool {
+    handler_may_need_administrator(op)
+        || fixed_operation_class(op).requires_elevation()
+        || matches!(
+            op,
+            IpcOperationName::RollbackRequest | IpcOperationName::ProductImpactDisableTemporary
+        )
+}
+
+/// [`may_ever_need_administrator`] for this payload.
+pub fn may_need_administrator(op: IpcOperationName, payload: &serde_json::Value) -> bool {
+    handler_may_need_administrator(op)
+        || canonical_operation_class(op, payload).requires_elevation()
+}
+
+/// Whether a `Forbidden` message is a handler's [`NEEDS_ADMINISTRATOR_SLUG`].
+pub fn is_needs_administrator(message: &str) -> bool {
+    message
+        .strip_prefix(NEEDS_ADMINISTRATOR_SLUG)
+        .is_some_and(|rest| rest.starts_with(':'))
+}
 
 impl IpcOperationClass {
     /// Every class, so a caller that has to reason about all of them (the
@@ -543,7 +637,11 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // Read the caller's check verdicts.
         | IpcOperationName::VerifyVerdictsList
         // Where one program connected, from the in-memory trace.
-        | IpcOperationName::VpnGatewayCandidatesList => IpcOperationClass::ReadSnapshot,
+        | IpcOperationName::VpnGatewayCandidatesList
+        // The caller's own recent rule changes, from stored revisions.
+        | IpcOperationName::RulesRecentChangesList
+        // The caller's own connection history.
+        | IpcOperationName::ConnHistoryList => IpcOperationClass::ReadSnapshot,
         // StatusUpdatesSubscribe sets up a long-lived push channel —
         // classified as DiagnosticQuery (no mutation queue, no elevation).
         IpcOperationName::StatusUpdatesSubscribe => IpcOperationClass::DiagnosticQuery,
@@ -577,16 +675,16 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // Log/audit retention write, service-global settings class.
         | IpcOperationName::LogRetentionConfigSet
         | IpcOperationName::ServiceStabilityConfigSet => IpcOperationClass::UserScopedConfiguration,
-        // Maintenance of what the service OBSERVED, not of what it enforces:
-        // clearing operational logs, discarding the rebuildable FQDN/IP cache.
-        // Mutating and queued like the settings writes, but they configure
-        // nothing, which is the distinction `DiagnosticAction` names.
-        IpcOperationName::LogsClear
-        | IpcOperationName::CacheClear
         // The export writes a FILE, and at `redaction-level: diagnostics` that
         // file holds unredacted hostnames, addresses and an audit summary: no
         // elevation, no token, but a record that it happened.
-        | IpcOperationName::DiagnosticsExportArchive => IpcOperationClass::DiagnosticAction,
+        IpcOperationName::DiagnosticsExportArchive => IpcOperationClass::DiagnosticAction,
+        // The logs are every user's and the service's, and the name cache is
+        // the whole machine's: wiping either decides for everyone, as wiping
+        // the traffic ledger does.
+        IpcOperationName::LogsClear | IpcOperationName::CacheClear => {
+            IpcOperationClass::MachineScopedAction
+        }
         // DoH resolver baseline replace. Machine-wide config write kept at the
         // settings class. NOTE: `requires_service_mutation_privilege` in the
         // catalog is a declaration, not a gate — nothing reads it at runtime, so
@@ -668,6 +766,11 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         IpcOperationName::PrincipalDataPurge => IpcOperationClass::UserScopedConfiguration,
         // A count of other principals, no identities and no writes.
         IpcOperationName::PrincipalDataCount => IpcOperationClass::ReadSnapshot,
+        // Erasing or switching off the caller's OWN connection history:
+        // per-SID configuration, no elevation, audited like the mute writes.
+        IpcOperationName::ConnHistoryClear | IpcOperationName::ConnHistorySettingsSet => {
+            IpcOperationClass::UserScopedConfiguration
+        }
     }
 }
 
@@ -927,6 +1030,34 @@ mod tests {
         let back: IpcErrorCode = serde_json::from_str("\"rules_locked\"").expect("deserialise");
         assert_eq!(back, IpcErrorCode::RulesLocked);
         assert_ne!(IpcErrorCode::RulesLocked, IpcErrorCode::Forbidden);
+    }
+
+    /// The authority's outcome reaches a client as its own code; any other
+    /// `Forbidden`, a handler's own needs-administrator included, stays
+    /// `forbidden` so a Windows client still retries it through its broker.
+    #[test]
+    fn a_forbidden_refusal_names_the_elevation_outcome_only_when_it_is_one() {
+        for slug in [
+            super::ELEVATION_DECLINED_CLIENT_SLUG,
+            super::ELEVATION_AGENT_MISSING_CLIENT_SLUG,
+            super::ELEVATION_UNAVAILABLE_CLIENT_SLUG,
+        ] {
+            assert_eq!(super::forbidden_client_code(&format!("{slug}: why")), slug);
+            assert_eq!(
+                super::forbidden_client_code(&format!("{slug}x: why")),
+                "forbidden"
+            );
+        }
+        for op in IpcOperationName::ALL {
+            let payload = serde_json::json!({ "admin-baseline": true, "payload": { "admin-baseline": true } });
+            if super::may_need_administrator(op, &payload) {
+                assert!(super::may_ever_need_administrator(op), "{}", op.slug());
+            }
+        }
+        let needs = format!("{}: retention", super::NEEDS_ADMINISTRATOR_SLUG);
+        assert_eq!(super::forbidden_client_code(&needs), "forbidden");
+        assert!(super::is_needs_administrator(&needs));
+        assert!(!super::is_needs_administrator("clients may not invoke it"));
     }
 
     /// The alert gate is not a `Forbidden`: a client that read it as one would

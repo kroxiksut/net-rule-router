@@ -470,6 +470,10 @@ pub struct EnforcementCapabilities {
     pub per_user_all_protocol_scoping: bool,
     /// How per-app matching is realised on this platform.
     pub app_match: AppMatchMechanism,
+    /// An application rule by path (a file, a folder, a folder with its
+    /// subfolders) is carried out. Until a platform can, such a rule stays in
+    /// the book and is reported as not applied.
+    pub app_path_rules: bool,
 }
 
 impl EnforcementCapabilities {
@@ -484,6 +488,7 @@ impl EnforcementCapabilities {
             per_app_block_leakproof: true,
             per_user_all_protocol_scoping: false,
             app_match: AppMatchMechanism::WfpAppId,
+            app_path_rules: false,
         }
     }
 
@@ -497,6 +502,7 @@ impl EnforcementCapabilities {
             per_app_block_leakproof: false,
             per_user_all_protocol_scoping: true,
             app_match: AppMatchMechanism::ObservedDestOnly,
+            app_path_rules: false,
         }
     }
 
@@ -522,6 +528,7 @@ impl EnforcementCapabilities {
             per_app_block_leakproof: false,
             per_user_all_protocol_scoping: false,
             app_match: AppMatchMechanism::ObservedDestOnly,
+            app_path_rules: false,
         }
     }
 
@@ -600,6 +607,13 @@ pub trait PolicyEnforcer: Send + Sync {
     /// knows no link, which spares nothing.
     fn flow_links(&self, _principal: &UserPrincipal) -> crate::fake_ip::stale_flows::FlowLinks {
         crate::fake_ip::stale_flows::FlowLinks::default()
+    }
+
+    /// Whether a block over every packet ([`Coverage::AllPackets`]) holds only
+    /// for its plan's principal. Where the packet layer carries no user, it
+    /// cuts everyone on the machine, and the others are told so.
+    fn packet_blocks_follow_the_principal(&self) -> bool {
+        false
     }
 
     /// Remove everything this product installed, and nothing else.
@@ -1237,6 +1251,23 @@ mod tests {
             mac_sup.per_user_all_protocol_scoping,
             mac_caps.per_user_all_protocol_scoping
         );
+        for (sup, caps) in [
+            (&win_sup, &win_caps),
+            (&lin_sup, &lin_caps),
+            (&mac_sup, &mac_caps),
+        ] {
+            assert_eq!(sup.app_path_rules, caps.app_path_rules);
+        }
+
+        // An application rule is offered exactly where a backend carries it
+        // out, by its own mechanism: app id on Windows, the destinations an
+        // app was seen using on Linux. macOS declares a mechanism it has no
+        // backend for yet.
+        assert_eq!(win_caps.app_match, AppMatchMechanism::WfpAppId);
+        assert!(win_sup.app_routing);
+        assert_eq!(lin_caps.app_match, AppMatchMechanism::ObservedDestOnly);
+        assert!(lin_sup.app_routing);
+        assert!(!mac_sup.app_routing);
 
         // `current()` picks the same OS the profile does.
         let cur_caps = EnforcementCapabilities::current();

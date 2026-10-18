@@ -244,6 +244,87 @@ fn keys_answer_the_chosen_group() {
     assert!(wide.contains("Reload the page you were on"), "{wide}");
 }
 
+/// An offer in another zone of its site says so, and `z` takes it as the
+/// site in every zone; a group that names no site sends nothing.
+#[test]
+fn z_adds_the_site_in_every_zone_where_one_is_named() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::AutoRuleCandidatesList,
+        json!({
+            "candidates": [
+                candidate("z1", "example.net", json!({ "any-zone-site": "example" })),
+                candidate("c2", "img.other.org", json!({})),
+            ],
+            "pending-count": 2, "inert-dropped": 0, "inert-sample": []
+        }),
+    );
+    let mut app = on_screen(&fake);
+    let wide = render(&app, 160, 60);
+    assert!(wide.contains("example.* instead"), "{wide}");
+
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('z'));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::AutoRuleCandidatesAccept);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["as-any-zone"], true, "{sent:?}");
+
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('z'));
+    drain(&mut app, &fake);
+    assert_eq!(
+        fake.sent(IpcOperationName::AutoRuleCandidatesAccept).len(),
+        1
+    );
+}
+
+/// An offer resting on one sighting of the site's name says so, and says what
+/// it rests on, as the window does.
+#[test]
+fn a_less_certain_offer_shows_its_mark_and_basis() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::AutoRuleCandidatesList,
+        json!({
+            "candidates": [
+                candidate("w1", "login.news.test", json!({
+                    "signal": "brand-related",
+                    "observations": 1,
+                    "affinity": 0.0,
+                    "less-certain": "brand-seen-once"
+                })),
+                candidate("c2", "img.other.org", json!({})),
+            ],
+            "pending-count": 2, "inert-dropped": 0, "inert-sample": []
+        }),
+    );
+    let app = on_screen(&fake);
+    let wide = render(&app, 160, 60);
+    assert!(
+        wide.contains("*.login.news.test — Pending; not checked on the main route; less certain"),
+        "{wide}"
+    );
+    assert!(
+        wide.contains(
+            "less certain: named like news.example, seen once · shares a name with the site"
+        ),
+        "{wide}"
+    );
+    // The certain offer beside it carries no mark.
+    assert_eq!(wide.matches("less certain").count(), 2, "{wide}");
+
+    let texts = texts_en();
+    for (i, group) in app.suggestions.shown().iter().enumerate() {
+        assert_eq!(
+            group_line_count(group),
+            group_lines(group, i, false, &texts).len(),
+            "{}",
+            group.domain
+        );
+    }
+}
+
 #[test]
 fn automatic_mode_asks_first_and_cancel_changes_nothing() {
     let fake = service();

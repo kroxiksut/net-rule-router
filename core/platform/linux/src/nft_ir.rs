@@ -107,6 +107,9 @@ pub enum NftMatch {
     SkUidSet(Vec<(u32, u32)>),
     /// `meta mark <mark>` — the packet's firewall mark, exact.
     Mark(u32),
+    /// `ct direction reply` — a packet answering a flow that began the other
+    /// way.
+    CtReply,
 }
 
 /// A single rule in the output chain, in evaluation order.
@@ -228,6 +231,7 @@ fn render_match(m: &NftMatch) -> String {
         NftMatch::SkUid(uid) => format!("meta skuid {uid}"),
         NftMatch::SkUidSet(ranges) => format!("meta skuid {{ {} }}", uid_items(ranges)),
         NftMatch::Mark(mark) => format!("meta mark {mark:#010x}"),
+        NftMatch::CtReply => "ct direction reply".to_owned(),
     }
 }
 

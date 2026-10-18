@@ -168,6 +168,8 @@ fn matches(m: &NftMatch, p: &Packet) -> bool {
             .any(|(first, last)| (*first..=*last).contains(&p.uid)),
         // The generated packets carry no mark.
         NftMatch::Mark(_) => false,
+        // Nor a conntrack direction: they all open a flow.
+        NftMatch::CtReply => false,
     }
 }
 

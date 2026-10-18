@@ -6,8 +6,8 @@ use libfuzzer_sys::fuzz_target;
 use nrr_service_runtime::dns_wire;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-/// The resolver reads one UDP datagram into a buffer of this size.
-const MAX_UDP_QUERY: usize = 4096;
+/// The listener reads one datagram into a buffer of the largest UDP payload.
+const MAX_UDP_QUERY: usize = 65_535;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_UDP_QUERY {

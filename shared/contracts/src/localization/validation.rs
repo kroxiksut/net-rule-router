@@ -40,10 +40,13 @@ pub(super) fn validate_metadata(
             .iter()
             .any(|allowed| allowed == &key.as_str())
         {
-            candidate.warnings.push(format!(
-                "unknown metadata field '{key}' is ignored for schema {}",
-                LOCALE_SCHEMA_VERSION
-            ));
+            push_warning(candidate, || {
+                format!(
+                    "unknown metadata field '{}' is ignored for schema {}",
+                    shown(key),
+                    LOCALE_SCHEMA_VERSION
+                )
+            });
         }
     }
 
@@ -60,7 +63,8 @@ pub(super) fn validate_metadata(
         if normalized_language != candidate.id {
             candidate.errors.push(format!(
                 "metadata.language '{}' does not match file locale id '{}'",
-                normalized_language, candidate.id
+                shown(&normalized_language),
+                candidate.id
             ));
         }
     }
@@ -69,7 +73,8 @@ pub(super) fn validate_metadata(
         if version != LOCALE_SCHEMA_VERSION {
             candidate.errors.push(format!(
                 "unsupported locale schema version '{}'; expected '{}'",
-                version, LOCALE_SCHEMA_VERSION
+                shown(&version),
+                LOCALE_SCHEMA_VERSION
             ));
         }
     }
@@ -161,6 +166,13 @@ pub(super) fn require_metadata_string_array(
             .push(format!("metadata field '{field}' must not be empty"));
         return None;
     }
+    // Each entry is checked against the others; a long list is no chain.
+    if values.len() > MAX_LOCALE_FALLBACKS {
+        candidate.errors.push(format!(
+            "metadata field '{field}' lists more than {MAX_LOCALE_FALLBACKS} locales"
+        ));
+        return None;
+    }
 
     let mut parsed = Vec::new();
     for item in values {
@@ -203,14 +215,24 @@ pub(super) fn flatten_locale_object_validated(
             continue;
         }
 
+        if output.len() >= MAX_LOCALE_KEYS {
+            let note = format!("more than {MAX_LOCALE_KEYS} keys; the rest are ignored");
+            if !candidate.warnings.contains(&note) {
+                push_warning(candidate, || note);
+            }
+            return;
+        }
+
         if is_root
             && RESERVED_ROOT_NAMESPACES
                 .iter()
                 .any(|reserved| reserved == &key.as_str())
         {
-            candidate.warnings.push(format!(
-                "reserved namespace '{key}' is not allowed in locale translation payload; the namespace is ignored"
-            ));
+            push_warning(candidate, || {
+                format!(
+                    "reserved namespace '{key}' is not allowed in locale translation payload; the namespace is ignored"
+                )
+            });
             continue;
         }
 
@@ -219,10 +241,25 @@ pub(super) fn flatten_locale_object_validated(
         // locale to English with no signal a user could see. Structural
         // failures below stay errors; this is a defect in one entry.
         if !is_valid_key_segment(key) {
-            candidate.warnings.push(format!(
-                "invalid key segment '{key}' in namespace '{}'; the key is ignored",
-                if prefix.is_empty() { "<root>" } else { prefix }
-            ));
+            push_warning(candidate, || {
+                format!(
+                    "invalid key segment '{}' in namespace '{}'; the key is ignored",
+                    shown(key),
+                    if prefix.is_empty() { "<root>" } else { prefix }
+                )
+            });
+            continue;
+        }
+
+        // Every key below a namespace repeats its name, so a long one would
+        // multiply the file in memory.
+        if prefix.len() + 1 + key.len() > MAX_LOCALE_KEY_BYTES {
+            push_warning(candidate, || {
+                format!(
+                    "key '{}' is longer than {MAX_LOCALE_KEY_BYTES} bytes; it is ignored",
+                    shown(&format!("{prefix}.{key}"))
+                )
+            });
             continue;
         }
 
@@ -233,9 +270,9 @@ pub(super) fn flatten_locale_object_validated(
         };
 
         if is_root && !nested.is_object() {
-            candidate.warnings.push(format!(
-                "root translation key '{key}' must be a namespace object; it is ignored"
-            ));
+            push_warning(candidate, || {
+                format!("root translation key '{key}' must be a namespace object; it is ignored")
+            });
             continue;
         }
 
@@ -243,23 +280,27 @@ pub(super) fn flatten_locale_object_validated(
             // Kept, a blank value would shadow the fallback and draw an empty
             // label; dropped, the key falls back per key like a missing one.
             if text.trim().is_empty() {
-                candidate.warnings.push(format!(
-                    "translation key '{merged_key}' contains an empty string; the key is ignored"
-                ));
+                push_warning(candidate, || {
+                    format!(
+                        "translation key '{merged_key}' contains an empty string; the key is ignored"
+                    )
+                });
                 continue;
             }
             if text.chars().count() > MAX_RECOMMENDED_LOCALE_VALUE_LEN {
-                candidate.warnings.push(format!(
-                    "translation key '{merged_key}' exceeds recommended length (>{MAX_RECOMMENDED_LOCALE_VALUE_LEN})"
-                ));
+                push_warning(candidate, || {
+                    format!(
+                        "translation key '{merged_key}' exceeds recommended length (>{MAX_RECOMMENDED_LOCALE_VALUE_LEN})"
+                    )
+                });
             }
             if text
                 .chars()
                 .any(|ch| ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t')
             {
-                candidate.warnings.push(format!(
-                    "translation key '{merged_key}' contains control characters"
-                ));
+                push_warning(candidate, || {
+                    format!("translation key '{merged_key}' contains control characters")
+                });
             }
 
             output.insert(merged_key, text.to_string());
@@ -271,9 +312,32 @@ pub(super) fn flatten_locale_object_validated(
             continue;
         }
 
-        candidate.warnings.push(format!(
-            "translation key '{merged_key}' has invalid value type; only string/object are allowed, so the key is ignored"
-        ));
+        push_warning(candidate, || {
+            format!(
+                "translation key '{merged_key}' has invalid value type; only string/object are allowed, so the key is ignored"
+            )
+        });
+    }
+}
+
+/// Records a warning while the list is short; once it is full, one line says
+/// the rest went unlisted, so no file grows its report without bound.
+pub(super) fn push_warning(candidate: &mut LocaleCandidate, warning: impl FnOnce() -> String) {
+    let listed = candidate.warnings.len();
+    if listed < MAX_LOCALE_WARNINGS {
+        candidate.warnings.push(warning());
+    } else if listed == MAX_LOCALE_WARNINGS {
+        candidate
+            .warnings
+            .push("further warnings are not listed".to_string());
+    }
+}
+
+/// A name from the file as a report quotes it: at most 80 characters.
+pub(super) fn shown(text: &str) -> std::borrow::Cow<'_, str> {
+    match text.char_indices().nth(80) {
+        Some((at, _)) => std::borrow::Cow::Owned(format!("{}...", &text[..at])),
+        None => std::borrow::Cow::Borrowed(text),
     }
 }
 

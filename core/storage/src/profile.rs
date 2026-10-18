@@ -45,6 +45,8 @@ pub struct StorageTopology {
     pub state_db_path: PathBuf,
     /// Rebuildable per-adapter traffic-statistics database.
     pub traffic_db_path: PathBuf,
+    /// Rebuildable per-user connection-history database.
+    pub conn_history_db_path: PathBuf,
     /// General backup directory.
     pub backup_dir: PathBuf,
     /// Pre-migration backups go here so a failed migration can be rolled back.
@@ -83,6 +85,7 @@ pub fn resolve_storage_topology(profile: &StorageProfile) -> StorageResult<Stora
         cache_db_path: data_dir.join("nrr_fqdn_ip_cache.db"),
         state_db_path: data_dir.join("nrr_service_state.db"),
         traffic_db_path: data_dir.join("nrr_traffic_stats.db"),
+        conn_history_db_path: data_dir.join("nrr_conn_history.db"),
         migration_backup_dir: backup_dir.join("migrations"),
         temp_dir: data_dir.join("tmp"),
         lock_file_path: data_dir.join("nrr_service.lock"),
@@ -139,6 +142,10 @@ mod tests {
         assert_eq!(
             topology.traffic_db_path,
             dir.path().join("nrr_traffic_stats.db")
+        );
+        assert_eq!(
+            topology.conn_history_db_path,
+            dir.path().join("nrr_conn_history.db")
         );
         assert_eq!(topology.backup_dir, dir.path().join("backups"));
         assert_eq!(

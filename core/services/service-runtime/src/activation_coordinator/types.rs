@@ -179,7 +179,7 @@ pub struct DryRunSummary {
     pub estimated_duration_ms: u32,
 }
 
-/// Outcome of [`ActivationCoordinator::activate`] / `rollback_to`.
+/// Outcome of [`ActivationCoordinator::activate_over`] / `rollback_to`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActivationOutcome {
     /// All target SIDs succeeded; revision is now `Active`.
@@ -251,6 +251,8 @@ pub enum PolicyError {
     },
     /// The same network on both routes, both routing it: a tie.
     NetworkOnBothRoutes { network: String },
+    /// The same program folder in the same form on both routes: a tie.
+    FolderOnBothRoutes { folder: String },
     /// A submitted revision holds a rule whose shape enforcement cannot carry
     /// out (see `nrr_domain::rule_shape`). Refused at submission so it never
     /// becomes a stored candidate.
@@ -274,6 +276,9 @@ pub enum PolicyError {
     },
     /// Another activation held the machine-wide gate for the whole wait.
     ActivationBusy,
+    /// The write was built from rules that are no longer the ones in force:
+    /// applying it would undo whatever changed them.
+    RulesChangedElsewhere,
     /// The rules were applied but the activation could not be recorded, so
     /// they were reverted and the previous revision stays in force. The
     /// confirmation token is spent; retrying takes a new review.
@@ -350,6 +355,10 @@ impl std::fmt::Display for PolicyError {
                 f,
                 "the network {network} is on both routes; give it one route"
             ),
+            Self::FolderOnBothRoutes { folder } => write!(
+                f,
+                "the program folder {folder} is on both routes; give it one route"
+            ),
             Self::UnsupportedRuleShape { rule_id, reason } => write!(
                 f,
                 "rule {rule_id} has a shape enforcement cannot carry out ({reason})"
@@ -370,6 +379,9 @@ impl std::fmt::Display for PolicyError {
             }
             Self::ActivationBusy => {
                 f.write_str("another activation held the gate for the whole wait")
+            }
+            Self::RulesChangedElsewhere => {
+                f.write_str("the rules changed since the write was built from them")
             }
             Self::ActivationNotRecorded {
                 revision_id,

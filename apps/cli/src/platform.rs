@@ -93,6 +93,17 @@ pub fn is_elevation_refusal(_err: &std::io::Error) -> bool {
     false
 }
 
+/// The machine-scope environment for a command run elevated on a user's
+/// behalf: `%ProgramData%` and the rest as the machine sets them.
+#[cfg(windows)]
+pub fn use_machine_environment(command: &mut std::process::Command) {
+    nrr_platform_windows::machine_environment::apply_machine_environment(command);
+}
+
+/// `pkexec` already starts the elevated copy with a clean environment.
+#[cfg(not(windows))]
+pub fn use_machine_environment(_command: &mut std::process::Command) {}
+
 /// Creates the elevated relay's report: a new file, refused when a link could
 /// redirect the elevated write somewhere else.
 #[cfg(windows)]

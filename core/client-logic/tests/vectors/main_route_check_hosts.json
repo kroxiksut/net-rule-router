@@ -45,6 +45,11 @@
     ] }, "expected": ["maybe.example"] },
     { "name": "a bare star is nothing", "input": { "rows": [
       { "ruleType": "domain", "matchValue": "*.", "targetRoute": "secondary", "enabled": true }
-    ] }, "expected": [] }
+    ] }, "expected": [] },
+    { "name": "a site in every zone names no host", "input": { "rows": [
+      { "ruleType": "domain", "matchValue": "autodesk.*", "targetRoute": "secondary", "enabled": true },
+      { "ruleType": "domain", "matchValue": "*.Autodesk.*", "targetRoute": "secondary", "enabled": true },
+      { "ruleType": "domain", "matchValue": "autodesk.com", "targetRoute": "secondary", "enabled": true }
+    ] }, "expected": ["autodesk.com"] }
   ]
 }

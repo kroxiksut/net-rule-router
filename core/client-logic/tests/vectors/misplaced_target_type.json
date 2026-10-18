@@ -1,0 +1,16 @@
+{
+  "description": "rules.js misplacedTargetType / nrr_client_logic::rule_value_class::misplaced_target_type: the rule type a verdict's message key moves the value to, \"\" for any other key",
+  "cases": [
+    { "name": "zone", "input": { "key": "rules.validation.match-value-invalid.is-zone" }, "expected": "zone" },
+    { "name": "domain", "input": { "key": "rules.validation.match-value-invalid.is-domain" }, "expected": "domain" },
+    { "name": "exact ip", "input": { "key": "rules.validation.match-value-invalid.is-exact-ip" }, "expected": "exact-ip" },
+    { "name": "subnet", "input": { "key": "rules.validation.match-value-invalid.is-subnet" }, "expected": "subnet" },
+    { "name": "range", "input": { "key": "rules.validation.match-value-invalid.is-ip-range" }, "expected": "ip-range" },
+    { "name": "application", "input": { "key": "rules.validation.match-value-invalid.is-application" }, "expected": "application" },
+    { "name": "another refusal", "input": { "key": "rules.validation.match-value-invalid.domain" }, "expected": "" },
+    { "name": "prefix alone", "input": { "key": "rules.validation.match-value-invalid.is-" }, "expected": "" },
+    { "name": "no such type", "input": { "key": "rules.validation.match-value-invalid.is-port" }, "expected": "" },
+    { "name": "prefix not at the start", "input": { "key": "x.rules.validation.match-value-invalid.is-zone" }, "expected": "" },
+    { "name": "empty", "input": { "key": "" }, "expected": "" }
+  ]
+}

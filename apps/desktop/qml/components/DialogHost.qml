@@ -298,13 +298,14 @@ Item {
             })
             ownerRoot.emitPrefs()
             var shownName = String(displayName || "")
+            var statusName = Pure.displayText(shownName)
             ownerRoot.statusLine = (path !== "")
                 ? ownerRoot.tr("vpn-onboarding.confirmed-status",
                     "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
-                    .replace("{name}", shownName)
+                    .replace("{name}", statusName)
                 : ownerRoot.tr("vpn-onboarding.confirmed-status-no-path",
                     "Noted {name} as your VPN. Pick its program file to finish setup.")
-                    .replace("{name}", shownName)
+                    .replace("{name}", statusName)
             if (path !== "") {
                 var lpName = (shownName !== "")
                     ? shownName

@@ -66,7 +66,9 @@ impl ConnectionObservationConsumer {
             app_additional_link: None,
             connection_programs: Mutex::new(std::collections::HashMap::new()),
             torn_down_before: Mutex::new(HashSet::new()),
-            last_secondary_at: Mutex::new(None),
+            owner_secondary_at: Mutex::new(std::collections::HashMap::new()),
+            primary_egress_learning: None,
+            reverse_budget: Mutex::new((None, 0)),
             outage_announced: std::sync::atomic::AtomicBool::new(false),
             block_notice_name_for_address: None,
             block_notice_sink: None,
@@ -191,6 +193,14 @@ impl ConnectionObservationConsumer {
     /// blind spot under block-all. Without it the observer does not reverse-learn.
     pub fn with_reverse_dns_learner(mut self, learner: ReverseDnsLearnFn) -> Self {
         self.reverse_dns_learner = Some(learner);
+        self
+    }
+
+    /// Let a direct connection whose name nobody resolved be named by reverse
+    /// lookup, for an owner `learns` says collects suggestions. Without it the
+    /// observer never queries for a direct connection.
+    pub fn with_primary_egress_learning(mut self, learns: super::PrimaryEgressLearningFn) -> Self {
+        self.primary_egress_learning = Some(learns);
         self
     }
 

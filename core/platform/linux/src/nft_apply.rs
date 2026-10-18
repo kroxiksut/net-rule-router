@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use nftables::batch::Batch;
-use nftables::expr::{Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField};
+use nftables::expr::{Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, CT};
 use nftables::schema::{Chain, FlushObject, NfCmd, NfListObject, Nftables, Rule, Table};
 use nftables::stmt::{JumpTarget, Limit, Log, Match, Operator, Statement};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
@@ -353,6 +353,15 @@ fn render_match(m: &NftMatch) -> Statement<'static> {
         NftMatch::Mark(mark) => Statement::Match(Match {
             left: Expression::Named(NamedExpression::Meta(Meta { key: MetaKey::Mark })),
             right: Expression::Number(*mark),
+            op: Operator::EQ,
+        }),
+        NftMatch::CtReply => Statement::Match(Match {
+            left: Expression::Named(NamedExpression::CT(CT {
+                key: Cow::Borrowed("direction"),
+                family: None,
+                dir: None,
+            })),
+            right: Expression::String(Cow::Borrowed("reply")),
             op: Operator::EQ,
         }),
     }

@@ -179,7 +179,7 @@ GroupBox {
 
     function _adapterCaption(row) {
         if (!row) return ""
-        var name = group._adapterName(row)
+        var name = Pure.displayText(group._adapterName(row))
         if (group._holdsRoleNow(row)) return name
         return name + "  ·  " + root.tr("settings.traffic.role-not-current", "not in this role now")
     }
@@ -452,6 +452,7 @@ GroupBox {
                             color: root.mutedTextColor
                             font.pixelSize: root.uiTheme.baseFontSizePx - 1
                             elide: Text.ElideRight
+                            textFormat: Text.PlainText
                             text: (root.uiRevision >= 0 && roleBlock.g.collapsed)
                                 ? group._adapterCaption(roleBlock.g.adapters[0]) : ""
                         }
@@ -482,6 +483,7 @@ GroupBox {
                                         Layout.fillWidth: true
                                         color: root.textColor
                                         elide: Text.ElideRight
+                                        textFormat: Text.PlainText
                                         text: root.uiRevision >= 0
                                             ? group._adapterCaption(adapterRow.a) : ""
                                     }

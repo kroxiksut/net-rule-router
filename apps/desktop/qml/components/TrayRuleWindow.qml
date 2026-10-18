@@ -49,7 +49,7 @@ ApplicationWindow {
         return Rules.routeDisplayLabel(role, trayHost.routePrimaryLabel,
             trayHost.routeSecondaryLabel, tr)
     }
-    function routeRoleOptions(includeBlock) { return Rules.routeRoleOptions(includeBlock, routeLabel) }
+    function routeRoleOptions() { return Rules.routeRoleOptions(true, routeLabel, tr) }
     function ruleTypeLabel(id) { return support.ruleTypeLabel(id) }
     function _punycodeFor(host) { return support.aceCodec.hint(host) }
     function nextFreeRuleId() { return Rules.nextFreeRuleId(_rows) }
@@ -64,19 +64,30 @@ ApplicationWindow {
     function saveRule() {
         _submit([support.ruleRowFromDialog(ruleDialog, nextFreeRuleId())], false)
     }
-    function saveRuleList(entries) {
-        var items = []
-        for (var i = 0; i < entries.length; i += 1) {
-            items.push(support.ruleRowFromForm({
-                ruleType: String(entries[i]["rule-type"] || ""),
-                value: String(entries[i].value || ""),
-                route: ruleDialog.localRoute,
-                verify: ruleDialog.localVerify,
-                comment: ruleDialog.localComment,
-                enabled: ruleDialog.localEnabled
-            }, Rules.nextFreeRuleId(_rows.concat(items))))
+    /// The service counts its own limit; the form marks nothing over it here.
+    function bulkRuleRoom() { return -1 }
+    /// A pasted list of rules (`Rules.planBulkRules`): its new rules and the
+    /// moves the user ticked go to the service in one apply.
+    function saveBulkRules(plan) {
+        var adds = []
+        var moves = []
+        var rows = (plan && plan.rows) || []
+        var nextId = parseInt(Rules.nextFreeRuleId(_rows).substring(2), 10)
+        for (var i = 0; i < rows.length; i += 1) {
+            var r = rows[i]
+            if (r.action !== "add" && r.action !== "move") continue
+            var item = support.ruleRowFromForm({ ruleType: r.type, value: r.value, route: r.route,
+                verify: r.verify, comment: r.comment, enabled: r.enabled },
+                Rules.sequentialRuleId(nextId - 1 + adds.length))
+            // A line of an `--- Auto` section stays app-authored, as an import keeps it.
+            item.originReason = String(r.originReason || "")
+            item.originAnchor = String(r.originAnchor || "")
+            item.originAdded = String(r.originAdded || "")
+            if (r.action === "add") adds.push(item)
+            else moves.push(item)
         }
-        _submit(items, false)
+        _bulkRemaining = String((plan && plan.remaining) || "")
+        _submitBulk(adds, moves)
     }
 
     // ── Window ──
@@ -149,10 +160,14 @@ ApplicationWindow {
     // "changed-elsewhere" while this pane stands in for it.
     property string _state: ""
     property string _message: ""
-    /// Rules waiting for the user's answer to "move it to this route?".
+    /// Rules waiting for the user's answer to "change the existing rule?".
     property var _pendingItems: []
+    /// The answer's button, worded for a move, a deny or a lifted deny.
+    property string _moveLabel: ""
     /// The service's rules as table rows, read on open and again on save.
     property var _rows: []
+    /// What a pasted list left in the form, put back once the rest is applied.
+    property string _bulkRemaining: ""
 
     ColumnLayout {
         id: messagePane
@@ -166,6 +181,7 @@ ApplicationWindow {
             Layout.fillWidth: true
             Layout.preferredWidth: 0
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
             text: trayRuleWindow._message
             color: trayRuleWindow._state === "error" || trayRuleWindow._state === "changed-elsewhere"
                 ? trayRuleWindow.uiTheme.colorDanger : trayRuleWindow.textColor
@@ -181,7 +197,7 @@ ApplicationWindow {
                 visible: trayRuleWindow._state === "elsewhere"
                 theme: trayRuleWindow.uiTheme
                 highlighted: true
-                text: trayRuleWindow.tr("tray.add-rule.move", "Move to this route")
+                text: trayRuleWindow._moveLabel
                 onClicked: trayRuleWindow._submit(trayRuleWindow._pendingItems, true)
                 Accessible.name: text
             }
@@ -233,6 +249,7 @@ ApplicationWindow {
         _state = ""
         _message = ""
         _pendingItems = []
+        _bulkRemaining = ""
         Pure.clearModel(ruleTypesModel)
         var types = Rules.offeredRuleTypes((trayHost.context || {}).supportedRuleTypes || [],
             supports("appRouting"))
@@ -315,6 +332,12 @@ ApplicationWindow {
                 rows.push(row)
             }
             trayRuleWindow._rows = rows
+            // The rule is added to exactly these rules, or not at all.
+            var submitter = trayRuleWindow.trayHost ? trayRuleWindow.trayHost.rulesSubmitter : null
+            if (submitter) {
+                submitter.baseRevision = (payload["base-revision"] !== undefined
+                    && payload["base-revision"] !== null) ? String(payload["base-revision"]) : null
+            }
             if (done) done(true)
         })
     }
@@ -344,6 +367,7 @@ ApplicationWindow {
             }
             var plan = Rules.planRuleAddition(trayRuleWindow._rows, items, moveElsewhere)
             if (plan.elsewhere.length > 0 && !moveElsewhere) {
+                trayRuleWindow._moveLabel = trayRuleWindow._moveText(plan.elsewhere)
                 trayRuleWindow._setState("elsewhere", trayRuleWindow._elsewhereText(plan.elsewhere))
                 return
             }
@@ -356,17 +380,79 @@ ApplicationWindow {
         })
     }
 
+    /// The adds and the moves of a pasted list against the rules read again
+    /// now, sent as one rule book. A move whose rule is gone is added instead.
+    function _submitBulk(adds, moves) {
+        _pendingItems = []
+        _setState("busy", tr("tray.add-rule.saving", "Adding the rule\u2026"))
+        _loadRows(function(ok) {
+            if (!ok) {
+                trayRuleWindow._fail("error", tr("tray.add-rule.load-failed",
+                    "Could not read your rules from the service, so nothing was added. Check that the service is running."))
+                return
+            }
+            var first = Rules.planRuleAddition(trayRuleWindow._rows, adds, false)
+            var second = Rules.planRuleAddition(first.rows, moves, true)
+            var plan = {
+                rows: second.rows,
+                added: first.added + second.added,
+                changed: second.changed,
+                addedRows: first.addedRows.concat(second.addedRows),
+                movedRows: second.movedRows,
+                duplicates: first.duplicates.concat(second.duplicates),
+                elsewhere: second.elsewhere,
+                bulk: true
+            }
+            if (plan.added === 0 && plan.changed === 0) {
+                trayRuleWindow._setState("duplicate",
+                    tr("dialog.rule.duplicate-title", "Rule already exists"))
+                return
+            }
+            trayRuleWindow._send(plan)
+        })
+    }
+
+    // A deny is not a route: the messages below say "denied" where the
+    // existing or the chosen rule is one, and name a route only where it is.
+    function _deniedCount(elsewhere) {
+        var n = 0
+        for (var i = 0; i < elsewhere.length; i += 1) {
+            if (String(elsewhere[i].row.targetRoute) === "block") n += 1
+        }
+        return n
+    }
+
     function _elsewhereText(elsewhere) {
+        var denied = _deniedCount(elsewhere)
         if (elsewhere.length === 1) {
             var row = elsewhere[0].row
-            return tr("tray.add-rule.on-other-route",
+            var one = denied > 0
+                ? tr("tray.add-rule.already-denied", "{value} is already denied in your rules.")
+                : tr("tray.add-rule.on-other-route",
                     "{value} is already in your rules, on the route {route}.")
-                .replace("{value}", String(row.matchValue))
+            return one.replace("{value}", Pure.displayText(row.matchValue))
                 .replace("{route}", routeLabel(String(row.targetRoute)))
         }
-        return tr("tray.add-rule.on-other-route-many",
+        var many = String(elsewhere[0].item.targetRoute) === "block"
+            ? tr("tray.add-rule.on-a-route-many",
+                "{count} of these are already in your rules, on a route.")
+            : denied === elsewhere.length
+            ? tr("tray.add-rule.already-denied-many",
+                "{count} of these are already denied in your rules.")
+            : denied > 0
+            ? tr("tray.add-rule.on-other-route-or-denied-many",
+                "{count} of these are already in your rules, on the other route or denied.")
+            : tr("tray.add-rule.on-other-route-many",
                 "{count} of these are already in your rules, on another route.")
-            .replace("{count}", String(elsewhere.length))
+        return many.replace("{count}", String(elsewhere.length))
+    }
+
+    function _moveText(elsewhere) {
+        if (String(elsewhere[0].item.targetRoute) === "block")
+            return tr("tray.add-rule.deny-instead", "Deny instead")
+        if (_deniedCount(elsewhere) === elsewhere.length)
+            return tr("tray.add-rule.lift-deny", "Lift the deny, use this route")
+        return tr("tray.add-rule.move", "Move to this route")
     }
 
     function _send(plan) {
@@ -398,31 +484,81 @@ ApplicationWindow {
             if (String(touched[i].comment || "") !== "") support.writeComment(touched[i])
         }
         trayHost.boundFileWriter.mirrorServiceIntoFiles()
-        trayHost.noteAddRuleOutcome(_outcomeText(plan))
+        trayHost.noteAddRuleOutcome(plan.bulk === true ? _bulkOutcomeText(plan) : _outcomeText(plan),
+            Rules.additionUndoRecord(plan))
         _state = ""
+        // Lines a pasted list left behind come back into the form to be fixed.
+        if (plan.bulk === true && _bulkRemaining !== "" && visible) {
+            var remaining = _bulkRemaining
+            _bulkRemaining = ""
+            ruleDialog.resumeBulk(remaining)
+            ruleDialog.open()
+            return
+        }
         _closeSoon()
         _releaseIfIdle()
     }
 
-    function _outcomeText(plan) {
-        if (plan.added + plan.changed > 1) {
-            var text = tr("status.rules-list-added", "Rules added: {count}.")
-                .replace("{count}", String(plan.added))
-            if (plan.changed > 0) {
-                text += " " + tr("tray.add-rule.moved-count", "Moved to this route: {count}.")
-                    .replace("{count}", String(plan.changed))
-            }
-            return text
+    function _bulkOutcomeText(plan) {
+        var parts = [tr("status.rules-list-added", "Rules added: {count}.")
+            .replace("{count}", String(plan.added))]
+        if (plan.changed > 0) {
+            parts.push(tr("status.rules-list-moved", "Moved to the chosen route: {count}.")
+                .replace("{count}", String(plan.changed)))
         }
+        return parts.join(" ")
+    }
+
+    function _outcomeText(plan) {
         var row = plan.added > 0 ? plan.addedRows[0] : plan.movedRows[0]
-        var template = plan.added > 0
-            ? (row.enabled === false
-                ? tr("tray.add-rule.added-disabled",
+        var route = String(row.targetRoute)
+        var toDeny = route === "block"
+        // A confirmed move moved every `elsewhere` row; the denies among them are lifted.
+        var lifted = toDeny ? 0 : _deniedCount(plan.elsewhere)
+        if (plan.added + plan.changed > 1) {
+            var parts = []
+            if (plan.added > 0) {
+                parts.push((toDeny
+                    ? tr("tray.add-rule.added-deny-many", "Deny rules added: {count}.")
+                    : tr("status.rules-list-added", "Rules added: {count}."))
+                    .replace("{count}", String(plan.added)))
+            }
+            if (toDeny && plan.changed > 0) {
+                parts.push(tr("tray.add-rule.now-denied-count", "Now denied: {count}.")
+                    .replace("{count}", String(plan.changed)))
+            }
+            if (!toDeny && plan.changed - lifted > 0) {
+                parts.push(tr("tray.add-rule.moved-count", "Moved to this route: {count}.")
+                    .replace("{count}", String(plan.changed - lifted)))
+            }
+            if (lifted > 0) {
+                parts.push(tr("tray.add-rule.deny-lifted-count",
+                        "Deny lifted, now over {route}: {count}.")
+                    .replace("{route}", routeLabel(route))
+                    .replace("{count}", String(lifted)))
+            }
+            return parts.join(" ")
+        }
+        var template
+        if (plan.added > 0 && row.enabled === false) {
+            template = toDeny
+                ? tr("tray.add-rule.added-deny-disabled",
+                    "Rule added, switched off: deny {value}. It does not deny anything until you switch it on.")
+                : tr("tray.add-rule.added-disabled",
                     "Rule added, switched off: {value} → {route}. It does not route anything until you switch it on.")
-                : tr("tray.add-rule.added", "Rule added: {value} → {route}"))
-            : tr("tray.add-rule.moved", "Rule moved: {value} → {route}")
+        } else if (plan.added > 0) {
+            template = toDeny
+                ? tr("tray.add-rule.added-deny", "Rule added: {value} denied.")
+                : tr("tray.add-rule.added", "Rule added: {value} → {route}")
+        } else {
+            template = toDeny
+                ? tr("tray.add-rule.moved-deny", "Rule changed: {value} is now denied.")
+                : lifted > 0
+                ? tr("tray.add-rule.deny-lifted", "Deny lifted: {value} → {route}")
+                : tr("tray.add-rule.moved", "Rule moved: {value} → {route}")
+        }
         return template.replace("{value}", String(row.matchValue))
-            .replace("{route}", routeLabel(String(row.targetRoute)))
+            .replace("{route}", routeLabel(route))
     }
 
     function _failed(r) {
@@ -435,6 +571,61 @@ ApplicationWindow {
         }
         _fail("error", typeof submitter.describeFailure === "function"
             ? submitter.describeFailure(r, tr) : String(reason))
+    }
+
+    /// Take back the add `record` describes (`Rules.additionUndoRecord`), as
+    /// one more ordinary apply: a rule it added leaves, a rule it moved goes
+    /// back. A rule changed since is left alone and the user is told.
+    function undoAddition(record) {
+        if (_state === "busy") return
+        _setState("busy", tr("tray.add-rule.undoing", "Undoing\u2026"))
+        _loadRows(function(ok) {
+            if (!ok) {
+                trayRuleWindow._undoDone(tr("tray.add-rule.undo-load-failed",
+                    "Could not read your rules from the service, so nothing was undone. Check that the service is running."))
+                return
+            }
+            var plan = Rules.planAdditionUndo(trayRuleWindow._rows, record)
+            if (plan.conflict) {
+                trayRuleWindow._undoDone(tr("tray.add-rule.undo-changed",
+                    "The rule has been changed since, so nothing was undone."))
+                return
+            }
+            var json = ""
+            try {
+                json = Rules.buildRulesJson(plan.rows, support.aceCodec.encode)
+            } catch (err) {
+                console.error("tray add-rule undo: rules serialization failed:", err)
+            }
+            var submitter = trayRuleWindow.trayHost.rulesSubmitter
+            if (!json || !submitter || typeof submitter.applyNow !== "function") {
+                trayRuleWindow._undoDone(tr("status.rules-serialize-failed",
+                    "Internal error while preparing rules \u2014 see logs"))
+                return
+            }
+            submitter.applyNow(json, "tray-add-rule-undo",
+                { added: 0, removed: plan.removed, changed: plan.restored },
+                function(applied, r) {
+                    if (applied) {
+                        trayRuleWindow.trayHost.boundFileWriter.mirrorServiceIntoFiles()
+                        trayRuleWindow._undoDone(tr("tray.add-rule.undone", "Undone: the rules are as they were."))
+                    } else if (String((r && r.reason) || "") === "unexpected-diff") {
+                        trayRuleWindow._undoDone(tr("tray.add-rule.undo-changed",
+                            "The rule has been changed since, so nothing was undone."))
+                    } else {
+                        trayRuleWindow._undoDone(typeof submitter.describeFailure === "function"
+                            ? submitter.describeFailure(r, tr) : String((r && r.reason) || ""))
+                    }
+                })
+        })
+    }
+
+    function _undoDone(message) {
+        _state = ""
+        _message = ""
+        trayHost.noteAddRuleOutcome(message, null)
+        if (visible) ruleDialog.open()
+        _releaseIfIdle()
     }
 
     /// Said here, or as a tray notice when the user already closed the window.

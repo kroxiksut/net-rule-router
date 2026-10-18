@@ -174,25 +174,29 @@ pub fn decode_response(
     let rcode = (flags & 0x000F) as u8;
     let question_count = u16::from_be_bytes([message[4], message[5]]);
     let answer_count = u16::from_be_bytes([message[6], message[7]]);
+    let asked = canonical_name(asked);
 
-    let mut at = 12;
-    for _ in 0..question_count {
-        let (name, next) = read_name(message, at)?;
-        // The question is echoed back; a mismatch means this datagram is not
-        // about our name, whatever else it claims.
-        let echoed_type = message
-            .get(next..next + 2)
-            .map(|t| u16::from_be_bytes([t[0], t[1]]));
-        if question_count == 1 && (name != canonical_name(asked) || echoed_type != Some(want)) {
-            return Err(DnsDecodeError::WrongQuestion {
-                asked: canonical_name(asked),
-                answered: name,
-            });
-        }
-        at = next + 4; // qtype + qclass
-        if at > message.len() {
-            return Err(DnsDecodeError::Truncated);
-        }
+    // Exactly our one question, echoed: a reply with none, or with a second
+    // one to hide ours among, answers nothing we asked.
+    if question_count != 1 {
+        return Err(DnsDecodeError::WrongQuestion {
+            asked,
+            answered: String::new(),
+        });
+    }
+    let (name, next) = read_name(message, 12)?;
+    let echoed_type = message
+        .get(next..next + 2)
+        .map(|t| u16::from_be_bytes([t[0], t[1]]));
+    if name != asked || echoed_type != Some(want) {
+        return Err(DnsDecodeError::WrongQuestion {
+            asked,
+            answered: name,
+        });
+    }
+    let mut at = next + 4; // qtype + qclass
+    if at > message.len() {
+        return Err(DnsDecodeError::Truncated);
     }
 
     match rcode {
@@ -202,38 +206,51 @@ pub fn decode_response(
         other => return Ok(DnsAnswer::ServerFailure { rcode: other }),
     }
 
-    let mut addresses = Vec::new();
-    let mut min_ttl = u32::MAX;
+    let mut records = Vec::new();
     for _ in 0..answer_count {
-        let (_name, after_name) = read_name(message, at)?;
+        let (owner, after_name) = read_name(message, at)?;
         let header_end = after_name + 10;
         if header_end > message.len() {
             return Err(DnsDecodeError::Truncated);
         }
-        let rtype = u16::from_be_bytes([message[after_name], message[after_name + 1]]);
-        let rclass = u16::from_be_bytes([message[after_name + 2], message[after_name + 3]]);
-        let ttl = u32::from_be_bytes([
-            message[after_name + 4],
-            message[after_name + 5],
-            message[after_name + 6],
-            message[after_name + 7],
-        ]);
         let rdlength =
             u16::from_be_bytes([message[after_name + 8], message[after_name + 9]]) as usize;
         let rdata_end = header_end + rdlength;
         if rdata_end > message.len() {
             return Err(DnsDecodeError::Truncated);
         }
-        if rclass == CLASS_IN && rtype == want && rdlength == want_rdlength {
-            addresses.push(address_from(&message[header_end..rdata_end]));
-            min_ttl = min_ttl.min(ttl);
-        } else if rclass == CLASS_IN && rtype == TYPE_CNAME {
-            // The alias itself is not an address; its own A records follow in
-            // the same answer section, so the chain needs no separate walk. The
-            // TTL still counts: the answer is only good while the alias is.
-            min_ttl = min_ttl.min(ttl);
-        }
+        records.push(AnswerRecord {
+            owner,
+            rtype: u16::from_be_bytes([message[after_name], message[after_name + 1]]),
+            rclass: u16::from_be_bytes([message[after_name + 2], message[after_name + 3]]),
+            ttl: u32::from_be_bytes([
+                message[after_name + 4],
+                message[after_name + 5],
+                message[after_name + 6],
+                message[after_name + 7],
+            ]),
+            rdata: header_end..rdata_end,
+        });
         at = rdata_end;
+    }
+
+    // A record answers our question only under the asked name or a name its
+    // CNAME chain reaches; anything else could pin an address under a name
+    // the server was never asked about.
+    let owners = owner_closure(message, &records, &asked);
+    let mut addresses = Vec::new();
+    let mut min_ttl = u32::MAX;
+    for record in records
+        .iter()
+        .filter(|r| r.rclass == CLASS_IN && owners.contains(r.owner.as_str()))
+    {
+        if record.rtype == want && record.rdata.len() == want_rdlength {
+            addresses.push(address_from(&message[record.rdata.clone()]));
+            min_ttl = min_ttl.min(record.ttl);
+        } else if record.rtype == TYPE_CNAME {
+            // The answer is only good while the alias is.
+            min_ttl = min_ttl.min(record.ttl);
+        }
     }
 
     if addresses.is_empty() {
@@ -244,6 +261,51 @@ pub fn decode_response(
         // `min_ttl` cannot still be MAX here: an address always sets it.
         min_ttl,
     })
+}
+
+/// One answer-section record, header decoded, RDATA left in the message.
+struct AnswerRecord {
+    owner: String,
+    rtype: u16,
+    rclass: u16,
+    ttl: u32,
+    rdata: std::ops::Range<usize>,
+}
+
+/// Longest alias chain followed. Resolvers stop well below this; the bound
+/// keeps a hostile answer full of aliases from costing a pass per record.
+const MAX_CNAME_CHAIN: usize = 16;
+
+/// The asked name plus every name its CNAME records in this answer reach, in
+/// whatever order the server wrote them.
+fn owner_closure(
+    message: &[u8],
+    records: &[AnswerRecord],
+    asked: &str,
+) -> std::collections::HashSet<String> {
+    let aliases: Vec<(&str, String)> = records
+        .iter()
+        .filter(|r| r.rclass == CLASS_IN && r.rtype == TYPE_CNAME)
+        .filter_map(|r| {
+            read_name(message, r.rdata.start)
+                .ok()
+                .map(|(target, _)| (r.owner.as_str(), target))
+        })
+        .collect();
+    let mut owners = std::collections::HashSet::from([asked.to_owned()]);
+    for _ in 0..MAX_CNAME_CHAIN {
+        let mut grew = false;
+        for (owner, target) in &aliases {
+            if owners.contains(*owner) && !owners.contains(target) {
+                owners.insert(target.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    owners
 }
 
 /// Read a (possibly compressed) name, returning it and the offset just past the
@@ -540,6 +602,107 @@ mod tests {
         assert_eq!(
             decode_response(&message, 1, "example.com", AddressFamily::Ipv4),
             Err(DnsDecodeError::Truncated)
+        );
+    }
+
+    fn cname_record(owner: &[u8], target: &[&str], ttl: u32) -> Vec<u8> {
+        let mut r = owner.to_vec();
+        r.extend_from_slice(&TYPE_CNAME.to_be_bytes());
+        r.extend_from_slice(&CLASS_IN.to_be_bytes());
+        r.extend_from_slice(&ttl.to_be_bytes());
+        let target = name(target);
+        r.extend_from_slice(&(target.len() as u16).to_be_bytes());
+        r.extend_from_slice(&target);
+        r
+    }
+
+    fn a_record_named(owner: &[&str], ttl: u32, ip: [u8; 4]) -> Vec<u8> {
+        let mut r = name(owner);
+        r.extend_from_slice(&a_record(ttl, ip)[2..]);
+        r
+    }
+
+    /// A forged answer that carries no question, or hides ours behind a
+    /// second one, is not an answer to ours.
+    #[test]
+    fn a_reply_without_exactly_our_question_is_rejected() {
+        let mut none = header(9, 0x8180, 0, 1);
+        none.extend_from_slice(&a_record_named(&["example", "com"], 60, [203, 0, 113, 9]));
+        assert!(matches!(
+            decode_response(&none, 9, "example.com", AddressFamily::Ipv4),
+            Err(DnsDecodeError::WrongQuestion { .. })
+        ));
+
+        let mut two = header(9, 0x8180, 2, 1);
+        for host in [["other", "test"], ["example", "com"]] {
+            two.extend_from_slice(&name(&host));
+            two.extend_from_slice(&TYPE_A.to_be_bytes());
+            two.extend_from_slice(&CLASS_IN.to_be_bytes());
+        }
+        two.extend_from_slice(&a_record_named(&["example", "com"], 60, [203, 0, 113, 9]));
+        assert!(matches!(
+            decode_response(&two, 9, "example.com", AddressFamily::Ipv4),
+            Err(DnsDecodeError::WrongQuestion { .. })
+        ));
+    }
+
+    /// An address filed under a name the question's alias chain never reaches
+    /// is dropped, so a reply cannot pin an address under someone else's name.
+    #[test]
+    fn an_address_under_an_unrelated_owner_is_not_believed() {
+        let message = response(
+            11,
+            &[
+                a_record_named(&["victim", "example", "org"], 60, [203, 0, 113, 66]),
+                a_record(60, [192, 0, 2, 4]),
+            ],
+            0,
+        );
+        assert_eq!(
+            decode_response(&message, 11, "example.com", AddressFamily::Ipv4),
+            Ok(DnsAnswer::Addresses {
+                addresses: vec![v4(192, 0, 2, 4)],
+                min_ttl: 60,
+            })
+        );
+
+        let only_forged = response(
+            12,
+            &[a_record_named(
+                &["victim", "example", "org"],
+                60,
+                [203, 0, 113, 66],
+            )],
+            0,
+        );
+        assert_eq!(
+            decode_response(&only_forged, 12, "example.com", AddressFamily::Ipv4),
+            Ok(DnsAnswer::NoAddresses)
+        );
+    }
+
+    /// The chain is followed whatever order the server writes it in.
+    #[test]
+    fn an_address_reached_through_the_alias_chain_is_kept_in_any_order() {
+        let message = response(
+            13,
+            &[
+                a_record_named(&["edge", "example", "net"], 120, [192, 0, 2, 77]),
+                cname_record(&[0xC0, 0x0C], &["cdn", "example", "net"], 40),
+                cname_record(
+                    &name(&["cdn", "example", "net"]),
+                    &["edge", "example", "net"],
+                    50,
+                ),
+            ],
+            0,
+        );
+        assert_eq!(
+            decode_response(&message, 13, "example.com", AddressFamily::Ipv4),
+            Ok(DnsAnswer::Addresses {
+                addresses: vec![v4(192, 0, 2, 77)],
+                min_ttl: 40,
+            })
         );
     }
 

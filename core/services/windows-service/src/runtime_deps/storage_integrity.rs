@@ -211,9 +211,38 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
             _ => None,
         };
 
+    // What the installer staged lands in the baseline before any pass reads it.
+    if let (Some(coord), Some(conn)) = (activation_coordinator.as_ref(), settings_conn.as_ref()) {
+        apply_provisioning(coord, conn, artifacts.audit_writer.as_deref());
+    }
+
     StorageIntegrity {
         activation_coordinator,
         revision_watch,
         block_notice_rule_author,
     }
+}
+
+/// Through its own executor, as the rule author above: no IPC handler stands
+/// in front of it, so the tamper gate is wired here.
+fn apply_provisioning(
+    coord: &Arc<ActivationCoordinator>,
+    conn: &Arc<Mutex<Connection>>,
+    audit: Option<&nrr_diagnostics::AuditWriter>,
+) {
+    use nrr_service_runtime::provisioning::{apply_staged, ProvisionApplier};
+    let Some(dir) = nrr_platform_api::paths::production_provision_dir() else {
+        return;
+    };
+    let alerts = ProductionSecurityAlertsRepository::new(Arc::clone(conn));
+    let executor = ProductionMutationExecutor::new(Arc::clone(coord))
+        .with_state_conn(Arc::clone(conn))
+        .with_alerts_repo(
+            Arc::new(ProductionSecurityAlertsRepository::new(Arc::clone(conn)))
+                as Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository>,
+        );
+    let mut applier = ProvisionApplier::new(&executor, conn);
+    applier.audit = audit;
+    applier.alerts = Some(&alerts);
+    let _ = apply_staged(&dir, &applier);
 }

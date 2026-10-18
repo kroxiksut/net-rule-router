@@ -1,5 +1,5 @@
 Service: OK
-┌> Screens─────────────────┐┌Addresses your sites need─────────────────────────┐
+╭> Screens─────────────────╮╭Addresses your sites need─────────────────────────╮
 │  1 Status                ││These addresses were pulled in by sites you route.│
 │  2 First run             ││Adding one sends it through the additional route  │
 │  3 Interfaces and routes ││together with the site that needs it. Anything you│
@@ -11,8 +11,8 @@ Service: OK
 │  9 Diagnostics and logs  ││No                                                │
 │  0 Settings              ││                                                  │
 │                          ││                                                  │
-│                          │└──────────────────────────────────────────────────┘
-│                          │┌Suggested addresses───────────────────────────────┐
+│                          │╰──────────────────────────────────────────────────╯
+│                          │╭Suggested addresses───────────────────────────────╮
 │                          ││1. example.org — Pending (1)                      │
 │                          ││   Needed by: news.example, shop.example          │
 │                          ││   *.video.example.org — Pending; connections to  │
@@ -20,5 +20,5 @@ Service: OK
 │                          ││     keeps appearing together with the site · seen│
 │                          ││in 4 visits · belongs to this site 75% of the time│
 │                          ││     The rule covers every name under             │
-└──────────────────────────┘└──────────────────────────────────────────────────┘
+╰──────────────────────────╯╰──────────────────────────────────────────────────╯
 F1: help   q: quit

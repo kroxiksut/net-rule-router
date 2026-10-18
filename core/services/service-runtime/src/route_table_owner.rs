@@ -10,21 +10,20 @@ use std::sync::{Arc, Mutex};
 use nrr_platform_api::active_principals::PresentPrincipal;
 use nrr_platform_api::enforcement::UserPrincipal;
 
-/// The person at the machine (the active session on a seat); with nobody at a
-/// seat, whoever signed in first; with no sign-in times, the first the authority
-/// named. Several at seats (multi-seat): the earliest of them.
+/// Whoever signed in first, as on every platform: someone sitting down later
+/// never takes the system's traffic from a user already working (over SSH, say).
+/// Only between equal sign-in times does the person at a seat win; with no
+/// times at all, the first the authority named.
 pub fn choose_route_table_owner(present: &[PresentPrincipal]) -> Option<&UserPrincipal> {
-    earliest(present.iter().filter(|p| p.at_seat))
-        .or_else(|| earliest(present.iter()))
-        .map(|p| &p.principal)
+    earliest(present.iter()).map(|p| &p.principal)
 }
 
-/// `min_by_key` keeps the first of equals, so ties follow the authority's order;
-/// an unknown time sorts after every known one.
+/// `min_by_key` keeps the first of equals, so remaining ties follow the
+/// authority's order; an unknown time sorts after every known one.
 fn earliest<'a>(
     candidates: impl Iterator<Item = &'a PresentPrincipal>,
 ) -> Option<&'a PresentPrincipal> {
-    candidates.min_by_key(|p| (p.signed_in_at.is_none(), p.signed_in_at))
+    candidates.min_by_key(|p| (p.signed_in_at.is_none(), p.signed_in_at, !p.at_seat))
 }
 
 /// The owner the last enforcement pass chose, shared with whatever must act for
@@ -33,6 +32,8 @@ fn earliest<'a>(
 #[derive(Default)]
 pub struct RouteTableOwner {
     owner: Mutex<Option<UserPrincipal>>,
+    /// Everyone the same pass served, owner first.
+    served: Mutex<Vec<UserPrincipal>>,
 }
 
 pub type RouteTableOwnerReader = Arc<dyn Fn() -> Option<UserPrincipal> + Send + Sync>;
@@ -40,6 +41,28 @@ pub type RouteTableOwnerReader = Arc<dyn Fn() -> Option<UserPrincipal> + Send + 
 impl RouteTableOwner {
     pub fn current(&self) -> Option<UserPrincipal> {
         self.lock().clone()
+    }
+
+    /// Everyone the last pass served, owner first: whoever the local resolver
+    /// answers for, since a query carries no trace of who asked.
+    pub fn served(&self) -> Vec<UserPrincipal> {
+        self.served
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Record who this pass served.
+    pub fn record_served(&self, served: &[UserPrincipal]) {
+        let owner = self.current();
+        let mut ordered: Vec<UserPrincipal> = owner.iter().cloned().collect();
+        ordered.extend(
+            served
+                .iter()
+                .filter(|p| Some(*p) != owner.as_ref())
+                .cloned(),
+        );
+        *self.served.lock().unwrap_or_else(|p| p.into_inner()) = ordered;
     }
 
     /// A reader for a consumer that should not depend on this type.
@@ -93,8 +116,29 @@ mod tests {
     }
 
     #[test]
-    fn the_person_at_the_seat_owns_it_even_when_others_came_first() {
+    fn the_served_list_names_everyone_owner_first() {
+        let owner = RouteTableOwner::default();
+        let (a, b) = (
+            UserPrincipal::from_linux_uid(1000),
+            UserPrincipal::from_linux_uid(1001),
+        );
+        owner.record(Some(&b));
+        owner.record_served(&[a.clone(), b.clone()]);
+        assert_eq!(owner.served(), vec![b, a]);
+        owner.record(None);
+        owner.record_served(&[]);
+        assert!(owner.served().is_empty());
+    }
+
+    #[test]
+    fn whoever_signed_in_first_keeps_it_when_someone_sits_down_later() {
         let present = [user(1000, false, Some(10)), user(1001, true, Some(90))];
+        assert_eq!(owner_uid(&present), Some(1000));
+    }
+
+    #[test]
+    fn the_seat_wins_only_between_equal_sign_in_times() {
+        let present = [user(1000, false, Some(10)), user(1001, true, Some(10))];
         assert_eq!(owner_uid(&present), Some(1001));
     }
 
@@ -109,13 +153,13 @@ mod tests {
     }
 
     #[test]
-    fn several_seats_go_to_the_earliest_of_them() {
+    fn several_seats_never_outrank_an_earlier_sign_in() {
         let present = [
             user(1000, false, Some(1)),
             user(1001, true, Some(40)),
             user(1002, true, Some(30)),
         ];
-        assert_eq!(owner_uid(&present), Some(1002));
+        assert_eq!(owner_uid(&present), Some(1000));
     }
 
     #[test]
@@ -128,7 +172,7 @@ mod tests {
 
     #[test]
     fn when_the_owner_leaves_the_next_one_takes_over() {
-        let mut present = vec![user(1000, true, Some(30)), user(1001, false, Some(10))];
+        let mut present = vec![user(1000, false, Some(10)), user(1001, true, Some(30))];
         assert_eq!(owner_uid(&present), Some(1000));
         present.remove(0);
         assert_eq!(owner_uid(&present), Some(1001));

@@ -102,6 +102,52 @@ pub fn untrusted_writer(binary: &Path) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// Who besides the trusted accounts could have written `file` or swapped it,
+/// if anyone. A reparse point at the file or its folder counts: what it points
+/// at is not what an administrator placed. Adding new files to the folder does
+/// not: ProgramData lets every user do that, and it changes no existing file.
+pub fn untrusted_author(file: &Path) -> Result<Option<String>, String> {
+    let dir = file.parent();
+    for path in std::iter::once(file).chain(dir) {
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|e| format!("inspect {}: {e}", path.display()))?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Ok(Some(format!("{} is a link", path.display())));
+        }
+    }
+    if !std::fs::symlink_metadata(file)
+        .map_err(|e| format!("inspect {}: {e}", file.display()))?
+        .is_file()
+    {
+        return Ok(Some(format!("{} is not a regular file", file.display())));
+    }
+    if let Some(found) = untrusted_rights(file, REPLACES_FILE)? {
+        return Ok(Some(format!("{found} can change {}", file.display())));
+    }
+    for ancestor in dir.into_iter().flat_map(Path::ancestors) {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        if let Some(found) = untrusted_rights(ancestor, REPLACES_SUBTREE)? {
+            return Ok(Some(format!(
+                "{found} can replace what is inside {}",
+                ancestor.display()
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// [`untrusted_author`] behind the neutral port.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsAdminAuthoredFiles;
+
+impl nrr_platform_api::admin_authored::AdminAuthoredFiles for WindowsAdminAuthoredFiles {
+    fn untrusted_because(&self, path: &Path) -> Option<String> {
+        untrusted_author(path).unwrap_or_else(Some)
+    }
+}
+
 /// Why the service tree could not be locked down.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LockdownError {
@@ -250,7 +296,7 @@ fn untrusted_rights(path: &Path, rights: u32) -> Result<Option<String>, String> 
     unsafe {
         for index in 0..u32::from((*dacl).AceCount) {
             let mut ace = std::ptr::null_mut();
-            if GetAce(dacl, index, &mut ace).is_err() {
+            if GetAce(dacl, index, &mut ace).is_err() || ace.is_null() {
                 continue;
             }
             let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
@@ -408,6 +454,19 @@ mod tests {
             found.is_some(),
             "a directory the test user owns is not trusted"
         );
+    }
+
+    #[test]
+    fn a_file_a_user_could_have_placed_has_an_untrusted_author_and_a_system_file_does_not() {
+        assert_eq!(
+            untrusted_author(&crate::system_shell::system32_exe("cmd.exe")),
+            Ok(None)
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sheet = dir.path().join("first-run.json");
+        std::fs::write(&sheet, b"{}").expect("write");
+        own_by_this_user(dir.path());
+        assert!(untrusted_author(&sheet).expect("readable").is_some());
     }
 
     #[test]

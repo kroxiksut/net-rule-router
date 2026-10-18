@@ -1,8 +1,9 @@
 //! The audit trail for privileged IPC requests.
 //!
-//! The router records every state-changing request BEFORE the handler runs, and
-//! treats a failed write as a refusal: an operation that cannot be accounted for
-//! does not happen. That safeguard was inert — the only implementation of the
+//! The router records every state-changing request its handler's precheck
+//! accepted, BEFORE the handler acts, and treats a failed write as a refusal: an
+//! operation that cannot be accounted for does not happen. A request refused by
+//! its precheck leaves no record. That safeguard was inert — the only implementation of the
 //! emitter trait in the tree was the no-op one, wired into both production
 //! builds, so the trail existed on paper and nowhere else.
 //!

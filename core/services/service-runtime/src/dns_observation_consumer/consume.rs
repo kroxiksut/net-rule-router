@@ -23,6 +23,9 @@ impl DnsObservationConsumer {
         if others.is_empty() {
             return self.consume_for(lead, observations, now, None);
         }
+        // With several users served, only a lookup known to be the lead's
+        // teaches the lead: a suggestion built from another user's browsing
+        // would show one user where the other went.
         let mut kept = vec![false; observations.len()];
         let mut summary = self.consume_for(lead, observations, now, Some(&mut kept));
         for sid in others {
@@ -77,12 +80,17 @@ impl DnsObservationConsumer {
                     StorageResolutionSource::Dns,
                     summary,
                 );
+                if crate::any_zone_sites::opens_a_zone(&snapshot.rule_book, &obs.hostname) {
+                    crate::any_zone_sites::note_new_zone();
+                }
             }
         }
     }
 
     /// The full treatment of a batch for `sid`. `kept`, when given, marks each
-    /// observation cached for `sid`, so another principal's pass skips it.
+    /// observation cached for `sid`, so another principal's pass skips it; it
+    /// also means several users are served, and then only an observation
+    /// owned by `sid` feeds `sid`'s learning and suggestions.
     fn consume_for(
         &self,
         sid: &str,
@@ -130,10 +138,16 @@ impl DnsObservationConsumer {
         // counts them and says it once at the end.
         let mut fake_intercepted: BTreeSet<&str> = BTreeSet::new();
         let mut loopback_pinned: BTreeSet<&str> = BTreeSet::new();
+        let several_served = kept.is_some();
         for (index, obs) in observations.iter().enumerate() {
             if obs.ipv4s.is_empty() {
                 continue;
             }
+            let teaches = !several_served
+                || obs
+                    .owner
+                    .as_deref()
+                    .is_some_and(|owner| owner.eq_ignore_ascii_case(&sid));
             // Every source lands here, ETW strings included: a name with
             // markup in it never reaches the cache or a screen that lists it.
             if !obs
@@ -175,7 +189,7 @@ impl DnsObservationConsumer {
                     // rule match runs only when a principal actually collects
                     // (`learning` is `None` when the mode is off), so this costs
                     // nothing on the default path.
-                    if let Some(batch) = learning.as_mut() {
+                    if let Some(batch) = learning.as_mut().filter(|_| teaches) {
                         let secondary =
                             rule_set_match_origin(&obs.hostname, &snapshot.rule_book.secondary);
                         let primary =
@@ -202,7 +216,7 @@ impl DnsObservationConsumer {
             // exactly the case the user otherwise has to diagnose and add by
             // hand. The engine applies its own exclusions, and the main-link
             // probe still gets to disagree before the user is asked.
-            if crate::dns_address_sanity::is_provider_placeholder_answer(&obs.ipv4s) {
+            if teaches && crate::dns_address_sanity::is_provider_placeholder_answer(&obs.ipv4s) {
                 // Parked, not offered: the same answer goes to a name a page
                 // prefetched and to one the user opened, and only the second
                 // one is followed by a connection. See
@@ -251,7 +265,7 @@ impl DnsObservationConsumer {
             // so learning adds no matching work. Hosts pinned to loopback by an
             // ad-blocking hosts file never reach here (the `routable` filter
             // above already dropped them) and so can never be suggested.
-            if let Some(batch) = learning.as_mut() {
+            if let Some(batch) = learning.as_mut().filter(|_| teaches) {
                 batch.observe(
                     batch_ms.saturating_add(index as u64),
                     &obs.hostname,
@@ -265,7 +279,7 @@ impl DnsObservationConsumer {
                 if let Some(kept) = kept.as_deref_mut() {
                     kept[index] = true;
                 }
-                if let Some(engine) = self.auto_rules.as_ref() {
+                if let Some(engine) = self.auto_rules.as_ref().filter(|_| teaches) {
                     engine.note_verify_candidate(&sid, &obs.hostname, &routable);
                 }
                 self.upsert_counted(
@@ -275,6 +289,10 @@ impl DnsObservationConsumer {
                     StorageResolutionSource::Dns,
                     &mut summary,
                 );
+                // Cached first, so the rebuilt book finds the new zone.
+                if crate::any_zone_sites::opens_a_zone(&snapshot.rule_book, &obs.hostname) {
+                    crate::any_zone_sites::note_new_zone();
+                }
             } else {
                 summary.ignored = summary.ignored.saturating_add(1);
                 // Discarded from the CACHE, kept as a name. An address

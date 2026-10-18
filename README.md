@@ -17,6 +17,7 @@ Windows builds today; Linux is in progress, macOS next.
 [![linux-quality](https://github.com/kroxiksut/net-rule-router/actions/workflows/linux-quality.yml/badge.svg?branch=main)](https://github.com/kroxiksut/net-rule-router/actions/workflows/linux-quality.yml)
 ![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fkroxiksut%2Fnet-rule-router%2Fmain%2Frust-toolchain.toml&query=%24.toolchain.channel&label=rust&color=orange)
 ![Platform: Windows, Linux in progress](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20(in%20progress)-0078D6.svg)
+![Languages: English, Russian](https://img.shields.io/badge/languages-EN%20%7C%20RU-informational.svg)
 ![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-red.svg)
 
 **English** · [Русский](README_RU.md)
@@ -82,17 +83,35 @@ The full walkthrough, including what to do if you lose network access, is in
 versions it runs on, and which have been checked, is in
 [`docs/en/supported-systems.md`](docs/en/supported-systems.md).
 
+## Verifying a download
+
+The installers and archives are not code-signed yet, so Windows may warn the
+first time one starts. For every file of a release GitHub keeps a record of
+the build and the commit it came from, so you can confirm that the file you
+downloaded is exactly what this repository's release build produced, without
+trusting the page you downloaded it from:
+
+```sh
+gh attestation verify <file> --repo kroxiksut/net-rule-router
+```
+
+This needs the GitHub CLI (`gh`), signed in with `gh auth login`. A file
+changed after the build, or built anywhere else, fails the check. For a quick
+check of the checksums, `SHA256SUMS` comes with the files:
+`sha256sum -c SHA256SUMS` (in PowerShell, compare with `Get-FileHash <file>`).
+
 ## Highlights
 
 - **Two-route model** — a `primary` and an additional route, one active config at a time.
-- **Six ways to match traffic** — by exact domain, by domain with all its subdomains, by exact IPv4 or IPv6 address, by subnet or address range, by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), or by application (the process name).
+- **Seven ways to match traffic** — by exact domain, by domain with all its subdomains, by a site in every zone (`bank.*`), by exact IPv4 or IPv6 address, by subnet or address range, by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), or by application (the program's name, or the file or folder it is installed in).
 - **Traffic statistics** — how much went through each connection today, during the current session of the additional connection and over every day kept (you choose how many), with a CSV export for any period.
-- **Per-name routing** — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
+- **Per-name routing** *(Windows, off by default: Settings → Routing)* — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
 - **Leak protection** — if the additional route goes down, matching traffic is held rather than silently leaking to `primary`.
+- **Deny** — a site, an address, a subnet or a program you deny is not let through any connection: put `!` before it in a rules file, or choose "Deny" when you add a rule in the window, the tray or the terminal interface. A deny by address or subnet does not depend on names; there are no block lists, only the rules you write.
 - **WSL, containers and virtual machines** — you choose whether their programs get the same leak protection as this computer or go unprotected while the additional route is down. Not yet verified on a live setup.
 - **Suggested addresses** — a routed site often pulls in helper domains of its own. The app collects them, shows which of your sites needs each one, and proposes adding them. Nothing is added behind your back, and ignoring a suggestion simply leaves that address on the main route.
 - **Overlaps** — when rules of the two routes cover the same sites (a zone on one route, a site inside it on the other), the narrower rule wins, and the app lists every such pair with the route its sites actually take. Confirm each one, or send those sites over the other route in one click. The same screen points out applied rules that work
-  differently from how they read — for example an address block that also
+  differently from how they read — for example an address deny that also
   stops a site you route.
 - **Explain mode** — ask *"why did this host go where it went?"* and get the exact rule trace. A local SQLite cache backs FQDN/IP mapping.
 - **Open, text-based presets** — human-readable rule packs (incl. ready-made country splits) you can diff, edit, and share.
@@ -111,11 +130,12 @@ and stops at the first match:
 |---|-----------|---------|
 | 1 | Exact domain (FQDN) | `api.bank.com` |
 | 2 | Subdomain / suffix | `*.bank.com` |
-| 3 | Exact IP address (IPv4 or IPv6) | `203.0.113.7`, `2001:db8::7` |
-| 4 | Subnet (CIDR) or IP range | `10.0.0.0/8`, `192.0.2.10-192.0.2.40` |
-| 5 | Zone (TLD / internal suffix, domain zones) | `.ru`, `.com`, `.intra` |
-| 6 | Application (process name) | `chrome.exe` |
-| 7 | Default route | behavior: prefer-primary / prefer-secondary / strict-fail-closed |
+| 3 | Site in every zone | `bank.*` |
+| 4 | Exact IP address (IPv4 or IPv6) | `203.0.113.7`, `2001:db8::7` |
+| 5 | Subnet (CIDR) or IP range | `10.0.0.0/8`, `192.0.2.10-192.0.2.40` |
+| 6 | Zone (TLD / internal suffix, domain zones) | `.ru`, `.com`, `.intra` |
+| 7 | Application (program name, file or folder) | `chrome.exe` |
+| 8 | Default route | behavior: prefer-primary / prefer-secondary / strict-fail-closed |
 
 Notes:
 
@@ -123,9 +143,12 @@ Notes:
   beats any network containing it, a network beats the zone it sits in.
   Between two names the longer one wins, between two networks the more
   specific one.
-- A **block** of an exact IP address stops that address whatever other rule
-  names it. Any other block takes its place in the order above.
-- When two rules of the same kind are equally specific, a block wins over a
+- A **site in every zone** (`bank.*`) covers `bank.com`, `bank.net`,
+  `bank.co.uk` and their subdomains with one rule. A rule that names the zone
+  (`bank.by`, `*.bank.by`) beats it, whichever route either sends the site to.
+- A **deny** of an exact IP address stops that address whatever other rule
+  names it. Any other deny takes its place in the order above.
+- When two rules of the same kind are equally specific, a deny wins over a
   route, and the main route over the additional one.
 - A rule names a destination **or** an application. A rule that limits an
   address to one application cannot be carried out yet, so the service refuses
@@ -310,9 +333,11 @@ The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
 | [`docs/en/where-files-live.md`](docs/en/where-files-live.md) | Where settings, rules, caches and logs are stored |
 | [`docs/en/diagnostic-archive.md`](docs/en/diagnostic-archive.md) | What goes into a diagnostic archive, and what never does |
 | [`docs/en/recovering-network-access.md`](docs/en/recovering-network-access.md) | Getting the network back if something goes wrong |
+| [`docs/en/known-limitations.md`](docs/en/known-limitations.md) | Gaps this release still has, and what to do about each |
 | [`docs/en/cli.md`](docs/en/cli.md) | The `nrr-cli` console: verbs, exit codes, and what it deliberately does not do |
 | [`docs/en/tui.md`](docs/en/tui.md) | The `nrr-tui` terminal interface: starting it, screens, keys, accessibility, rights |
 | [`docs/en/building-windows.md`](docs/en/building-windows.md) | Building from source on Windows: toolchain, Qt, common failures |
+| [`docs/en/unattended-install.md`](docs/en/unattended-install.md) | Installing from a script with your rules ready for every user, and the exit codes |
 | [`docs/en/packaging-windows.md`](docs/en/packaging-windows.md) | Producing the portable package and the installers for distribution |
 
 ## License

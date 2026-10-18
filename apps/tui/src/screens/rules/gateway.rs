@@ -9,6 +9,7 @@ use nrr_client_logic::rules_table::RuleRow;
 use nrr_client_logic::vpn_gateway::{gateway_rule_draft, program_file_name};
 use nrr_client_logic::Route;
 use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     VpnGatewayCandidateDto, VpnGatewayCandidatesRequest, VpnGatewayCandidatesResponse,
@@ -350,7 +351,8 @@ fn candidate_text(c: &VpnGatewayCandidateDto, texts: &Texts) -> String {
     );
     if !c.hostname.is_empty() {
         line.push_str(" · ");
-        line.push_str(&texts.fill(text::GATEWAY_BY_NAME, &[("host", c.hostname.as_str())]));
+        let host = display_text(&c.hostname);
+        line.push_str(&texts.fill(text::GATEWAY_BY_NAME, &[("host", &host)]));
     }
     line
 }

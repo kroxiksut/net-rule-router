@@ -69,6 +69,7 @@ fn fresh_deps() -> SupervisedRuntimeDeps {
         auto_rules_engine: None,
         auto_rule_probe: None,
         app_destination_memory: None,
+        conn_history: None,
         secondary_external_address: None,
         health: Arc::new(HealthAggregator::new()),
         liveness: None,
@@ -746,4 +747,52 @@ fn a_sign_in_without_a_state_database_applies_the_default() {
         controller.desired_mode(),
         nrr_domain::enforcement_mode::EnforcementMode::default()
     );
+}
+
+/// A graceful stop writes what the last tick did not; a reader that opens
+/// the file afresh finds it.
+#[test]
+fn a_graceful_stop_writes_the_last_minute_of_connection_history() {
+    use crate::conn_history::{ConnHistory, HistoryRead};
+    use crate::conn_observation_consumer::ConnectionTraceRecord;
+    use nrr_platform_api::conn_observe::egress::{EgressInterface, EgressRole};
+    use nrr_platform_api::conn_observe::{ConnectionVerdict, TransportProtocol};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    const OWNER: &str = "S-1-5-21-1-2-3-1001";
+    const AT: u64 = 1_700_000_000_000;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("nrr_conn_history.db");
+    let history = Arc::new(ConnHistory::open(path.clone()));
+    history.record(
+        &ConnectionTraceRecord {
+            process_path: Some("/usr/bin/browser".into()),
+            user_sid: Some(OWNER.into()),
+            protocol: TransportProtocol::Tcp,
+            local: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 5)), 50_000),
+            remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 443),
+            egress: EgressInterface {
+                ifindex: 2,
+                role: EgressRole::Primary,
+            },
+            verdict: ConnectionVerdict::Permit,
+            blocked_by_nrr: None,
+            nrr_drop_spec_id: None,
+            nrr_block_reason: None,
+            observed_unix_ms: Some(AT),
+            remote_names: None,
+        },
+        AT,
+    );
+    flush_conn_history_at_stop(Some(&history));
+    flush_conn_history_at_stop(None);
+
+    let reader = ConnHistory::open(path);
+    let read = HistoryRead {
+        principal: Some(OWNER),
+        to_ms: AT * 2,
+        limit: 10,
+        ..HistoryRead::default()
+    };
+    assert_eq!(reader.read(&read, AT).expect("read").0.len(), 1);
 }

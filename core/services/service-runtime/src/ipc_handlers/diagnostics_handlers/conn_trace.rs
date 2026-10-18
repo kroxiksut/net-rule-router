@@ -39,16 +39,17 @@ impl TraceViewGates {
             .unwrap_or(true)
     }
 
-    /// What the active user's rules send over the secondary link, or `None`
-    /// when the deps are absent, nobody is routing-active, or `only_for` names
-    /// someone else — another user's rules say nothing about this user's rows.
-    /// Built once per request, never per row.
-    fn secondary_owners(&self, only_for: Option<&str>) -> Option<SecondaryAddressOwners> {
+    /// What `user`'s own rules send over the additional link, or `None` when
+    /// the deps are absent or the user has no book; an empty `user` means the
+    /// routing user. Another user's rules say nothing about this user's rows.
+    /// Built once per user per request, never per row.
+    fn secondary_owners(&self, user: &str) -> Option<SecondaryAddressOwners> {
         let (rules, fqdn, active_sid) = self.expectation.as_ref()?;
-        let sid = active_sid()?;
-        if only_for.is_some_and(|caller| !caller.eq_ignore_ascii_case(&sid)) {
-            return None;
-        }
+        let sid = if user.is_empty() {
+            active_sid()?
+        } else {
+            user.to_owned()
+        };
         let snapshot = rules.active_rules_for(&sid)?;
         Some(SecondaryAddressOwners::build(
             &snapshot.rule_book,
@@ -192,17 +193,34 @@ impl IpcHandler for ConnTraceEntriesListHandler {
             format!("{}:{}", shown_ip(sa.ip()), sa.port())
         };
 
-        // Built ONCE per page. A row whose remote it owns is EXPECTED to
-        // egress the secondary link; the GUI flags expected=secondary +
-        // egress=primary permits as leaks.
-        let secondary_owners = self.gates.secondary_owners(None);
+        // Built ONCE per user per page: each row is judged by the rules of the
+        // user who made the connection; a machine row by the viewer's. A row
+        // whose remote they own is EXPECTED to egress the additional link; the
+        // GUI flags expected=secondary + egress=primary permits as leaks.
+        let viewer = ctx.caller_stored();
+        let judge_of = |rec: &crate::conn_observation_consumer::ConnectionTraceRecord| {
+            rec.user_sid
+                .as_deref()
+                .filter(|u| !u.is_empty())
+                .unwrap_or(viewer)
+                .to_owned()
+        };
+        let mut books: std::collections::HashMap<String, Option<SecondaryAddressOwners>> =
+            std::collections::HashMap::new();
+        for rec in &rows {
+            if let std::collections::hash_map::Entry::Vacant(slot) = books.entry(judge_of(rec)) {
+                let owners = self.gates.secondary_owners(slot.key());
+                slot.insert(owners);
+            }
+        }
         // The same owners answer both questions: whether policy expects this
-        // remote on the secondary link, and — for a flow the service itself
+        // remote on the additional link, and — for a flow the service itself
         // opened — whose traffic it is carrying.
-        let owner_of = |remote: &std::net::SocketAddr| -> Option<String> {
-            secondary_owners
+        let owner_of = |rec: &crate::conn_observation_consumer::ConnectionTraceRecord| {
+            books
+                .get(&judge_of(rec))?
                 .as_ref()?
-                .owner_of(remote.ip())
+                .owner_of(rec.remote.ip())
                 .map(std::borrow::Cow::into_owned)
         };
         let expected_route = |remote: &std::net::SocketAddr, owned: bool| -> String {
@@ -221,7 +239,7 @@ impl IpcHandler for ConnTraceEntriesListHandler {
             .into_iter()
             .take(limit as usize)
             .map(|r| {
-                let owner = owner_of(&r.remote);
+                let owner = owner_of(&r);
                 ConnTraceEntryDto {
                     relay_for: match owner.as_ref() {
                         Some(host) if is_own_service(&exe_name(r.process_path.as_deref())) => {
@@ -362,7 +380,7 @@ impl IpcHandler for ConnTraceOutageBlocksListHandler {
             return serialise(OP, empty(true));
         }
         let snapshot = outages.snapshot(caller);
-        let owners = self.gates.secondary_owners(Some(caller));
+        let owners = self.gates.secondary_owners(caller);
         let entries = snapshot
             .entries
             .into_iter()

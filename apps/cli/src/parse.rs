@@ -32,8 +32,9 @@ pub struct Invocation {
 pub enum Command {
     /// Register the service.
     Install { start_mode: ServiceStartMode },
-    /// Deregister the service, optionally deleting service-owned data.
-    Uninstall { purge: bool },
+    /// Deregister the service, optionally deleting service-owned data, and
+    /// the audit trail only when asked for by name.
+    Uninstall { purge: bool, purge_audit: bool },
     /// Start the service.
     Start,
     /// Stop the service.
@@ -108,6 +109,12 @@ pub enum ParseError {
         verb: &'static str,
         argument: String,
     },
+    /// A flag that only makes sense beside another one, given without it.
+    RequiresFlag {
+        verb: &'static str,
+        flag: &'static str,
+        requires: &'static str,
+    },
 }
 
 impl std::fmt::Display for ParseError {
@@ -159,6 +166,11 @@ impl std::fmt::Display for ParseError {
             Self::UnexpectedArgument { verb, argument } => {
                 write!(f, "`{verb}` does not take the argument `{argument}`")
             }
+            Self::RequiresFlag {
+                verb,
+                flag,
+                requires,
+            } => write!(f, "`{verb} --{flag}` needs `--{requires}`"),
         }
     }
 }
@@ -311,9 +323,18 @@ fn build(
             };
             Ok(Command::Install { start_mode })
         }
-        "uninstall" => Ok(Command::Uninstall {
-            purge: flag(flags, "purge").is_some(),
-        }),
+        "uninstall" => {
+            let purge = flag(flags, "purge").is_some();
+            let purge_audit = flag(flags, "purge-audit").is_some();
+            if purge_audit && !purge {
+                return Err(ParseError::RequiresFlag {
+                    verb: "uninstall",
+                    flag: "purge-audit",
+                    requires: "purge",
+                });
+            }
+            Ok(Command::Uninstall { purge, purge_audit })
+        }
         "start" => Ok(Command::Start),
         "stop" => Ok(Command::Stop),
         "restart" => Ok(Command::Restart),
@@ -416,7 +437,10 @@ mod tests {
         assert_eq!(
             inv(&["uninstall", "--purge", "--elevate"]),
             Ok(Invocation {
-                command: Command::Uninstall { purge: true },
+                command: Command::Uninstall {
+                    purge: true,
+                    purge_audit: false,
+                },
                 elevate: true,
                 privilege: Privilege::Administrator,
             })
@@ -661,10 +685,30 @@ mod tests {
 
     #[test]
     fn uninstall_keeps_data_unless_purge_is_asked_for() {
-        assert_eq!(p(&["uninstall"]), Ok(Command::Uninstall { purge: false }));
+        assert_eq!(
+            p(&["uninstall"]),
+            Ok(Command::Uninstall {
+                purge: false,
+                purge_audit: false
+            })
+        );
         assert_eq!(
             p(&["uninstall", "--purge"]),
-            Ok(Command::Uninstall { purge: true })
+            Ok(Command::Uninstall {
+                purge: true,
+                purge_audit: false
+            })
+        );
+        assert_eq!(
+            p(&["uninstall", "--purge", "--purge-audit"]),
+            Ok(Command::Uninstall {
+                purge: true,
+                purge_audit: true
+            })
+        );
+        assert!(
+            p(&["uninstall", "--purge-audit"]).is_err(),
+            "the audit trail alone is never the thing purged"
         );
     }
 

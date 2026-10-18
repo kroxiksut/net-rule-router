@@ -69,6 +69,8 @@ pub fn secondary_ip_denylist(
                 | CanonicalAddressMatch::IpRange(_),
             )
             | None => {}
+            // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
+            Some(CanonicalAddressMatch::AnyZoneDomain(_)) => {}
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
                 rule_hosts.insert(host.clone());
                 // The shared-IP census is an IPv4 ledger.

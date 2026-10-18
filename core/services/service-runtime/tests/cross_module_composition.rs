@@ -78,7 +78,16 @@ fn build_coordinator() -> CoordFixture {
 /// since they assert the audit + outcome, not the per-SID teardown fan-out.
 /// The returned tempdir backs the coordinator's state DB and must be kept alive
 /// by the caller for the duration of the test.
+const ALICE: &str = "S-1-5-21-100-1001";
+const BOB: &str = "S-1-5-21-100-1002";
+
 fn build_pause_coordinator() -> (Arc<RoutingPauseCoordinator>, tempfile::TempDir) {
+    build_pause_coordinator_for(Arc::new(ActiveSidRegistry::new()))
+}
+
+fn build_pause_coordinator_for(
+    registry: Arc<ActiveSidRegistry>,
+) -> (Arc<RoutingPauseCoordinator>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("pause_state.db");
     let conn = open_connection(&path).expect("open");
@@ -86,7 +95,6 @@ fn build_pause_coordinator() -> (Arc<RoutingPauseCoordinator>, tempfile::TempDir
     runner.run_pending_migrations().expect("migrate");
     let conn = Arc::new(Mutex::new(runner.into_connection()));
 
-    let registry = Arc::new(ActiveSidRegistry::new());
     let dispatcher: Arc<dyn PauseDispatcher> = Arc::new(NoopPauseDispatcher);
     let audit: Arc<dyn RoutingPauseAudit> = Arc::new(NoopRoutingPauseAudit);
     let clock: Arc<dyn Clock> = FixedClock::new(1_700_000_000);
@@ -143,7 +151,7 @@ fn safe_disable_with_recording_sink_completes_and_audits() {
         .with_recovery_audit_sink(Arc::clone(&sink) as Arc<dyn RecoveryAuditSink>)
         .with_pause_coordinator(pause);
 
-    let outcome = exec.safe_disable("operator triggered safe-disable");
+    let outcome = exec.safe_disable(ALICE, "operator triggered safe-disable");
     match outcome {
         MutationOutcome::Completed(payload) => {
             assert_eq!(payload["outcome"], "safe-disabled");
@@ -163,6 +171,34 @@ fn safe_disable_with_recording_sink_completes_and_audits() {
     }
 }
 
+/// Safe-disable from one of two signed-in users pauses that user alone: the
+/// other keeps routing and the leak guard, and nothing they did not ask for
+/// waits on a resume only the first one could give.
+#[test]
+fn safe_disable_pauses_only_the_caller_on_a_two_user_machine() {
+    use nrr_service_runtime::IpcClientProfile;
+    let fx = build_coordinator();
+    let registry = Arc::new(ActiveSidRegistry::new());
+    registry.on_connect(ALICE, IpcClientProfile::TrayLightweight);
+    registry.on_connect(BOB, IpcClientProfile::TrayLightweight);
+    let (pause, _pause_dir) = build_pause_coordinator_for(registry);
+    let exec = ProductionMutationExecutor::new(Arc::clone(&fx.coordinator))
+        .with_recovery_audit_sink(
+            Arc::new(RecordingRecoveryAuditSink::new()) as Arc<dyn RecoveryAuditSink>
+        )
+        .with_pause_coordinator(Arc::clone(&pause));
+
+    match exec.safe_disable(ALICE, "checking something") {
+        MutationOutcome::Completed(payload) => assert_eq!(payload["suspended-sids"], 1),
+        other => panic!("expected Completed, got {other:?}"),
+    }
+    assert!(pause.is_paused(ALICE).expect("read"));
+    assert!(
+        !pause.is_paused(BOB).expect("read"),
+        "the other signed-in user must keep their routing"
+    );
+}
+
 /// Without a recovery audit sink wired, `safe_disable` refuses with
 /// `audit-unavailable` rather than silently no-op'ing or running without
 /// an audit trail.
@@ -170,7 +206,7 @@ fn safe_disable_with_recording_sink_completes_and_audits() {
 fn safe_disable_without_sink_returns_audit_unavailable() {
     let fx = build_coordinator();
     let exec = ProductionMutationExecutor::new(Arc::clone(&fx.coordinator));
-    match exec.safe_disable("test") {
+    match exec.safe_disable(ALICE, "test") {
         MutationOutcome::Failed(err) => {
             assert_eq!(err.code, "audit-unavailable");
         }
@@ -189,7 +225,7 @@ fn safe_disable_when_audit_sink_fails_returns_audit_write_failed() {
     let exec = ProductionMutationExecutor::new(Arc::clone(&fx.coordinator))
         .with_recovery_audit_sink(Arc::new(FailingRecoveryAuditSink) as Arc<dyn RecoveryAuditSink>)
         .with_pause_coordinator(pause);
-    match exec.safe_disable("test") {
+    match exec.safe_disable(ALICE, "test") {
         MutationOutcome::Failed(err) => {
             assert_eq!(err.code, "audit-write-failed");
             assert!(err.message.contains("simulated"));

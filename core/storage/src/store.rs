@@ -758,6 +758,32 @@ impl CacheRepository for SqliteCacheStore {
         Ok(out)
     }
 
+    fn list_hostnames_with_site(&self, site: &str, limit: usize) -> StorageResult<Vec<String>> {
+        let normalised = site.trim().trim_matches('.').to_ascii_lowercase();
+        if limit == 0 || normalised.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.borrow();
+        // Escaped for the same reason as the suffix query: the site comes
+        // from a user's rule.
+        let site = escape_like_literal(&normalised);
+        let mut stmt = conn
+            .prepare(
+                "SELECT canonical_host FROM hostnames
+                 WHERE canonical_host LIKE ?1 ESCAPE '\\' OR canonical_host LIKE ?2 ESCAPE '\\'
+                 ORDER BY last_seen_at DESC, canonical_host ASC
+                 LIMIT ?3",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(
+                params![format!("{site}.%"), format!("%.{site}.%"), limit as i64],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(db_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+    }
+
     fn list_resolutions(
         &self,
         offset: u32,

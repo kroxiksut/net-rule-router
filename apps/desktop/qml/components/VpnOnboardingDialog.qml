@@ -247,12 +247,12 @@ Window {
     }
 
     function _kernelTunnelTitle(c) {
-        var name = String(c.displayName || "")
+        var name = Pure.displayText(c.displayName)
         if (c.running === true && String(c.interfaceName || "") !== "") {
             return root.tr("vpn-onboarding.kernel-tunnel-assign",
                 "Kernel tunnel {name} — assign adapter {interface} as the additional link")
                 .replace("{name}", name)
-                .replace("{interface}", String(c.interfaceName))
+                .replace("{interface}", Pure.displayText(c.interfaceName))
         }
         return root.tr("vpn-onboarding.kernel-tunnel-down", "Tunnel {name} is not up")
             .replace("{name}", name)
@@ -457,7 +457,7 @@ Window {
                                         ? candidateCheck.indicator.implicitHeight : 20
                                 }
                                 Accessible.role: Accessible.CheckBox
-                                Accessible.name: String(modelData.displayName || "")
+                                Accessible.name: Pure.displayText(modelData.displayName)
                             }
                             ColumnLayout {
                                 Layout.fillWidth: true
@@ -471,9 +471,10 @@ Window {
                                         wrapMode: Text.WordWrap
                                         font.bold: true
                                         color: root.ownerRoot ? root.ownerRoot.textColor : "white"
+                                        textFormat: Text.PlainText
                                         text: candidateCard.isTunnel
                                             ? root._kernelTunnelTitle(modelData)
-                                            : String(modelData.displayName || "")
+                                            : Pure.displayText(modelData.displayName)
                                     }
                                     // "running now" badge.
                                     Rectangle {
@@ -503,8 +504,9 @@ Window {
                                     font.pixelSize: (root.ownerRoot
                                         ? root.ownerRoot.uiTheme.baseFontSizePx : 13) - 1
                                     color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
+                                    textFormat: Text.PlainText
                                     text: String(modelData.exePath || "") !== ""
-                                        ? String(modelData.exePath)
+                                        ? Pure.displayText(modelData.exePath)
                                         : root.tr("vpn-onboarding.not-found",
                                             "not found — pick manually")
                                 }

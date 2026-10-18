@@ -100,7 +100,7 @@ tempfile = "3"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 # Archive enrichment — the export-handler test reads the
 # produced zip to assert the diagnostics level ships the extra sections.
-zip = "2"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

@@ -52,6 +52,8 @@ fn candidate(id: &str, proposed: &str, served: bool) -> AutoRuleCandidateDto {
         served_by_main_link: served,
         third_party: Some(true),
         secondary_reach: None,
+        any_zone_site: String::new(),
+        less_certain: String::new(),
     }
 }
 

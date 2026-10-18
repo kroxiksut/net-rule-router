@@ -150,7 +150,7 @@ fn auto_entries_round_trip_through_write_and_parse() {
 rr3.example-cdn.net  # auto:site-companion anchor:example.com added:2026-07-31
 *.assets.example.net  # auto:site-companion anchor:example.com added:2026-07-31 all asset hosts
 # stale.example.net  # auto:user-confirmed anchor:example.com added:2026-01-05
-tracker.example.net +block  # auto:user-confirmed anchor:example.com added:2026-02-02
+!tracker.example.net  # auto:user-confirmed anchor:example.com added:2026-02-02
 ";
     let first = parse_rules_file(input).parsed;
     let written = write_rules_file(&first, &[], None);
@@ -332,4 +332,57 @@ fn user_authored_rules_are_unaffected_by_the_origin_field() {
     );
     let written = write_rules_file(&outcome.parsed, &[], None);
     assert!(!written.contains("auto:"), "got:\n{written}");
+}
+
+// ── App-authored program rules ───────────────────────────────────────────
+
+/// A program rule the application wrote keeps its own section — `--- Auto`
+/// reads domains only — and its origin with it, through a file and back.
+#[test]
+fn an_app_authored_program_rule_keeps_its_section_and_its_origin() {
+    let program = crate::canonical::CanonicalRule {
+        id: RuleId("r-1".to_string()),
+        enabled: true,
+        address_match: None,
+        app_match: Some(crate::canonical::CanonicalAppMatch {
+            pattern: crate::canonical::CanonicalAppPattern::Exact("client.exe".to_string()),
+            include_child_processes: false,
+        }),
+        comment: "tunnel client".to_string(),
+        action: crate::canonical::RuleAction::Route,
+        origin: Some(auto_origin(AutoRuleReason::VpnClientBootstrap)),
+    };
+    let set = CanonicalRuleSet::from_rules(vec![program]);
+
+    let parsed = canonical_rule_set_to_rules_file_parsed(&set, RulesFileSection::Windows);
+    let text = write_rules_file(&parsed, &[], None);
+    assert!(
+        text.contains(
+            "--- Windows\nclient.exe  # auto:vpn-client-bootstrap anchor:example.com \
+             added:2026-07-31 tunnel client\n"
+        ),
+        "{text}"
+    );
+
+    let outcome = parse_rules_file(&text);
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    assert_eq!(outcome.parsed, parsed);
+    let back = rules_file_to_route_rule_set(&outcome.parsed, HostPlatform::Windows, false);
+    assert_eq!(back.rules.len(), 1);
+    assert_eq!(
+        back.rules[0].origin,
+        Some(auto_origin(AutoRuleReason::VpnClientBootstrap))
+    );
+    assert_eq!(back.rules[0].comment, "tunnel client");
+}
+
+/// A program line without the tokens is the user's own, and nothing is
+/// reported about it.
+#[test]
+fn a_program_line_without_provenance_is_the_users() {
+    let outcome = parse_rules_file("--- Windows\nbrowser.exe  # my browser\n");
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    let entries = outcome.parsed.entries_for(RulesFileSection::Windows);
+    assert_eq!(entries[0].origin, None);
+    assert_eq!(entries[0].inline_comment.as_deref(), Some("my browser"));
 }

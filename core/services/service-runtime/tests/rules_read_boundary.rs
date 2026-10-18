@@ -57,35 +57,6 @@ const STORED_ROW_READERS: &[(&str, usize, &str)] = &[
     ),
 ];
 
-/// Rule-content readers that still bypass the provider. This list may only
-/// shrink: converting one means deleting its entry.
-const KNOWN_GAPS: &[(&str, usize, &str)] = &[
-    (
-        "production_handlers_misc.rs",
-        3,
-        "rules.list projects the revision row (id and rules) for the GUI; the \
-         provider returns a decoded book without the revision id the response carries",
-    ),
-    (
-        "production_merge_preview.rs",
-        2,
-        "the merge preview reports storage and decode failures as distinct typed \
-         errors, which the provider's Option answer collapses",
-    ),
-    (
-        "production_preset_exporter.rs",
-        2,
-        "the export decodes for the target app platform, not the compiled one, and \
-         tells 'no active revision' from a storage error",
-    ),
-    (
-        "production_mutation_executor.rs",
-        2,
-        "the risk diff compares a candidate with the caller's OWN stored book on \
-         purpose (no baseline read-through) and decodes for the executor's platform",
-    ),
-];
-
 fn src_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
 }
@@ -218,12 +189,11 @@ fn direct_readers() -> BTreeMap<String, usize> {
 fn rules_are_read_through_the_provider() {
     let listed: BTreeMap<&str, (usize, &str)> = STORED_ROW_READERS
         .iter()
-        .chain(KNOWN_GAPS)
         .map(|(file, count, reason)| (*file, (*count, *reason)))
         .collect();
     assert_eq!(
         listed.len(),
-        STORED_ROW_READERS.len() + KNOWN_GAPS.len(),
+        STORED_ROW_READERS.len(),
         "a file is listed twice"
     );
 
@@ -260,7 +230,7 @@ fn rules_are_read_through_the_provider() {
 
 #[test]
 fn every_listed_reader_says_why() {
-    for (file, count, reason) in STORED_ROW_READERS.iter().chain(KNOWN_GAPS) {
+    for (file, count, reason) in STORED_ROW_READERS {
         assert!(*count > 0, "{file}: a zero count is not an entry");
         assert!(!reason.trim().is_empty(), "{file}: no reason given");
     }

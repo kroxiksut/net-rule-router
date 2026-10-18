@@ -25,7 +25,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
-use nrr_shared::ipc_payloads::{EnforcementStatusDto, RoutesHeldDto, RuleConflictDto};
+use nrr_shared::ipc_payloads::{
+    EnforcementStatusDto, RoutesHeldDto, RuleConflictDto, TrafficCarriedDto,
+};
 
 /// Ceiling on the conflicts kept per principal, so one pathological rule book
 /// cannot grow the snapshot past a frame.
@@ -218,7 +220,14 @@ impl BlockAllPostureStatus {
 /// answer or hammering the resolver would cost the user connectivity it never
 /// protects.
 #[derive(Clone, Default)]
-pub struct FailClosedPostureStatus(Arc<Mutex<bool>>);
+pub struct FailClosedPostureStatus(Arc<Mutex<FailClosedPosture>>);
+
+#[derive(Default)]
+struct FailClosedPosture {
+    armed: bool,
+    /// Who the guard holds for, where the writer knows it per principal.
+    holding: std::collections::BTreeSet<String>,
+}
 
 impl FailClosedPostureStatus {
     /// Construct disarmed.
@@ -230,13 +239,33 @@ impl FailClosedPostureStatus {
     /// diagnostics must never panic the apply path).
     pub fn set(&self, armed: bool) {
         if let Ok(mut guard) = self.0.lock() {
-            *guard = armed;
+            guard.armed = armed;
+            guard.holding.clear();
         }
+    }
+
+    /// Replace who the guard holds for; armed when anyone is. Returns whether
+    /// that set changed.
+    pub fn set_holding(&self, holding: std::collections::BTreeSet<String>) -> bool {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = guard.holding != holding;
+        guard.armed = !holding.is_empty();
+        guard.holding = holding;
+        changed
     }
 
     /// The last stored armed flag. A poisoned lock recovers the inner value.
     pub fn armed(&self) -> bool {
-        *self.0.lock().unwrap_or_else(|p| p.into_inner())
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).armed
+    }
+
+    /// Whether the guard holds for `principal`, as [`Self::set_holding`] said.
+    pub fn armed_for(&self, principal: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .holding
+            .contains(principal)
     }
 }
 
@@ -253,6 +282,8 @@ pub struct RouteEnforcementStatus {
     outages: Arc<std::sync::OnceLock<Arc<crate::outage_blocks::OutageBlocks>>>,
     /// Per principal, the destinations another signed-in user's routing holds.
     held: Arc<Mutex<HashMap<String, RoutesHeldDto>>>,
+    /// Per principal, the other user's tunnel their unrouted traffic rides.
+    carried: Arc<Mutex<HashMap<String, TrafficCarriedDto>>>,
 }
 
 /// Principal → role → report.
@@ -303,6 +334,7 @@ impl RouteEnforcementStatus {
             };
             let stored = EnforcementStatusDto {
                 since_unix_ms,
+                quiet: crate::startup_quiet::quiet(principal, &report.role, &report.status, now_ms),
                 ..report.clone()
             };
             if previous == Some(&stored) {
@@ -311,6 +343,9 @@ impl RouteEnforcementStatus {
             roles.insert(report.role.clone(), stored.clone());
             stored
         };
+        if stored.role == "secondary" && stored.status == "ok" {
+            crate::startup_quiet::note_up(principal);
+        }
         if stored.role == "secondary" {
             if let Some(outages) = self.outages.get() {
                 let at_ms = u64::try_from(now_ms).unwrap_or(0);
@@ -342,6 +377,7 @@ impl RouteEnforcementStatus {
             role: role.to_string(),
             candidates,
             since_unix_ms: None,
+            quiet: false,
         };
         let Some(report) = self.record(principal, &report) else {
             return;
@@ -357,6 +393,7 @@ impl RouteEnforcementStatus {
                 role: report.role,
                 candidates: report.candidates,
                 since_unix_ms: report.since_unix_ms,
+                quiet: report.quiet,
             },
         );
     }
@@ -427,6 +464,40 @@ impl RouteEnforcementStatus {
             .get(principal)
             .cloned()
     }
+
+    /// Store whose tunnel carries `principal`'s traffic; `carried = false`
+    /// forgets it. `true` when that changed, which decides the push.
+    pub fn record_traffic_carried(&self, principal: &str, report: TrafficCarriedDto) -> bool {
+        let mut carried = self.carried.lock().unwrap_or_else(|p| p.into_inner());
+        if !report.carried {
+            return carried.remove(principal).is_some();
+        }
+        if carried.get(principal) == Some(&report) {
+            return false;
+        }
+        carried.insert(principal.to_string(), report);
+        true
+    }
+
+    /// `principal`'s standing report; never another principal's.
+    pub fn traffic_carried(&self, principal: &str) -> Option<TrafficCarriedDto> {
+        self.carried
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(principal)
+            .cloned()
+    }
+
+    /// Everyone whose traffic is reported carried, so a pass can end the
+    /// reports it no longer finds.
+    pub fn traffic_carried_principals(&self) -> Vec<String> {
+        self.carried
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
 }
 
 /// The rule conflicts in one codegen pass, projected for the GUI.
@@ -449,6 +520,21 @@ pub fn rule_conflicts_from(
 mod tests {
     use super::*;
 
+    /// One user's tunnel down must not hold another user's names back.
+    #[test]
+    fn the_guard_is_held_per_principal_and_reports_its_edges() {
+        let posture = FailClosedPostureStatus::new();
+        let only_b: std::collections::BTreeSet<String> = ["S-B".to_string()].into();
+
+        assert!(posture.set_holding(only_b.clone()), "an edge");
+        assert!(posture.armed());
+        assert!(posture.armed_for("S-B"));
+        assert!(!posture.armed_for("S-A"));
+        assert!(!posture.set_holding(only_b), "no edge, no flush");
+        assert!(posture.set_holding(Default::default()));
+        assert!(!posture.armed());
+    }
+
     #[test]
     fn rule_conflicts_are_kept_per_principal_and_cleared_by_an_empty_set() {
         use nrr_shared::ipc_payloads::RuleConflictKind;
@@ -463,6 +549,7 @@ mod tests {
             host: "b.example".into(),
             via_host: "a.example".into(),
             app: String::new(),
+            reason: String::new(),
         };
         assert!(status.set_rule_conflicts("S-1", vec![conflict.clone()]));
         assert_eq!(status.rule_conflicts("S-1"), vec![conflict.clone()]);
@@ -502,12 +589,37 @@ mod tests {
         assert!(!board.record_routes_held("S-1", over), "already over");
     }
 
+    #[test]
+    fn traffic_carried_is_kept_per_principal_and_ends_when_not_carried() {
+        let board = RouteEnforcementStatus::new();
+        let carried = TrafficCarriedDto {
+            carried: true,
+            link: "Example Tunnel".into(),
+        };
+        assert!(board.record_traffic_carried("S-1", carried.clone()));
+        assert!(
+            !board.record_traffic_carried("S-1", carried.clone()),
+            "no change"
+        );
+        assert_eq!(board.traffic_carried("S-1"), Some(carried));
+        assert_eq!(board.traffic_carried("S-2"), None, "another user sees none");
+        assert_eq!(board.traffic_carried_principals(), vec!["S-1".to_string()]);
+        let over = TrafficCarriedDto {
+            carried: false,
+            link: String::new(),
+        };
+        assert!(board.record_traffic_carried("S-1", over.clone()));
+        assert_eq!(board.traffic_carried("S-1"), None);
+        assert!(!board.record_traffic_carried("S-1", over), "already over");
+    }
+
     fn status_report(status: &str, role: &str) -> EnforcementStatusDto {
         EnforcementStatusDto {
             status: status.into(),
             role: role.into(),
             candidates: Vec::new(),
             since_unix_ms: None,
+            quiet: false,
         }
     }
 

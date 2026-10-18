@@ -1,7 +1,10 @@
 //! The add and edit form (the GUI's `RuleEditDialog` and `saveRule`).
 
+use nrr_client_logic::rule_value_class::misplaced_target_type;
 use nrr_client_logic::rules_overlaps::overlaps_of_rule;
-use nrr_client_logic::rules_table::{normalize_host_input, RuleRow, RuleType, TargetRoute};
+use nrr_client_logic::rules_table::{
+    normalize_host_input, value_is_any_zone, RuleRow, RuleType, TargetRoute,
+};
 use nrr_shared::platform_profile::PlatformProfile;
 use nrr_shared::rules_json::FREE_MAX_RULES;
 use nrr_shared::rules_overlap::{find_route_overlaps, OverlapRule, RouteOverlap};
@@ -30,7 +33,7 @@ pub fn offered_types() -> Vec<RuleType> {
     .collect()
 }
 
-/// The routes a rule can take.
+/// The routes a rule can take; a deny is the third.
 pub fn route_options() -> [TargetRoute; 3] {
     [
         TargetRoute::Primary,
@@ -39,15 +42,9 @@ pub fn route_options() -> [TargetRoute; 3] {
     ]
 }
 
-/// The length the GUI's field allows for a type (`matchValueMaxLength`).
+/// The length the GUI's field allows for a type (`ruleValueMaxLength`).
 fn max_len(rule_type: &RuleType) -> usize {
-    match rule_type {
-        RuleType::Zone | RuleType::Domain => 253,
-        RuleType::ExactIp | RuleType::ExactIpv4 | RuleType::ExactIpv6 => 45,
-        RuleType::Subnet => 51,
-        RuleType::IpRange => 93,
-        _ => 260,
-    }
+    nrr_client_logic::rule_value_class::rule_value_max_length(rule_type.as_str())
 }
 
 /// The characters the GUI's field lets through for a type (`matchValueRegex`).
@@ -170,12 +167,32 @@ impl Form {
     }
 
     pub fn verdict(&self) -> Option<Verdict> {
-        (!self.value.trim().is_empty()).then(|| Verdict::of(&self.rule_type, &self.value))
+        (!self.value.trim().is_empty())
+            .then(|| Verdict::for_route(&self.rule_type, &self.value, &self.route))
     }
 
-    /// "Unsure" fits a domain or one address on a route, never a block.
+    /// "Unsure" fits a domain or one address on a route, never a deny.
     pub fn verify_offered(&self) -> bool {
-        self.rule_type.allows_verify() && self.route != TargetRoute::Block
+        self.rule_type.allows_verify() && self.route != TargetRoute::Block && !self.any_zone()
+    }
+
+    /// A deny where "Unsure" would otherwise fit: the form says why it is off.
+    pub fn verify_refused_by_deny(&self) -> bool {
+        self.route == TargetRoute::Block && self.rule_type.allows_verify() && !self.any_zone()
+    }
+
+    /// The file cannot hold `!` and `?` together, so a deny clears the tick
+    /// rather than keeping it for a later route change.
+    pub fn set_route(&mut self, route: TargetRoute) {
+        if route == TargetRoute::Block {
+            self.verify = false;
+        }
+        self.route = route;
+    }
+
+    /// `x.*`: the site in every zone, which "Unsure" has no one host to check.
+    pub fn any_zone(&self) -> bool {
+        value_is_any_zone(&self.value)
     }
 
     /// The `?` a save writes.
@@ -213,7 +230,7 @@ impl Form {
                     None => 0,
                 };
                 if let Some(r) = routes.get(next) {
-                    self.route = r.clone();
+                    self.set_route(r.clone());
                 }
             }
             Field::Verify => self.verify = !self.verify,
@@ -226,6 +243,24 @@ impl Form {
     /// A type that cannot carry `?` keeps it ticked but writes none.
     pub fn set_type(&mut self, rule_type: RuleType) {
         self.rule_type = rule_type;
+    }
+
+    /// The type the value's verdict says it is, when this form offers it.
+    pub fn switch_target(&self) -> Option<RuleType> {
+        let verdict = self.verdict()?;
+        let target = RuleType::from_slug(misplaced_target_type(&verdict.message_key)?);
+        (target != self.rule_type && offered_types().contains(&target)).then_some(target)
+    }
+
+    /// Ctrl+T: the rule takes the type its value is; only on the user's key.
+    pub fn switch_type(&mut self) -> bool {
+        let Some(target) = self.switch_target() else {
+            return false;
+        };
+        self.set_type(target);
+        self.field = Field::Value;
+        self.duplicate = None;
+        true
     }
 
     pub fn type_char(&mut self, c: char) {
@@ -286,7 +321,7 @@ impl Form {
             Field::Route => {
                 let routes = route_options();
                 if let Some(i) = pick(routes.len()) {
-                    self.route = routes[i].clone();
+                    self.set_route(routes[i].clone());
                 }
             }
             Field::Verify => match pick(2) {
@@ -334,7 +369,8 @@ impl Form {
     /// the value is refused.
     fn candidate(&self, table: &Table) -> Option<RuleRow> {
         let value = normalize_host_input(&self.rule_type, self.value.trim());
-        let refused = Verdict::of(&self.rule_type, &value).status == VerdictStatus::Error;
+        let refused =
+            Verdict::for_route(&self.rule_type, &value, &self.route).status == VerdictStatus::Error;
         if value.is_empty() || refused {
             return None;
         }
@@ -449,4 +485,41 @@ fn overlaps_with(
             loser_route: route_of(&pair.loser),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_site_in_every_zone_is_not_offered_unsure_and_saves_without_it() {
+        let mut form = Form::add();
+        form.route = TargetRoute::Secondary;
+        form.verify = true;
+        form.value = "example.com".into();
+        assert!(form.verify_offered());
+        form.value = "example.*".into();
+        assert!(form.any_zone());
+        assert!(!form.verify_offered());
+        assert!(!form.saved_verify());
+    }
+
+    /// A deny and "Unsure" never meet: picking the deny clears the tick, and
+    /// the form says why the box is gone.
+    #[test]
+    fn a_deny_clears_unsure_and_says_why() {
+        let mut form = Form::add();
+        form.value = "example.com".into();
+        form.verify = true;
+        form.field = Field::Route;
+        while form.route != TargetRoute::Block {
+            form.cycle(1);
+        }
+        assert!(!form.verify);
+        assert!(!form.verify_offered());
+        assert!(form.verify_refused_by_deny());
+        form.cycle(1);
+        assert_eq!(form.route, TargetRoute::Primary);
+        assert!(!form.verify, "the tick does not come back on its own");
+    }
 }

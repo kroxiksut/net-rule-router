@@ -772,7 +772,7 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
                 Err(error) => tracing::warn!(
                     target: "nrr::dns-redirect",
                     msg_key = "win-dns-redirect-keep-write-failed",
-                    name = %name,
+                    host = %name,
                     error = %error,
                     "could not keep this rule host with the resolver",
                 ),

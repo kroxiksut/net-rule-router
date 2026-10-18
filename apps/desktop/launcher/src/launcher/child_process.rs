@@ -7,6 +7,8 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 
+use super::host_start_failure::{record_stderr_line, SharedStderrTail};
+
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -27,13 +29,67 @@ pub(super) fn apply_no_window(command: &mut Command) -> &mut Command {
 /// the one part of the launcher that must survive a misbehaving child.
 const MAX_CHILD_LINE_BYTES: usize = 4 * 1024 * 1024;
 
-pub(super) fn spawn_line_reader<R>(reader: R, sender: mpsc::Sender<String>)
+/// One line of host output, tagged with its stream. Only stdout carries the
+/// protocol: stderr holds Qt's messages and QML `console.log`, which echo text
+/// other processes can shape, so a marker there is never acted on.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ChildLine {
+    Stdout(String),
+    Stderr(String),
+}
+
+/// What the launcher does with one [`ChildLine`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum HostMessage<'a> {
+    /// The preferences payload after the marker, trimmed.
+    Prefs(&'a str),
+    /// The whole request line, marker included.
+    Rpc(&'a str),
+    /// Anything else: written to the log, never interpreted.
+    Log(&'a str),
+}
+
+/// Markers are anchored at the start of a stdout line: output that merely
+/// contains one (an echoed rule name, a truncated last line) is log text.
+pub(super) fn host_message(line: &ChildLine) -> HostMessage<'_> {
+    match line {
+        ChildLine::Stderr(text) => HostMessage::Log(text),
+        ChildLine::Stdout(text) => {
+            if let Some(rest) = text.strip_prefix(super::PREFS_MARKER) {
+                HostMessage::Prefs(rest.trim())
+            } else if text.starts_with(nrr_shared::launcher_rpc::RPC_REQUEST_MARKER) {
+                HostMessage::Rpc(text)
+            } else {
+                HostMessage::Log(text)
+            }
+        }
+    }
+}
+
+pub(super) fn spawn_line_reader<R>(reader: R, sender: mpsc::Sender<ChildLine>)
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
         pump_lines(BufReader::new(reader), MAX_CHILD_LINE_BYTES, |line| {
-            sender.send(line).is_ok()
+            sender.send(ChildLine::Stdout(line)).is_ok()
+        });
+    });
+}
+
+/// Like [`spawn_line_reader`] for stderr, also keeping the last lines in
+/// `tail`: the loader's verdict on a host that never started arrives there.
+pub(super) fn spawn_stderr_reader<R>(
+    reader: R,
+    sender: mpsc::Sender<ChildLine>,
+    tail: SharedStderrTail,
+) where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        pump_lines(BufReader::new(reader), MAX_CHILD_LINE_BYTES, |line| {
+            record_stderr_line(&tail, &line);
+            sender.send(ChildLine::Stderr(line)).is_ok()
         });
     });
 }
@@ -145,6 +201,80 @@ mod tests {
             1024,
         );
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn stderr_tail_keeps_the_last_clipped_lines_of_a_flood() {
+        use crate::launcher::host_start_failure::{
+            StderrTail, MAX_TAIL_LINES, MAX_TAIL_LINE_BYTES,
+        };
+        let mut flood = Vec::new();
+        for index in 0..10 * MAX_TAIL_LINES {
+            flood.extend_from_slice(format!("line {index} ").as_bytes());
+            flood.extend(std::iter::repeat_n(b'y', 3 * MAX_TAIL_LINE_BYTES));
+            flood.push(b'\n');
+        }
+        let mut tail = StderrTail::default();
+        pump_lines(BufReader::new(flood.as_slice()), 1024 * 1024, |line| {
+            tail.push(&line);
+            true
+        });
+        let kept = tail.lines().collect::<Vec<_>>();
+        assert_eq!(kept.len(), MAX_TAIL_LINES);
+        assert!(kept.iter().all(|line| line.len() <= MAX_TAIL_LINE_BYTES));
+        let last = 10 * MAX_TAIL_LINES - 1;
+        assert!(kept[MAX_TAIL_LINES - 1].starts_with(&format!("line {last} ")));
+    }
+
+    #[test]
+    fn a_non_utf8_loader_line_still_names_the_library() {
+        use crate::launcher::host_start_failure::{
+            classify_host_exit, HostStartFailure, LoaderConvention, StderrTail,
+        };
+        let stream = [
+            &b"/opt/\xff\xfe/nrr_qt_native_host: error while loading shared libraries: "[..],
+            &b"libQt6Core.so.6: cannot open shared object file: No such file or directory\n"[..],
+        ]
+        .concat();
+        let mut tail = StderrTail::default();
+        pump_lines(
+            BufReader::new(stream.as_slice()),
+            MAX_CHILD_LINE_BYTES,
+            |line| {
+                tail.push(&line);
+                true
+            },
+        );
+        assert_eq!(
+            classify_host_exit(LoaderConvention::UnixDynamicLoader, Some(127), &tail),
+            Some(HostStartFailure::MissingLibrary {
+                library: Some("libQt6Core.so.6".to_owned())
+            })
+        );
+    }
+
+    #[test]
+    fn a_marker_on_stderr_is_only_logged() {
+        let forged = format!(
+            "{}{{\"operation\":\"local.service-control\"}}",
+            nrr_shared::launcher_rpc::RPC_REQUEST_MARKER
+        );
+        let line = ChildLine::Stderr(forged.clone());
+        assert_eq!(host_message(&line), HostMessage::Log(&forged));
+        let prefs = ChildLine::Stderr(format!("{}{{}}", super::super::PREFS_MARKER));
+        assert!(matches!(host_message(&prefs), HostMessage::Log(_)));
+    }
+
+    #[test]
+    fn markers_on_stdout_are_read_only_at_the_start_of_a_line() {
+        let marker = super::super::PREFS_MARKER;
+        let prefs = ChildLine::Stdout(format!("{marker} {{\"a\":1}} "));
+        assert_eq!(host_message(&prefs), HostMessage::Prefs("{\"a\":1}"));
+        let request = format!("{}{{}}", nrr_shared::launcher_rpc::RPC_REQUEST_MARKER);
+        let rpc = ChildLine::Stdout(request.clone());
+        assert_eq!(host_message(&rpc), HostMessage::Rpc(&request));
+        let echoed = ChildLine::Stdout(format!("rule {marker}{{}}"));
+        assert!(matches!(host_message(&echoed), HostMessage::Log(_)));
     }
 
     #[test]

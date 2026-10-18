@@ -9,6 +9,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import "../components"
+import "../lib/pure.js" as Pure
 
 ColumnLayout {
     id: section
@@ -52,7 +53,7 @@ ColumnLayout {
     function _mainStaysText() { return section.controller.mainStaysText() }
     function _reason(overlap) {
         if (section._blockWinsTie(overlap))
-            return root.tr("rules.overlaps.reason.block-tie", "A block wins a tie")
+            return root.tr("rules.overlaps.reason.block-tie", "A deny wins a tie")
         var kind = String(overlap.kind)
         return kind === "duplicate"
             ? root.tr("rules.overlaps.reason.duplicate", "Same rule on both routes")
@@ -72,19 +73,28 @@ ColumnLayout {
         var kind = String(c.kind)
         var text = kind === "literal-block-overrides-route"
             ? root.tr("rules.overlaps.conflicts.literal-block",
-                "{rule}: {host} resolves to {ip}, and a block of that address wins over any name rule, so the address is blocked.")
+                "{rule}: {host} resolves to {ip}, and a deny of that address wins over any name rule, so the address is denied.")
             : kind === "network-carving-over-cap"
             ? root.tr("rules.overlaps.conflicts.carving-over-cap",
                 "{rule} holds more narrower rules than can be carved out of it, so it applies to its whole network and the narrower rules inside it do not take effect. Split it into smaller networks.")
             : kind === "unsupported-rule-shape"
             ? root.tr("rules.overlaps.conflicts.unsupported-shape",
                 "{rule} for {app} is not enforced: a rule that limits an address to one application cannot be carried out yet, so it is skipped rather than applied to every application.")
+            : kind === "protected-target"
+            ? root.tr("rules.overlaps.conflicts.protected", "The rule {rule} is not applied. {reason}")
             : root.tr("rules.overlaps.conflicts.leak",
-                "{rule} does not block {host}: it shares {ip} with {via}, which a narrower rule routes, so the address stays open.")
-        text = text.split("{rule}").join(String(c["rule-value"] || c["rule-id"] || ""))
-            .split("{app}").join(String(c.app || ""))
-            .split("{host}").join(String(c.host || c["rule-value"] || ""))
-            .split("{via}").join(String(c["via-host"] || ""))
+                "{rule} does not deny {host}: it shares {ip} with {via}, which a narrower rule routes, so the address stays open.")
+        // The protection says why in the rules table's own words.
+        var reason = String(c.reason || "")
+        var reasonText = reason === "" ? ""
+            : root.tr((reason === "file-in-system-folder"
+                    ? "rules.validation.match-value-warning.protected-"
+                    : "rules.validation.match-value-invalid.protected-") + reason, reason)
+        text = text.split("{reason}").join(reasonText)
+        text = text.split("{rule}").join(Pure.displayText(c["rule-value"] || c["rule-id"] || ""))
+            .split("{app}").join(Pure.displayText(c.app))
+            .split("{host}").join(Pure.displayText(c.host || c["rule-value"] || ""))
+            .split("{via}").join(Pure.displayText(c["via-host"]))
             .split("{ip}").join(ip)
         var more = Number(c.count || 0) - 1
         if (more > 0)
@@ -104,6 +114,7 @@ ColumnLayout {
     component Cell: Label {
         Layout.alignment: Qt.AlignVCenter
         wrapMode: Text.Wrap
+        textFormat: Text.PlainText
         color: root.textColor
         Accessible.role: Accessible.Cell
         Accessible.name: text
@@ -175,6 +186,7 @@ ColumnLayout {
                     required property var modelData
                     Layout.fillWidth: true
                     wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
                     color: root.uiTheme.colorWarning
                     text: section._conflictText(modelData)
                     Accessible.role: Accessible.StaticText
@@ -363,7 +375,7 @@ ColumnLayout {
                             ThemedButton {
                                 theme: root.uiTheme
                                 visible: section.controller.canReroute(row.overlap)
-                                enabled: root.allowUserRuleEdits !== false
+                                enabled: root.ruleEditsLocked !== true
                                 text: root.tr("rules.overlaps.send-over", "Send over {route} instead")
                                     .replace("{route}", root.routeLabel(String(row.overlap.loser.route)))
                                 Accessible.role: Accessible.Button
@@ -389,7 +401,7 @@ ColumnLayout {
                                 wrapMode: Text.Wrap
                                 color: root.mutedTextColor
                                 text: root.tr("rules.overlaps.block-note",
-                                        "A block rule is part of this pair; change it in the rules list.")
+                                        "A deny rule is part of this pair; change it in the rules list.")
                                 Accessible.role: Accessible.StaticText
                                 Accessible.name: text
                             }

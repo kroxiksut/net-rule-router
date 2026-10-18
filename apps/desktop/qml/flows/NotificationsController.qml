@@ -31,10 +31,11 @@ QtObject {
     // retires the other.
     property var _pushNotices: []
 
-    /// `false` when the user silenced this kind of notice on its own. The
-    /// master switch is checked by the surfaces that raise OS notifications;
-    /// this is the per-kind layer under it.
+    /// `false` when the user silenced this kind of notice on its own, or all
+    /// of them with the master switch, which governs this window as it does
+    /// the tray.
     function noticeKindEnabled(kind) {
+        if (root.prefs.showNotifications === false) return false
         if (String(kind || "") === "suggestions-changed")
             return root.prefs.notifySuggestionChanges !== false
         if (String(kind || "") === "block-notice")

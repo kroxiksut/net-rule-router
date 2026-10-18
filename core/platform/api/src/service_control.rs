@@ -175,21 +175,38 @@ pub struct ServiceUninstallSpec {
     /// When `true`, the service-owned data directory tree is deleted after the
     /// service registration is removed.
     pub remove_service_owned_data: bool,
+    /// When `true`, the audit trail goes with it. Only an explicit request
+    /// removes it: the trail is the record of what was done on this machine.
+    pub remove_audit_trail: bool,
 }
+
+/// The audit trail's directory under the service data root, on every OS.
+pub const AUDIT_SUBDIR: &str = "audit";
 
 impl ServiceUninstallSpec {
     /// Deregister the service but leave every file in place.
     pub const fn keep_data() -> Self {
         Self {
             remove_service_owned_data: false,
+            remove_audit_trail: false,
         }
     }
 
-    /// Deregister and delete the service-owned data tree. User-owned rule files
-    /// live outside that tree and are never touched by this.
+    /// Deregister and delete the service-owned data tree except the audit
+    /// trail. User-owned rule files live outside that tree and are never
+    /// touched by this.
     pub const fn purge_data() -> Self {
         Self {
             remove_service_owned_data: true,
+            remove_audit_trail: false,
+        }
+    }
+
+    /// [`Self::purge_data`], the audit trail included.
+    pub const fn purge_data_and_audit() -> Self {
+        Self {
+            remove_service_owned_data: true,
+            remove_audit_trail: true,
         }
     }
 }
@@ -465,6 +482,11 @@ mod tests {
     fn uninstall_specs_say_exactly_what_they_do() {
         assert!(!ServiceUninstallSpec::keep_data().remove_service_owned_data);
         assert!(ServiceUninstallSpec::purge_data().remove_service_owned_data);
+        assert!(
+            !ServiceUninstallSpec::purge_data().remove_audit_trail,
+            "a purge keeps the audit trail unless asked"
+        );
+        assert!(ServiceUninstallSpec::purge_data_and_audit().remove_audit_trail);
     }
 
     #[test]

@@ -19,13 +19,25 @@
 //! resolves the key against the active locale and substitutes args.
 //! Domain code never produces user-facing strings.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 
-use nrr_shared::rules_json::{AddressMatchDto, CanonicalRulesJsonV1, RuleDto};
+use nrr_shared::preset_parser::ParsedRuleType;
+use nrr_shared::rule_value_class::{
+    misplaced_message_key, misplaced_rule_value, rule_type_from_slug,
+};
+use nrr_shared::rules_json::{
+    AddressMatchDto, AppPatternDto, CanonicalRulesJsonV1, RuleAction as WireRuleAction, RuleDto,
+};
+use nrr_shared::RouteRole;
 
 use crate::address_class::AddressClass;
-use crate::ip_network_policy::IpValueKind;
-use crate::rules_file::HostPlatform;
+/// What a rule does to what it names; the verdict depends on it for programs.
+pub use crate::protected_places::RuleEffect;
+use crate::protected_places::{
+    protection_verdict, AppTarget, ProtectedPlaces, ProtectionReason, ProtectionVerdict,
+};
+use crate::rules_file::{extract_rule_flags, HostPlatform};
 use crate::rules_json_codec::wire_app_pattern;
 use crate::validation::{
     canonical_app_pattern, canonical_host_name, canonical_ip_address, canonical_ip_range,
@@ -116,6 +128,25 @@ pub fn validate_rule_value(rule_type_slug: &str, match_value: &str) -> RuleValue
     if trimmed.is_empty() {
         return RuleValueValidation::error("rules.validation.match-value-empty");
     }
+    if let Some(refusal) = deny_mark_refusal(trimmed) {
+        return refusal;
+    }
+    if let Some(belongs_in) = rule_type_from_slug(rule_type_slug).and_then(|section| {
+        // The file reader drops `+children` before it judges the name.
+        let value = if section == ParsedRuleType::Application {
+            Cow::Owned(extract_rule_flags(trimmed))
+        } else {
+            Cow::Borrowed(trimmed)
+        };
+        misplaced_rule_value(
+            section,
+            &value,
+            HostPlatform::compiled().executable_naming(),
+        )
+    }) {
+        return wrong_type(belongs_in);
+    }
+    let control_char = nrr_shared::preset_parser::first_forbidden_field_char(trimmed).is_some();
     match rule_type_slug {
         "zone" => validate_host_name(HostNameKind::Zone, trimmed),
         "domain" => validate_host_name(HostNameKind::Domain, trimmed),
@@ -126,7 +157,13 @@ pub fn validate_rule_value(rule_type_slug: &str, match_value: &str) -> RuleValue
         "ip-range" => validate_network(trimmed, |value, warnings| {
             canonical_ip_range(value, &RuleId(String::new()), warnings).map(drop)
         }),
-        "application" => validate_application(trimmed),
+        // A control character is refused before `+children` comes off: taking
+        // the flag rejoins the words, and a line break between them with it.
+        "application" if control_char => {
+            RuleValueValidation::error("rules.validation.match-value-invalid.application")
+        }
+        // `+children` is the rule's, not the program's: a path ends before it.
+        "application" => validate_application(&extract_rule_flags(trimmed)),
         _ => {
             let mut args = BTreeMap::new();
             args.insert("slug".to_string(), rule_type_slug.to_string());
@@ -136,6 +173,108 @@ pub fn validate_rule_value(rule_type_slug: &str, match_value: &str) -> RuleValue
             }
         }
     }
+}
+
+/// [`validate_rule_value`] for a rule that does `effect`: an application a
+/// deny or the additional route may not name (a critical system process, one
+/// of our own programs) is refused, one file in a system folder warned. The
+/// folders are this platform's static ones; the service judges a revision
+/// with the machine's own ([`rules_with_refused_values_in`]).
+pub fn validate_rule_value_for(
+    rule_type_slug: &str,
+    match_value: &str,
+    effect: RuleEffect,
+) -> RuleValueValidation {
+    validate_rule_value_in(
+        rule_type_slug,
+        match_value,
+        effect,
+        &ProtectedPlaces::defaults(HostPlatform::compiled()),
+    )
+}
+
+/// [`validate_rule_value_for`] judging protected folders by `places`.
+pub fn validate_rule_value_in(
+    rule_type_slug: &str,
+    match_value: &str,
+    effect: RuleEffect,
+    places: &ProtectedPlaces,
+) -> RuleValueValidation {
+    let verdict = validate_rule_value(rule_type_slug, match_value);
+    if verdict.is_error() || rule_type_slug != "application" {
+        return verdict;
+    }
+    match application_protection(match_value, effect, places) {
+        ProtectionVerdict::Refused(reason) => {
+            RuleValueValidation::error(protection_message_key(reason))
+        }
+        // A warning of the value's own says more about what to fix.
+        ProtectionVerdict::Warn(reason) if !verdict.is_warning() => {
+            RuleValueValidation::warning(protection_message_key(reason))
+        }
+        ProtectionVerdict::Warn(_) | ProtectionVerdict::Allowed => verdict,
+    }
+}
+
+/// The locale key a protection reason is told by: a refusal under
+/// `match-value-invalid`, the one warning under `match-value-warning`.
+#[must_use]
+pub fn protection_message_key(reason: ProtectionReason) -> String {
+    let kind = if reason == ProtectionReason::FileInSystemFolder {
+        "warning"
+    } else {
+        "invalid"
+    };
+    format!(
+        "rules.validation.match-value-{kind}.protected-{}",
+        reason.slug()
+    )
+}
+
+/// The protection's verdict on an application value as the table holds it,
+/// `+children` and all; a value the pipeline refuses is not its question.
+fn application_protection(
+    value: &str,
+    effect: RuleEffect,
+    places: &ProtectedPlaces,
+) -> ProtectionVerdict {
+    let value = extract_rule_flags(value.trim());
+    canonical_app_pattern(
+        &value,
+        value.contains('*'),
+        places.platform(),
+        &RuleId(String::new()),
+        &mut Vec::new(),
+    )
+    .map_or(ProtectionVerdict::Allowed, |pattern| {
+        protection_verdict(AppTarget::of_pattern(&pattern), effect, places)
+    })
+}
+
+/// A deny mark the parsers left in the value: the retired `+block` suffix, or a
+/// `!` that is detached, doubled or beside a `?`. Named before the type's own
+/// verdict, which would only say the value is malformed — and an application
+/// name may hold a space, so `! app.exe` would pass as a route.
+fn deny_mark_refusal(value: &str) -> Option<RuleValueValidation> {
+    use nrr_shared::preset_parser::{
+        carries_retired_block_flag, without_retired_block_flag, DENY_PREFIX, VERIFY_PRIMARY_PREFIX,
+    };
+    if carries_retired_block_flag(value) {
+        let head = without_retired_block_flag(value);
+        let head = head.strip_prefix(VERIFY_PRIMARY_PREFIX).unwrap_or(&head);
+        let head = head.strip_prefix(DENY_PREFIX).unwrap_or(head);
+        return Some(RuleValueValidation::Error {
+            message_key: "rules.validation.match-value-invalid.retired-block-flag".to_string(),
+            args: BTreeMap::from([("value".to_string(), format!("{DENY_PREFIX}{head}"))]),
+        });
+    }
+    let after_verify = value.strip_prefix(VERIFY_PRIMARY_PREFIX).unwrap_or(value);
+    if after_verify.starts_with(DENY_PREFIX) {
+        return Some(RuleValueValidation::error(
+            "rules.validation.match-value-invalid.deny-mark",
+        ));
+    }
+    None
 }
 
 // ── exact-ip ──────────────────────────────────────────────────────────────────
@@ -154,8 +293,8 @@ fn validate_exact_ip(value: &str) -> RuleValueValidation {
                 _ => "rules.validation.match-value-invalid.exact-ip-this-host",
             });
         }
-        Err(ValidationError::WrongAddressSection { belongs_in, .. }) => {
-            return wrong_kind(belongs_in)
+        Err(ValidationError::WrongSection { belongs_in, .. }) => {
+            return wrong_type(belongs_in.rule_type())
         }
         Err(_) => return exact_ip_refusal(value),
     }
@@ -204,13 +343,13 @@ fn exact_ip_refusal(value: &str) -> RuleValueValidation {
     RuleValueValidation::error("rules.validation.match-value-invalid.exact-ip")
 }
 
-/// The value is another kind of address: name the type it belongs to.
-fn wrong_kind(belongs_in: IpValueKind) -> RuleValueValidation {
-    RuleValueValidation::error(match belongs_in {
-        IpValueKind::Address => "rules.validation.match-value-invalid.is-exact-ip",
-        IpValueKind::Subnet => "rules.validation.match-value-invalid.is-subnet",
-        IpValueKind::Range => "rules.validation.match-value-invalid.is-ip-range",
-    })
+/// The value is a rule of another type: name the type it belongs to, also as
+/// the `type` argument a "move it there" offer reads.
+fn wrong_type(belongs_in: ParsedRuleType) -> RuleValueValidation {
+    RuleValueValidation::Error {
+        message_key: misplaced_message_key(belongs_in).to_string(),
+        args: BTreeMap::from([("type".to_string(), belongs_in.slug().to_string())]),
+    }
 }
 
 // ── subnet / ip-range ─────────────────────────────────────────────────────────
@@ -223,8 +362,8 @@ fn validate_network(
     let mut warnings = Vec::new();
     match canonical(value, &mut warnings) {
         Ok(()) => {}
-        Err(ValidationError::WrongAddressSection { belongs_in, .. }) => {
-            return wrong_kind(belongs_in)
+        Err(ValidationError::WrongSection { belongs_in, .. }) => {
+            return wrong_type(belongs_in.rule_type())
         }
         Err(ValidationError::InvalidSubnet { .. }) => {
             return RuleValueValidation::error("rules.validation.match-value-invalid.subnet")
@@ -296,11 +435,12 @@ fn prefix_arg(prefix: u8) -> BTreeMap<String, String> {
 fn validate_host_name(kind: HostNameKind, value: &str) -> RuleValueValidation {
     // A domain value carries its suffix form the way the rules file does.
     let body = match kind {
-        HostNameKind::Domain => value.strip_prefix("*.").unwrap_or(value),
+        HostNameKind::Domain => crate::AddressMatch::domain_value_name(value),
         HostNameKind::Zone => value,
     };
     match canonical_host_name(kind, body, &RuleId(String::new()), &mut Vec::new()) {
         Ok(_) => RuleValueValidation::Valid,
+        Err(ValidationError::WrongSection { belongs_in, .. }) => wrong_type(belongs_in.rule_type()),
         Err(refusal) => RuleValueValidation::error(refusal_message_key(kind, body, &refusal)),
     }
 }
@@ -363,16 +503,20 @@ fn is_valid_ascii_dns_label(label: &str) -> bool {
 // ── application ───────────────────────────────────────────────────────────────
 
 /// The pipeline's verdict on an application value, written as a pattern when
-/// it carries a `*` — the way the rules file reads it.
+/// it carries a `*` — the way the rules file reads it. A path that names no
+/// program says why.
 fn validate_application(value: &str) -> RuleValueValidation {
     match canonical_app_pattern(
         value,
         value.contains('*'),
-        HostPlatform::compiled().executable_naming(),
+        HostPlatform::compiled(),
         &RuleId(String::new()),
         &mut Vec::new(),
     ) {
         Ok(_) => RuleValueValidation::Valid,
+        Err(ValidationError::AppPathInvalid { problem, .. }) => RuleValueValidation::error(
+            format!("rules.validation.match-value-invalid.{}", problem.slug()),
+        ),
         Err(_) => RuleValueValidation::error("rules.validation.match-value-invalid.application"),
     }
 }
@@ -385,6 +529,7 @@ pub fn wire_rule_values(rule: &RuleDto) -> impl Iterator<Item = (&'static str, S
     let address = rule.address_match.as_ref().map(|m| match m {
         AddressMatchDto::ExactFqdn { value } => ("domain", value.clone()),
         AddressMatchDto::SuffixDomain { suffix } => ("domain", format!("*.{suffix}")),
+        AddressMatchDto::AnyZoneDomain { base } => ("domain", format!("{base}.*")),
         AddressMatchDto::Zone { name } => ("zone", name.clone()),
         AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address } => {
             ("exact-ip", address.clone())
@@ -416,9 +561,34 @@ pub struct RefusedRuleValue {
 /// written before the check must stay editable, and refusing it would also stop
 /// every automatic edit of that book. A rule refused outright is never spared:
 /// reading the book in force drops it ([`drop_rules_refused_outright`]).
+///
+/// The service's acceptance gate: a protected program or folder is not its
+/// question. Such a rule is accepted into the book and withheld from
+/// enforcement ([`crate::protected_places::withhold_protected`]), so a
+/// hand-edited file shows it as not applied rather than failing whole.
 pub fn rules_with_refused_values(
     book: &CanonicalRulesJsonV1,
     carried: Option<&CanonicalRulesJsonV1>,
+) -> Vec<RefusedRuleValue> {
+    refused_values(book, carried, None)
+}
+
+/// [`rules_with_refused_values`] that also refuses a new rule on a protected
+/// program or folder, judged by `places`: what a form shows before a rule is
+/// saved. A protected rule the book in force already holds with the same
+/// effect is spared like any other value.
+pub fn rules_with_refused_values_in(
+    book: &CanonicalRulesJsonV1,
+    carried: Option<&CanonicalRulesJsonV1>,
+    places: &ProtectedPlaces,
+) -> Vec<RefusedRuleValue> {
+    refused_values(book, carried, Some(places))
+}
+
+fn refused_values(
+    book: &CanonicalRulesJsonV1,
+    carried: Option<&CanonicalRulesJsonV1>,
+    places: Option<&ProtectedPlaces>,
 ) -> Vec<RefusedRuleValue> {
     let held: HashSet<(&'static str, String)> = carried
         .into_iter()
@@ -426,20 +596,73 @@ pub fn rules_with_refused_values(
         .filter(|rule| refused_outright(rule).is_none())
         .flat_map(wire_rule_values)
         .collect();
-    book.primary
-        .iter()
-        .chain(&book.secondary)
-        .filter_map(|rule| {
+    let held_protected: HashSet<(String, RuleEffect)> = carried
+        .into_iter()
+        .flat_map(routed_rules)
+        .filter_map(|(rule, role)| {
+            let app = rule.app_match.as_ref()?;
+            Some((app.pattern.value().to_owned(), wire_effect(rule, role)?))
+        })
+        .collect();
+    routed_rules(book)
+        .filter_map(|(rule, role)| {
             wire_rule_values(rule)
                 .find(|entry| {
                     validate_rule_value(entry.0, &entry.1).is_error() && !held.contains(entry)
                 })
-                .map(|(_, value)| RefusedRuleValue {
+                .map(|(_, value)| value)
+                .or_else(|| {
+                    let places = places?;
+                    let effect = wire_effect(rule, role)?;
+                    let app = rule.app_match.as_ref()?;
+                    let value = app.pattern.value().to_owned();
+                    let refused = wire_protection(&app.pattern, effect, places).is_refused();
+                    (refused && !held_protected.contains(&(value.clone(), effect))).then_some(value)
+                })
+                .map(|value| RefusedRuleValue {
                     rule_id: rule.id.clone(),
                     value,
                 })
         })
         .collect()
+}
+
+/// Every rule of `book` with the file it is written in, primary first.
+fn routed_rules(book: &CanonicalRulesJsonV1) -> impl Iterator<Item = (&RuleDto, RouteRole)> {
+    book.primary
+        .iter()
+        .map(|rule| (rule, RouteRole::Primary))
+        .chain(
+            book.secondary
+                .iter()
+                .map(|rule| (rule, RouteRole::Secondary)),
+        )
+}
+
+/// What a wire rule written in `role`'s file does; `None` for an action this
+/// build does not know, which it never applies.
+fn wire_effect(rule: &RuleDto, role: RouteRole) -> Option<RuleEffect> {
+    match rule.action {
+        WireRuleAction::Block => Some(RuleEffect::Deny),
+        WireRuleAction::Route | WireRuleAction::VerifyPrimary => Some(match role {
+            RouteRole::Primary => RuleEffect::PrimaryRoute,
+            RouteRole::Secondary => RuleEffect::SecondaryRoute,
+        }),
+        WireRuleAction::Unrecognized(_) => None,
+    }
+}
+
+/// The protection's verdict on a wire application pattern; a pattern the
+/// pipeline refuses is the value check's, not this one's.
+fn wire_protection(
+    pattern: &AppPatternDto,
+    effect: RuleEffect,
+    places: &ProtectedPlaces,
+) -> ProtectionVerdict {
+    wire_app_pattern(pattern, places.platform(), &RuleId(String::new()))
+        .map_or(ProtectionVerdict::Allowed, |canonical| {
+            protection_verdict(AppTarget::of_pattern(&canonical), effect, places)
+        })
 }
 
 /// Removes from a stored `book` every rule no book may hold and returns them,
@@ -496,14 +719,9 @@ fn refused_outright(rule: &RuleDto) -> Option<String> {
         _ => {}
     }
     let app = rule.app_match.as_ref()?;
-    // The refusal does not depend on the platform's spelling of names.
-    wire_app_pattern(
-        &app.pattern,
-        HostPlatform::compiled().executable_naming(),
-        &no_rule,
-    )
-    .is_err()
-    .then(|| app.pattern.value().to_owned())
+    wire_app_pattern(&app.pattern, HostPlatform::compiled(), &no_rule)
+        .is_err()
+        .then(|| app.pattern.value().to_owned())
 }
 
 // ── network domain ────────────────────────────────────────────────────────────
@@ -667,9 +885,8 @@ mod tests {
             "10.0.0.1-10.0.0.9",
             "match-value-invalid.is-ip-range",
         );
-        for value in ["abc.def", "fe80::1%3"] {
-            err("exact-ip", value, "match-value-invalid.exact-ip");
-        }
+        err("exact-ip", "abc.def", "match-value-invalid.is-domain");
+        err("exact-ip", "fe80::1%3", "match-value-invalid.exact-ip");
     }
 
     #[test]
@@ -715,8 +932,68 @@ mod tests {
 
     #[test]
     fn ipv4_non_digit_rejected() {
-        err("exact-ip", "abc.def.ghi.jkl", "exact-ip");
-        err("exact-ip", "1.2.3.x", "exact-ip");
+        err(
+            "exact-ip",
+            "abc.def.ghi.jkl",
+            "match-value-invalid.is-domain",
+        );
+        err("exact-ip", "1.2.3.x", "match-value-invalid.exact-ip");
+    }
+
+    /// A section is a type: a value spelled as another type's names the type
+    /// it belongs to, and is never kept as a rule that cannot match.
+    #[test]
+    fn a_value_of_another_type_names_the_type_it_belongs_to() {
+        let windows = HostPlatform::compiled() == HostPlatform::Windows;
+        for (rule_type, value, belongs_in) in [
+            ("domain", "chrome.exe", "application"),
+            ("zone", "chrome.exe", "application"),
+            ("domain", "192.0.2.7", "exact-ip"),
+            ("zone", "192.0.2.7", "exact-ip"),
+            ("domain", "2001:db8::7", "exact-ip"),
+            ("exact-ip", "example.com", "domain"),
+            ("subnet", "example.com", "domain"),
+            ("ip-range", "example.com", "domain"),
+            ("exact-ip", "*.ru", "zone"),
+            ("zone", "example.*", "domain"),
+            ("application", "192.0.2.7", "exact-ip"),
+            ("application", "10.0.0.0/24", "subnet"),
+            ("application", "10.0.0.0/33", "subnet"),
+            ("application", "192.0.2.10-192.0.2.40", "ip-range"),
+            ("application", "*.example.com", "domain"),
+        ] {
+            let verdict = validate_rule_value(rule_type, value);
+            assert_eq!(
+                verdict.message_key(),
+                format!("rules.validation.match-value-invalid.is-{belongs_in}"),
+                "{rule_type} {value:?}"
+            );
+            assert_eq!(
+                verdict.args().get("type").map(String::as_str),
+                Some(belongs_in),
+                "{rule_type} {value:?}"
+            );
+        }
+        // A program's name may carry dots on Linux and macOS only.
+        for value in ["example.com", "deploy.sh", "example.*"] {
+            if windows {
+                err("application", value, "match-value-invalid.is-domain");
+            } else {
+                ok("application", value);
+            }
+        }
+        if windows {
+            err("application", "*.ru", "match-value-invalid.is-zone");
+        }
+        // What the spelling does not settle is left to the type it is
+        // written as.
+        ok("zone", "corp.internal");
+        ok("domain", "*.ru");
+        ok("domain", "telegram");
+        ok("application", "telegram");
+        ok("application", "script.ps1");
+        ok("application", "codex.exe +children");
+        err("exact-ip", "telegram", "match-value-invalid.exact-ip");
     }
 
     // ── domain ──
@@ -857,17 +1134,42 @@ mod tests {
         ok("application", "browser.exe");
         ok("application", "*vpn*.exe");
         ok("application", "script.ps1");
-        ok("application", "deploy.sh");
         ok("application", "Some App.app");
         // Cyrillic process name.
         ok("application", "браузер.exe");
     }
 
-    /// The pipeline keeps the file name of a path, so the row does too.
+    /// A path in this platform's spelling is a rule; one that names no
+    /// program says why.
     #[test]
-    fn an_application_path_is_valid() {
-        ok("application", "C:\\Program Files\\app.exe");
-        ok("application", "/usr/bin/app");
+    fn an_application_path_is_judged_by_its_form() {
+        if cfg!(windows) {
+            for value in [
+                r"C:\Program Files\app.exe",
+                r"C:\Program Files\App",
+                r"C:\Program Files\App\",
+                r"C:\Program Files\App\*",
+                r"C:\Program Files\App\* +children",
+            ] {
+                ok("application", value);
+            }
+            err("application", r"C:\Program Files\*.exe", "path-star");
+            err("application", r"App\app.exe", "path-not-absolute");
+            err("application", "/usr/bin/app", "path-not-absolute");
+            err("application", r"C:\App\..\Windows\", "path-invalid");
+        } else {
+            for value in [
+                "/usr/lib/app",
+                "/opt/app/",
+                "/opt/app/*",
+                "/opt/app/* +children",
+            ] {
+                ok("application", value);
+            }
+            err("application", "/opt/*/app", "path-star");
+            err("application", "bin/app", "path-not-absolute");
+            err("application", "/opt/../etc/", "path-invalid");
+        }
     }
 
     #[test]
@@ -881,6 +1183,15 @@ mod tests {
     fn application_with_control_chars_rejected() {
         err("application", "app\x01.exe", "application");
         err("application", "app\n.exe", "application");
+        // Taking `+children` off rejoins the words; the break is still refused.
+        err("application", "app\n.exe +children", "application");
+        let path = if cfg!(windows) {
+            "C:\\Apps\\to\nol\\"
+        } else {
+            "/opt/to\nol/"
+        };
+        err("application", path, "application");
+        err("application", &format!("{path} +children"), "application");
     }
 
     // ── general ──
@@ -903,6 +1214,181 @@ mod tests {
             err(rule_type, "", "match-value-empty");
             err(rule_type, "   ", "match-value-empty");
         }
+    }
+
+    /// A deny mark the parsers left in a value is named whatever the type: an
+    /// application name may hold a space, so its own verdict would pass it.
+    #[test]
+    fn a_misplaced_deny_mark_is_named_for_every_type() {
+        for (rule_type, value) in [
+            ("zone", "example"),
+            ("domain", "example.com"),
+            ("exact-ip", "192.0.2.7"),
+            ("subnet", "10.20.0.0/24"),
+            ("ip-range", "10.0.0.5-10.0.0.40"),
+            ("application", "telemetry.exe"),
+        ] {
+            ok(rule_type, value);
+            for marked in [
+                format!("! {value}"),
+                format!("!!{value}"),
+                format!("?!{value}"),
+                format!("!?{value}"),
+            ] {
+                err(rule_type, &marked, "match-value-invalid.deny-mark");
+            }
+            let retired = validate_rule_value(rule_type, &format!("{value} +block"));
+            assert_eq!(
+                retired.message_key(),
+                "rules.validation.match-value-invalid.retired-block-flag",
+                "{rule_type}"
+            );
+            assert_eq!(
+                retired.args().get("value"),
+                Some(&format!("!{value}")),
+                "{rule_type}"
+            );
+        }
+        // Only a later word is the retired suffix.
+        ok("application", "+block.exe");
+        err(
+            "domain",
+            "?a.example +block",
+            "match-value-invalid.retired-block-flag",
+        );
+    }
+
+    /// A critical process of the platform this build runs on.
+    fn critical_name() -> &'static str {
+        match HostPlatform::compiled() {
+            HostPlatform::Windows => "svchost.exe",
+            HostPlatform::Linux => "NetworkManager",
+            HostPlatform::MacOS => "configd",
+        }
+    }
+
+    #[test]
+    fn a_critical_process_is_refused_for_a_deny_and_the_additional_route() {
+        for effect in [RuleEffect::Deny, RuleEffect::SecondaryRoute] {
+            let verdict = validate_rule_value_for("application", critical_name(), effect);
+            assert_eq!(
+                verdict.message_key(),
+                "rules.validation.match-value-invalid.protected-critical-process",
+                "{effect:?}"
+            );
+            assert!(verdict.is_error());
+        }
+        assert_eq!(
+            validate_rule_value_for("application", critical_name(), RuleEffect::PrimaryRoute),
+            RuleValueValidation::Valid
+        );
+        // Only an application is a program.
+        assert_eq!(
+            validate_rule_value_for("domain", "example.com", RuleEffect::Deny),
+            RuleValueValidation::Valid
+        );
+        // The value's own refusal comes first.
+        err("application", "*", "application");
+        assert_eq!(
+            validate_rule_value_for("application", "*", RuleEffect::Deny).message_key(),
+            "rules.validation.match-value-invalid.application"
+        );
+    }
+
+    #[test]
+    fn a_mask_and_a_children_flag_do_not_hide_a_critical_process() {
+        let masked = match HostPlatform::compiled() {
+            HostPlatform::Windows => "svc*.exe +children",
+            HostPlatform::Linux => "system*",
+            HostPlatform::MacOS => "mdns*",
+        };
+        assert!(validate_rule_value_for("application", masked, RuleEffect::Deny).is_error());
+    }
+
+    #[test]
+    fn every_protection_reason_has_one_key() {
+        let keys: HashSet<String> = ProtectionReason::ALL
+            .into_iter()
+            .map(protection_message_key)
+            .collect();
+        assert_eq!(keys.len(), ProtectionReason::ALL.len());
+        assert_eq!(
+            protection_message_key(ProtectionReason::FileInSystemFolder),
+            "rules.validation.match-value-warning.protected-file-in-system-folder"
+        );
+    }
+
+    fn app_dto(id: &str, value: &str, action: WireRuleAction) -> RuleDto {
+        RuleDto {
+            id: id.into(),
+            enabled: true,
+            address_match: None,
+            app_match: Some(nrr_shared::rules_json::AppMatchDto {
+                pattern: AppPatternDto::Exact {
+                    value: value.into(),
+                },
+                include_child_processes: false,
+            }),
+            comment: String::new(),
+            action,
+            origin: None,
+        }
+    }
+
+    fn book(primary: Vec<RuleDto>, secondary: Vec<RuleDto>) -> CanonicalRulesJsonV1 {
+        CanonicalRulesJsonV1 {
+            schema_version: nrr_shared::rules_json::RULES_JSON_SCHEMA_VERSION,
+            primary,
+            secondary,
+        }
+    }
+
+    #[test]
+    fn a_new_protected_rule_is_refused_and_a_carried_one_spared_with_its_effect() {
+        let places = ProtectedPlaces::defaults(HostPlatform::Windows);
+        let refused = |submitted: &CanonicalRulesJsonV1, carried: Option<&CanonicalRulesJsonV1>| {
+            rules_with_refused_values_in(submitted, carried, &places)
+                .into_iter()
+                .map(|r| r.rule_id)
+                .collect::<Vec<_>>()
+        };
+        let submitted = book(
+            vec![
+                app_dto("p-main", "svchost.exe", WireRuleAction::Route),
+                app_dto("p-deny", "svchost.exe", WireRuleAction::Block),
+            ],
+            vec![
+                app_dto("s-route", "lsass.exe", WireRuleAction::Route),
+                app_dto("s-game", "game.exe", WireRuleAction::Route),
+            ],
+        );
+        assert_eq!(refused(&submitted, None), ["p-deny", "s-route"]);
+        assert!(
+            rules_with_refused_values(&submitted, None).is_empty(),
+            "the service gate accepts them; enforcement withholds them"
+        );
+
+        // An older book already denied it: kept editable, withheld from enforcement.
+        let carried = book(
+            vec![app_dto("old", "svchost.exe", WireRuleAction::Block)],
+            vec![],
+        );
+        let still = book(
+            vec![app_dto("p-deny", "svchost.exe", WireRuleAction::Block)],
+            vec![],
+        );
+        assert!(refused(&still, Some(&carried)).is_empty());
+
+        // Moved from the main route to the additional one: new there.
+        let main = book(
+            vec![app_dto("x", "lsass.exe", WireRuleAction::Route)],
+            vec![],
+        );
+        let moved = book(
+            vec![],
+            vec![app_dto("x", "lsass.exe", WireRuleAction::Route)],
+        );
+        assert_eq!(refused(&moved, Some(&main)), ["x"]);
     }
 
     #[test]

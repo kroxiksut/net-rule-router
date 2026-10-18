@@ -27,6 +27,18 @@ pub(crate) fn build_supervised_runtime_deps(
     // collect expired dry-run tokens: a dry-run needs no elevation, skips the
     // mutation queue and parks its payload here until confirmed or expired.
     let mutation_tokens = Arc::new(MutationTokenStore::new());
+    // At boot the VPN usually comes up after the service: its absence is quiet
+    // for a while, not an outage.
+    nrr_service_runtime::startup_quiet::install(
+        i64::try_from(nrr_service_runtime::conn_observation_consumer::now_unix_ms())
+            .unwrap_or(i64::MAX),
+    );
+    // Before any rules read: every one judges protected programs by these.
+    nrr_service_runtime::protected_rules::install(
+        nrr_platform_api::protected_places::ProtectedPlacesSource::protected_places(
+            &nrr_platform_windows::protected_places::WindowsProtectedPlaces,
+        ),
+    );
     // ── Shared HealthAggregator ────────────────────────────────────────
     // Constructed once at the top of the function so that:
     //   * `IpcHandlerDeps.health` (read-side, accessed via the IPC
@@ -638,6 +650,11 @@ pub(crate) fn build_supervised_runtime_deps(
                     // protection. This tick fires at task spawn, on every
                     // adapter/network change, and every 30 s; a decider that
                     // cannot answer (pause-flag read error) touches nothing.
+                    // A pass before the engine opened did nothing, so it
+                    // settles nothing either.
+                    if !orch.engine_open() {
+                        clean = false;
+                    }
                     let settled = match orch.settle() {
                         Ok(sids) => sids,
                         Err(e) => {
@@ -1080,11 +1097,11 @@ pub(crate) fn build_supervised_runtime_deps(
             reverse_dns_learner_tx: fcrdns_hook,
             app_destination_forget: settings_conn.as_ref().map(|conn| {
             let conn = Arc::clone(conn);
-            Arc::new(move |app: &str, ip: std::net::Ipv4Addr| {
+            Arc::new(move |owner: Option<&str>, app: &str, ip: std::net::Ipv4Addr| {
                 let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
                 if let Err(e) =
                     nrr_storage::app_destinations::AppDestinationsRepository::new(&guard)
-                        .forget(app, ip)
+                        .forget(owner, app, ip)
                 {
                     tracing::warn!(
                         target: "nrr::app-routing",
@@ -1196,6 +1213,13 @@ pub(crate) fn build_supervised_runtime_deps(
             let orch = Arc::clone(orch);
             Arc::new(move || orch.any_fail_closed_armed()) as Arc<dyn Fn() -> bool + Send + Sync>
         });
+    // One user's guard withholds only the hosts that user's rules name.
+    let fail_closed_armed_for: Option<nrr_service_runtime::dns_stack::PrincipalFlag> =
+        per_sid_orchestrator.as_ref().map(|orch| {
+            let orch = Arc::clone(orch);
+            Arc::new(move |sid: &str| orch.fail_closed_armed_for(sid))
+                as nrr_service_runtime::dns_stack::PrincipalFlag
+        });
     // A hostname's fake address is its stable identity across restarts: seed
     // the allocator from the persisted bindings and mirror every later change
     // back. Without this the in-memory allocator re-deals the same indices to
@@ -1281,6 +1305,7 @@ pub(crate) fn build_supervised_runtime_deps(
                     coordinator: Arc::clone(coord),
                     active_sid: Arc::clone(sid),
                     cache: Mutex::new(None),
+                    owner_cache: Mutex::default(),
                 });
                 Some(Arc::new(move || source.current().1.is_some()))
             }
@@ -1313,6 +1338,14 @@ pub(crate) fn build_supervised_runtime_deps(
             );
         }
     }
+    let served_principals: nrr_service_runtime::fake_ip::ServedPrincipalsFn = {
+        let registry = Arc::clone(&sid_registry);
+        let coord = route_coordinator.clone();
+        Arc::new(move || match coord.as_ref() {
+            Some(c) => c.served_sids(&registry.active_sids()),
+            None => registry.active_sids(),
+        })
+    };
     let fake_ip_armed = if let Some(stack_factory) = build_fake_ip_stack_factory(
         Arc::clone(&fake_ip_assembly),
         cache_store.as_ref(),
@@ -1320,6 +1353,7 @@ pub(crate) fn build_supervised_runtime_deps(
         active_routing_sid.as_ref(),
         route_coordinator.as_ref(),
         auto_rules_engine.as_ref(),
+        Arc::clone(&served_principals),
         Arc::clone(&task_liveness),
     ) {
         fake_ip_controller.set_factory(stack_factory);
@@ -1411,6 +1445,29 @@ pub(crate) fn build_supervised_runtime_deps(
     // BLOCKS the shared addresses, so standing steering down handed direct
     // hosts a set of addresses that could only be dropped. See
     // `ActiveSecondaryOwnedIps`.
+    // The resolver also waits for one of those signed in to bind a connection:
+    // before that the service leaves name resolution as it found it.
+    let resolver_may_arm: Arc<dyn Fn() -> bool + Send + Sync> = match settings_conn.as_ref() {
+        Some(conn) => {
+            let reg = Arc::clone(&sid_registry);
+            nrr_service_runtime::routing_setup::resolver_may_arm(
+                Arc::clone(&signed_in),
+                Arc::new(move || {
+                    let mut present = reg.active_sids();
+                    for sid in
+                        nrr_platform_windows::win32_ffi::console_session::interactive_user_sids()
+                    {
+                        if !present.contains(&sid) {
+                            present.push(sid);
+                        }
+                    }
+                    present
+                }),
+                Arc::clone(conn),
+            )
+        }
+        None => Arc::clone(&signed_in),
+    };
     if let Some(factory) = build_dns_resolver_factory(
         settings_conn.as_ref(),
         cache_store.as_ref(),
@@ -1419,12 +1476,14 @@ pub(crate) fn build_supervised_runtime_deps(
         known_direct_registry.as_ref(),
         block_all_armed,
         fail_closed_armed,
+        fail_closed_armed_for,
+        Some(Arc::clone(&served_principals)),
         Some(Arc::clone(&fake_ip_assembly)),
         Some(Arc::clone(&fake_ip_running)),
         fake_ip_secondary_ready,
         dns_egress_policy,
         auto_rules_engine.clone(),
-        Some(Arc::clone(&signed_in)),
+        Some(Arc::clone(&resolver_may_arm)),
         route_coordinator.clone(),
         conn_trace_ring
             .as_ref()
@@ -1432,7 +1491,10 @@ pub(crate) fn build_supervised_runtime_deps(
         Arc::clone(&task_liveness),
     ) {
         dns_resolver_controller.set_factory(factory);
-        dns_resolver_controller.set_sign_in_probe(Arc::clone(&signed_in));
+        dns_resolver_controller.set_sign_in_probe(resolver_may_arm);
+        // A binding is not a sign-in event: the watchdog tick asks again
+        // while the arm waits, and only then.
+        dns_resolver_controller.poll_for_sign_in();
     }
     // DNS-over-secondary — seed the shared live flag from storage at boot, so
     // the setting holds from the first query instead of only after the user
@@ -1629,6 +1691,9 @@ pub(crate) fn build_supervised_runtime_deps(
         auto_rules_engine,
         auto_rule_probe: auto_probe_wiring,
         app_destination_memory,
+        conn_history: conn_trace_ring
+            .as_ref()
+            .and_then(|ring| ring.history().cloned()),
         dns_resolver_controller: Some(dns_resolver_controller),
         dns_resolver_mode,
         // The SAME EventBus the IPC handlers publish

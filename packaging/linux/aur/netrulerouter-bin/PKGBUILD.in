@@ -1,0 +1,37 @@
+# Maintainer: NetRuleRouter <fmalkov91@gmail.com>
+#
+# Rendered by scripts/aur-update.sh from packaging/linux/aur/netrulerouter-bin/;
+# edit the template there, not the copy in the AUR repository.
+
+pkgname=netrulerouter-bin
+_tag=@TAG@
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc="Policy routing over existing network connections: sites, addresses and programs by your rules"
+arch=('x86_64' 'aarch64')
+url="https://github.com/kroxiksut/net-rule-router"
+license=('MPL-2.0')
+depends=('glibc' 'systemd' 'nftables' 'iproute2'
+         'qt6-base' 'qt6-declarative' 'qt6-svg')
+optdepends=('polkit: privileged changes without root'
+            'qt6-wayland: the window and the tray on a Wayland session')
+provides=('netrulerouter')
+conflicts=('netrulerouter')
+install=netrulerouter.install
+_stem_x86_64="netrulerouter-${_tag#v}-linux-x86_64"
+_stem_aarch64="netrulerouter-${_tag#v}-linux-aarch64"
+source_x86_64=("$url/releases/download/$_tag/$_stem_x86_64.tar.gz")
+source_aarch64=("$url/releases/download/$_tag/$_stem_aarch64.tar.gz")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+
+package() {
+  local stem="_stem_$CARCH"
+  cd "$srcdir/${!stem}"
+  cp -a root/. "$pkgdir/"
+  # The archive's own removal is for installs by hand; pacman owns this one.
+  rm -f "$pkgdir/usr/libexec/netrulerouter/scripts/uninstall.sh"
+  # The unit is the one the daemon renders for packages, as for .deb and .rpm.
+  "$pkgdir/usr/libexec/netrulerouter/nrr-serviced" package-files "$pkgdir" >/dev/null
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

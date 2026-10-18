@@ -1662,3 +1662,62 @@ fn the_fingerprint_survives_a_key_change() {
         vec![AdoptionOutcome::Adopted]
     );
 }
+
+/// Activates `id` under `principal` at `at`, retiring `previous`.
+fn activate_at(
+    repo: &RevisionsRepository<'_>,
+    principal: &str,
+    id: &str,
+    previous: Option<&str>,
+    at: i64,
+) {
+    let mut rec = sample_record(id, &format!("h-{id}"));
+    rec.created_at = at;
+    repo.insert_candidate_for(principal, &rec).expect("insert");
+    repo.mark_apply_succeeded_for(principal, id, previous, at)
+        .expect("activate");
+}
+
+#[test]
+fn enforced_since_lists_what_came_into_force_newest_first() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let repo = RevisionsRepository::new(&conn);
+    let user = "S-1-5-21-A";
+    activate_at(&repo, user, "rev-1", None, 100);
+    activate_at(&repo, user, "rev-2", Some("rev-1"), 200);
+    activate_at(&repo, user, "rev-3", Some("rev-2"), 300);
+    // Never enforced: left out.
+    repo.insert_candidate_for(user, &sample_record("rev-c", "h-c"))
+        .expect("insert candidate");
+    // Another user's history: left out.
+    activate_at(&repo, "S-1-5-21-B", "rev-b", None, 250);
+
+    let ids = |rows: Vec<EnforcedRevisionStamp>| -> Vec<String> {
+        rows.into_iter().map(|r| r.revision_id).collect()
+    };
+    assert_eq!(
+        ids(repo.enforced_since_for(user, 200, 10).expect("since")),
+        vec!["rev-3".to_string(), "rev-2".to_string()]
+    );
+    assert_eq!(
+        ids(repo.enforced_since_for(user, 0, 2).expect("limited")),
+        vec!["rev-3".to_string(), "rev-2".to_string()]
+    );
+    let before = repo
+        .last_enforced_before_for(user, 200)
+        .expect("before")
+        .expect("present");
+    assert_eq!(before.revision_id, "rev-1");
+    assert_eq!(before.activated_at, 100);
+    assert_eq!(before.source, RulesRevisionSource::GuiRulesEdit);
+    assert!(repo
+        .last_enforced_before_for(user, 100)
+        .expect("before first")
+        .is_none());
+    assert_eq!(repo.superseded_count_since_for(user, 0).expect("count"), 2);
+    assert_eq!(
+        repo.superseded_count_since_for(user, 150).expect("count"),
+        1
+    );
+}

@@ -9,6 +9,7 @@ use nrr_client_logic::adapters::{
 use nrr_client_logic::route_policy::{build_full_update_request, name_changes};
 use nrr_client_logic::Route;
 use nrr_ipc_client::{ipc_error_to_wire, ipc_operation_timeout, IpcClient, IpcClientError};
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     InterfaceRowDto, RouteBindingDto, RoutePolicyDto, SnapshotInterfacesResponse,
@@ -202,7 +203,7 @@ impl RoleChange {
         match self {
             Self::Assign { name, .. } => texts.fill(
                 k::ROLE_SET,
-                &[("role", role.as_str()), ("name", name.as_str())],
+                &[("role", role.as_str()), ("name", &*display_text(name))],
             ),
             Self::Unassign { .. } => texts.fill(k::ROLE_UNASSIGNED, &[("role", role)]),
         }

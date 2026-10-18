@@ -132,6 +132,43 @@ pub const TRACE_HELP_OUTAGE: Key = key(
     "tui.trace.help-outage",
     "o: what was blocked while the additional route was down",
 );
+pub const TRACE_HELP_HISTORY: Key = key(
+    "tui.trace.help-history",
+    "h: the latest connections or your kept history   t: the history's period — last hour, today, last 7 days",
+);
+pub const TRACE_PLAIN_HISTORY: Key = key(
+    "tui.trace.plain-history",
+    "h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period",
+);
+
+// ── The kept connection history ──────────────────────────────────────────────
+
+pub const HISTORY_MODE: Key = key("diag.conn-history.mode-history", "History");
+pub const HISTORY_HOUR: Key = key("diag.conn-history.period-hour", "Last hour");
+pub const HISTORY_TODAY: Key = key("diag.conn-history.period-today", "Today");
+pub const HISTORY_WEEK: Key = key("diag.conn-history.period-week", "Last 7 days");
+pub const HISTORY_EMPTY: Key = key("diag.conn-history.empty", "No connections in this period");
+pub const HISTORY_OFF: Key = key(
+    "diag.conn-history.off",
+    "Your connection history is switched off in Settings → Diagnostics and logs.",
+);
+pub const HISTORY_UNAVAILABLE: Key = key(
+    "diag.conn-history.unavailable",
+    "The connection history cannot be kept right now. The service log says why.",
+);
+pub const HISTORY_REMOVED: Key = key(
+    "diag.conn-history.removed",
+    "%1 older entries were removed to keep the history within its size limit, so it may cover less than the period you chose.",
+);
+pub const HISTORY_SKIPPED: Key = key(
+    "diag.conn-history.skipped",
+    "%1 connections came too fast to be recorded and are missing from the history.",
+);
+pub const HISTORY_ROW_DETAIL: Key = key("diag.conn-history.row-detail", "%1 times  ·  %2 – %3");
+pub const HISTORY_FAILED: Key = key(
+    "diag.conn-history.load-failed",
+    "Failed to load the connection history: ",
+);
 
 // ── Blocked while the route was down ─────────────────────────────────────────
 
@@ -476,6 +513,19 @@ pub const ALL: &[Key] = &[
     TRACE_PLAIN_EXPLAIN,
     TRACE_PLAIN_SEARCH,
     TRACE_HELP_OUTAGE,
+    TRACE_HELP_HISTORY,
+    TRACE_PLAIN_HISTORY,
+    HISTORY_MODE,
+    HISTORY_HOUR,
+    HISTORY_TODAY,
+    HISTORY_WEEK,
+    HISTORY_EMPTY,
+    HISTORY_OFF,
+    HISTORY_UNAVAILABLE,
+    HISTORY_REMOVED,
+    HISTORY_SKIPPED,
+    HISTORY_ROW_DETAIL,
+    HISTORY_FAILED,
     OUTAGE_INTRO,
     OUTAGE_ACTIVE,
     OUTAGE_ENDED,

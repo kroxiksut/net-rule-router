@@ -196,6 +196,8 @@ pub struct ConnectionTraceRing {
     outage_blocks: Arc<crate::outage_blocks::OutageBlocks>,
     /// Told each connection's owner and remote end, on both platforms' feeds.
     connection_watch: std::sync::OnceLock<ConnectionWatch>,
+    /// Each user's history: every named row is folded in on its way past.
+    history: std::sync::OnceLock<Arc<crate::conn_history::ConnHistory>>,
 }
 
 /// A cheap look at one connection: `(owner, remote)`.
@@ -211,7 +213,19 @@ impl ConnectionTraceRing {
             namer: std::sync::OnceLock::new(),
             outage_blocks: Arc::new(crate::outage_blocks::OutageBlocks::new()),
             connection_watch: std::sync::OnceLock::new(),
+            history: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Keep each user's history of the rows pushed from now on. The first
+    /// history stays; `false` says one was already attached.
+    pub fn attach_history(&self, history: Arc<crate::conn_history::ConnHistory>) -> bool {
+        self.history.set(history).is_ok()
+    }
+
+    /// The history fed alongside this ring, when one is attached.
+    pub fn history(&self) -> Option<&Arc<crate::conn_history::ConnHistory>> {
+        self.history.get()
     }
 
     /// The outage list fed alongside this ring.
@@ -264,6 +278,9 @@ impl ConnectionTraceRing {
             if let Some(namer) = self.namer.get() {
                 rec.remote_names = namer.name(rec.remote.ip());
             }
+        }
+        if let Some(history) = self.history.get() {
+            history.record(&rec, now_unix_ms());
         }
         if let (Some(at_ms), Some(sid)) = (outage_at_ms, rec.user_sid.as_deref()) {
             let app = rec
@@ -374,6 +391,22 @@ pub fn classify_connection(
         nrr_block_reason: None,
         observed_unix_ms: obs.observed_unix_ms,
         remote_names: None,
+    }
+}
+
+/// Whose suggestion a connection feeds: the account that opened it. A service
+/// account's connection, or one whose owner could not be read, follows the
+/// routing user, whose routes that traffic takes.
+pub fn suggestion_owner(owner: Option<&str>, routing: &ActiveSidFn) -> Option<String> {
+    let is_service_account = |o: &str| {
+        nrr_platform_api::types::SERVICE_ACCOUNT_SIDS
+            .iter()
+            .any(|sid| sid.eq_ignore_ascii_case(o))
+            || o.starts_with("S-1-5-80-")
+    };
+    match owner.filter(|o| !o.is_empty() && !is_service_account(o)) {
+        Some(owner) => Some(owner.to_owned()),
+        None => routing(),
     }
 }
 
@@ -572,14 +605,23 @@ pub struct ConnectionObservationConsumer {
     app_additional_link: Option<AppAdditionalLinkFn>,
     /// Which program opened each recent main-link connection (see
     /// `remember_program`).
-    connection_programs: Mutex<std::collections::HashMap<(SocketAddr, SocketAddr), (String, u64)>>,
+    /// Program and owner of each recent main-link connection: a resend or a
+    /// close carries neither.
+    #[allow(clippy::type_complexity)]
+    connection_programs:
+        Mutex<std::collections::HashMap<(SocketAddr, SocketAddr), (String, Option<String>, u64)>>,
     /// Destinations already torn down once (see [`Self::note_torn_down`]).
     torn_down_before: Mutex<HashSet<std::net::IpAddr>>,
-    /// Last time traffic left over the SECONDARY link, as a cheap proxy for
-    /// "the user is on a routed site right now". Gates the reverse lookup
-    /// below: without it every direct connection on an idle machine would
-    /// queue a PTR query.
-    last_secondary_at: Mutex<Option<Instant>>,
+    /// Last time each connection owner's traffic ("" for an unattributed
+    /// connection) left over the additional link: a cheap proxy for "this user
+    /// is on a routed site right now", which gates the reverse lookup — without
+    /// it every direct connection on an idle machine would queue a PTR query.
+    owner_secondary_at: Mutex<std::collections::HashMap<String, Instant>>,
+    /// Whether a connection owner (as [`Self::owner_secondary_at`] keys them)
+    /// collects suggestions. Unwired, no direct connection is ever looked up.
+    primary_egress_learning: Option<PrimaryEgressLearningFn>,
+    /// Lookups spent in the current window: `(window start, count)`.
+    reverse_budget: Mutex<(Option<Instant>, u32)>,
     /// Whether the current outage has already been announced. While the
     /// block-all is armed every routed host is unreachable, so each application
     /// that tries produces its own episode with the same cause; one notice is
@@ -626,9 +668,10 @@ const MAX_STALE_FLOW_RESETS_PER_BATCH: usize = 64;
 /// link unbound, absent or (secondary) declared dead.
 pub type EgressIfindexesFn = Arc<dyn Fn(&str) -> (Option<u32>, Option<u32>) + Send + Sync>;
 
-/// Delete one `(app, destination)` pair from the cross-session store, so a
-/// withdrawal survives the restart that would otherwise re-seed it.
-pub type AppDestinationForgetFn = Arc<dyn Fn(&str, std::net::Ipv4Addr) + Send + Sync>;
+/// Delete one `(owner, app, destination)` row from the cross-session store, so
+/// a withdrawal survives the restart that would otherwise re-seed it. The owner
+/// is the user whose store held the pair, `None` for a machine-wide store.
+pub type AppDestinationForgetFn = Arc<dyn Fn(Option<&str>, &str, std::net::Ipv4Addr) + Send + Sync>;
 
 /// The application patterns the rule book currently routes over the additional
 /// link. Read per batch: a rule edit must take effect without a restart.
@@ -729,21 +772,31 @@ pub type NameForAddressFn = Arc<dyn Fn(std::net::Ipv4Addr) -> Option<String> + S
 
 /// Reports a companion host the user's traffic actually reached while it was
 /// leaving over the WRONG link — the half-broken page, observed directly.
-pub type CompanionInUseFn = Arc<dyn Fn(&str) + Send + Sync>;
+/// The first argument is the account that opened the connection, when known:
+/// the suggestion belongs to that user, never to whoever routes the machine.
+/// Whether the owner of a direct connection (`""` = unattributed) collects
+/// suggestions; see [`ConnectionObservationConsumer::with_primary_egress_learning`].
+pub type PrimaryEgressLearningFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+pub type CompanionInUseFn = Arc<dyn Fn(Option<&str>, &str) + Send + Sync>;
 
 /// Reports how a host fared on the primary route: `true` when a connection to
 /// it stalled, `false` when one closed in order. Separate from
 /// [`CompanionInUseFn`] because it answers a different question — not "did the
 /// traffic take the wrong link" but "does this host work over that link".
-pub type CompanionPrimaryHealthFn = Arc<dyn Fn(&str, bool) + Send + Sync>;
+/// Leads with the connection's owner, as [`CompanionInUseFn`].
+pub type CompanionPrimaryHealthFn = Arc<dyn Fn(Option<&str>, &str, bool) + Send + Sync>;
 
 /// Reports one main-link connection outcome to the application measure: the
 /// program that opened it, the remote address, whether it stalled (`false` for
 /// an orderly close), and whether the address has a name.
-pub type AppMainLinkFn = Arc<dyn Fn(&str, std::net::IpAddr, bool, bool) + Send + Sync>;
+/// Leads with the connection's owner, as [`CompanionInUseFn`].
+pub type AppMainLinkFn =
+    Arc<dyn Fn(Option<&str>, &str, std::net::IpAddr, bool, bool) + Send + Sync>;
 
 /// Reports a program one of whose connections left over the additional link.
-pub type AppAdditionalLinkFn = Arc<dyn Fn(&str) + Send + Sync>;
+/// Leads with the connection's owner, as [`CompanionInUseFn`].
+pub type AppAdditionalLinkFn = Arc<dyn Fn(Option<&str>, &str) + Send + Sync>;
 
 /// Reports one outbound connection attempt to the navigation measurement:
 /// the initiating image path, the destination's name when it has one, and
@@ -752,7 +805,8 @@ pub type AppAdditionalLinkFn = Arc<dyn Fn(&str) + Send + Sync>;
 pub type NavigationAttemptFn = Arc<dyn Fn(Option<&str>, Option<&str>, u64) + Send + Sync>;
 
 /// Sink for a censored host somebody actually went to.
-pub type PlaceholderConfirmedFn = Arc<dyn Fn(&str) + Send + Sync>;
+/// Leads with the connection's owner, as [`CompanionInUseFn`].
+pub type PlaceholderConfirmedFn = Arc<dyn Fn(Option<&str>, &str) + Send + Sync>;
 
 /// Sink for one blocked-connection attempt worth reporting. The production
 /// impl hands it to `block_notice_center::BlockNoticeCenter::record`, which

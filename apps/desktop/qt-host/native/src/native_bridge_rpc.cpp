@@ -193,6 +193,12 @@ QString NrrNativeBridge::rpcRulesList() {
     return emitRpcRequest(QStringLiteral("rules.list"), QJsonObject());
 }
 
+QString NrrNativeBridge::rpcRulesRecentChangesList(qint64 since) {
+    QJsonObject obj;
+    obj.insert(QStringLiteral("since"), QJsonValue(since));
+    return emitRpcRequest(QStringLiteral("rules.recent-changes.list"), obj);
+}
+
 QString NrrNativeBridge::rpcRetentionSettingsGet() {
     return emitRpcRequest(QStringLiteral("settings.retention.get"), QJsonObject());
 }

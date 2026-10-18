@@ -101,7 +101,9 @@ mod timeouts;
 
 #[cfg(target_os = "windows")]
 pub use client::NamedPipeIpcClient;
-pub use timeouts::ipc_operation_timeout;
+pub use timeouts::{
+    ipc_operation_bound, ipc_operation_timeout, ipc_request_timeout, AUTHORIZATION_PROMPT_BUDGET,
+};
 
 /// The transport this OS talks to the service over. One name for the two
 /// implementations, so callers that only need "the client" name this and carry

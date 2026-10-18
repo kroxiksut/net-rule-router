@@ -101,6 +101,11 @@ pub struct UnixClientIdentity {
     /// basename check, and the reason the client's own declaration cannot
     /// widen what it may ask for.
     pub program_name: Option<String>,
+    /// Start time of [`Self::pid`] (`/proc/<pid>/stat`, clock ticks since
+    /// boot), read at accept while the peer still holds its end open. With the
+    /// pid it names the process unambiguously for polkit; `None` when it could
+    /// not be read, and polkit is then never asked.
+    pub start_time: Option<u64>,
 }
 
 /// Classify a connected `AF_UNIX` stream into a [`UnixClientIdentity`], the
@@ -118,6 +123,9 @@ pub fn classify_unix_client(stream: &UnixStream) -> io::Result<UnixClientIdentit
         uid: cred.uid,
         gid: cred.gid,
         program_name: peer_program_name(cred.pid),
+        start_time: u32::try_from(cred.pid)
+            .ok()
+            .and_then(crate::polkit::process_start_time),
     })
 }
 
@@ -290,6 +298,18 @@ mod tests {
         // baseline sentinel.
         assert_eq!(id.principal.as_stored(), format!("unix:uid:{}", own_uid()));
         assert!(!id.principal.is_baseline());
+    }
+
+    /// The pair polkit identifies a subject by must come out of the accept
+    /// for the real process on the other end, not just a pid.
+    #[test]
+    fn an_accepted_peer_carries_the_start_time_of_the_real_process() {
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        let id = classify_unix_client(&a).expect("classify");
+        assert_eq!(u32::try_from(id.pid).ok(), Some(std::process::id()));
+        let own = crate::polkit::process_start_time(std::process::id());
+        assert!(own.is_some(), "/proc/self/stat must name our start time");
+        assert_eq!(id.start_time, own);
     }
 
     #[test]

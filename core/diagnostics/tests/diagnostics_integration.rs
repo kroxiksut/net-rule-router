@@ -344,10 +344,10 @@ fn archive_default_export_contains_no_raw_db_files() {
     let mut zip = zip::ZipArchive::new(file).expect("parse zip");
     for i in 0..zip.len() {
         let entry = zip.by_index(i).expect("entry");
+        let name = entry.name().expect("entry name");
         assert!(
-            !entry.name().ends_with(".db"),
-            "archive must not contain .db files: {}",
-            entry.name()
+            !name.ends_with(".db"),
+            "archive must not contain .db files: {name}"
         );
     }
 }

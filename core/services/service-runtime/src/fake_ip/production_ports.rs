@@ -25,8 +25,9 @@ use crate::service_tasks::ServiceTaskKind;
 use crate::task_liveness::{TaskLiveness, ThreadExit, ThreadLease, Watch};
 
 use super::dialer::RelayNameResolver;
-use super::relay::{RouteSelector, UpstreamAddressResolver};
+use super::relay::{FlowOwner, FlowOwners, RouteSelector, UpstreamAddressResolver};
 use nrr_platform_api::dns::AddressFamily;
+use nrr_platform_api::fake_ip::{FlowOwnerLookup, FlowTransport};
 
 /// [`UpstreamAddressResolver`] over the FQDN cache.
 ///
@@ -170,8 +171,11 @@ const FLOW_NOTICE_WORK_DEADLINE: Duration = Duration::from_secs(60);
 /// only hands over the hostname and the instant; the queue is bounded and a
 /// full queue DROPS the notice, because an observation is optional and a
 /// connection is not.
+/// A relayed flow's hostname, owner (`None` = the routing user) and time.
+type FlowNotice = (String, Option<String>, SystemTime);
+
 pub struct FlowActivityObserver {
-    notices: std::sync::mpsc::SyncSender<(String, SystemTime)>,
+    notices: std::sync::mpsc::SyncSender<FlowNotice>,
     dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -182,8 +186,7 @@ impl FlowActivityObserver {
         active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
         liveness: Option<Arc<TaskLiveness>>,
     ) -> Self {
-        let (notices, inbox) =
-            std::sync::mpsc::sync_channel::<(String, SystemTime)>(FLOW_NOTICE_QUEUE_DEPTH);
+        let (notices, inbox) = std::sync::mpsc::sync_channel::<FlowNotice>(FLOW_NOTICE_QUEUE_DEPTH);
         // The worker ends when the sender goes — i.e. when the stack drops this
         // observer during teardown. No stop token to keep in sync.
         let spawned = std::thread::Builder::new()
@@ -196,9 +199,11 @@ impl FlowActivityObserver {
                         Watch::Work(FLOW_NOTICE_WORK_DEADLINE),
                     )
                 });
-                while let Ok((hostname, at)) = inbox.recv() {
+                while let Ok((hostname, owner, at)) = inbox.recv() {
                     let _notice = lease.as_ref().map(ThreadLease::work);
-                    if let Some(sid) = active_sid() {
+                    // Another served user's flow teaches their book, not the
+                    // routing user's.
+                    if let Some(sid) = owner.or_else(|| active_sid()) {
                         engine.note_flow(&sid, &hostname, at);
                     }
                 }
@@ -222,13 +227,23 @@ impl FlowActivityObserver {
 }
 
 impl super::stack::FlowObserver for FlowActivityObserver {
-    fn on_flow_opened(&self, _client: SocketAddr, _fake: SocketAddr, hostname: &str) {
+    fn on_flow_opened(
+        &self,
+        _client: SocketAddr,
+        _fake: SocketAddr,
+        hostname: &str,
+        owner: Option<&str>,
+    ) {
         if hostname.is_empty() {
             return;
         }
         if self
             .notices
-            .try_send((hostname.to_owned(), SystemTime::now()))
+            .try_send((
+                hostname.to_owned(),
+                owner.map(str::to_owned),
+                SystemTime::now(),
+            ))
             .is_err()
         {
             // Full, or the worker is gone. Either way the connection continues;
@@ -266,9 +281,15 @@ impl CompositeFlowObserver {
 }
 
 impl super::stack::FlowObserver for CompositeFlowObserver {
-    fn on_flow_opened(&self, client: SocketAddr, fake: SocketAddr, hostname: &str) {
+    fn on_flow_opened(
+        &self,
+        client: SocketAddr,
+        fake: SocketAddr,
+        hostname: &str,
+        owner: Option<&str>,
+    ) {
         for observer in &self.observers {
-            observer.on_flow_opened(client, fake, hostname);
+            observer.on_flow_opened(client, fake, hostname, owner);
         }
     }
 }
@@ -298,22 +319,140 @@ impl RuleBookRouteSelector {
     }
 }
 
+/// A rule enforcement skips for its shape steers and blocks nothing here
+/// either.
+fn steers(rule: &nrr_domain::canonical::CanonicalRule) -> bool {
+    rule.enabled && crate::wfp_codegen::rule_shape_enforced(rule)
+}
+
+fn secondary_covers(book: &nrr_domain::canonical::CanonicalRuleBook, hostname: &str) -> bool {
+    book.secondary
+        .rules()
+        .iter()
+        .any(|r| steers(r) && rule_covers(r, hostname))
+}
+
+/// Whether the narrowest name rule claiming `hostname` in `book` is a block.
+/// A block and a route equally narrow leave it blocked.
+fn book_blocks(book: &nrr_domain::canonical::CanonicalRuleBook, hostname: &str) -> bool {
+    use nrr_domain::rule_specificity::rule_match_specificity;
+    let mut block = None;
+    let mut route = None;
+    for rule in book
+        .primary
+        .rules()
+        .iter()
+        .chain(book.secondary.rules())
+        .filter(|r| steers(r) && r.app_match.is_none())
+    {
+        let claim = rule_match_specificity(hostname, rule);
+        match rule.action {
+            nrr_domain::RuleAction::Block => block = block.max(claim),
+            nrr_domain::RuleAction::Route | nrr_domain::RuleAction::Verify => {
+                route = route.max(claim)
+            }
+        }
+    }
+    block.is_some() && block >= route
+}
+
 impl RouteSelector for RuleBookRouteSelector {
     fn route_for(&self, hostname: &str) -> RouteRole {
-        // A rule enforcement skips for its shape steers nothing here either.
         let is_secondary = (self.active_sid)()
             .and_then(|sid| self.rules_provider.active_rules_for(&sid))
-            .is_some_and(|snapshot| {
-                snapshot.rule_book.secondary.rules().iter().any(|r| {
-                    r.enabled
-                        && crate::wfp_codegen::rule_shape_enforced(r)
-                        && rule_covers(r, hostname)
-                })
-            });
+            .is_some_and(|snapshot| secondary_covers(&snapshot.rule_book, hostname));
         if is_secondary {
             RouteRole::Secondary
         } else {
             RouteRole::Primary
+        }
+    }
+
+    /// The shared DNS answer was given by the routing user's book, so a host
+    /// this user blocks can arrive here: their own filters never see the
+    /// relay's dial, and the block is honoured here instead.
+    fn route_for_principal(&self, principal: &str, hostname: &str) -> Option<RouteRole> {
+        let Some(snapshot) = self.rules_provider.active_rules_for(principal) else {
+            return Some(RouteRole::Primary);
+        };
+        if book_blocks(&snapshot.rule_book, hostname) {
+            return None;
+        }
+        Some(if secondary_covers(&snapshot.rule_book, hostname) {
+            RouteRole::Secondary
+        } else {
+            RouteRole::Primary
+        })
+    }
+}
+
+/// The served users, longest-served first.
+pub type ServedPrincipalsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// [`FlowOwners`] for the running service: nobody is looked up while one
+/// user is served, so a single-user machine pays nothing; with two or more,
+/// each new flow's owner is read from the connection table, and a flow whose
+/// owner is unknown or not served is refused.
+pub struct ServedFlowOwners {
+    lookup: Arc<dyn FlowOwnerLookup>,
+    served: ServedPrincipalsFn,
+    routing: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+}
+
+impl ServedFlowOwners {
+    #[must_use]
+    pub fn new(
+        lookup: Arc<dyn FlowOwnerLookup>,
+        served: ServedPrincipalsFn,
+        routing: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Self {
+        Self {
+            lookup,
+            served,
+            routing,
+        }
+    }
+}
+
+/// A machine account (LocalSystem, LocalService, NetworkService, a per-service
+/// SID): its traffic follows the route-table owner, as the leak guard has it.
+fn is_service_account(principal: &str) -> bool {
+    nrr_platform_api::types::SERVICE_ACCOUNT_SIDS
+        .iter()
+        .any(|sid| sid.eq_ignore_ascii_case(principal))
+        || principal.starts_with("S-1-5-80-")
+}
+
+impl FlowOwners for ServedFlowOwners {
+    fn owner_of(
+        &self,
+        client: SocketAddr,
+        destination: SocketAddr,
+        transport: Option<FlowTransport>,
+    ) -> FlowOwner {
+        let served = (self.served)();
+        if served.len() < 2 {
+            return FlowOwner::RoutingUser;
+        }
+        let Some(transport) = transport else {
+            return FlowOwner::Refused("owner-unreadable");
+        };
+        let Some(owner) = self.lookup.owner_principal(client, destination, transport) else {
+            return FlowOwner::Refused("owner-unknown");
+        };
+        if is_service_account(&owner) {
+            return FlowOwner::RoutingUser;
+        }
+        let Some(principal) = served
+            .into_iter()
+            .find(|sid| sid.eq_ignore_ascii_case(&owner))
+        else {
+            return FlowOwner::Refused("owner-not-served");
+        };
+        if (self.routing)().is_some_and(|routing| routing == principal) {
+            FlowOwner::RoutingUser
+        } else {
+            FlowOwner::Principal(principal)
         }
     }
 }
@@ -363,7 +502,7 @@ mod tests {
         let notices = FLOW_NOTICE_QUEUE_DEPTH * 2;
         let started = Instant::now();
         for _ in 0..notices {
-            observer.on_flow_opened(addr, addr, "cdn.example.net");
+            observer.on_flow_opened(addr, addr, "cdn.example.net", None);
         }
         let elapsed = started.elapsed();
 
@@ -453,5 +592,100 @@ mod tests {
     fn route_selector_defaults_to_primary_with_no_active_principal() {
         let selector = selector_for("assistant.example", None);
         assert_eq!(selector.route_for("assistant.example"), RouteRole::Primary);
+    }
+
+    fn suffix_rule(id: &str, suffix: &str, action: nrr_domain::RuleAction) -> CanonicalRule {
+        CanonicalRule {
+            address_match: Some(CanonicalAddressMatch::SuffixDomain(suffix.into())),
+            action,
+            ..exact_rule(id, "unused.example")
+        }
+    }
+
+    /// Each served user's flow takes that user's book: the blocks in it hold
+    /// even though the relay's own dial passes every user's filters, and the
+    /// narrower rule still beats the wider block.
+    #[test]
+    fn another_users_book_routes_and_blocks_their_flow() {
+        let mut blocked = exact_rule("r-b", "blocked.example");
+        blocked.action = nrr_domain::RuleAction::Block;
+        let rules = Arc::new(FakeRules {
+            primary: CanonicalRuleSet::from_rules(vec![
+                blocked,
+                suffix_rule("r-w", "wide.example", nrr_domain::RuleAction::Block),
+                exact_rule("r-n", "open.wide.example"),
+            ]),
+            secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "tunnel.example")]),
+        });
+        let selector = RuleBookRouteSelector::new(rules, Arc::new(|| None::<String>));
+
+        let route = |host| selector.route_for_principal("S-1-5-21-2", host);
+        assert_eq!(route("tunnel.example"), Some(RouteRole::Secondary));
+        assert_eq!(route("blocked.example"), None);
+        assert_eq!(route("deep.wide.example"), None);
+        assert_eq!(route("open.wide.example"), Some(RouteRole::Primary));
+        assert_eq!(route("elsewhere.example"), Some(RouteRole::Primary));
+    }
+
+    fn owners(
+        served: &'static [&'static str],
+        lookup: Arc<MockFlowOwnerLookup>,
+    ) -> ServedFlowOwners {
+        ServedFlowOwners::new(
+            lookup,
+            Arc::new(move || served.iter().map(|s| s.to_string()).collect()),
+            Arc::new(move || served.first().map(|s| s.to_string())),
+        )
+    }
+
+    use nrr_platform_api::MockFlowOwnerLookup;
+
+    /// With two users served, a flow is carried for its own owner, a service
+    /// account follows the routing user, and a flow nobody can be named for
+    /// is refused rather than carried by somebody else's rules.
+    #[test]
+    fn a_flow_is_carried_for_its_owner_when_two_users_are_served() {
+        let fake: SocketAddr = "198.18.0.9:443".parse().expect("addr");
+        let a: SocketAddr = "10.0.0.2:50001".parse().expect("addr");
+        let b: SocketAddr = "10.0.0.2:50002".parse().expect("addr");
+        let svc: SocketAddr = "10.0.0.2:50003".parse().expect("addr");
+        let ghost: SocketAddr = "10.0.0.2:50004".parse().expect("addr");
+        let stranger: SocketAddr = "10.0.0.2:50005".parse().expect("addr");
+        let lookup = Arc::new(MockFlowOwnerLookup::new());
+        lookup.set_principal(a, FlowTransport::Tcp, "S-1-5-21-1");
+        lookup.set_principal(b, FlowTransport::Tcp, "S-1-5-21-2");
+        lookup.set_principal(svc, FlowTransport::Tcp, "S-1-5-18");
+        lookup.set_principal(stranger, FlowTransport::Tcp, "S-1-5-21-9");
+        let owners = owners(&["S-1-5-21-1", "S-1-5-21-2"], lookup);
+
+        let tcp = Some(FlowTransport::Tcp);
+        assert_eq!(owners.owner_of(a, fake, tcp), FlowOwner::RoutingUser);
+        assert_eq!(
+            owners.owner_of(b, fake, tcp),
+            FlowOwner::Principal("S-1-5-21-2".into())
+        );
+        assert_eq!(owners.owner_of(svc, fake, tcp), FlowOwner::RoutingUser);
+        assert!(matches!(
+            owners.owner_of(ghost, fake, tcp),
+            FlowOwner::Refused(_)
+        ));
+        assert!(matches!(
+            owners.owner_of(stranger, fake, tcp),
+            FlowOwner::Refused(_)
+        ));
+        assert!(matches!(
+            owners.owner_of(b, fake, None),
+            FlowOwner::Refused(_)
+        ));
+    }
+
+    /// One user served: no lookup at all, whatever the table would say.
+    #[test]
+    fn a_single_user_machine_never_looks_an_owner_up() {
+        let lookup = Arc::new(MockFlowOwnerLookup::new());
+        let owners = owners(&["S-1-5-21-1"], Arc::clone(&lookup));
+        let any: SocketAddr = "10.0.0.2:50001".parse().expect("addr");
+        assert_eq!(owners.owner_of(any, any, None), FlowOwner::RoutingUser);
+        assert_eq!(lookup.call_count(), 0);
     }
 }

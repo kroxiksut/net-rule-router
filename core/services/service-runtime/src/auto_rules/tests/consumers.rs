@@ -338,7 +338,7 @@ fn a_suggestion_arriving_after_an_acceptance_is_still_announced() {
     let accepted: Vec<String> = engine.candidates(SID).into_iter().map(|c| c.id).collect();
     assert_eq!(accepted.len(), 1);
     engine
-        .accept(SID, &accepted, later())
+        .accept(SID, &accepted, false, later())
         .expect("the offer is accepted");
     assert!(engine.candidates(SID).is_empty(), "and stops being pending");
 

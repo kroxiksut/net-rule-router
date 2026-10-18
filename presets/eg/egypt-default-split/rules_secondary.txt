@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 8
 # name: EG Egypt Default Split - Secondary Route
 # description: Messengers whose voice and video calls are restricted in Egypt, and platforms blocked nationwide
 # author: NetRuleRouter contributors
@@ -11,8 +11,7 @@
 # Checked: September 2026. AI, developer and social services are not listed: they serve Egypt directly.
 # Calls reach relay servers by address; the app rules below carry them on desktop.
 
-*.whatsapp.com  # WhatsApp: voice and video calls restricted by operators
-*.whatsapp.net  # WhatsApp: voice and video calls restricted by operators
+whatsapp.*  # WhatsApp: voice and video calls restricted by operators
 wa.me  # WhatsApp: voice and video calls restricted by operators
 *.viber.com  # Viber: voice and video calls restricted by operators
 

@@ -103,28 +103,50 @@ fn a_detached_or_doubled_question_mark_stays_in_the_value() {
     }
 }
 
+/// A check never applies to a deny: neither mark is taken, the line keeps
+/// both in its value, and the import refuses it rather than guess one.
 #[test]
-fn verify_and_block_on_one_line_refuse_the_line() {
+fn verify_and_deny_on_one_line_take_neither_mark() {
     let outcome = parse_rules_file(
-        "--- Domains\n?both.example.com +block\n# ?off.example.com +block\nkept.example.com\n",
+        "--- Domains\n?!both.example.com\n# !?off.example.com\nkept.example.com\n",
     );
-    let entries = outcome.parsed.entries_for(RulesFileSection::Domains);
+    let read: Vec<_> = outcome
+        .parsed
+        .entries_for(RulesFileSection::Domains)
+        .iter()
+        .map(|e| {
+            (
+                e.match_value.as_str(),
+                e.enabled,
+                e.blocked,
+                e.verify_primary,
+            )
+        })
+        .collect();
     assert_eq!(
-        entries.len(),
-        1,
-        "only the plain line is a rule: {entries:?}"
+        read,
+        [
+            ("?!both.example.com", true, false, false),
+            ("!?off.example.com", false, false, false),
+            ("kept.example.com", true, false, false),
+        ]
     );
-    assert_eq!(entries[0].match_value, "kept.example.com");
     assert_eq!(
         outcome.warnings,
         vec![
             ParseWarning::VerifyPrimaryWithBlock {
-                match_value: "both.example.com".to_string(),
+                match_value: "?!both.example.com".to_string(),
             },
             ParseWarning::VerifyPrimaryWithBlock {
-                match_value: "off.example.com".to_string(),
+                match_value: "!?off.example.com".to_string(),
             },
         ]
+    );
+    let canonical =
+        canonicalize_preset_rules(&outcome, RouteRole::Secondary, HostPlatform::Windows, false);
+    assert!(
+        matches!(canonical, PresetRulesCanonicalizeOutcome::Rejected { .. }),
+        "{canonical:?}"
     );
 }
 

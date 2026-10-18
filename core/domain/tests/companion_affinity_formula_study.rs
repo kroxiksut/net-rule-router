@@ -34,7 +34,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use nrr_domain::companion_affinity::{
-    CoActivityKind, CompanionAffinityLedger, CompanionSignal, NoExclusions, ProposedCompanionMatch,
+    CoActivityKind, CompanionAffinityLedger, CompanionProposal, CompanionSignal, LessCertainBasis,
+    NoExclusions, ProposalUse, ProposedCompanionMatch,
 };
 use nrr_shared::RouteRole;
 
@@ -700,17 +701,20 @@ fn suffix_verdict(anchor: &str, apex: &str, observed: &BTreeSet<&str>) -> Verdic
     }
 }
 
-/// End-to-end pin: the shipped `CompanionAffinityLedger` fed the raw trace must
-/// reproduce the rule the study recommends — every proposal it emits is a real
-/// companion of the site it is offered for, and none is background traffic.
-#[test]
-fn the_shipped_engine_reproduces_the_recommended_rule_on_the_trace() {
-    let anchors: BTreeSet<String> = ANCHORS.iter().map(|s| (*s).to_string()).collect();
-    let events = parse(TRACE);
-    let observed: BTreeSet<&str> = events.iter().map(|(_, h)| h.as_str()).collect();
+/// One emitted row: anchor, proposed value, tier, less-certain mark, verdict.
+type Row<'a> = (
+    &'a str,
+    &'a str,
+    CompanionSignal,
+    Option<LessCertainBasis>,
+    Verdict,
+);
 
+const SEEN_ONCE: Option<LessCertainBasis> = Some(LessCertainBasis::BrandSeenOnce);
+
+fn replayed(events: &[(u64, String)], anchors: &BTreeSet<String>) -> CompanionAffinityLedger {
     let mut ledger = CompanionAffinityLedger::with_defaults();
-    for (at, host) in &events {
+    for (at, host) in events {
         let kind = if anchors.contains(host) {
             CoActivityKind::Anchor {
                 route: RouteRole::Secondary,
@@ -720,103 +724,163 @@ fn the_shipped_engine_reproduces_the_recommended_rule_on_the_trace() {
         };
         ledger.observe(*at, host, kind);
     }
-    let now = events.last().map_or(0, |(at, _)| *at);
-    let proposals = ledger.proposals(now, &NoExclusions);
+    ledger
+}
 
-    let emitted: Vec<(&str, &str, CompanionSignal, Verdict)> = proposals
+fn rows<'a>(proposals: &'a [CompanionProposal], observed: &BTreeSet<&str>) -> Vec<Row<'a>> {
+    proposals
         .iter()
         .map(|p| {
             let anchor = p.anchor_hostname.as_str();
             let verdict = match &p.proposed {
                 ProposedCompanionMatch::ExactHost(h) => verdict(anchor, h),
                 ProposedCompanionMatch::SuffixDomain(apex) => {
-                    suffix_verdict(anchor, apex, &observed)
+                    suffix_verdict(anchor, apex, observed)
                 }
             };
-            (anchor, p.proposed.value(), p.signal, verdict)
+            (
+                anchor,
+                p.proposed.value(),
+                p.signal,
+                p.less_certain,
+                verdict,
+            )
         })
-        .collect();
+        .collect()
+}
 
-    // Eight review rows, every one confirmed by the hand-labelled ground
-    // truth. Brand and delivery names generalize to a *different* domain from
-    // the anchor's own, so the two cross-TLD companions of `anchor-f` collapse
-    // into one row. `rt.anchor-k.example` stays exact: its apex IS the anchor's
-    // own domain (`anchor-k.example`), and generalizing there would swallow
-    // `www.anchor-k.example` itself on one window's evidence — the same guard
-    // that keeps a subdomain from speaking for the umbrella domain it lives
-    // under.
-    //
-    // The last two rows (`anchorb`'s own suffix and `bot.anchor-i.example`)
-    // arrived with the opening window's look-back: their first sighting landed
-    // a moment BEFORE the page that pulls them, and a forward-only window threw
-    // exactly those away. Both are `Good` against the same ground truth, and no
-    // row was lost — the look-back only adds companions the ledger would
-    // otherwise never have tracked at all.
+/// End-to-end pin: the shipped `CompanionAffinityLedger` fed the trace must
+/// reproduce the rule the study recommends — every proposal it emits is a real
+/// companion of the site it is offered for, and none is background traffic —
+/// at the bar of each use.
+#[test]
+fn the_shipped_engine_reproduces_the_recommended_rule_on_the_trace() {
+    let anchors: BTreeSet<String> = ANCHORS.iter().map(|s| (*s).to_string()).collect();
+    let events = parse(TRACE);
+    let observed: BTreeSet<&str> = events.iter().map(|(_, h)| h.as_str()).collect();
+    let ledger = replayed(&events, &anchors);
+    let now = events.last().map_or(0, |(at, _)| *at);
+
+    // Written unasked: brand evidence needs two independent windows, the page
+    // that did the fetching, and two named hosts before reaching a whole
+    // domain. The rest of this trace's brand companions rested on one
+    // sighting each — what a hostile page embedding a rule host beside a
+    // look-alike of its brand produces.
+    let unasked = ledger.proposals_for(now, &NoExclusions, ProposalUse::AuthoredUnasked);
+    assert_eq!(unasked, ledger.proposals(now, &NoExclusions));
     assert_eq!(
-        emitted,
+        rows(&unasked, &observed),
         vec![
             (
                 "anchor-a.example",
                 "cdn-a.example",
                 CompanionSignal::DeliveryName,
-                Verdict::Good
-            ),
-            (
-                "anchor-e.example",
-                "anchor-e.test",
-                CompanionSignal::BrandRelated,
-                Verdict::Good
-            ),
-            (
-                "anchorb.example",
-                "anchorb.example",
-                CompanionSignal::BrandRelated,
+                None,
                 Verdict::Good
             ),
             (
                 "anchord.example",
                 "anchordx.example",
                 CompanionSignal::BrandRelated,
+                None,
                 Verdict::Good
             ),
             (
                 "web.anchor-f.example",
-                "anchor-f.test",
+                "static.anchor-f.test",
                 CompanionSignal::BrandRelated,
+                None,
+                Verdict::Good
+            ),
+        ]
+    );
+
+    // Offered to a person: the same rows, plus the single-sighting brand
+    // companions as the exact hosts they are, marked. None widens to its
+    // domain — `anchor-e.test`, `anchorb.example` and `anchor-f.test` were
+    // suffixes before the bar rose, and are hosts now.
+    let review = ledger.proposals_for(now, &NoExclusions, ProposalUse::OfferedForReview);
+    assert_eq!(
+        rows(&review, &observed),
+        vec![
+            (
+                "anchor-a.example",
+                "cdn-a.example",
+                CompanionSignal::DeliveryName,
+                None,
+                Verdict::Good
+            ),
+            (
+                "anchor-e.example",
+                "login.anchor-e.test",
+                CompanionSignal::BrandRelated,
+                SEEN_ONCE,
+                Verdict::Good
+            ),
+            (
+                "anchorb.example",
+                "sso.anchorb.example",
+                CompanionSignal::BrandRelated,
+                SEEN_ONCE,
+                Verdict::Good
+            ),
+            (
+                "anchord.example",
+                "anchordx.example",
+                CompanionSignal::BrandRelated,
+                None,
+                Verdict::Good
+            ),
+            (
+                "web.anchor-f.example",
+                "static.anchor-f.test",
+                CompanionSignal::BrandRelated,
+                None,
+                Verdict::Good
+            ),
+            (
+                "web.anchor-f.example",
+                "crashlogs.anchor-f.test",
+                CompanionSignal::BrandRelated,
+                SEEN_ONCE,
                 Verdict::Good
             ),
             (
                 "www.anchor-i.example",
                 "bot.anchor-i.example",
                 CompanionSignal::BrandRelated,
+                SEEN_ONCE,
                 Verdict::Good
             ),
             (
                 "www.anchor-k.example",
                 "rt.anchor-k.example",
                 CompanionSignal::BrandRelated,
+                SEEN_ONCE,
                 Verdict::Good
             ),
             (
                 "www.anchor-m.example",
                 "anchor-m.example",
                 CompanionSignal::BrandRelated,
+                SEEN_ONCE,
                 Verdict::Good
             ),
         ]
     );
+    assert!(review
+        .iter()
+        .filter(|p| p.less_certain.is_some())
+        .all(|p| matches!(p.proposed, ProposedCompanionMatch::ExactHost(_))));
 
-    // Replaying the same events twice must produce the same list.
-    let mut twin = CompanionAffinityLedger::with_defaults();
-    for (at, host) in &events {
-        let kind = if anchors.contains(host) {
-            CoActivityKind::Anchor {
-                route: RouteRole::Secondary,
-            }
-        } else {
-            CoActivityKind::Candidate
-        };
-        twin.observe(*at, host, kind);
-    }
-    assert_eq!(twin.proposals(now, &NoExclusions), proposals);
+    // Replaying the same events twice must produce the same lists.
+    let twin = replayed(&events, &anchors);
+    assert_eq!(
+        twin.proposals_for(now, &NoExclusions, ProposalUse::AuthoredUnasked),
+        unasked
+    );
+    assert_eq!(
+        twin.proposals_for(now, &NoExclusions, ProposalUse::OfferedForReview),
+        review
+    );
 }

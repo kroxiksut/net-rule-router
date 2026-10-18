@@ -219,6 +219,91 @@ impl<'c> RevisionsRepository<'c> {
         Ok(out)
     }
 
+    /// `principal`'s revisions that came into force at or after `since`, newest
+    /// first, at most `limit`. Rows that never enforced (candidates, rejected)
+    /// are left out; ties in the second fall back to insertion order.
+    pub fn enforced_since_for(
+        &self,
+        principal: &str,
+        since: i64,
+        limit: usize,
+    ) -> StorageResult<Vec<EnforcedRevisionStamp>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.enforced_stamps(
+            "SELECT revision_id, content_hash, source, activated_at FROM revisions
+             WHERE principal = ?1 AND status IN ('active', 'superseded', 'rolled-back')
+               AND activated_at IS NOT NULL AND activated_at >= ?2
+             ORDER BY activated_at DESC, created_at DESC, rowid DESC LIMIT ?3",
+            params![principal, since, limit],
+        )
+    }
+
+    /// The newest of `principal`'s revisions that came into force before
+    /// `before`: the set in force at that moment, while history still holds it.
+    pub fn last_enforced_before_for(
+        &self,
+        principal: &str,
+        before: i64,
+    ) -> StorageResult<Option<EnforcedRevisionStamp>> {
+        Ok(self
+            .enforced_stamps(
+                "SELECT revision_id, content_hash, source, activated_at FROM revisions
+                 WHERE principal = ?1 AND status IN ('active', 'superseded', 'rolled-back')
+                   AND activated_at IS NOT NULL AND activated_at < ?2
+                 ORDER BY activated_at DESC, created_at DESC, rowid DESC LIMIT 1",
+                params![principal, before],
+            )?
+            .into_iter()
+            .next())
+    }
+
+    /// How many of `principal`'s superseded revisions came into force at or
+    /// after `since`.
+    pub fn superseded_count_since_for(&self, principal: &str, since: i64) -> StorageResult<usize> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM revisions
+                 WHERE principal = ?1 AND status = 'superseded' AND activated_at >= ?2",
+                params![principal, since],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Internal(format!("superseded_count_since_for: {e}")))?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    fn enforced_stamps(
+        &self,
+        sql: &str,
+        args: impl rusqlite::Params,
+    ) -> StorageResult<Vec<EnforcedRevisionStamp>> {
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| StorageError::Internal(format!("enforced stamps prepare: {e}")))?;
+        let rows = stmt
+            .query_map(args, |row| {
+                let source_slug: String = row.get(2)?;
+                let source = RulesRevisionSource::from_slug(&source_slug).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        format!("unknown revision source slug: {source_slug:?}").into(),
+                    )
+                })?;
+                Ok(EnforcedRevisionStamp {
+                    revision_id: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    source,
+                    activated_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| StorageError::Internal(format!("enforced stamps query: {e}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| StorageError::Internal(format!("enforced stamps collect: {e}")))?;
+        Ok(rows)
+    }
+
     /// Distinct `principal` values present in `revisions`,
     /// in stable order. Drives the per-principal retention sweep and any
     /// table-wide maintenance that must fan out over users.

@@ -21,7 +21,11 @@ use nrr_storage::revisions::RevisionsRepository;
 
 const BOOT_MS: i64 = 1_747_000_000_000;
 const USER: &str = "S-1-5-21-0-0-0-3001";
-const RULES: &str = r#"{"rules":[]}"#;
+/// Distinct bytes per change: the service hashes the content itself, so one
+/// body under two labels would dedupe into one revision.
+fn rules(label: &str) -> String {
+    format!(r#"{{"rules":[],"label":"{label}"}}"#)
+}
 
 /// One state database the "service" reopens across starts, as a host does.
 struct Host {
@@ -78,7 +82,7 @@ fn activate(coord: &Arc<ActivationCoordinator>, hash: &str) -> String {
     let outcome = ProductionMutationExecutor::new(Arc::clone(coord)).execute(
         StoredMutation {
             kind: MutationKind::RulesUpdate,
-            payload: serde_json::json!({ "rules-json": RULES, "content-hash": hash }),
+            payload: serde_json::json!({ "rules-json": rules(hash), "content-hash": hash }),
             correlation_id: None,
             issuer_sid: USER.to_string(),
             caller_is_elevated: false,
@@ -99,15 +103,15 @@ fn active(coord: &ActivationCoordinator) -> Option<String> {
         .map(|r| r.revision_id)
 }
 
-/// The active revision is a trusted one again: not the edited row, and
-/// carrying the content the app wrote.
+/// The active revision is a trusted one again: not the edited row, but the
+/// one [`previous_run`] activated before it, with the content the app wrote.
 fn assert_recovered_from(coord: &ActivationCoordinator, edited: &str) {
     let record = coord
         .current_active_for(USER)
         .expect("active")
         .expect("something active");
     assert_ne!(record.revision_id, edited);
-    assert_eq!(record.rules_json, RULES);
+    assert_eq!(record.rules_json, rules("h-1"));
 }
 
 fn edit_from_outside(host: &Host, id: &str) {
@@ -295,7 +299,7 @@ fn rules_update(exec: &ProductionMutationExecutor, hash: &str) -> MutationOutcom
     exec.execute(
         StoredMutation {
             kind: MutationKind::RulesUpdate,
-            payload: serde_json::json!({ "rules-json": RULES, "content-hash": hash }),
+            payload: serde_json::json!({ "rules-json": rules(hash), "content-hash": hash }),
             correlation_id: None,
             issuer_sid: USER.to_string(),
             caller_is_elevated: false,

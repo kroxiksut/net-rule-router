@@ -528,6 +528,7 @@ fn a_late_subscriber_reads_the_standing_status_instead_of_waiting_for_a_change()
         role: role.into(),
         candidates: Vec::new(),
         since_unix_ms: None,
+        quiet: false,
     };
     let board = coord.enforcement_status();
     let standing = board.for_principal("S-LATE");

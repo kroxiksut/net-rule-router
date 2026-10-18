@@ -17,6 +17,7 @@ use nrr_client_logic::restore::{
     route_policy_divergence,
 };
 use nrr_ipc_client::{ipc_error_to_wire, ipc_operation_timeout, IpcClient};
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName as Op;
 use nrr_shared::ipc_payloads::BlockNoticeMuteDto;
 use nrr_shared::user_settings::{
@@ -424,7 +425,8 @@ fn names(offer: &Offer, texts: &Texts) -> String {
 fn with_missing(mut body: String, missing: &[String], texts: &Texts) -> String {
     if !missing.is_empty() {
         body.push(' ');
-        body.push_str(&texts.fill(ADAPTER_MISSING, &[("name", missing.join(", "))]));
+        let shown: Vec<_> = missing.iter().map(|name| display_text(name)).collect();
+        body.push_str(&texts.fill(ADAPTER_MISSING, &[("name", shown.join(", "))]));
     }
     body
 }
@@ -455,10 +457,10 @@ pub fn announce(app: &mut AppState, texts: &Texts, now: std::time::Instant) -> V
             ),
             // Nothing went because its adapter is gone: that is the news.
             Outcome::Nothing { missing } if !missing.is_empty() => {
-                let names = missing.join(", ");
+                let names: Vec<_> = missing.iter().map(|name| display_text(name)).collect();
                 (
                     NoticeLevel::Warning,
-                    texts.fill(ADAPTER_MISSING, &[("name", names)]),
+                    texts.fill(ADAPTER_MISSING, &[("name", names.join(", "))]),
                 )
             }
             Outcome::Nothing { .. } => (NoticeLevel::Info, texts.get(NOTHING)),

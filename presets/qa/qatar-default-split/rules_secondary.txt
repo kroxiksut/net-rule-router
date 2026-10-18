@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 8
 # name: Qatar Default Split - Secondary Route
 # description: WhatsApp whose calls are restricted in Qatar, and VK blocked by the main operator
 # author: NetRuleRouter contributors
@@ -11,8 +11,7 @@
 # Checked: September 2026. AI, developer and major social services are not listed: they serve Qatar directly.
 # Calls reach relay servers by address; the app rule below carries them on desktop.
 
-*.whatsapp.com  # WhatsApp: voice and video calls restricted
-*.whatsapp.net  # WhatsApp: voice and video calls restricted
+whatsapp.*  # WhatsApp: voice and video calls restricted
 
 *.vk.com  # VK: blocked by the main operator
 *.vk.me  # VK: blocked by the main operator

@@ -32,11 +32,59 @@
 use std::time::Duration;
 
 use nrr_platform_api::authorization::{
-    AuthorizationDecision, AuthorizationPort, AuthorizationSubject,
+    AuthorizationDecision, AuthorizationPort, AuthorizationSubject, PromptAgentSession,
+    TerminalPromptAgent,
 };
 
 /// polkit's CLI. Present wherever polkit is.
 pub const PKCHECK_PROGRAM: &str = "pkcheck";
+/// polkit's text agent, shipped beside `pkcheck`.
+pub const PKTTYAGENT_PROGRAM: &str = "pkttyagent";
+
+/// polkit's text agent registered for this process alone: the password prompt
+/// for a request this process sends is asked in its own terminal, and nothing
+/// else in the session is answered by it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PkttyAgent;
+
+impl TerminalPromptAgent for PkttyAgent {
+    fn start(&self) -> Result<Box<dyn PromptAgentSession>, String> {
+        let pid = std::process::id();
+        let start_time = process_start_time(pid)
+            .ok_or_else(|| "the start time of this process could not be read".to_owned())?;
+        let exe = crate::command::system_tool(PKTTYAGENT_PROGRAM)
+            .map_err(|e| format!("{PKTTYAGENT_PROGRAM}: {e}"))?;
+        // The terminal is handed over whole: the agent prints the prompt and
+        // reads the password itself.
+        let child = std::process::Command::new(exe)
+            .args(pkttyagent_args(pid, start_time))
+            .spawn()
+            .map_err(|e| format!("{PKTTYAGENT_PROGRAM}: {e}"))?;
+        Ok(Box::new(PkttyAgentSession(child)))
+    }
+}
+
+/// `pkttyagent` arguments for one process. Pure, so the shape is tested
+/// without polkit installed.
+#[must_use]
+pub fn pkttyagent_args(pid: u32, start_time: u64) -> Vec<String> {
+    vec!["--process".to_owned(), format!("{pid},{start_time}")]
+}
+
+struct PkttyAgentSession(std::process::Child);
+
+impl PromptAgentSession for PkttyAgentSession {
+    fn is_running(&mut self) -> bool {
+        matches!(self.0.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for PkttyAgentSession {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 /// How long the check may take. Generous, because an interactive check waits
 /// for a human to type a password; the caller decides whether to allow
@@ -230,6 +278,16 @@ mod tests {
                 "--action-id".to_owned(),
                 "com.netrulerouter.manage-service".to_owned(),
             ],
+        );
+    }
+
+    /// The agent answers for exactly the process the service asks about: the
+    /// same pid and start time `pkcheck` names.
+    #[test]
+    fn the_terminal_agent_is_registered_for_this_process_by_the_same_pair() {
+        assert_eq!(
+            pkttyagent_args(4321, 987_654),
+            vec!["--process".to_owned(), "4321,987654".to_owned()]
         );
     }
 

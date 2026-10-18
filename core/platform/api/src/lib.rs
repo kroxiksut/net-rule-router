@@ -58,6 +58,9 @@ pub mod enforcement;
 // two it is rather than pretending they are the same.
 pub mod elevation;
 pub mod error;
+// Whether a file under the machine state root was placed by an administrator:
+// an unprivileged reader believes it only then. Ownership is read per-OS.
+pub mod admin_authored;
 // Per-adapter external (reflexive) address discovery over STUN. Portable as
 // written — the transport is `std::net` and the codec is pure bytes — so there
 // is no per-OS mechanism to hide behind a trait here.
@@ -112,6 +115,9 @@ pub mod process_lineage;
 // file) is the caller's; the mechanism (std-handle table / file descriptor) is
 // per-OS.
 pub mod process_error_stream;
+// Where the machine keeps the programs a rule may not deny or send over the
+// additional route; the verdict is the domain's.
+pub mod protected_places;
 pub mod reachability;
 // The route table + adapters half of the old `WindowsApiPort` — the part
 // every OS can implement.

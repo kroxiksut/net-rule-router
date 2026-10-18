@@ -252,6 +252,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
                     cache_db_path: PathBuf::new(),
                     state_db_path: PathBuf::new(),
                     traffic_db_path: PathBuf::new(),
+                    conn_history_db_path: PathBuf::new(),
                     backup_dir: PathBuf::new(),
                     migration_backup_dir: PathBuf::new(),
                     temp_dir: PathBuf::new(),

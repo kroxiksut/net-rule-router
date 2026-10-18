@@ -51,16 +51,10 @@ pub fn rules_file_to_route_rule_set(
                 ),
                 // `Auto` shares the domain value grammar — it separates
                 // authorship, not match kinds.
-                RulesFileSection::Domains | RulesFileSection::Auto => {
-                    // `*.example.com` → SuffixDomain (stored without `*.` prefix).
-                    // `example.com` → ExactFqdn.
-                    let addr_match = if let Some(label) = entry.match_value.strip_prefix("*.") {
-                        AddressMatch::SuffixDomain(label.to_string())
-                    } else {
-                        AddressMatch::ExactFqdn(entry.match_value.clone())
-                    };
-                    (Some(addr_match), None)
-                }
+                RulesFileSection::Domains | RulesFileSection::Auto => (
+                    Some(AddressMatch::from_domain_value(&entry.match_value)),
+                    None,
+                ),
                 // Addresses only: validation refuses anything else, a name
                 // included, rather than reading it as a domain.
                 RulesFileSection::Ip => {
@@ -126,6 +120,7 @@ pub fn rules_file_to_route_rule_set(
 /// |----------------------------|--------------|-----------------------|
 /// | `ExactFqdn(label)`         | `Domains`    | `label`               |
 /// | `SuffixDomain(label)`      | `Domains`    | `*.label`             |
+/// | `AnyZoneDomain(base)`      | `Domains`    | `base.*`              |
 /// | `Zone(name)`               | `Zones`      | `name`                |
 /// | `ExactIp(addr)`            | `IP`         | `addr.to_string()`    |
 /// | `Subnet(block)`            | `CIDR`       | `net/len`             |
@@ -138,7 +133,8 @@ pub fn rules_file_to_route_rule_set(
 ///
 /// A rule carrying an [`nrr_shared::auto_rule::RuleOrigin`] overrides the
 /// address-kind mapping for the two domain kinds and lands in `Auto` instead,
-/// with its provenance rendered into the inline comment.
+/// with its provenance rendered into the inline comment; a program rule keeps
+/// its section and carries the same comment there.
 ///
 /// # `host_app_section`
 ///
@@ -164,7 +160,7 @@ pub fn canonical_rule_set_to_rules_file_parsed(
     set: &crate::canonical::CanonicalRuleSet,
     host_app_section: RulesFileSection,
 ) -> RulesFileParsed {
-    use crate::canonical::{CanonicalAddressMatch, CanonicalAppPattern};
+    use crate::canonical::CanonicalAddressMatch;
 
     let mut zones: Vec<RulesFileEntry> = Vec::new();
     let mut domains: Vec<RulesFileEntry> = Vec::new();
@@ -214,6 +210,7 @@ pub fn canonical_rule_set_to_rules_file_parsed(
                     },
                     format!("*.{label}"),
                 ),
+                CanonicalAddressMatch::AnyZoneDomain(base) => (&mut domains, format!("{base}.*")),
                 CanonicalAddressMatch::Zone(name) => (&mut zones, name.clone()),
                 CanonicalAddressMatch::ExactIp(addr) => (&mut ips, addr.to_string()),
                 CanonicalAddressMatch::Subnet(block) => (&mut subnets, block.to_string()),
@@ -232,16 +229,17 @@ pub fn canonical_rule_set_to_rules_file_parsed(
                 },
             });
         } else if let Some(app) = &rule.app_match {
-            let value = match &app.pattern {
-                CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.clone(),
-            };
+            // A path keeps its form: a folder its trailing separator, a tree
+            // its `*`, so it reads back as written.
+            let value = app.pattern.as_str().to_string();
+            // An app-authored program rule keeps its section and its origin.
             apps.push(RulesFileEntry {
                 match_value: value,
                 inline_comment: comment,
                 enabled: rule.enabled,
                 blocked,
                 verify_primary: false,
-                origin: None,
+                origin: rule.origin.clone(),
             });
         }
         // CanonicalRule with neither address_match nor app_match cannot

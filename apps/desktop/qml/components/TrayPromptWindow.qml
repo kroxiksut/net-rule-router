@@ -664,6 +664,8 @@ Window {
                         Layout.minimumWidth: pairedWithSecondary ? columnWidth : 0
                         Layout.maximumWidth: pairedWithSecondary ? columnWidth : Number.POSITIVE_INFINITY
                         text: String((modelData || {}).primaryText || "")
+                        // Rows carry names other programs chose: never markup.
+                        textFormat: Text.PlainText
                         color: promptWindow._fgColor
                         font.pixelSize: promptWindow._baseFontPx
                         elide: Text.ElideMiddle
@@ -675,6 +677,7 @@ Window {
                         Layout.preferredWidth: 0
                         visible: String((modelData || {}).secondaryText || "") !== ""
                         text: String((modelData || {}).secondaryText || "")
+                        textFormat: Text.PlainText
                         color: promptWindow._mutedColor
                         font.pixelSize: promptWindow._baseFontPx - 1
                         wrapMode: Text.WordWrap
@@ -699,6 +702,7 @@ Window {
                         visible: promptWindow.detailsExpanded
                             && String((modelData || {}).detailText || "") !== ""
                         text: String((modelData || {}).detailText || "")
+                        textFormat: Text.PlainText
                         color: promptWindow._mutedColor
                         font.pixelSize: promptWindow._baseFontPx - 1
                         wrapMode: Text.WordWrap

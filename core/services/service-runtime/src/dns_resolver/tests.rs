@@ -1291,6 +1291,37 @@ fn scoped_answerer_returns_none_when_disabled_or_excluded() {
     assert_eq!(on.fake_answer("100.64.0.78"), None);
 }
 
+/// A flood of names that fills the pool costs the newcomers their virtual
+/// address, not anyone else: they are answered on the real path, and every
+/// host already holding an address keeps it.
+#[test]
+fn a_full_pool_answers_newcomers_on_the_real_path_and_keeps_live_addresses() {
+    let pool = nrr_platform_api::fake_ip::FakeIpPoolConfig {
+        v4_base: std::net::Ipv4Addr::new(198, 18, 0, 0),
+        v4_prefix_len: 29,
+        v6_base: None,
+        v6_prefix_len: 0,
+    };
+    let allocator = Arc::new(Mutex::new(FakeIpAllocator::new(pool)));
+    let answerer = ScopedFakeIpAnswerer::new(FakeIpScope::enabled(Vec::<String>::new()), allocator);
+    let held: Vec<_> = (0..5)
+        .map(|i| {
+            answerer
+                .fake_answer(&format!("h{i}.example"))
+                .expect("room left")
+        })
+        .collect();
+    for i in 0..50 {
+        assert_eq!(answerer.fake_answer(&format!("flood{i}.example")), None);
+    }
+    for (i, addresses) in held.iter().enumerate() {
+        assert_eq!(
+            answerer.fake_answer(&format!("h{i}.example")).as_ref(),
+            Some(addresses)
+        );
+    }
+}
+
 #[test]
 fn scoped_answerer_honours_a_runtime_exclusion() {
     let allocator = Arc::new(Mutex::new(FakeIpAllocator::default()));

@@ -7,6 +7,25 @@ It covers the rules text file format and the settings export YAML format.
 
 ## 1. Rules File Format
 
+**Quick reference.** Everything a line can carry; the sections below give the
+details.
+
+| Write | Meaning | Example |
+|---|---|---|
+| `--- Name` | Section header: the type of the rules below it (§1.2) | `--- Domains` |
+| `value` | A rule: send this destination over this file's route | `example.com` |
+| `*.value` | The site with all its subdomains | `*.example.com` |
+| `value.*` | The site in every zone | `example.*` |
+| `!value` | Deny: never send this destination through any connection (§1.12) | `!telemetry.example.net` |
+| `?value` | This file's route while the site opens there (§1.15) | `?accounts.example.com` |
+| `# value` | Rule kept but turned off | `# example.com`, `# !example.com` |
+| `value  # text` | Rule with your note | `example.com  # updates` |
+| `value +children` | Application rule that also covers the programs it starts (§1.6) | `codex.exe +children` |
+| `# text` | Comment, ignored | `# my notes` |
+
+`!` and `?` go right before the value, after the `#` of a turned-off rule, and
+never together.
+
 ### 1.1 Overview
 
 Routing rules are stored in plain text files — one file per route role. The
@@ -37,9 +56,9 @@ and must appear exactly as shown.
 | `--- IP` | Exact IP address rules | All |
 | `--- CIDR` | Subnet rules (`10.0.0.0/8`) | All |
 | `--- Ranges` | IP range rules (`192.0.2.10-192.0.2.40`) | All |
-| `--- Windows` | Windows application rules (`.exe` filename) | Windows only |
-| `--- Linux` | Linux application rules (process name or path) | Linux only |
-| `--- MacOS` | macOS application rules (bundle ID or process name) | macOS only |
+| `--- Windows` | Windows application rules (`.exe` name, file path or folder) | Windows only |
+| `--- Linux` | Linux application rules (process name, file path or folder) | Linux only |
+| `--- MacOS` | macOS application rules (process name, file path or folder) | macOS only |
 | `--- Auto` | Rules the application added on your behalf (§1.13) | All |
 
 Future revisions may introduce additional sections (such as `Ports`) as the
@@ -49,10 +68,15 @@ Sections are written in the order of the table above, empty ones included
 (see "Empty sections" below). `--- Auto` is written last, so a file reads as
 "the rules you wrote, then the rules the application added for you".
 
-**A section is a type, strictly.** A subnet or a range under `--- IP`, an exact
-address under `--- CIDR`, a subnet under `--- Ranges` and so on are line
-errors, and the message names the section the value belongs in. The program
-never moves lines between sections on its own.
+**A section is a type, strictly.** A value spelled as another type is a line
+error, and the message names the section it belongs in: a subnet or a range
+under `--- IP`, an address under `--- CIDR`, a program (`chrome.exe`, a path)
+under `--- Domains` or `--- Zones`, an address, a network or a domain under
+`--- Windows`, an address or a network under `--- Linux` / `--- MacOS`. A single
+word (`telegram`, `ru`) can be a zone or a program, so the section decides.
+Program names on Linux and macOS may contain dots, so a dotted name is accepted
+there. The program never moves lines between sections on its own: it offers to
+move a line and moves it only when you confirm.
 
 #### Platform filtering
 
@@ -112,6 +136,7 @@ they are not bound to a rule.
 
 ```
 # example.com
+# codex.exe +children
 ```
 
 A `#` at the start of a line followed by a valid rule value marks the rule as
@@ -135,6 +160,19 @@ A `?` written immediately before a domain value or a single IP address, in
 either file, asks the app to check that the site opens through that file's
 route (§1.15). It goes after the `#` of a disabled rule, never before it.
 
+#### Deny
+
+```
+!telemetry.example.net
+!10.20.0.0/16
+!telemetry.exe
+# !old.example.com
+```
+
+A `!` written immediately before a value, in either file and in any section,
+denies the destination: it is not sent through any connection (§1.12). It goes
+after the `#` of a disabled rule, and it is never combined with `?`.
+
 #### Free comment
 
 ```
@@ -145,6 +183,19 @@ Standalone comment lines (where the content after `#` is not a recognizable
 rule value) are preserved in the file but ignored by the rule engine. They
 are not shown in the GUI rule list.
 
+#### Syntax hint
+
+```
+#: !value           deny: through no connection at all  !ads.example.net
+#: ?value           this route while the site opens     ?mail.example.com
+```
+
+A file the app writes opens with a few lines starting with `#:` that sum up
+this syntax. They are written anew on every save, in the interface language of
+that moment, and the app never reads them: editing them changes nothing. Do
+not start your own lines with `#:` — they are dropped as part of the hint. The
+hint does not change the format version: an older build reads it as comments.
+
 #### Empty lines
 
 Empty lines and lines containing only whitespace are ignored.
@@ -152,7 +203,7 @@ Empty lines and lines containing only whitespace are ignored.
 ### 1.4 Complete example
 
 ```
-# NetRuleRouter rules file — version 7
+# NetRuleRouter rules file — version 10
 # Route: Primary (main network)
 
 --- Zones
@@ -176,9 +227,10 @@ updates.example.org    # exact FQDN: vendor update endpoint
 192.0.2.10-192.0.2.40  # a block of addresses
 
 --- Windows
-browser.exe      # browser traffic
-*vpn*.exe        # any VPN client executable
-# powershell.exe # temporarily disabled
+browser.exe        # browser traffic
+*vpn*.exe          # any VPN client executable
+C:\Tools\Sync\*    # every program of the folder and its subfolders
+# powershell.exe   # temporarily disabled
 
 --- Linux
 # (reserved — not applied on Windows)
@@ -193,12 +245,14 @@ rr3.example-cdn.net  # auto:site-companion anchor:example.org added:2026-07-31
 The additional-route file of the same pair:
 
 ```
-# NetRuleRouter rules file — version 7
+# NetRuleRouter rules file — version 10
 # Route: Additional (VPN)
 
 --- Domains
 *.streaming.example.com    # always through the VPN
 ?*.video.example.net       # through the VPN while it opens there (§1.15)
+example-tv.*               # the site in every zone (§1.5)
+!telemetry.example.net     # never leaves this computer (§1.12)
 ```
 
 ### 1.5 Rule evaluation priority
@@ -212,30 +266,37 @@ both files are evaluated together:
    and any subdomain of it at any depth. The longest base domain wins among
    competing suffix rules. To route the apex differently from its subdomains,
    add an exact rule for the apex — it is a higher tier and wins.
-3. **IP** — `203.0.113.7`, one exact address. It beats any network that
+3. **Site in every zone** — `example.*` matches `example.com`, `example.net`,
+   `example.co.uk` and any of their subdomains: for each host it is the rule
+   `*.example.<zone>`. A rule that names the zone (`example.by`,
+   `*.example.by`) beats it on any route; between two such rules the longer
+   name wins, so `mail.example.*` beats `example.*`.
+4. **IP** — `203.0.113.7`, one exact address. It beats any network that
    contains it.
-4. **CIDR and Ranges** — `10.1.0.0/16` or `192.0.2.10-192.0.2.40`. Between
+5. **CIDR and Ranges** — `10.1.0.0/16` or `192.0.2.10-192.0.2.40`. Between
    networks the longer prefix wins, so `10.1.0.0/16` beats `10.0.0.0/8`. The
    same network on both routes is an error.
-5. **Zones** — `ru` matches every hostname ending in `.ru`. A longer zone beats
+6. **Zones** — `ru` matches every hostname ending in `.ru`. A longer zone beats
    a shorter one. A network or an exact address inside a zone beats the zone.
-6. **Application** — `chrome.exe` (`Windows` / `Linux` / `MacOS`), matched by
-   process filename (exact or glob). Exact names take precedence over glob
-   patterns; among glob matches, the first rule in the file wins. Only the
-   platform-appropriate section is evaluated. The destinations an application
-   rule teaches the router (§1.10) are evaluated at this tier too, so an address
-   rule for the same address wins.
-7. **Default route** — set by the routing mode (see
+7. **Application** — `chrome.exe`, `C:\Apps\Tool\tool.exe`, `C:\Apps\*`
+   (`Windows` / `Linux` / `MacOS`). Within the tier the narrower rule wins: a
+   full path first, then an exact name, then a folder (a deeper folder first;
+   at the same depth "this folder only" before "with subfolders"), then a name
+   pattern; among matching name patterns, the first rule in the file wins. Only
+   the platform-appropriate section is evaluated. The destinations an
+   application rule teaches the router (§1.10) are evaluated at this tier too,
+   so an address rule for the same address wins.
+8. **Default route** — set by the routing mode (see
    [Routing modes](routing-modes.md)).
 
-Name rules (tiers 1, 2 and 5) apply only when the destination's name is known.
+Name rules (tiers 1, 2, 3 and 6) apply only when the destination's name is known.
 
 Two more rules settle the rest:
 
-- A `+block` rule (§1.12) for an exact IP address stops that address whatever
-  other rule names it. Any other block takes its tier in the order above, so a
-  zone block does not stop a site an exact rule routes.
-- When two rules of the same tier are equally specific, a block beats a route
+- A deny rule (`!`, §1.12) for an exact IP address stops that address whatever
+  other rule names it. Any other deny takes its tier in the order above, so a
+  zone deny does not stop a site an exact rule routes.
+- When two rules of the same tier are equally specific, a deny beats a route
   and the primary route beats the additional one.
 
 By default a rule for a site or an address wins over a rule for a program.
@@ -244,7 +305,7 @@ Routing) turns that around for programs: a program you named in a rule then
 sends everything it connects to over that rule's route, even to sites another
 rule sends the other way. Routing works per address, so such a site then goes
 that route for every program on the computer, not only for the one you named.
-An exact-IP `+block` rule still stops its address, and a site your primary
+An exact-IP deny rule still stops its address, and a site your primary
 route names stays reachable for other programs when the additional route is
 down. The switch is off by default.
 
@@ -283,13 +344,32 @@ only the ones codex actually spawned.
 priority over routing inherited from a parent-process match. `+children` never
 overrides a direct rule for the child.
 
-> `+block` (§1.12) is the sibling per-rule flag. The two are orthogonal and
-> may appear on the same line (`codex.exe +children +block`).
+> A deny (`!`, §1.12) combines with the flag: `!codex.exe +children`.
+
+The flag means something only after a program name. After any other value
+it is dropped on reading, and the rule is read without it. A turned-off
+program rule keeps it: `# codex.exe +children`.
 
 **Status in this release:** the flag is accepted and ignored. A rule written
 with `+children` is read as a plain application rule and covers the named
 process only; the descendant subtree is not followed yet. Writing it now costs
 nothing and starts working when subtree attribution lands.
+
+### 1.7 Section names are not localized
+
+Section names (`Zones`, `Domains`, `IP`, `CIDR`, `Ranges`, `Windows`, `Linux`,
+`MacOS`, `Auto`)
+are technical keywords in the file format. They are not passed through the
+locale layer and are not translated. The same applies to the reason slugs used
+inside the `--- Auto` section (§1.13): the slug in the file is a fixed keyword,
+and the GUI renders a translated sentence for it.
+
+The GUI may display localized descriptions *about* each section (shown as
+hints or tooltips), but the section name written to the file is always the
+canonical English keyword.
+
+User-written inline comments (after `#`) are personal notes in whatever
+language the user chooses — they are never modified or translated.
 
 ### 1.8 Match value syntax
 
@@ -316,6 +396,7 @@ label characters (letters, digits, hyphens, dots for compound zones such as
 |---|---|---|
 | `example.com` | Exact FQDN — matches `example.com` only | Exact domain (tier 1) |
 | `*.example.com` | Suffix — matches `example.com` and any subdomain of it at any depth | Domain with subdomains (tier 2) |
+| `example.*` | The site in every zone — `example.com`, `example.net`, `example.co.uk` and their subdomains | Site in every zone (tier 3) |
 
 The `*.` prefix is the explicit subdomain operator. A bare domain name
 without `*.` matches only the exact FQDN. The two forms are orthogonal:
@@ -325,6 +406,14 @@ only if a suffix rule covers it.
 Because tier 1 is checked first, writing both forms is how you split a site:
 `*.example.com` on one route and `example.com` on the other sends the
 subdomains one way and the bare domain the other.
+
+`example.*` is for a site that lives under several zones: one line replaces
+`example.com`, `example.net` and the rest. The zone is the end of the host
+name a registrar sells under — `com`, `ru`, or two parts such as `co.uk` — so
+`example.com.other.net` belongs to `other.net` and does not match. `*.example.*`
+is read as the same rule. To send one zone of the site the other way, add a
+rule for it (`example.by`): a rule that names the zone always wins. The `?`
+check (§1.15) needs one host and does not apply to `example.*`.
 
 #### IP (`--- IP`)
 
@@ -387,16 +476,29 @@ stays on the main connection even when the additional one is down.
 
 #### Windows / Linux / MacOS (application sections)
 
-Process filename match. Both exact names and glob patterns are accepted.
+A program is named by its file name, by a pattern over file names, or by where
+it lives: one file, the programs of one folder, or the programs of a folder and
+every folder below it. A value without a path separator is a name; a value
+with one (`\` or `/` on Windows, `/` on Linux and macOS) is a path.
 
 | Example | Matches |
 |---|---|
-| `chrome.exe` | Exact process name |
-| `*vpn.exe` | Any process name ending with `vpn.exe` |
-| `nord*` | Any process name starting with `nord` |
-| `*vpn*.exe` | Any process name containing `vpn` and ending with `.exe` |
+| `chrome.exe` | The program with this name, wherever it is installed |
+| `*vpn.exe` | Any program whose name ends with `vpn.exe` |
+| `nord*` | Any program whose name starts with `nord` |
+| `*vpn*.exe` | Any program whose name contains `vpn` and ends with `.exe` |
+| `C:\Apps\Tool\tool.exe` | That one program file |
+| `C:\Apps\Tool` or `C:\Apps\Tool\` | The programs directly in that folder, not in its subfolders |
+| `C:\Apps\Tool\*` | The programs in that folder and in every folder below it |
+| `/opt/tool/bin/tool` | That one program file, or the programs of that folder if it is one |
+| `/opt/tool/` | The programs directly in that folder |
+| `/opt/tool/*` | The programs in that folder and in every folder below it |
 
-Glob semantics:
+A folder rule suits a program that keeps several executables of its own next
+to each other or in subfolders (helpers, updaters, a new version folder after
+each update): one rule covers all of them.
+
+Name patterns:
 
 - `*` matches **zero or more characters** (any character, including `.` and
   `-`). It is the only wildcard: `?` has no special meaning.
@@ -404,27 +506,50 @@ Glob semantics:
   broad, would match every running process.
 - Matching is **case-insensitive** on every platform: `Telegram.exe`,
   `telegram.exe` and `TELEGRAM.EXE` name the same program.
-- Only the **process filename** is matched, not the full path.
 
-Precedence within the Application tier: an exact name always takes
-precedence over any glob match. Among multiple glob rules that match the
-same process name, the first rule defined in the file wins.
+Paths:
 
-### 1.7 Section names are not localized
+- A path starts at a drive (`C:\`), a network share (`\\server\share\`) or, on
+  Linux and macOS, at `/`. A relative path (`Tools\tool.exe`, `bin/tool`) or
+  one with `..` in it is a line error.
+- `*` may stand only as the whole last part of a path, written `\*` (or `/*`):
+  "this folder with its subfolders". Anywhere else in a path (`C:\Apps\*.exe`,
+  `C:\*\tool.exe`) it is a line error; to name programs by a pattern, write a
+  name pattern without a path.
+- On Windows a path without a trailing `\` is a program file when its last
+  part ends with `.exe`, and a folder otherwise. On Linux and macOS a path
+  without a trailing `/` is whatever is there when the rule is applied: a
+  program file or a folder. Write the trailing `/` to say "folder" outright.
+- Windows and macOS paths are compared without regard to case; Linux paths
+  are compared exactly, as Linux names files.
+- The same folder in the same form ("this folder only" or "with subfolders")
+  in both files is an error, like the same network on both routes.
+- `!` before a path denies the programs it names; `+children` after it
+  extends the rule to the programs they start.
+- Where this system does not apply rules by path yet, such a rule stays in
+  the file and in the rules list, and the Overlaps tab shows it as not
+  applied, with the reason.
 
-Section names (`Zones`, `Domains`, `IP`, `CIDR`, `Ranges`, `Windows`, `Linux`,
-`MacOS`, `Auto`)
-are technical keywords in the file format. They are not passed through the
-locale layer and are not translated. The same applies to the reason slugs used
-inside the `--- Auto` section (§1.13): the slug in the file is a fixed keyword,
-and the GUI renders a translated sentence for it.
+Precedence within the Application tier, narrowest first: a full path, an
+exact name, a folder (the deeper folder first; at the same depth "this folder
+only" before "with subfolders"), a name pattern. Among multiple name patterns
+that match the same program, the first rule defined in the file wins.
 
-The GUI may display localized descriptions *about* each section (shown as
-hints or tooltips), but the section name written to the file is always the
-canonical English keyword.
+#### System programs
 
-User-written inline comments (after `#`) are personal notes in whatever
-language the user chooses — they are never modified or translated.
+A deny (`!`) or a rule in the additional route's file cannot name a program
+the system needs to stay on the network, signed in and on time: on Windows
+`svchost.exe`, `lsass.exe`, `services.exe`, `csrss.exe`, `wininit.exe`,
+`smss.exe` and `winlogon.exe` among others; on Linux the `systemd` services,
+`NetworkManager`, `dhclient` and `wpa_supplicant`; on macOS `launchd`,
+`mDNSResponder` and `configd`. The same holds for a pattern that would catch
+one of them (`svc*.exe`) and for the app's own programs. The main route may
+name them: it is the way they reach the network anyway.
+
+The Add dialog refuses such a rule before it is saved. One already in a rules
+file — written by hand or kept from an older version — stays in the file and
+in the rules list, is shown as not applied with the reason, and is not carried
+out until it is changed.
 
 ### 1.9 Forward compatibility — extended sections
 
@@ -473,16 +598,30 @@ The header line `# NetRuleRouter rules file — version N` (and the preset heade
 |---|---|
 | 1 | Sections, top-level rules, inline comments, disabled rules. |
 | 2 | Reserved, never used. |
-| 3 | Per-rule `+block` flag (§1.12). |
+| 3 | Per-rule `+block` flag, replaced by `!` in version 9. |
 | 4 | App-authored rules section (§1.13, `--- Auto`). |
 | 5 | Subnet and range sections (§1.8, `--- CIDR`, `--- Ranges`). |
 | 6 | The `?` prefix on domain rules in the additional-route file (§1.15). |
 | 7 | The `?` prefix on single IP addresses and in the main-route file (§1.15). |
+| 8 | A site in every zone (§1.8, `example.*`). |
+| 9 | Deny written as `!` before the value (§1.12); the `+block` flag of version 3 is gone. |
+| 10 | An application named by path: one file, a folder, a folder with its subfolders (§1.8). |
 
 Version 2 was reserved for a nested `- destination` syntax under application
 rules. It was never implemented and no build reads or writes it; the number is
 left in place rather than reused, so a file from any build means the same thing
 in every build. Do not declare version 2 in a file.
+
+A file that names an application by path declares **version 10**. An older
+build reads a file path there as the program's name alone and does not apply
+a folder rule; open such a file in a current build.
+
+A file that uses `!` declares **version 9**. A line still carrying `+block` is
+a line error whose message shows the `!` form; it is never read as a route.
+
+A file that uses `example.*` declares **version 8**. An older build reads the
+line as a domain it cannot accept and does not apply it; the rest of the file
+works.
 
 A file that uses the `?` prefix declares **version 7** (version 6 when it is
 only on domain rules of the additional-route file). A version-6 build reads a
@@ -500,70 +639,63 @@ pre-version-4 reader does not recognise the section name and therefore treats
 it as an extended section (§1.9): the rules are preserved on round-trip but not
 applied, so nothing is lost and nothing is misinterpreted.
 
-A file that uses the `+block` flag declares **version 3**. A pre-version-3
-reader treats `value +block` like any other unknown trailing token: for an
-address section the space makes the value fail validation (the rule is dropped,
-not silently routed), and for an application section it becomes a
-never-matching process name — so the flag degrades safely rather than
-converting a block into an accidental route.
+### 1.12 Deny (`!`)
 
-### 1.12 Blocking destinations (`+block`)
-
-By default a rule *routes* its destination through the adapter bound to the
+By default a rule *routes* its destination through the connection bound to the
 file the rule lives in (`rules_primary.txt` → primary, `rules_secondary.txt` →
-additional; §1.10). Appending the flag **`+block`** after the match value
-instead **drops** all traffic to that destination — it is enforced by a hard
-WFP `FWP_ACTION_BLOCK` filter (both the connect layer for TCP/UDP and the
-packet layer for ICMP/ping and other protocols) and installs **no** route.
+additional; §1.10). A **`!`** right before the value **denies** the destination
+instead: nothing is sent to it through any connection, ping and other
+protocols included, and no route is installed for it.
 
 ```
 --- Domains
-telemetry.vendor.example +block     # not allowed from this machine
-*.metrics.vendor.example +block
+!telemetry.vendor.example     # not allowed from this computer
+!*.metrics.vendor.example
+
+--- CIDR
+!10.20.0.0/16
 
 --- IP
-203.0.113.9 +block
+!203.0.113.9
+
+--- Windows
+!telemetry.exe
 ```
 
-**What this flag is, and what it is not.** `+block` is a manual policy rule:
-you name a destination, and it stops being reachable from this machine. It is
-not an ad blocker or a tracker blocker. NetRuleRouter ships no block lists,
-maintains none, and has no view inside a page — it cannot remove an element,
-and it cannot touch anything served from the same domain as the content around
-it. Blocking by name also depends on seeing the name resolved, so a browser
-using its own encrypted DNS (DoH/DoT) can make a name-based block rule miss;
-see [What routing changes — and what it does not](what-routing-changes.md).
-Use the flag for destinations you have decided about yourself.
+**What a deny is, and what it is not.** It is a manual rule: you name a
+destination, and it stops being reachable from this computer. It is not an ad
+blocker or a tracker blocker. NetRuleRouter ships no block lists, maintains
+none, and has no view inside a page — it cannot remove an element, and it
+cannot touch anything served from the same domain as the content around it.
+Denying by name also depends on seeing the name resolved, so a browser using
+its own encrypted DNS (DoH/DoT) can make a name-based deny miss; see
+[What routing changes — and what it does not](what-routing-changes.md). A deny
+by address or subnet does not depend on names.
 
 Key properties:
 
-- The flag is a single space-separated token after the match value and before
-  any inline `#` comment (`telemetry.vendor.example +block  # policy`), mirroring the
-  `+children` convention (§1.6). Order is not significant if both are present.
-- **The containing file is irrelevant for a blocked rule.** A `+block` rule
-  drops its destination whether it lives in `rules_primary.txt` or
-  `rules_secondary.txt` — the block action overrides the route. (Editors
-  typically keep block rules in the additional file by convention.)
-- `+block` works uniformly across every section: `Zones`, `Domains`, `IP`, and
-  the application sections (`Windows` / `Linux` / `MacOS`). A blocked
-  application rule drops that process's connect-layer traffic.
-- Disable a block rule the same way as any rule — comment the line
-  (`# telemetry.vendor.example +block`); it is retained but inactive.
-- A matched `+block` rule short-circuits to **DROP** at its evaluation tier
-  (§1.5); no lower tier or the default route is consulted for that connection.
-- **An IP block wins over every other rule for that address.** A site whose
-  name you route is still blocked while it answers on an address you blocked.
-- **A block wins a tie.** When a block rule and a route rule name the same
-  destination equally narrowly — even from different files — the destination
-  is blocked. The Overlaps screen points out such pairs.
-- **A narrower route keeps a shared address open.** When a site you route by
-  a narrower rule shares an address with sites a wider block covers, that
-  address stays reachable, and so do those other sites on it. The Overlaps
-  screen lists these cases for the rules currently applied.
-- **Where a block rule is authored.** The flag applies wherever it appears in a
-  rules file, and an existing block rule stays one when you open it in the app.
-  The Add/Edit Rule dialog does not offer Block as a target for a *new* rule —
-  block rules are written in the file.
+- `!` touches the value: `! example.com` with a space is a line error, and so
+  is `?!example.com` — a check never applies to a deny.
+- **The file does not matter.** A deny stops its destination whether it lives
+  in `rules_primary.txt` or `rules_secondary.txt`.
+- `!` works in every section: `Zones`, `Domains`, `IP`, `CIDR`, `Ranges` and the
+  application sections (`Windows` / `Linux` / `MacOS`). A denied application
+  cannot connect anywhere.
+- Turn a deny off like any rule — `# !telemetry.vendor.example` keeps it in the
+  file, inactive.
+- A matched deny stops the connection at its tier (§1.5); no lower tier or the
+  default route is consulted.
+- **An address deny wins over every other rule for that address.** A site whose
+  name you route is still stopped while it answers on an address you denied.
+- **A deny wins a tie.** When a deny and a route name the same destination
+  equally narrowly — even from different files — the destination is denied.
+  The Overlaps screen points out such pairs.
+- **A narrower route keeps a shared address open.** When a site you route by a
+  narrower rule shares an address with sites a wider deny covers, that address
+  stays reachable, and so do those other sites on it. The Overlaps screen lists
+  these cases for the rules currently applied.
+- In the app, choose **Deny** as the route of a rule; the Rules list filters
+  denied rules with **Denied**.
 
 ### 1.13 App-authored rules (`--- Auto`)
 
@@ -613,7 +745,7 @@ Key properties:
   round-trip, so a file written by a newer build is never damaged by an older
   one.
 - **All the ordinary syntax applies.** Comment the line to disable a rule
-  (§1.3), append `+block` to block instead of route (§1.12), edit or delete a
+  (§1.3), put `!` before the value to deny instead of route (§1.12), edit or delete a
   line by hand — the section is plain text like every other one.
 - **A line without an `auto:` token is still a rule.** It is imported as an
   ordinary rule of that file's route and reported as a warning, never dropped
@@ -673,10 +805,11 @@ Key properties:
 - **Domain and single-address rules.** The prefix is read in `--- Domains`
   (and in `--- Auto`, which shares its grammar, §1.13), on exact hosts and on
   `*.` suffix rules alike, and in `--- IP`. On an IPv6 address the `?` is kept
-  but never leads to a move. In any other section the `?` is part of the
-  value, which makes it invalid.
-- **Not together with `+block`.** "Check where it works" and "drop it"
-  contradict each other, so a line carrying both is not read as a rule.
+  but never leads to a move. On `example.*` the `?` is dropped with a warning
+  and the rule routes without a check: the check needs one host. In any other
+  section the `?` is part of the value, which makes it invalid.
+- **Not together with a deny.** "Check where it works" and "never send it"
+  contradict each other, so `?!value` is a line error.
 - **Disable it like any rule** — comment the line: `# ?accounts.example.com`.
 - **One rule per site in a file.** `?accounts.example.com` and
   `accounts.example.com` in the same file are the same rule; the line without
@@ -786,14 +919,14 @@ Preset metadata is stored as header comments at the top of each file, before
 any section headers. All keys are optional.
 
 ```
-# NetRuleRouter preset — version 7
+# NetRuleRouter preset — version 8
 # name: Corporate VPN Rules
 # description: Routes corporate traffic via the additional (VPN) interface
 # author: Jane Doe
 # preset_version: 1
 ```
 
-The first line `# NetRuleRouter preset — version 7` identifies the file as a
+The first line `# NetRuleRouter preset — version 8` identifies the file as a
 preset and carries the format version. A file without this header is still
 valid as a rules file; the metadata lines are treated as free comments.
 

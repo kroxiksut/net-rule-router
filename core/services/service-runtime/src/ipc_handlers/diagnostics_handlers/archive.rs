@@ -211,11 +211,26 @@ impl DiagnosticsExportArchiveHandler {
     }
 }
 
-impl IpcHandler for DiagnosticsExportArchiveHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for DiagnosticsExportArchiveHandler {
+    type Checked = DiagnosticsExportArchiveRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        _ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        serde_json::from_value(request.payload.clone())
+            .map_err(|e| malformed("diagnostics.export-archive", e))
+    }
+
+    fn execute(
+        &self,
+        req: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         const OP: &str = "diagnostics.export-archive";
-        let req: DiagnosticsExportArchiveRequest =
-            serde_json::from_value(request.payload.clone()).map_err(|e| malformed(OP, e))?;
+        let req = req.into_inner();
 
         // Collect data. We always include status; logs / audit are
         // gated on the request flags. Playbook inclusion lands as

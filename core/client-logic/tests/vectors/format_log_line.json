@@ -16,6 +16,7 @@
     { "name": "cyrillic translation", "input": { "translated": "Правило {rule} отклонено", "source": "Rule {rule} refused", "args": { "rule": "R-0001" }, "positional": [] }, "expected": "Правило R-0001 отклонено" },
     { "name": "non-ASCII name is not a name", "input": { "translated": "{héllo}", "source": "src", "args": { "héllo": "x" }, "positional": [] }, "expected": "{héllo}" },
     { "name": "unclosed brace", "input": { "translated": "{a", "source": "src", "args": { "a": "x" }, "positional": null }, "expected": "{a" },
-    { "name": "args and positional absent", "input": { "translated": "{0}", "source": "fallback" }, "expected": "fallback" }
+    { "name": "args and positional absent", "input": { "translated": "{0}", "source": "fallback" }, "expected": "fallback" },
+    { "name": "a foreign name in a value is shown, not obeyed", "input": { "translated": "{process} blocked, {0}", "source": "src", "args": { "process": "gnp‮.exe\u001b]0;x\u0007" }, "positional": ["corr​1"] }, "expected": "gnp·.exe·]0;x· blocked, corr·1" }
   ]
 }

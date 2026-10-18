@@ -36,6 +36,7 @@ pub enum ServiceTaskKind {
     AutoRules,
     AppDestinationFlush,
     SecondaryExternalAddress,
+    ConnHistoryFlush,
     // Threads outside the supervisor; each holds a `TaskLiveness` lease.
     DnsResolver,
     DnsRedirectGuard,
@@ -76,7 +77,7 @@ const BACKGROUND: TaskHealth = TaskHealth::Reports {
 };
 
 impl ServiceTaskKind {
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
         Self::HealthAggregator,
         Self::AdapterMonitor,
         Self::RouteReconcileSafety,
@@ -102,6 +103,7 @@ impl ServiceTaskKind {
         Self::AutoRules,
         Self::AppDestinationFlush,
         Self::SecondaryExternalAddress,
+        Self::ConnHistoryFlush,
         Self::DnsResolver,
         Self::DnsRedirectGuard,
         Self::DnsReconcileWorker,
@@ -140,6 +142,7 @@ impl ServiceTaskKind {
             Self::AutoRules => TASK_ID_AUTO_RULES,
             Self::AppDestinationFlush => TASK_ID_APP_DESTINATION_FLUSH,
             Self::SecondaryExternalAddress => TASK_ID_SECONDARY_EXTERNAL_ADDRESS,
+            Self::ConnHistoryFlush => TASK_ID_CONN_HISTORY_FLUSH,
             Self::DnsResolver => "dns-resolver",
             Self::DnsRedirectGuard => "dns-redirect-guard",
             Self::DnsReconcileWorker => "dns-reconcile-worker",
@@ -241,6 +244,7 @@ impl ServiceTaskKind {
             | Self::AutoRules
             | Self::AppDestinationFlush
             | Self::SecondaryExternalAddress
+            | Self::ConnHistoryFlush
             | Self::FakeIpFlowObserver
             | Self::FakeIpSelfHeal
             | Self::FakeIpWatchdog

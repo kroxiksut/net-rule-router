@@ -156,6 +156,9 @@ pub enum NoticeKind {
     /// Some of this user's addresses follow another signed-in user's route;
     /// nothing this user can fix.
     RoutesHeld,
+    /// What this user's rules do not route rides another signed-in user's
+    /// tunnel.
+    TrafficCarried,
 }
 
 impl NoticeKind {
@@ -171,6 +174,7 @@ impl NoticeKind {
             Self::RulesDrift => "rules-drift",
             Self::SecondaryDown => "secondary-down",
             Self::RoutesHeld => "routes-held",
+            Self::TrafficCarried => "traffic-carried",
         }
     }
 
@@ -180,7 +184,7 @@ impl NoticeKind {
         Self::ALL.into_iter().find(|kind| kind.slug() == slug)
     }
 
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::BlockBacklog,
         Self::ExternalAddress,
         Self::RoutingRestored,
@@ -189,6 +193,7 @@ impl NoticeKind {
         Self::RulesDrift,
         Self::SecondaryDown,
         Self::RoutesHeld,
+        Self::TrafficCarried,
     ];
 }
 

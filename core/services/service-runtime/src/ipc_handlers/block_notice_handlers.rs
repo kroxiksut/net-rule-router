@@ -29,7 +29,8 @@ use crate::block_notice_center::BlockNoticeCenter;
 use crate::block_notice_journal_store::BlockNoticeJournalStore;
 use crate::block_notice_mute_store::BlockNoticeMuteStore;
 use crate::ipc::{
-    HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
+    CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext,
+    IpcRequestEnvelope, Prechecked,
 };
 
 /// Resolves the principal a request acts for. Mutes and rules are both
@@ -173,16 +174,31 @@ impl BlockNoticeMutesSetHandler {
     }
 }
 
-impl IpcHandler for BlockNoticeMutesSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let sid = principal(ctx)?;
+impl CheckedIpcHandler for BlockNoticeMutesSetHandler {
+    type Checked = Mute;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        principal(ctx)?;
         let parsed: BlockNoticeMutesSetRequest = serde_json::from_value(request.payload.clone())
             .map_err(|e| malformed("block-notices.mutes.set payload invalid", e))?;
-        let scope = scope_from_dto(parsed.scope)?;
-        let mute = Mute {
-            scope,
+        Ok(Mute {
+            scope: scope_from_dto(parsed.scope)?,
             until_ms: parsed.until_unix_ms,
-        };
+        })
+    }
+
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        let sid = principal(ctx)?;
+        let mute = checked.into_inner();
         self.store.upsert(sid, &mute, now_ms());
         self.center.reload_mutes(sid);
         serialize(
@@ -207,12 +223,28 @@ impl BlockNoticeMutesRemoveHandler {
     }
 }
 
-impl IpcHandler for BlockNoticeMutesRemoveHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let sid = principal(ctx)?;
+impl CheckedIpcHandler for BlockNoticeMutesRemoveHandler {
+    type Checked = MuteScope;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        principal(ctx)?;
         let parsed: BlockNoticeMutesRemoveRequest = serde_json::from_value(request.payload.clone())
             .map_err(|e| malformed("block-notices.mutes.remove payload invalid", e))?;
-        let scope = scope_from_dto(parsed.scope)?;
+        scope_from_dto(parsed.scope)
+    }
+
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        let sid = principal(ctx)?;
+        let scope = checked.into_inner();
         // A scope that was never muted is a no-op, not an error — the caller
         // only ever asks for their own mute to go away.
         let removed = self.store.remove(sid, &scope);
@@ -240,8 +272,23 @@ impl BlockNoticeMutesClearHandler {
     }
 }
 
-impl IpcHandler for BlockNoticeMutesClearHandler {
-    fn handle(&self, _request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for BlockNoticeMutesClearHandler {
+    type Checked = ();
+
+    fn precheck(
+        &self,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<(), IpcError> {
+        principal(ctx).map(|_| ())
+    }
+
+    fn execute(
+        &self,
+        _checked: Prechecked<()>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         let sid = principal(ctx)?;
         self.store.clear(sid);
         self.center.reload_mutes(sid);
@@ -300,12 +347,27 @@ impl BlockNoticeJournalAckHandler {
     }
 }
 
-impl IpcHandler for BlockNoticeJournalAckHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+impl CheckedIpcHandler for BlockNoticeJournalAckHandler {
+    type Checked = BlockNoticeJournalAckRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        principal(ctx)?;
+        serde_json::from_value(request.payload.clone())
+            .map_err(|e| malformed("block-notices.journal.ack payload", e))
+    }
+
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
         let sid = principal(ctx)?;
-        let parsed: BlockNoticeJournalAckRequest = serde_json::from_value(request.payload.clone())
-            .map_err(|e| malformed("block-notices.journal.ack payload", e))?;
-        let acknowledged = self.store.ack_through(sid, parsed.through_id) as u64;
+        let acknowledged = self.store.ack_through(sid, checked.through_id) as u64;
         serialize(
             "block-notices.journal.ack",
             BlockNoticeJournalAckResponse { acknowledged },
@@ -337,9 +399,16 @@ impl BlockNoticeRouteToSecondaryHandler {
     }
 }
 
-impl IpcHandler for BlockNoticeRouteToSecondaryHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let sid = principal(ctx)?;
+impl CheckedIpcHandler for BlockNoticeRouteToSecondaryHandler {
+    /// The destination, trimmed, known to be a hostname.
+    type Checked = String;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        principal(ctx)?;
         let parsed: BlockNoticeRouteToSecondaryRequest =
             serde_json::from_value(request.payload.clone())
                 .map_err(|e| malformed("block-notices.route-to-secondary payload invalid", e))?;
@@ -365,7 +434,17 @@ impl IpcHandler for BlockNoticeRouteToSecondaryHandler {
                 diagnostics_id: None,
             });
         }
+        Ok(destination)
+    }
 
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        let sid = principal(ctx)?;
+        let destination = checked.into_inner();
         let rule_value = destination.clone();
         let rule = AuthoredRule {
             route: RouteRole::Secondary,

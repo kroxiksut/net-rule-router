@@ -417,6 +417,9 @@ pub fn generate_secondary_routes(
         if let Some(app) = rule.app_match.as_ref() {
             let pattern = match &app.pattern {
                 CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.as_str(),
+                // TODO: a path rule is enforced once the platform can list the
+                // programs of a folder; until then it routes nothing.
+                CanonicalAppPattern::Path(_) => continue,
             };
             let destinations = gate.admit(pattern, link);
             if destinations.admitted.is_empty() && destinations.refused.is_empty() {
@@ -560,6 +563,8 @@ pub fn generate_secondary_routes(
                     });
                 }
             }
+            // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
+            Some(CanonicalAddressMatch::AnyZoneDomain(_)) => {}
             None => {
                 // A rule with neither an address nor an app condition has
                 // nothing to route — ignored. (App rules were handled by

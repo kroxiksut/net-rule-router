@@ -40,6 +40,7 @@ impl SecondaryRouteCoordinator {
             last_resolution: Mutex::new(HashMap::new()),
             served_ranks: Mutex::new(super::served::ServedRanks::default()),
             session_cache: Mutex::new(None),
+            sign_in_times: Mutex::new(HashMap::new()),
             signed_in_memory: Mutex::new(super::served::SignedInMemory::new(
                 super::served::DEPARTURE_GRACE,
             )),

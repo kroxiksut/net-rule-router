@@ -21,7 +21,7 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -82,11 +82,24 @@ pub struct LinuxDnsResolver {
     budget: Duration,
     /// Always 53 outside tests, which cannot bind a privileged port.
     port: u16,
-    /// Transaction ids are sequential from a per-process starting point rather
-    /// than random: the id is a check that a datagram answers OUR question, and
-    /// the real defence against a forged answer is that we also compare the
-    /// question and the peer address.
-    next_id: AtomicU16,
+    /// Mixed into every transaction id, so two ids drawn together still differ.
+    queries: AtomicU64,
+}
+
+/// A transaction id an off-path forger has to guess: a sequential one is read
+/// off one reply and the next is known. `RandomState` carries keys the OS
+/// seeded and changes them per instance, so no new dependency is needed.
+fn random_query_id(counter: &AtomicU64) -> u16 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(counter.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    hasher.finish() as u16
 }
 
 impl Default for LinuxDnsResolver {
@@ -103,16 +116,12 @@ impl LinuxDnsResolver {
 
     #[must_use]
     pub fn with_servers(servers: Box<dyn SystemDnsServersPort>) -> Self {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u16)
-            .unwrap_or(1);
         Self {
             servers,
             timeout: QUERY_TIMEOUT,
             budget: RESOLVE_BUDGET,
             port: 53,
-            next_id: AtomicU16::new(seed),
+            queries: AtomicU64::new(0),
         }
     }
 
@@ -158,7 +167,7 @@ impl LinuxDnsResolver {
                 hostname: canonical.to_owned(),
             });
         };
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = random_query_id(&self.queries);
         let query =
             encode_query(id, canonical, family).ok_or_else(|| DnsResolverError::InvalidName {
                 name: canonical.to_owned(),
@@ -199,11 +208,29 @@ impl LinuxDnsResolver {
             .map_err(|e| net_error(e, canonical))?;
         socket.send(query).map_err(|e| net_error(e, canonical))?;
 
+        // A datagram that answers somebody else's question — a late reply, or
+        // a forgery racing the server — is skipped, not taken as the answer
+        // nor as the failure of this one.
+        let until = Instant::now() + wait;
         let mut buffer = [0u8; MAX_DATAGRAM];
-        let read = socket
-            .recv(&mut buffer)
-            .map_err(|e| timeout_or_net(e, canonical))?;
-        interpret(&buffer[..read], id, canonical, family)
+        loop {
+            let read = socket
+                .recv(&mut buffer)
+                .map_err(|e| timeout_or_net(e, canonical))?;
+            let reply = &buffer[..read];
+            if !answers_another_question(reply, id, canonical, family) {
+                return interpret(reply, id, canonical, family);
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(UdpFailure::Failed(DnsResolverError::Timeout {
+                    hostname: canonical.to_owned(),
+                }));
+            }
+            socket
+                .set_read_timeout(Some(left))
+                .map_err(|e| net_error(e, canonical))?;
+        }
     }
 
     fn ask_tcp(
@@ -300,6 +327,17 @@ fn interpret(
             code: decode_code(&other),
         })),
     }
+}
+
+/// Whether `reply` is not about our query at all: another id, another
+/// question, or not a response.
+fn answers_another_question(reply: &[u8], id: u16, canonical: &str, family: AddressFamily) -> bool {
+    matches!(
+        decode_response(reply, id, canonical, family),
+        Err(DnsDecodeError::WrongTransaction { .. }
+            | DnsDecodeError::WrongQuestion { .. }
+            | DnsDecodeError::NotAResponse)
+    )
 }
 
 /// A stable number per decode failure, so a log or a report can tell them apart
@@ -680,6 +718,60 @@ options edns0
         answering.join().expect("the answering thread finishes");
 
         assert!(reports.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+    }
+
+    /// The query echoed back as a response carrying one `A` record.
+    fn answer_to(query: &[u8], id: u16, ip: [u8; 4]) -> Vec<u8> {
+        let mut reply = query.to_vec();
+        reply[0..2].copy_from_slice(&id.to_be_bytes());
+        reply[2] |= 0x80;
+        reply[6..8].copy_from_slice(&1u16.to_be_bytes());
+        reply.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+        reply.extend_from_slice(&ip);
+        reply
+    }
+
+    /// A forged reply that races the server is neither believed nor taken as
+    /// the server's failure: the real answer that follows it is the one used.
+    #[test]
+    fn a_forged_reply_ahead_of_the_real_one_is_skipped() {
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener");
+        let port = listener.local_addr().expect("a bound address").port();
+        let answering = std::thread::spawn(move || {
+            let mut buffer = [0u8; MAX_DATAGRAM];
+            let (read, peer) = listener.recv_from(&mut buffer).expect("one query");
+            let query = &buffer[..read];
+            let id = u16::from_be_bytes([query[0], query[1]]);
+            let forged = answer_to(query, id ^ 0x5A5A, [203, 0, 113, 66]);
+            let real = answer_to(query, id, [192, 0, 2, 10]);
+            listener
+                .send_to(&forged, peer)
+                .expect("the forgery is sent");
+            listener.send_to(&real, peer).expect("the answer is sent");
+        });
+        let (resolver, _) = reporting_resolver(&[Ipv4Addr::LOCALHOST], port);
+
+        let record = resolver
+            .resolve("example.com", AddressFamily::Ipv4)
+            .expect("the real answer arrives after the forgery");
+        answering.join().expect("the answering thread finishes");
+
+        assert_eq!(
+            record.addresses,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]
+        );
+    }
+
+    /// Ids drawn back to back are not a counter an observer can extrapolate.
+    #[test]
+    fn query_ids_are_not_sequential() {
+        let counter = AtomicU64::new(0);
+        let ids: Vec<u16> = (0..64).map(|_| random_query_id(&counter)).collect();
+        let sequential = ids
+            .windows(2)
+            .filter(|w| w[1] == w[0].wrapping_add(1))
+            .count();
+        assert!(sequential < 4, "ids look sequential: {ids:?}");
     }
 
     #[test]

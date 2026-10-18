@@ -4,6 +4,7 @@
 use nrr_client_logic::adapters::{bound_row_index, display_name};
 use nrr_client_logic::placeholders::list_summary;
 use nrr_client_logic::Route;
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc_payloads::{InterfaceRowDto, RouteBindingDto};
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -12,8 +13,9 @@ use super::Screen;
 use crate::i18n::{Key, Texts};
 use crate::keys;
 use crate::link::{admin_command, Link};
+use crate::primary_suggestion;
 use crate::restore;
-use crate::state::{enforcement_text, AppState, NoticeLevel, RoutingState};
+use crate::state::{enforcement_text, traffic_carried_text, AppState, NoticeLevel, RoutingState};
 use crate::view::{Panel, ScreenView, Segment, StateTone, ViewLine};
 use crate::vpn_trust;
 
@@ -44,17 +46,27 @@ impl Screen for StatusScreen {
     }
 
     fn help(&self) -> &'static [Key] {
-        &[keys::HELP_STATUS_FEED, restore::HELP, vpn_trust::HELP]
+        &[
+            keys::HELP_STATUS_FEED,
+            restore::HELP,
+            vpn_trust::HELP,
+            primary_suggestion::HELP,
+        ]
     }
 
     fn plain_help(&self) -> &'static [Key] {
-        &[restore::PLAIN_HELP, vpn_trust::HELP]
+        &[
+            restore::PLAIN_HELP,
+            vpn_trust::HELP,
+            primary_suggestion::HELP,
+        ]
     }
 
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('r') => restore::restore(app),
             KeyCode::Char('t') => vpn_trust::trust_pending(app),
+            KeyCode::Char('p') => primary_suggestion::confirm(app),
             _ => false,
         }
     }
@@ -63,6 +75,7 @@ impl Screen for StatusScreen {
         match line {
             "r" => restore::restore(app),
             "t" => vpn_trust::trust_pending(app),
+            "p" => primary_suggestion::confirm(app),
             _ => false,
         }
     }
@@ -210,9 +223,27 @@ fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     if app.restore.offer.is_some() {
         lines.push(ViewLine::text(texts.get(restore::OFFER_LINE)));
     }
+    lines.extend(traffic_carried_lines(app, texts));
     lines.extend(unresolved_app_lines(app, texts));
     lines.extend(pending_vpn_client_lines(app, texts));
     lines
+}
+
+/// Another signed-in user's tunnel carrying this user's traffic: standing
+/// while it lasts, so it sits with the state as well as in the feed.
+fn traffic_carried_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
+    let Some(link) = app
+        .traffic_carried
+        .as_ref()
+        .filter(|_| app.link.is_connected())
+    else {
+        return Vec::new();
+    };
+    let (title, body) = traffic_carried_text(link, texts);
+    vec![
+        ViewLine::new(vec![Segment::state(title, StateTone::Caution)]),
+        ViewLine::text(body),
+    ]
 }
 
 /// VPN-named programs leak protection does not trust by place: standing,
@@ -242,7 +273,8 @@ fn unresolved_app_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     if apps.is_empty() {
         return Vec::new();
     }
-    let summary = list_summary(apps, &texts.get(keys::APP_UNRESOLVED_MORE));
+    let shown: Vec<String> = apps.iter().map(|a| display_text(a).into()).collect();
+    let summary = list_summary(&shown, &texts.get(keys::APP_UNRESOLVED_MORE));
     vec![
         ViewLine::new(vec![Segment::state(
             texts.get(keys::APP_UNRESOLVED_TITLE),
@@ -254,7 +286,9 @@ fn unresolved_app_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
 
 fn role_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     let Some(snapshot) = &app.snapshot else {
-        return vec![ViewLine::text(texts.get(keys::NO_DATA))];
+        return vec![ViewLine::new(vec![Segment::muted(
+            texts.get(keys::NO_DATA),
+        )])];
     };
     let policy = snapshot.route_policy.as_ref();
     let rows = &snapshot.adapters.rows;
@@ -267,7 +301,10 @@ fn role_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
                 policy.and_then(|p| p.secondary.as_ref()),
             ),
         };
-        let mut segments = vec![Segment::strong(format!("{}: ", texts.get(label)))];
+        let mut segments = vec![
+            Segment::route(texts.get(label), route),
+            Segment::plain(": "),
+        ];
         let Some(binding) = binding else {
             segments.push(Segment::state(
                 texts.get(keys::NOT_SELECTED),
@@ -277,10 +314,10 @@ fn role_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             continue;
         };
         let row = bound_row(rows, binding);
-        segments.push(Segment::plain(
-            row.map(display_name)
-                .unwrap_or_else(|| binding.display_name.clone()),
-        ));
+        segments
+            .push(Segment::plain(row.map(display_name).unwrap_or_else(|| {
+                display_text(&binding.display_name).into_owned()
+            })));
         segments.push(Segment::plain(" — "));
         segments.push(availability(row, texts));
         segments.push(Segment::plain(" — "));
@@ -338,7 +375,9 @@ fn rules_state(app: &AppState, reported_down: bool, texts: &Texts) -> Segment {
 /// until the program ends: nothing here disappears on a timer.
 fn notice_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     if app.notices.is_empty() {
-        return vec![ViewLine::text(texts.get(keys::NOTICES_EMPTY))];
+        return vec![ViewLine::new(vec![Segment::muted(
+            texts.get(keys::NOTICES_EMPTY),
+        )])];
     }
     let mut lines = Vec::new();
     for notice in app.notices.iter().rev() {
@@ -428,5 +467,35 @@ mod tests {
 
         app.link = Link::Offline;
         assert!(!shown(&app).iter().any(|l| l.contains("Is this your VPN?")));
+    }
+
+    /// Another user's tunnel carrying this user's traffic stands under the
+    /// state, naming the connection; nothing while it does not, or offline.
+    #[test]
+    fn traffic_carried_by_another_users_tunnel_stands_under_the_state() {
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        let title = "Your traffic goes through another user's tunnel";
+        assert!(!shown(&app).iter().any(|l| l == title));
+
+        app.traffic_carried = Some("Office\u{202E}Tunnel".into());
+        let lines = shown(&app);
+        assert!(lines.iter().any(|l| l == title), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("through the tunnel \"Office\u{b7}Tunnel\".")),
+            "the name is shown through display_text: {lines:?}"
+        );
+
+        app.traffic_carried = Some(String::new());
+        assert!(
+            shown(&app)
+                .iter()
+                .any(|l| l.contains("through their tunnel.")),
+            "no name: the wording that does without one"
+        );
+
+        app.link = Link::Offline;
+        assert!(!shown(&app).iter().any(|l| l == title));
     }
 }

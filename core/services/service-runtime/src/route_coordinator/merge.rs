@@ -9,6 +9,11 @@
 //! still pin the destination to their link: a route they lose is blocked for
 //! them, not sent the other way.
 //!
+//! "Everything through my tunnel" is a claim on every other user's unnamed
+//! traffic too, so a later user's tunnel overlay stays out while an earlier
+//! user has no overlay of their own; an earlier user's overlay that carries a
+//! later user's traffic is named in [`MergedRoutes::default_carried_by`].
+//!
 //! Pure: no I/O, so every rule here is tested without a route table.
 
 use std::collections::HashMap;
@@ -37,6 +42,16 @@ pub(crate) struct MergedRoutes {
     pub contributed: HashMap<String, Vec<RouteEntry>>,
     pub conflicts: Vec<RouteConflict>,
     pub view: MergedRouteView,
+    /// `(user, holder)`: a user with no overlay in the table — none asked, or
+    /// theirs stayed out — whose unnamed traffic leaves through the holder's
+    /// tunnel, because the holder was served first.
+    pub default_carried_by: Vec<(String, String)>,
+}
+
+/// An overlay that sends everything through the user's tunnel (mode B), as
+/// opposed to the counter-overlay that brings it back to the main link.
+fn is_tunnel_overlay(route: &RouteEntry) -> bool {
+    is_overlay_route(route) && route.prefix_length == crate::route_codegen::OVERLAY_LOW.1
 }
 
 struct Accepted<'a> {
@@ -77,14 +92,33 @@ pub(crate) fn merge_user_routes(plans: &[(String, Vec<RouteEntry>)]) -> MergedRo
     // destination other than their own.
     let mut wide: Vec<usize> = Vec::new();
     let mut accepted: Vec<Accepted<'_>> = Vec::new();
+    // The first served user whose unnamed traffic follows the main link, and
+    // the first whose tunnel overlay went in.
+    let mut default_on_main: Option<&str> = None;
+    let mut tunnel_default: Option<&str> = None;
     for (sid, routes) in plans {
         let mine = out.contributed.entry(sid.clone()).or_default();
+        let has_overlay = routes.iter().any(is_overlay_route);
+        let carrier = tunnel_default.filter(|h| *h != sid.as_str());
+        let mut overlay_in = false;
         for route in routes {
             let overlay = is_overlay_route(route);
+            if is_tunnel_overlay(route) {
+                if let Some(holder) = default_on_main.filter(|h| *h != sid.as_str()) {
+                    out.conflicts.push(RouteConflict {
+                        sid: sid.clone(),
+                        holder: holder.to_string(),
+                        destination: route.destination,
+                        prefix_length: route.prefix_length,
+                    });
+                    continue;
+                }
+            }
             let key = (route.destination, route.prefix_length);
             if let Some(&at) = exact.get(&key) {
                 let held = &accepted[at];
                 if held.route.interface_index == route.interface_index {
+                    overlay_in |= overlay;
                     mine.push(route.clone());
                 } else if held.owner != sid {
                     out.conflicts.push(RouteConflict {
@@ -125,10 +159,24 @@ pub(crate) fn merge_user_routes(plans: &[(String, Vec<RouteEntry>)]) -> MergedRo
                 block,
                 overlay,
             });
+            if is_tunnel_overlay(route) {
+                tunnel_default.get_or_insert(sid);
+            }
+            overlay_in |= overlay;
             mine.push(route.clone());
             out.routes.push(route.clone());
         }
+        // No overlay of theirs in the table: their unnamed traffic follows
+        // the holder's.
+        if let (false, Some(holder)) = (overlay_in, carrier) {
+            out.default_carried_by
+                .push((sid.clone(), holder.to_string()));
+        }
+        if !has_overlay {
+            default_on_main.get_or_insert(sid);
+        }
     }
+    out.view.carried = out.default_carried_by.clone();
     out
 }
 
@@ -137,6 +185,8 @@ pub(crate) fn merge_user_routes(plans: &[(String, Vec<RouteEntry>)]) -> MergedRo
 /// Overlays are left out: they are nobody's named destination.
 #[derive(Debug, Default)]
 pub(crate) struct MergedRouteView {
+    /// See [`MergedRoutes::default_carried_by`].
+    carried: Vec<(String, String)>,
     hosts: HashMap<IpAddr, (String, u32)>,
     networks: Vec<(IpBlock, String, u32)>,
     /// Each served user's own additional link, as the merge saw it.
@@ -154,6 +204,14 @@ impl MergedRouteView {
         } else if !self.networks.iter().any(|(b, _, _)| *b == block) {
             self.networks.push((block, sid.to_string(), link));
         }
+    }
+
+    /// Whose tunnel carries `sid`'s unnamed traffic, when another user's does.
+    pub(crate) fn default_carried_by(&self, sid: &str) -> Option<&str> {
+        self.carried
+            .iter()
+            .find(|(user, _)| user == sid)
+            .map(|(_, holder)| holder.as_str())
     }
 
     pub(crate) fn set_link(&mut self, sid: &str, link: Option<u32>) {
@@ -298,6 +356,67 @@ mod tests {
             vec![overlay(0, 9), overlay(128, 9), host(2, 11)]
         );
         assert_eq!(merged.conflicts.len(), 1);
+    }
+
+    /// A user with ordinary internet came first: the later user's "everything
+    /// through my tunnel" stays out, so the first user's traffic is not
+    /// carried through somebody else's tunnel.
+    #[test]
+    fn a_later_users_tunnel_overlay_never_takes_an_earlier_users_plain_default() {
+        let merged = merge_user_routes(&plans(
+            vec![host(1, 9)],
+            vec![overlay(0, 11), overlay(128, 11), host(2, 11)],
+        ));
+        assert_eq!(merged.routes, vec![host(1, 9), host(2, 11)]);
+        assert_eq!(merged.conflicts.len(), 2, "{:?}", merged.conflicts);
+        assert!(merged.conflicts.iter().all(|c| c.sid == B && c.holder == A));
+        assert!(merged.default_carried_by.is_empty());
+    }
+
+    /// The tunnel user came first and keeps their overlay; the later user's
+    /// traffic rides it, and that is named so they can be told.
+    #[test]
+    fn an_earlier_users_tunnel_overlay_carrying_a_later_user_is_named() {
+        let merged = merge_user_routes(&plans(
+            vec![overlay(0, 9), overlay(128, 9)],
+            vec![host(2, 11)],
+        ));
+        assert_eq!(
+            merged.default_carried_by,
+            vec![(B.to_string(), A.to_string())]
+        );
+    }
+
+    /// The later user's own overlay stayed out — their tunnel through another
+    /// link, or a counter-overlay back to the main one — so the earlier user's
+    /// tunnel carries their traffic all the same.
+    #[test]
+    fn a_later_user_whose_overlay_stayed_out_is_named_as_carried() {
+        let counter = route(
+            [0, 0, 0, 0],
+            2,
+            3,
+            crate::route_codegen::SECONDARY_ROUTE_METRIC,
+        );
+        for later in [vec![overlay(0, 11), overlay(128, 11)], vec![counter]] {
+            let merged = merge_user_routes(&plans(vec![overlay(0, 9), overlay(128, 9)], later));
+            assert_eq!(
+                merged.default_carried_by,
+                vec![(B.to_string(), A.to_string())]
+            );
+        }
+    }
+
+    /// Both send everything through the same tunnel: it is the later user's
+    /// own choice of link, not somebody else's.
+    #[test]
+    fn a_shared_tunnel_overlay_is_not_carried_by_another_user() {
+        let merged = merge_user_routes(&plans(
+            vec![overlay(0, 9), overlay(128, 9)],
+            vec![overlay(0, 9), overlay(128, 9)],
+        ));
+        assert!(merged.default_carried_by.is_empty());
+        assert!(merged.conflicts.is_empty());
     }
 
     #[test]

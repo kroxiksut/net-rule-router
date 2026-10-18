@@ -18,6 +18,8 @@ use crate::testing::{app_at, missing_from_locales, texts_en, FakeService, Fixtur
 fn every_key_is_in_both_locale_files() {
     let missing = missing_from_locales(text::ALL);
     assert!(missing.is_empty(), "{missing:?}");
+    let missing = missing_from_locales(&text::file_hint_keys());
+    assert!(missing.is_empty(), "{missing:?}");
 }
 
 /// Under `sudo` the screen writes the administrator's baseline and says so;
@@ -29,6 +31,7 @@ fn under_root_the_rules_go_to_the_baseline_and_the_title_says_so() {
         content_hash: "h".into(),
         correlation_id: "c".into(),
         admin_baseline,
+        base_revision: None,
     };
     for baseline in [true, false] {
         let fake = FakeService::new(ConnectionStatus::Connected);
@@ -54,6 +57,49 @@ fn under_root_the_rules_go_to_the_baseline_and_the_title_says_so() {
     app.rules.baseline = true;
     let view = super::render::view(&app, &texts);
     assert_eq!(view.title, texts.get(text::TITLE_BASELINE));
+}
+
+/// The set the screen shows is the set every writer of the terminal writes:
+/// `b` switches between the caller's own rules and the baseline, the list is
+/// read from the one chosen, and a writer of the caller's own rules is refused
+/// while the baseline is on screen.
+#[test]
+fn the_book_on_screen_is_the_book_written_and_b_switches_it() {
+    let fake = service(vec![rule("r1", "domain", "example.com", "secondary")]);
+    let mut app = on_rules(&fake);
+    let baseline_asked = |fake: &FakeService| {
+        fake.sent(IpcOperationName::RulesList)
+            .last()
+            .and_then(|sent| sent.get("baseline"))
+            .and_then(Value::as_bool)
+    };
+    assert_eq!(baseline_asked(&fake), Some(false));
+
+    answer(&mut app, &["b"]);
+    assert!(app.rules.baseline);
+    drain(&mut app, &fake);
+    assert_eq!(baseline_asked(&fake), Some(true));
+    let texts = texts_en();
+    assert_eq!(
+        super::render::view(&app, &texts).title,
+        texts.get(text::TITLE_BASELINE)
+    );
+    assert!(!super::own_rules_on_screen(&mut app));
+
+    answer(&mut app, &["t 1"]);
+    answer(&mut app, &["b"]);
+    assert!(
+        app.rules.baseline,
+        "edits made in the baseline stay with it"
+    );
+
+    // As after an apply: nothing on screen is the baseline's alone any more.
+    app.rules.table.mark_applied();
+    answer(&mut app, &["b"]);
+    assert!(!app.rules.baseline);
+    drain(&mut app, &fake);
+    assert_eq!(baseline_asked(&fake), Some(false));
+    assert!(super::own_rules_on_screen(&mut app));
 }
 
 fn rule(id: &str, rule_type: &str, value: &str, route: &str) -> Value {
@@ -1127,5 +1173,305 @@ mod gateway {
         let row = app.rules.table.rows.last().expect("a rule was added");
         assert_eq!(row.rule.match_value, "198.51.100.7");
         assert_eq!(row.rule.target_route, TargetRoute::Secondary);
+    }
+}
+
+mod several_rules {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn note(app: &AppState) -> String {
+        app.rules
+            .note
+            .as_ref()
+            .map(|note| note.text(&texts_en()))
+            .unwrap_or_default()
+    }
+
+    fn press(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
+        screen(ScreenId::Rules).on_key(app, KeyEvent::new(code, modifiers));
+    }
+
+    /// The planner holds a comment to the length an import accepts.
+    #[test]
+    fn the_comment_bound_is_the_import_bound() {
+        assert_eq!(
+            nrr_client_logic::bulk_rules::COMMENT_MAX_CHARS,
+            nrr_domain::preset_validation::MAX_INLINE_COMMENT_CHARS
+        );
+    }
+
+    /// A pasted list goes into the list on screen in one step: new rules
+    /// added, a rule found on another route moved only once asked, and a line
+    /// that is no rule kept in the form. The service hears of none of it until
+    /// the one apply.
+    #[test]
+    fn several_rules_go_in_at_once_and_the_rest_stays_in_the_form() {
+        let fake = service(vec![rule("1", "domain", "moved.example", "primary")]);
+        let mut app = on_rules(&fake);
+        answer(
+            &mut app,
+            &[
+                "A",
+                "2",
+                "one.example",
+                "!ads.example.net  # ads",
+                "moved.example",
+                "not a rule",
+                "",
+            ],
+        );
+        let Mode::Bulk(form) = &app.rules.mode else {
+            panic!("the several-rules form is open");
+        };
+        assert_eq!(
+            form.plan
+                .count(nrr_client_logic::bulk_rules::RowAction::Move),
+            0
+        );
+        // Line 3 stands on Primary; it moves only when asked.
+        answer(&mut app, &["m 3", "y"]);
+
+        let rows: Vec<(String, TargetRoute)> = app
+            .rules
+            .table
+            .rules()
+            .map(|r| (r.match_value.clone(), r.target_route.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("moved.example".to_owned(), TargetRoute::Secondary),
+                ("one.example".to_owned(), TargetRoute::Secondary),
+                ("ads.example.net".to_owned(), TargetRoute::Block),
+            ]
+        );
+        assert_eq!(
+            app.rules.table.rules().nth(2).map(|r| r.comment.as_str()),
+            Some("ads")
+        );
+        assert!(app.rules.table.is_dirty(), "applied only by the one apply");
+        let Mode::Bulk(form) = &app.rules.mode else {
+            panic!("the form stays up with what was not taken");
+        };
+        assert_eq!(form.text, "not a rule");
+        let said = note(&app);
+        assert!(said.contains("Rules added: 2."), "{said}");
+        assert!(said.contains("Moved to the chosen route: 1."), "{said}");
+        assert!(said.contains("Left in the form to fix: 1."), "{said}");
+    }
+
+    /// One word asks for its type on its own row, and is added as that type.
+    #[test]
+    fn one_word_takes_the_type_the_user_picks() {
+        let fake = service(Vec::new());
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["A", "", "corp-internal", ""]);
+        let Mode::Bulk(form) = &app.rules.mode else {
+            panic!("the several-rules form is open");
+        };
+        assert_eq!(
+            form.plan
+                .count(nrr_client_logic::bulk_rules::RowAction::Add),
+            0
+        );
+        answer(&mut app, &["t 1 1", "y"]);
+        let added = app.rules.table.rules().next().expect("added");
+        assert_eq!(added.rule_type, RuleType::Zone);
+        assert_eq!(added.match_value, "corp-internal");
+        assert!(matches!(app.rules.mode, Mode::List), "nothing left to fix");
+    }
+
+    /// The one-rule form offers the type its value is; it changes on the
+    /// user's key only, in line mode and full-screen alike.
+    #[test]
+    fn the_form_switches_to_the_type_the_value_is() {
+        let fake = service(Vec::new());
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["a", "", "192.0.2.7"]);
+        let Mode::Form(form) = &app.rules.mode else {
+            panic!("the form is open");
+        };
+        assert_eq!(form.rule_type, RuleType::Domain, "nothing moves on its own");
+        assert!(screen_text(&app, ScreenId::Rules).contains("!t in line mode"));
+        answer(&mut app, &["!t"]);
+        let Mode::Form(form) = &app.rules.mode else {
+            panic!("the form is open");
+        };
+        assert_eq!(form.rule_type, RuleType::ExactIp);
+
+        let mut app = on_rules(&fake);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        for c in "192.0.2.8".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let Mode::Form(form) = &app.rules.mode else {
+            panic!("the form is open");
+        };
+        assert_eq!(form.rule_type, RuleType::ExactIp);
+    }
+
+    /// Line mode moves a rule to the type its value is, one or all, as Shift+T
+    /// and Shift+M do.
+    #[test]
+    fn line_mode_moves_a_rule_to_its_type() {
+        let fake = service(vec![
+            rule("1", "domain", "192.0.2.7", "primary"),
+            rule("2", "domain", "198.51.100.0/24", "primary"),
+        ]);
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["T 1"]);
+        let types: Vec<RuleType> = app
+            .rules
+            .table
+            .rules()
+            .map(|r| r.rule_type.clone())
+            .collect();
+        assert_eq!(types, vec![RuleType::ExactIp, RuleType::Domain]);
+        answer(&mut app, &["M"]);
+        assert_eq!(
+            app.rules.table.rules().nth(1).map(|r| r.rule_type.clone()),
+            Some(RuleType::Subnet)
+        );
+    }
+
+    /// F2 takes the one-rule form's route and value into "several rules".
+    #[test]
+    fn f2_carries_the_form_into_several_rules() {
+        let fake = service(Vec::new());
+        let mut app = on_rules(&fake);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        for c in "one.example".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        let Mode::Bulk(form) = &app.rules.mode else {
+            panic!("the several-rules form is open");
+        };
+        assert_eq!(form.text, "one.example");
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(app.rules.table.rows.len(), 1);
+    }
+}
+
+/// `R`: «Recent», the window's filter of the same name.
+mod recent {
+    use super::*;
+
+    fn with_recent(rows: Vec<Value>, changes: Value) -> FakeService {
+        let fake = service(rows);
+        fake.answer(IpcOperationName::RulesRecentChangesList, changes);
+        fake
+    }
+
+    fn entry(value: &str, route: &str) -> Value {
+        rule("", "domain", value, route)
+    }
+
+    fn changes() -> Value {
+        let now = chrono::Utc::now().timestamp();
+        json!({
+            "changes": [
+                { "kind": "added", "at": now - 60, "rule": entry("new.example", "secondary") },
+                {
+                    "kind": "changed",
+                    "at": now - 120,
+                    "rule": entry("moved.example", "secondary"),
+                    "previous": { "target-route": "primary", "enabled": true }
+                },
+                { "kind": "deleted", "at": now - 180, "rule": entry("gone.example", "primary") },
+                { "kind": "replaced", "at": now - 240, "count": 7, "members": [entry("a.example", "primary")] }
+            ],
+            "history-starts-at": now - 3000
+        })
+    }
+
+    #[test]
+    fn the_rules_changed_lately_show_newest_first_with_what_they_were() {
+        let fake = with_recent(
+            vec![
+                rule("r1", "domain", "old.example", "primary"),
+                rule("r2", "domain", "moved.example", "secondary"),
+                rule("r3", "domain", "new.example", "secondary"),
+            ],
+            changes(),
+        );
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["R", "3"]);
+        drain(&mut app, &fake);
+
+        let sent = fake.sent(IpcOperationName::RulesRecentChangesList);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0]["since"].as_i64().is_some(), "{sent:?}");
+
+        let visible: Vec<String> = app
+            .rules
+            .table
+            .visible()
+            .into_iter()
+            .map(|i| app.rules.table.rows[i].rule.match_value.clone())
+            .collect();
+        assert_eq!(visible, ["new.example", "moved.example"]);
+
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("Recent: Today"), "{shown}");
+        assert!(
+            shown.contains("new.example — Additional · added"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("moved.example — Additional · changed"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("Rule set replaced, rules in it: 7"),
+            "{shown}"
+        );
+        assert!(shown.contains("Deleted"), "{shown}");
+        assert!(
+            shown.contains("U1. Domain  gone.example — Primary, deleted"),
+            "{shown}"
+        );
+        assert!(shown.contains("History is kept from"), "{shown}");
+
+        // Off again: every rule is back.
+        answer(&mut app, &["R", "1"]);
+        assert_eq!(app.rules.table.visible().len(), 3);
+    }
+
+    #[test]
+    fn a_deleted_rule_goes_back_as_it_was_and_only_once() {
+        let fake = with_recent(
+            vec![rule("r1", "domain", "old.example", "primary")],
+            changes(),
+        );
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["R", "3"]);
+        drain(&mut app, &fake);
+
+        answer(&mut app, &["U 1"]);
+        let row = app.rules.table.rows.last().expect("put back");
+        assert_eq!(row.rule.match_value, "gone.example");
+        assert_eq!(row.rule.target_route, TargetRoute::Primary);
+        assert!(row.rule.enabled);
+        assert!(app.rules.table.is_dirty(), "s applies it like any edit");
+        let count = app.rules.table.rows.len();
+
+        // It is in the list now: a second time adds nothing.
+        answer(&mut app, &["U 1"]);
+        assert_eq!(app.rules.table.rows.len(), count);
+    }
+
+    #[test]
+    fn nothing_is_asked_while_recent_is_off() {
+        let fake = with_recent(
+            vec![rule("r1", "domain", "old.example", "primary")],
+            changes(),
+        );
+        let _app = on_rules(&fake);
+        assert!(fake
+            .sent(IpcOperationName::RulesRecentChangesList)
+            .is_empty());
     }
 }

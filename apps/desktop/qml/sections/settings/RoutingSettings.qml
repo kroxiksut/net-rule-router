@@ -343,7 +343,7 @@ ColumnLayout {
 
     function localNetworkSubtitle(entry) {
         var kind = String((entry || {}).kind || "")
-        var adapter = String((entry || {}).adapter || "")
+        var adapter = Pure.displayText((entry || {}).adapter)
         if (kind === "manual") {
             return root.tr("settings.routing.local-networks.kind-manual", "added by you")
         }
@@ -1434,13 +1434,13 @@ ColumnLayout {
         var apps = panel._focusContext.apps || []
         return root.tr("settings.routing.focus.blocked", "Just blocked: {apps}.")
             .replace("{apps}", apps.length > 0
-                ? apps.join(", ")
+                ? Pure.displayTextList(apps).join(", ")
                 : root.tr("notifications.block-notice.app-unknown", "unknown app"))
     }
     function _focusDetails() {
         var addresses = panel._focusContext.addresses || []
         if (addresses.length === 0) return ""
-        var list = addresses.join(", ")
+        var list = Pure.displayTextList(addresses).join(", ")
         var more = Number(panel._focusContext.more || 0)
         if (more > 0) {
             list += ", " + root.tr("notifications.block-notice.backlog.more", "and {count} more")
@@ -1844,7 +1844,7 @@ ColumnLayout {
         if (p === "") return ""
         var i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"))
         var b = i >= 0 ? p.substring(i + 1) : p
-        return b.replace(/\.exe$/i, "")
+        return Pure.displayText(b.replace(/\.exe$/i, ""))
     }
 
     // Dedicated "Your VPN client" group. Moved out of the leak-
@@ -1884,6 +1884,7 @@ ColumnLayout {
                     Layout.preferredWidth: 0
                     color: root.textColor
                     wrapMode: Text.WordWrap
+                    textFormat: Text.PlainText
                     text: vpnClientGroup.vpnName !== ""
                         ? root.tr("settings.routing.vpn-client.current", "Current: {name}")
                             .replace("{name}", vpnClientGroup.vpnName)
@@ -2905,7 +2906,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.kill-switch.block-all-note",
-                    "Most aggressive: while the additional adapter is down, only your explicitly primary-routed sites keep working — everything else, including ping, is blocked. This is what stops routed sites (and ICMP) from leaking to the primary link. Requires leak protection to be on.")
+                    "Most aggressive: while the additional adapter is down, only your explicitly primary-routed sites keep working — everything else, including ping, is blocked. This is what stops routed sites (and ICMP) from leaking to the primary link. Requires leak protection to be on. On Windows, IPv6, ping and VPN protocols such as IPsec are then held back for every user of this computer.")
             }
             // Prominent alert when the strict
             // catch-all is CHOSEN: it cuts the user's real internet when the
@@ -3537,6 +3538,7 @@ ColumnLayout {
                     Label {
                         Layout.fillWidth: true
                         elide: Text.ElideRight
+                        textFormat: Text.PlainText
                         color: root.mutedTextColor
                         text: parent.reasonText === ""
                             ? panel.localNetworkSubtitle(modelData)

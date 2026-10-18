@@ -162,6 +162,7 @@ QtObject {
 
         var dups = (decisions && decisions.duplicates) || {}
         var reclass = (decisions && decisions.reclassify) || {}
+        var refiled = []
 
         // Apply duplicate decisions to passthrough first.
         var routes = ["primary", "secondary"]
@@ -215,73 +216,57 @@ QtObject {
                 } else if (ch === "skip") {
                     // Drop entirely.
                 } else {
-                    // Reclassify to a known type: convert lines to
-                    // rules and append to parsedRowsByRoute.
-                    var rules = ctx.parsedRowsByRoute[route] || []
-                    var converted = _reclassifyPassthroughBlock(blk, ch, route, rules.length + 1)
-                    ctx.parsedRowsByRoute[route] = rules.concat(converted)
+                    // Reclassify to a known type: its lines become rules of
+                    // that type, appended to parsedRowsByRoute below.
+                    refiled.push({ route: route, block: blk, target: ch })
                 }
             }
             ctx.passthroughByRoute[route] = filteredBlocks
         }
 
-        ctx.applyAndPersist()
+        _reclassifyPassthroughBlocks(ctx, refiled, 0)
     }
 
-    /// Convert each non-blank, non-comment line of a passthrough
-    /// block's raw_text into a ParsedRule of the given target type.
-    /// Caller is responsible for assigning final R-NNNN ids; we
-    /// emit rows in the same shape `_buildRulesModelRowsFromParseResult`
-    /// uses (matchValue passed through `_unicodeDecodeHost` for
-    /// hostlike types). Lines we can't make sense of in isolation
-    /// are still emitted — the snapshot-side validator will mark
-    /// them as invalid in the rules table.
-    function _reclassifyPassthroughBlock(block, targetSlug, targetRoute, startId) {
-        var raw = String(block["raw-text"] || "")
-        var lines = raw.split("\n")
-        var rows = []
-        var nextId = Math.max(1, parseInt(startId || 1))
-        // Map the reclassify dropdown's value to the parser's
-        // rule-type slug (the dropdown names sections, the parser types).
-        var ruleType = (targetSlug === "ip") ? "exact-ip"
-                     : (targetSlug === "cidr") ? "subnet"
-                     : (targetSlug === "ranges") ? "ip-range"
-                     : (targetSlug === "windows") ? "application"
-                     : (targetSlug === "zones") ? "zone"
-                     : (targetSlug === "domains") ? "domain"
-                     : ""
-        if (ruleType === "") return rows
-        for (var i = 0; i < lines.length; i += 1) {
-            var raw_line = lines[i].replace(/\s+$/, "")
-            if (raw_line === "") continue
-            // Skip comment lines — there's no rule there.
-            if (raw_line.charAt(0) === "#") continue
-            // Inline comment split.
-            var hash = raw_line.indexOf("#")
-            var matchValue = raw_line
-            var comment = ""
-            if (hash >= 0) {
-                matchValue = raw_line.substring(0, hash)
-                comment = raw_line.substring(hash + 1)
-            }
-            matchValue = matchValue.replace(/^\s+|\s+$/g, "")
-            comment = comment.replace(/^\s+|\s+$/g, "")
-            if (matchValue === "") continue
-            var displayValue = Rules.isHostlikeRuleType(ruleType)
-                ? root._unicodeDecodeHost(matchValue)
-                : matchValue
-            rows.push({
-                id: "R-" + ("0000" + String(nextId)).slice(-4),
-                enabled: true,
-                ruleType: ruleType,
-                ruleTypeTitle: root.ruleTypeLabel(ruleType),
-                matchValue: displayValue,
-                targetRoute: String(targetRoute),
-                comment: comment
-            })
-            nextId += 1
+    // Re-file the blocks the user re-classified one after another, so the row
+    // ids of one route follow on, then apply.
+    function _reclassifyPassthroughBlocks(ctx, refiled, at) {
+        if (at >= refiled.length) {
+            ctx.applyAndPersist()
+            return
         }
-        return rows
+        var item = refiled[at]
+        var startId = (ctx.parsedRowsByRoute[item.route] || []).length + 1
+        _reclassifyPassthroughBlock(item.block, item.target, item.route, startId, function(rows) {
+            ctx.parsedRowsByRoute[item.route] = (ctx.parsedRowsByRoute[item.route] || []).concat(rows)
+            _reclassifyPassthroughBlocks(ctx, refiled, at + 1)
+        })
+    }
+
+    /// The rows a passthrough block's raw_text stands for under the section
+    /// the user picked, read by the same parser as any rules file: disabled
+    /// lines, `!`, `?` and `+children` survive, and each row carries the
+    /// service's verdict, so a line that is not of the picked type says so
+    /// (and offers its own type) instead of being re-filed silently.
+    /// `done(rows)` is called exactly once.
+    function _reclassifyPassthroughBlock(block, targetSlug, targetRoute, startId, done) {
+        // The reclassify dropdown names sections; "windows" stands for the
+        // application section, which is this OS's one.
+        var header = (targetSlug === "ip") ? "IP"
+                   : (targetSlug === "cidr") ? "CIDR"
+                   : (targetSlug === "ranges") ? "Ranges"
+                   : (targetSlug === "zones") ? "Zones"
+                   : (targetSlug === "domains") ? "Domains"
+                   : (targetSlug === "windows")
+                       ? Rules.appSectionHeader(root.platformProfile ? root.platformProfile.os : "")
+                   : ""
+        if (header === "") {
+            done([])
+            return
+        }
+        var text = "--- " + header + "\n" + String(block["raw-text"] || "")
+        _parseCanonicalRulesAsync(text, targetRoute, startId, function(result) {
+            done((result && result.rows) || [])
+        })
     }
 
     // Format the "preserved sections" suffix
@@ -385,7 +370,7 @@ QtObject {
             // through unchanged.
             var displayValue = Rules.isHostlikeRuleType(ruleType)
                 ? root._unicodeDecodeHost(matchValue)
-                : matchValue
+                : Rules.parsedRuleStoredValue(r)
             // Absent for a row the service did not flag, which is the common
             // case: the roles below then fall back to "valid".
             var verdict = verdicts[String(r["id-hint"])]
@@ -395,7 +380,7 @@ QtObject {
                 ruleType: ruleType,
                 ruleTypeTitle: root.ruleTypeLabel(ruleType),
                 matchValue: displayValue,
-                // A parsed `+block` rule shows as "block" whichever file it
+                // A parsed `!` rule shows as "block" whichever file it
                 // came from; a `?` rule keeps its file's route and its mark.
                 targetRoute: Rules.parsedRuleTargetRoute(r, targetRoute),
                 verify: Rules.parsedRuleVerify(r),

@@ -9,6 +9,7 @@
 mod args;
 mod backend;
 mod block_backlog;
+mod elevation_prompt;
 mod forwarded_traffic;
 mod full;
 mod i18n;
@@ -17,6 +18,7 @@ mod link;
 mod local_network_offer;
 mod plain;
 mod platform;
+mod primary_suggestion;
 mod restore;
 mod screens;
 mod state;
@@ -140,7 +142,15 @@ fn run(
     let client = Arc::new(ServiceIpcClient::start());
     let shared: Arc<dyn IpcClient> = client.clone();
     let (tx, events) = std::sync::mpsc::channel();
-    let backend = Backend::spawn(shared, platform::service_control, tx)?;
+    // Line mode reads every line on its own input thread, which would take the
+    // password from the agent; it is told how to start elevated instead.
+    let prompt_agent = if options.plain {
+        None
+    } else {
+        platform::terminal_prompt_agent()
+    };
+    let backend =
+        Backend::spawn_with_prompt_agent(shared, platform::service_control, tx, prompt_agent)?;
 
     let first = if options.wizard {
         ScreenId::Wizard

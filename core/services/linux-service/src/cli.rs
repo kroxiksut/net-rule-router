@@ -28,6 +28,11 @@ pub enum Command {
     /// `package-files <DIR>` — write the install footprint a distribution
     /// package ships under DIR, for the packaging script.
     PackageFiles,
+    /// `provision-check <options>` — check install-time files, no side effect.
+    ProvisionCheck,
+    /// `provision-stage <options>` — check them and place them where the
+    /// service applies them at its next start.
+    ProvisionStage,
     /// `help` / `--help` / no arguments — print usage.
     Help,
     /// Any unrecognised verb — a hard error, never a daemon start.
@@ -54,6 +59,8 @@ pub fn parse_command(args: &[String]) -> Command {
         "stop-and-cleanup" => Command::StopAndCleanup,
         "after-crash" => Command::AfterCrash,
         "package-files" => Command::PackageFiles,
+        "provision-check" => Command::ProvisionCheck,
+        "provision-stage" => Command::ProvisionStage,
         "help" | "h" | "" => Command::Help,
         other => Command::Unknown(other.to_string()),
     }
@@ -115,6 +122,11 @@ mod tests {
             Command::PackageFiles
         );
         assert_eq!(parse(&["help"]), Command::Help);
+        assert_eq!(
+            parse(&["provision-check", "--primary", "/tmp/r.txt"]),
+            Command::ProvisionCheck
+        );
+        assert_eq!(parse(&["provision-stage"]), Command::ProvisionStage);
     }
 
     #[test]

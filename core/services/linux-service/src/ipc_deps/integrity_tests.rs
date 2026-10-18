@@ -198,19 +198,25 @@ fn stored(kind: MutationKind, payload: serde_json::Value) -> StoredMutation {
     }
 }
 
+/// Distinct bytes per change: the service hashes the content itself, so one
+/// body under two labels would dedupe into one revision.
+fn rules(label: &str) -> String {
+    format!(r#"{{"rules":[],"label":"{label}"}}"#)
+}
+
 /// A rule change from the GUI, through the surface's own executor.
-fn apply(surface: &IpcSurface, hash: &str) -> MutationOutcome {
+fn apply(surface: &IpcSurface, label: &str) -> MutationOutcome {
     surface.deps.mutation_executor.execute(
         stored(
             MutationKind::RulesUpdate,
-            serde_json::json!({ "rules-json": r#"{"rules":[]}"#, "content-hash": hash }),
+            serde_json::json!({ "rules-json": rules(label), "content-hash": label }),
         ),
         USER,
     )
 }
 
-fn applied(surface: &IpcSurface, hash: &str) -> String {
-    let outcome = apply(surface, hash);
+fn applied(surface: &IpcSurface, label: &str) -> String {
+    let outcome = apply(surface, label);
     assert!(
         matches!(outcome, MutationOutcome::Completed(_)),
         "{outcome:?}"
@@ -310,7 +316,7 @@ fn an_active_revision_edited_while_stopped_is_rolled_back_and_needs_one_acknowle
 
     let restored = machine.active().expect("a trusted revision is active");
     assert_ne!(restored.revision_id, edited);
-    assert_eq!(restored.rules_json, r#"{"rules":[]}"#);
+    assert_eq!(restored.rules_json, rules("h-1"));
     one_acknowledgement_settles(&machine, &surface, &edited);
 }
 

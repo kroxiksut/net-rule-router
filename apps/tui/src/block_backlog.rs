@@ -4,6 +4,7 @@
 
 use nrr_client_logic::block_notices::{backlog_summary, BacklogSummary};
 use nrr_ipc_client::IpcClient;
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     BlockNoticeJournalAckRequest, BlockNoticeJournalAckResponse, BlockNoticeJournalListRequest,
@@ -75,7 +76,8 @@ pub fn announce(app: &mut AppState, texts: &Texts, now: std::time::Instant) -> V
         &[("count", summary.count.to_string())],
     );
     if !summary.shown.is_empty() {
-        let mut list = summary.shown.join(", ");
+        let shown: Vec<_> = summary.shown.iter().map(|d| display_text(d)).collect();
+        let mut list = shown.join(", ");
         if summary.more > 0 {
             list.push_str(", ");
             list.push_str(&texts.fill(

@@ -1,7 +1,8 @@
 //! The rules-file writer puts application rules under the section of the OS
 //! it runs on, and only that OS's parser applies them. A caller that leaves
 //! the OS out gets the Windows section, so on Linux the app rules would come
-//! back as inert text. Every QML call passes it.
+//! back as inert text. Every QML call passes it, and the translated syntax
+//! hint after it: a call without one writes a file with no hint.
 #![allow(clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
@@ -65,11 +66,14 @@ fn every_qml_writer_call_names_the_os() {
         let source = std::fs::read_to_string(&file).expect("read qml");
         for arity in writer_call_arities(&source) {
             calls += 1;
-            if arity != 5 {
+            if arity != 6 {
                 short.push(format!("{} ({arity} arguments)", file.display()));
             }
         }
     }
     assert!(calls > 0, "no writer call found: the scan is broken");
-    assert!(short.is_empty(), "calls without the OS: {short:?}");
+    assert!(
+        short.is_empty(),
+        "calls without the OS or the hint: {short:?}"
+    );
 }

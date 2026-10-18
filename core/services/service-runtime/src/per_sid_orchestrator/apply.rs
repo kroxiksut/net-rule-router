@@ -217,6 +217,26 @@ impl PerSidApplyOrchestrator {
     /// nothing takes it down when we exit, and it keeps dropping traffic with no
     /// service left to lift it. Checked at entry AND right before the engine
     /// call: a pass that entered before the latch is still running.
+    /// Whether the filtering engine has handed out a session.
+    pub fn engine_open(&self) -> bool {
+        self.session.is_open()
+    }
+
+    /// Whether the filtering engine has yet to hand out a session. Until it
+    /// does, a pass is a quiet no-op: the opener settles every user once it
+    /// lands, and a refusal recorded on every tick would bury that one fact.
+    pub(super) fn engine_pending(&self, stage: &'static str) -> bool {
+        if self.session.is_open() {
+            return false;
+        }
+        tracing::debug!(
+            target: "nrr::per_sid_orchestrator",
+            stage,
+            "filtering engine not open yet — pass skipped",
+        );
+        true
+    }
+
     fn adds_refused(&self, sid: &str, stage: &'static str) -> bool {
         if !(self.teardown_gate)() {
             return false;
@@ -239,7 +259,7 @@ impl PerSidApplyOrchestrator {
         if sid.is_empty() {
             return Err(OrchestratorError::EmptySid);
         }
-        if self.adds_refused(sid, "install") {
+        if self.adds_refused(sid, "install") || self.engine_pending("install") {
             return Ok(0);
         }
         // The admin baseline is never enforced as its own machine-wide
@@ -722,26 +742,26 @@ impl PerSidApplyOrchestrator {
     /// **non-dynamic** — filters persist until an explicit delete or reboot —
     /// so this explicit strip (not session close) is what removes them.
     pub fn cleanup_wfp(&self) -> Result<usize, OrchestratorError> {
-        // Every SID's apply lock first: a transaction still in flight commits
-        // before the sweep enumerates, so nothing lands behind it with its
-        // ledger line already erased. Nothing holds one of these and waits on
-        // another, so taking them in name order cannot deadlock.
-        let locks: Vec<Arc<Mutex<()>>> = {
-            let g = self.apply_locks.lock().unwrap_or_else(|p| p.into_inner());
-            let mut named: Vec<(&String, &Arc<Mutex<()>>)> = g.iter().collect();
-            named.sort_by(|a, b| a.0.cmp(b.0));
-            named.into_iter().map(|(_, l)| Arc::clone(l)).collect()
-        };
+        // A stop that came before the engine answered still owes the machine
+        // the strip: one more attempt, bounded by the caller's deadline.
+        if !self.session.is_open() {
+            self.session.ensure_open().map_err(|e| {
+                OrchestratorError::WfpFailed(format!("filtering engine never opened: {e}"))
+            })?;
+        }
+        let locks = self.every_apply_lock();
         let _held: Vec<std::sync::MutexGuard<'_, ()>> = locks
             .iter()
             .map(|l| l.lock().unwrap_or_else(|p| p.into_inner()))
             .collect();
-        // Nothing is left to adopt once everything is gone.
-        *self
+        // (1) This session's known filters and a dead instance's inherited
+        // ones, by id: the enumerate below can under-report.
+        let inherited = self
             .pending_orphans
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) = None;
-        // (1) Delete this session's known filters by id.
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap_or_default();
         let tracked: Vec<WfpFilterId> = {
             let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
             g.values()
@@ -749,13 +769,14 @@ impl PerSidApplyOrchestrator {
                 .collect()
         };
         let tracked_deleted = tracked.len();
-        if !tracked.is_empty() {
-            let actions: Vec<WfpFilterAction> = tracked
-                .into_iter()
-                .map(WfpFilterAction::DeleteFilter)
-                .collect();
+        let by_id: Vec<WfpFilterAction> = tracked
+            .into_iter()
+            .chain(inherited.into_iter().map(|raw| WfpFilterId { raw }))
+            .map(WfpFilterAction::DeleteFilter)
+            .collect();
+        if !by_id.is_empty() {
             // Delete-missing is idempotent (FWP_E_FILTER_NOT_FOUND → ok).
-            if let Err(e) = self.session.execute_wfp_plan(&actions) {
+            if let Err(e) = self.session.execute_wfp_plan(&by_id) {
                 tracing::warn!(
                     target: "nrr::per_sid_orchestrator",
                     msg_key = "persid-apply-cleanup-delete-failed",
@@ -783,8 +804,7 @@ impl PerSidApplyOrchestrator {
             self.forget_sid_state(sid);
         }
         // Anything the loop above did not cover (a latch left from a SID whose
-        // record was already gone). No flush here — teardown itself unblocks
-        // nothing the OS cache could hide.
+        // record was already gone).
         self.state.lock().unwrap_or_else(|p| p.into_inner()).clear();
         self.block_all_flush_state
             .lock()
@@ -809,56 +829,22 @@ impl PerSidApplyOrchestrator {
         Ok(tracked_deleted + swept)
     }
 
-    /// Reap a hard-killed prior instance's
-    /// orphaned filters at startup. Reads the on-disk ledger (ids the dead
-    /// process recorded before it was killed) and deletes each **by id** — no
-    /// dependence on `wfp_enumerate_our_filters`, so it works even when
-    /// enumerate under-reports (the `stripped_filters:0` anomaly). Idempotent
-    /// (delete-missing is a no-op). Drains + truncates the ledger. Returns the
-    /// number of ids reaped. No-op (returns 0) when no ledger is wired.
-    pub fn cleanup_persisted_orphans(&self) -> usize {
-        let Some(ledger) = self.ledger.as_ref() else {
-            return 0;
-        };
-        let ids = ledger.drain();
-        if ids.is_empty() {
-            return 0;
-        }
-        let actions: Vec<WfpFilterAction> = ids
-            .iter()
-            .map(|raw| WfpFilterAction::DeleteFilter(WfpFilterId { raw: *raw }))
-            .collect();
-        if let Err(e) = self.session.execute_wfp_plan(&actions) {
-            tracing::warn!(
-                target: "nrr::per_sid_orchestrator",
-                msg_key = "persid-apply-cleanup-orphans-failed",
-                error = %e,
-                "cleanup_persisted_orphans: delete-by-id best-effort failed",
-            );
-        } else {
-            // Phrased as "cleared", not "reaped N filters": delete-by-id is a
-            // no-op for an id already gone, and after a reboot every id in
-            // the ledger is (WFP drops non-persistent filters on shutdown) —
-            // "reaped N" on a clean boot would read like N live blocks had
-            // just been cleared.
-            tracing::info!(
-                target: "nrr::per_sid_orchestrator",
-                msg_key = "persid-apply-cleanup-orphans-cleared",
-                ledger_ids = ids.len() as u64,
-                "startup: cleared the previous instance's filter ledger (ids already gone after a reboot are a no-op)",
-            );
-        }
-        ids.len()
+    /// Every SID's apply lock, in name order: taken together, a transaction in
+    /// flight commits first, and nothing holds one of these while waiting on
+    /// another, so the order cannot deadlock.
+    fn every_apply_lock(&self) -> Vec<Arc<Mutex<()>>> {
+        let g = self.apply_locks.lock().unwrap_or_else(|p| p.into_inner());
+        let mut named: Vec<(&String, &Arc<Mutex<()>>)> = g.iter().collect();
+        named.sort_by(|a, b| a.0.cmp(b.0));
+        named.into_iter().map(|(_, l)| Arc::clone(l)).collect()
     }
 
     /// Strip only **block** (kill-switch / fail-closed) WFP filters, keeping
     /// permit filters. Used on `routing_stop_policy = persist` graceful stop
     /// (matched hosts keep egressing the secondary, but no block ever
-    /// persists) and — unconditionally — at service startup so an orphaned
-    /// kill-switch left by a hard-killed prior instance can never lock the
-    /// user out. Leaves the in-memory SID→filter map untouched: any now-gone
-    /// block IDs it still references are handled idempotently on the next
-    /// `remove_for_sid` (delete-missing → success).
+    /// persists) and at a start nobody's leak protection asked to hold. Leaves
+    /// the in-memory SID→filter map untouched: any now-gone block IDs it still
+    /// references are handled idempotently on the next `remove_for_sid`.
     pub fn cleanup_wfp_blocks_only(&self) -> Result<usize, OrchestratorError> {
         self.session
             .cleanup_blocks_only()
@@ -867,11 +853,11 @@ impl PerSidApplyOrchestrator {
 
     /// Keep a dead instance's filters in force until the first pass has
     /// re-derived every present user's set: with leak protection on, a strip
-    /// before that pass is a leak for the whole boot. The inherited ids leave
-    /// the ledger now so the pass records only its own;
+    /// before that pass is a leak for the whole boot. The inherited ids stay in
+    /// the ledger until they are settled, so a stop before then loses none;
     /// [`Self::adopt_orphans_after_pass`] settles what the pass did not claim.
     pub fn defer_orphans_to_first_pass(&self) {
-        let inherited = self.ledger.as_ref().map(|l| l.drain()).unwrap_or_default();
+        let inherited = self.ledger.as_ref().map(|l| l.read()).unwrap_or_default();
         tracing::info!(
             target: "nrr::per_sid_orchestrator",
             msg_key = "persid-apply-orphans-deferred",
@@ -884,22 +870,83 @@ impl PerSidApplyOrchestrator {
             .unwrap_or_else(|p| p.into_inner()) = Some(inherited);
     }
 
+    /// Delete the deferred inherited filters by id now, for a start that may
+    /// lift them at once before any pass is wired. Returns how many ids went.
+    pub fn strip_inherited_now(&self) -> usize {
+        if self.engine_pending("orphan-reap") {
+            return 0;
+        }
+        let Some(inherited) = self
+            .pending_orphans
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        else {
+            return 0;
+        };
+        if inherited.is_empty() {
+            return 0;
+        }
+        let actions: Vec<WfpFilterAction> = inherited
+            .iter()
+            .map(|raw| WfpFilterAction::DeleteFilter(WfpFilterId { raw: *raw }))
+            .collect();
+        if let Err(e) = self.session.execute_wfp_plan(&actions) {
+            tracing::warn!(
+                target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-cleanup-orphans-failed",
+                error = %e,
+                "startup: delete of the previous instance's filters by id failed; the first pass settles them",
+            );
+            *self
+                .pending_orphans
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(inherited);
+            return 0;
+        }
+        self.rewrite_ledger_to_tracked();
+        // "Cleared", not "reaped N": after a reboot every id is already gone.
+        tracing::info!(
+            target: "nrr::per_sid_orchestrator",
+            msg_key = "persid-apply-cleanup-orphans-cleared",
+            ledger_ids = inherited.len() as u64,
+            "startup: cleared the previous instance's filter ledger (ids already gone after a reboot are a no-op)",
+        );
+        inherited.len()
+    }
+
+    fn tracked_raw_ids(&self) -> std::collections::BTreeSet<u64> {
+        let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        g.values()
+            .flat_map(|s| s.installed.iter().map(|id| id.raw))
+            .collect()
+    }
+
+    fn rewrite_ledger_to_tracked(&self) {
+        if let Some(ledger) = self.ledger.as_ref() {
+            let tracked: Vec<u64> = self.tracked_raw_ids().into_iter().collect();
+            ledger.rewrite(&tracked);
+        }
+    }
+
     /// Delete every filter of ours the pass did not claim: the inherited ids
     /// no SID tracks, and anything else under our provider no SID tracks (the
     /// enumerate covers what the ledger missed, the ledger what the enumerate
-    /// under-reports). Returns `None` when nothing was deferred.
+    /// under-reports). Every SID's apply lock is held, so a filter a tick adds
+    /// meanwhile is never taken for an orphan. Returns `None` when nothing was
+    /// deferred.
     pub fn adopt_orphans_after_pass(&self) -> Option<usize> {
+        let locks = self.every_apply_lock();
+        let _held: Vec<std::sync::MutexGuard<'_, ()>> = locks
+            .iter()
+            .map(|l| l.lock().unwrap_or_else(|p| p.into_inner()))
+            .collect();
         let inherited = self
             .pending_orphans
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take()?;
-        let tracked: std::collections::HashSet<u64> = {
-            let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            g.values()
-                .flat_map(|s| s.installed.iter().map(|id| id.raw))
-                .collect()
-        };
+        let tracked = self.tracked_raw_ids();
         let mut doomed: Vec<u64> = inherited
             .into_iter()
             .filter(|raw| !tracked.contains(raw))
@@ -921,6 +968,7 @@ impl PerSidApplyOrchestrator {
             ),
         }
         if doomed.is_empty() {
+            self.rewrite_ledger_to_tracked();
             return Some(0);
         }
         let actions: Vec<WfpFilterAction> = doomed
@@ -928,12 +976,16 @@ impl PerSidApplyOrchestrator {
             .map(|raw| WfpFilterAction::DeleteFilter(WfpFilterId { raw: *raw }))
             .collect();
         match self.session.execute_wfp_plan(&actions) {
-            Ok(_) => tracing::info!(
-                target: "nrr::per_sid_orchestrator",
-                msg_key = "persid-apply-orphans-adopted",
-                removed = doomed.len() as u64,
-                "first pass done: a previous instance's filters nobody claimed are gone",
-            ),
+            Ok(_) => {
+                self.rewrite_ledger_to_tracked();
+                tracing::info!(
+                    target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-apply-orphans-adopted",
+                    removed = doomed.len() as u64,
+                    "first pass done: a previous instance's filters nobody claimed are gone",
+                )
+            }
+            // The unclaimed ids stay in the ledger for the next start.
             Err(e) => tracing::warn!(
                 target: "nrr::per_sid_orchestrator",
                 msg_key = "persid-apply-orphans-adopt-failed",
@@ -1167,6 +1219,11 @@ impl PerSidApplyOrchestrator {
     }
 
     fn reconcile_locked(&self, snapshot: &[String]) -> Result<(), OrchestratorError> {
+        // Before the adoption below: an inherited set is settled only by a pass
+        // that really ran.
+        if self.engine_pending("reconcile") {
+            return Ok(());
+        }
         let want: std::collections::BTreeSet<String> = snapshot.iter().cloned().collect();
         let have: std::collections::BTreeSet<String> = {
             let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1558,11 +1615,6 @@ impl PerSidApplyOrchestrator {
                 crate::flow_reset_log::ResetCause::NewDestination
             };
             crate::flow_reset_log::log_reset_flows(Some(sid), &decision.reset, |_| (None, cause));
-            let reason = if tunnel_came_up {
-                "tore down connections still running beside the additional link that just came up — the application reconnects through it instead of finishing on the main one"
-            } else {
-                "tore down connections that predate the destinations this activation started enforcing — the application reconnects over the route the new rule assigns instead of finishing on the old link"
-            };
             tracing::info!(
                 target: "nrr::per_sid_orchestrator",
                 msg_key = "persid-apply-flows-torn-down",
@@ -1575,7 +1627,7 @@ impl PerSidApplyOrchestrator {
                 kept_unknown_owner = decision.kept_unknown_owner,
                 kept_other_link = decision.kept_other_link,
                 kept_on_course = decision.kept_on_course,
-                "{reason}",
+                "tore down connections that predate the route now in force (a tunnel that just came up, or destinations this activation started enforcing) — the application reconnects over that route instead of finishing on the old link",
             );
         }
     }

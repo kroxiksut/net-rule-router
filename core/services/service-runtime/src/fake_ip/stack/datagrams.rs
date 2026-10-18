@@ -8,6 +8,7 @@
 //! Same inherent impl, split across files.
 
 use super::*;
+use nrr_platform_api::fake_ip::FlowTransport;
 
 impl FakeIpStack {
     /// Bind a UDP socket for a fresh datagram to an in-scope fake endpoint.
@@ -173,6 +174,21 @@ impl FakeIpStack {
         }
         let Some(target) = self.udp_binds.get(key).map(|bind| bind.target.clone()) else {
             return;
+        };
+        // One bind serves every client of a virtual endpoint, and the clients
+        // may belong to different users: each is carried for its own.
+        let destination = SocketAddr::new(key.0, key.1);
+        let owned = self
+            .relay
+            .for_owner(target, client, destination, Some(FlowTransport::Udp));
+        let target = match owned {
+            Ok(target) => target,
+            Err(refusal) => {
+                self.log_gate
+                    .log_refusal(&destination, &RelayDecision::from(refusal));
+                self.send_port_unreachable(*key, client, payload.len());
+                return;
+            }
         };
         self.health.record_udp_relay_flow_opened();
         let outcome = Arc::new(Mutex::new(None));

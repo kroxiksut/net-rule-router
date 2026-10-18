@@ -18,6 +18,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use nrr_client_logic::rules_overlaps::confirmed_by_own_edit;
 use nrr_client_logic::rules_table::TargetRoute;
 use nrr_client_logic::Route;
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc_payloads::{RuleConflictDto, RuleConflictKind};
 use nrr_shared::rules_overlap::{OverlapRule, RouteOverlap, RouteOverlapKind};
 
@@ -413,10 +414,12 @@ fn pair_item_lines(
         route_of(app, &pair.loser),
         texts,
     );
-    let mut lines = vec![ViewLine::new(vec![
-        Segment::plain(format!("{marker}{}. ", index + 1)),
-        Segment::strong(sentence),
-    ])];
+    let number = format!("{marker}{}. ", index + 1);
+    let mut lines = vec![ViewLine::new(if selected {
+        vec![Segment::selected(format!("{number}{sentence}"))]
+    } else {
+        vec![Segment::plain(number), Segment::strong(sentence)]
+    })];
     lines.push(ViewLine::text(format!(
         "   {}: {}",
         texts.get(keys::REASON_LABEL),
@@ -515,6 +518,7 @@ fn describe(side: &OverlapRule, texts: &Texts) -> String {
     } else {
         side.value.clone()
     };
+    let value = display_text(&value).into_owned();
     texts.fill(keys::RULE, &[("value", value), ("type", type_label)])
 }
 
@@ -533,7 +537,17 @@ fn conflict_text(conflict: &RuleConflictDto, texts: &Texts) -> String {
         RuleConflictKind::UnsupportedRuleShape => keys::CONFLICT_UNSUPPORTED,
         RuleConflictKind::BlockLeaksSharedAddress => keys::CONFLICT_LEAK,
         RuleConflictKind::NetworkCarvingOverCap => keys::CONFLICT_CARVING_OVER_CAP,
+        RuleConflictKind::ProtectedTarget => keys::CONFLICT_PROTECTED,
     };
+    // The protection says why in the rules table's own words.
+    let reason = nrr_domain::protected_places::ProtectionReason::from_slug(&conflict.reason)
+        .map(|reason| {
+            texts.dynamic(
+                &nrr_domain::rule_value_validation::protection_message_key(reason),
+                reason.slug(),
+            )
+        })
+        .unwrap_or_default();
     let rule = if conflict.rule_value.is_empty() {
         &conflict.rule_id
     } else {
@@ -547,11 +561,12 @@ fn conflict_text(conflict: &RuleConflictDto, texts: &Texts) -> String {
     let mut text = texts.fill(
         template,
         &[
-            ("rule", rule.as_str()),
-            ("app", conflict.app.as_str()),
-            ("host", host.as_str()),
-            ("via", conflict.via_host.as_str()),
-            ("ip", conflict.ip.as_str()),
+            ("rule", display_text(rule)),
+            ("app", display_text(&conflict.app)),
+            ("host", display_text(host)),
+            ("via", display_text(&conflict.via_host)),
+            ("ip", conflict.ip.as_str().into()),
+            ("reason", reason.into()),
         ],
     );
     let more = conflict.count.saturating_sub(1);

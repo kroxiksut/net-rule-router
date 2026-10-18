@@ -172,6 +172,7 @@ SystemTrayIcon {
     /// as a reply to it, then let the queue move.
     function _onPromptRetired() {
         _activeNoticeId = ""
+        _addRuleUndo = null
         _autoRuleActiveIds = []
         _enforcementNoticeKind = ""
         _noticeMuteKind = ""
@@ -336,6 +337,7 @@ SystemTrayIcon {
         rpc: tray.rpc
         presence: tray.guiPresence
         os: tray.platformProfile.os || ""
+        textSource: tray
     }
 
     // ── "Add rule…" ──────────────────────────────────────────────────────────
@@ -344,7 +346,10 @@ SystemTrayIcon {
     // user is looking at. Without it, the same form opens in a small window of
     // the tray's own and the rule goes straight to the service.
 
-    property var rulesSubmitter: RulesSubmitter { rpc: tray.rpc }
+    property var rulesSubmitter: RulesSubmitter {
+        rpc: tray.rpc
+        onBaseRevisionMoved: function(base) { baseRevision = base }
+    }
     property Component _addRuleWindowComponent: Component { TrayRuleWindow {} }
     /// Made on demand and dropped once closed with no rule on its way.
     property var _addRuleWindow: null
@@ -356,28 +361,53 @@ SystemTrayIcon {
             triggerAction("add-rule")
             return
         }
+        var w = _ensureAddRuleWindow()
+        if (w) w.present()
+    }
+
+    function _ensureAddRuleWindow() {
         if (!_addRuleWindow) {
             var w = _addRuleWindowComponent.createObject(tray, { trayHost: tray })
-            if (!w) return
+            if (!w) return null
             w.released.connect(function() {
                 if (tray._addRuleWindow === w) tray._addRuleWindow = null
                 Qt.callLater(function() { w.destroy() })
             })
             _addRuleWindow = w
         }
-        _addRuleWindow.present()
+        return _addRuleWindow
     }
 
-    /// What became of a rule added from the tray's own form.
-    function noteAddRuleOutcome(bodyText) {
+    /// How long the notice of an add offers to take it back.
+    readonly property int _addRuleUndoMs: 15000
+    /// What the add on screen can be taken back with, while its notice is up.
+    property var _addRuleUndo: null
+
+    /// What became of a rule added from the tray's own form. `undo`
+    /// (`Rules.additionUndoRecord`) puts an "Undo" on the notice.
+    function noteAddRuleOutcome(bodyText, undo) {
+        var canUndo = !!undo && ((undo.added || []).length + (undo.moved || []).length) > 0
         _presentOrQueue("tray-add-rule", function() {
+            tray._addRuleUndo = canUndo ? undo : null
             promptWindow.present({
                 titleText: tr("tray.add-rule.title", "Add rule"),
                 bodyText: bodyText,
+                primaryAction: canUndo
+                    ? { label: tr("action.undo", "Undo"), actionId: "tray-add-rule-undo" }
+                    : null,
                 dismissActionId: "tray-add-rule-dismiss",
-                autoRetireMs: _infoNoticeMs
+                autoRetireMs: canUndo ? _addRuleUndoMs : _infoNoticeMs
             })
         })
+    }
+
+    /// "Undo" on the notice: one more ordinary apply, made by the add form.
+    function _undoAddRule() {
+        var undo = _addRuleUndo
+        _addRuleUndo = null
+        if (!undo) return
+        var w = _ensureAddRuleWindow()
+        if (w) w.undoAddition(undo)
     }
 
     // Service status snapshot for icon + menu state.
@@ -456,7 +486,7 @@ SystemTrayIcon {
                 _onAutoRuleCandidatesChanged(event)
                 break
             case "secondary-external-address-observed":
-                _onSecondaryExternalAddress(event, eventId)
+                _onSecondaryExternalAddress(event)
                 break
             case "verify-verdicts-changed":
                 verifyVerdicts.refresh()
@@ -469,6 +499,9 @@ SystemTrayIcon {
                 break
             case "routes-held-by-another-user":
                 _onRoutesHeldByAnotherUser(event)
+                break
+            case "traffic-carried-by-another-user":
+                _onTrafficCarriedByAnotherUser(event)
                 break
             case "unassigned-tunnel-detected":
                 _onUnassignedTunnel(event)
@@ -626,23 +659,9 @@ SystemTrayIcon {
     }
 
     function _onAutoRuleCandidatesChanged(event) {
-        var pending = Number(event["pending-count"] || 0)
-        // Record the count before any gate: the menu shows it whether or not a
-        // notice was wanted, and the inbox keeps everything either way.
-        _autoRulePendingCount = pending
-        if (!(pending > 0)) return
-        if (!notifySuggestionChanges) {
-            console.log("tray auto-rules: suppressed — this notice kind is silenced")
-            return
-        }
-        if (Date.now() < _autoRuleSilencedUntilMs) {
-            console.log("tray auto-rules: suppressed — the user asked for quiet")
-            return
-        }
-        // `top-anchor` is deliberately ignored: the prompt fetches the whole
-        // pending list, so the site named by one push does not describe what the
-        // user ends up seeing. The heading is derived from the shown rows.
-        _fetchAutoRuleCandidates()
+        // Listed, not announced: the menu carries the count and opens the
+        // prompt when the user asks for it.
+        _autoRulePendingCount = Number(event["pending-count"] || 0)
     }
 
     function _fetchAutoRuleCandidates() {
@@ -714,11 +733,26 @@ SystemTrayIcon {
         var parts = []
         if (candidateAnchor !== "" && !selfSigned) {
             parts.push(tr("tray.auto-rules.item-companion-short", "← {name}")
-                .replace("{name}", candidateAnchor))
+                .replace("{name}", Pure.displayText(candidateAnchor)))
         }
         var route = _routeSentence(routeSlug)
         if (route !== "") parts.push(route)
         return parts.join(" · ")
+    }
+
+    /// The mark of an offer resting on less than the service adds on its own,
+    /// and the basis it does rest on — the same words the suggestions page
+    /// uses. Empty for an offer on full evidence.
+    function _lessCertainMark(c) {
+        if (String((c || {})["less-certain"] || "") === "") return ""
+        return tr("rules.suggestions.inbox.less-certain", "less certain")
+    }
+    function _lessCertainLine(c) {
+        var slug = String((c || {})["less-certain"] || "")
+        if (slug === "") return ""
+        var basis = tr("rules.suggestions.less-certain." + slug, "")
+            .replace("{site}", Pure.displayText(String((c || {}).anchor || "")))
+        return basis !== "" ? _lessCertainMark(c) + ": " + basis : _lessCertainMark(c)
     }
 
     /// "How do you know?" for one candidate, shown when the user asks for
@@ -726,6 +760,8 @@ SystemTrayIcon {
     /// evidence travels with the offer instead of being taken on trust.
     function _candidateDetailLine(c) {
         var parts = []
+        var lessCertain = _lessCertainLine(c)
+        if (lessCertain !== "") parts.push(lessCertain)
         var signal = String(c.signal || c["signal"] || "")
         if (signal !== "") {
             parts.push(tr("tray.auto-rules.signal." + signal, signal))
@@ -802,11 +838,21 @@ SystemTrayIcon {
                 routes.push(candidateRoute)
             }
             ids.push(id)
+            // The window has no room for another answer: its details name the
+            // `site.*` alternative, which the suggestions page offers.
+            var anyZoneSite = String(c["any-zone-site"] || "")
+            var anyZoneLine = anyZoneSite === "" ? ""
+                : tr("rules.suggestions.inbox.any-zone",
+                        "The same site in another zone: it can be added as {site}.* instead, every zone at once.")
+                    .replace("{site}", anyZoneSite)
             items.push({
-                primaryText: String(c["proposed-match"] || c.proposedMatch || ""),
-                secondaryText: _companionRowSubtitle(
-                    candidateAnchor, routes.length > 1 ? candidateRoute : "", selfSigned),
-                detailText: _candidateDetailLine(c)
+                primaryText: Pure.displayText(c["proposed-match"] || c.proposedMatch || ""),
+                secondaryText: [_companionRowSubtitle(
+                        candidateAnchor, routes.length > 1 ? candidateRoute : "", selfSigned),
+                    _lessCertainMark(c)]
+                    .filter(function(s) { return s !== "" }).join(" · "),
+                detailText: [_candidateDetailLine(c), anyZoneLine]
+                    .filter(function(s) { return s !== "" }).join("\n")
             })
         }
         var anchorNames = Object.keys(anchorCounts)
@@ -844,7 +890,7 @@ SystemTrayIcon {
         _activeNoticeId = ""
 
         var siteName = anchor !== ""
-            ? anchor
+            ? Pure.displayText(anchor)
             : tr("tray.auto-rules.site-fallback", "a site you use")
         // Every row is a site that will not open. Saying "addresses a site
         // needs" over that list states the wrong problem: nobody is missing
@@ -941,74 +987,22 @@ SystemTrayIcon {
     //
     // The additional link's own client often cannot say which address the
     // outside world sees behind it. The service can, and pushes it once the
-    // link has settled after connecting. This is a NOTICE, not a question: it
-    // carries no decision, so it closes itself.
+    // link has settled after connecting; the menu shows it.
 
-    /// How long a notice that asks NOTHING stays on screen — the external
-    /// address, "routing is back". Long enough to read and copy an address,
-    /// short enough that a user who walked away comes back to their own work
+    /// How long a notice that asks NOTHING stays on screen — "routing is
+    /// back" and the like. Long enough to read, short enough that a user who walked away comes back to their own work
     /// rather than to a stale window sitting over it. Notices that carry a
     /// decision keep `_promptAutoRetireMs`: those wait for an answer.
     readonly property int _infoNoticeMs: 10000
 
-    /// One notice per PUSH, not per address. The service publishes this on
-    /// every (re)connect, and a user who reconnects wants the address again —
-    /// keyed on the address alone, one dismissal retired it for good and the
-    /// notice was never seen a second time. The push id is identical in the
-    /// main window, so the two surfaces still cannot double up on one event.
-    function _externalAddressNoticeId(eventId, address) {
-        return "secondary-external-address:" + String(eventId || "")
-            + ":" + String(address || "")
-    }
-
-    /// How long an answered external-address notice stays suppressed. The push
-    /// id it is keyed on restarts at 1 with the SERVICE, so the same id comes
-    /// round again on a later run and a permanent record of it silenced a whole
-    /// week's notices for the same address. All the record has to outlive is
-    /// the gap between the two surfaces receiving one push.
-    readonly property int _externalAddressRefractoryMs: 600000
-
-    // Every early return here is announced. Each one is a legitimate reason to
-    // stay quiet, but from the outside they all look the same as a lost event —
-    // and telling them apart after the fact is exactly what two test runs were
-    // spent failing to do.
-    function _onSecondaryExternalAddress(event, eventId) {
-        // Record it before any gate: the menu shows this address whether or
-        // not a notification was wanted.
+    function _onSecondaryExternalAddress(event) {
+        // Listed, not announced: a reconnect is routine, and the menu shows
+        // the address for whoever wants it.
         var observed = String(event["external-address"] || "")
         if (observed !== "") {
             _externalSecondary = observed
             _externalSecondaryCachedAtMs = 0
         }
-        if (!showNotifications) {
-            console.log("tray external-address: suppressed — notifications are off")
-            return
-        }
-        var address = String(event["external-address"] || "")
-        // The service only publishes this event WITH an address; the guard is
-        // here so a future/garbled frame can never produce an empty notice.
-        if (address === "") {
-            console.log("tray external-address: suppressed — frame carries no address")
-            return
-        }
-        var noticeId = _externalAddressNoticeId(eventId, address)
-        // Already answered — here, or in the main window, which shows the same
-        // notice as insurance against a silent tray. Only a RECENT answer
-        // counts: see `_externalAddressRefractoryMs`.
-        var answeredAt = noticeLedger.decidedAt(noticeId)
-        if (answeredAt > 0 && (Date.now() - answeredAt) < _externalAddressRefractoryMs) {
-            console.log("tray external-address: suppressed — already answered:", noticeId)
-            return
-        }
-        console.log("tray external-address: showing notice for", address)
-
-        var adapter = String(event["adapter-name"] || "")
-        // An informational notice must not shove a question off the screen —
-        // but it must not be thrown away either, which is what "stay quiet"
-        // turned into. It waits its turn.
-        _offerNotice("external-address", "external-address", function() {
-            tray._showExternalAddressNotice(noticeId, address, adapter)
-        })
     }
 
     // ── `?` rules that work only on the other route ──────────────────────────
@@ -1104,41 +1098,6 @@ SystemTrayIcon {
         }
         verifyVerdicts.accept(function(ok, code) {
             if (!ok) console.log("tray verify-verdicts: accept failed:", code)
-        })
-    }
-
-    function _showExternalAddressNotice(noticeId, address, adapter) {
-        // Bold only the address itself, not the surrounding sentence — the
-        // markup lives here, not in the translated string, so the localized
-        // text stays plain prose in both locale files.
-        var body = tr("tray.external-address.body",
-                "External address of the additional route: {address}")
-            .replace("{address}", "<b>" + _escapeMarkup(address) + "</b>")
-        if (adapter !== "") {
-            // `<br>`, not `\n`: StyledText collapses a bare newline.
-            body = body + "<br>" + Pure.fillPlaceholders(
-                tr("tray.external-address.adapter", "Adapter: {name}"),
-                { name: _escapeMarkup(adapter) })
-        }
-        _activeNoticeId = noticeId
-        promptWindow.present({
-            titleText: tr("tray.external-address.title",
-                "Additional route connected"),
-            bodyText: body,
-            bodyRichText: true,
-            // The address is the whole point of this notice — it has to be
-            // takeable, not just readable.
-            copyPayload: address,
-            // No accent "Close": the corner close box closes it, and an accent
-            // button here lands right on top of the main window's own "Close" —
-            // one notice retiring a moment early took the app down with it.
-            // "Don't show…" only opens a chooser, so a stray click costs nothing.
-            secondaryAction: _noticeMuteAction("external-address"),
-            // Timing out is not an answer: a user who was away never saw it,
-            // so the notice stays undecided and the main window still offers
-            // it. The window owns the countdown — one mechanism, and it fires
-            // for whatever is on screen rather than for a hand-wired case.
-            autoRetireMs: _infoNoticeMs
         })
     }
 
@@ -1523,7 +1482,7 @@ SystemTrayIcon {
             : (raw && typeof raw.length === "number" ? raw : [])
         var out = []
         for (var i = 0; i < list.length && out.length < 6; i += 1) {
-            var name = (list[i] === undefined || list[i] === null) ? "" : String(list[i]).trim()
+            var name = (list[i] === undefined || list[i] === null) ? "" : Pure.displayText(String(list[i]).trim())
             if (name !== "") out.push(name.length > 64 ? name.slice(0, 63) + "…" : name)
         }
         return out
@@ -1616,7 +1575,7 @@ SystemTrayIcon {
                 return tr("tray.block-notice.reason-short.not-covered-by-rules",
                     "No rule for this address")
             case "blocked-by-rule":
-                return tr("tray.block-notice.reason-short.blocked-by-rule", "Blocked by a rule")
+                return tr("tray.block-notice.reason-short.blocked-by-rule", "Denied by a rule")
             case "ipv6-blocked":
                 return tr("tray.block-notice.reason-short.ipv6-blocked", "IPv6 is switched off")
             case "dns-lockdown":
@@ -1664,7 +1623,7 @@ SystemTrayIcon {
     function _blockNoticeDestinationText() {
         return hideBlockNoticeAddresses
             ? tr("notifications.block-notice.destination-hidden", "a hidden destination")
-            : _blockNoticeDestination
+            : Pure.displayText(_blockNoticeDestination)
     }
 
     /// Every value placed into a StyledText body goes through this: a path may
@@ -1719,8 +1678,9 @@ SystemTrayIcon {
         // Bold only the identifiers, never the sentence around them: the
         // markup lives here so the locale strings stay plain prose.
         var summaryParts = ["<b>" + _escapeMarkup(_blockNoticeDestinationText()) + "</b>"]
+        var appShown = Pure.displayText(app)
         if (app !== "") {
-            summaryParts.push(["<b>" + _escapeMarkup(app) + "</b>"]
+            summaryParts.push(["<b>" + _escapeMarkup(appShown) + "</b>"]
                 .concat(chain.map(function(n) { return tray._escapeMarkup(n) }))
                 .join(" ← "))
         }
@@ -1732,7 +1692,7 @@ SystemTrayIcon {
             + _escapeMarkup(_blockNoticeReasonLine(reason))
         var spoken = ""
         if (chain.length > 0) {
-            spoken = [_blockNoticeDestinationText(), _appChainAccessible(app, chain),
+            spoken = [_blockNoticeDestinationText(), _appChainAccessible(appShown, chain),
                 attemptsText].join(", ") + ". " + _blockNoticeReasonLine(reason)
         }
         // "Route unavailable" already means the address HAS a rule pointing at
@@ -1837,12 +1797,12 @@ SystemTrayIcon {
     function _blockNoticeRowItem(row, sharedReason) {
         var entries = row.entries
         var first = entries[0]
-        var app = String(first.app || "")
+        var app = Pure.displayText(first.app)
         var chain = app !== "" ? _blockNoticeChainOf(entries) : []
         var reasonPart = sharedReason === "" ? _blockNoticeReasonShort(first.reason) : ""
         if (row.grouped && entries.length > 1) {
             var countText = _blockNoticeCountNoun(first.reason, entries.length)
-            var addresses = entries.map(function(e) { return String(e.destination || "") })
+            var addresses = entries.map(function(e) { return Pure.displayText(e.destination) })
             return {
                 key: row.key,
                 primaryText: app,
@@ -1865,7 +1825,7 @@ SystemTrayIcon {
             : ""
         var destination = hideBlockNoticeAddresses
             ? tr("notifications.block-notice.destination-hidden", "a hidden destination")
-            : String(first.destination || "")
+            : Pure.displayText(first.destination)
         var tail = [attempts, reasonPart].filter(function(s) { return s !== "" })
         return {
             key: row.key,
@@ -2007,6 +1967,9 @@ SystemTrayIcon {
     /// one must not take down the other's question — and carried as the whole
     /// kind so "nothing on screen" stays distinguishable from a roleless one.
     property string _enforcementNoticeKind: ""
+    /// The connection the shown no-policy notice offers as main, by the name
+    /// the interfaces list gives it; empty when it offers none.
+    property string _suggestedPrimaryName: ""
 
     /// Roles the service last reported as not enforced. Kept apart from what is
     /// on screen: the question may have been suppressed (window in front,
@@ -2188,7 +2151,7 @@ SystemTrayIcon {
         if (missing.length > 0) {
             body += " " + tray.tr("status.settings-restore-adapter-missing",
                     "Not restored: the adapter {name} is not on this computer now.")
-                .replace("{name}", missing.join(", "))
+                .replace("{name}", Pure.displayTextList(missing).join(", "))
         }
         tray._presentOrQueue("settings-restored", function() {
             promptWindow.present({
@@ -2257,7 +2220,7 @@ SystemTrayIcon {
                 : tray.tr("notifications.local-networks.body-open",
                     "Your home network's IPv6 addresses {cidr} on {adapter} are closed while routed traffic is blocked. Open them to devices on this network?"))
                 .replace("{cidr}", String(first.cidr || ""))
-                .replace("{adapter}", String(first.adapter || ""))
+                .replace("{adapter}", Pure.displayText(first.adapter))
             tray._offerNotice("local-networks", "local-networks", function() {
                 promptWindow.present({
                     titleText: tray.tr("notifications.local-networks.title",
@@ -2303,8 +2266,8 @@ SystemTrayIcon {
                     "This network looks suspicious"),
                 bodyText: tr("notifications.local-network-too-wide.body",
                         "{adapter} reports {network} as its local network — far wider than any local network can be. It is not treated as local: devices on it stay blocked while leak protection is on, and sites inside it still follow your rules.")
-                    .replace("{adapter}", adapter)
-                    .replace("{network}", network),
+                    .replace("{adapter}", Pure.displayText(adapter))
+                    .replace("{network}", Pure.displayText(network)),
                 dismissActionId: "enforcement-dismiss",
                 autoRetireMs: tray._enforcementNoticeMs
             })
@@ -2329,7 +2292,7 @@ SystemTrayIcon {
                     "The additional route is not assigned"),
                 bodyText: tr("notifications.unassigned-tunnel.body",
                         "{adapter} is up, but no connection is assigned to the additional route — so the sites your rules send there will not open.")
-                    .replace("{adapter}", adapter),
+                    .replace("{adapter}", Pure.displayText(adapter)),
                 primaryAction: {
                     label: tr("notifications.unassigned-tunnel.action", "Assign it now"),
                     actionId: "enforcement-open-interfaces",
@@ -2475,7 +2438,7 @@ SystemTrayIcon {
                     "New application rule is settling in"),
                 bodyText: tr("notifications.app-rule-learning.body",
                         "{apps}: the service is still learning which addresses this program uses, so its first connection attempts may fail. Restart the program if it is already open.")
-                    .replace("{apps}", apps.join(", ")),
+                    .replace("{apps}", Pure.displayTextList(apps).join(", ")),
                 dismissActionId: "enforcement-dismiss",
                 autoRetireMs: tray._enforcementNoticeMs
             })
@@ -2490,7 +2453,7 @@ SystemTrayIcon {
         if (offers.length === 0 || !showNotifications) return
         if (_windowOnScreen()) return
         var names = []
-        for (var i = 0; i < offers.length; i += 1) names.push(offers[i].name)
+        for (var i = 0; i < offers.length; i += 1) names.push(Pure.displayText(offers[i].name))
         _presentOrQueue("vpn-client-trust", function() {
             promptWindow.present({
                 titleText: tr("notifications.vpn-client-trust.title", "Is this your VPN?"),
@@ -2608,6 +2571,52 @@ SystemTrayIcon {
         })
     }
 
+    /// The connection last announced as carrying this user's traffic for
+    /// another user ("" while it does not), so the same is not raised twice.
+    property string _trafficCarriedShown: ""
+
+    /// What this user's rules do not route rides another signed-in user's
+    /// tunnel. Said once per change; when it ends, a notice still waiting is
+    /// dropped.
+    function _onTrafficCarriedByAnotherUser(event) {
+        if (event.carried !== true) {
+            _trafficCarriedShown = ""
+            var kept = _noticeQueue.filter(function(n) { return n.kind !== "traffic-carried" })
+            if (kept.length !== _noticeQueue.length) _noticeQueue = kept
+            return
+        }
+        var link = Pure.displayText(String(event.link || ""))
+        var signature = "carried|" + link
+        if (_trafficCarriedShown === signature) return
+        _trafficCarriedShown = signature
+        if (!showNotifications) {
+            console.log("tray traffic-carried notice: suppressed, notifications are off")
+            return
+        }
+        var presence = guiPresence ? guiPresence.read() : { windowActive: false }
+        if (presence.windowActive) return
+        _offerNotice("traffic-carried", "traffic-carried", function() {
+            if (tray._trafficCarriedShown !== signature) {
+                tray._scheduleDrain()
+                return
+            }
+            var body = link !== ""
+                ? tr("notifications.traffic-carried.body",
+                    "Another user of this computer signed in earlier and sends all their traffic through the tunnel \"{link}\". This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.")
+                    .replace("{link}", function() { return link })
+                : tr("notifications.traffic-carried.body-unnamed",
+                    "Another user of this computer signed in earlier and sends all their traffic through their tunnel. This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.")
+            promptWindow.present({
+                titleText: tr("notifications.traffic-carried.title",
+                    "Your traffic goes through another user's tunnel"),
+                bodyText: body,
+                secondaryAction: tray._noticeMuteAction("traffic-carried"),
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
     function _onEnforcementStatusChanged(event) {
         var status = String(event.status || "")
         var role = String(event.role || "")
@@ -2620,6 +2629,13 @@ SystemTrayIcon {
                     function(r) { return r !== role })
                 _noteEnforcementRestored()
             }
+            return
+        }
+        // Not up since the service started and still within its wait: the
+        // VPN is coming up, which is neither an outage now nor news later.
+        if (event.quiet === true) {
+            _enforcementDownRoles = _enforcementDownRoles.filter(
+                function(r) { return r !== role })
             return
         }
         if (!wasDown) _enforcementDownRoles = _enforcementDownRoles.concat([role])
@@ -2638,12 +2654,13 @@ SystemTrayIcon {
         var routine = status === "secondary-down" && role !== "primary"
         var title = ""
         var body = ""
+        var suggestedPrimary = ""
         if (status === "adapter-choice-needed") {
             title = tr("notifications.enforcement.adapter-choice.title",
                 "Choose which adapter to use")
             body = tr("notifications.enforcement.adapter-choice.body",
                     "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}")
-                .replace("{list}", candidates.join(", "))
+                .replace("{list}", Pure.displayTextList(candidates).join(", "))
         } else if (status === "adapter-gone") {
             // A vendor that replaced its adapter outright, a driver that no
             // longer starts, a connection removed by hand. The cause differs,
@@ -2654,7 +2671,7 @@ SystemTrayIcon {
             body = candidates.length > 0
                 ? tr("notifications.enforcement.adapter-gone.body",
                         "The connection your rules were set to use is no longer on this computer, so the rules are not being applied. Pick another one: {list}")
-                    .replace("{list}", candidates.join(", "))
+                    .replace("{list}", Pure.displayTextList(candidates).join(", "))
                 : tr("notifications.enforcement.adapter-gone.body-empty",
                     "The connection your rules were set to use is no longer on this computer, and there is nothing to replace it with right now.")
         } else if (status === "adapter-failed") {
@@ -2667,7 +2684,7 @@ SystemTrayIcon {
             body = candidates.length > 0
                 ? tr("notifications.enforcement.adapter-failed.body",
                         "The connection your rules use is still installed, but its driver will not start, so the rules are not being applied. Reinstall it, or pick another one: {list}")
-                    .replace("{list}", candidates.join(", "))
+                    .replace("{list}", Pure.displayTextList(candidates).join(", "))
                 : tr("notifications.enforcement.adapter-failed.body-empty",
                     "The connection your rules use is still installed, but its driver will not start, and there is nothing to replace it with right now. Reinstalling it usually helps.")
         } else if (status === "no-primary-route") {
@@ -2680,6 +2697,15 @@ SystemTrayIcon {
                 "The main connection has no way to the internet")
             body = tr("notifications.enforcement.primary-no-way-out.body",
                 "The connection chosen as main has no gateway, so traffic your rules do not route is going out the way the system sends it instead. Choose the connection that actually reaches the internet as main.")
+        } else if (status === "no-policy" && candidates.length > 0) {
+            // The service names the one connection the route table points at;
+            // a press here binds it, nothing else does.
+            suggestedPrimary = String(candidates[0])
+            title = tr("notifications.enforcement.no-policy.suggest-title",
+                    "Confirm your main connection: {name}")
+                .replace("{name}", Pure.displayText(suggestedPrimary))
+            body = tr("notifications.enforcement.no-policy.suggest-body",
+                "Nothing is routed until you confirm it. Rules for the additional connection wait until you choose one.")
         } else if (status === "no-policy") {
             title = tr("notifications.enforcement.no-policy.title",
                 "Connections are not chosen yet")
@@ -2714,19 +2740,28 @@ SystemTrayIcon {
         // and a downed secondary are two questions, and the newer one must not
         // silently replace the older in the queue.
         var queueKind = "enforcement-status:" + role
+        var openInterfaces = {
+            label: tr("notifications.enforcement.action", "Open interfaces"),
+            actionId: "enforcement-open-interfaces",
+            accent: true
+        }
         var show = function() {
             tray._enforcementNoticeKind = queueKind
+            tray._suggestedPrimaryName = suggestedPrimary
             promptWindow.present({
                 titleText: title,
                 bodyText: body,
-                primaryAction: {
-                    label: tr("notifications.enforcement.action", "Open interfaces"),
-                    actionId: "enforcement-open-interfaces",
-                    accent: true
-                },
+                primaryAction: suggestedPrimary !== ""
+                    ? { label: tr("action.confirm", "Confirm"),
+                        actionId: "enforcement-confirm-primary", accent: true }
+                    : openInterfaces,
                 // Only a switched-off tunnel may be silenced; every other state
                 // here is a fault the user has to fix.
-                secondaryAction: routine ? tray._noticeMuteAction("secondary-down") : null,
+                secondaryAction: suggestedPrimary !== ""
+                    ? { label: tr("notifications.enforcement.no-policy.choose-other",
+                            "Choose another"),
+                        actionId: "enforcement-open-interfaces" }
+                    : (routine ? tray._noticeMuteAction("secondary-down") : null),
                 dismissActionId: "enforcement-dismiss",
                 autoRetireMs: tray._enforcementNoticeMs
             })
@@ -2745,6 +2780,52 @@ SystemTrayIcon {
         })
     }
 
+    /// "Confirm" on the suggested main connection: bind that row as main and
+    /// leave every other field as the service holds it. When the name no longer
+    /// picks exactly one row, the interfaces window takes the choice.
+    function _confirmSuggestedPrimary(name) {
+        if (!bridgeAvailable || typeof nrrNativeBridge === "undefined"
+                || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcSnapshotInterfacesGet !== "function"
+                || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function"
+                || typeof nrrNativeBridge.rpcRoutePolicyUpdate !== "function") {
+            triggerAction("interfaces-routes")
+            return
+        }
+        var rowsCorr = nrrNativeBridge.rpcSnapshotInterfacesGet()
+        rpc.registerRpcCallback(rowsCorr, function(ok, payload) {
+            var binding = ok
+                ? Pure.suggestedPrimaryBinding((payload && payload.rows) || [], name) : null
+            if (binding === null) {
+                console.log("tray primary suggestion: no single row answers to it; choosing in the window")
+                tray.triggerAction("interfaces-routes")
+                return
+            }
+            var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
+            tray.rpc.registerRpcCallback(readCorr, function(ok2, snapshot, code2, msg2) {
+                if (!ok2) {
+                    console.warn("tray primary suggestion: policy read failed:", code2, msg2)
+                    tray.triggerAction("interfaces-routes")
+                    return
+                }
+                var cur = (snapshot && (snapshot["route-policy"] || snapshot.routePolicy)) || {}
+                var req = tray._buildFullRoutePolicyReq(cur)
+                req.primary = binding
+                req["apply-only"] = ["primary"]
+                var writeCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
+                tray.rpc.registerRpcCallback(writeCorr, function(ok3, p3, code3, msg3) {
+                    if (!ok3) {
+                        console.warn("tray primary suggestion: write failed:", code3, msg3)
+                        tray.triggerAction("interfaces-routes")
+                        return
+                    }
+                    tray._recordIntent({ "namespace": "route-policy",
+                                         "merge": { "primary": binding } })
+                })
+            })
+        })
+    }
+
     /// Second step of "To additional route": the action changes routing, so it
     /// gets its own yes/no instead of firing straight off the first click —
     /// same two-step shape as `_confirmAutoRulesAlways`.
@@ -2760,7 +2841,7 @@ SystemTrayIcon {
             titleText: targets.length === 1
                 ? tr("tray.block-notice.route-confirm.title",
                     "Route {name} via the additional link?")
-                    .replace("{name}", targets[0])
+                    .replace("{name}", Pure.displayText(targets[0]))
                 : tr("tray.block-notice.route-confirm.title-many",
                     "Route {count} addresses via the additional link?")
                     .replace("{count}", String(targets.length)),
@@ -2852,7 +2933,7 @@ SystemTrayIcon {
     /// the user has to answer from memory — but a full FQDN or a long
     /// executable name would push the footer into extra rows, so it is cut.
     function _blockNoticeMuteName(text) {
-        var name = String(text)
+        var name = Pure.displayText(text)
         return name.length > 28 ? name.slice(0, 27) + "…" : name
     }
 
@@ -2916,7 +2997,7 @@ SystemTrayIcon {
             case "not-covered-by-rules":
                 return tr("block-reason.not-covered-by-rules", "Addresses no rule covers")
             case "blocked-by-rule":
-                return tr("block-reason.blocked-by-rule", "Blocks by rule")
+                return tr("block-reason.blocked-by-rule", "Denied by rules")
             case "ipv6-blocked":
                 return tr("block-reason.ipv6-blocked", "IPv6 blocks")
             case "dns-lockdown":
@@ -3102,6 +3183,12 @@ SystemTrayIcon {
             _scheduleDrain()
             return
         }
+        if (action === "enforcement-confirm-primary") {
+            _enforcementNoticeKind = ""
+            _confirmSuggestedPrimary(_suggestedPrimaryName)
+            _scheduleDrain()
+            return
+        }
         if (action === "rule-duplicates-open-rules") {
             triggerAction("rules")
             _scheduleDrain()
@@ -3136,6 +3223,12 @@ SystemTrayIcon {
             return
         }
         if (action === "auto-rules-reload-dismiss" || action === "tray-add-rule-dismiss") {
+            _addRuleUndo = null
+            _scheduleDrain()
+            return
+        }
+        if (action === "tray-add-rule-undo") {
+            _undoAddRule()
             _scheduleDrain()
             return
         }
@@ -4152,7 +4245,7 @@ SystemTrayIcon {
                 "The service blocked {count} connection(s) while NetRuleRouter was not open.")
             .replace("{count}", "<b>" + String(count) + "</b>")
         if (names.length > 0) {
-            var list = names.map(function(n) { return _escapeMarkup(n) }).join(", ")
+            var list = names.map(function(n) { return _escapeMarkup(Pure.displayText(n)) }).join(", ")
             if (summary.more > 0) {
                 list = list + ", "
                     + tr("notifications.block-notice.backlog.more", "and {count} more")

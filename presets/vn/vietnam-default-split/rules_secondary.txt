@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 8
 # name: Vietnam Default Split - Secondary Route
 # description: Medium, Reddit and Telegram, blocked or restricted by Vietnamese ISPs, routed to secondary
 # author: NetRuleRouter contributors
@@ -15,9 +15,8 @@
 *.redditstatic.com  # Reddit: blocked on part of the networks of a major ISP
 *.redditmedia.com  # Reddit: blocked on part of the networks of a major ISP
 
-*.telegram.org  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
+telegram.*  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
 *.t.me  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
-*.telegram.me  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
 *.telesco.pe  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
 
 --- IP

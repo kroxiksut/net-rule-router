@@ -23,6 +23,7 @@ Notifications:
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the listed programs as your VPN, so leak protection keeps them working
+  p: confirm the suggested main connection; another one is chosen under Interfaces and routes
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Suggested addresses
@@ -37,6 +38,7 @@ Addresses your sites need:
 Suggested addresses:
 Commands on this screen:
   a and an item number, for example a 2: add that item to the additional route
+  z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
@@ -69,6 +71,7 @@ Suggested addresses:
        The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
 Commands on this screen:
   a and an item number, for example a 2: add that item to the additional route
+  z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
@@ -101,6 +104,7 @@ Suggested addresses:
        The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
 Commands on this screen:
   a and an item number, for example a 2: add that item to the additional route
+  z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
@@ -135,6 +139,7 @@ Suggested addresses:
        The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
 Commands on this screen:
   a and an item number, for example a 2: add that item to the additional route
+  z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
@@ -170,6 +175,7 @@ Suggested addresses:
        The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
 Commands on this screen:
   a and an item number, for example a 2: add that item to the additional route
+  z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
@@ -203,6 +209,7 @@ Suggested addresses:
        The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
 Commands on this screen:
   a and an item number, for example a 2: add that item to the additional route
+  z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
@@ -237,6 +244,7 @@ Suggested addresses:
        The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
 Commands on this screen:
   a and an item number, for example a 2: add that item to the additional route
+  z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
   r and an item number: allow that item to be suggested again
   m and an item number: add that item and add suggestions automatically from now on (asks first)
