@@ -61,7 +61,7 @@ sha2 = "0.10"
 # PresetExportGet and SettingsExportFull responses wrap
 # file bytes in base64 (RFC 4648 standard alphabet, padded) so the
 # wire framing stays text-safe.
-base64 = "0.22"
+base64 = "0.23"
 # Fake-IP: the userspace TCP/IP stack that terminates
 # flows addressed to the fake pool. Minimal feature set — IP medium only
 # (the TUN adapter is L3), v4+v6, TCP sockets; UDP replies are hand-built

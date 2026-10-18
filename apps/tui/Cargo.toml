@@ -44,7 +44,7 @@ idna = "1"
 sha2 = "0.10"
 # Rule-set bytes for the preset import, which the service takes base64-encoded.
 # The version the service already links.
-base64 = "0.22"
+base64 = "0.23"
 # Log and trace times in the reader's local time, as the GUI shows them. The
 # same features the launcher and diagnostics already link: nothing new built.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
