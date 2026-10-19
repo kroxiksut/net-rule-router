@@ -316,8 +316,8 @@ impl ProductionPrincipalPlanSource {
         // and a plan built without that would pin nothing.
         // Without a policy or rules nothing is planned, so nothing conflicts.
         let Some(policy) = self.policy.load_for_sid(stored) else {
-            self.publish_conflicts(stored, None);
-            return None;
+            // Routing needs connections; a deny does not.
+            return self.plan_denies_without_policy(principal);
         };
         timings.mark("policy");
         let Some(rules) = self.rules.active_rules_for(stored) else {
@@ -537,6 +537,79 @@ impl ProductionPrincipalPlanSource {
                 principal: PlanPrincipal::from_stored(stored).ok()?,
                 flows,
                 routes,
+                policy_rules: Vec::new(),
+            },
+            coverage,
+        ))
+    }
+}
+
+impl ProductionPrincipalPlanSource {
+    /// The plan of a user with no route policy: their denies, through the same
+    /// planner as everyone's, and nothing that needs a connection.
+    fn plan_denies_without_policy(
+        &self,
+        principal: &UserPrincipal,
+    ) -> Option<(EnforcementPlan, PlanCoverage)> {
+        let stored = principal.as_stored();
+        let Some(rules) = self
+            .rules
+            .active_rules_for(stored)
+            .filter(|r| crate::rule_book_facts::has_deny_rules(&r.rule_book))
+        else {
+            self.publish_conflicts(stored, None);
+            return None;
+        };
+        let secondary_ip_denylist = crate::secondary_ip_policy::secondary_ip_denylist(
+            &rules.rule_book.secondary,
+            self.fqdn_cache.as_ref(),
+            nrr_domain::shared_ip::SharedIpPolicy::default(),
+        );
+        let ipv6 = match self.machine_reading() {
+            Some(reading) => crate::enforcement_planner::Ipv6Guard::from_links(
+                reading.adapters().unwrap_or_default(),
+                None,
+            ),
+            None => crate::enforcement_planner::Ipv6Guard::Off,
+        };
+        let own_observations = self.app_observations.for_principal(stored);
+        let input = PlannerInput {
+            fqdn_cache: self.fqdn_cache.as_ref(),
+            app_resolver: self.app_resolver.as_ref(),
+            app_observations: own_observations
+                .as_deref()
+                .unwrap_or(self.app_observations.as_ref()),
+            zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
+            secondary_ip_denylist: &secondary_ip_denylist,
+            ipv6,
+            packet_blocks: self.rules.rules_are_baseline_for(stored),
+        };
+        let (mut flows, report) = plan_route_rules(
+            &rules.rule_book,
+            stored,
+            RouteBehaviorMode::PreferPrimary,
+            &input,
+        );
+        self.publish_conflicts(stored, Some((&report, &rules.rule_book)));
+        // A permit rides a route or carves a hole in a guard; neither exists
+        // here, and a narrower rule inside a deny is already cut out of it.
+        flows.retain(|f| f.verdict == Verdict::Block);
+        if flows.is_empty() {
+            return None;
+        }
+        let coverage = PlanCoverage {
+            rule_driven_flows: flows.len(),
+            fail_closed_blocks: 0,
+            guard_holding: false,
+            route_intents: 0,
+            kill_switch_complete: true,
+        };
+        Some((
+            EnforcementPlan {
+                principal: PlanPrincipal::from_stored(stored).ok()?,
+                flows,
+                routes: Vec::new(),
                 policy_rules: Vec::new(),
             },
             coverage,
@@ -1964,6 +2037,7 @@ mod tests {
         app_scoped.app_match = Some(CanonicalAppMatch {
             pattern: CanonicalAppPattern::Exact("app".into()),
             include_child_processes: false,
+            override_requested: false,
         });
         let rule_book = CanonicalRuleBook {
             primary: CanonicalRuleSet::from_rules(vec![
@@ -1985,6 +2059,7 @@ mod tests {
                     app_match: Some(CanonicalAppMatch {
                         pattern: CanonicalAppPattern::Exact("not-installed-app".into()),
                         include_child_processes: false,
+                        override_requested: false,
                     }),
                     ..rule(
                         "r-app",
@@ -2144,6 +2219,54 @@ mod tests {
     #[test]
     fn a_principal_without_stored_policy_plans_nothing() {
         assert!(source(Arc::new(NoRules), Arc::new(NoPolicy))
+            .plan_for(&user(), availability(true))
+            .is_none());
+    }
+
+    /// A deny on a literal address beside a routing rule on another.
+    struct DenyAndRoute;
+    impl RulesProvider for DenyAndRoute {
+        fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+            let rule = |id: &str, ip: Ipv4Addr, action| CanonicalRule {
+                id: RuleId(id.into()),
+                enabled: true,
+                address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(ip))),
+                app_match: None,
+                comment: String::new(),
+                action,
+                origin: None,
+            };
+            Some(ActiveRulesSnapshot {
+                rule_book: CanonicalRuleBook {
+                    primary: CanonicalRuleSet::from_rules(vec![rule(
+                        "deny-0",
+                        Ipv4Addr::new(203, 0, 113, 99),
+                        RuleAction::Block,
+                    )]),
+                    secondary: CanonicalRuleSet::from_rules(vec![rule(
+                        "s-0",
+                        SECONDARY_HOST,
+                        RuleAction::Route,
+                    )]),
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn a_principal_without_stored_policy_still_gets_their_denies() {
+        let plan = source(Arc::new(DenyAndRoute), Arc::new(NoPolicy))
+            .plan_for(&user(), availability(true))
+            .expect("the deny needs no route policy")
+            .plan;
+        assert!(!plan.flows.is_empty());
+        assert!(plan.flows.iter().all(|f| f.verdict == Verdict::Block));
+        assert!(plan.routes.is_empty());
+    }
+
+    #[test]
+    fn a_principal_without_stored_policy_and_without_denies_plans_nothing() {
+        assert!(source(Arc::new(OneSecondaryRule), Arc::new(NoPolicy))
             .plan_for(&user(), availability(true))
             .is_none());
     }

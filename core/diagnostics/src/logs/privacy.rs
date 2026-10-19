@@ -61,6 +61,8 @@ const SENSITIVE_FIELDS: &[&str] = &[
     "apps",
     "launched_by",
     "pattern",
+    // An application rule's value: a path on this machine.
+    "rule",
     "patterns",
     "program",
     // Files on this machine: the folder, a backup, a log file's name.

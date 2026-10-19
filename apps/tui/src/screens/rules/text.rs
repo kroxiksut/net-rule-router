@@ -60,6 +60,40 @@ pub const APP_NOT_LEAKPROOF: Key = key(
     "rules.application-not-leakproof",
     "On this system an application rule is not airtight: connections the app makes before it is recognised can still get through.",
 );
+/// A rule by folder and the scripts its folder holds.
+pub const APP_FOLDER_SCRIPTS: Key = key(
+    "rules.application-folder-scripts",
+    "Scripts from this folder follow the rule too, even when an interpreter installed elsewhere runs them (a .py, .ps1, .bat, .sh or .jar file, say): from the moment their first connection is seen.",
+);
+pub const PATH_COUNTING: Key = key("dialog.rule.path.counting", "Counting the programs...");
+pub const PATH_COUNT: Key = key("dialog.rule.path.count", "Programs covered now: {count}.");
+pub const PATH_COUNT_MORE: Key = key(
+    "dialog.rule.path.count-more",
+    "Programs covered now: the first {count}. The folder holds more than one rule covers.",
+);
+pub const PATH_MISSING: Key = key(
+    "dialog.rule.path.missing",
+    "Nothing is there yet: the rule takes effect once the program or folder appears.",
+);
+pub const PATH_PLACE: Key = key("dialog.rule.path.place", "For you this is {place}.");
+pub const PATH_UNSUPPORTED: Key = key(
+    "dialog.rule.path.unsupported",
+    "This system does not apply rules by path yet.",
+);
+pub const PATH_ANYONE_CAN_WRITE: Key = key(
+    "dialog.rule.path.anyone-can-write",
+    "Anyone can put a program here, so the rule may cover programs you did not install. A program here is never exempt from leak protection.",
+);
+pub const PATH_INCLUDE_SUBFOLDERS: Key =
+    key("dialog.rule.path.include-subfolders", "Include subfolders");
+pub const PATH_SUBFOLDERS_KEY: Key = key(
+    "tui.rules.form-subfolders",
+    "Ctrl+F, or !f in line mode: with subfolders or without",
+);
+pub const APP_FOLDER_SCRIPTS_DENY: Key = key(
+    "rules.application-folder-scripts-deny",
+    "A deny by folder stops the programs in it, but not for certain a script from it that an interpreter installed elsewhere runs.",
+);
 /// What an application rule does, in the words of the window's form for this
 /// platform: Windows names the program by its executable, Linux by process.
 pub const APP_ROUTING_NOTE: Key = key(
@@ -866,9 +900,161 @@ pub const PLAIN_RECENT: Key = key(
     "R: recent changes. U: put a deleted rule back",
 );
 
+// ── Rules applied despite the protection of system programs ──
+pub const FILTER_OVERRIDDEN: Key = key(
+    "rules.filter.enabled.overridden",
+    "Allowed despite protection",
+);
+pub const OVERRIDE_GRANTED_MARK: Key = key(
+    "rules.override.badge.granted",
+    "Allowed despite protection \u{b7} {left}",
+);
+pub const OVERRIDE_PENDING_MARK: Key =
+    key("rules.override.badge.pending", "Needs your confirmation");
+pub const OVERRIDE_TITLE: Key = key(
+    "rules.override.dialog.title",
+    "Apply despite the protection?",
+);
+pub const OVERRIDE_READING: Key = key(
+    "rules.override.dialog.reading",
+    "Reading what the rule would take...",
+);
+pub const OVERRIDE_PROGRAMS: Key = key(
+    "rules.override.dialog.programs",
+    "Programs it takes: {count}.",
+);
+pub const OVERRIDE_PROGRAMS_OVER_CAP: Key = key(
+    "rules.override.dialog.programs-over-cap",
+    "Programs it takes: more than {count}.",
+);
+pub const OVERRIDE_CRITICAL: Key = key(
+    "rules.override.dialog.critical",
+    "System processes it takes: {list}.",
+);
+pub const OVERRIDE_ACCOUNTS: Key = key(
+    "rules.override.dialog.accounts",
+    "Running under service accounts: {list}.",
+);
+pub const OVERRIDE_OTHER_USERS: Key = key(
+    "rules.override.dialog.other-users",
+    "Other users run what it takes: {count}.",
+);
+pub const OVERRIDE_BREAKS: Key = key(
+    "rules.override.dialog.breaks",
+    "What may stop working: {list}.",
+);
+pub const OVERRIDE_ADMINISTRATOR: Key = key(
+    "rules.override.dialog.administrator",
+    "It reaches past your own programs, so confirming it needs administrator rights.",
+);
+pub const OVERRIDE_TERM: Key = key("rules.override.dialog.term", "Applies for");
+pub const OVERRIDE_TYPE: Key = key(
+    "rules.override.dialog.type",
+    "To confirm, type the rule's value: {value}",
+);
+pub const OVERRIDE_REVOKED: Key = key(
+    "rules.override.revoked",
+    "The protection holds {value} again.",
+);
+pub const OVERRIDE_GRANTED: Key = key(
+    "tui.rules.override.granted",
+    "{value} applies despite the protection for the term you chose.",
+);
+pub const OVERRIDE_FAILED: Key = key(
+    "tui.rules.override.failed",
+    "The confirmation did not go through: {error}",
+);
+pub const NEEDS_ADMINISTRATOR: Key = key(
+    "tui.rules.override.needs-administrator",
+    "This confirmation needs administrator rights: confirm it in the NetRuleRouter window, or start the terminal as administrator.",
+);
+pub const OVERRIDE_NOTHING: Key = key(
+    "tui.rules.override.nothing",
+    "This rule does not ask to apply despite the protection: add +override after its value and apply the rules first.",
+);
+pub const OVERRIDE_MISMATCH: Key = key(
+    "tui.rules.override.mismatch",
+    "The value typed does not name the rule; type it in full.",
+);
+pub const OVERRIDE_SENDING: Key = key(
+    "tui.rules.override.sending",
+    "Confirming... An administrator's password may be asked here.",
+);
+pub const OVERRIDE_KEYS: Key = key(
+    "tui.rules.override.keys",
+    "Left and Right choose the term, Enter confirms once the value is typed, Esc cancels.",
+);
+pub const OVERRIDE_PLAIN_PROMPT: Key = key(
+    "tui.rules.override.plain-prompt",
+    "Type the rule's value to confirm, 1-4 to choose the term, ! to cancel",
+);
+pub const OVERRIDE_ENDED_TITLE: Key = key(
+    "notifications.rule-override-ended.title",
+    "The protection holds a rule again",
+);
+pub const OVERRIDE_ENDED_BODY: Key = key(
+    "notifications.rule-override-ended.body",
+    "The term you confirmed has ended for {rules}. The rule is not applied until you confirm it again in the rules list.",
+);
+pub const OVERRIDE_WITHDRAWN_TITLE: Key = key(
+    "notifications.rule-override-withdrawn.title",
+    "Confirmations were withdrawn",
+);
+pub const OVERRIDE_WITHDRAWN_BODY: Key = key(
+    "notifications.rule-override-withdrawn.body",
+    "Confirmations of protected rules were withdrawn: the service stopped unexpectedly several times in a row. The rules are not applied until you confirm them again in the rules list.",
+);
+pub const OVERRIDE_RECHECK_TITLE: Key = key(
+    "notifications.rule-override-recheck.title",
+    "A rule needs a new confirmation",
+);
+pub const OVERRIDE_RECHECK_BODY: Key = key(
+    "notifications.rule-override-recheck.body",
+    "A service now runs what {rules} takes, which your confirmation did not cover. The rule is not applied until you confirm it again in the rules list.",
+);
+pub const HELP_OVERRIDE: Key = key(
+    "tui.rules.help.override",
+    "Shift+P: apply a protected rule despite the protection (it needs +override after its value), or take the confirmation back",
+);
+pub const PLAIN_OVERRIDE: Key = key(
+    "tui.rules.plain.override",
+    "P and a rule number: confirm a protected rule, or take the confirmation back",
+);
+
 /// Every key above, for the test that holds both locale files to them.
 #[cfg(test)]
 pub const ALL: &[Key] = &[
+    FILTER_OVERRIDDEN,
+    OVERRIDE_GRANTED_MARK,
+    OVERRIDE_PENDING_MARK,
+    OVERRIDE_TITLE,
+    OVERRIDE_READING,
+    OVERRIDE_PROGRAMS,
+    OVERRIDE_PROGRAMS_OVER_CAP,
+    OVERRIDE_CRITICAL,
+    OVERRIDE_ACCOUNTS,
+    OVERRIDE_OTHER_USERS,
+    OVERRIDE_BREAKS,
+    OVERRIDE_ADMINISTRATOR,
+    OVERRIDE_TERM,
+    OVERRIDE_TYPE,
+    OVERRIDE_REVOKED,
+    OVERRIDE_GRANTED,
+    OVERRIDE_FAILED,
+    NEEDS_ADMINISTRATOR,
+    OVERRIDE_NOTHING,
+    OVERRIDE_MISMATCH,
+    OVERRIDE_SENDING,
+    OVERRIDE_KEYS,
+    OVERRIDE_PLAIN_PROMPT,
+    OVERRIDE_ENDED_TITLE,
+    OVERRIDE_ENDED_BODY,
+    OVERRIDE_WITHDRAWN_TITLE,
+    OVERRIDE_WITHDRAWN_BODY,
+    OVERRIDE_RECHECK_TITLE,
+    OVERRIDE_RECHECK_BODY,
+    HELP_OVERRIDE,
+    PLAIN_OVERRIDE,
     TITLE_BASELINE,
     BASELINE_NOTE,
     BOOK_BASELINE,
@@ -906,6 +1092,17 @@ pub const ALL: &[Key] = &[
     VERIFY_ANY_ZONE,
     VERIFY_DENY,
     APP_NOT_LEAKPROOF,
+    APP_FOLDER_SCRIPTS,
+    APP_FOLDER_SCRIPTS_DENY,
+    PATH_COUNTING,
+    PATH_COUNT,
+    PATH_COUNT_MORE,
+    PATH_MISSING,
+    PATH_PLACE,
+    PATH_UNSUPPORTED,
+    PATH_ANYONE_CAN_WRITE,
+    PATH_INCLUDE_SUBFOLDERS,
+    PATH_SUBFOLDERS_KEY,
     APP_ROUTING_NOTE,
     APP_ROUTING_NOTE_LINUX,
     VERDICTS_TITLE,

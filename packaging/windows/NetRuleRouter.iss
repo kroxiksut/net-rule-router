@@ -236,8 +236,9 @@ begin
     ProvisionExitCode := RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'),
       '-Action Provision -ProvisionSpec "' + ProvisionSpec() + '"');
     if ProvisionExitCode <> 0 then
-      SuppressibleMsgBox(FmtMessage(CustomMessage('ProvisionNotStaged'),
-        [IntToStr(ProvisionExitCode), ActionLog()]), mbError, MB_OK, IDOK);
+      { A line may not start with a bracket: Inno reads it as a section. }
+      SuppressibleMsgBox(FmtMessage(CustomMessage('ProvisionNotStaged'), [
+        IntToStr(ProvisionExitCode), ActionLog()]), mbError, MB_OK, IDOK);
   end;
   if RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), '-Action Register') <> 0 then
     SuppressibleMsgBox(FmtMessage(CustomMessage('ServiceRegisterFailed'), [ActionLog()]),

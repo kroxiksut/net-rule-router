@@ -1431,6 +1431,7 @@ fn normalize_app_match(
     Ok(CanonicalAppMatch {
         pattern: canonical_app_pattern(raw, glob, platform, rule_id, warnings)?,
         include_child_processes: app.include_child_processes,
+        override_requested: app.override_requested,
     })
 }
 

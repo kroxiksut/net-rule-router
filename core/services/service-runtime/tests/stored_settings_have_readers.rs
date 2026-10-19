@@ -1231,6 +1231,29 @@ fn capabilities() -> Vec<Capability> {
             )]),
         },
         Capability {
+            key: "appPathScripts",
+            windows: Backed(vec![
+                (
+                    "core/services/windows-service/src/runtime_deps/conn_trace.rs",
+                    ".with_script_launches(",
+                ),
+                (
+                    "core/platform/windows/src/process_launch.rs",
+                    "impl ProcessLaunchReader for WindowsProcessLaunches",
+                ),
+            ]),
+            linux: Backed(vec![
+                (
+                    "core/services/linux-service/src/runtime_deps/drop_observation.rs",
+                    "ScriptLaunches::new(Arc::new(LinuxProcessLaunches))",
+                ),
+                (
+                    "core/platform/linux/src/process_launch.rs",
+                    "impl ProcessLaunchReader for LinuxProcessLaunches",
+                ),
+            ]),
+        },
+        Capability {
             key: "perUserAllProtocolScoping",
             windows: NotOffered,
             linux: Backed(vec![("core/platform/linux/src/nft_ir.rs", "meta skuid")]),

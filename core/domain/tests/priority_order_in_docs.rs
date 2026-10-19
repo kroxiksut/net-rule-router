@@ -43,6 +43,7 @@ fn rule(id: &str, address: Option<CanonicalAddressMatch>) -> CanonicalRule {
         app_match: address.is_none().then(|| CanonicalAppMatch {
             pattern: CanonicalAppPattern::Exact(PROCESS.to_string()),
             include_child_processes: false,
+            override_requested: false,
         }),
         address_match: address,
         comment: String::new(),

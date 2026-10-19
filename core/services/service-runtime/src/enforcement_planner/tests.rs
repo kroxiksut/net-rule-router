@@ -163,6 +163,7 @@ fn app_rule(id: &str, pattern: &str, action: RuleAction) -> CanonicalRule {
         app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
             pattern: CanonicalAppPattern::Exact(pattern.into()),
             include_child_processes: false,
+            override_requested: false,
         }),
         comment: String::new(),
         action,
@@ -1857,6 +1858,7 @@ fn slice5_routes_match_current_codegen() {
                 app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
                     pattern: CanonicalAppPattern::Exact("messenger.exe".into()),
                     include_child_processes: false,
+                    override_requested: false,
                 }),
                 comment: String::new(),
                 action: RuleAction::Route,
@@ -2093,6 +2095,7 @@ fn an_app_and_address_rule_plans_nothing_and_is_reported() {
         combined.app_match = Some(CanonicalAppMatch {
             pattern: CanonicalAppPattern::Exact("chrome.exe".into()),
             include_child_processes: false,
+            override_requested: false,
         });
         let rule_book = book(vec![exact_ip_rule("p-plain", plain_ip)], vec![combined]);
         let (flows, report) = plan_route_rules(
@@ -2229,6 +2232,7 @@ fn a_folder_rule_plans_one_flow_and_routes_what_its_programs_used() {
             app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
                 pattern: CanonicalAppPattern::Path(Box::new(rule.clone())),
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action: RuleAction::Route,
@@ -2262,4 +2266,76 @@ fn a_folder_rule_plans_one_flow_and_routes_what_its_programs_used() {
         plan().iter().any(|f| f.flow.dst == DstMatch::HostV4(seen)),
         "the next plan routes what the folder's program used"
     );
+}
+
+/// A rules file line on another user's folder plans nothing and tells the
+/// Overlaps screen why.
+#[test]
+fn a_folder_in_another_users_profile_plans_nothing_and_says_so() {
+    use nrr_platform_api::app_folders::{AppPath, PathOutcome, PathPrograms};
+    let rule_text = if cfg!(windows) {
+        r"C:\Users\Bob\Tool\*"
+    } else {
+        "/home/bob/tool/*"
+    };
+    let rule = AppPath::parse(
+        rule_text,
+        nrr_domain::rules_file::HostPlatform::compiled().path_style(),
+    )
+    .expect("rule");
+    let resolver = nrr_platform_api::MockAppPathResolver::new().with_path_programs(
+        rule.as_str(),
+        "*",
+        PathPrograms {
+            outcome: PathOutcome::OtherUsersFolder,
+            place: None,
+            programs: Vec::new(),
+            over_cap: false,
+        },
+    );
+    let store = crate::app_observation_lookup::AppObservationStore::new();
+    let cache = MapCache::default();
+    let input = PlannerInput {
+        ipv6: Ipv6Guard::Off,
+        secondary_ip_denylist: NO_DENYLIST.get_or_init(HashSet::new),
+        fqdn_cache: &cache,
+        app_resolver: &resolver,
+        app_observations: &store,
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        packet_blocks: true,
+    };
+    let rule_book = book(
+        Vec::new(),
+        vec![CanonicalRule {
+            id: RuleId("r-other".into()),
+            enabled: true,
+            address_match: None,
+            app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
+                pattern: CanonicalAppPattern::Path(Box::new(rule)),
+                include_child_processes: false,
+                override_requested: false,
+            }),
+            comment: String::new(),
+            action: RuleAction::Route,
+            origin: None,
+        }],
+    );
+    let (flows, report) = plan_route_rules(
+        &rule_book,
+        "unix:uid:1000",
+        RouteBehaviorMode::PreferPrimary,
+        &input,
+    );
+    assert!(
+        flows
+            .iter()
+            .all(|f| !matches!(f.app, AppScope::Program { .. })),
+        "{flows:?}"
+    );
+    assert!(report.conflicts.contains(
+        &crate::rule_conflicts::RuleConflict::PathInOtherUsersProfile {
+            rule_id: "r-other".into(),
+        }
+    ));
 }

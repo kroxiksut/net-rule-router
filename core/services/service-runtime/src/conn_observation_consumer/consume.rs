@@ -97,6 +97,10 @@ impl ConnectionObservationConsumer {
             std::net::IpAddr,
             drop_reporter::PinDropVictims,
         > = std::collections::BTreeMap::new();
+        // A process connects many times a batch; its command line is asked
+        // about once.
+        let mut scripts_this_batch: std::collections::HashMap<u32, Vec<String>> =
+            std::collections::HashMap::new();
 
         for obs in batch {
             // Asked of EVERY observation, before the filter below keeps only
@@ -352,9 +356,21 @@ impl ConnectionObservationConsumer {
                     } else {
                         None
                     };
+                    let script_rules = self.script_rule_paths(
+                        &store,
+                        obs.pid,
+                        path,
+                        ScriptOwner {
+                            per_user,
+                            owner: rec.user_sid.as_deref(),
+                            active: active_sid_now.as_deref(),
+                        },
+                        &mut scripts_this_batch,
+                    );
                     for owner in collateral_pin_owners(
                         &store,
                         path,
+                        &script_rules,
                         crate::app_observation_lookup::own_process_key(),
                         &routed_apps,
                         rec.egress.role,
@@ -379,8 +395,11 @@ impl ConnectionObservationConsumer {
                     // process before the rule set is compiled against it, or a
                     // destination could be pinned in the same tick that proved
                     // somebody else was already using it.
-                    store.note_process_destination(path, rip);
+                    store.note_process_destination_running(path, obs.pid, &script_rules, rip);
                     if store.record(path, rip) {
+                        summary.app_ips_added += 1;
+                    }
+                    if store.record_for_rule_paths(&script_rules, rip) {
                         summary.app_ips_added += 1;
                     }
                 }
@@ -542,4 +561,41 @@ impl ConnectionObservationConsumer {
         seen.insert(owner.to_owned(), links);
         links
     }
+
+    /// The rule paths whose script the process `pid` runs, for its own
+    /// observations only.
+    fn script_rule_paths(
+        &self,
+        store: &AppObservationStore,
+        pid: u32,
+        image: &str,
+        whose: ScriptOwner<'_>,
+        memo: &mut std::collections::HashMap<u32, Vec<String>>,
+    ) -> Vec<String> {
+        let Some(launches) = self.script_launches.as_ref() else {
+            return Vec::new();
+        };
+        // One store serves the routing user's plan here. Machine accounts
+        // follow that user's rules, as their programs do; another person's
+        // script in that user's folder must not move the user's routes.
+        let credited = whose.per_user
+            || whose.owner.is_some_and(|owner| {
+                whose.active == Some(owner)
+                    || nrr_platform_api::types::is_service_account_sid(owner)
+            });
+        if !credited {
+            return Vec::new();
+        }
+        memo.entry(pid)
+            .or_insert_with(|| launches.rule_paths_run_by(store, pid, image))
+            .clone()
+    }
+}
+
+/// Whose observations a connection teaches.
+struct ScriptOwner<'a> {
+    /// The store is the connection owner's own.
+    per_user: bool,
+    owner: Option<&'a str>,
+    active: Option<&'a str>,
 }

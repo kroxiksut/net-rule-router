@@ -347,6 +347,7 @@ fn an_app_authored_program_rule_keeps_its_section_and_its_origin() {
         app_match: Some(crate::canonical::CanonicalAppMatch {
             pattern: crate::canonical::CanonicalAppPattern::Exact("client.exe".to_string()),
             include_child_processes: false,
+            override_requested: false,
         }),
         comment: "tunnel client".to_string(),
         action: crate::canonical::RuleAction::Route,

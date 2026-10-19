@@ -178,6 +178,12 @@ pub struct IpcHandlerDeps {
     /// "Is it us or the site?" for the caller. `None` keeps both
     /// `diagnostics.site-check.*` operations unimplemented.
     pub site_check: Option<Arc<crate::site_check::SiteChecker>>,
+    /// What a rule by program path covers for the caller. `None` keeps
+    /// `rules.app-path-coverage.get` unimplemented.
+    pub app_path_coverage: Option<Arc<crate::app_path_coverage::AppPathCoverage>>,
+    /// Confirming rules the protection of system programs refuses. `None`
+    /// keeps the three `rules.override.*` operations unimplemented.
+    pub rule_override: Option<Arc<crate::ipc_handlers::rule_override::RuleOverrideDeps>>,
     /// Records the sites the caller says refuse main-link addresses. `None`
     /// keeps `autorules.refusing-anchor.set` unimplemented.
     pub refusing_anchors: Option<Arc<dyn crate::ipc_handlers::providers::RefusingAnchorsWriter>>,
@@ -316,6 +322,8 @@ impl IpcHandlerDeps {
             local_networks: None,
             auto_rule_probe: None,
             site_check: None,
+            app_path_coverage: None,
+            rule_override: None,
             refusing_anchors: None,
             merge_preview_source: None,
             traffic_stats: None,
@@ -630,6 +638,24 @@ impl IpcHandlerDeps {
     /// Attach the site check (see [`Self::site_check`]).
     pub fn with_site_check(mut self, checker: Arc<crate::site_check::SiteChecker>) -> Self {
         self.site_check = Some(checker);
+        self
+    }
+
+    /// Attach the confirmations of protected rules (see [`Self::rule_override`]).
+    pub fn with_rule_override(
+        mut self,
+        overrides: Arc<crate::ipc_handlers::rule_override::RuleOverrideDeps>,
+    ) -> Self {
+        self.rule_override = Some(overrides);
+        self
+    }
+
+    /// Attach the rule form's count (see [`Self::app_path_coverage`]).
+    pub fn with_app_path_coverage(
+        mut self,
+        coverage: Arc<crate::app_path_coverage::AppPathCoverage>,
+    ) -> Self {
+        self.app_path_coverage = Some(coverage);
         self
     }
 

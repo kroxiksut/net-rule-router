@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::*;
-use crate::app_folders::PathStyle;
+use crate::app_folders::{path_programs_once, PathStyle};
 
 const OWNER: &str = "uid:1000";
 const OTHER: &str = "uid:1001";
@@ -275,5 +275,91 @@ fn a_folder_no_rule_asks_about_is_forgotten() {
         calls.load(Ordering::SeqCst),
         0,
         "a forgotten folder reports nothing"
+    );
+}
+
+/// Two users' homes, each holding `apps/run`.
+struct Homes;
+
+impl ProgramFolders for Homes {
+    fn path_style(&self) -> PathStyle {
+        PathStyle::Linux
+    }
+
+    fn place(&self, path: &Path) -> PlaceOnDisk {
+        if path.starts_with("/home/a/apps") || path.starts_with("/home/b/apps") {
+            PlaceOnDisk::Folder
+        } else {
+            PlaceOnDisk::Missing
+        }
+    }
+
+    fn real_path(&self, path: &Path) -> Option<PathBuf> {
+        Some(PathBuf::from(
+            path.to_string_lossy().trim_end_matches('/').to_string(),
+        ))
+    }
+
+    fn is_program(&self, _path: &Path) -> bool {
+        true
+    }
+
+    fn list(&self, folder: &Path, _subfolders: bool) -> FolderListing {
+        FolderListing {
+            programs: vec![folder.join("run")],
+            truncated: false,
+        }
+    }
+
+    fn foreign_profile(&self, place: &Path, owner: &str) -> bool {
+        (place.starts_with("/home/a") && owner != OWNER)
+            || (place.starts_with("/home/b") && owner != OTHER)
+    }
+
+    fn owner_profile(&self, owner: &str) -> Option<PathBuf> {
+        match owner {
+            OWNER => Some(PathBuf::from("/home/a")),
+            OTHER => Some(PathBuf::from("/home/b")),
+            _ => None,
+        }
+    }
+}
+
+/// One rule written from `~` covers each owner's own folder; an owner with no
+/// profile gets nothing rather than somebody else's.
+#[test]
+fn a_rule_from_the_home_folder_covers_each_owners_own() {
+    let index = ProgramFolderIndex::new(Arc::new(Homes));
+    let from_home = rule("~/apps/*");
+    assert_eq!(
+        index.programs(&from_home, OWNER).programs,
+        vec![PathBuf::from("/home/a/apps/run")]
+    );
+    assert_eq!(
+        index.programs(&from_home, OTHER).programs,
+        vec![PathBuf::from("/home/b/apps/run")]
+    );
+    let nobody = index.programs(&from_home, "baseline");
+    assert_eq!(nobody.outcome, PathOutcome::Missing);
+    assert!(nobody.programs.is_empty());
+}
+
+/// A literal path in another user's home is refused before the disk is
+/// looked at, by the index and by the one-off read alike.
+#[test]
+fn another_users_folder_is_refused_before_the_disk_is_read() {
+    let fake = Arc::new(FakeFolders {
+        profiles: vec![(OTHER, "/home/b")],
+        ..FakeFolders::holding(2)
+    });
+    let once = path_programs_once(fake.as_ref(), &rule("/home/b/app/*"), OWNER);
+    assert_eq!(once.outcome, PathOutcome::OtherUsersFolder);
+    assert_eq!(fake.places.load(Ordering::SeqCst), 0, "not even looked at");
+    let own = path_programs_once(fake.as_ref(), &rule("/home/b/app/*"), OTHER);
+    assert_eq!(own.outcome, PathOutcome::Found);
+    assert_eq!(own.programs.len(), 2);
+    assert!(
+        fake.callbacks.lock().expect("lock").is_empty(),
+        "nothing watched"
     );
 }

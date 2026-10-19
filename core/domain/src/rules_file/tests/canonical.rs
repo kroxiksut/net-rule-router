@@ -21,6 +21,7 @@ fn rule_with_app(
         app_match: Some(CanonicalAppMatch {
             pattern,
             include_child_processes: false,
+            override_requested: false,
         }),
         comment: comment.to_string(),
         action: crate::canonical::RuleAction::Route,

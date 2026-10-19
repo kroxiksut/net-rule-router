@@ -102,6 +102,7 @@ pub mod lower_windows;
 #[cfg(windows)]
 pub mod machine_environment;
 pub mod network_change;
+pub mod service_set_change;
 /// The Windows `EnforcementBackend` — the neutral plan reconciled onto WFP.
 pub mod wfp_backend;
 // Per-user environment mechanism behind
@@ -120,6 +121,8 @@ pub mod process_error_stream;
 // Process starts from ETW behind the neutral `ProcessLineagePort`: who launched
 // a blocked program.
 pub mod process_lineage;
+// How another process was started, so a rule by folder follows its scripts.
+pub mod process_launch;
 // The folders and search path a rule may not deny or route over the tunnel.
 #[cfg(windows)]
 pub mod protected_places;

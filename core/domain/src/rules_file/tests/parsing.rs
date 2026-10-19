@@ -132,6 +132,37 @@ fn the_children_flag_is_consumed_instead_of_corrupting_the_value() {
         .any(|e| e.match_value.contains("+childern")));
 }
 
+/// `+override` comes off a program's value as `+children` does and is kept as
+/// the request; written back it returns, in a program section only.
+#[test]
+fn the_override_request_is_read_and_written_on_program_lines() {
+    let input = "--- Domains\nexample.com +override\n\n--- Linux\n!/var/www/* +override  # site\n\
+                 # !/usr/bin/* +children +override\n";
+    let outcome = parse_rules_file(input);
+    let domain = &outcome.parsed.entries_for(RulesFileSection::Domains)[0];
+    assert_eq!(domain.match_value, "example.com");
+    assert!(
+        !domain.override_requested,
+        "a request means nothing off a program"
+    );
+    let programs = outcome.parsed.entries_for(RulesFileSection::Linux);
+    assert_eq!(programs[0].match_value, "/var/www/*");
+    assert!(programs[0].blocked && programs[0].override_requested && programs[0].enabled);
+    assert_eq!(programs[0].inline_comment.as_deref(), Some("site"));
+    assert_eq!(programs[1].match_value, "/usr/bin/*");
+    assert!(programs[1].override_requested && !programs[1].enabled);
+
+    let written = write_rules_file(&outcome.parsed, &[], None);
+    assert!(
+        written.contains("!/var/www/* +override  # site\n"),
+        "{written}"
+    );
+    assert!(written.contains("# !/usr/bin/* +override\n"), "{written}");
+    assert!(written.contains("example.com\n"), "{written}");
+    assert!(!written.contains("example.com +override"), "{written}");
+    assert_eq!(parse_rules_file(&written).parsed, outcome.parsed);
+}
+
 /// The retired suffix is neither a deny nor dropped: skipped, the line would
 /// become a route. It stays in the value, enabled or not, and the per-row
 /// verdict names the new spelling.

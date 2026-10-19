@@ -139,7 +139,7 @@ use std::collections::HashSet;
 /// It replaced a pinned COUNT, which could not see an operation removed and
 /// another added in the same change — and a prose comment that tried to
 /// enumerate the catalog and had drifted to naming 33 of 70.
-const PINNED_OPERATION_SLUGS: [&str; 82] = [
+const PINNED_OPERATION_SLUGS: [&str; 86] = [
     "audit.list",
     "autorules.candidates.accept",
     "autorules.candidates.dismiss",
@@ -191,8 +191,12 @@ const PINNED_OPERATION_SLUGS: [&str; 82] = [
     "route.policy.update",
     "routing.pause.get",
     "routing.pause.toggle",
+    "rules.app-path-coverage.get",
     "rules.list",
     "rules.merge-preview",
+    "rules.override.grant",
+    "rules.override.preview",
+    "rules.override.revoke",
     "rules.recent-changes.list",
     "rules.verify.verdicts.accept",
     "rules.verify.verdicts.dismiss",

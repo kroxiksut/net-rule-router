@@ -161,7 +161,10 @@ jobs:
       - name: Point Debian 10 at its archive
         if: matrix.image == 'debian:10'
         run: |
+          # The image's libc comes from the security updates: without them
+          # its -dev packages do not match and build-essential cannot install.
           echo 'deb http://archive.debian.org/debian buster main' > /etc/apt/sources.list
+          echo 'deb http://archive.debian.org/debian-security buster/updates main' >> /etc/apt/sources.list
           echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
 
       - name: Install build tools

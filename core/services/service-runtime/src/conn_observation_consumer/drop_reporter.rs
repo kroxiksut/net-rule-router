@@ -147,10 +147,13 @@ impl ConnectionObservationConsumer {
             return;
         }
         let reason = self.reason_for_drop(rec, killswitch_verified, default_block_id);
-        // A route that has not come up since the start is not an outage yet:
-        // its status notice speaks for it if it never does.
+        // A route that had not come up since the start when this drop happened
+        // is not an outage yet: its status notice speaks for it if it never does.
         if reason == nrr_domain::block_notice::BlockReason::RouteUnavailable
-            && crate::startup_quiet::never_up(rec.user_sid.as_deref().unwrap_or_default())
+            && crate::startup_quiet::down_at(
+                rec.user_sid.as_deref().unwrap_or_default(),
+                rec.observed_unix_ms,
+            )
         {
             return;
         }

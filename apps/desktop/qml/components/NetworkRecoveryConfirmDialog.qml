@@ -58,6 +58,13 @@ Dialog {
                     + "again, routing is off and sites meant for the additional adapter "
                     + "can go over the main connection. Administrator rights are required.")
         }
+        Label {
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+            text: root.tr("dialog.network-recovery.overrides",
+                "Rules you confirmed despite the protection of system programs are revoked.")
+        }
         RowLayout {
             Layout.fillWidth: true
             Layout.topMargin: 6

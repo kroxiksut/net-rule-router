@@ -476,6 +476,11 @@ pub struct EnforcementCapabilities {
     /// there. Where it is `false`, such a rule stays in the book and is
     /// reported as not applied.
     pub app_path_rules: bool,
+    /// A folder rule also follows a script an interpreter installed elsewhere
+    /// runs from the folder, read from the process's command line in the
+    /// observation pass: its destinations are learnt from its first
+    /// connection, and a deny does not hold it.
+    pub app_path_scripts: bool,
 }
 
 impl EnforcementCapabilities {
@@ -491,6 +496,7 @@ impl EnforcementCapabilities {
             per_user_all_protocol_scoping: false,
             app_match: AppMatchMechanism::WfpAppId,
             app_path_rules: true,
+            app_path_scripts: true,
         }
     }
 
@@ -505,6 +511,7 @@ impl EnforcementCapabilities {
             per_user_all_protocol_scoping: true,
             app_match: AppMatchMechanism::ObservedDestOnly,
             app_path_rules: true,
+            app_path_scripts: true,
         }
     }
 
@@ -531,6 +538,7 @@ impl EnforcementCapabilities {
             per_user_all_protocol_scoping: false,
             app_match: AppMatchMechanism::ObservedDestOnly,
             app_path_rules: false,
+            app_path_scripts: false,
         }
     }
 
@@ -1259,6 +1267,7 @@ mod tests {
             (&mac_sup, &mac_caps),
         ] {
             assert_eq!(sup.app_path_rules, caps.app_path_rules);
+            assert_eq!(sup.app_path_scripts, caps.app_path_scripts);
         }
 
         // An application rule is offered exactly where a backend carries it

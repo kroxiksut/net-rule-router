@@ -44,6 +44,7 @@ impl ConnectionObservationConsumer {
             app_observations: None,
             app_destination_forget: None,
             routed_apps: None,
+            script_launches: None,
             trace_ring: None,
             killswitch_drop_check: None,
             killswitch_app_scope_check: None,
@@ -300,6 +301,17 @@ impl ConnectionObservationConsumer {
     /// the collateral check able to fire at all.
     pub fn with_routed_apps(mut self, routed: RoutedAppsFn) -> Self {
         self.routed_apps = Some(routed);
+        self
+    }
+
+    /// Wire the reading of command lines, so a rule by folder also follows
+    /// the scripts its folder holds when an interpreter installed elsewhere
+    /// runs them.
+    pub fn with_script_launches(
+        mut self,
+        launches: Arc<crate::script_launches::ScriptLaunches>,
+    ) -> Self {
+        self.script_launches = Some(launches);
         self
     }
 

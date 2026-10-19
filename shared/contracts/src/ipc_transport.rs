@@ -307,6 +307,8 @@ pub const fn needs_administrator_action(op: IpcOperationName) -> &'static str {
         IpcOperationName::PrincipalDataPurge => ACTION_CLEAR_SHARED_DATA,
         // Clearing an alert that adopts other users' rows.
         IpcOperationName::MutationSubmit => ACTION_EDIT_BASELINE,
+        // Applying a rule the protection of system programs refuses.
+        IpcOperationName::RulesOverrideGrant => ACTION_DISABLE_PROTECTION,
         _ => ACTION_CHANGE_MACHINE_SETTINGS,
     }
 }
@@ -354,6 +356,7 @@ pub const fn handler_may_need_administrator(op: IpcOperationName) -> bool {
             | IpcOperationName::TrafficStatsSet
             | IpcOperationName::PrincipalDataPurge
             | IpcOperationName::MutationSubmit
+            | IpcOperationName::RulesOverrideGrant
     )
 }
 
@@ -776,6 +779,18 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // the mutation slot is held only while the check is handed over.
         IpcOperationName::SiteCheckRun => IpcOperationClass::UserScopedConfiguration,
         IpcOperationName::SiteCheckResultGet => IpcOperationClass::ReadSnapshot,
+        // Lists the caller's own folder within one rule's bounds; changes nothing.
+        IpcOperationName::RulesAppPathCoverageGet => IpcOperationClass::ReadSnapshot,
+        // What a confirmation would let a protected rule take: reads only.
+        IpcOperationName::RulesOverridePreview => IpcOperationClass::ReadSnapshot,
+        // The caller's OWN confirmation, granted or taken back: per-SID,
+        // audited. A grant that reaches past the caller is refused by its
+        // handler until an administrator answers, and the confirmation it
+        // spends names its owner, so an elevated relay under another
+        // identity still grants for the person who asked.
+        IpcOperationName::RulesOverrideGrant | IpcOperationName::RulesOverrideRevoke => {
+            IpcOperationClass::UserScopedConfiguration
+        }
     }
 }
 

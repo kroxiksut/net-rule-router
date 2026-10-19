@@ -151,6 +151,10 @@ pub struct PlatformSupports {
     /// subfolders) is carried out. Mirrors `EnforcementCapabilities::
     /// app_path_rules`; macOS waits for its backend.
     pub app_path_rules: bool,
+    /// A folder rule also follows the scripts an interpreter installed
+    /// elsewhere runs from the folder. Mirrors `EnforcementCapabilities::
+    /// app_path_scripts`.
+    pub app_path_scripts: bool,
 }
 
 impl PlatformProfile {
@@ -206,6 +210,7 @@ impl PlatformProfile {
                 per_app_block_leakproof: true,
                 per_user_all_protocol_scoping: false,
                 app_path_rules: true,
+                app_path_scripts: true,
             },
         }
     }
@@ -261,6 +266,7 @@ impl PlatformProfile {
                 per_app_block_leakproof: false,
                 per_user_all_protocol_scoping: true,
                 app_path_rules: true,
+                app_path_scripts: true,
             },
         }
     }
@@ -299,6 +305,7 @@ impl PlatformProfile {
                 per_app_block_leakproof: false,
                 per_user_all_protocol_scoping: false,
                 app_path_rules: false,
+                app_path_scripts: false,
             },
         }
     }

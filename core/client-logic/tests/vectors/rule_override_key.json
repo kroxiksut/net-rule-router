@@ -1,0 +1,17 @@
+{
+  "description": "rules.js ruleOverrideKey: the key a confirmation of a protected rule and its table row share; empty for anything no confirmation is about",
+  "cases": [
+    { "name": "windows folder with flags", "input": { "ruleType": "application", "value": "C:\\InetPub\\* +override", "route": "block", "os": "windows" }, "expected": "block|c:\\inetpub\\*" },
+    { "name": "windows folder as the service spells it", "input": { "ruleType": "application", "value": "c:\\inetpub\\*", "route": "block", "os": "windows" }, "expected": "block|c:\\inetpub\\*" },
+    { "name": "windows forward slashes", "input": { "ruleType": "application", "value": "C:/Tools/*", "route": "secondary", "os": "windows" }, "expected": "secondary|c:\\tools\\*" },
+    { "name": "a name keeps its key without .exe", "input": { "ruleType": "application", "value": "SvcHost.exe +children +override", "route": "secondary", "os": "windows" }, "expected": "secondary|svchost" },
+    { "name": "linux path keeps its case", "input": { "ruleType": "application", "value": "/var/WWW/* +override", "route": "block", "os": "linux" }, "expected": "block|/var/WWW/*" },
+    { "name": "linux name", "input": { "ruleType": "application", "value": "NetworkManager", "route": "block", "os": "linux" }, "expected": "block|networkmanager" },
+    { "name": "macos path ignores case", "input": { "ruleType": "application", "value": "/Library/WebServer/Documents/*", "route": "block", "os": "macos" }, "expected": "block|/library/webserver/documents/*" },
+    { "name": "a backslash on linux is no separator", "input": { "ruleType": "application", "value": "a\\b.exe", "route": "block", "os": "linux" }, "expected": "block|b" },
+    { "name": "the main route takes no confirmation", "input": { "ruleType": "application", "value": "/var/www/*", "route": "primary", "os": "linux" }, "expected": "" },
+    { "name": "an address rule takes no confirmation", "input": { "ruleType": "domain", "value": "example.com", "route": "block", "os": "linux" }, "expected": "" },
+    { "name": "flags only", "input": { "ruleType": "application", "value": "  ", "route": "block", "os": "windows" }, "expected": "" },
+    { "name": "absent os reads as windows", "input": { "ruleType": "application", "value": "C:\\X\\*", "route": "block" }, "expected": "block|c:\\x\\*" }
+  ]
+}

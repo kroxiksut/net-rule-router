@@ -13,7 +13,7 @@ use crate::{js, Route};
 /// The preset format version this build writes. Mirrors
 /// `nrr_domain::rules_file::CURRENT_RULES_FILE_FORMAT_VERSION` through the
 /// GUI's `CANONICAL_PRESET_FORMAT_VERSION`, which a GUI test pins to it.
-pub const PRESET_FORMAT_VERSION: u32 = 10;
+pub const PRESET_FORMAT_VERSION: u32 = 11;
 
 /// Room between a rule and its inline comment.
 const COMMENT_GAP: &str = "          # ";

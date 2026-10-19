@@ -2,12 +2,14 @@
 //! route is down" is the expected state, not news. Until a principal's
 //! additional route has been up once, its down status is published quietly
 //! for a while and its blocks are not announced as an outage; one notice
-//! follows only if the route never comes up.
+//! follows only if the route never comes up. A block is judged by when it
+//! happened, not when it is read: the observer reports drops in batches, and
+//! one from before the first rise must not turn into news after it.
 //!
 //! Installed once by the production service. Without it nothing is quiet,
 //! which is what tests and tools get.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -21,8 +23,8 @@ const QUIET_STATUSES: [&str; 2] = ["secondary-down", "adapter-gone"];
 
 struct StartupQuiet {
     quiet_until_ms: i64,
-    /// Principals whose additional route has been usable since the start.
-    seen_up: Mutex<HashSet<String>>,
+    /// When each principal's additional route was first usable since the start.
+    first_up_ms: Mutex<HashMap<String, i64>>,
 }
 
 impl StartupQuiet {
@@ -30,23 +32,28 @@ impl StartupQuiet {
         let window = i64::try_from(STARTUP_QUIET.as_millis()).unwrap_or(i64::MAX);
         Self {
             quiet_until_ms: now_ms.saturating_add(window),
-            seen_up: Mutex::new(HashSet::new()),
+            first_up_ms: Mutex::new(HashMap::new()),
         }
     }
 
-    fn note_up(&self, principal: &str) {
-        let mut seen = self.seen_up.lock().unwrap_or_else(|p| p.into_inner());
-        if !seen.contains(principal) {
-            seen.insert(principal.to_owned());
+    fn note_up(&self, principal: &str, now_ms: i64) {
+        let mut first = self.first_up_ms.lock().unwrap_or_else(|p| p.into_inner());
+        if !first.contains_key(principal) {
+            first.insert(principal.to_owned(), now_ms);
         }
     }
 
     fn never_up(&self, principal: &str) -> bool {
-        let seen = self.seen_up.lock().unwrap_or_else(|p| p.into_inner());
+        self.down_at(principal, i64::MAX)
+    }
+
+    /// Whether `principal`'s route had not come up yet at `at_ms`.
+    fn down_at(&self, principal: &str, at_ms: i64) -> bool {
+        let first = self.first_up_ms.lock().unwrap_or_else(|p| p.into_inner());
         if principal.is_empty() {
-            seen.is_empty()
+            first.values().all(|&up| up > at_ms)
         } else {
-            !seen.contains(principal)
+            first.get(principal).is_none_or(|&up| up > at_ms)
         }
     }
 
@@ -65,19 +72,21 @@ pub fn install(now_ms: i64) -> bool {
     INSTALLED.set(StartupQuiet::new(now_ms)).is_ok()
 }
 
-/// `principal`'s additional route is usable.
-pub fn note_up(principal: &str) {
+/// `principal`'s additional route is usable at `now_ms`.
+pub fn note_up(principal: &str, now_ms: i64) {
     if let Some(state) = INSTALLED.get() {
-        state.note_up(principal);
+        state.note_up(principal, now_ms);
     }
 }
 
-/// Whether `principal`'s additional route has never been up since the start.
-/// An empty principal (a drop no user owns) asks about anyone.
-pub fn never_up(principal: &str) -> bool {
+/// Whether `principal`'s additional route had not come up since the start by
+/// `at_ms`, when a drop happened; `None` (time unknown) asks about now. An
+/// empty principal (a drop no user owns) asks about anyone.
+pub fn down_at(principal: &str, at_ms: Option<u64>) -> bool {
+    let at_ms = at_ms.map_or(i64::MAX, |at| i64::try_from(at).unwrap_or(i64::MAX));
     INSTALLED
         .get()
-        .is_some_and(|state| state.never_up(principal))
+        .is_some_and(|state| state.down_at(principal, at_ms))
 }
 
 /// Whether a `status` report for `principal`'s `role` is published quietly.
@@ -106,7 +115,7 @@ mod tests {
     #[test]
     fn once_up_a_drop_is_news_again() {
         let q = StartupQuiet::new(START);
-        q.note_up("u");
+        q.note_up("u", START + 1);
         assert!(!q.quiet("u", "secondary", "secondary-down", START + 1));
         assert!(!q.never_up("u"));
         assert!(q.never_up("other"), "each user has their own route");
@@ -124,14 +133,38 @@ mod tests {
     fn a_drop_nobody_owns_asks_about_anyone() {
         let q = StartupQuiet::new(START);
         assert!(q.never_up(""));
-        q.note_up("u");
+        q.note_up("u", START + 1);
         assert!(!q.never_up(""));
+    }
+
+    #[test]
+    fn a_drop_is_judged_by_when_it_happened_not_when_it_is_read() {
+        let q = StartupQuiet::new(START);
+        let up = START + 120_000;
+        q.note_up("u", up);
+        assert!(
+            q.down_at("u", up - 2_000),
+            "dropped before the rise, read after it"
+        );
+        assert!(!q.down_at("u", up), "the rise itself counts as up");
+        assert!(!q.down_at("u", up + 2_000));
+        assert!(q.down_at("", up - 1));
+        assert!(!q.down_at("", up + 1));
+    }
+
+    #[test]
+    fn the_first_rise_stays_the_reference() {
+        let q = StartupQuiet::new(START);
+        q.note_up("u", START + 10);
+        q.note_up("u", START + 50_000);
+        assert!(!q.down_at("u", START + 20));
     }
 
     #[test]
     fn nothing_is_quiet_until_installed() {
         // The global is never installed in unit tests.
         assert!(!quiet("u", "secondary", "secondary-down", START));
-        assert!(!never_up("u"));
+        assert!(!down_at("u", None));
+        assert!(!down_at("u", Some(0)));
     }
 }

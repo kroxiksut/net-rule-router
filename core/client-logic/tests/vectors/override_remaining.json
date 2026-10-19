@@ -1,0 +1,16 @@
+{
+  "description": "rules.js overrideRemaining: how much of a confirmation's term is left, rounded up in the largest fitting unit",
+  "cases": [
+    { "name": "until revoked", "input": { "until": null, "now": 1000 }, "expected": { "kind": "until-revoked", "count": 0 } },
+    { "name": "absent deadline", "input": { "now": 1000 }, "expected": { "kind": "until-revoked", "count": 0 } },
+    { "name": "at the deadline", "input": { "until": 1000, "now": 1000 }, "expected": { "kind": "ended", "count": 0 } },
+    { "name": "past the deadline", "input": { "until": 1000, "now": 5000 }, "expected": { "kind": "ended", "count": 0 } },
+    { "name": "one millisecond", "input": { "until": 1001, "now": 1000 }, "expected": { "kind": "minutes", "count": 1 } },
+    { "name": "just under an hour", "input": { "until": 3600000, "now": 1 }, "expected": { "kind": "minutes", "count": 60 } },
+    { "name": "an hour", "input": { "until": 3600000, "now": 0 }, "expected": { "kind": "hours", "count": 1 } },
+    { "name": "a day", "input": { "until": 86400000, "now": 0 }, "expected": { "kind": "hours", "count": 24 } },
+    { "name": "just under two days", "input": { "until": 172799999, "now": 0 }, "expected": { "kind": "hours", "count": 48 } },
+    { "name": "a week", "input": { "until": 604800000, "now": 0 }, "expected": { "kind": "days", "count": 7 } },
+    { "name": "a week and a minute", "input": { "until": 604860000, "now": 0 }, "expected": { "kind": "days", "count": 8 } }
+  ]
+}

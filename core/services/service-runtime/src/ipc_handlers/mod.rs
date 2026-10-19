@@ -43,6 +43,7 @@ pub mod event_bus;
 pub mod mutation_token_store;
 pub mod operation_status_store;
 
+pub mod app_path_coverage;
 pub mod audit_list;
 pub mod auto_rules_handlers;
 pub mod block_notice_handlers;
@@ -63,6 +64,7 @@ pub mod product_impact_disable;
 pub mod rollback;
 pub mod route_link_provider_set;
 pub mod route_policy_update;
+pub mod rule_override;
 pub mod rules_list;
 pub mod rules_recent_changes;
 pub mod security_alerts;
@@ -82,6 +84,7 @@ pub mod verify_verdicts_handlers;
 #[cfg(test)]
 pub(crate) mod test_fakes;
 
+pub use app_path_coverage::AppPathCoverageHandler;
 pub use audit_list::AuditListHandler;
 pub use auto_rules_handlers::{
     AutoRuleCandidatesAcceptHandler, AutoRuleCandidatesDismissHandler,
@@ -97,6 +100,7 @@ pub use contract_negotiate::{
     service_binary_version, set_service_binary_version, ContractNegotiateHandler,
     MIN_SUPPORTED_CLIENT_VERSION,
 };
+pub use diagnostics_handlers::DEFAULT_UNIX_SYS_UID_MAX;
 pub use diagnostics_handlers::{
     CacheClearHandler, CacheEntriesListHandler, DiagnosticsExportArchiveHandler, ExplainGetHandler,
     LogsClearHandler,
@@ -138,6 +142,10 @@ pub use providers::{
 pub use rollback::RollbackHandler;
 pub use route_link_provider_set::RouteLinkProviderSetHandler;
 pub use route_policy_update::RoutePolicyUpdateHandler;
+pub use rule_override::{
+    service_accounts_reader, RuleOverrideDeps, RuleOverrideGrantHandler,
+    RuleOverridePreviewHandler, RuleOverrideRevokeHandler,
+};
 pub use rules_list::RulesListHandler;
 pub use rules_recent_changes::RulesRecentChangesHandler;
 pub use security_alerts::SecurityAlertsHandler;

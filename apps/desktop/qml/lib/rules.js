@@ -51,7 +51,7 @@ function rowIsVerify(row) {
 // `nrr_domain::rules_file::CURRENT_RULES_FILE_FORMAT_VERSION`; the Rust test
 // `the_gui_writes_the_current_preset_format_version` reads this line and fails
 // when the two drift.
-var CANONICAL_PRESET_FORMAT_VERSION = 10
+var CANONICAL_PRESET_FORMAT_VERSION = 11
 
 // True for the rule types whose match value is a hostname (so callers know to
 // apply host-specific handling such as ACE encoding at the wire boundary).
@@ -517,7 +517,9 @@ function _rowWireDto(row, aceEncodeHost, options, asTyped) {
             // in the file, not in the name the service matches.
             // A separator makes it a path, which the service reads in its
             // platform's spelling.
-            if (!asTyped) value = withoutChildrenFlag(value)
+            // `+override` travels as the request it is, absent when unset.
+            var asksOverride = !asTyped && _bulkSplitRuleFlags(value).override
+            if (!asTyped) value = withoutRuleFlags(value)
             dto["app-match"] = {
                 pattern: {
                     kind: /[\\\/]/.test(value) ? "path"
@@ -526,6 +528,7 @@ function _rowWireDto(row, aceEncodeHost, options, asTyped) {
                 },
                 "include-child-processes": false
             }
+            if (asksOverride) dto["app-match"]["override-requested"] = true
             break
         case "domain":
         default:
@@ -639,8 +642,9 @@ function driftSortKey(d) {
     var appKind = pat ? "app:" + String(pat.kind || "") : ""
     var appVal = pat ? String(pat.value || "") : ""
     var children = (ap && ap["include-child-processes"]) ? "1" : "0"
+    var override = (ap && ap["override-requested"]) ? "1" : "0"
     return kind + sep + val + sep + appKind + sep + appVal + sep
-        + children + sep + (d.enabled ? "1" : "0") + sep
+        + children + sep + override + sep + (d.enabled ? "1" : "0") + sep
         + String(d.action || "route")
 }
 
@@ -733,17 +737,18 @@ function parsedRuleVerify(r) {
 // The value a table keeps for a `preset.parse` rule (`ParsedRule::stored_value`).
 function parsedRuleStoredValue(r) {
     return storedRuleValue(String(r["rule-type"] || ""), String(r["match-value"] || ""),
-        r.children === true)
+        r.children === true, r["override-requested"] === true)
 }
 
 // Minimal drift row from one `preset.parse` result rule. `route` is the file's
 // own route; a parsed block overrides it, exactly as the import path does
-// when it builds full model rows.
+// when it builds full model rows. The value as a table keeps it: a program's
+// `+override` is routing, whether the rule may apply.
 function driftRowFromParsedRule(r, route) {
     return {
         enabled: !!r.enabled,
         ruleType: String(r["rule-type"] || ""),
-        matchValue: String(r["match-value"] || ""),
+        matchValue: parsedRuleStoredValue(r),
         targetRoute: parsedRuleTargetRoute(r, route),
         verify: parsedRuleVerify(r)
     }
@@ -1439,24 +1444,78 @@ function _apSegments(path, windows, foldCase) {
     return segments
 }
 
+// The profile folders a Windows path may start from (`ProfileFolder`), with
+// the folders between the profile and each; `~` is the one elsewhere.
+var APP_PATH_PROFILE_WINDOWS = { "%localappdata%": 2, "%appdata%": 2, "%userprofile%": 0 }
+
+function _apIsProfileToken(t, windows) {
+    return windows
+        ? Object.prototype.hasOwnProperty.call(APP_PATH_PROFILE_WINDOWS, t.toLowerCase())
+        : t === "~"
+}
+
+// `profile_prefix`: { rest, below } after a profile folder this platform
+// reads, "unknown" for any other variable, null when `body` starts from none.
+function _apProfileHead(body, windows) {
+    var first = body.charAt(0)
+    var headLen
+    if (first === "%") {
+        var close = body.indexOf("%", 1)
+        if (close < 0) return "unknown"
+        headLen = close + 1
+    } else if (first === "~") {
+        headLen = 1
+    } else if (first === "$") {
+        return "unknown"
+    } else {
+        return null
+    }
+    var head = body.substring(0, headLen)
+    if (!_apIsProfileToken(head, windows)) return "unknown"
+    var rest = body.substring(headLen)
+    if (rest !== "" && !_apIsSep(rest.charAt(0), windows)) return "unknown"
+    return { rest: rest, below: windows ? APP_PATH_PROFILE_WINDOWS[head.toLowerCase()] : 0 }
+}
+
+// `AppPath::under_profile`: the form of a path below a profile folder.
+function _apProfileForm(head, tree, windows, foldCase) {
+    var rest = head.rest
+    var rooted = windows ? "c:" + rest : (rest === "" ? "/" : rest)
+    var below = _apSegments(rooted, windows, foldCase)
+    if (below === null) return "path-invalid"
+    below = below.slice(windows ? 1 : 0)
+    // The probe profile: `c:\users\<profile>` or `/home/<profile>`.
+    var probe = windows ? 3 : 2
+    if (probe + head.below + below.length > APP_PATH_MAX_SEGMENTS) return "path-invalid"
+    if (tree) return "folder-tree"
+    var trailing = rest.length > 0 && _apIsSep(rest.charAt(rest.length - 1), windows)
+    if (trailing || below.length === 0) return "folder"
+    if (!windows) return "file-or-folder"
+    var last = below[below.length - 1]
+    return last.length >= 4 && last.substring(last.length - 4) === ".exe" ? "file" : "folder"
+}
+
 // What an application rule value names on `os`: name, name-glob, file,
 // folder, folder-tree, file-or-folder, or path-star / path-not-absolute /
-// path-invalid when a path names no program.
+// path-invalid / path-unknown-variable when a path names no program.
 function appValueForm(value, os) {
     var trimmed = _rvcTrim(value === undefined || value === null ? "" : value)
-    var v = withoutChildrenFlag(trimmed)
+    var v = withoutRuleFlags(trimmed)
     var o = String(os || "")
     var windows = o !== "linux" && o !== "macos"
     var foldCase = o !== "linux"
     var isPath = windows ? /[\\\/]/.test(v) : v.indexOf("/") >= 0
     if (!isPath) return v.indexOf("*") >= 0 ? "name-glob" : "name"
-    // Taking `+children` off rejoins the words, a line break with them.
+    // Taking the flags off rejoins the words, a line break with them.
     if (v.length > APP_PATH_MAX_UNITS || _apHasControl(trimmed)) return "path-invalid"
     var t = _rvcTrim(v)
     var tree = t.length >= 2 && t.charAt(t.length - 1) === "*"
         && _apIsSep(t.charAt(t.length - 2), windows)
     var body = tree ? t.substring(0, t.length - 1) : t
     if (body.indexOf("*") >= 0) return "path-star"
+    var head = _apProfileHead(body, windows)
+    if (head === "unknown") return "path-unknown-variable"
+    if (head !== null) return _apProfileForm(head, tree, windows, foldCase)
     var absolute = windows
         ? (/^[A-Za-z]:([\\\/]|$)/.test(body) || /^[\\\/][\\\/]/.test(body))
         : body.charAt(0) === "/"
@@ -1587,27 +1646,75 @@ function _bulkMarkers(value, readsVerify) {
     return { rest: rest, deny: deny, verify: verify }
 }
 
-// `split_children_flag`: words rejoined, every later `+children` taken off.
-function _bulkSplitChildren(value) {
+// `split_rule_flags`: words rejoined, every later `+children` and
+// `+override` taken off.
+function _bulkSplitRuleFlags(value) {
     var words = _bulkWords(value)
     var kept = []
     var children = false
+    var override = false
     for (var i = 0; i < words.length; i += 1) {
         if (i > 0 && words[i] === "+children") children = true
+        else if (i > 0 && words[i] === "+override") override = true
         else kept.push(words[i])
     }
-    return { value: kept.join(" "), children: children }
+    return { value: kept.join(" "), children: children, override: override }
 }
 
-// `stored_rule_value`: a table keeps `+children` on a program only.
-function storedRuleValue(ruleType, value, children) {
-    return children && ruleType === "application" ? value + " +children" : value
+// `stored_rule_value`: a table keeps `+children` and `+override` on a program
+// only.
+function storedRuleValue(ruleType, value, children, override) {
+    if (ruleType !== "application") return value
+    return value + (children === true ? " +children" : "")
+        + (override === true ? " +override" : "")
 }
 
-// `without_children_flag`: what the service matches for a table's value.
-function withoutChildrenFlag(value) {
-    var split = _bulkSplitChildren(value)
-    return split.children ? split.value : value
+// `without_rule_flags`: what the service matches for a table's value.
+function withoutRuleFlags(value) {
+    var split = _bulkSplitRuleFlags(value)
+    return (split.children || split.override) ? split.value : value
+}
+
+// `app_match_key`: the file name, ASCII lower case, without `.exe`.
+function _appMatchKey(raw) {
+    var t = _rvcTrim(String(raw || ""))
+    var cut = Math.max(t.lastIndexOf("\\"), t.lastIndexOf("/"))
+    var name = (cut >= 0 ? t.substring(cut + 1) : t)
+        .replace(/[A-Z]/g, function(c) { return c.toLowerCase() })
+    if (name.length > 4 && name.substring(name.length - 4) === ".exe")
+        return name.substring(0, name.length - 4)
+    return name
+}
+
+// `rule_override_key`: the key a confirmation and its rule share; "" for
+// anything no confirmation can be about.
+function ruleOverrideKey(ruleType, value, route, os) {
+    var r = String(route || "")
+    if (String(ruleType || "") !== "application" || (r !== "secondary" && r !== "block"))
+        return ""
+    var bare = _rvcTrim(withoutRuleFlags(_rvcTrim(String(value || ""))))
+    if (bare === "") return ""
+    var o = String(os || "")
+    var windows = o !== "linux" && o !== "macos"
+    var isPath = bare.indexOf("/") >= 0 || (windows && bare.indexOf("\\") >= 0)
+    var lower = function(s) { return s.replace(/[A-Z]/g, function(c) { return c.toLowerCase() }) }
+    var spelled = !isPath ? _appMatchKey(bare)
+        : windows ? lower(bare.replace(/\//g, "\\"))
+        : o === "macos" ? lower(bare)
+        : bare
+    return r + "|" + spelled
+}
+
+// `override_remaining`: how much of a confirmation's term is left, rounded up
+// in the largest fitting unit: `{ kind, count }`.
+function overrideRemaining(untilMs, nowMs) {
+    if (untilMs === undefined || untilMs === null) return { kind: "until-revoked", count: 0 }
+    var left = Number(untilMs) - Number(nowMs)
+    var minute = 60000, hour = 3600000, day = 86400000
+    if (!(left > 0)) return { kind: "ended", count: 0 }
+    if (left < hour) return { kind: "minutes", count: Math.ceil(left / minute) }
+    if (left < 2 * day) return { kind: "hours", count: Math.ceil(left / hour) }
+    return { kind: "days", count: Math.ceil(left / day) }
 }
 
 // `without_retired_block_flag` when `carries_retired_block_flag`; null otherwise.
@@ -1823,9 +1930,10 @@ function _bulkLine(ctx, raw, lineNo) {
         return _bulkFail(row, "rules.paste.section-not-applied", { section: sec.name })
     }
     // Off before the type and the `#` are judged, as the file reader does.
-    var split = _bulkSplitChildren(collapsed)
+    var split = _bulkSplitRuleFlags(collapsed)
     collapsed = split.value
     var children = split.children
+    var override = split.override
     var choice = _bulkOwn(ctx.choices, String(lineNo)) ? ctx.choices[String(lineNo)] : null
     var chosen = choice && typeof choice.type === "string" ? choice.type : ""
     // Under no header a file has no type for the line: its value names one, or
@@ -1848,7 +1956,7 @@ function _bulkLine(ctx, raw, lineNo) {
     var value = marks.rest
     if (value === "") return null
     if (hashed && !_bulkIsDisabledRuleValue(type, value)) return null
-    row.value = storedRuleValue(type, value, children)
+    row.value = storedRuleValue(type, value, children, override)
     row.enabled = !hashed
     if (marks.deny) row.route = "block"
     row.comment = comment
@@ -1886,7 +1994,7 @@ function _bulkLine(ctx, raw, lineNo) {
         row.options = [target]
         if (chosen === target) {
             row.type = target
-            row.value = storedRuleValue(target, value, children)
+            row.value = storedRuleValue(target, value, children, override)
             row.verify = row.verify && (target === "domain" || target === "exact-ip")
             verdict = _bulkVerdict(ctx, row)
             if (verdict === null) return row
@@ -2053,4 +2161,210 @@ function bulkPendingVerdicts(plan) {
         out.push({ "rule-type": r.type, "match-value": r.value, key: r.verdictKey })
     }
     return out
+}
+
+// ---- unsaved edits over rules changed elsewhere ----
+
+function _copyRow(row) {
+    var out = {}
+    for (var k in row) out[k] = row[k]
+    return out
+}
+
+// Whether two rows are the same rule with the same settings: the id is no
+// part of it, and neither is the spelling of the type or the case of the value,
+// which mergeKey folds too: a recased value is not a change.
+function rowSameContent(a, b) {
+    return !!a.enabled === !!b.enabled
+        && canonicalRuleTypeSlug(a.ruleType) === canonicalRuleTypeSlug(b.ruleType)
+        && String(a.matchValue || "").toLowerCase() === String(b.matchValue || "").toLowerCase()
+        && String(a.targetRoute || "") === String(b.targetRoute || "")
+        && !!a.verify === !!b.verify
+        && String(a.comment || "") === String(b.comment || "")
+        && String(a.originReason || "") === String(b.originReason || "")
+        && String(a.originAnchor || "") === String(b.originAnchor || "")
+        && String(a.originAdded || "") === String(b.originAdded || "")
+}
+
+function _firstByKey(rows) {
+    var map = Object.create(null)
+    for (var i = 0; i < rows.length; i += 1) {
+        var key = mergeKey(rows[i])
+        if (!(key in map)) map[key] = rows[i]
+    }
+    return map
+}
+
+// `rebase_edits` (nrr-client-logic): the user's edits (`edited`, made against
+// `base`) laid over the `fresh` rules in force. A rule the user added, changed
+// or deleted is added, changed or deleted in `fresh` too; everything else stays
+// as `fresh` has it. Where both sides touched one rule the user's version wins
+// and `conflicts` lists it, unless its mergeKey is in `keepTheirs`. Returns
+// { rows, added, changed, removed, conflicts }; rows added have an empty id.
+// Conflict kinds: changed-both, edited-but-deleted-elsewhere,
+// deleted-but-changed-elsewhere, added-both.
+function rebaseEdits(base, edited, fresh, keepTheirs) {
+    base = base || []
+    edited = edited || []
+    fresh = fresh || []
+    var keep = Object.create(null)
+    var kept = keepTheirs || []
+    for (var q = 0; q < kept.length; q += 1) keep[String(kept[q])] = true
+    var baseByKey = _firstByKey(base)
+    var editedByKey = _firstByKey(edited)
+    var freshByKey = _firstByKey(fresh)
+    var out = { rows: [], added: [], changed: [], removed: [], conflicts: [] }
+    var dropped = Object.create(null)
+    var seen = Object.create(null)
+    var key, i
+
+    for (i = 0; i < base.length; i += 1) {
+        key = mergeKey(base[i])
+        if (key in editedByKey || key in seen) continue
+        seen[key] = true
+        if (!(key in freshByKey)) continue
+        var theirs = freshByKey[key]
+        if (!rowSameContent(theirs, base[i])) {
+            out.conflicts.push({ key: key, kind: "deleted-but-changed-elsewhere",
+                mine: null, theirs: _copyRow(theirs) })
+            if (keep[key]) continue
+        }
+        out.removed.push(_copyRow(theirs))
+        dropped[key] = true
+    }
+
+    var at = Object.create(null)
+    for (i = 0; i < fresh.length; i += 1) {
+        key = mergeKey(fresh[i])
+        if (key in dropped) continue
+        if (!(key in at)) at[key] = out.rows.length
+        out.rows.push(_copyRow(fresh[i]))
+    }
+
+    var done = Object.create(null)
+    for (i = 0; i < edited.length; i += 1) {
+        var mine = edited[i]
+        key = mergeKey(mine)
+        var before = (key in baseByKey) ? baseByKey[key] : null
+        if ((before && rowSameContent(before, mine)) || key in done) continue
+        done[key] = true
+        var placed
+        if (key in at) {
+            var cur = out.rows[at[key]]
+            if (rowSameContent(cur, mine)) continue
+            var kind = ""
+            if (before) { if (!rowSameContent(cur, before)) kind = "changed-both" }
+            else kind = "added-both"
+            if (kind !== "") {
+                out.conflicts.push({ key: key, kind: kind,
+                    mine: _copyRow(mine), theirs: _copyRow(cur) })
+                if (keep[key]) continue
+            }
+            placed = _copyRow(mine)
+            placed.id = cur.id
+            out.rows[at[key]] = placed
+            out.changed.push(_copyRow(placed))
+        } else {
+            if (before) {
+                out.conflicts.push({ key: key, kind: "edited-but-deleted-elsewhere",
+                    mine: _copyRow(mine), theirs: null })
+                if (keep[key]) continue
+            }
+            placed = _copyRow(mine)
+            placed.id = ""
+            at[key] = out.rows.length
+            out.rows.push(placed)
+            out.added.push(_copyRow(placed))
+        }
+    }
+    return out
+}
+
+// Plain copies of the fields a rebase compares and the wire needs: a model's
+// own row objects change under the caller as the table is edited.
+function rebaseSnapshot(rows) {
+    var out = []
+    for (var i = 0; i < _rowCount(rows); i += 1) {
+        var r = _rowAt(rows, i)
+        out.push({
+            id: String(r.id || ""),
+            enabled: !!r.enabled,
+            ruleType: String(r.ruleType || ""),
+            matchValue: String(r.matchValue || ""),
+            targetRoute: String(r.targetRoute || ""),
+            verify: !!r.verify,
+            comment: String(r.comment || ""),
+            originReason: String(r.originReason || ""),
+            originAnchor: String(r.originAnchor || ""),
+            originAdded: String(r.originAdded || "")
+        })
+    }
+    return out
+}
+
+// `fresh` rows with the note a rule has in the sidecar, which the service's
+// list does not carry: an empty note is filled from the same rule among
+// `known` (the edited rows first, then the base).
+function rebaseFreshWithNotes(fresh, known) {
+    var notes = Object.create(null)
+    for (var k = 0; k < known.length; k += 1) {
+        for (var j = 0; j < known[k].length; j += 1) {
+            var key = mergeKey(known[k][j])
+            if (!(key in notes) && known[k][j].comment) notes[key] = String(known[k][j].comment)
+        }
+    }
+    var out = []
+    for (var i = 0; i < fresh.length; i += 1) {
+        var row = _copyRow(fresh[i])
+        var note = notes[mergeKey(row)]
+        if (!row.comment && note) row.comment = note
+        out.push(row)
+    }
+    return out
+}
+
+function _rebaseItem(row) {
+    if (!row) return null
+    return {
+        "type-slug": String(row.ruleType || ""),
+        value: String(row.matchValue || ""),
+        route: routeBucket(row.targetRoute),
+        action: String(row.targetRoute) === "block" ? "block"
+            : (rowIsVerify(row) ? "verify-primary" : "route"),
+        enabled: !!row.enabled,
+        comment: String(row.comment || "")
+    }
+}
+
+// A `rebaseEdits` result as the merge window shows it: what the user added,
+// changed and deleted, and the rules both sides touched as conflicts (file
+// side: the user's version, service side: the one in force).
+function rebaseMergeView(result) {
+    var inConflict = Object.create(null)
+    var view = { "file-only": [], "service-only": [], conflicts: [], changed: [],
+        removed: [], "normalized-duplicates": [], noop: false }
+    var i
+    for (i = 0; i < result.conflicts.length; i += 1) {
+        var c = result.conflicts[i]
+        inConflict[c.key] = true
+        var any = c.mine || c.theirs
+        view.conflicts.push({
+            "identity-key": c.key,
+            "type-slug": String(any.ruleType || ""),
+            value: String(any.matchValue || ""),
+            kind: c.kind,
+            file: _rebaseItem(c.mine),
+            service: _rebaseItem(c.theirs)
+        })
+    }
+    var parts = [["added", "file-only"], ["changed", "changed"], ["removed", "removed"]]
+    for (var p = 0; p < parts.length; p += 1) {
+        var rows = result[parts[p][0]]
+        for (i = 0; i < rows.length; i += 1) {
+            if (!(mergeKey(rows[i]) in inConflict)) view[parts[p][1]].push(_rebaseItem(rows[i]))
+        }
+    }
+    view.noop = view["file-only"].length + view.changed.length + view.removed.length
+        + view.conflicts.length === 0
+    return view
 }

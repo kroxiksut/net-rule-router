@@ -433,6 +433,15 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         Verdict::Bounded("one teardown step at stop, waited for under a deadline"),
     ),
     (
+        "service-runtime/src/override_recheck.rs",
+        "nrr-override-recheck",
+        1,
+        Verdict::Invisible(
+            "if it stops, confirmations stay as the last re-check left them and the next \
+             service start re-checks them",
+        ),
+    ),
+    (
         "linux-service/src/run.rs",
         "nrr-sd-watchdog",
         1,

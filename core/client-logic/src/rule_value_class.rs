@@ -10,7 +10,7 @@
 
 use nrr_shared::app_identity::ExecutableNaming;
 use nrr_shared::app_path::{is_path_value, AppPath, AppPathError, PathStyle};
-use nrr_shared::preset_parser::without_children_flag;
+use nrr_shared::preset_parser::without_rule_flags;
 use nrr_shared::rule_value_class::{
     misplaced_rule_value, misplaced_target_of_message_key, rule_type_from_slug,
 };
@@ -74,15 +74,16 @@ pub fn path_style_for_os(os: &str) -> PathStyle {
 /// What an application rule value names on `os` (`appValueForm` in
 /// `rules.js`): `name`, `name-glob`, a path form (`file`, `folder`,
 /// `folder-tree`, `file-or-folder`), or why a path names no program
-/// (`path-star`, `path-not-absolute`, `path-invalid`, the tail of the locale
-/// key the service's verdict carries). `+children` is not part of the value.
+/// (`path-star`, `path-not-absolute`, `path-invalid`, `path-unknown-variable`,
+/// the tail of the locale key the service's verdict carries). `+children` and
+/// `+override` are not part of the value.
 #[must_use]
 pub fn app_value_form(value: &str, os: &str) -> &'static str {
     let trimmed = value.trim();
-    let value = without_children_flag(trimmed);
+    let value = without_rule_flags(trimmed);
     let style = path_style_for_os(os);
     if is_path_value(&value, style) {
-        // Taking `+children` off rejoins the words, a line break with them.
+        // Taking the flags off rejoins the words, a line break with them.
         if trimmed.chars().any(char::is_control) {
             return AppPathError::Malformed.slug();
         }

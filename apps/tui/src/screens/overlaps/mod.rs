@@ -530,6 +530,33 @@ fn route_label(route: &str, texts: &Texts) -> String {
     })
 }
 
+/// The sentence Overlaps gives for a rule on `app` refused for `reason` (a
+/// protection slug, or `other-users-folder`), for the Status screen.
+pub fn refusal_text(app: &str, reason: &str, texts: &Texts) -> String {
+    let other_users = reason == "other-users-folder";
+    let conflict = RuleConflictDto {
+        kind: if other_users {
+            RuleConflictKind::OtherUsersFolder
+        } else {
+            RuleConflictKind::ProtectedTarget
+        },
+        rule_id: String::new(),
+        rule_value: app.to_owned(),
+        ip: String::new(),
+        count: 0,
+        other_rule_id: String::new(),
+        host: String::new(),
+        via_host: String::new(),
+        app: app.to_owned(),
+        reason: if other_users {
+            String::new()
+        } else {
+            reason.to_owned()
+        },
+    };
+    conflict_text(&conflict, texts)
+}
+
 /// One service-reported conflict as a sentence.
 fn conflict_text(conflict: &RuleConflictDto, texts: &Texts) -> String {
     let template = match conflict.kind {
@@ -538,7 +565,9 @@ fn conflict_text(conflict: &RuleConflictDto, texts: &Texts) -> String {
         RuleConflictKind::BlockLeaksSharedAddress => keys::CONFLICT_LEAK,
         RuleConflictKind::NetworkCarvingOverCap => keys::CONFLICT_CARVING_OVER_CAP,
         RuleConflictKind::ProtectedTarget => keys::CONFLICT_PROTECTED,
+        RuleConflictKind::OverrideNeedsConfirmation => keys::CONFLICT_OVERRIDE_PENDING,
         RuleConflictKind::FolderOverCap => keys::CONFLICT_FOLDER_OVER_CAP,
+        RuleConflictKind::OtherUsersFolder => keys::CONFLICT_OTHER_USERS_FOLDER,
     };
     // The protection says why in the rules table's own words.
     let reason = nrr_domain::protected_places::ProtectionReason::from_slug(&conflict.reason)

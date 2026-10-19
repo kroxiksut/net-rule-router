@@ -65,6 +65,7 @@ fn app_rule(id: &str, process: &str, include_children: bool) -> CanonicalRule {
         app_match: Some(CanonicalAppMatch {
             pattern: CanonicalAppPattern::Exact(process.into()),
             include_child_processes: include_children,
+            override_requested: false,
         }),
         comment: String::new(),
         action: nrr_domain::RuleAction::Route,
@@ -80,6 +81,7 @@ fn glob_app_rule(id: &str, glob: &str) -> CanonicalRule {
         app_match: Some(CanonicalAppMatch {
             pattern: CanonicalAppPattern::Glob(glob.into()),
             include_child_processes: false,
+            override_requested: false,
         }),
         comment: String::new(),
         action: nrr_domain::RuleAction::Route,
@@ -1948,6 +1950,7 @@ fn no_capability_set_unlocks_an_unimplemented_shape() {
         per_user_all_protocol_scoping: true,
         app_match: AppMatchMechanism::WfpAppId,
         app_path_rules: true,
+        app_path_scripts: true,
     };
     for caps in [
         everything,
@@ -1998,6 +2001,7 @@ fn path_rule(id: &str, text: &str, action: nrr_domain::RuleAction) -> CanonicalR
         app_match: Some(CanonicalAppMatch {
             pattern: CanonicalAppPattern::Path(Box::new(host_path(text))),
             include_child_processes: false,
+            override_requested: false,
         }),
         comment: String::new(),
         action,
@@ -2122,6 +2126,45 @@ fn a_folder_larger_than_the_cap_is_reported_as_a_conflict() {
     assert_eq!(dtos[0].rule_value, rule.as_str());
 }
 
+/// A rules file line on another user's folder applies nothing, and the
+/// Overlaps screen says why instead of the rule reading as applied.
+#[test]
+fn a_folder_in_another_users_profile_is_reported_as_not_applied() {
+    let (rule_text, _, _, _) = host_paths();
+    let rule = host_path(rule_text);
+    let resolver = MockAppPathResolver::new().with_path_programs(
+        rule.as_str(),
+        "*",
+        nrr_platform_api::app_folders::PathPrograms {
+            outcome: nrr_platform_api::app_folders::PathOutcome::OtherUsersFolder,
+            place: None,
+            programs: Vec::new(),
+            over_cap: false,
+        },
+    );
+    let rule_book = book(
+        vec![path_rule(
+            "r-other",
+            rule_text,
+            nrr_domain::RuleAction::Route,
+        )],
+        vec![],
+    );
+    let out = path_codegen("S-1-5-21-A", &rule_book, &resolver);
+    assert!(out.filters.iter().all(|f| f.app_pattern.is_none()));
+    assert!(out
+        .diagnostics
+        .contains(&CodegenDiagnostic::PathInOtherUsersProfile {
+            rule_id: "r-other".into(),
+        }));
+    let dtos = crate::app_enforcement_status::rule_conflicts_from(&out.diagnostics, &rule_book);
+    assert_eq!(
+        dtos.iter().map(|d| d.kind).collect::<Vec<_>>(),
+        [nrr_shared::ipc_payloads::RuleConflictKind::OtherUsersFolder]
+    );
+    assert_eq!(dtos[0].rule_value, rule.as_str());
+}
+
 /// The rules file names a harmless folder; the disk says it leads into a
 /// system one. The deny applies nothing and the Overlaps screen says why.
 #[test]
@@ -2177,4 +2220,45 @@ fn a_name_rule_still_fans_out_one_weight_per_path() {
         .collect();
     assert_eq!(weights.len(), 2);
     assert_ne!(weights[0], weights[1]);
+}
+
+/// A folder's own program is held by its per-program pair; a script the
+/// folder holds runs in an interpreter outside that pair, so the address it
+/// taught keeps its per-destination guard.
+#[test]
+fn an_address_a_folders_script_taught_is_not_left_to_the_program_pair() {
+    use crate::app_observation_lookup::{AppObservationLookup, AppObservationStore};
+    let (rule_text, inside, _, _) = host_paths();
+    let rule = host_path(rule_text);
+    let resolver = MockAppPathResolver::new().with_path_programs(
+        rule.as_str(),
+        "*",
+        found_at(rule.clone(), vec![inside.clone()], false),
+    );
+    let store = AppObservationStore::new();
+    let _ = store.ips_for_app(rule.as_str());
+    let by_program = Ipv4Addr::new(203, 0, 113, 50);
+    let by_script = Ipv4Addr::new(203, 0, 113, 51);
+    assert!(store.record(&inside.to_string_lossy(), by_program));
+    assert!(store.record_for_rule_paths(&[rule.as_str().to_string()], by_script));
+    let rule_book = book(
+        vec![],
+        vec![path_rule("r-dir", rule_text, nrr_domain::RuleAction::Route)],
+    );
+    let cache = MockFqdnCacheLookup::new();
+    let out = generate_filters(CodegenInput {
+        sid: "S-1-5-21-A",
+        rule_book: &rule_book,
+        behavior_mode: RouteBehaviorMode::PreferPrimary,
+        fqdn_cache: &cache,
+        app_observations: &store,
+        app_resolver: &resolver,
+        secondary_ip_denylist: &std::collections::HashSet::new(),
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: false,
+    });
+    assert_eq!(out.app_observed_secondary_ips, vec![by_program]);
+    assert!(out.secondary_dest_ips.contains(&IpAddr::V4(by_script)));
 }

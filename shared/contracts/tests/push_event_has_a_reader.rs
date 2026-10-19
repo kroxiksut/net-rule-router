@@ -184,6 +184,12 @@ const TABLE: &[Row] = &[
         tui: Read,
     },
     Row {
+        slug: "rule-overrides-changed",
+        gui: Read,
+        tray: Read,
+        tui: Read,
+    },
+    Row {
         slug: "enforcement-status-changed",
         gui: Read,
         tray: Read,

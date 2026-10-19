@@ -261,6 +261,7 @@ mod tests {
             app_match: Some(CanonicalAppMatch {
                 pattern: CanonicalAppPattern::Exact(name.to_string()),
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action: nrr_domain::RuleAction::Route,

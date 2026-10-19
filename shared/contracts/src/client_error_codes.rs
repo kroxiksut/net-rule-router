@@ -72,6 +72,7 @@ pub const CLIENT_ERROR_CODES: &[&str] = &[
     "invalid-rule-value",
     "network-on-both-routes",
     "folder-on-both-routes",
+    "path-in-other-users-profile",
     "network-covers-link",
     "network-covers-fake-ip-pool",
     "rule-kind-unknown",

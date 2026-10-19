@@ -19,12 +19,14 @@ use nrr_platform_api::fake_ip::stale_flows::StaleFlowReset;
 use nrr_platform_api::route_table::RouteTablePort;
 use nrr_platform_api::PlatformError;
 use nrr_platform_linux::drop_tag::{DropKind, DropTag};
+use nrr_platform_linux::process_launch::LinuxProcessLaunches;
 use nrr_service_runtime::app_observation_lookup::AppObservationStore;
 use nrr_service_runtime::block_notice_center::BlockNoticeCenter;
 use nrr_service_runtime::conn_observation_consumer::{
     BlockNoticeSinkFn, ConnTraceTee, ConnectionObservationConsumer, ConnectionTraceRing,
     EgressIfindexesFn, KillswitchDropCheckFn,
 };
+use nrr_service_runtime::script_launches::ScriptLaunches;
 use nrr_service_runtime::service_tasks::AppObservationWiring;
 
 /// What the drop consumer takes from the policy stack.
@@ -88,6 +90,7 @@ pub(crate) fn drop_consumer(
     parts: DropObservationParts,
     ring: Arc<ConnectionTraceRing>,
     store: Arc<AppObservationStore>,
+    scripts: Arc<ScriptLaunches>,
 ) -> ConnectionObservationConsumer {
     let recent = nrr_service_runtime::recent_rule_addresses::global_recent_rule_addresses();
     let consumer = ConnectionObservationConsumer::with_egress(
@@ -102,6 +105,7 @@ pub(crate) fn drop_consumer(
     // The socket table lists a dropped connection as one more socket.
     .with_drop_pairing()
     .with_app_observations(store)
+    .with_script_launches(scripts)
     .with_trace_ring(ring)
     .with_killswitch_drop_check(tag_check(|tag| tag.kind.verifies_kill_switch()))
     .with_ipv6_cut_drop_check(tag_check(|tag| tag.kind == DropKind::Ipv6Cut))
@@ -124,6 +128,8 @@ pub(crate) fn app_observation_wiring(
     tee: Option<Arc<ConnTraceTee>>,
     store: Arc<AppObservationStore>,
 ) -> AppObservationWiring {
+    // A rule by folder follows the scripts it holds, whichever reads the batch.
+    let scripts = Arc::new(ScriptLaunches::new(Arc::new(LinuxProcessLaunches)));
     let started = match (drops, tee.as_ref()) {
         (Some(parts), Some(tee)) => match start_drop_reports() {
             Ok(reports) => Some((parts, tee.ring(), reports)),
@@ -146,7 +152,7 @@ pub(crate) fn app_observation_wiring(
                 msg_key = "linux-svc-drop-reports-enabled",
                 "drop reports enabled: notices and the outage list are fed",
             );
-            let consumer = drop_consumer(parts, ring, Arc::clone(&store));
+            let consumer = drop_consumer(parts, ring, Arc::clone(&store), scripts);
             AppObservationWiring {
                 // Socket table first: a drop reported by the time the table is
                 // read lands in the same batch as its socket row.
@@ -157,6 +163,7 @@ pub(crate) fn app_observation_wiring(
                 store,
                 trace: None,
                 consumer: Some(Arc::new(consumer)),
+                scripts: None,
             }
         }
         None => AppObservationWiring {
@@ -164,6 +171,7 @@ pub(crate) fn app_observation_wiring(
             store,
             trace: tee,
             consumer: None,
+            scripts: Some(scripts),
         },
     }
 }

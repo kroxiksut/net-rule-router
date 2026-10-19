@@ -395,6 +395,7 @@ mod tests {
             app_match: Some(CanonicalAppMatch {
                 pattern: CanonicalAppPattern::Exact(pattern.into()),
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action: RuleAction::Route,
@@ -860,6 +861,7 @@ mod tests {
         rule.app_match = Some(CanonicalAppMatch {
             pattern: CanonicalAppPattern::Glob("*vpn*.exe".into()),
             include_child_processes: false,
+            override_requested: false,
         });
         let rules = book(vec![rule]);
 

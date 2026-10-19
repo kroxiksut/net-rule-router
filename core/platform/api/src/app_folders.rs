@@ -176,6 +176,21 @@ pub trait ProgramFolders: Send + Sync {
         false
     }
 
+    /// The profile (home) folder of `owner`, where a rule written from
+    /// `%LOCALAPPDATA%` or `~` starts for that owner. `None` for an owner
+    /// that names no user, or one this machine keeps no profile for: such a
+    /// rule then covers nothing for them.
+    fn owner_profile(&self, _owner: &str) -> Option<PathBuf> {
+        None
+    }
+
+    /// Whether any account may put a program at `place`, or create it first
+    /// where it is missing (`/tmp`, `C:\Users\Public`). What runs from such
+    /// a place vouches for nothing. Best-effort: unreadable reads as `false`.
+    fn writable_by_anyone(&self, place: &Path) -> bool {
+        writable_by_anyone_unix(place)
+    }
+
     /// Calls `on_change` when something in `folder` (and, with `subfolders`,
     /// below it) may have changed which programs it holds. Dropping the
     /// subscription ends the watch. Coalescing is the caller's job.
@@ -194,6 +209,33 @@ pub trait ProgramFolders: Send + Sync {
             reason: "no folder watch on this platform",
         })
     }
+}
+
+/// What `path` covers for `owner` now, read straight from `folders`: nothing
+/// remembered, nothing watched, within the same bounds. For a question asked
+/// once, such as the count a rule form shows; a pass asks a
+/// [`ProgramFolderIndex`].
+#[must_use]
+pub fn path_programs_once(
+    folders: &dyn ProgramFolders,
+    path: &AppPath,
+    owner: &str,
+) -> PathPrograms {
+    index::covered(
+        folders,
+        path,
+        owner,
+        &|text| {
+            let at = Path::new(text);
+            let kind = folders.place(at);
+            let real = match kind {
+                PlaceOnDisk::Missing => None,
+                PlaceOnDisk::File | PlaceOnDisk::Folder => folders.real_path(at),
+            };
+            (kind, real)
+        },
+        &|folder, subfolders| folders.list(&folder, subfolders),
+    )
 }
 
 /// The programs under `folder`, breadth first, each folder's entries sorted
@@ -387,6 +429,31 @@ fn has_execute_bit(path: &Path) -> bool {
 
 #[cfg(not(unix))]
 fn has_execute_bit(_path: &Path) -> bool {
+    false
+}
+
+/// Folder levels [`writable_by_anyone_unix`] climbs; a deeper path is judged
+/// by its lowest levels only.
+#[cfg(unix)]
+const WRITABLE_CHECK_DEPTH: usize = 64;
+
+/// [`ProgramFolders::writable_by_anyone`] by Unix permissions: the place, or
+/// any folder above it, carries the write bit for others (`/tmp`, `/var/tmp`
+/// and `/dev/shm` do, sticky or not: anyone may create a folder there first).
+#[cfg(unix)]
+#[must_use]
+pub fn writable_by_anyone_unix(place: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    place
+        .ancestors()
+        .take(WRITABLE_CHECK_DEPTH)
+        .filter_map(|level| std::fs::metadata(level).ok())
+        .any(|meta| meta.is_dir() && meta.permissions().mode() & 0o002 != 0)
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub fn writable_by_anyone_unix(_place: &Path) -> bool {
     false
 }
 

@@ -140,6 +140,56 @@ pub fn verify_pointer(row: &PointerFields<'_>, stored_hmac: &[u8], key: &[u8]) -
     }
 }
 
+/// The signed fields of a confirmed override of the protection of system
+/// programs and folders.
+///
+/// Tagged with the revision key because the row relaxes a gate: enforcement
+/// applies a protected rule only beside a row that verifies, so a row written
+/// past the service — however it got into the file — lifts nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct GrantFields<'a> {
+    pub sid: &'a str,
+    pub rule_value: &'a str,
+    pub effect: &'a str,
+    pub reason: &'a str,
+    pub critical: &'a str,
+    pub accounts: &'a str,
+    pub programs: i64,
+    pub granted_by: &'a str,
+    pub granted_at: i64,
+    pub expires_at: Option<i64>,
+}
+
+/// Keeps a grant tag from ever equalling a revision or pointer tag.
+const GRANT_DOMAIN: &str = "override-grant-v1";
+
+/// HMAC over a grant row, using the same key as [`compute_hmac`].
+#[must_use]
+pub fn compute_grant_hmac(row: &GrantFields<'_>, key: &[u8]) -> [u8; HMAC_BYTE_LEN] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("HMAC accepts a key of any length"));
+    feed_grant(&mut mac, row);
+    let out = mac.finalize().into_bytes();
+    let mut tag = [0u8; HMAC_BYTE_LEN];
+    tag.copy_from_slice(&out);
+    tag
+}
+
+/// Compare a stored grant tag with a fresh recomputation. An empty tag is
+/// [`HmacVerification::Unsigned`], which a reader treats as no grant at all.
+#[must_use]
+pub fn verify_grant(row: &GrantFields<'_>, stored_hmac: &[u8], key: &[u8]) -> HmacVerification {
+    if stored_hmac.is_empty() {
+        return HmacVerification::Unsigned;
+    }
+    let expected = compute_grant_hmac(row, key);
+    if stored_hmac.len() == expected.len() && stored_hmac == expected.as_slice() {
+        HmacVerification::Verified
+    } else {
+        HmacVerification::Tampered
+    }
+}
+
 /// Outcome of comparing a stored HMAC with one we just recomputed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HmacVerification {
@@ -271,6 +321,21 @@ fn feed_pointer(mac: &mut impl Sink, row: &PointerFields<'_>) {
     ] {
         feed_label(mac, part.as_bytes());
     }
+}
+
+/// Every field, labelled and length-prefixed like a revision row.
+fn feed_grant(mac: &mut impl Sink, row: &GrantFields<'_>) {
+    feed_label(mac, GRANT_DOMAIN.as_bytes());
+    feed_field_bytes(mac, b"sid", row.sid.as_bytes());
+    feed_field_bytes(mac, b"rule_value", row.rule_value.as_bytes());
+    feed_field_bytes(mac, b"effect", row.effect.as_bytes());
+    feed_field_bytes(mac, b"reason", row.reason.as_bytes());
+    feed_field_bytes(mac, b"critical", row.critical.as_bytes());
+    feed_field_bytes(mac, b"accounts", row.accounts.as_bytes());
+    feed_field_i64(mac, b"programs", row.programs);
+    feed_field_bytes(mac, b"granted_by", row.granted_by.as_bytes());
+    feed_field_i64(mac, b"granted_at", row.granted_at);
+    feed_field_i64_opt(mac, b"expires_at", row.expires_at);
 }
 
 fn feed_label(mac: &mut impl Sink, label: &[u8]) {
@@ -537,5 +602,86 @@ mod tests {
             verify(&sample_row(), &h, &key_verifier),
             HmacVerification::Tampered
         );
+    }
+
+    fn sample_grant() -> GrantFields<'static> {
+        GrantFields {
+            sid: "S-1-5-21-1",
+            rule_value: "/var/www/*",
+            effect: "deny",
+            reason: "shared-folder",
+            critical: "",
+            accounts: "unix:uid:33",
+            programs: 3,
+            granted_by: "S-1-5-21-1",
+            granted_at: 1_700_000_000_000,
+            expires_at: Some(1_700_086_400_000),
+        }
+    }
+
+    /// Any field moved breaks the tag: a grant cannot be re-homed, widened to
+    /// another rule, or given a longer term past the service.
+    #[test]
+    fn a_grant_tag_covers_every_field() {
+        let key = [0x42u8; 32];
+        let base = sample_grant();
+        let tag = compute_grant_hmac(&base, &key);
+        assert_eq!(verify_grant(&base, &tag, &key), HmacVerification::Verified);
+        assert_eq!(verify_grant(&base, &[], &key), HmacVerification::Unsigned);
+        let moved = [
+            GrantFields {
+                sid: "S-1-5-21-2",
+                ..base
+            },
+            GrantFields {
+                rule_value: "/var/*",
+                ..base
+            },
+            GrantFields {
+                effect: "secondary",
+                ..base
+            },
+            GrantFields {
+                reason: "system-folder",
+                ..base
+            },
+            GrantFields {
+                critical: "systemd",
+                ..base
+            },
+            GrantFields {
+                accounts: "",
+                ..base
+            },
+            GrantFields {
+                programs: 4,
+                ..base
+            },
+            GrantFields {
+                granted_by: "S-1-5-21-9",
+                ..base
+            },
+            GrantFields {
+                granted_at: 1,
+                ..base
+            },
+            GrantFields {
+                expires_at: None,
+                ..base
+            },
+            GrantFields {
+                expires_at: Some(i64::MAX),
+                ..base
+            },
+        ];
+        for row in moved {
+            assert_eq!(
+                verify_grant(&row, &tag, &key),
+                HmacVerification::Tampered,
+                "{row:?}"
+            );
+        }
+        // Never interchangeable with a revision tag over the same key.
+        assert_ne!(tag, compute_hmac(&sample_row(), &key));
     }
 }

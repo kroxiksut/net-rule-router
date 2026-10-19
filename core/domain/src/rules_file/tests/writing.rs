@@ -127,6 +127,7 @@ fn write_disabled_entry_with_inline_comment() {
                 blocked: false,
                 verify_primary: false,
                 origin: None,
+                override_requested: false,
             }],
         }],
     };

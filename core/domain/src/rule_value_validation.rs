@@ -205,6 +205,12 @@ pub fn validate_rule_value_in(
         return verdict;
     }
     match application_protection(match_value, effect, places) {
+        // Asked for on purpose: kept, and applied once its owner confirms it.
+        ProtectionVerdict::Refused(reason)
+            if reason.overridable() && carries_override_request(match_value) =>
+        {
+            RuleValueValidation::warning(OVERRIDE_REQUESTED_KEY)
+        }
         ProtectionVerdict::Refused(reason) => {
             RuleValueValidation::error(protection_message_key(reason))
         }
@@ -214,6 +220,17 @@ pub fn validate_rule_value_in(
         }
         ProtectionVerdict::Warn(_) | ProtectionVerdict::Allowed => verdict,
     }
+}
+
+/// The row's word for a protected rule that asks to apply anyway: not applied
+/// until its owner confirms it.
+pub const OVERRIDE_REQUESTED_KEY: &str = "rules.validation.match-value-warning.override-requested";
+
+/// Whether a table's application value carries `+override`.
+fn carries_override_request(value: &str) -> bool {
+    nrr_shared::preset_parser::split_rule_flags(value.trim())
+        .1
+        .override_requested
 }
 
 /// The locale key a protection reason is told by: a refusal under
@@ -616,7 +633,14 @@ fn refused_values(
                     let effect = wire_effect(rule, role)?;
                     let app = rule.app_match.as_ref()?;
                     let value = app.pattern.value().to_owned();
-                    let refused = wire_protection(&app.pattern, effect, places).is_refused();
+                    // A request to override is the owner's to confirm, not
+                    // the form's to refuse.
+                    let refused = match wire_protection(&app.pattern, effect, places) {
+                        ProtectionVerdict::Refused(reason) => {
+                            !(app.override_requested && reason.overridable())
+                        }
+                        ProtectionVerdict::Warn(_) | ProtectionVerdict::Allowed => false,
+                    };
                     (refused && !held_protected.contains(&(value.clone(), effect))).then_some(value)
                 })
                 .map(|value| RefusedRuleValue {
@@ -1305,6 +1329,28 @@ mod tests {
         assert!(validate_rule_value_for("application", masked, RuleEffect::Deny).is_error());
     }
 
+    /// `+override` turns an overridable refusal into the row's "needs
+    /// confirmation"; the disk root and our own programs stay refused.
+    #[test]
+    fn an_override_request_is_kept_as_a_warning_where_the_protection_allows_it() {
+        let requested = format!("{} +override", critical_name());
+        let verdict = validate_rule_value_for("application", &requested, RuleEffect::Deny);
+        assert_eq!(verdict.message_key(), OVERRIDE_REQUESTED_KEY);
+        assert!(verdict.is_warning());
+        let root = match HostPlatform::compiled() {
+            HostPlatform::Windows => r"C:\* +override",
+            HostPlatform::Linux | HostPlatform::MacOS => "/* +override",
+        };
+        assert_eq!(
+            validate_rule_value_for("application", root, RuleEffect::Deny).message_key(),
+            "rules.validation.match-value-invalid.protected-disk-root"
+        );
+        assert_eq!(
+            validate_rule_value_for("application", &requested, RuleEffect::PrimaryRoute),
+            RuleValueValidation::Valid
+        );
+    }
+
     #[test]
     fn every_protection_reason_has_one_key() {
         let keys: HashSet<String> = ProtectionReason::ALL
@@ -1328,6 +1374,7 @@ mod tests {
                     value: value.into(),
                 },
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action,

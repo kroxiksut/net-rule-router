@@ -659,7 +659,9 @@ fn run_console() -> std::process::ExitCode {
     #[cfg(windows)]
     {
         let deps = runtime_deps::build_supervised_runtime_deps(&artifacts, verbosity_handle);
+        let data_dir = artifacts.topology.data_dir.clone();
         run_supervised_runtime(&ConsoleController, &stop, artifacts, deps);
+        nrr_service_runtime::crash_series::end_run(&data_dir);
         std::process::ExitCode::SUCCESS
     }
     // Console mode drives the same supervised runtime the SCM path does, and

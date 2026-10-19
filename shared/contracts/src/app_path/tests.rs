@@ -103,7 +103,7 @@ fn a_relative_path_names_no_program() {
             "{raw}"
         );
     }
-    for raw in ["./app", "bin/app", "~/bin/app", "../app"] {
+    for raw in ["./app", "bin/app", "../app"] {
         assert_eq!(
             AppPath::parse(raw, LINUX),
             Err(AppPathError::NotAbsolute),
@@ -329,4 +329,170 @@ fn a_path_has_its_own_byte_bound_and_a_name_the_shorter_one() {
         crate::rule_value_class::MAX_RULE_VALUE_BYTES
     );
     const { assert!(MAX_PATH_VALUE_BYTES > crate::rule_value_class::MAX_RULE_VALUE_BYTES) };
+}
+
+#[test]
+fn a_profile_folder_heads_a_path_and_is_kept_as_written() {
+    for (raw, style, kind, text) in [
+        (
+            r"%LOCALAPPDATA%\Discord\*",
+            WIN,
+            AppPathKind::FolderTree,
+            r"%localappdata%\discord\*",
+        ),
+        (
+            r"%AppData%\Tool",
+            WIN,
+            AppPathKind::Folder,
+            r"%appdata%\tool\",
+        ),
+        (
+            "%USERPROFILE%/Apps/tool.exe",
+            WIN,
+            AppPathKind::File,
+            r"%userprofile%\apps\tool.exe",
+        ),
+        (
+            "%LOCALAPPDATA%",
+            WIN,
+            AppPathKind::Folder,
+            r"%localappdata%\",
+        ),
+        ("~/apps/*", LINUX, AppPathKind::FolderTree, "~/apps/*"),
+        ("~/Apps/run", LINUX, AppPathKind::FileOrFolder, "~/Apps/run"),
+        ("~/", LINUX, AppPathKind::Folder, "~/"),
+        ("~/Apps/", MAC, AppPathKind::Folder, "~/apps/"),
+    ] {
+        let path = AppPath::parse(raw, style).unwrap_or_else(|e| panic!("{raw}: {e}"));
+        assert_eq!((path.kind(), path.as_str()), (kind, text), "{raw}");
+        assert!(path.profile_folder().is_some(), "{raw}");
+        let again = AppPath::parse(path.as_str(), style).expect("reads back");
+        assert_eq!(again, path, "{raw}");
+    }
+}
+
+#[test]
+fn a_variable_the_platform_does_not_read_is_an_error() {
+    for (raw, style) in [
+        (r"%TEMP%\app.exe", WIN),
+        (r"%LOCALAPPDATA\app.exe", WIN),
+        (r"%APPDATA%x\app.exe", WIN),
+        (r"~\apps\", WIN),
+        (r"$env:APPDATA\app.exe", WIN),
+        ("~bob/apps/", LINUX),
+        ("$HOME/apps/", LINUX),
+        ("%LOCALAPPDATA%/apps/", LINUX),
+        ("%HOME%/apps/", MAC),
+    ] {
+        assert_eq!(
+            AppPath::parse(raw, style),
+            Err(AppPathError::UnknownVariable),
+            "{raw}"
+        );
+    }
+    assert_eq!(
+        AppPath::parse(r"%LOCALAPPDATA%\..\..\x\", WIN),
+        Err(AppPathError::Malformed)
+    );
+}
+
+/// The separator still says "path": every reader of the wire agrees on it.
+#[test]
+fn a_profile_folder_is_a_path_only_with_its_separator() {
+    assert!(is_path_value(r"%LOCALAPPDATA%\", WIN));
+    assert!(is_path_value("~/", LINUX));
+    assert!(!is_path_value("%LOCALAPPDATA%", WIN));
+    assert!(!is_path_value("~", LINUX));
+    assert!(!is_path_value("%odd%.exe", WIN));
+}
+
+/// One rule of the shared configuration names each owner's own folder.
+#[test]
+fn a_profile_path_resolves_to_each_owners_own_folder() {
+    let rule = AppPath::parse(r"%LOCALAPPDATA%\Discord\*", WIN).expect("parses");
+    let alice = rule.for_profile(r"C:\Users\Alice").expect("alice");
+    let bob = rule.for_profile(r"D:\Profiles\bob\").expect("bob");
+    assert_eq!(alice.as_str(), r"c:\users\alice\appdata\local\discord\*");
+    assert_eq!(bob.as_str(), r"d:\profiles\bob\appdata\local\discord\*");
+    assert_eq!(alice.profile_folder(), None);
+    assert_eq!(
+        alice.match_image(r"C:\Users\Alice\AppData\Local\Discord\app-1.0\Discord.exe"),
+        Some(AppPathKind::FolderTree)
+    );
+    assert_eq!(
+        alice.match_image(r"C:\Users\Bob\AppData\Local\Discord\Discord.exe"),
+        None
+    );
+    let home = AppPath::parse("~/apps/run", LINUX).expect("parses");
+    let resolved = home.for_profile("/home/alice").expect("alice");
+    assert_eq!(resolved.as_str(), "/home/alice/apps/run");
+    assert_eq!(resolved.kind(), AppPathKind::FileOrFolder);
+    assert!(rule.for_profile("relative").is_err());
+    assert!(
+        rule.for_profile(r"C:\").is_err(),
+        "a drive is nobody's profile"
+    );
+    let full = AppPath::parse(r"C:\Tools\*", WIN).expect("parses");
+    assert_eq!(full.for_profile(r"C:\Users\Alice").expect("same"), full);
+}
+
+/// Unresolved, a profile path matches no image and is judged at a profile no
+/// account can have, where profiles live by default.
+#[test]
+fn an_unresolved_profile_path_matches_nothing_and_is_judged_at_the_probe() {
+    let rule = AppPath::parse(r"%APPDATA%\Tool\", WIN).expect("parses");
+    assert_eq!(
+        rule.match_image(r"C:\Users\<profile>\AppData\Roaming\Tool\t.exe"),
+        None
+    );
+    assert_eq!(rule.place(), r"c:\users\<profile>\appdata\roaming\tool\");
+    assert_eq!(rule.depth(), 5);
+    let home = AppPath::parse("~/apps/*", LINUX).expect("parses");
+    assert_eq!(home.place(), "/home/<profile>/apps/");
+    assert_eq!(home.match_image("/home/<profile>/apps/run"), None);
+    assert_eq!(home.match_image("/apps/run"), None);
+}
+
+#[test]
+fn hostile_profile_input_never_panics() {
+    for raw in [
+        "%",
+        "%%",
+        r"%%\\",
+        "%\u{0}%",
+        "~",
+        "~~",
+        "~/\u{10FFFF}",
+        "$",
+        "%\u{FB00}%\\x",
+        "%LOCALAPPDATA%%",
+    ] {
+        for style in [WIN, LINUX, MAC] {
+            if let Ok(path) = AppPath::parse(raw, style) {
+                let _ = path.for_profile("/home/a");
+                let _ = path.for_profile(r"C:\Users\a");
+            }
+        }
+    }
+}
+
+/// A class-path folder is held by a folder rule over it and by a tree rule
+/// above it, never by a file rule.
+#[test]
+fn the_files_of_a_folder_are_held_by_the_folder_forms_only() {
+    let folder = AppPath::parse("/opt/cassandra/lib/", LINUX).expect("parses");
+    let tree = AppPath::parse("/opt/cassandra/*", LINUX).expect("parses");
+    let file = AppPath::parse(r"C:\Apps\tool.exe", WIN).expect("parses");
+    let undecided = AppPath::parse("/opt/cassandra/lib", LINUX).expect("parses");
+    assert!(folder.holds_files_in("/opt/cassandra/lib"));
+    assert!(!folder.holds_files_in("/opt/cassandra/lib/ext"));
+    assert!(tree.holds_files_in("/opt/cassandra/lib/ext"));
+    assert!(tree.holds_files_in("/opt/cassandra"));
+    assert!(!tree.holds_files_in("/opt"));
+    assert!(undecided.holds_files_in("/opt/cassandra/lib"));
+    assert!(!file.holds_files_in(r"C:\Apps"));
+    let win_tree = AppPath::parse(r"C:\Tools\*", WIN).expect("parses");
+    assert!(win_tree.holds_files_in(r"c:\TOOLS\lib"));
+    assert!(!win_tree.holds_files_in(r"C:\Tools\..\Windows"));
+    assert!(!win_tree.holds_files_in("relative"));
 }

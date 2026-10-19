@@ -224,6 +224,30 @@ QtObject {
             ? bridge.rpcRulesRecentChangesList(Math.floor(Number(since || 0)))
             : ""
     }
+    // What a rule by program path covers for the caller now.
+    function rpcRulesAppPathCoverage(value, route) {
+        return (bridgeAvailable && typeof bridge.rpcRulesAppPathCoverage === "function")
+            ? bridge.rpcRulesAppPathCoverage(String(value || ""), String(route || ""))
+            : ""
+    }
+    // Confirming a rule the protection of system programs refuses: what it
+    // would take, the confirmation itself, and taking it back.
+    function rpcRulesOverridePreview(value, route) {
+        return (bridgeAvailable && typeof bridge.rpcRulesOverridePreview === "function")
+            ? bridge.rpcRulesOverridePreview(String(value || ""), String(route || ""))
+            : ""
+    }
+    function rpcRulesOverrideGrant(token, typedValue, term) {
+        return (bridgeAvailable && typeof bridge.rpcRulesOverrideGrant === "function")
+            ? bridge.rpcRulesOverrideGrant(String(token || ""), String(typedValue || ""),
+                String(term || ""))
+            : ""
+    }
+    function rpcRulesOverrideRevoke(value, route) {
+        return (bridgeAvailable && typeof bridge.rpcRulesOverrideRevoke === "function")
+            ? bridge.rpcRulesOverrideRevoke(String(value || ""), String(route || ""))
+            : ""
+    }
     // The caller's kept connection history: `{ "from-unix-ms", "pagination" }`.
     function rpcConnHistoryList(payload) {
         return (bridgeAvailable && typeof bridge.rpcConnHistoryList === "function")

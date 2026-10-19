@@ -42,6 +42,7 @@ fn rule(
         blocked: false,
         verify_primary: false,
         children: false,
+        override_requested: false,
         line_number: line,
         origin: None,
     }
@@ -389,29 +390,115 @@ fn the_children_flag_is_taken_off_before_a_disabled_line_is_judged() {
 }
 
 #[test]
-fn split_children_flag_reads_only_a_later_word() {
+fn split_rule_flags_reads_only_a_later_word() {
+    let children = RuleFlags {
+        children: true,
+        override_requested: false,
+    };
+    let none = RuleFlags::default();
     assert_eq!(
-        split_children_flag("codex.exe  +children"),
-        ("codex.exe".to_owned(), true)
+        split_rule_flags("codex.exe  +children"),
+        ("codex.exe".to_owned(), children)
     );
     assert_eq!(
-        split_children_flag("+children"),
-        ("+children".to_owned(), false)
+        split_rule_flags("+children"),
+        ("+children".to_owned(), none)
     );
     assert_eq!(
-        split_children_flag("codex.exe +children +block"),
-        ("codex.exe +block".to_owned(), true)
+        split_rule_flags("codex.exe +children +block"),
+        ("codex.exe +block".to_owned(), children)
     );
     assert_eq!(
-        split_children_flag("a.exe +childrenx"),
-        ("a.exe +childrenx".to_owned(), false)
+        split_rule_flags("a.exe +childrenx"),
+        ("a.exe +childrenx".to_owned(), none)
     );
-    assert_eq!(split_children_flag(""), (String::new(), false));
-    assert_eq!(without_children_flag("codex.exe +children"), "codex.exe");
+    assert_eq!(split_rule_flags(""), (String::new(), none));
+    assert_eq!(without_rule_flags("codex.exe +children"), "codex.exe");
+    assert_eq!(without_rule_flags("Adobe  Reader.exe"), "Adobe  Reader.exe");
+}
+
+#[test]
+fn the_override_flag_is_a_later_word_in_any_order() {
+    let both = RuleFlags {
+        children: true,
+        override_requested: true,
+    };
     assert_eq!(
-        without_children_flag("Adobe  Reader.exe"),
-        "Adobe  Reader.exe"
+        split_rule_flags("/var/www/* +override +children"),
+        ("/var/www/*".to_owned(), both)
     );
+    assert_eq!(
+        split_rule_flags("/var/www/* +children +override"),
+        ("/var/www/*".to_owned(), both)
+    );
+    assert_eq!(
+        split_rule_flags("+override"),
+        ("+override".to_owned(), RuleFlags::default())
+    );
+    assert_eq!(
+        split_rule_flags("a.exe +overrides").1,
+        RuleFlags::default(),
+        "a typo is no flag"
+    );
+    assert_eq!(
+        without_rule_flags(r"C:\Program Files\* +override"),
+        r"C:\Program Files\*"
+    );
+}
+
+/// `+override` on a program line enabled or not: taken off the value before
+/// the line is judged rule or prose, and kept on the program only.
+#[test]
+fn the_override_flag_is_read_on_program_lines_and_dropped_elsewhere() {
+    let text = format!(
+        "--- Domains\nexample.com +override\n--- {NATIVE_APP}\n\
+         !svchost.exe +override  # on purpose\n# !C:\\Windows\\* +override\n"
+    );
+    let result = parse_canonical_rules(&text);
+    let read: Vec<_> = result
+        .rules
+        .iter()
+        .map(|r| {
+            (
+                r.match_value.as_str(),
+                r.enabled,
+                r.override_requested,
+                r.stored_value(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("example.com", true, true, "example.com".to_owned()),
+            (
+                "svchost.exe",
+                true,
+                true,
+                "svchost.exe +override".to_owned()
+            ),
+            (
+                r"C:\Windows\*",
+                false,
+                true,
+                r"C:\Windows\* +override".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(result.rules[1].comment, "on purpose");
+    assert!(result.rules[1].blocked);
+}
+
+#[test]
+fn the_override_flag_travels_only_when_set() {
+    let text = format!("--- {NATIVE_APP}\ncodex.exe\ntool.exe +override\n");
+    let result = parse_canonical_rules(&text);
+    let plain = serde_json::to_value(&result.rules[0]).expect("serialize");
+    assert!(plain.get("override-requested").is_none());
+    let flagged = serde_json::to_value(&result.rules[1]).expect("serialize");
+    assert_eq!(flagged["override-requested"], serde_json::Value::Bool(true));
+    let back: ParsedRule = serde_json::from_value(plain).expect("deserialize");
+    assert!(!back.override_requested);
 }
 
 /// A table keeps the flag on a program only: in any other section the service

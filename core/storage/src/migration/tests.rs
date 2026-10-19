@@ -167,7 +167,7 @@ fn run_state_migrations_empty_db() {
     // + v48 (auto_rule_dismissals.dto_json — the refused offer, kept verbatim)
     // + v49 (block_notice_mutes table — durable "do not show" choices)
     // + v50 (isp_block_candidates_enabled on service_stability_config)
-    assert_eq!(s.to_version, 76);
+    assert_eq!(s.to_version, 77);
     assert_eq!(
         s.migrations_applied,
         [
@@ -247,6 +247,7 @@ fn run_state_migrations_empty_db() {
             "add_install_policy",
             "app_destinations_by_principal",
             "add_conn_history_prefs",
+            "add_override_grants",
         ]
     );
 }
@@ -258,8 +259,8 @@ fn state_migration_idempotent() {
 
     runner.run_pending_migrations().expect("first run");
     let s = runner.run_pending_migrations().expect("second run");
-    assert_eq!(s.from_version, 76);
-    assert_eq!(s.to_version, 76);
+    assert_eq!(s.from_version, 77);
+    assert_eq!(s.to_version, 77);
     assert!(s.migrations_applied.is_empty());
 }
 
@@ -292,8 +293,9 @@ fn every_intermediate_state_version_upgrades_to_the_current_schema() {
         let partial = older
             .run_pending_migrations()
             .unwrap_or_else(|e| panic!("migrating an empty db to v{stop_at}: {e}"));
+        let stopped_version = STATE_MIGRATIONS[stop_at - 1].version;
         assert_eq!(
-            partial.to_version, stop_at as u32,
+            partial.to_version, stopped_version,
             "the prefix runner must stop exactly where it was told"
         );
         drop(older);
@@ -303,10 +305,14 @@ fn every_intermediate_state_version_upgrades_to_the_current_schema() {
             .run_pending_migrations()
             .unwrap_or_else(|e| panic!("upgrading a v{stop_at} database: {e}"));
         assert_eq!(
-            rest.from_version, stop_at as u32,
+            rest.from_version, stopped_version,
             "the upgrade must start from the version the older build left"
         );
-        assert_eq!(rest.to_version, STATE_MIGRATIONS.len() as u32);
+        // A version, not a count: a number may be held for a later step.
+        assert_eq!(
+            rest.to_version,
+            STATE_MIGRATIONS.last().map_or(0, |m| m.version)
+        );
         let verified = current
             .verify_schema()
             .unwrap_or_else(|e| panic!("verifying after an upgrade from v{stop_at}: {e}"));
@@ -352,8 +358,8 @@ fn verify_state_schema_after_migration() {
 
     let v = runner.verify_schema().expect("verify");
     assert!(v.is_ok(), "state schema verification failed: {v:?}");
-    // through v76 (add_conn_history_prefs)
-    assert_eq!(v.version, 76);
+    // through v77 (add_override_grants)
+    assert_eq!(v.version, 77);
 }
 
 #[test]
@@ -537,6 +543,7 @@ fn shipped_state_checksums_are_unchanged() {
             (74, "42c87cddcd988877"),
             (75, "dfa2c31391bb2ddf"),
             (76, "855bba352ad44570"),
+            (77, "64506a874e24293a"),
         ],
     );
 }
@@ -987,7 +994,7 @@ fn upgrade_state_db_from_v1_to_v2() {
 
     let summary = runner.run_pending_migrations().expect("upgrade v1→latest");
     assert_eq!(summary.from_version, 1);
-    assert_eq!(summary.to_version, 76);
+    assert_eq!(summary.to_version, 77);
     assert_eq!(
         summary.migrations_applied,
         [
@@ -1066,6 +1073,7 @@ fn upgrade_state_db_from_v1_to_v2() {
             "add_install_policy",
             "app_destinations_by_principal",
             "add_conn_history_prefs",
+            "add_override_grants",
         ]
     );
 
@@ -1103,7 +1111,7 @@ fn upgrade_state_db_from_v2_to_v3() {
 
     let summary = runner.run_pending_migrations().expect("upgrade v2→latest");
     assert_eq!(summary.from_version, 2);
-    assert_eq!(summary.to_version, 76);
+    assert_eq!(summary.to_version, 77);
     assert_eq!(
         summary.migrations_applied,
         [
@@ -1181,6 +1189,7 @@ fn upgrade_state_db_from_v2_to_v3() {
             "add_install_policy",
             "app_destinations_by_principal",
             "add_conn_history_prefs",
+            "add_override_grants",
         ]
     );
 

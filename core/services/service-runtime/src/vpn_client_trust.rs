@@ -4,7 +4,8 @@
 //! something anyone can give a file. What makes a match a client rather than
 //! a download named like one is where the file sits: a folder only the
 //! machine's administrators write to, or a path the user confirmed as their
-//! link provider. Everything else is remembered as pending so the user can be
+//! link provider. A place anyone may write into never makes one, confirmed
+//! or not. Everything else is remembered as pending so the user can be
 //! asked, and exempted from nothing until they answer.
 
 use std::collections::{HashMap, HashSet};
@@ -51,7 +52,14 @@ where
         if lower.trim().is_empty() || !seen.insert(lower.clone()) {
             continue;
         }
-        if confirmed.contains(&lower) || resolver.is_protected_install(Path::new(&candidate)) {
+        let path = Path::new(&candidate);
+        if resolver.is_protected_install(path) {
+            split.accepted.push(candidate);
+        } else if resolver.writable_by_anyone(path) {
+            // Anyone could have put it there: no confirmation makes it a
+            // client, so the user is not asked either.
+            continue;
+        } else if confirmed.contains(&lower) {
             split.accepted.push(candidate);
         } else {
             split.pending.push(candidate);
@@ -199,6 +207,21 @@ mod tests {
             "the user's confirmation is the way in, whatever the casing"
         );
         assert!(split.pending.is_empty());
+    }
+
+    /// A folder anyone may write into vouches for nothing: a client there is
+    /// neither exempt, even confirmed, nor offered for confirmation.
+    #[test]
+    fn a_client_where_anyone_may_write_is_never_exempt() {
+        const SHARED: &str = r"C:\Users\Public\x-vpn.exe";
+        let resolver = resolver().with_anyone_writable_root(r"C:\Users\Public");
+        let split = split_by_trust(
+            &resolver,
+            &[SHARED.to_string()],
+            [SHARED.to_string(), INSTALLED.to_string()],
+        );
+        assert_eq!(split.accepted, vec![INSTALLED.to_string()]);
+        assert!(split.pending.is_empty(), "{:?}", split.pending);
     }
 
     #[test]

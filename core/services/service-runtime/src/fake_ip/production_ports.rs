@@ -417,10 +417,7 @@ impl ServedFlowOwners {
 /// A machine account (LocalSystem, LocalService, NetworkService, a per-service
 /// SID): its traffic follows the route-table owner, as the leak guard has it.
 fn is_service_account(principal: &str) -> bool {
-    nrr_platform_api::types::SERVICE_ACCOUNT_SIDS
-        .iter()
-        .any(|sid| sid.eq_ignore_ascii_case(principal))
-        || principal.starts_with("S-1-5-80-")
+    nrr_platform_api::types::is_service_account_sid(principal)
 }
 
 impl FlowOwners for ServedFlowOwners {

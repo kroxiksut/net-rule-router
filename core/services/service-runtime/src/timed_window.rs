@@ -1,4 +1,5 @@
-//! A diagnostic log switch as a window that closes by itself.
+//! A switch as a window that closes by itself: a diagnostic log switch, or a
+//! confirmed override of the protection of system programs.
 //!
 //! Verbose logging and the connection trace on disk both write privacy-
 //! sensitive detail and cost disk for as long as nobody remembers them. Every
@@ -78,6 +79,8 @@ impl TimedWindow {
 pub enum WindowKind {
     VerboseLogging,
     ConnTraceLog,
+    /// One confirmed override's term; its owner logs the end itself.
+    ProtectionOverride,
 }
 
 impl WindowKind {
@@ -85,6 +88,7 @@ impl WindowKind {
         match self {
             Self::VerboseLogging => "nrr-verbose-expiry",
             Self::ConnTraceLog => "nrr-conn-trace-expiry",
+            Self::ProtectionOverride => "nrr-override-expiry",
         }
     }
 
@@ -100,6 +104,7 @@ impl WindowKind {
                 msg_key = "conn-trace-log-window-ended",
                 "connection trace log window ended; connections are no longer written to the log",
             ),
+            Self::ProtectionOverride => {}
         }
     }
 
@@ -116,6 +121,12 @@ impl WindowKind {
                 msg_key = "conn-trace-log-expiry-unarmed",
                 error = %error,
                 "connection trace log timer could not start; the window ends at the next restart",
+            ),
+            Self::ProtectionOverride => tracing::warn!(
+                target: "nrr::override",
+                msg_key = "protection-override-expiry-unarmed",
+                error = %error,
+                "a confirmed override's timer could not start; it still ends on time at the next rules read",
             ),
         }
     }

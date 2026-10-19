@@ -316,10 +316,16 @@ impl RulesSnapshotProvider for ProductionRulesSnapshotProvider {
 /// an address and an app match shows the address; an app-only rule falls
 /// back to the application pattern).
 pub(crate) fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str) -> RuleRowEntry {
-    let (rule_type, match_value) = nrr_domain::rule_value_validation::wire_rule_values(dto)
+    let (rule_type, mut match_value) = nrr_domain::rule_value_validation::wire_rule_values(dto)
         .next()
         .unwrap_or(("application", String::new()));
     let rule_type = rule_type.to_string();
+    // The request rides the value as the rules file writes it, so a table or a
+    // file built from these rows keeps it.
+    if rule_type == "application" && dto.app_match.as_ref().is_some_and(|a| a.override_requested) {
+        match_value.push(' ');
+        match_value.push_str(nrr_shared::preset_parser::OVERRIDE_FLAG);
+    }
     // A Block-action rule displays as the "block" route regardless of which
     // bucket it physically lives in — set membership is enforcement-irrelevant
     // for a blocked rule (the WFP codegen drops it). A `?` rule shows its own
@@ -973,6 +979,7 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
         };
         drop(conn);
         self.forget_history(Some(sid));
+        crate::override_grants::forget_principal(sid);
         Ok(PrincipalDataPurgeResponse {
             rows_deleted: summary.rows_deleted,
             tables_touched: summary.tables_touched as u32,
@@ -1007,6 +1014,9 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
         total.principals_purged = principals.len() as u32;
         drop(conn);
         self.forget_history(None);
+        for principal in &principals {
+            crate::override_grants::forget_principal(principal);
+        }
         Ok(total)
     }
 

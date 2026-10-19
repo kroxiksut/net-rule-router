@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use nrr_client_logic::rebase::rebase_edits;
 use nrr_client_logic::rules_table::{
     file_row_from_service_wire, main_route_check_hosts, main_route_rank, row_matches_search,
     RowOrigin, RuleRow, RuleType, TargetRoute,
@@ -155,15 +156,18 @@ pub enum RouteFilter {
     Block,
     /// The `?` rules, on either route.
     Unsure,
+    /// The rules applied despite the protection of system programs.
+    Overridden,
 }
 
 impl RouteFilter {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::All,
         Self::Primary,
         Self::Secondary,
         Self::Block,
         Self::Unsure,
+        Self::Overridden,
     ];
 
     pub fn label(self) -> Key {
@@ -173,6 +177,7 @@ impl RouteFilter {
             Self::Secondary => text::ROUTE_SECONDARY,
             Self::Block => text::FILTER_DENIED,
             Self::Unsure => text::ROUTE_UNSURE,
+            Self::Overridden => text::FILTER_OVERRIDDEN,
         }
     }
 
@@ -184,6 +189,8 @@ impl RouteFilter {
             Self::Secondary => *route == TargetRoute::Secondary,
             Self::Block => *route == TargetRoute::Block,
             Self::Unsure => rule.is_verify(),
+            // Judged by the table, which holds the confirmations.
+            Self::Overridden => true,
         }
     }
 }
@@ -224,14 +231,14 @@ pub fn route_label(route: &TargetRoute) -> Option<Key> {
     }
 }
 
-/// What the rows on screen changed against the rules last read, each rule
-/// named by its `merge_key`.
+/// The rows on screen and the rules they were made against: laid over
+/// rules read since, they say what the user changed (`rebase_edits`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Edits {
-    /// Rules read that are no longer on screen.
-    pub removed: Vec<String>,
-    /// Rows added, or changed in anything but their key.
-    pub rows: Vec<RuleRow>,
+    /// The rules last read.
+    base: Vec<RuleRow>,
+    /// The rows on screen.
+    edited: Vec<RuleRow>,
 }
 
 /// The routing part of a row, and its note: what "unchanged" compares.
@@ -263,6 +270,9 @@ pub struct Table {
     /// «Recent» while it is on: only the rules changed lately are shown,
     /// newest first.
     pub recent: Option<super::recent::Recent>,
+    /// Keys ([`super::overrides::key_of`]) of the rules applied despite the
+    /// protection, for the filter by them.
+    pub overridden: std::collections::HashSet<String>,
 }
 
 impl Table {
@@ -275,6 +285,10 @@ impl Table {
             .enumerate()
             .filter(|(_, row)| {
                 self.filter.passes(&row.rule)
+                    && (self.filter != RouteFilter::Overridden
+                        || self
+                            .overridden
+                            .contains(&super::overrides::key_of(&row.rule)))
                     && row_matches_search(&row.rule, &row.ace_lower, &self.search)
                     && self
                         .recent
@@ -426,54 +440,48 @@ impl Table {
 
     /// What the rows on screen changed against the rules last read.
     pub fn edits(&self) -> Edits {
-        let base: HashMap<String, &RuleRow> = self
-            .baseline
-            .iter()
-            .flatten()
-            .map(|rule| (rule.merge_key(), rule))
-            .collect();
-        let on_screen: std::collections::HashSet<String> =
-            self.rows.iter().map(|r| r.rule.merge_key()).collect();
-        let mut removed: Vec<String> = base
-            .keys()
-            .filter(|key| !on_screen.contains(*key))
-            .cloned()
-            .collect();
-        removed.sort();
-        let rows = self
-            .rows
-            .iter()
-            .map(|r| content(&r.rule))
-            .filter(|rule| base.get(&rule.merge_key()) != Some(&rule))
-            .collect();
-        Edits { removed, rows }
+        Edits {
+            base: self.baseline.clone().unwrap_or_default(),
+            edited: self.rows.iter().map(|r| r.rule.clone()).collect(),
+        }
     }
 
     /// `edits` laid over the rows just read: a rule removed goes, a row of
     /// the same rule is replaced, a new one is added.
     pub fn apply_edits(&mut self, edits: Edits) {
-        self.rows
-            .retain(|row| !edits.removed.contains(&row.rule.merge_key()));
-        for rule in edits.rows {
-            let key = rule.merge_key();
-            match self.rows.iter().position(|r| r.rule.merge_key() == key) {
-                Some(at) => {
-                    let old = &self.rows[at];
+        let fresh: Vec<RuleRow> = self.rows.iter().map(|r| r.rule.clone()).collect();
+        let rebased = rebase_edits(&edits.base, &edits.edited, &fresh, &[]);
+        let mut old: HashMap<String, Row> = HashMap::new();
+        for row in std::mem::take(&mut self.rows) {
+            old.entry(row.rule.merge_key()).or_insert(row);
+        }
+        let mut next = rebased
+            .rows
+            .iter()
+            .filter_map(|r| r.id.strip_prefix("R-")?.parse::<usize>().ok())
+            .max()
+            .unwrap_or(0);
+        for rule in rebased.rows {
+            let kept = old.remove(&rule.merge_key());
+            let row = match kept {
+                Some(old) if old.rule == rule => old,
+                Some(old) => {
                     let mut row = Row {
                         service_id: old.service_id.clone(),
-                        ..Row::new(RuleRow {
-                            id: old.rule.id.clone(),
-                            ..rule
-                        })
+                        ..Row::new(rule)
                     };
-                    row.inherit_main_route(old);
-                    self.rows[at] = row;
+                    row.inherit_main_route(&old);
+                    row
                 }
                 None => {
-                    let id = self.next_free_id();
-                    self.rows.push(Row::new(RuleRow { id, ..rule }));
+                    next += 1;
+                    Row::new(RuleRow {
+                        id: rule_id(next.min(FREE_MAX_RULES)),
+                        ..rule
+                    })
                 }
-            }
+            };
+            self.rows.push(row);
         }
         self.clamp_cursor();
     }

@@ -26,8 +26,12 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
 use nrr_shared::ipc_payloads::{
-    EnforcementStatusDto, RoutesHeldDto, RuleConflictDto, TrafficCarriedDto,
+    EnforcementStatusDto, RoutesHeldDto, RuleConflictDto, RuleConflictKind, TrafficCarriedDto,
 };
+
+/// The reason a rule on another user's folder is not applied; the other
+/// reasons are protection slugs.
+const OTHER_USERS_FOLDER_REASON: &str = "other-users-folder";
 
 /// Ceiling on the conflicts kept per principal, so one pathological rule book
 /// cannot grow the snapshot past a frame.
@@ -78,6 +82,42 @@ impl AppEnforcementStatus {
             .get(principal)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The apps `principal`'s rules leave unenforced, each with the reason
+    /// the conflicts name for it, if any. A rule refused for its place is
+    /// listed beside the ones that found no program, with its reason, so the
+    /// Status screen says what Overlaps says.
+    pub fn unenforced_apps(&self, principal: &str) -> (Vec<String>, BTreeMap<String, String>) {
+        let guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut apps = guard.unresolved.get(principal).cloned().unwrap_or_default();
+        let mut reasons = BTreeMap::new();
+        for conflict in guard.conflicts.get(principal).into_iter().flatten() {
+            let reason = match conflict.kind {
+                RuleConflictKind::ProtectedTarget if !conflict.reason.is_empty() => {
+                    conflict.reason.as_str()
+                }
+                RuleConflictKind::OtherUsersFolder => OTHER_USERS_FOLDER_REASON,
+                _ => continue,
+            };
+            if conflict.app.is_empty() {
+                continue;
+            }
+            let entry = match apps
+                .iter()
+                .find(|app| app.eq_ignore_ascii_case(&conflict.app))
+            {
+                Some(known) => known.clone(),
+                None => {
+                    apps.push(conflict.app.clone());
+                    conflict.app.clone()
+                }
+            };
+            reasons.insert(entry, reason.to_string());
+        }
+        apps.sort();
+        apps.dedup();
+        (apps, reasons)
     }
 
     /// Replace `principal`'s rule conflicts; an empty list forgets them.
@@ -344,7 +384,7 @@ impl RouteEnforcementStatus {
             stored
         };
         if stored.role == "secondary" && stored.status == "ok" {
-            crate::startup_quiet::note_up(principal);
+            crate::startup_quiet::note_up(principal, now_ms);
         }
         if stored.role == "secondary" {
             if let Some(outages) = self.outages.get() {
@@ -771,6 +811,52 @@ mod tests {
         status.set_unresolved(other, Vec::new());
         assert_eq!(status.unresolved(SID), vec!["ab.exe"]);
         assert!(status.unresolved(other).is_empty());
+    }
+
+    fn conflict(kind: RuleConflictKind, app: &str, reason: &str) -> RuleConflictDto {
+        RuleConflictDto {
+            kind,
+            rule_id: "r-1".into(),
+            rule_value: app.into(),
+            ip: String::new(),
+            count: 0,
+            other_rule_id: String::new(),
+            host: String::new(),
+            via_host: String::new(),
+            app: app.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Status names the reason Overlaps names: a refused place is listed with
+    /// its reason, a program never found stays without one.
+    #[test]
+    fn unenforced_apps_carry_the_reason_the_conflicts_name() {
+        let status = AppEnforcementStatus::new();
+        status.set_unresolved(SID, vec!["ab.exe".to_string(), r"c:\other\*".to_string()]);
+        status.set_rule_conflicts(
+            SID,
+            vec![
+                conflict(
+                    RuleConflictKind::ProtectedTarget,
+                    r"c:\junk\*",
+                    "system-folder",
+                ),
+                conflict(RuleConflictKind::OtherUsersFolder, r"C:\Other\*", ""),
+                conflict(RuleConflictKind::FolderOverCap, r"c:\big\*", ""),
+            ],
+        );
+        let (apps, reasons) = status.unenforced_apps(SID);
+        assert_eq!(apps, vec!["ab.exe", r"c:\junk\*", r"c:\other\*"]);
+        assert_eq!(
+            reasons.get(r"c:\junk\*").map(String::as_str),
+            Some("system-folder")
+        );
+        assert_eq!(
+            reasons.get(r"c:\other\*").map(String::as_str),
+            Some("other-users-folder")
+        );
+        assert!(!reasons.contains_key("ab.exe"));
     }
 
     #[test]

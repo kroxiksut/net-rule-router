@@ -73,6 +73,10 @@ pub struct ParsedRule {
     /// takes it off.
     #[serde(default)]
     pub children: bool,
+    /// Whether the value carried `+override` (docs/en/rules-file-format.md
+    /// Overriding the protection), taken off `match_value` as `children` is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub override_requested: bool,
     /// Provenance of an app-authored rule — `Some` only for entries in the
     /// `--- Auto` section (docs/en/rules-file-format.md App-authored rules). The structured tokens are
     /// removed from `comment`, which keeps only the free text that followed
@@ -90,7 +94,14 @@ impl ParsedRule {
     /// What a rules table stores for this rule ([`stored_rule_value`]).
     #[must_use]
     pub fn stored_value(&self) -> String {
-        stored_rule_value(self.rule_type, &self.match_value, self.children)
+        stored_rule_value(
+            self.rule_type,
+            &self.match_value,
+            RuleFlags {
+                children: self.children,
+                override_requested: self.override_requested,
+            },
+        )
     }
 }
 

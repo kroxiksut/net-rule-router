@@ -178,7 +178,38 @@ pub(crate) fn run_offline_reset() -> std::process::ExitCode {
             nrr_platform_api::service_control::EXIT_SERVICE_RUNNING,
         );
     }
-    finish_offline_reset()
+    with_overrides_revoked(finish_offline_reset())
+}
+
+/// The user's emergency reset also takes back every confirmed override of the
+/// protection of system programs, so the machine comes back protected. Not
+/// the after-crash sweep: nobody asked for a reset there.
+fn with_overrides_revoked(code: std::process::ExitCode) -> std::process::ExitCode {
+    let path = match nrr_storage::resolve_storage_topology(
+        &nrr_storage::StorageProfile::ProductionService,
+    ) {
+        Ok(topology) => topology.state_db_path,
+        Err(e) => {
+            eprintln!(
+                "cleanup: the service's data could not be found ({e:?}); \
+                 no confirmation was revoked."
+            );
+            return std::process::ExitCode::from(1);
+        }
+    };
+    match nrr_service_runtime::override_grants::revoke_all_offline(&path) {
+        Ok(n) => {
+            println!("  rules confirmed despite the protection: {n} revoked");
+            code
+        }
+        Err(e) => {
+            eprintln!(
+                "cleanup: rules confirmed despite the protection could not be revoked ({e}); \
+                 revoke them in the rules list once the service runs."
+            );
+            std::process::ExitCode::from(1)
+        }
+    }
 }
 
 /// "Stop the service and restore the network": a clean stop, the process ended
@@ -220,7 +251,7 @@ pub(crate) fn run_stop_and_cleanup() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     }
-    let code = finish_offline_reset();
+    let code = with_overrides_revoked(finish_offline_reset());
     if let Some(hold) = hold {
         if let Err(e) = hold.release() {
             eprintln!(

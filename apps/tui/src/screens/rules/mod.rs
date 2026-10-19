@@ -6,11 +6,13 @@
 mod ace;
 mod apply;
 mod bulk;
+mod coverage;
 mod files;
 mod folder;
 mod form;
 mod gateway;
 mod main_route;
+pub mod overrides;
 mod own_settings;
 mod recent;
 mod render;
@@ -52,6 +54,8 @@ pub enum Mode {
     Gateway(Box<gateway::Stage>),
     /// `A`: several rules at once, as lines of a rules file.
     Bulk(Box<bulk::BulkForm>),
+    /// `P`: a protected rule confirmed to apply despite the protection.
+    Override(Box<overrides::Confirm>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,6 +233,9 @@ pub struct RulesState {
     /// The `base-revision` of the rules on screen: what the next apply is
     /// built on. `None` until a read names it.
     pub base_revision: Option<String>,
+    /// The caller's rules applied despite the protection of system programs,
+    /// by [`overrides::key_of`], as the last snapshot listed them.
+    pub overrides: std::collections::HashMap<String, nrr_shared::ipc_payloads::RuleOverrideDto>,
     /// An add form another screen asked for while the list was being read;
     /// it opens once the list is in, so the read cannot replace the rule.
     prefilled: Option<Box<Form>>,
@@ -288,6 +295,7 @@ impl Screen for RulesScreen {
             text::HELP_FORM,
             text::HELP_BULK,
             text::HELP_RECENT,
+            text::HELP_OVERRIDE,
         ]
     }
 
@@ -311,6 +319,7 @@ impl Screen for RulesScreen {
             text::PLAIN_BULK,
             text::PLAIN_MOVE_TO_TYPE,
             text::PLAIN_RECENT,
+            text::PLAIN_OVERRIDE,
         ]
     }
 
@@ -336,6 +345,7 @@ impl Screen for RulesScreen {
             Mode::Review(review) => review_key(app, review, key),
             Mode::Gateway(stage) => gateway::on_key(app, *stage, key),
             Mode::Bulk(form) => bulk::on_key(app, form, key),
+            Mode::Override(confirm) => overrides::on_key(app, confirm, key),
         };
         settle(app);
         handled
@@ -367,6 +377,7 @@ impl Screen for RulesScreen {
             Mode::Review(_) => Some(text::PLAIN_REVIEW_PROMPT),
             Mode::Gateway(stage) => gateway::plain_prompt(stage),
             Mode::Bulk(form) => Some(bulk::plain_prompt(form)),
+            Mode::Override(confirm) => Some(overrides::plain_prompt(confirm)),
         }
     }
 }
@@ -395,6 +406,12 @@ fn line_in_mode(app: &mut AppState, line: &str) -> bool {
             }
             if line == "!t" {
                 form.switch_type();
+                refresh_form(app, &mut form);
+                app.rules.mode = Mode::Form(form);
+                return true;
+            }
+            if line == "!f" {
+                form.toggle_subfolders();
                 refresh_form(app, &mut form);
                 app.rules.mode = Mode::Form(form);
                 return true;
@@ -454,6 +471,12 @@ fn line_in_mode(app: &mut AppState, line: &str) -> bool {
         Mode::Bulk(form) => {
             if line != "!" {
                 bulk::on_line(app, form, line);
+            }
+            true
+        }
+        Mode::Override(confirm) => {
+            if line != "!" {
+                overrides::on_line(app, confirm, line);
             }
             true
         }
@@ -680,6 +703,7 @@ fn finished(app: &mut AppState, finished: Finished) {
             // The next apply is built on what this one left in force.
             rules.base_revision = base;
             rules.table.mark_applied();
+            app.snapshot_refresh_due = true;
             if quit {
                 app.quit = true;
             }
@@ -757,9 +781,11 @@ fn open_form(app: &mut AppState, mut form: Form) {
     }
 }
 
-/// The form's overlap line follows the rule in it.
-fn refresh_form(app: &AppState, form: &mut Form) {
+/// The form's overlap line follows the rule in it, and its count of what a
+/// rule by path covers is asked again once the value rests.
+fn refresh_form(app: &mut AppState, form: &mut Form) {
     form.refresh_overlaps(&app.rules.table, include_subdomains(app));
+    coverage::schedule(app, form);
 }
 
 fn edit_selected(app: &mut AppState, master: Option<usize>) {
@@ -1266,6 +1292,7 @@ fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
             'A' => return bulk::start(app, TargetRoute::Primary, String::new(), false),
             'R' => return recent::ask(app),
             'U' => return recent::ask_restore(app),
+            'P' => return overrides::start(app, selected),
             'b' => switch_book(app),
             _ => return false,
         },
@@ -1386,6 +1413,9 @@ fn form_key(app: &mut AppState, mut form: Box<Form>, key: KeyEvent) -> bool {
         }
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             form.switch_type();
+        }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            form.toggle_subfolders();
         }
         KeyCode::F(2) if form.editing.is_none() => {
             return bulk::start(app, form.route.clone(), form.value.clone(), true);
@@ -1547,6 +1577,13 @@ fn list_line(app: &mut AppState, line: &str) -> bool {
         }
         "M" => return move_all_to_type(app),
         "R" => return recent::ask(app),
+        "P" => {
+            let master = numbered(app, arg);
+            if let Some(i) = master {
+                app.rules.table.select(i);
+            }
+            return overrides::start(app, master);
+        }
         "U" => {
             // `U 2` puts back the second deleted rule listed.
             match arg.trim().parse::<usize>() {

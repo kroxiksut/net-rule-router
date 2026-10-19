@@ -138,6 +138,9 @@ windows = { version = "0.58", features = [
     # connect event's PID → full image path so the connection trace can show
     # the owning process (the Kernel-Network ETW event carries only the PID).
     "Win32_System_Threading",
+    # NotifyServiceStatusChangeW: the Service Control Manager's create/delete
+    # notifications behind the neutral service-set-change port.
+    "Win32_System_Services",
     # app_path_resolver: EnumProcesses snapshots the running-process
     # PID set; each PID is then resolved to its full image path (via the
     # Threading APIs above) so an `Application` rule's exe name/glob can match a

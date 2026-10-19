@@ -481,6 +481,7 @@ fn append_app_rule(
         app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
             pattern: nrr_domain::canonical::CanonicalAppPattern::Exact(rule.value.clone()),
             include_child_processes: false,
+            override_requested: false,
         }),
         comment: String::new(),
         action: RuleAction::Route,

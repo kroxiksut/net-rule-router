@@ -34,6 +34,7 @@ priority.
 | Package repositories for Linux | Installs and updates the way your distribution does it: `apt` on Ubuntu and Debian, `dnf` on Fedora, RHEL, AlmaLinux and Rocky Linux, `zypper` on openSUSE, the AUR on Arch Linux, then the Astra Linux and RED OS app stores | medium |
 | NetRuleRouter on your VPN server | Installed on a server running WireGuard or AmneziaWG, it routes the traffic of that server's clients by your rules — a phone, a laptop, or a home router connected to the server — with nothing to install on them. We will verify the setup and describe it step by step | medium |
 | Up-to-date libraries | The libraries for checksums, signatures and data encoding move to their current versions, while rules and the audit trail saved by earlier versions keep working unchanged | medium |
+| Installing a program without network access | Start an installer from the window or the terminal interface, and neither it nor anything it starts can reach beyond your computer until the installation ends. The network comes back on its own, and the app offers rules for the program it installed. An Explorer context-menu item will follow if users ask for it | medium |
 | Gateway for home network devices | A computer running NetRuleRouter routes the traffic of a phone, a TV and other devices by the same rules | low |
 | Warning about tampered name answers | A notice when a public Wi-Fi network or the provider tampers with the answers about site names | low |
 | Own route for containers and virtual machines | Docker, Podman and local virtual machines get a route the way a program does, with the same protection if the connection drops | low |
@@ -42,6 +43,7 @@ priority.
 | Suggestions for programs | A program whose connections do not get through on the main connection is offered a move to the additional one, as sites are today | low |
 | Connection check | One button shows whether the VPN connection loses large packets and what to change in the VPN client's settings | low |
 | History of rule changes | Every rule added, removed or changed, with when and from where, and any one change undone on its own | low |
+| Administrator rights from the terminal interface on Windows | When a change made in the terminal interface needs administrator rights, Windows asks for them with its usual prompt, with no need to restart the terminal as administrator | low |
 | Traffic charts by connection | The traffic statistics you can already export, as a chart in the window | low |
 | Running on OpenWrt routers | Not researched yet. If you know how NetRuleRouter would fit on a router — memory, storage, the firewall — we will be glad to hear it | — |
 

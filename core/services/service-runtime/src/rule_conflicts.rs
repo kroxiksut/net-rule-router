@@ -55,10 +55,16 @@ pub enum RuleConflict {
     PathProtected {
         rule_id: String,
         reason: ProtectionReason,
+        /// The rule asks to apply anyway (`+override`) and waits for its
+        /// owner's confirmation.
+        override_pending: bool,
     },
     /// A rule by folder covers the first `covered` programs of a folder that
     /// holds more.
     FolderOverCap { rule_id: String, covered: usize },
+    /// A rule by path names a folder in another user's profile, which is
+    /// never read for this owner: it applies nothing.
+    PathInOtherUsersProfile { rule_id: String },
 }
 
 /// One address rule's fan-out: decides per target whether the rule's filter
@@ -229,8 +235,12 @@ pub fn rule_conflict_dtos(
                 app: app_of(rule_id),
                 reason: String::new(),
             },
-            RuleConflict::PathProtected { rule_id, reason } => RuleConflictDto {
-                kind: RuleConflictKind::ProtectedTarget,
+            RuleConflict::PathProtected {
+                rule_id,
+                reason,
+                override_pending,
+            } => RuleConflictDto {
+                kind: protected_kind(*override_pending),
                 rule_id: rule_id.clone(),
                 rule_value: app_of(rule_id),
                 ip: String::new(),
@@ -247,6 +257,18 @@ pub fn rule_conflict_dtos(
                 rule_value: app_of(rule_id),
                 ip: String::new(),
                 count: u32::try_from(*covered).unwrap_or(u32::MAX),
+                other_rule_id: String::new(),
+                host: String::new(),
+                via_host: String::new(),
+                app: app_of(rule_id),
+                reason: String::new(),
+            },
+            RuleConflict::PathInOtherUsersProfile { rule_id } => RuleConflictDto {
+                kind: RuleConflictKind::OtherUsersFolder,
+                rule_id: rule_id.clone(),
+                rule_value: app_of(rule_id),
+                ip: String::new(),
+                count: 0,
                 other_rule_id: String::new(),
                 host: String::new(),
                 via_host: String::new(),
@@ -278,7 +300,7 @@ pub fn protected_rule_dtos(
     withheld
         .iter()
         .map(|rule| RuleConflictDto {
-            kind: RuleConflictKind::ProtectedTarget,
+            kind: protected_kind(rule.override_pending),
             rule_id: rule.rule_id.as_str().to_string(),
             rule_value: rule.value.clone(),
             ip: String::new(),
@@ -290,6 +312,15 @@ pub fn protected_rule_dtos(
             reason: rule.reason.slug().to_string(),
         })
         .collect()
+}
+
+/// A protected rule's kind: refused, or waiting for its owner to confirm it.
+const fn protected_kind(override_pending: bool) -> RuleConflictKind {
+    if override_pending {
+        RuleConflictKind::OverrideNeedsConfirmation
+    } else {
+        RuleConflictKind::ProtectedTarget
+    }
 }
 
 /// `rule (pieces/cap)` for each network rule carved past the cap, for the log.

@@ -93,11 +93,12 @@ pub use crate::auto_rule::RuleOrigin as RuleOriginDto;
 /// content-hash idempotency or codec round-trips.
 ///
 /// Cumulative: 2 added subnets and ranges, 3 the `verify-primary` action, 4
-/// the any-zone domain, 5 the application path. A
+/// the any-zone domain, 5 the application path, 6 a program rule's
+/// `override-requested`. A
 /// book is written at the lowest version its content needs, so its bytes and
 /// content hash stay what they were; a reader accepts any version and keeps
 /// the kinds it does not know.
-pub const RULES_JSON_SCHEMA_VERSION: u16 = 5;
+pub const RULES_JSON_SCHEMA_VERSION: u16 = 6;
 
 /// Versioned canonical envelope for the rules of a single revision.
 ///
@@ -365,6 +366,11 @@ pub struct AppMatchDto {
     pub pattern: AppPatternDto,
     /// When `true`, direct child processes are also matched.
     pub include_child_processes: bool,
+    /// The owner asks for the rule to apply although the protection of system
+    /// programs and folders refuses it (`+override`). Absent when unset, so a
+    /// book without one keeps its bytes and its content hash.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub override_requested: bool,
 }
 
 /// Tagged enum: how an application is matched.
@@ -456,12 +462,13 @@ pub fn required_schema_version(dto: &CanonicalRulesJsonV1) -> u16 {
             RuleAction::VerifyPrimary => needed = needed.max(3),
             RuleAction::Route | RuleAction::Block => {}
         }
-        if rule
-            .app_match
-            .as_ref()
-            .is_some_and(|m| matches!(m.pattern, AppPatternDto::Path { .. }))
-        {
-            needed = needed.max(5);
+        if let Some(app) = rule.app_match.as_ref() {
+            if matches!(app.pattern, AppPatternDto::Path { .. }) {
+                needed = needed.max(5);
+            }
+            if app.override_requested {
+                needed = needed.max(6);
+            }
         }
     }
     needed
@@ -680,7 +687,7 @@ fn fold_rule(rule: &mut RuleDto) {
 fn fold_app_path(value: &str) -> Option<AppPatternDto> {
     use crate::app_path::{AppPath, PathStyle};
     let trimmed = value.trim();
-    let style = if trimmed.starts_with('/') {
+    let style = if trimmed.starts_with(['/', '~']) {
         PathStyle::MacOS
     } else {
         PathStyle::Windows
@@ -822,7 +829,7 @@ fn comparison_key(rule: &RuleDto) -> String {
     // The app side keeps its own discriminator: an `Exact` and a `Glob` of the
     // same text are different rules, and folding them into one slot left input
     // order to decide which came first.
-    let (app_kind, app_value, app_children) = match &rule.app_match {
+    let (app_kind, app_value, app_children, app_override) = match &rule.app_match {
         Some(app) => {
             let (k, v) = match &app.pattern {
                 AppPatternDto::Exact { value } => ("app:exact", value.as_str()),
@@ -830,17 +837,17 @@ fn comparison_key(rule: &RuleDto) -> String {
                 AppPatternDto::Path { value } => ("app:path", value.as_str()),
                 AppPatternDto::Unrecognized(_) => ("app:unrecognized", ""),
             };
-            (k, v, app.include_child_processes)
+            (k, v, app.include_child_processes, app.override_requested)
         }
-        None => ("", "", false),
+        None => ("", "", false, false),
     };
     let mut key =
-        String::with_capacity(kind.len() + value.len() + app_kind.len() + app_value.len() + 12);
+        String::with_capacity(kind.len() + value.len() + app_kind.len() + app_value.len() + 14);
     for part in [kind, value, app_kind, app_value] {
         key.push_str(part);
         key.push('\0');
     }
-    for flag in [app_children, rule.enabled] {
+    for flag in [app_children, app_override, rule.enabled] {
         key.push(if flag { '1' } else { '0' });
         key.push('\0');
     }
@@ -881,6 +888,7 @@ mod tests {
                     value: process.into(),
                 },
                 include_child_processes: include_children,
+                override_requested: false,
             }),
             comment: String::new(),
             action: crate::rules_json::RuleAction::Route,
@@ -1058,6 +1066,7 @@ mod tests {
                     value: value.into(),
                 },
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action: crate::rules_json::RuleAction::Route,
@@ -1114,6 +1123,7 @@ mod tests {
                     value: "chrome.exe".into(),
                 },
                 include_child_processes: false,
+                override_requested: false,
             }),
             ..sample_app_rule("r-001", "chrome.exe", false)
         };
@@ -1157,7 +1167,7 @@ mod tests {
 
     #[test]
     fn a_book_of_the_older_kinds_needs_schema_one_only() {
-        assert_eq!(RULES_JSON_SCHEMA_VERSION, 5);
+        assert_eq!(RULES_JSON_SCHEMA_VERSION, 6);
         let mut dto = CanonicalRulesJsonV1 {
             schema_version: 2,
             primary: vec![sample_exact_fqdn("r-1", "api.example.com")],
@@ -1173,6 +1183,45 @@ mod tests {
             base: "example".into(),
         });
         assert_eq!(required_schema_version(&dto), 4);
+    }
+
+    /// An override request is the one thing a schema-5 reader would drop: a
+    /// book carrying one says so, a book without one keeps its bytes.
+    #[test]
+    fn an_override_request_needs_schema_six_and_is_absent_otherwise() {
+        let mut dto = CanonicalRulesJsonV1 {
+            schema_version: 1,
+            primary: vec![sample_app_rule("r-1", "svchost.exe", false)],
+            secondary: vec![],
+        };
+        assert_eq!(required_schema_version(&dto), 1);
+        let plain = to_canonical_string(&dto).expect("serialize");
+        assert!(!plain.contains("override"), "{plain}");
+        if let Some(app) = dto.primary[0].app_match.as_mut() {
+            app.override_requested = true;
+        }
+        assert_eq!(required_schema_version(&dto), 6);
+        let flagged = to_canonical_string(&dto).expect("serialize");
+        assert!(flagged.contains("\"override-requested\":true"), "{flagged}");
+        assert_eq!(from_canonical_string(&flagged).expect("deserialize"), dto);
+        let older: CanonicalRulesJsonV1 = from_canonical_string(&plain).expect("deserialize");
+        assert!(older.primary[0]
+            .app_match
+            .as_ref()
+            .is_some_and(|app| !app.override_requested));
+    }
+
+    /// Two rules that differ only by the request are two rules to the fold.
+    #[test]
+    fn the_fold_tells_an_override_request_apart() {
+        let mut flagged = sample_app_rule("r-1", "svchost.exe", false);
+        if let Some(app) = flagged.app_match.as_mut() {
+            app.override_requested = true;
+        }
+        assert_ne!(
+            comparison_key(&flagged),
+            comparison_key(&sample_app_rule("r-1", "svchost.exe", false))
+        );
     }
 
     #[test]
@@ -1256,6 +1305,7 @@ mod tests {
                         value: "*vpn*.exe".into(),
                     },
                     include_child_processes: true,
+                    override_requested: false,
                 }),
                 comment: "vpn-related processes".into(),
                 action: crate::rules_json::RuleAction::Route,
@@ -1405,6 +1455,7 @@ mod tests {
                         value: "*vpn*.exe".into(),
                     },
                     include_child_processes: false,
+                    override_requested: false,
                 }),
                 comment: String::new(),
                 action: crate::rules_json::RuleAction::Route,

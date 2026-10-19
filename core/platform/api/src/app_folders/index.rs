@@ -135,52 +135,26 @@ impl ProgramFolderIndex {
         self.shared.folders.path_style()
     }
 
-    /// What `path` covers for `owner` now.
+    /// What `path` covers for `owner` now. A path from a profile folder
+    /// covers the owner's own.
     #[must_use]
     pub fn programs(&self, path: &AppPath, owner: &str) -> PathPrograms {
-        let shared = &self.shared;
-        let place = self.place(path.place());
-        let is_folder = match place.kind {
-            PlaceOnDisk::Missing => return PathPrograms::missing(),
-            PlaceOnDisk::Folder => true,
-            PlaceOnDisk::File => false,
-        };
-        let Some(real) = place.real else {
-            return PathPrograms::missing();
-        };
-        let Ok(decided) = path.on_disk(&real.to_string_lossy(), is_folder) else {
-            return PathPrograms::missing();
-        };
-        if shared.folders.foreign_profile(&real, owner) {
-            return PathPrograms {
-                outcome: PathOutcome::OtherUsersFolder,
-                place: Some(decided),
-                programs: Vec::new(),
-                over_cap: false,
-            };
-        }
-        let (mut programs, mut over_cap) = match (decided.kind(), is_folder) {
-            (AppPathKind::File, false) if shared.folders.is_program(&real) => (vec![real], false),
-            (AppPathKind::Folder, true) => {
-                let listing = self.listing(real, false);
-                (listing.programs, listing.truncated)
-            }
-            (AppPathKind::FolderTree, true) => {
-                let listing = self.listing(real, true);
-                (listing.programs, listing.truncated)
-            }
-            _ => (Vec::new(), false),
-        };
-        if programs.len() > PATH_RULE_PROGRAM_CAP {
-            programs.truncate(PATH_RULE_PROGRAM_CAP);
-            over_cap = true;
-        }
-        PathPrograms {
-            outcome: PathOutcome::Found,
-            place: Some(decided),
-            programs,
-            over_cap,
-        }
+        covered(
+            self.shared.folders.as_ref(),
+            path,
+            owner,
+            &|text| {
+                let place = self.place(text);
+                (place.kind, place.real)
+            },
+            &|folder, subfolders| self.listing(folder, subfolders),
+        )
+    }
+
+    /// [`ProgramFolders::writable_by_anyone`] of the port behind the index.
+    #[must_use]
+    pub fn writable_by_anyone(&self, place: &Path) -> bool {
+        self.shared.folders.writable_by_anyone(place)
     }
 
     fn place(&self, text: &str) -> Place {
@@ -280,6 +254,89 @@ impl ProgramFolderIndex {
         while self.shared.lock().worker_running && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+}
+
+/// What a place sits as on disk, and its real path.
+pub(super) type PlaceLookup<'a> = &'a dyn Fn(&str) -> (PlaceOnDisk, Option<PathBuf>);
+
+/// The programs of one folder, with or without its subfolders.
+pub(super) type FolderLister<'a> = &'a dyn Fn(PathBuf, bool) -> FolderListing;
+
+/// What `path` covers for `owner`, reading the disk through `place` and
+/// `list`. A path from a profile folder starts from the owner's own; a place
+/// in another user's profile is refused before the disk is touched, and
+/// again at its real place behind links.
+pub(super) fn covered(
+    folders: &dyn ProgramFolders,
+    path: &AppPath,
+    owner: &str,
+    place: PlaceLookup<'_>,
+    list: FolderLister<'_>,
+) -> PathPrograms {
+    let resolved;
+    let path = if path.profile_folder().is_some() {
+        let Some(profile) = folders.owner_profile(owner) else {
+            return PathPrograms::missing();
+        };
+        match path.for_profile(&profile.to_string_lossy()) {
+            Ok(own) => {
+                resolved = own;
+                &resolved
+            }
+            Err(_) => return PathPrograms::missing(),
+        }
+    } else {
+        path
+    };
+    let other_users = || PathPrograms {
+        outcome: PathOutcome::OtherUsersFolder,
+        place: None,
+        programs: Vec::new(),
+        over_cap: false,
+    };
+    if folders.foreign_profile(Path::new(path.place()), owner) {
+        return other_users();
+    }
+    let (kind, real) = place(path.place());
+    let is_folder = match kind {
+        PlaceOnDisk::Missing => return PathPrograms::missing(),
+        PlaceOnDisk::Folder => true,
+        PlaceOnDisk::File => false,
+    };
+    let Some(real) = real else {
+        return PathPrograms::missing();
+    };
+    let Ok(decided) = path.on_disk(&real.to_string_lossy(), is_folder) else {
+        return PathPrograms::missing();
+    };
+    if folders.foreign_profile(&real, owner) {
+        return PathPrograms {
+            place: Some(decided),
+            ..other_users()
+        };
+    }
+    let (mut programs, mut over_cap) = match (decided.kind(), is_folder) {
+        (AppPathKind::File, false) if folders.is_program(&real) => (vec![real], false),
+        (AppPathKind::Folder, true) => {
+            let listing = list(real, false);
+            (listing.programs, listing.truncated)
+        }
+        (AppPathKind::FolderTree, true) => {
+            let listing = list(real, true);
+            (listing.programs, listing.truncated)
+        }
+        _ => (Vec::new(), false),
+    };
+    if programs.len() > PATH_RULE_PROGRAM_CAP {
+        programs.truncate(PATH_RULE_PROGRAM_CAP);
+        over_cap = true;
+    }
+    PathPrograms {
+        outcome: PathOutcome::Found,
+        place: Some(decided),
+        programs,
+        over_cap,
     }
 }
 

@@ -65,6 +65,8 @@ pub struct WindowsAppPathResolver {
     /// for the resolve TTL: a security-descriptor read per client per
     /// recompute is cheap, but the recompute runs every few seconds.
     ownership: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, bool)>>,
+    /// "Anyone may write here" answers, kept as long as the ownership ones.
+    open_places: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, bool)>>,
     ownership_ttl: Duration,
     /// What rules by path cover, remembered and watched off the traffic path.
     folders: Arc<ProgramFolderIndex>,
@@ -127,6 +129,7 @@ impl WindowsAppPathResolver {
             processes: ProcessImages::new(Arc::new(running_process_images), Self::PROCESS_LIST_TTL),
             walk_listener,
             ownership: std::sync::Mutex::new(std::collections::HashMap::new()),
+            open_places: std::sync::Mutex::new(std::collections::HashMap::new()),
             ownership_ttl: resolve_ttl,
             folders: Arc::new(ProgramFolderIndex::new(Arc::new(
                 crate::app_folders::WindowsProgramFolders::new(),
@@ -250,6 +253,23 @@ impl AppPathResolver for WindowsAppPathResolver {
 
     fn path_programs(&self, path: &AppPath, owner: &str) -> PathPrograms {
         self.folders.programs(path, owner)
+    }
+
+    fn writable_by_anyone(&self, path: &Path) -> bool {
+        let key = path.to_string_lossy().to_ascii_lowercase();
+        let now = std::time::Instant::now();
+        let mut seen = self.open_places.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, open)) = seen.get(&key) {
+            if now.saturating_duration_since(*at) < self.ownership_ttl {
+                return *open;
+            }
+        }
+        let open = self.folders.writable_by_anyone(path);
+        if seen.len() >= OWNERSHIP_CACHE_CAP {
+            seen.clear();
+        }
+        seen.insert(key, (now, open));
+        open
     }
 }
 

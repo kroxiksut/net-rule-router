@@ -68,6 +68,14 @@ pub trait AppPathResolver: Send + Sync {
     fn path_programs(&self, _path: &AppPath, _owner: &str) -> PathPrograms {
         PathPrograms::unsupported()
     }
+
+    /// Whether any account may put a program at `path`
+    /// ([`crate::app_folders::ProgramFolders::writable_by_anyone`]). Nothing
+    /// from such a place is exempt from the leak guard, not even with the
+    /// user's confirmation. The default is `false`.
+    fn writable_by_anyone(&self, _path: &std::path::Path) -> bool {
+        false
+    }
 }
 
 /// Default / off-platform resolver: resolves nothing. Compiles on every OS so the
@@ -186,6 +194,8 @@ pub struct MockAppPathResolver {
     /// `(rule path as canonically spelled, owner) -> what it covers`; an owner
     /// of `*` answers for everyone.
     path_programs: HashMap<(String, String), PathPrograms>,
+    /// Lowercased directory prefixes standing in for places anyone may write.
+    anyone_writable_roots: Vec<String>,
 }
 
 impl MockAppPathResolver {
@@ -212,6 +222,7 @@ impl MockAppPathResolver {
             siblings: HashMap::new(),
             protected_roots: Vec::new(),
             path_programs: HashMap::new(),
+            anyone_writable_roots: Vec::new(),
         }
     }
 
@@ -232,6 +243,17 @@ impl MockAppPathResolver {
             root.push('\\');
         }
         self.protected_roots.push(root);
+        self
+    }
+
+    /// Declare a directory anyone may write into (chainable).
+    #[must_use]
+    pub fn with_anyone_writable_root(mut self, root: &str) -> Self {
+        let mut root = root.trim().to_ascii_lowercase();
+        if !root.ends_with(['\\', '/']) {
+            root.push('\\');
+        }
+        self.anyone_writable_roots.push(root);
         self
     }
 
@@ -281,6 +303,13 @@ impl AppPathResolver for MockAppPathResolver {
             .or_else(|| self.path_programs.get(&(rule, "*".to_string())))
             .cloned()
             .unwrap_or_else(PathPrograms::missing)
+    }
+
+    fn writable_by_anyone(&self, path: &std::path::Path) -> bool {
+        let path = path.to_string_lossy().to_ascii_lowercase();
+        self.anyone_writable_roots
+            .iter()
+            .any(|root| path.starts_with(root.as_str()))
     }
 }
 
@@ -392,6 +421,7 @@ mod tests {
                 app_match: Some(CanonicalAppMatch {
                     pattern: CanonicalAppPattern::Glob(pattern.to_owned()),
                     include_child_processes: false,
+                    override_requested: false,
                 }),
                 comment: String::new(),
                 action: RuleAction::Route,

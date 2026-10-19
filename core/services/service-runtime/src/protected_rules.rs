@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 use nrr_domain::canonical::CanonicalRuleBook;
 use nrr_domain::protected_places::{
-    withhold_app_paths, withhold_protected, ProtectedPlaces, ProtectedRule,
+    withhold_app_paths, withhold_protected_unless, ProtectedPlaces, ProtectedRule,
 };
 use nrr_domain::rules_file::HostPlatform;
 use nrr_platform_api::enforcement::EnforcementCapabilities;
@@ -33,19 +33,29 @@ pub fn places() -> &'static ProtectedPlaces {
     })
 }
 
-/// `book` as enforcement may see it, and the rules kept out of it: the
-/// protected ones, and rules by program path where the platform cannot carry
-/// them out yet.
+/// `principal`'s `book` as enforcement may see it, and the rules kept out of
+/// it: the protected ones `principal` has not confirmed applying anyway, and
+/// rules by program path where the platform cannot carry them out yet.
 #[must_use]
-pub fn withhold(book: CanonicalRuleBook) -> (CanonicalRuleBook, Vec<ProtectedRule>) {
-    withhold_on(book, EnforcementCapabilities::current().app_path_rules)
+pub fn withhold_for(
+    principal: &str,
+    book: CanonicalRuleBook,
+) -> (CanonicalRuleBook, Vec<ProtectedRule>) {
+    withhold_on(
+        principal,
+        book,
+        EnforcementCapabilities::current().app_path_rules,
+    )
 }
 
 fn withhold_on(
+    principal: &str,
     book: CanonicalRuleBook,
     app_path_rules: bool,
 ) -> (CanonicalRuleBook, Vec<ProtectedRule>) {
-    let (book, mut withheld) = withhold_protected(book, places());
+    let (book, mut withheld) = withhold_protected_unless(book, places(), |ask| {
+        crate::override_grants::honoured(principal, ask)
+    });
     if app_path_rules {
         return (book, withheld);
     }
@@ -95,6 +105,7 @@ mod tests {
             app_match: Some(CanonicalAppMatch {
                 pattern: CanonicalAppPattern::Exact(critical.into()),
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action: RuleAction::Block,
@@ -104,7 +115,7 @@ mod tests {
             primary: CanonicalRuleSet::from_rules(vec![rule]),
             secondary: CanonicalRuleSet::default(),
         };
-        let (kept, withheld) = withhold(book);
+        let (kept, withheld) = withhold_for("S-1-5-21-1", book);
         assert!(kept.primary.is_empty());
         assert_eq!(withheld.len(), 1);
         assert_eq!(withheld[0].value, critical);
@@ -138,13 +149,13 @@ mod tests {
             HostPlatform::compiled(),
         )
         .expect("decode");
-        let (kept, withheld) = withhold_on(content.rule_book.clone(), false);
+        let (kept, withheld) = withhold_on("S-1-5-21-1", content.rule_book.clone(), false);
         assert!(kept.primary.is_empty());
         assert_eq!(
             withheld.iter().map(|r| r.reason).collect::<Vec<_>>(),
             [nrr_domain::protected_places::ProtectionReason::AppPathUnsupported]
         );
-        let (kept, withheld) = withhold_on(content.rule_book, true);
+        let (kept, withheld) = withhold_on("S-1-5-21-1", content.rule_book, true);
         assert_eq!(kept.primary.len(), 1);
         assert!(withheld.is_empty());
         // Windows and Linux carry path rules out; macOS has no backend yet.

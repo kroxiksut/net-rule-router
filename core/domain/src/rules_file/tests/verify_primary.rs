@@ -223,6 +223,7 @@ fn on_an_application_rule_the_prefix_is_a_plain_route_with_a_warning() {
             pattern: crate::AppMatchPattern::Exact(name.to_string()),
             include_child_processes: false,
             windows_service_name: None,
+            override_requested: false,
         }),
         comment: String::new(),
         action: RuleAction::Verify,

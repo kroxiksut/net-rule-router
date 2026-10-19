@@ -102,9 +102,17 @@ pub const CONFLICT_PROTECTED: Key = key(
     "rules.overlaps.conflicts.protected",
     "The rule {rule} is not applied. {reason}",
 );
+pub const CONFLICT_OVERRIDE_PENDING: Key = key(
+    "rules.overlaps.conflicts.override-pending",
+    "The rule {rule} asks to apply despite the protection and is not applied until you confirm it in the rules list. {reason}",
+);
 pub const CONFLICT_FOLDER_OVER_CAP: Key = key(
     "rules.overlaps.conflicts.folder-over-cap",
     "{rule} covers the first {count} programs of its folder. The folder holds more, and those are not covered: name the folder of the program you mean instead.",
+);
+pub const CONFLICT_OTHER_USERS_FOLDER: Key = key(
+    "rules.overlaps.conflicts.other-users-folder",
+    "The rule {rule} is not applied: its folder is in another user's profile, and a rule decides only for its owner's programs. To cover each user's own folder, start the path from %LOCALAPPDATA%, %APPDATA% or %USERPROFILE% on Windows, or from ~ on Linux and macOS.",
 );
 pub const CONFLICT_MORE: Key = key(
     "rules.overlaps.conflicts.more",
@@ -231,7 +239,9 @@ pub fn all() -> Vec<Key> {
         CONFLICT_CARVING_OVER_CAP,
         CONFLICT_UNSUPPORTED,
         CONFLICT_PROTECTED,
+        CONFLICT_OVERRIDE_PENDING,
         CONFLICT_FOLDER_OVER_CAP,
+        CONFLICT_OTHER_USERS_FOLDER,
         CONFLICT_MORE,
         ROUTE_PRIMARY,
         ROUTE_SECONDARY,

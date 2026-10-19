@@ -95,6 +95,10 @@ impl ProgramFolders for LinuxProgramFolders {
         is_foreign_home(&place.to_string_lossy(), owner, &self.homes())
     }
 
+    fn owner_profile(&self, owner: &str) -> Option<PathBuf> {
+        home_of(owner, &self.homes())
+    }
+
     #[cfg(target_os = "linux")]
     fn watch(
         &self,
@@ -161,6 +165,15 @@ pub fn is_foreign_home(place: &str, owner: &str, homes: &[(u32, Vec<String>)]) -
     homes
         .iter()
         .any(|(uid, home)| Some(*uid) != owner_uid && place.starts_with(home))
+}
+
+/// The home of the person `owner` names, from `homes`; `None` for an owner
+/// that names nobody with a home there (the shared baseline, root).
+#[must_use]
+pub fn home_of(owner: &str, homes: &[(u32, Vec<String>)]) -> Option<PathBuf> {
+    let uid: u32 = owner.strip_prefix(UID_PREFIX)?.parse().ok()?;
+    let (_, home) = homes.iter().find(|(person, _)| *person == uid)?;
+    Some(PathBuf::from(format!("/{}", home.join("/"))))
 }
 
 /// Whether a batch of events may change which programs a watched folder
@@ -435,6 +448,20 @@ mod tests {
             is_foreign_home("/home/alice/apps", "baseline", &homes),
             "a rule of nobody in particular reads nobody's home"
         );
+    }
+
+    /// A rule from `~` starts at the owner's own home; the shared baseline
+    /// and an account without a home of its own start nowhere.
+    #[test]
+    fn the_home_of_an_owner_is_their_own() {
+        let homes = homes_from_passwd(PASSWD);
+        assert_eq!(
+            home_of("unix:uid:1001", &homes),
+            Some(PathBuf::from("/home/bob"))
+        );
+        assert_eq!(home_of("unix:uid:0", &homes), None);
+        assert_eq!(home_of("baseline", &homes), None);
+        assert_eq!(home_of("unix:uid:x", &homes), None);
     }
 
     #[test]

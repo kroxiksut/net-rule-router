@@ -74,6 +74,10 @@ pub mod dns_settings;
 #[cfg(target_os = "windows")]
 pub mod process;
 
+// Another process's start time, command line and working folder.
+#[cfg(target_os = "windows")]
+pub mod process_launch;
+
 // Read-only registry access shared by discovery, DNS scopes and profiles.
 #[cfg(target_os = "windows")]
 pub mod registry;

@@ -42,6 +42,11 @@ pub(crate) trait CleanupHost {
     fn stop_service(&self) -> Result<(), String> {
         Err("stopping the service is not available here".to_string())
     }
+    /// Take back every confirmed override of the protection of system
+    /// programs; `Ok(None)` where this run was not asked to.
+    fn revoke_overrides(&self) -> Result<Option<usize>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -59,13 +64,19 @@ pub(crate) struct Report {
     pub table: Result<bool, String>,
     pub rules: Result<usize, String>,
     pub routes: Result<usize, String>,
+    /// Confirmed overrides taken back; `None` when not asked.
+    pub overrides: Result<Option<usize>, String>,
     /// Why systemd could not say whether the unit runs, when it could not.
     pub unit_unknown: Option<String>,
 }
 
 impl Report {
     fn complete(&self) -> bool {
-        self.dns.is_ok() && self.table.is_ok() && self.rules.is_ok() && self.routes.is_ok()
+        self.dns.is_ok()
+            && self.table.is_ok()
+            && self.rules.is_ok()
+            && self.routes.is_ok()
+            && self.overrides.is_ok()
     }
 }
 
@@ -97,11 +108,14 @@ pub(crate) fn cleanup(host: &dyn CleanupHost, stop_first: bool) -> Outcome {
     // Rules before routes: without a rule pointing at it a table is inert.
     let rules = host.sweep_rules();
     let routes = host.sweep_routes();
+    // Last: the machine comes back protected, whatever was confirmed.
+    let overrides = host.revoke_overrides();
     Outcome::Ran(Report {
         dns,
         table,
         rules,
         routes,
+        overrides,
         unit_unknown,
     })
 }
@@ -202,6 +216,19 @@ pub(crate) fn render(outcome: &Outcome) -> (String, String) {
                     let _ = writeln!(err, "cleanup: route sweep failed: {e}");
                 }
             }
+            match &report.overrides {
+                Ok(None) => {}
+                Ok(Some(n)) => {
+                    let _ = writeln!(out, "  confirmed rules: {n} revoked");
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "  confirmed rules: NOT revoked");
+                    let _ = writeln!(
+                        err,
+                        "cleanup: rules confirmed despite the protection could not be revoked: {e}"
+                    );
+                }
+            }
             if report.table.is_err() || report.rules.is_err() || report.routes.is_err() {
                 let _ = writeln!(
                     err,
@@ -216,6 +243,9 @@ pub(crate) fn render(outcome: &Outcome) -> (String, String) {
 /// The real machine.
 pub(crate) struct SystemHost {
     pub data_dir: Option<PathBuf>,
+    /// The person's emergency reset takes back every confirmed override;
+    /// the after-crash sweep nobody asked for does not.
+    pub revoke_overrides: bool,
 }
 
 impl CleanupHost for SystemHost {
@@ -258,6 +288,17 @@ impl CleanupHost for SystemHost {
         nrr_platform_linux::service_control::LinuxServiceControl::new()
             .stop_or_kill(STOP_FOR_RESET_BUDGET)
             .map_err(|e| e.to_string())
+    }
+
+    fn revoke_overrides(&self) -> Result<Option<usize>, String> {
+        if !self.revoke_overrides {
+            return Ok(None);
+        }
+        let path =
+            nrr_storage::resolve_storage_topology(&nrr_storage::StorageProfile::ProductionService)
+                .map(|t| t.state_db_path)
+                .map_err(|e| format!("{e:?}"))?;
+        nrr_service_runtime::override_grants::revoke_all_offline(&path).map(Some)
     }
 
     fn sweep_routes(&self) -> Result<usize, String> {

@@ -1,0 +1,1120 @@
+{
+ "description": "rules.js rebaseEdits / nrr_client_logic::rebase::rebase_edits: the user's edits laid over rules changed elsewhere. Rows print as `id type value route on|off [?] [#comment]`; a conflict as `key kind mine / theirs`.",
+ "cases": [
+  {
+   "name": "nothing edited keeps the fresh rules",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0003",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "theirs.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0001 domain a.example secondary on",
+     "R-0002 domain b.example secondary on",
+     "R-0003 domain theirs.example secondary on"
+    ],
+    "added": [],
+    "changed": [],
+    "removed": [],
+    "conflicts": []
+   }
+  },
+  {
+   "name": "a deleted rule stays deleted",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0001 domain a.example secondary on"
+    ],
+    "added": [],
+    "changed": [],
+    "removed": [
+     "R-0002 domain b.example secondary on"
+    ],
+    "conflicts": []
+   }
+  },
+  {
+   "name": "a deleted rule stays deleted next to a rule added elsewhere",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0003",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "theirs.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0001 domain a.example secondary on",
+     "R-0003 domain theirs.example secondary on"
+    ],
+    "added": [],
+    "changed": [],
+    "removed": [
+     "R-0002 domain b.example secondary on"
+    ],
+    "conflicts": []
+   }
+  },
+  {
+   "name": "deleting a rule fresh no longer has is nothing",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0001 domain a.example secondary on"
+    ],
+    "added": [],
+    "changed": [],
+    "removed": [],
+    "conflicts": []
+   }
+  },
+  {
+   "name": "an added rule goes last with no id",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "mine.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0005",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "theirs.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0001 domain a.example secondary on",
+     "R-0005 domain theirs.example secondary on",
+     " domain mine.example secondary on"
+    ],
+    "added": [
+     " domain mine.example secondary on"
+    ],
+    "changed": [],
+    "removed": [],
+    "conflicts": []
+   }
+  },
+  {
+   "name": "a change takes the fresh rule's id",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": false,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0007",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0008",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0007 domain a.example secondary off",
+     "R-0008 domain b.example secondary on"
+    ],
+    "added": [],
+    "changed": [
+     "R-0007 domain a.example secondary off"
+    ],
+    "removed": [],
+    "conflicts": []
+   }
+  },
+  {
+   "name": "a change, an addition and a deletion together",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": "note"
+     },
+     {
+      "id": "R-0003",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "c.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0004",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "theirs.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0001 domain a.example secondary on #note",
+     "R-0004 domain theirs.example secondary on",
+     " domain c.example secondary on"
+    ],
+    "added": [
+     " domain c.example secondary on"
+    ],
+    "changed": [
+     "R-0001 domain a.example secondary on #note"
+    ],
+    "removed": [
+     "R-0002 domain b.example secondary on"
+    ],
+    "conflicts": []
+   }
+  },
+  {
+   "name": "a change that fresh already has is nothing",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": false,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0004",
+      "enabled": false,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0004 domain a.example secondary off"
+    ],
+    "added": [],
+    "changed": [],
+    "removed": [],
+    "conflicts": []
+   }
+  },
+  {
+   "name": "both changing one rule differently: the user wins, listed",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": false,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": "theirs"
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0001 domain a.example secondary off"
+    ],
+    "added": [],
+    "changed": [
+     "R-0001 domain a.example secondary off"
+    ],
+    "removed": [],
+    "conflicts": [
+     "domain|a.example|secondary changed-both R-0001 domain a.example secondary off / R-0001 domain a.example secondary on #theirs"
+    ]
+   }
+  },
+  {
+   "name": "keeping theirs leaves the fresh rule",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": false,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": "theirs"
+     }
+    ],
+    "keep": [
+     "domain|a.example|secondary"
+    ]
+   },
+   "expected": {
+    "rows": [
+     "R-0001 domain a.example secondary on #theirs"
+    ],
+    "added": [],
+    "changed": [],
+    "removed": [],
+    "conflicts": [
+     "domain|a.example|secondary changed-both R-0001 domain a.example secondary off / R-0001 domain a.example secondary on #theirs"
+    ]
+   }
+  },
+  {
+   "name": "an edited rule deleted elsewhere comes back, listed",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": false,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0002 domain b.example secondary on",
+     " domain a.example secondary off"
+    ],
+    "added": [
+     " domain a.example secondary off"
+    ],
+    "changed": [],
+    "removed": [],
+    "conflicts": [
+     "domain|a.example|secondary edited-but-deleted-elsewhere R-0001 domain a.example secondary off / -"
+    ]
+   }
+  },
+  {
+   "name": "declining an edit of a rule deleted elsewhere",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": false,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": [
+     "domain|a.example|secondary"
+    ]
+   },
+   "expected": {
+    "rows": [
+     "R-0002 domain b.example secondary on"
+    ],
+    "added": [],
+    "changed": [],
+    "removed": [],
+    "conflicts": [
+     "domain|a.example|secondary edited-but-deleted-elsewhere R-0001 domain a.example secondary off / -"
+    ]
+   }
+  },
+  {
+   "name": "deleting a rule changed elsewhere: deleted, listed",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0001",
+      "enabled": false,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0002 domain b.example secondary on"
+    ],
+    "added": [],
+    "changed": [],
+    "removed": [
+     "R-0001 domain a.example secondary off"
+    ],
+    "conflicts": [
+     "domain|a.example|secondary deleted-but-changed-elsewhere - / R-0001 domain a.example secondary off"
+    ]
+   }
+  },
+  {
+   "name": "declining a deletion of a rule changed elsewhere",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0001",
+      "enabled": false,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     },
+     {
+      "id": "R-0002",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "b.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": [
+     "domain|a.example|secondary"
+    ]
+   },
+   "expected": {
+    "rows": [
+     "R-0001 domain a.example secondary off",
+     "R-0002 domain b.example secondary on"
+    ],
+    "added": [],
+    "changed": [],
+    "removed": [],
+    "conflicts": [
+     "domain|a.example|secondary deleted-but-changed-elsewhere - / R-0001 domain a.example secondary off"
+    ]
+   }
+  },
+  {
+   "name": "the same rule added on both sides with other settings",
+   "input": {
+    "base": [],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": "mine"
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0004",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0004 domain a.example secondary on #mine"
+    ],
+    "added": [],
+    "changed": [
+     "R-0004 domain a.example secondary on #mine"
+    ],
+    "removed": [],
+    "conflicts": [
+     "domain|a.example|secondary added-both R-0001 domain a.example secondary on #mine / R-0004 domain a.example secondary on"
+    ]
+   }
+  },
+  {
+   "name": "the same rule added on both sides alike",
+   "input": {
+    "base": [],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0004",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0004 domain a.example secondary on"
+    ],
+    "added": [],
+    "changed": [],
+    "removed": [],
+    "conflicts": []
+   }
+  },
+  {
+   "name": "a route change is a deletion plus an addition",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "primary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "fresh": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "primary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     " domain a.example secondary on"
+    ],
+    "added": [
+     " domain a.example secondary on"
+    ],
+    "changed": [],
+    "removed": [
+     "R-0001 domain a.example primary on"
+    ],
+    "conflicts": []
+   }
+  },
+  {
+   "name": "identity folds the type spelling and the value case",
+   "input": {
+    "base": [
+     {
+      "id": "R-0001",
+      "enabled": true,
+      "ruleType": "suffix-domain",
+      "matchValue": "A.Example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "edited": [],
+    "fresh": [
+     {
+      "id": "R-0009",
+      "enabled": true,
+      "ruleType": "domain",
+      "matchValue": "a.example",
+      "targetRoute": "secondary",
+      "verify": false,
+      "comment": ""
+     }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [],
+    "added": [],
+    "changed": [],
+    "removed": [
+     "R-0009 domain a.example secondary on"
+    ],
+    "conflicts": []
+   }
+  }
+ ]
+}

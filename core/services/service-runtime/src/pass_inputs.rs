@@ -307,6 +307,12 @@ pub fn verify_verdicts() -> InputGeneration {
     Arc::new(|| Some(crate::verify_overlay::changes()))
 }
 
+/// The confirmed overrides of the protection, and whether one is due: a term
+/// that ran out moves a pass even if its timer never fired.
+pub fn rule_overrides() -> InputGeneration {
+    Arc::new(|| Some(crate::override_grants::pass_generation()))
+}
+
 /// The hash of whatever `read` returns; `None` when it fails.
 pub fn hashed<T: Hash, E>(
     read: impl Fn() -> Result<T, E> + Send + Sync + 'static,

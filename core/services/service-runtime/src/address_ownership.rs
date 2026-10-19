@@ -1166,6 +1166,13 @@ impl<'a> AppDestinationGate<'a> {
         self.observations.note_path_places(key, places);
     }
 
+    /// Whether `pattern`'s rule learnt `ip` from a script its folder holds
+    /// (see [`AppObservationLookup::learnt_from_scripts`]).
+    #[must_use]
+    pub fn learnt_from_scripts(&self, pattern: &str, ip: Ipv4Addr) -> bool {
+        self.observations.learnt_from_scripts(pattern, ip)
+    }
+
     /// Destinations `pattern`'s rule on `for_link` may take, in observation
     /// order, with a reason recorded for every one held back.
     ///
@@ -1226,6 +1233,7 @@ mod tests {
             app_match: Some(CanonicalAppMatch {
                 pattern: CanonicalAppPattern::Exact("helper.exe".into()),
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action: RuleAction::Route,
@@ -1625,6 +1633,7 @@ mod tests {
                 app_match: Some(CanonicalAppMatch {
                     pattern: CanonicalAppPattern::Exact(exe.into()),
                     include_child_processes: false,
+                    override_requested: false,
                 }),
                 ..app_rule(id)
             }

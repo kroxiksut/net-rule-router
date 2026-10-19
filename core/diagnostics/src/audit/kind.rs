@@ -67,6 +67,11 @@ pub enum AuditEventKind {
     /// Files an administrator handed the installer were refused at the
     /// service's first start; the shared rules stayed as they were.
     ProvisioningRefused,
+    /// A user confirmed a rule the protection of system programs and folders
+    /// refuses; it applies for the term they chose.
+    ProtectionOverrideGranted,
+    /// A confirmed override ended: revoked, expired, or taken by a reset.
+    ProtectionOverrideRevoked,
 }
 
 impl AuditEventKind {
@@ -92,6 +97,8 @@ impl AuditEventKind {
             Self::AuditChainRestarted => "audit_chain_restarted",
             Self::IntegrityCheckUnavailable => "integrity_check_unavailable",
             Self::ProvisioningRefused => "provisioning_refused",
+            Self::ProtectionOverrideGranted => "protection_override_granted",
+            Self::ProtectionOverrideRevoked => "protection_override_revoked",
         }
     }
 
@@ -117,6 +124,8 @@ impl AuditEventKind {
             "audit_chain_restarted" => Some(Self::AuditChainRestarted),
             "integrity_check_unavailable" => Some(Self::IntegrityCheckUnavailable),
             "provisioning_refused" => Some(Self::ProvisioningRefused),
+            "protection_override_granted" => Some(Self::ProtectionOverrideGranted),
+            "protection_override_revoked" => Some(Self::ProtectionOverrideRevoked),
             _ => None,
         }
     }
@@ -217,6 +226,8 @@ mod tests {
             AuditEventKind::AuditChainRestarted,
             AuditEventKind::IntegrityCheckUnavailable,
             AuditEventKind::ProvisioningRefused,
+            AuditEventKind::ProtectionOverrideGranted,
+            AuditEventKind::ProtectionOverrideRevoked,
         ] {
             let s = kind.as_str();
             let back = AuditEventKind::from_str(s).expect("round trip");

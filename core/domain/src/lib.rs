@@ -275,6 +275,8 @@ pub struct AppMatch {
     pub pattern: AppMatchPattern,
     /// If `true`, direct child processes of the matched executable are also matched.
     pub include_child_processes: bool,
+    /// The line carried `+override`: see [`canonical::CanonicalAppMatch::override_requested`].
+    pub override_requested: bool,
     /// Reserved — always `None` in v1.
     pub windows_service_name: Option<String>,
 }

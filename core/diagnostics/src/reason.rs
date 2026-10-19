@@ -205,6 +205,16 @@ pub mod integrity {
     pub const ALERT_ACKNOWLEDGED: ReasonCode = ReasonCode("integrity.alert_acknowledged");
     /// A user marked a security alert resolved.
     pub const ALERT_RESOLVED: ReasonCode = ReasonCode("integrity.alert_resolved");
+    /// A user confirmed a rule the protection of system programs refuses.
+    pub const PROTECTION_OVERRIDE_GRANTED: ReasonCode =
+        ReasonCode("integrity.protection_override_granted");
+    /// A confirmed override was taken back: by its owner, a reset, or because
+    /// its record did not verify.
+    pub const PROTECTION_OVERRIDE_REVOKED: ReasonCode =
+        ReasonCode("integrity.protection_override_revoked");
+    /// A confirmed override reached the end of its term.
+    pub const PROTECTION_OVERRIDE_EXPIRED: ReasonCode =
+        ReasonCode("integrity.protection_override_expired");
 }
 
 /// Reason codes for Windows Service lifecycle events (`service.*`).
@@ -489,6 +499,24 @@ pub fn reason_code_meta(code: ReasonCode) -> Option<ReasonCodeMeta> {
             "diag.integrity.alert_resolved.summary",
             true,
         ),
+        "integrity.protection_override_granted" => (
+            Lvl::Warn,
+            Cat::Security,
+            "diag.integrity.protection_override_granted.summary",
+            true,
+        ),
+        "integrity.protection_override_revoked" => (
+            Lvl::Info,
+            Cat::Security,
+            "diag.integrity.protection_override_revoked.summary",
+            true,
+        ),
+        "integrity.protection_override_expired" => (
+            Lvl::Info,
+            Cat::Security,
+            "diag.integrity.protection_override_expired.summary",
+            true,
+        ),
         // service.*
         "service.started" => (
             Lvl::Info,
@@ -630,6 +658,9 @@ pub const ALL_REASON_CODES: &[ReasonCode] = &[
     integrity::INTEGRITY_CHECK_UNAVAILABLE,
     integrity::ALERT_ACKNOWLEDGED,
     integrity::ALERT_RESOLVED,
+    integrity::PROTECTION_OVERRIDE_GRANTED,
+    integrity::PROTECTION_OVERRIDE_REVOKED,
+    integrity::PROTECTION_OVERRIDE_EXPIRED,
     service::STARTED,
     service::STOPPED,
     service::DEGRADED_MODE,

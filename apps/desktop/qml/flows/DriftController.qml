@@ -56,22 +56,93 @@ QtObject {
     /// edits on top of the rules now in force, through the same dialog.
     property bool mergeFromEdits: false
 
+    /// The edits merge in progress: the rows the edits were made against and
+    /// the rows on screen, both taken when the window opened.
+    property var _editsBase: []
+    property var _editsRows: []
+
     /// The apply was refused as built on rules no longer in force
     /// (`rules-changed-elsewhere`). Nothing was lost: the edits are still in
-    /// the table, and the merge review shows them against the fresh rules.
+    /// the table. The window shows what they add, change and delete once laid
+    /// over the rules now in force (`Rules.rebaseEdits`, as the TUI does).
     function openMergeWithPendingEdits() {
-        if (!_mergeBridgeReady()) {
+        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.rpcRulesList !== "function") {
             root.statusLine = root.tr("errors.rules-changed-elsewhere",
                 "Your rules were changed elsewhere since you opened them. Nothing was applied.")
             return
         }
-        var os = root.platformProfile ? root.platformProfile.os : ""
-        root._mergePrimaryText = Rules.buildCanonicalRulesText(
-            root.rulesModel, "primary", {}, true, os, [])
-        root._mergeSecondaryText = Rules.buildCanonicalRulesText(
-            root.rulesModel, "secondary", {}, true, os, [])
         mergeFromEdits = true
-        _openMergeDialogOnTexts()
+        _editsBase = Rules.rebaseSnapshot(root._rulesBaseRows)
+        _editsRows = Rules.rebaseSnapshot(root._rulesModelToRowArray())
+        var dialog = root.mergeReviewDialog
+        dialog.fromEdits = true
+        dialog.policy = "union"
+        dialog.mergeResult = null
+        dialog.picks = ({})
+        dialog.keepSecondary = ({})
+        dialog.errorText = ""
+        dialog.loading = true
+        dialog.open()
+        _readFreshForEdits(function(fresh) {
+            dialog.loading = false
+            if (!fresh) {
+                dialog.errorText = root.tr("dialog.merge.error", "Could not build the merge preview.")
+                return
+            }
+            var view = Rules.rebaseMergeView(
+                Rules.rebaseEdits(_editsBase, _editsRows, fresh.rows, []))
+            _fillMergeDialog(view)
+        })
+    }
+
+    /// The rules in force now, as table rows, with the `base-revision` they
+    /// carry: `done({ rows, base })`, or `done(null)` when they cannot be read.
+    function _readFreshForEdits(done) {
+        var corr = nrrNativeBridge.rpcRulesList()
+        root.rpc.registerRpcCallback(corr, function(ok, p) {
+            if (!ok || !p) { done(null); return }
+            var rows = (p.rows || []).map(root._serviceRuleRowToModelRow)
+            done({
+                rows: Rules.rebaseFreshWithNotes(rows, [_editsRows, _editsBase]),
+                base: (p["base-revision"] !== undefined && p["base-revision"] !== null)
+                    ? String(p["base-revision"]) : null
+            })
+        })
+    }
+
+    /// Confirm the edits merge: the edits go over the rules in force as they
+    /// are now, a pick for "in force" keeping that side, and the result goes
+    /// to the ordinary review.
+    function _applyEditsMerge(resolutions) {
+        var keepTheirs = []
+        for (var i = 0; i < resolutions.length; i += 1) {
+            if (resolutions[i].side === "service") keepTheirs.push(String(resolutions[i]["identity-key"]))
+        }
+        _readFreshForEdits(function(fresh) {
+            if (!fresh) {
+                root.statusLine = root.tr("dialog.merge.error", "Could not build the merge preview.")
+                return
+            }
+            var rebased = Rules.rebaseEdits(_editsBase, _editsRows, fresh.rows, keepTheirs)
+            var rows = []
+            for (var r = 0; r < rebased.rows.length; r += 1) {
+                var row = rebased.rows[r]
+                row.id = Rules.sequentialRuleId(r)
+                rows.push(row)
+            }
+            var rulesJson = ""
+            try {
+                rulesJson = Rules.buildRulesJson(rows, root._aceEncodeHost)
+            } catch (err) {
+                var refusal = Rules.wireRefusalCode(err)
+                root.statusLine = refusal !== "" ? root.ipcErrorLabel(refusal)
+                    : root.tr("status.rules-serialize-failed",
+                        "Internal error while preparing rules — see logs")
+                return
+            }
+            _startMergedReview(rulesJson, fresh.base)
+        })
     }
 
     function _openMergeDialogOnTexts() {
@@ -123,17 +194,14 @@ QtObject {
     /// null on failure. Split out of `_openMergeDialog` so the same pass can
     /// answer "does merging change anything at all" before any dialog opens.
     function _fetchMergePreview(resolutions, done, keepSecondaryKeys) {
-        // The edits' texts were taken when the merge opened.
-        if (!mergeFromEdits) {
-            var primaryPath = _rememberedRulesPath("primary")
-            var secondaryPath = _rememberedRulesPath("secondary")
-            var primB64 = primaryPath
-                ? String(nrrNativeBridge.readFileBytes(primaryPath) || "") : ""
-            var secB64 = secondaryPath
-                ? String(nrrNativeBridge.readFileBytes(secondaryPath) || "") : ""
-            root._mergePrimaryText = primB64 ? nrrNativeBridge.decodeBase64Utf8(primB64) : ""
-            root._mergeSecondaryText = secB64 ? nrrNativeBridge.decodeBase64Utf8(secB64) : ""
-        }
+        var primaryPath = _rememberedRulesPath("primary")
+        var secondaryPath = _rememberedRulesPath("secondary")
+        var primB64 = primaryPath
+            ? String(nrrNativeBridge.readFileBytes(primaryPath) || "") : ""
+        var secB64 = secondaryPath
+            ? String(nrrNativeBridge.readFileBytes(secondaryPath) || "") : ""
+        root._mergePrimaryText = primB64 ? nrrNativeBridge.decodeBase64Utf8(primB64) : ""
+        root._mergeSecondaryText = secB64 ? nrrNativeBridge.decodeBase64Utf8(secB64) : ""
         var corr = nrrNativeBridge.rpcRulesMergePreview(
             root._mergePrimaryText, root._mergeSecondaryText,
             _mergePolicy(), resolutions || [], keepSecondaryKeys || [])
@@ -143,7 +211,7 @@ QtObject {
     }
 
     function _fillMergeDialog(res) {
-        root.mergeReviewDialog.policy = _mergePolicy()
+        root.mergeReviewDialog.policy = mergeFromEdits ? "union" : _mergePolicy()
         root.mergeReviewDialog.mergeResult = res
         // Default each conflict pick to the file-provisional side (Union).
         var picks = {}
@@ -165,29 +233,13 @@ QtObject {
             return
         }
         if (mergeFromEdits) {
-            // Read before the merge is built: a write landing in between then
-            // makes the apply refused again, never undone.
-            _readBaseRevision(function(base) {
-                _buildAndApplyMerge(resolutions, keepSecondaryKeys, base)
-            })
+            _applyEditsMerge(resolutions || [])
             return
         }
-        _buildAndApplyMerge(resolutions, keepSecondaryKeys, undefined)
+        _buildAndApplyMerge(resolutions, keepSecondaryKeys)
     }
 
-    /// The `base-revision` of the rules in force now, `null` when unknown.
-    function _readBaseRevision(onBase) {
-        if (typeof nrrNativeBridge.rpcRulesList !== "function") { onBase(null); return }
-        var corr = nrrNativeBridge.rpcRulesList()
-        root.rpc.registerRpcCallback(corr, function(ok, p) {
-            var base = (ok && p && p["base-revision"] !== undefined && p["base-revision"] !== null)
-                ? String(p["base-revision"]) : null
-            onBase(base)
-        })
-    }
-
-    /// `base`: what the apply is built on; undefined keeps the table's own.
-    function _buildAndApplyMerge(resolutions, keepSecondaryKeys, base) {
+    function _buildAndApplyMerge(resolutions, keepSecondaryKeys) {
         var policy = String((root.prefs && root.prefs.mergeConflictPolicy) || "union")
         var corr = nrrNativeBridge.rpcRulesMergePreview(
             root._mergePrimaryText, root._mergeSecondaryText, policy, resolutions || [],
@@ -204,26 +256,32 @@ QtObject {
                     "Could not build the merge preview.")
                 return
             }
-            root.mergeReviewDialog.close()
-            var contentHash = ""
-            if (typeof nrrNativeBridge.sha256Hex === "function") {
-                contentHash = nrrNativeBridge.sha256Hex(mergedRulesJson)
-            } else {
-                contentHash = "client-stub-" + String(Date.now())
-            }
-            // Mark bound files dirty so the post-activation write converges them
-            // to the merged (== service) revision.
-            if (String(root.prefs.lastSavedPathPrimary || "") !== "") {
-                root._filesSyncDirtyPrimary = true
-            }
-            if (String(root.prefs.lastSavedPathSecondary || "") !== "") {
-                root._filesSyncDirtySecondary = true
-            }
-            root._mergeApplyPendingWrite = true
-            root.reviewFlowController.startRulesReviewFlow(
-                mergedRulesJson, contentHash, false,
-                mergeFromEdits ? "edits-merge" : "drift-merge", base)
+            _startMergedReview(mergedRulesJson, undefined)
         })
+    }
+
+    /// Hand a merged rule book to the review + apply flow. `base`: what it is
+    /// built on; undefined keeps the table's own.
+    function _startMergedReview(mergedRulesJson, base) {
+        root.mergeReviewDialog.close()
+        var contentHash = ""
+        if (typeof nrrNativeBridge.sha256Hex === "function") {
+            contentHash = nrrNativeBridge.sha256Hex(mergedRulesJson)
+        } else {
+            contentHash = "client-stub-" + String(Date.now())
+        }
+        // Mark bound files dirty so the post-activation write converges them
+        // to the merged (== service) revision.
+        if (String(root.prefs.lastSavedPathPrimary || "") !== "") {
+            root._filesSyncDirtyPrimary = true
+        }
+        if (String(root.prefs.lastSavedPathSecondary || "") !== "") {
+            root._filesSyncDirtySecondary = true
+        }
+        root._mergeApplyPendingWrite = true
+        root.reviewFlowController.startRulesReviewFlow(
+            mergedRulesJson, contentHash, false,
+            mergeFromEdits ? "edits-merge" : "drift-merge", base)
     }
 
     /// Dialog action: load the

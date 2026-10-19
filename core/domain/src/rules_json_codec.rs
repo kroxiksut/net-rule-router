@@ -253,6 +253,7 @@ fn encode_app_match(m: &CanonicalAppMatch) -> AppMatchDto {
             },
         },
         include_child_processes: m.include_child_processes,
+        override_requested: m.override_requested,
     }
 }
 
@@ -478,6 +479,7 @@ fn decode_app_match(
     Ok(CanonicalAppMatch {
         pattern,
         include_child_processes: m.include_child_processes,
+        override_requested: m.override_requested,
     })
 }
 
@@ -545,6 +547,7 @@ mod tests {
             app_match: Some(CanonicalAppMatch {
                 pattern: CanonicalAppPattern::Exact(process.into()),
                 include_child_processes: include_children,
+                override_requested: false,
             }),
             comment: String::new(),
             action: crate::canonical::RuleAction::Route,
@@ -560,6 +563,7 @@ mod tests {
             app_match: Some(CanonicalAppMatch {
                 pattern: CanonicalAppPattern::Glob(pattern.into()),
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action: crate::canonical::RuleAction::Route,
@@ -589,6 +593,7 @@ mod tests {
                         value: "DiskO*.exe".into(),
                     },
                     include_child_processes: false,
+                    override_requested: false,
                 }),
                 comment: String::new(),
                 action: WireRuleAction::default(),
@@ -622,6 +627,7 @@ mod tests {
                 app_match: Some(AppMatchDto {
                     pattern,
                     include_child_processes: false,
+                    override_requested: false,
                 }),
                 comment: String::new(),
                 action: WireRuleAction::default(),
@@ -667,6 +673,7 @@ mod tests {
                         value: value.into(),
                     },
                     include_child_processes: false,
+                    override_requested: false,
                 }),
                 comment: String::new(),
                 action: WireRuleAction::default(),
@@ -723,6 +730,7 @@ mod tests {
                         value: "Messenger-Desktop".into(),
                     },
                     include_child_processes: false,
+                    override_requested: false,
                 }),
                 comment: String::new(),
                 action: WireRuleAction::default(),
@@ -758,6 +766,7 @@ mod tests {
                 app_match: Some(AppMatchDto {
                     pattern,
                     include_child_processes: false,
+                    override_requested: false,
                 }),
                 comment: String::new(),
                 action: WireRuleAction::default(),

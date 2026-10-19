@@ -220,7 +220,9 @@ pub fn run() -> ExitCode {
     );
     // READY comes from here, once the runtime reports the socket bound.
     let controller = LogController::new(health, notify);
+    let data_dir = artifacts.topology.data_dir.clone();
     run_supervised_runtime(&controller, &stop, artifacts, deps);
+    nrr_service_runtime::crash_series::end_run(&data_dir);
 
     tracing::info!(
         target: "nrr::lifecycle",

@@ -1,0 +1,7 @@
+# NetRuleRouter preset — version 11
+# name: Protected rules
+--- Windows
+!svc*.exe +override
+C:\Windows\System32\* +override
+--- Linux
+!/var/www/* +override

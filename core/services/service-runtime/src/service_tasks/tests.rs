@@ -618,6 +618,7 @@ fn an_observed_connection_becomes_a_destination_the_rule_can_route() {
         store: Arc::clone(&store),
         trace: None,
         consumer: None,
+        scripts: None,
     };
 
     assert_eq!(fold_observations(&wiring), 1);
@@ -680,6 +681,7 @@ fn a_wired_consumer_reads_the_batch_and_stamps_the_drain_time() {
         store: Arc::clone(&store),
         trace: None,
         consumer: Some(Arc::new(consumer)),
+        scripts: None,
     };
 
     assert_eq!(fold_observations(&wiring), 1);

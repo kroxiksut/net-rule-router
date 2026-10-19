@@ -1,0 +1,13 @@
+# NetRuleRouter rules file — version 11
+--- Linux
+!/var/www/* +override  # keep the site's programs off the network
+# !/usr/bin/* +children +override
+/srv/www/app/* +override +children
+
+--- Windows
+!svchost.exe +override
+C:\inetpub\* +override
++override
+
+--- Domains
+example.com +override

@@ -207,6 +207,14 @@ pub fn ipc_operation_timeout(op: IpcOperationName) -> Duration {
         IpcOperationName::SiteCheckRun | IpcOperationName::SiteCheckResultGet => {
             Duration::from_secs(2)
         }
+        // One folder listing within one rule's entry budget.
+        IpcOperationName::RulesAppPathCoverageGet => Duration::from_secs(5),
+        // A folder listing and the connection table, read once.
+        IpcOperationName::RulesOverridePreview => Duration::from_secs(5),
+        // One signed row; the enforcement pass follows on its own.
+        IpcOperationName::RulesOverrideGrant | IpcOperationName::RulesOverrideRevoke => {
+            Duration::from_secs(5)
+        }
     }
 }
 

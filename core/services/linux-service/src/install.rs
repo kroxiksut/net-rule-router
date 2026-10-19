@@ -75,6 +75,7 @@ fn sweep_routing_leftovers() {
     use crate::cleanup::CleanupHost;
     let host = crate::cleanup::SystemHost {
         data_dir: nrr_platform_api::paths::production_data_root(),
+        revoke_overrides: false,
     };
     if let Err(reason) = host.sweep_rules() {
         eprintln!("could not remove the per-user routing rules: {reason}");

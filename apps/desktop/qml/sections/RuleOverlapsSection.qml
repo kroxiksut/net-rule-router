@@ -82,9 +82,15 @@ ColumnLayout {
                 "{rule} for {app} is not enforced: a rule that limits an address to one application cannot be carried out yet, so it is skipped rather than applied to every application.")
             : kind === "protected-target"
             ? root.tr("rules.overlaps.conflicts.protected", "The rule {rule} is not applied. {reason}")
+            : kind === "override-needs-confirmation"
+            ? root.tr("rules.overlaps.conflicts.override-pending",
+                "The rule {rule} asks to apply despite the protection and is not applied until you confirm it in the rules list. {reason}")
             : kind === "folder-over-cap"
             ? root.tr("rules.overlaps.conflicts.folder-over-cap",
                 "{rule} covers the first {count} programs of its folder. The folder holds more, and those are not covered: name the folder of the program you mean instead.")
+            : kind === "other-users-folder"
+            ? root.tr("rules.overlaps.conflicts.other-users-folder",
+                "The rule {rule} is not applied: its folder is in another user's profile, and a rule decides only for its owner's programs. To cover each user's own folder, start the path from %LOCALAPPDATA%, %APPDATA% or %USERPROFILE% on Windows, or from ~ on Linux and macOS.")
             : root.tr("rules.overlaps.conflicts.leak",
                 "{rule} does not deny {host}: it shares {ip} with {via}, which a narrower rule routes, so the address stays open.")
         // The protection says why in the rules table's own words.

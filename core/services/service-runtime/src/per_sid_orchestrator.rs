@@ -131,6 +131,7 @@ pub use registry_wiring::{
 
 mod apply;
 mod builder;
+mod deny_only;
 mod plan;
 mod service_accounts;
 use service_accounts::OwnerGuard;

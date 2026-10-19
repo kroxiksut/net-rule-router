@@ -148,6 +148,32 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
         .as_ref()
         .and_then(|signing| signing.enforce_and_watch(activation_coordinator.as_ref()));
 
+    // Confirmed overrides of the protection of system programs, honoured only
+    // under the key their rows were signed with. Before any rules read.
+    if let Some(conn) = settings_conn.as_ref() {
+        let grants = nrr_service_runtime::override_grants::OverrideGrants::open(
+            Arc::clone(conn),
+            revision_signing
+                .as_ref()
+                .and_then(|signing| signing.signing_key())
+                .map(<[u8]>::to_vec),
+            artifacts
+                .audit_writer
+                .clone()
+                .map(|w| w as Arc<nrr_service_runtime::boot_integrity::AuditTrail>),
+            now_ms,
+        );
+        grants.attach_events(Arc::clone(&event_bus));
+        // A service that keeps stopping unexpectedly loses every confirmation
+        // before the first pass can honour one.
+        nrr_service_runtime::crash_series::withdraw_on_crash_loop(
+            &artifacts.topology.data_dir,
+            &grants,
+            now_ms,
+        );
+        nrr_service_runtime::override_grants::install(grants);
+    }
+
     // The rule author behind companion-domain acceptance and the "route this
     // blocked host" notice action. It submits through the ordinary mutation
     // executor, so an authored rule meets the same rule cap, gates, revision

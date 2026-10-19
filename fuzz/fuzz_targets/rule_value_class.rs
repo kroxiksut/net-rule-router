@@ -5,6 +5,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use nrr_shared::app_identity::ExecutableNaming;
+use nrr_shared::app_path::{AppPath, PathStyle};
 use nrr_shared::preset_parser::ParsedRuleType;
 use nrr_shared::rule_value_class::{classify_rule_value, misplaced_rule_value};
 
@@ -37,5 +38,15 @@ fuzz_target!(|data: &[u8]| {
     }
     for os in ["windows", "linux", "macos"] {
         let _ = nrr_client_logic::rule_value_class::app_value_form(&text, os);
+    }
+    // A path from a profile folder, resolved for owners as enforcement does.
+    for style in [PathStyle::Windows, PathStyle::Linux, PathStyle::MacOS] {
+        if let Ok(path) = AppPath::parse(&text, style) {
+            for profile in [r"C:\Users\alice", "/home/alice", "relative", ""] {
+                if let Ok(own) = path.for_profile(profile) {
+                    assert!(own.profile_folder().is_none(), "{text:?}");
+                }
+            }
+        }
     }
 });

@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use crate::bounded_set::BoundedRecentSet;
 use nrr_platform_api::conn_observe::live::LiveConnection;
+use nrr_platform_api::process_launch::Launched;
 use nrr_shared::app_path::{AppPath, PathStyle};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -80,6 +81,15 @@ pub const CENSUS_KEYS_PER_IP: usize = 4;
 /// own programs from a namesake elsewhere. A longer one is kept by name, which
 /// no path rule claims.
 pub const CENSUS_IMAGE_MAX_BYTES: usize = nrr_shared::app_path::MAX_PATH_VALUE_BYTES;
+
+/// Rule paths one census entry says a script process belongs to. More rule
+/// folders than this holding one script is nothing a book means.
+pub const CENSUS_RULE_PATHS_PER_PROCESS: usize = 8;
+
+/// Destinations remembered as taught by a rule's script, far above what the
+/// scripts of a book reach; past it the oldest is forgotten and left to the
+/// per-program guard.
+pub const SCRIPT_PAIR_CAP: usize = 4096;
 
 /// Rules by path whose places are remembered at once; past it the memory
 /// starts over and each is relearnt from its spelling on the next ask.
@@ -129,6 +139,13 @@ pub trait AppObservationLookup: Send + Sync {
     /// its bucket collects live. The default keeps nothing; a path rule then
     /// matches only where it is spelled.
     fn note_path_places(&self, _key: &str, _places: &[AppPath]) {}
+
+    /// Whether the rule by path `pattern` learnt `ip` from a script an
+    /// interpreter installed elsewhere ran: no per-program filter covers that
+    /// interpreter, so only a per-destination guard holds such an address.
+    fn learnt_from_scripts(&self, _pattern: &str, _ip: Ipv4Addr) -> bool {
+        false
+    }
 }
 
 /// File name of the running executable, lower-cased.
@@ -228,6 +245,9 @@ pub struct AppObservationStore {
     /// live at. Never held while another lock of this store is taken.
     path_places: Mutex<HashMap<String, Vec<AppPath>>>,
     image_normalizer: OnceLock<ImageNormalizer>,
+    /// `(rule path, ip)` pairs a rule's script taught, as opposed to its own
+    /// programs.
+    script_pairs: Mutex<BoundedRecentSet<(String, Ipv4Addr)>>,
 }
 
 /// Sighting order of applications as a counter, so a sighting costs one map
@@ -290,6 +310,7 @@ impl AppObservationStore {
             path_style: nrr_domain::rules_file::HostPlatform::compiled().path_style(),
             path_places: Mutex::new(HashMap::new()),
             image_normalizer: OnceLock::new(),
+            script_pairs: Mutex::new(BoundedRecentSet::new(SCRIPT_PAIR_CAP)),
         }
     }
 
@@ -637,6 +658,20 @@ impl AppObservationStore {
     /// with RULE PATTERNS as keys, and a pattern is not a process — letting one
     /// into the census would have a rule vouching for itself.
     pub fn note_process_destination(&self, process_path: &str, ip: Ipv4Addr) {
+        self.note_process_destination_running(process_path, 0, &[], ip);
+    }
+
+    /// [`Self::note_process_destination`] for process `pid` (`0` unknown),
+    /// which runs a script of the rule paths `rule_paths` (see
+    /// [`Self::rule_paths_holding`]): those rules count it as their own
+    /// program.
+    pub fn note_process_destination_running(
+        &self,
+        process_path: &str,
+        pid: u32,
+        rule_paths: &[String],
+        ip: Ipv4Addr,
+    ) {
         if is_unroutable(ip) {
             return;
         }
@@ -645,10 +680,19 @@ impl AppObservationStore {
             return;
         }
         // The image itself, so a rule by path can claim its own programs.
-        let key = if process_path.len() <= CENSUS_IMAGE_MAX_BYTES {
+        let image = if process_path.len() <= CENSUS_IMAGE_MAX_BYTES {
             process_path.trim().to_string()
         } else {
             name
+        };
+        let key = CensusEntry {
+            image,
+            rule_paths: rule_paths
+                .iter()
+                .take(CENSUS_RULE_PATHS_PER_PROCESS)
+                .cloned()
+                .collect(),
+            last_pid: pid,
         };
         // The census only matters to a plan for an address a planned
         // application's set holds; asked before the census lock, never under it.
@@ -661,11 +705,26 @@ impl AppObservationStore {
         let mut g = self.census.lock().unwrap_or_else(|p| p.into_inner());
         match g.seen.get_mut(&ip) {
             Some(keys) => {
-                if keys.len() < CENSUS_KEYS_PER_IP && !keys.iter().any(|k| k == &key) {
-                    keys.push(key);
-                    if pinned {
-                        self.generation.fetch_add(1, Ordering::Relaxed);
+                let changed = if let Some(at) = keys.iter().position(|k| k.same_as(&key)) {
+                    if let Some(known) = keys.get_mut(at) {
+                        known.last_pid = key.last_pid;
                     }
+                    false
+                } else if let Some(at) = keys.iter().position(|k| k.is_now_known_as(&key)) {
+                    // The process noted before its script was read, or before
+                    // a rule named the script's folder.
+                    if let Some(bare) = keys.get_mut(at) {
+                        *bare = key;
+                    }
+                    true
+                } else if keys.len() < CENSUS_KEYS_PER_IP {
+                    keys.push(key);
+                    true
+                } else {
+                    false
+                };
+                if changed && pinned {
+                    self.generation.fetch_add(1, Ordering::Relaxed);
                 }
             }
             None => {
@@ -702,8 +761,68 @@ impl AppObservationStore {
         keys.iter().any(|seen| {
             !friendly
                 .iter()
-                .any(|pattern| self.names_process(pattern, seen))
+                .any(|pattern| self.names_process_running(pattern, &seen.image, &seen.rule_paths))
         })
+    }
+
+    /// [`Self::names_process`] for a process that runs a script of the rule
+    /// paths `rule_paths`: each of those rules names it too.
+    #[must_use]
+    pub fn names_process_running(
+        &self,
+        pattern: &str,
+        process_path: &str,
+        rule_paths: &[String],
+    ) -> bool {
+        (is_path_pattern(pattern) && rule_paths.iter().any(|key| key == pattern.trim()))
+            || self.names_process(pattern, process_path)
+    }
+
+    /// Whether a plan has asked about any rule by path: only then is a
+    /// process's command line worth reading.
+    #[must_use]
+    pub fn watches_paths(&self) -> bool {
+        !self
+            .path_places
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    }
+
+    /// The rule paths a plan asked about whose places hold `launched`, a file
+    /// a command line runs or a class-path folder it loads.
+    #[must_use]
+    pub fn rule_paths_holding(&self, launched: &Launched) -> Vec<String> {
+        let places = self.path_places.lock().unwrap_or_else(|p| p.into_inner());
+        places
+            .iter()
+            .filter(|(_, at)| {
+                at.iter().any(|place| match launched {
+                    Launched::File(file) => place.match_image(file).is_some(),
+                    Launched::FilesIn(folder) => place.holds_files_in(folder),
+                })
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Record that a process running a script of the rule paths `rule_paths`
+    /// connected to `ip`, in those rules' buckets only: the interpreter's own
+    /// name keeps what [`Self::record`] gives it. Returns `true` when `ip` is
+    /// new to one of them.
+    pub fn record_for_rule_paths(&self, rule_paths: &[String], ip: Ipv4Addr) -> bool {
+        if self.per_principal.is_some() || is_unroutable(ip) {
+            return false;
+        }
+        let mut is_new = false;
+        for key in rule_paths.iter().filter(|key| is_path_pattern(key)) {
+            is_new |= self.record_key(key.clone(), ip);
+            self.script_pairs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .observe((key.clone(), ip));
+        }
+        is_new
     }
 
     /// Whether the rule `pattern` names the process whose image is
@@ -857,10 +976,36 @@ impl AppObservationStore {
     }
 }
 
+/// One process seen on a destination: its image, and the rule paths whose
+/// script it was running, which claim it as their own program.
+#[derive(Clone)]
+struct CensusEntry {
+    image: String,
+    rule_paths: Vec<String>,
+    /// The last process noted as this entry, `0` unknown: lets a process
+    /// noted bare be told apart later as a rule's script, without one entry
+    /// per process filling the destination's few slots.
+    last_pid: u32,
+}
+
+impl CensusEntry {
+    fn same_as(&self, other: &Self) -> bool {
+        self.image == other.image && self.rule_paths == other.rule_paths
+    }
+
+    fn is_now_known_as(&self, other: &Self) -> bool {
+        other.last_pid != 0
+            && self.last_pid == other.last_pid
+            && self.rule_paths.is_empty()
+            && !other.rule_paths.is_empty()
+            && self.image == other.image
+    }
+}
+
 /// Destinations mapped to the processes seen using them, FIFO-bounded.
 #[derive(Default)]
 struct CensusIndex {
-    seen: HashMap<Ipv4Addr, Vec<String>>,
+    seen: HashMap<Ipv4Addr, Vec<CensusEntry>>,
     /// Insertion order, so the bound evicts the oldest destination in O(1)
     /// instead of scanning for a victim.
     order: VecDeque<Ipv4Addr>,
@@ -931,6 +1076,15 @@ impl AppObservationLookup for AppObservationStore {
 
     fn note_path_places(&self, key: &str, places: &[AppPath]) {
         self.set_path_places(key, places);
+    }
+
+    fn learnt_from_scripts(&self, pattern: &str, ip: Ipv4Addr) -> bool {
+        is_path_pattern(pattern)
+            && self
+                .script_pairs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&(pattern.trim().to_string(), ip))
     }
 }
 

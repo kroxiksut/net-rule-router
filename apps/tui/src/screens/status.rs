@@ -9,7 +9,7 @@ use nrr_shared::ipc_payloads::{InterfaceRowDto, RouteBindingDto};
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use super::Screen;
+use super::{overlaps, Screen};
 use crate::i18n::{Key, Texts};
 use crate::keys;
 use crate::link::{admin_command, Link};
@@ -266,22 +266,40 @@ fn pending_vpn_client_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
 /// The caller's app rules that found no program: standing while it lasts, so
 /// it sits with the state rather than in the feed.
 fn unresolved_app_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
-    let apps = match &app.snapshot {
-        Some(snapshot) if app.link.is_connected() => &snapshot.unenforced_app_rules,
+    let snapshot = match &app.snapshot {
+        Some(snapshot) if app.link.is_connected() => snapshot,
         _ => return Vec::new(),
     };
-    if apps.is_empty() {
-        return Vec::new();
-    }
-    let shown: Vec<String> = apps.iter().map(|a| display_text(a).into()).collect();
-    let summary = list_summary(&shown, &texts.get(keys::APP_UNRESOLVED_MORE));
-    vec![
-        ViewLine::new(vec![Segment::state(
+    let reasons = &snapshot.unenforced_app_reasons;
+    // A rule refused for its place says why, as Overlaps does.
+    let mut lines: Vec<ViewLine> = snapshot
+        .unenforced_app_rules
+        .iter()
+        .filter_map(|a| {
+            let reason = reasons.get(a)?;
+            Some(ViewLine::new(vec![Segment::state(
+                overlaps::refusal_text(a, reason, texts),
+                StateTone::Caution,
+            )]))
+        })
+        .collect();
+    let missing: Vec<String> = snapshot
+        .unenforced_app_rules
+        .iter()
+        .filter(|a| !reasons.contains_key(*a))
+        .map(|a| display_text(a).into())
+        .collect();
+    if !missing.is_empty() {
+        let summary = list_summary(&missing, &texts.get(keys::APP_UNRESOLVED_MORE));
+        lines.push(ViewLine::new(vec![Segment::state(
             texts.get(keys::APP_UNRESOLVED_TITLE),
             StateTone::Caution,
-        )]),
-        ViewLine::text(texts.fill(keys::APP_UNRESOLVED_BODY, &[("apps", summary)])),
-    ]
+        )]));
+        lines.push(ViewLine::text(
+            texts.fill(keys::APP_UNRESOLVED_BODY, &[("apps", summary)]),
+        ));
+    }
+    lines
 }
 
 fn role_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
@@ -432,6 +450,28 @@ mod tests {
         );
         app.link = Link::Offline;
         assert!(!shown(&app).iter().any(|l| l.contains("weren't found")));
+    }
+
+    /// A rule refused for its place stands with the reason Overlaps gives, and
+    /// is not counted among the programs that were not found.
+    #[test]
+    fn a_refused_app_rule_names_its_reason_not_a_missing_program() {
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.unenforced_app_rules = vec![r"c:\junk\*".to_string()];
+            snapshot
+                .unenforced_app_reasons
+                .insert(r"c:\junk\*".to_string(), "other-users-folder".to_string());
+        }
+        let lines = shown(&app);
+        assert!(
+            lines.iter().any(|l| l.contains("another user's profile")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("weren't found")),
+            "{lines:?}"
+        );
     }
 
     /// A VPN-named program the service does not trust by place stands under

@@ -41,6 +41,8 @@ pub enum Failure {
     },
     /// The values the service refused, `", "`-joined.
     Values(String),
+    /// The service wants an administrator and this terminal has no broker.
+    NeedsAdministrator,
 }
 
 impl Failure {
@@ -59,6 +61,16 @@ impl Failure {
         match self {
             Self::Values(values) => texts.fill(text::INVALID_VALUES, &[("rules", values)]),
             Self::Code { code, args } => error_label(code, args, texts),
+            Self::NeedsAdministrator => texts.get(text::NEEDS_ADMINISTRATOR),
+        }
+    }
+
+    /// A refusal from a call, with the administrator one told apart.
+    pub fn of_call(code: &str, message: &str) -> Self {
+        if nrr_shared::ipc_transport::is_needs_administrator(message) {
+            Self::NeedsAdministrator
+        } else {
+            Self::code(code)
         }
     }
 }

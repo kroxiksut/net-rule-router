@@ -116,6 +116,7 @@ Dialog {
     onLocalRuleTypeChanged: {
         _requestVerdict()
         overlapTimer.restart()
+        coverageTimer.restart()
     }
     onLocalRouteChanged: {
         // The file cannot hold `!` and `?` together, so choosing a deny clears
@@ -127,6 +128,7 @@ Dialog {
         _syncRouteCombo()
         _requestVerdict()
         overlapTimer.restart()
+        coverageTimer.restart()
         if (bulkMode) bulkPlanTimer.restart()
     }
     onLocalEnabledChanged: overlapTimer.restart()
@@ -354,15 +356,162 @@ Dialog {
             }
         })
     }
-    onLocalValueChanged: { _requestVerdict(); overlapTimer.restart() }
+    onLocalValueChanged: { _requestVerdict(); overlapTimer.restart(); coverageTimer.restart() }
     function _verdictFor(ruleType, raw) {
         return _verdict.key === _verdictKey(ruleType, raw) ? _verdict : null
     }
-    // No answer yet counts as not saveable: OK waits for the verdict.
+    // No answer yet counts as not saveable: OK waits for the verdict. A path
+    // the service refuses (another user's folder) is not saveable either.
     function isMatchValueValid(ruleType, raw) {
         if (String(raw || "").trim() === "") return false
         var verdict = _verdictFor(ruleType, raw)
         return verdict !== null && verdict.status !== "error"
+            && !(ruleType === "application" && coverageRefused())
+    }
+
+    // ── A rule by program path ──
+    // What the value names (`Rules.appValueForm`), and the service's count of
+    // the programs it covers for this user, asked after a pause in typing.
+    // `key` names the value and route it answers, as `_verdict` does.
+    readonly property string _pathOs: root ? String(root.platformProfile.os || "") : ""
+    readonly property string appForm: localRuleType === "application"
+        ? Rules.appValueForm(localValue, _pathOs) : ""
+    readonly property bool isFolderValue: appForm === "folder" || appForm === "folder-tree"
+    readonly property bool coverageAvailable: !!root && !!root.rpc && root.rpc.bridgeAvailable
+        && typeof root.rpc.rpcRulesAppPathCoverage === "function"
+    property var _coverage: ({ key: "", answer: null })
+    onAppFormChanged: {
+        // User clicks sever the box's binding; the value decides it.
+        if (includeSubfoldersCheck) includeSubfoldersCheck.checked = appForm === "folder-tree"
+    }
+    function _isPathForm(form) {
+        return form === "file" || form === "folder" || form === "folder-tree"
+            || form === "file-or-folder"
+    }
+    function _coverageKey() {
+        return String(localValue || "").trim() + "|" + String(localRoute || "")
+    }
+    function _requestCoverage() {
+        if (bulkMode || !_isPathForm(appForm) || !coverageAvailable) return
+        var key = _coverageKey()
+        var corr = root.rpc.rpcRulesAppPathCoverage(String(localValue || "").trim(),
+            String(localRoute || ""))
+        if (corr === "") return
+        root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
+            if (!ok) {
+                console.log("rules.app-path-coverage.get failed:", code, msg)
+                return
+            }
+            ruleDialog._coverage = { key: key, answer: payload || null }
+        })
+    }
+    function _coverageNow() {
+        return _coverage.key === _coverageKey() ? _coverage.answer : null
+    }
+    function coverageRefused() {
+        var a = _coverageNow()
+        return a !== null && String(a.outcome || "") === "refused"
+    }
+    function _hasProfileFolder() {
+        return /^\s*[%~]/.test(String(localValue || ""))
+    }
+    function coverageText() {
+        if (!_isPathForm(appForm) || !coverageAvailable) return ""
+        var a = _coverageNow()
+        if (a === null) return root.tr("dialog.rule.path.counting", "Counting the programs...")
+        var outcome = String(a.outcome || "")
+        var text = ""
+        if (outcome === "found") {
+            text = (a.truncated === true
+                ? root.tr("dialog.rule.path.count-more",
+                    "Programs covered now: the first {count}. The folder holds more than one rule covers.")
+                : root.tr("dialog.rule.path.count", "Programs covered now: {count}."))
+                .replace("{count}", String(a.programs || 0))
+        } else if (outcome === "missing") {
+            text = root.tr("dialog.rule.path.missing",
+                "Nothing is there yet: the rule takes effect once the program or folder appears.")
+        } else if (outcome === "unsupported") {
+            return root.tr("dialog.rule.path.unsupported",
+                "This system does not apply rules by path yet.")
+        } else {
+            return ""
+        }
+        if (_hasProfileFolder() && String(a.place || "") !== "") {
+            text += " " + root.tr("dialog.rule.path.place", "For you this is {place}.")
+                .replace("{place}", Pure.displayText(String(a.place)))
+        }
+        return text
+    }
+    // The service's refusal, when the launcher's verdict has not said it.
+    function coverageRefusalText() {
+        var a = _coverageNow()
+        if (a === null || !coverageRefused()
+                || isMatchValueRefused(localRuleType, localValue)) return ""
+        return root.tr(String(a["refusal-key"] || ""),
+            root.tr("rules.validation.error", "Error — rule is inactive"))
+    }
+    function coverageWarningText() {
+        var a = _coverageNow()
+        if (a === null || coverageRefused()) return ""
+        var lines = []
+        if (a["anyone-can-write"] === true) {
+            lines.push(root.tr("dialog.rule.path.anyone-can-write",
+                "Anyone can put a program here, so the rule may cover programs you did not install. A program here is never exempt from leak protection."))
+        }
+        var key = String(a["warning-key"] || "")
+        var verdict = _verdictFor(localRuleType, localValue)
+        if (key !== "" && (verdict === null || verdict.messageKey !== key)) {
+            lines.push(root.tr(key, root.tr("rules.validation.warning", "Warning")))
+        }
+        return lines.join("\n")
+    }
+    Timer {
+        id: coverageTimer
+        interval: 400
+        repeat: false
+        onTriggered: ruleDialog._requestCoverage()
+    }
+    function _pathSeparator() {
+        return _pathOs === "linux" || _pathOs === "macos" ? "/" : "\\"
+    }
+    // The rule flags after the value (`+children`), kept as they stand.
+    function _flagTail(v) {
+        var m = /(\s+\+[A-Za-z-]+)+$/.exec(v)
+        return m ? m[0] : ""
+    }
+    function _setValueKeepingFlags(path, tail) {
+        var next = path + tail
+        if (matchValueField) matchValueField.text = next
+        localValue = next
+    }
+    // "Choose folder": the folder with its trailing separator, and `*` when
+    // "Include subfolders" is ticked.
+    function setFolderValue(folder) {
+        var p = String(folder || "")
+        if (p === "") return
+        var sep = _pathSeparator()
+        if (sep === "\\") p = p.replace(/\//g, "\\")
+        if (p.charAt(p.length - 1) !== sep) p += sep
+        if (includeSubfoldersCheck && includeSubfoldersCheck.checked) p += "*"
+        var current = String(localValue || "").trim()
+        _setValueKeepingFlags(p, localRuleType === "application" ? _flagTail(current) : "")
+    }
+    // "Include subfolders" adds or takes off the `*` of a folder rule.
+    function setSubfolders(on) {
+        var v = String(localValue || "").trim()
+        var tail = _flagTail(v)
+        var core = v.substring(0, v.length - tail.length)
+        var sep = _pathSeparator()
+        var isSep = function(c) { return c === "/" || (sep === "\\" && c === "\\") }
+        var tree = core.length >= 2 && core.charAt(core.length - 1) === "*"
+            && isSep(core.charAt(core.length - 2))
+        if (on && !tree) {
+            if (!isSep(core.charAt(core.length - 1))) core += sep
+            core += "*"
+        } else if (!on && tree) {
+            core = core.substring(0, core.length - 1)
+        }
+        _setValueKeepingFlags(core, tail)
     }
     function isMatchValueRefused(ruleType, raw) {
         var verdict = _verdictFor(ruleType, raw)
@@ -987,7 +1136,33 @@ Dialog {
                     text: root.tr("action.browse", "Browse...")
                     onClicked: appExeFileDialog.open()
                 }
+                // A folder of programs: the rule covers what it holds.
+                ThemedButton {
+                    theme: root.uiTheme
+                    text: root.uiRevision >= 0
+                        ? root.tr("dialog.rule.path.choose-folder", "Choose folder...") : ""
+                    onClicked: appFolderDialog.open()
+                    Accessible.name: text
+                }
+                CheckBox {
+                    id: includeSubfoldersCheck
+                    visible: ruleDialog.isFolderValue
+                    checked: ruleDialog.appForm === "folder-tree"
+                    text: root.uiRevision >= 0
+                        ? root.tr("dialog.rule.path.include-subfolders", "Include subfolders") : ""
+                    onToggled: ruleDialog.setSubfolders(checked)
+                    Accessible.role: Accessible.CheckBox
+                    Accessible.name: text
+                }
                 Item { Layout.fillWidth: true }
+            }
+            FolderDialog {
+                id: appFolderDialog
+                title: root.uiRevision >= 0
+                    ? root.tr("dialog.rule.path.choose-folder-title",
+                        "Choose the folder with the programs")
+                    : ""
+                onAccepted: ruleDialog.setFolderValue(Pure.localPathFromFileUrl(selectedFolder))
             }
             FileDialog {
                 id: appExeFileDialog
@@ -1047,6 +1222,27 @@ Dialog {
                 text: root.uiRevision >= 0
                     ? root.tr("rules.application-not-leakproof",
                         "On this system an application rule is not airtight: connections the app makes before it is recognised can still get through.")
+                    : ""
+            }
+            // A folder rule follows the scripts the folder holds through what
+            // they are seen connecting to, so a deny cannot hold them for certain.
+            Label {
+                readonly property string valueForm: Rules.appValueForm(ruleDialog.localValue,
+                    root.platformProfile ? root.platformProfile.os : "")
+                Layout.fillWidth: true
+                visible: !ruleDialog.bulkMode && ruleDialog.localRuleType === "application"
+                    && root.supports("appPathScripts")
+                    && (valueForm === "folder" || valueForm === "folder-tree"
+                        || valueForm === "file-or-folder")
+                wrapMode: Text.WordWrap
+                color: ruleDialog.localRoute === "block" ? root.uiTheme.colorWarning : root.mutedTextColor
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                text: root.uiRevision >= 0
+                    ? (ruleDialog.localRoute === "block"
+                        ? root.tr("rules.application-folder-scripts-deny",
+                            "A deny by folder stops the programs in it, but not for certain a script from it that an interpreter installed elsewhere runs.")
+                        : root.tr("rules.application-folder-scripts",
+                            "Scripts from this folder follow the rule too, even when an interpreter installed elsewhere runs them (a .py, .ps1, .bat, .sh or .jar file, say): from the moment their first connection is seen."))
                     : ""
             }
             // What this rule will actually cover, spelled out. A bare
@@ -1123,6 +1319,44 @@ Dialog {
                 visible: !ruleDialog.bulkMode && ruleDialog.localValue !== ""
                     && ruleDialog.isMatchValueWarned(ruleDialog.localRuleType, ruleDialog.localValue)
                 text: root.uiRevision >= 0 ? ruleDialog.warningText() : ""
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            // A rule by path: how many programs it covers for this user now,
+            // and what the service says about the place before it is saved.
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                color: root.mutedTextColor
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                visible: !ruleDialog.bulkMode && text !== ""
+                text: root.uiRevision >= 0 ? ruleDialog.coverageText() : ""
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                color: root.uiTheme.colorDanger
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                visible: !ruleDialog.bulkMode && text !== ""
+                text: root.uiRevision >= 0 ? ruleDialog.coverageRefusalText() : ""
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                color: root.uiTheme.colorWarning
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                visible: !ruleDialog.bulkMode && text !== ""
+                text: root.uiRevision >= 0 ? ruleDialog.coverageWarningText() : ""
                 Accessible.role: Accessible.StaticText
                 Accessible.name: text
             }

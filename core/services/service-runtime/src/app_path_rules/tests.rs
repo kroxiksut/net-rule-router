@@ -28,7 +28,7 @@ fn targets(
 ) -> super::PathRuleTargets {
     let ownership = AddressOwnership::default();
     let gate = AppDestinationGate::for_rule_set(&ownership, store, &Default::default());
-    path_rule_targets(rule, owner, effect, resolver, &gate, places)
+    path_rule_targets(rule, owner, effect, false, resolver, &gate, places)
 }
 
 /// The rules file names a harmless folder; the disk says it is a link into a
@@ -150,4 +150,61 @@ fn the_real_place_teaches_the_observations() {
     let ip = std::net::Ipv4Addr::new(203, 0, 113, 40);
     store.record("/data/app/bin/tool", ip);
     assert_eq!(store.ips_for_app(rule.as_str()), vec![ip]);
+}
+
+/// A folder rule that asks to apply anyway waits for its owner's
+/// confirmation; with one it covers the folder's programs, until a critical
+/// program turns up there, which the confirmation never named.
+#[test]
+fn a_requested_override_needs_a_confirmation_that_still_covers_the_folder() {
+    use crate::override_grants::Preview;
+    use nrr_shared::ipc_payloads::OverrideTerm;
+    let grants = crate::override_grants::tests::installed_for_tests();
+    let owner = "S-1-5-21-override-path";
+    let rule = AppPath::parse("/var/www/*", PathStyle::Linux).expect("rule");
+    let store = AppObservationStore::new().with_path_style(PathStyle::Linux);
+    let places = ProtectedPlaces::defaults(HostPlatform::Linux);
+    let run = |programs: &[&str]| {
+        let listing = found(&rule, programs);
+        let resolver = MockAppPathResolver::new().with_path_programs(rule.as_str(), "*", listing);
+        let ownership = AddressOwnership::default();
+        let gate = AppDestinationGate::for_rule_set(&ownership, &store, &Default::default());
+        path_rule_targets(
+            &rule,
+            owner,
+            RuleEffect::Deny,
+            true,
+            &resolver,
+            &gate,
+            &places,
+        )
+    };
+    let waiting = run(&["/var/www/app/run.sh"]);
+    assert_eq!(waiting.refused, Some(ProtectionReason::SharedFolder));
+    assert!(waiting.override_pending);
+
+    grants
+        .grant(
+            &Preview {
+                owner: owner.into(),
+                value: rule.as_str().into(),
+                effect: RuleEffect::Deny,
+                reason: ProtectionReason::SharedFolder,
+                critical: Vec::new(),
+                accounts: Vec::new(),
+                programs: 1,
+                needs_administrator: false,
+            },
+            OverrideTerm::OneDay,
+            owner,
+            crate::timed_window::now_ms(),
+        )
+        .expect("granted");
+    let applied = run(&["/var/www/app/run.sh"]);
+    assert_eq!(applied.refused, None);
+    assert_eq!(applied.programs, vec![PathBuf::from("/var/www/app/run.sh")]);
+
+    let lapsed = run(&["/var/www/app/run.sh", "/var/www/app/dhclient"]);
+    assert_eq!(lapsed.refused, Some(ProtectionReason::SharedFolder));
+    assert!(lapsed.override_pending);
 }

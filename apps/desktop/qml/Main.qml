@@ -26,7 +26,7 @@ ApplicationWindow {
     // emitted into the QML context by the launcher. Windows-all-supported
     // default so mock/preview (which emits no context) still renders every
     // section; the real profile loads from `context.platformProfile` below.
-    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, fakeIp: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, forwardedTrafficGuard: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, serviceStartOnAppLaunch: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false, appPathRules: false } })
+    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, fakeIp: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, forwardedTrafficGuard: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, serviceStartOnAppLaunch: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false, appPathRules: false, appPathScripts: false } })
     // Capability query for declarative, OS-agnostic section gating: a
     // feature-keyed section renders only when the running OS supports it.
     // Unknown feature or missing profile → true (show it), which is why the
@@ -468,9 +468,7 @@ ApplicationWindow {
                 "dismissible": true,
                 "title": tr("notifications.app-unresolved.title",
                     "App rules aren't active yet"),
-                "body": tr("notifications.app-unresolved.body",
-                    "NetRuleRouter couldn't find these programs (they may not be installed in a standard location, or aren't running), so their traffic isn't routed by your rules: {apps}. Launch the app, or check the program name in Rules.")
-                    .replace("{apps}", _unenforcedAppRulesSummary()),
+                "body": _unenforcedAppNoticeBody(),
                 "actionKey": "open-rules",
                 "actionText": tr("action.open-rules", "Open rules")
             })
@@ -2349,6 +2347,9 @@ ApplicationWindow {
         // Files all missed), so no per-process filter was built and that app's
         // traffic is NOT routed by its rule. Drives the app-unresolved banner.
         unenforcedAppRules: [],
+        // Why some of those are not applied (app -> reason slug); an app
+        // without one found no program.
+        unenforcedAppReasons: {},
         // What the service may do with the companion domains it finds
         // ("off" / "suggest" / "auto"). Mirrored from the connect snapshot so
         // the start screen can show and change it without opening Settings.
@@ -2376,7 +2377,10 @@ ApplicationWindow {
         // Where the applied rules are enforced differently from how they
         // read (a literal-IP block over a route, a block leaking a shared
         // address). Shown on the Overlaps screen; refreshed from the snapshot.
-        ruleConflicts: []
+        ruleConflicts: [],
+        // The caller's rules applied despite the protection of system
+        // programs, each with its term. Marks the rules list.
+        ruleOverrides: []
     })
 
     function updateRoutingState(patch) {
@@ -2413,6 +2417,7 @@ ApplicationWindow {
             _offerPendingVpnClients(p["pending-vpn-clients"] || [])
             var patch = {
                 unenforcedAppRules: list,
+                unenforcedAppReasons: p["unenforced-app-reasons"] || {},
                 // Keep the auto-seed checkbox in sync with the
                 // service-side per-SID value on every reconnect/rules refresh.
                 browserHistoryAutoSeed: rp["browser-history-auto-seed"] === true,
@@ -2438,6 +2443,8 @@ ApplicationWindow {
                     p["kill-switch-block-all-armed"] === true,
                 ruleConflicts: (p["rule-conflicts"] instanceof Array)
                     ? p["rule-conflicts"] : [],
+                ruleOverrides: (p["rule-overrides"] instanceof Array)
+                    ? p["rule-overrides"] : [],
                 forwardedOutage: window._routePolicyEffective(rp, "forwarded-outage")
             }
             // Autostart is the LAUNCHER's answer, not the service's: the
@@ -2503,9 +2510,44 @@ ApplicationWindow {
     }
     /// Human-readable summary of the unresolved app rules for the banner:
     /// the first few names, then "+N more" so a long list never blows the row.
+    function _unenforcedAppReason(app) {
+        var reasons = (routingState && routingState.unenforcedAppReasons) || {}
+        return String(reasons[app] || "")
+    }
     function _unenforcedAppRulesSummary() {
-        return Pure.listSummary(Pure.displayTextList(unenforcedAppRules),
+        var missing = []
+        for (var i = 0; i < unenforcedAppRules.length; i += 1)
+            if (_unenforcedAppReason(unenforcedAppRules[i]) === "")
+                missing.push(unenforcedAppRules[i])
+        return Pure.listSummary(Pure.displayTextList(missing),
             tr("status.app-unresolved-more", "+{n} more"))
+    }
+    /// A rule refused for its place, in the words Overlaps uses for it.
+    function _unenforcedAppRefusal(app, reason) {
+        if (reason === "other-users-folder")
+            return tr("rules.overlaps.conflicts.other-users-folder",
+                "The rule {rule} is not applied: its folder is in another user's profile, and a rule decides only for its owner's programs. To cover each user's own folder, start the path from %LOCALAPPDATA%, %APPDATA% or %USERPROFILE% on Windows, or from ~ on Linux and macOS.")
+                .split("{rule}").join(Pure.displayText(app))
+        var why = tr((reason === "file-in-system-folder"
+                ? "rules.validation.match-value-warning.protected-"
+                : "rules.validation.match-value-invalid.protected-") + reason, reason)
+        return tr("rules.overlaps.conflicts.protected", "The rule {rule} is not applied. {reason}")
+            .split("{rule}").join(Pure.displayText(app)).split("{reason}").join(why)
+    }
+    /// The notice's text: the programs not found, then each refused rule's reason.
+    function _unenforcedAppNoticeBody() {
+        var parts = []
+        var missing = _unenforcedAppRulesSummary()
+        if (missing !== "")
+            parts.push(tr("notifications.app-unresolved.body",
+                "NetRuleRouter couldn't find these programs (they may not be installed in a standard location, or aren't running), so their traffic isn't routed by your rules: {apps}. Launch the app, or check the program name in Rules.")
+                .replace("{apps}", missing))
+        for (var i = 0; i < unenforcedAppRules.length; i += 1) {
+            var reason = _unenforcedAppReason(unenforcedAppRules[i])
+            if (reason !== "")
+                parts.push(_unenforcedAppRefusal(unenforcedAppRules[i], reason))
+        }
+        return parts.join(" ")
     }
     // Correlation-id RPC transport over the C++ bridge: the pending-callback
     // table, GC timer, and bridge forwarders live in flows/RpcTransport, not
@@ -3766,6 +3808,53 @@ ApplicationWindow {
                 break
             case "block-notice-mutes-changed":
                 notificationsController.onNoticeMutesChanged()
+                break
+            case "rule-overrides-changed":
+                // A confirmation was given, taken back or ran out: the rules
+                // list's marks follow the snapshot.
+                refreshUnenforcedAppRules()
+                var overridesEnded = []
+                var overridesRaw = event.expired || []
+                for (var oe = 0; oe < overridesRaw.length; oe += 1) {
+                    if (String(overridesRaw[oe] || "") !== "")
+                        overridesEnded.push(Pure.displayText(overridesRaw[oe]))
+                }
+                var overridesCause = String(event.cause || "")
+                if (overridesCause === "crash-loop") {
+                    notificationsController._addPushNotice({
+                        "id": "rule-override-withdrawn:" + String(eventId || ""),
+                        "severity": "warning",
+                        "dismissible": true,
+                        "kind": "rule-override-withdrawn",
+                        "title": tr("notifications.rule-override-withdrawn.title",
+                            "Confirmations were withdrawn"),
+                        "body": tr("notifications.rule-override-withdrawn.body",
+                            "Confirmations of protected rules were withdrawn: the service stopped unexpectedly several times in a row. The rules are not applied until you confirm them again in the rules list."),
+                        "actionKey": "open-rules",
+                        "actionText": tr("action.open-rules", "Open rules")
+                    })
+                } else if (overridesEnded.length > 0) {
+                    var overridesRecheck = overridesCause === "services-changed"
+                    notificationsController._addPushNotice({
+                        "id": "rule-override-ended:" + String(eventId || ""),
+                        "severity": "warning",
+                        "dismissible": true,
+                        "kind": "rule-override-ended",
+                        "title": overridesRecheck
+                            ? tr("notifications.rule-override-recheck.title",
+                                "A rule needs a new confirmation")
+                            : tr("notifications.rule-override-ended.title",
+                                "The protection holds a rule again"),
+                        "body": (overridesRecheck
+                            ? tr("notifications.rule-override-recheck.body",
+                                "A service now runs what {rules} takes, which your confirmation did not cover. The rule is not applied until you confirm it again in the rules list.")
+                            : tr("notifications.rule-override-ended.body",
+                                "The term you confirmed has ended for {rules}. The rule is not applied until you confirm it again in the rules list."))
+                            .replace("{rules}", overridesEnded.join(", ")),
+                        "actionKey": "open-rules",
+                        "actionText": tr("action.open-rules", "Open rules")
+                    })
+                }
                 break
             case "unassigned-tunnel-detected":
                 _onUnassignedTunnel(event)
@@ -8049,8 +8138,12 @@ ApplicationWindow {
     /// route it touched — the bound-file reminder is per route.
     property string _rulesDirtyBaselinePrimary: ""
     property string _rulesDirtyBaselineSecondary: ""
+    /// The rows the baseline was taken from: what an edits merge measures the
+    /// user's changes against.
+    property var _rulesBaseRows: []
     function _captureRulesDirtyBaseline() {
         var rows = _rulesModelToRowArray()
+        _rulesBaseRows = Rules.rebaseSnapshot(rows)
         _rulesDirtyBaselinePrimary = _buildRulesJsonForRoute(rows, "primary")
         _rulesDirtyBaselineSecondary = _buildRulesJsonForRoute(rows, "secondary")
         _rulesGuardAcknowledged = false

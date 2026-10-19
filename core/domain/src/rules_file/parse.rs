@@ -206,6 +206,10 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
         };
         let verify_values =
             matches!(slot, Slot::Known(idx) if known[*idx].section.takes_verify_prefix());
+        // `+override` asks something of a program rule only; elsewhere it is
+        // gone, as `+children` is.
+        let program_values =
+            matches!(slot, Slot::Known(idx) if known[*idx].section.app_platform().is_some());
 
         let (mut entry, markers) = if let Some(rest) = trimmed.strip_prefix('#') {
             // Possibly a disabled rule — `nrr_shared` owns the one predicate
@@ -216,7 +220,7 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                 continue;
             }
             let (value, comment) = split_inline_comment(rest);
-            let value = extract_rule_flags(value.trim());
+            let (value, flags) = nrr_shared::preset_parser::split_rule_flags(value.trim());
             let (value, markers) = take_rule_markers(&value, verify_values);
             // By the section, not by whether this host applies it: a disabled
             // spaced path in another OS's section is still a rule to keep.
@@ -239,13 +243,14 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                     enabled: false,
                     blocked: markers.deny,
                     verify_primary: markers.verify,
+                    override_requested: flags.override_requested && program_values,
                     origin: None,
                 },
                 markers,
             )
         } else {
             let (value, comment) = split_inline_comment(trimmed);
-            let value = extract_rule_flags(value.trim());
+            let (value, flags) = nrr_shared::preset_parser::split_rule_flags(value.trim());
             if value.is_empty() {
                 continue;
             }
@@ -260,6 +265,7 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                     enabled: true,
                     blocked: markers.deny,
                     verify_primary: markers.verify,
+                    override_requested: flags.override_requested && program_values,
                     origin: None,
                 },
                 markers,
@@ -377,12 +383,12 @@ fn split_inline_comment(s: &str) -> (String, Option<String>) {
     }
 }
 
-/// The value with its words rejoined and `+children` taken off, by the one
-/// reading the GUI's parser shares. Nothing acts on the flag yet, but left in,
-/// `codex.exe +children` normalised to the pattern `codex.exe +children.exe`
-/// and covered no process at all.
+/// The value with its words rejoined and `+children` and `+override` taken
+/// off, by the one reading the GUI's parser shares. Left in, `codex.exe
+/// +children` normalised to the pattern `codex.exe +children.exe` and covered
+/// no process at all.
 pub(crate) fn extract_rule_flags(value: &str) -> String {
-    nrr_shared::preset_parser::split_children_flag(value).0
+    nrr_shared::preset_parser::split_rule_flags(value).0
 }
 
 /// Lifts the `!` prefix off `value` in any section, and the `?` prefix in a

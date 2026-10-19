@@ -358,6 +358,7 @@ pub fn plan_route_rules_with_shapes(
                             path,
                             sid,
                             nrr_domain::protected_places::RuleEffect::of(rule.action, role),
+                            app.override_requested,
                             input.app_resolver,
                             &gate,
                             crate::protected_rules::places(),
@@ -367,6 +368,17 @@ pub fn plan_route_rules_with_shapes(
                                 crate::rule_conflicts::RuleConflict::PathProtected {
                                     rule_id: rule.id.as_str().to_string(),
                                     reason,
+                                    override_pending: targets.override_pending,
+                                },
+                            );
+                            continue;
+                        }
+                        if targets.outcome
+                            == nrr_platform_api::app_folders::PathOutcome::OtherUsersFolder
+                        {
+                            report.conflicts.push(
+                                crate::rule_conflicts::RuleConflict::PathInOtherUsersProfile {
+                                    rule_id: rule.id.as_str().to_string(),
                                 },
                             );
                             continue;

@@ -28,9 +28,10 @@
 //!   file (primary/secondary) is irrelevant for enforcement. See
 //!   docs/en/rules-file-format.md Blocking destinations. The retired `+block`
 //!   suffix is left in the value for validation to refuse.
-//! * `+children` after the value moves into [`ParsedRule::children`] before a
-//!   `#` line is judged rule or prose ([`split_children_flag`], shared with
-//!   the service's reader).
+//! * `+children` and `+override` after the value move into
+//!   [`ParsedRule::children`] and [`ParsedRule::override_requested`] before a
+//!   `#` line is judged rule or prose ([`split_rule_flags`], shared with the
+//!   service's reader).
 //! * The first unescaped `#` past the value content starts an inline
 //!   comment that becomes the rule's `comment` field.
 //! * Lines preceding any `--- ` header are file-level prelude and are

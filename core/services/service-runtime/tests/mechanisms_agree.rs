@@ -68,6 +68,7 @@ fn app_rule(id: &str, process: &str) -> CanonicalRule {
         app_match: Some(CanonicalAppMatch {
             pattern: CanonicalAppPattern::Exact(process.into()),
             include_child_processes: false,
+            override_requested: false,
         }),
         comment: String::new(),
         action: RuleAction::Route,

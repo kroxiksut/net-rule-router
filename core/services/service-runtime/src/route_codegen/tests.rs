@@ -18,6 +18,7 @@ fn app_rule(id: &str, pattern: &str) -> CanonicalRule {
         app_match: Some(CanonicalAppMatch {
             pattern: CanonicalAppPattern::Exact(pattern.to_string()),
             include_child_processes: false,
+            override_requested: false,
         }),
         comment: String::new(),
         action: nrr_domain::RuleAction::Route,
@@ -627,6 +628,7 @@ fn combined_app_and_address_rule_is_not_routed_in_free() {
         app_match: Some(CanonicalAppMatch {
             pattern: CanonicalAppPattern::Exact("chrome.exe".into()),
             include_child_processes: true,
+            override_requested: false,
         }),
         comment: String::new(),
         action: nrr_domain::RuleAction::Route,

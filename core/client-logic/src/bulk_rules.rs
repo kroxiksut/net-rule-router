@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, HashMap};
 use nrr_shared::auto_rule::{parse_provenance_comment, AUTO_SECTION_NAME};
 use nrr_shared::preset_parser::{
     carries_retired_block_flag, is_disabled_rule_value, is_syntax_hint_line, parse_section_header,
-    split_children_flag, split_deny, split_rule_markers, split_verify_primary, stored_rule_value,
-    without_retired_block_flag,
+    split_deny, split_rule_flags, split_rule_markers, split_verify_primary, stored_rule_value,
+    without_retired_block_flag, RuleFlags,
 };
 use nrr_shared::rule_value_class::{classify_rule_value, rule_type_from_slug, RuleValueClass};
 
@@ -187,7 +187,8 @@ pub struct BulkRow {
     pub rule_type: &'static str,
     /// The types the user may pick for this row.
     pub options: Vec<&'static str>,
-    /// The match value as a table stores it: `+children` kept on a program.
+    /// The match value as a table stores it: `+children` and `+override` kept
+    /// on a program.
     pub value: String,
     pub enabled: bool,
     /// `block` for a deny.
@@ -375,9 +376,9 @@ fn classified_core(collapsed: &str) -> String {
 }
 
 /// [`stored_rule_value`] by type slug; `""` and unknown slugs keep no flag.
-fn stored_value(rule_type: &str, value: &str, children: bool) -> String {
+fn stored_value(rule_type: &str, value: &str, flags: RuleFlags) -> String {
     match rule_type_from_slug(rule_type) {
-        Some(parsed) => stored_rule_value(parsed, value, children),
+        Some(parsed) => stored_rule_value(parsed, value, flags),
         None => value.to_owned(),
     }
 }
@@ -474,7 +475,7 @@ impl<'a> Planner<'a> {
             return Some(fail(row, "rules.paste.section-not-applied", args));
         }
         // Off before the type and the `#` are judged, as the file reader does.
-        let (collapsed, children) = split_children_flag(&collapsed);
+        let (collapsed, flags) = split_rule_flags(&collapsed);
         let choice = input.choices.get(&line_no);
         let chosen = choice
             .and_then(|c| c.rule_type.as_deref())
@@ -517,7 +518,7 @@ impl<'a> Planner<'a> {
                 return None;
             }
         }
-        row.value = stored_value(rule_type, value, children);
+        row.value = stored_value(rule_type, value, flags);
         row.enabled = !hashed;
         if marks.deny {
             row.route = "block".to_owned();
@@ -558,7 +559,7 @@ impl<'a> Planner<'a> {
                     row.options = vec![target];
                     if chosen == target {
                         row.rule_type = target;
-                        row.value = stored_value(target, value, children);
+                        row.value = stored_value(target, value, flags);
                         row.verify = row.verify && matches!(target, "domain" | "exact-ip");
                         match self.verdict(&mut row) {
                             Some(again) => verdict = again,

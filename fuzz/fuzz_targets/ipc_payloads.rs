@@ -98,5 +98,9 @@ fuzz_target!(|data: &[u8]| {
         ConnHistorySettingsSetRequest,
         SiteCheckRequest,
         SiteCheckResultRequest,
+        AppPathCoverageRequest,
+        RuleOverridePreviewRequest,
+        RuleOverrideGrantRequest,
+        RuleOverrideRevokeRequest,
     );
 });

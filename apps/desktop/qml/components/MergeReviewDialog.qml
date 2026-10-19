@@ -74,7 +74,7 @@ Dialog {
         "dialog.merge.title": ["dialog.merge.edits-title",
             "Your edits and the rules now in force"],
         "dialog.merge.body": ["dialog.merge.edits-body",
-            "Your rules were changed elsewhere while you were editing them. Combine your edits with the rules now in force: a rule on only one side is kept, and where both sides changed the same rule you pick the version that stays. A rule you deleted that is still in force is kept; delete it again after the merge."],
+            "Your rules were changed elsewhere while you were editing them. Your edits go on top of the rules now in force: a rule you added, changed or deleted is added, changed or deleted there too, and rules changed elsewhere stay. Where both sides changed the same rule you pick the version that stays."],
         "dialog.merge.loading": ["dialog.merge.edits-loading",
             "Comparing your edits with the rules in force…"],
         "dialog.merge.no-op": ["dialog.merge.edits-no-op",
@@ -131,10 +131,12 @@ Dialog {
     function _serviceOnly() { return (mergeResult && mergeResult["service-only"]) ? mergeResult["service-only"] : [] }
     function _conflicts() { return (mergeResult && mergeResult.conflicts) ? mergeResult.conflicts : [] }
     function _isNoop() { return !!(mergeResult && mergeResult.noop === true) }
+    function _changed() { return (mergeResult && mergeResult.changed) ? mergeResult.changed : [] }
+    function _removed() { return (mergeResult && mergeResult.removed) ? mergeResult.removed : [] }
 
     /// A concise one-line summary of one conflict side: route + off/block flags.
     function _sideSummary(side) {
-        if (!side) return "—"
+        if (!side) return fromEdits ? tr("dialog.merge.side-deleted", "deleted") : "—"
         var parts = [ _itemRouteLabel(side) ]
         // Shared wording with the review diff — one "disabled" text app-wide.
         if (side.enabled === false) parts.push(tr("label.disabled", "disabled"))
@@ -360,6 +362,110 @@ Dialog {
                             implicitWidth: blockBadgeF.implicitWidth + 10
                             Label {
                                 id: blockBadgeF
+                                anchors.centerIn: parent
+                                text: dialog.tr("dialog.merge.badge-block", "Denied")
+                                font.pixelSize: 10
+                                color: "white"
+                            }
+                        }
+                    }
+                }
+
+                // Changed and deleted by the user (edits merge only)
+                Label {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 6
+                    visible: dialog._changed().length > 0
+                    text: dialog.tr("dialog.merge.bucket-edits-changed", "Changed by you")
+                        + " (" + dialog._changed().length + ")"
+                    font.bold: true
+                    color: dialog._textColor()
+                }
+                Repeater {
+                    model: dialog._changed()
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        Layout.leftMargin: 12
+                        spacing: 8
+                        Label {
+                            text: dialog._typeLabel(modelData["type-slug"])
+                            font.pixelSize: 12
+                            color: dialog._mutedColor()
+                            Layout.preferredWidth: 96
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: String(modelData.value || "")
+                            font.pixelSize: 12
+                            font.family: "Consolas, Courier New, monospace"
+                            color: dialog._textColor()
+                            elide: Text.ElideRight
+                        }
+                        Label {
+                            text: dialog._itemRouteLabel(modelData)
+                            font.pixelSize: 11
+                            color: dialog._mutedColor()
+                        }
+                        Rectangle {
+                            visible: String(modelData.action) === "block"
+                            color: "#c0392b"
+                            radius: 3
+                            implicitHeight: blockBadgeC.implicitHeight + 2
+                            implicitWidth: blockBadgeC.implicitWidth + 10
+                            Label {
+                                id: blockBadgeC
+                                anchors.centerIn: parent
+                                text: dialog.tr("dialog.merge.badge-block", "Denied")
+                                font.pixelSize: 10
+                                color: "white"
+                            }
+                        }
+                    }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 6
+                    visible: dialog._removed().length > 0
+                    text: dialog.tr("dialog.merge.bucket-edits-deleted", "Deleted by you")
+                        + " (" + dialog._removed().length + ")"
+                    font.bold: true
+                    color: dialog._textColor()
+                }
+                Repeater {
+                    model: dialog._removed()
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        Layout.leftMargin: 12
+                        spacing: 8
+                        Label {
+                            text: dialog._typeLabel(modelData["type-slug"])
+                            font.pixelSize: 12
+                            color: dialog._mutedColor()
+                            Layout.preferredWidth: 96
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: String(modelData.value || "")
+                            font.pixelSize: 12
+                            font.family: "Consolas, Courier New, monospace"
+                            color: dialog._textColor()
+                            elide: Text.ElideRight
+                        }
+                        Label {
+                            text: dialog._itemRouteLabel(modelData)
+                            font.pixelSize: 11
+                            color: dialog._mutedColor()
+                        }
+                        Rectangle {
+                            visible: String(modelData.action) === "block"
+                            color: "#c0392b"
+                            radius: 3
+                            implicitHeight: blockBadgeD.implicitHeight + 2
+                            implicitWidth: blockBadgeD.implicitWidth + 10
+                            Label {
+                                id: blockBadgeD
                                 anchors.centerIn: parent
                                 text: dialog.tr("dialog.merge.badge-block", "Denied")
                                 font.pixelSize: 10

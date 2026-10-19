@@ -19,6 +19,10 @@
 //! - warned: one file in a system folder (`System32\curl.exe`);
 //! - allowed: everything else, a program's own folder inside a shared one
 //!   included (`C:\Program Files\App\*`, `/usr/lib/firefox/*`).
+//!
+//! A refused rule written with `+override` asks to apply anyway. Only its
+//! owner's confirmation, kept by the service, lifts the refusal, and never
+//! for the disk root or our own programs ([`withhold_protected_unless`]).
 
 use crate::canonical::{
     CanonicalAppPattern, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet, RuleAction,
@@ -29,6 +33,9 @@ use nrr_shared::app_identity::app_match_key;
 use nrr_shared::app_path::AppPathKind;
 use nrr_shared::glob::glob_match;
 use nrr_shared::product_identity::BinaryRole;
+
+mod coverage;
+pub use coverage::*;
 
 // ── Effect and target ─────────────────────────────────────────────────────────
 
@@ -782,6 +789,96 @@ pub struct ProtectedRule {
     pub value: String,
     pub effect: RuleEffect,
     pub reason: ProtectionReason,
+    /// The rule asks to apply anyway (`+override`) and the protection allows
+    /// that: it waits for its owner's confirmation rather than being refused.
+    pub override_pending: bool,
+}
+
+// ── Deliberate overrides ──────────────────────────────────────────────────────
+
+/// Critical processes one rule covers, at most: a rule naming more than this
+/// is told by the first ones, and confirming it still binds them all.
+pub const MAX_CRITICAL_NAMED: usize = 64;
+
+/// A refused rule that asks to apply anyway, as a confirmation is weighed
+/// against it: the rule's value as the table shows it, what it does, why it
+/// is refused, and the critical processes it covers now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverrideAsk<'a> {
+    pub value: &'a str,
+    pub effect: RuleEffect,
+    pub reason: ProtectionReason,
+    pub critical: &'a [String],
+}
+
+/// Whether a confirmation recorded for `critical_then` still covers what the
+/// rule takes now: a critical process it did not name means the owner never
+/// agreed to it, and the rule waits for a confirmation again.
+#[must_use]
+pub fn confirmation_still_covers(critical_then: &[String], critical_now: &[String]) -> bool {
+    critical_now
+        .iter()
+        .all(|name| critical_then.iter().any(|then| then == name))
+}
+
+/// Whether `key` (a match key) is one of `platform`'s critical processes.
+fn is_critical_key(key: &str, platform: HostPlatform) -> bool {
+    !key.is_empty()
+        && critical_processes(platform)
+            .iter()
+            .any(|entry| glob_match(entry, key))
+}
+
+/// The critical processes a rule on `target` takes, as match keys, sorted and
+/// at most [`MAX_CRITICAL_NAMED`]: the ones a name or a mask catches, or — for
+/// a rule by path — the ones among `programs`, the programs its place holds.
+#[must_use]
+pub fn critical_processes_covered<P: AsRef<str>>(
+    target: AppTarget<'_>,
+    programs: &[P],
+    platform: HostPlatform,
+) -> Vec<String> {
+    let mut found: Vec<String> = match target {
+        AppTarget::Name(name) => {
+            let key = app_match_key(name);
+            if is_critical_key(&key, platform) {
+                vec![key]
+            } else {
+                Vec::new()
+            }
+        }
+        AppTarget::NameGlob(glob) => {
+            let key = app_match_key(glob);
+            critical_processes(platform)
+                .iter()
+                .chain(critical_family_members(platform))
+                .filter(|entry| glob_match(&key, entry) || glob_match(entry, &key))
+                .map(|entry| (*entry).to_owned())
+                .collect()
+        }
+        AppTarget::File(_)
+        | AppTarget::Folder(_)
+        | AppTarget::FolderTree(_)
+        | AppTarget::FileOrFolder(_) => {
+            // The key is the file name, whichever separator the path uses.
+            let mut named: Vec<String> = programs
+                .iter()
+                .map(|program| app_match_key(program.as_ref()))
+                .filter(|key| is_critical_key(key, platform))
+                .collect();
+            if let AppTarget::File(path) = target {
+                let key = app_match_key(path);
+                if is_critical_key(&key, platform) {
+                    named.push(key);
+                }
+            }
+            named
+        }
+    };
+    found.sort_unstable();
+    found.dedup();
+    found.truncate(MAX_CRITICAL_NAMED);
+    found
 }
 
 /// `book` without the rules the protection refuses, and those rules. Only
@@ -793,7 +890,44 @@ pub fn withhold_protected(
     book: CanonicalRuleBook,
     places: &ProtectedPlaces,
 ) -> (CanonicalRuleBook, Vec<ProtectedRule>) {
-    withhold(book, |rule, role| rule_protection(rule, role, places))
+    withhold_protected_unless(book, places, |_| false)
+}
+
+/// [`withhold_protected`], keeping a refused rule that asks to apply anyway
+/// when `confirmed` says its owner confirmed it. Nothing else lifts a
+/// refusal, and only a reason that [`ProtectionReason::overridable`] can be.
+/// A rule by path is judged again where the disk names its programs.
+#[must_use]
+pub fn withhold_protected_unless(
+    book: CanonicalRuleBook,
+    places: &ProtectedPlaces,
+    confirmed: impl Fn(&OverrideAsk<'_>) -> bool,
+) -> (CanonicalRuleBook, Vec<ProtectedRule>) {
+    withhold(book, |rule, role| {
+        let verdict = rule_protection(rule, role, places);
+        let ProtectionVerdict::Refused(reason) = verdict else {
+            return verdict;
+        };
+        let Some(app) = rule.app_match.as_ref() else {
+            return verdict;
+        };
+        if !(app.override_requested && reason.overridable()) {
+            return verdict;
+        }
+        let target = AppTarget::of_pattern(&app.pattern);
+        let critical = critical_processes_covered::<&str>(target, &[], places.platform);
+        let ask = OverrideAsk {
+            value: app.pattern.as_str(),
+            effect: RuleEffect::of(rule.action, role),
+            reason,
+            critical: &critical,
+        };
+        if confirmed(&ask) {
+            ProtectionVerdict::Allowed
+        } else {
+            verdict
+        }
+    })
 }
 
 /// `book` without its rules by program path, and those rules, for a platform
@@ -829,15 +963,16 @@ fn withhold(
             match verdict {
                 ProtectionVerdict::Refused(reason) => {
                     if rule.enabled {
+                        let app = rule.app_match.as_ref();
                         withheld.push(ProtectedRule {
                             rule_id: rule.id.clone(),
-                            value: rule
-                                .app_match
-                                .as_ref()
+                            value: app
                                 .map(|app| app.pattern.as_str().to_string())
                                 .unwrap_or_default(),
                             effect: RuleEffect::of(rule.action, role),
                             reason,
+                            override_pending: reason.overridable()
+                                && app.is_some_and(|app| app.override_requested),
                         });
                     }
                 }

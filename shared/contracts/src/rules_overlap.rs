@@ -267,6 +267,7 @@ mod tests {
                 value: "chrome.exe".to_string(),
             },
             include_child_processes: false,
+            override_requested: false,
         });
         let dto = book(vec![], vec![suffix("r-1", "example.com"), scoped]);
         let found = find_overlaps(&dto);

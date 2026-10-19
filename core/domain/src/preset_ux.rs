@@ -402,6 +402,7 @@ mod tests {
                     blocked: false,
                     verify_primary: false,
                     origin: None,
+                    override_requested: false,
                 },
                 crate::rules_file::RulesFileEntry {
                     match_value: "192.168.0.0/16".to_string(),
@@ -410,6 +411,7 @@ mod tests {
                     blocked: false,
                     verify_primary: false,
                     origin: None,
+                    override_requested: false,
                 },
             ],
         };

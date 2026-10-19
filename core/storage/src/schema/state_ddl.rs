@@ -1546,3 +1546,32 @@ pub const STATE_DB_V76_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS conn_history
     retention_days INTEGER NOT NULL CHECK(retention_days BETWEEN 1 AND 30),
     updated_at     INTEGER NOT NULL
 ) WITHOUT ROWID"];
+
+/// Confirmed overrides of the protection of system programs and folders, one
+/// per user, rule value and effect. Signed with the revision key: an unsigned
+/// or altered row lifts no protection. `expires_at` NULL is "until revoked".
+/// An emergency network reset run while the service is stopped moves every
+/// override into the second table, which the next start audits and clears.
+pub const STATE_DB_V77_DDL: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS override_grants (
+    sid        TEXT    NOT NULL,
+    rule_value TEXT    NOT NULL,
+    effect     TEXT    NOT NULL CHECK(effect IN ('deny', 'secondary')),
+    reason     TEXT    NOT NULL,
+    critical   TEXT    NOT NULL DEFAULT '',
+    accounts   TEXT    NOT NULL DEFAULT '',
+    programs   INTEGER NOT NULL DEFAULT 0 CHECK(programs >= 0),
+    granted_by TEXT    NOT NULL,
+    granted_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    row_hmac   BLOB    NOT NULL,
+    PRIMARY KEY (sid, rule_value, effect)
+) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS override_revocations_pending (
+    sid        TEXT    NOT NULL,
+    rule_value TEXT    NOT NULL,
+    effect     TEXT    NOT NULL,
+    revoked_at INTEGER NOT NULL,
+    cause      TEXT    NOT NULL
+)",
+];

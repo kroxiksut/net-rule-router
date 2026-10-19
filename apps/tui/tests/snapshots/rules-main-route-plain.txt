@@ -51,6 +51,7 @@ Commands on this screen:
   A: add several rules at once
   T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
   R: recent changes. U: put a deleted rule back
+  P and a rule number: confirm a protected rule, or take the confirmation back
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Rules
@@ -82,6 +83,7 @@ Commands on this screen:
   A: add several rules at once
   T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
   R: recent changes. U: put a deleted rule back
+  P and a rule number: confirm a protected rule, or take the confirmation back
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Rules
@@ -113,6 +115,7 @@ Commands on this screen:
   A: add several rules at once
   T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
   R: recent changes. U: put a deleted rule back
+  P and a rule number: confirm a protected rule, or take the confirmation back
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Rules
@@ -144,4 +147,5 @@ Commands on this screen:
   A: add several rules at once
   T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
   R: recent changes. U: put a deleted rule back
+  P and a rule number: confirm a protected rule, or take the confirmation back
 Type a screen number, h for help or q to quit, then press Enter.

@@ -554,6 +554,7 @@ fn app_rule(
         app_match: Some(CanonicalAppMatch {
             pattern,
             include_child_processes: false,
+            override_requested: false,
         }),
         comment: String::new(),
         action,
@@ -595,12 +596,14 @@ fn a_stored_protected_rule_is_withheld_and_reported_never_dropped_silently() {
                 value: "svchost.exe".into(),
                 effect: Deny,
                 reason: R::CriticalProcess,
+                override_pending: false,
             },
             ProtectedRule {
                 rule_id: RuleId("s-mask".into()),
                 value: "svc*.exe".into(),
                 effect: SecondaryRoute,
                 reason: R::CriticalProcess,
+                override_pending: false,
             },
         ],
         "the disabled rule applies nothing and is not reported"
@@ -758,7 +761,124 @@ fn a_path_rule_is_withheld_with_its_own_reason() {
             value: "/opt/tool/*".into(),
             effect: PrimaryRoute,
             reason: R::AppPathUnsupported,
+            override_pending: false,
         }]
     );
     assert!(!R::AppPathUnsupported.overridable());
+}
+
+// ── Deliberate overrides ──────────────────────────────────────────────────────
+
+fn requested(mut rule: CanonicalRule) -> CanonicalRule {
+    if let Some(app) = rule.app_match.as_mut() {
+        app.override_requested = true;
+    }
+    rule
+}
+
+fn linux_path(value: &str) -> CanonicalAppPattern {
+    crate::validation::canonical_app_pattern(
+        value,
+        value.contains('*'),
+        HostPlatform::Linux,
+        &RuleId(String::new()),
+        &mut Vec::new(),
+    )
+    .expect("a path")
+}
+
+/// `!/var/www/* +override` is not applied until confirmed, and is applied
+/// once it is; a rule without the request is never asked about.
+#[test]
+fn a_requested_override_waits_for_a_confirmation_and_only_it() {
+    let rule = |id: &str| app_rule(id, linux_path("/var/www/*"), RuleAction::Block, true);
+    let book = || CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![requested(rule("p-asked")), rule("p-plain")]),
+        secondary: CanonicalRuleSet::default(),
+    };
+    let (kept, withheld) = withhold_protected(book(), &linux());
+    assert!(kept.primary.is_empty());
+    let mut pending: Vec<(&str, bool)> = withheld
+        .iter()
+        .map(|w| (w.rule_id.as_str(), w.override_pending))
+        .collect();
+    pending.sort_unstable();
+    assert_eq!(pending, [("p-asked", true), ("p-plain", false)]);
+    assert!(withheld.iter().all(|w| w.reason == R::SharedFolder));
+
+    let asked = std::cell::RefCell::new(Vec::new());
+    let (kept, withheld) = withhold_protected_unless(book(), &linux(), |ask| {
+        asked
+            .borrow_mut()
+            .push((ask.value.to_owned(), ask.effect, ask.reason));
+        true
+    });
+    let ids: Vec<&str> = kept.primary.rules().iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, ["p-asked"], "only the rule that asks is confirmed");
+    assert_eq!(withheld.len(), 1);
+    assert_eq!(
+        asked.into_inner(),
+        [("/var/www/*".to_owned(), Deny, R::SharedFolder)]
+    );
+}
+
+/// The disk root and our own programs stay refused whatever is confirmed.
+#[test]
+fn a_final_refusal_is_never_put_to_a_confirmation() {
+    let root = requested(app_rule(
+        "p-root",
+        linux_path("/*"),
+        RuleAction::Block,
+        true,
+    ));
+    let book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![root]),
+        secondary: CanonicalRuleSet::default(),
+    };
+    let (kept, withheld) = withhold_protected_unless(book, &linux(), |_| {
+        panic!("a final refusal is not a question");
+    });
+    assert!(kept.primary.is_empty());
+    assert_eq!(withheld[0].reason, R::DiskRoot);
+    assert!(!withheld[0].override_pending);
+}
+
+#[test]
+fn the_critical_processes_a_rule_covers_are_named() {
+    let none: [&str; 0] = [];
+    assert_eq!(
+        critical_processes_covered(AppTarget::Name("svchost.exe"), &none, HostPlatform::Windows),
+        ["svchost"]
+    );
+    let game = AppTarget::Name("game.exe");
+    assert!(critical_processes_covered(game, &none, HostPlatform::Windows).is_empty());
+    let glob = AppTarget::NameGlob("system*");
+    let caught = critical_processes_covered(glob, &none, HostPlatform::Linux);
+    assert!(
+        caught.contains(&"systemd-resolved".to_owned()),
+        "{caught:?}"
+    );
+    let programs = [
+        "/usr/sbin/NetworkManager",
+        "/usr/sbin/sshd",
+        "/usr/sbin/dhclient",
+    ];
+    let sbin = AppTarget::FolderTree("/usr/sbin");
+    assert_eq!(
+        critical_processes_covered(sbin, &programs, HostPlatform::Linux),
+        ["dhclient", "networkmanager"]
+    );
+}
+
+/// A confirmation covers what it named; a critical process that appears since
+/// asks for a new one, one that went away does not.
+#[test]
+fn a_new_critical_process_needs_a_new_confirmation() {
+    let then = vec!["dhclient".to_owned()];
+    assert!(confirmation_still_covers(&then, &[]));
+    assert!(confirmation_still_covers(&then, &then));
+    assert!(!confirmation_still_covers(
+        &then,
+        &["dhclient".to_owned(), "networkmanager".to_owned()]
+    ));
 }

@@ -9,6 +9,7 @@
 
 mod file_text;
 mod main_route;
+mod overrides;
 mod search;
 mod wire;
 
@@ -22,6 +23,7 @@ pub use file_text::{
     build_rules_file_text, RulesFileOptions, PRESET_FORMAT_VERSION, RULES_FILE_HINT_KEYS,
 };
 pub use main_route::{main_route_check_hosts, main_route_rank};
+pub use overrides::{override_remaining, rule_override_key};
 pub use search::{normalize_host_input, row_matches_search, search_box_text};
 pub use wire::{
     drift_row_from_parsed_rule, drift_row_from_service_wire, file_row_from_service_wire,

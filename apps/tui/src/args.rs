@@ -39,6 +39,24 @@ pub struct Env<'a> {
     pub plain: Option<&'a str>,
 }
 
+/// The language asked for, wherever it stands: help, version and a usage error
+/// are worded in it too, which `parse` cannot tell once it stops early.
+pub fn lang_of(args: &[String]) -> Option<String> {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--lang" {
+            return rest
+                .next()
+                .filter(|v| !v.starts_with("--") && !v.is_empty())
+                .cloned();
+        }
+        if let Some(value) = arg.strip_prefix("--lang=").filter(|v| !v.is_empty()) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 pub fn parse(args: &[String], env: Env<'_>) -> Result<Invocation, ArgError> {
     let mut options = Options {
         no_color: env.no_color.is_some_and(|v| !v.is_empty()),
@@ -104,6 +122,21 @@ mod tests {
             run(&["--lang=en"], Env::default()).lang.as_deref(),
             Some("en")
         );
+    }
+
+    #[test]
+    fn the_language_is_found_where_parsing_stops_early() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            lang_of(&args(&["--help", "--lang", "en"])).as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            lang_of(&args(&["--colour", "--lang=ru"])).as_deref(),
+            Some("ru")
+        );
+        assert_eq!(lang_of(&args(&["--lang"])), None);
+        assert_eq!(lang_of(&args(&["--plain"])), None);
     }
 
     #[test]

@@ -379,6 +379,20 @@ public:
     /// `since` (Unix seconds), newest first (`rules.recent-changes.list`).
     Q_INVOKABLE QString rpcRulesRecentChangesList(qint64 since);
 
+    /// What an application rule by path would cover for the caller now
+    /// (`rules.app-path-coverage.get`): `value` as the rule form holds it,
+    /// `route` the one it has chosen.
+    Q_INVOKABLE QString rpcRulesAppPathCoverage(const QString &value, const QString &route);
+
+    /// What confirming a protected rule would let it take, and the token the
+    /// confirmation spends (`rules.override.preview`).
+    Q_INVOKABLE QString rpcRulesOverridePreview(const QString &value, const QString &route);
+    /// Confirm a previewed rule for `term` (`rules.override.grant`).
+    Q_INVOKABLE QString rpcRulesOverrideGrant(const QString &token, const QString &typedValue,
+                                              const QString &term);
+    /// Take a confirmation back (`rules.override.revoke`).
+    Q_INVOKABLE QString rpcRulesOverrideRevoke(const QString &value, const QString &route);
+
     Q_INVOKABLE QString rpcRetentionSettingsGet();
     Q_INVOKABLE QString rpcRetentionSettingsSet(const QVariantMap &payload);
 

@@ -6,6 +6,10 @@
 //! check and the matcher all read such a path; the reduction lives here once,
 //! so they cannot disagree about which folder a rule names.
 //!
+//! A path may start from a folder of the rule owner's own profile
+//! (`%LOCALAPPDATA%`, `%APPDATA%`, `%USERPROFILE%`, `~`). It is kept as
+//! written and resolved per owner when applied ([`AppPath::for_profile`]).
+//!
 //! Paths are text someone else shaped (a rules file, an IPC payload, the image
 //! path the OS reports for another user's process): every reader here is
 //! bounded in length and segments, runs in linear time and never panics.
@@ -168,10 +172,122 @@ pub fn path_segments(path: &str, style: PathStyle, pattern: bool) -> Option<Vec<
 }
 
 /// Whether an application rule value is written as a path on `style`: it
-/// holds a separator. Without one it is a name or a mask over names.
+/// holds a separator. Without one it is a name or a mask over names; a
+/// profile folder alone is written with its separator (`%LOCALAPPDATA%\`).
 #[must_use]
 pub fn is_path_value(raw: &str, style: PathStyle) -> bool {
     raw.chars().any(|c| style.is_separator(c))
+}
+
+/// A folder of the rule owner's own profile a path may start from. Kept as
+/// written in the rules file and the wire, and resolved for each owner when
+/// the rule is applied, so one rule of the shared configuration names each
+/// user's own folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProfileFolder {
+    /// `%LOCALAPPDATA%`: the profile's `AppData\Local`.
+    LocalAppData,
+    /// `%APPDATA%`: the profile's `AppData\Roaming`.
+    AppData,
+    /// `%USERPROFILE%`: the profile folder itself.
+    UserProfile,
+    /// `~` on Linux and macOS: the home folder.
+    Home,
+}
+
+impl ProfileFolder {
+    pub const ALL: [Self; 4] = [
+        Self::LocalAppData,
+        Self::AppData,
+        Self::UserProfile,
+        Self::Home,
+    ];
+
+    /// The stable name the wire and the clients use.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::LocalAppData => "localappdata",
+            Self::AppData => "appdata",
+            Self::UserProfile => "userprofile",
+            Self::Home => "home",
+        }
+    }
+
+    /// The canonical spelling at the head of a path.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::LocalAppData => "%localappdata%",
+            Self::AppData => "%appdata%",
+            Self::UserProfile => "%userprofile%",
+            Self::Home => "~",
+        }
+    }
+
+    /// Whether `style` reads this folder: the `%…%` ones on Windows, `~`
+    /// elsewhere.
+    #[must_use]
+    pub const fn on(self, style: PathStyle) -> bool {
+        match self {
+            Self::Home => !matches!(style, PathStyle::Windows),
+            Self::LocalAppData | Self::AppData | Self::UserProfile => {
+                matches!(style, PathStyle::Windows)
+            }
+        }
+    }
+
+    /// The folders between the profile folder and this one, as `style`
+    /// compares them. The default layout: a redirected folder is not read.
+    #[must_use]
+    pub const fn below_profile(self) -> &'static [&'static str] {
+        match self {
+            Self::LocalAppData => &["appdata", "local"],
+            Self::AppData => &["appdata", "roaming"],
+            Self::UserProfile | Self::Home => &[],
+        }
+    }
+}
+
+/// The profile folder `body` starts from and what follows it; `None` for a
+/// body that names no variable. A variable this platform does not read
+/// (`%TEMP%`, `$HOME`, `~user`, `~` on Windows) is an error, never a name.
+fn profile_prefix(
+    body: &str,
+    style: PathStyle,
+) -> Result<Option<(ProfileFolder, &str)>, AppPathError> {
+    let head_len = match body.as_bytes().first() {
+        Some(b'%') => {
+            body.get(1..)
+                .and_then(|tail| tail.find('%'))
+                .ok_or(AppPathError::UnknownVariable)?
+                + 2
+        }
+        Some(b'~') => 1,
+        Some(b'$') => return Err(AppPathError::UnknownVariable),
+        _ => return Ok(None),
+    };
+    let head = body.get(..head_len).ok_or(AppPathError::UnknownVariable)?;
+    let folder = ProfileFolder::ALL
+        .into_iter()
+        .find(|folder| folder.on(style) && folder.token().eq_ignore_ascii_case(head))
+        .ok_or(AppPathError::UnknownVariable)?;
+    let rest = body.get(head_len..).unwrap_or_default();
+    if rest.chars().next().is_some_and(|c| !style.is_separator(c)) {
+        return Err(AppPathError::UnknownVariable);
+    }
+    Ok(Some((folder, rest)))
+}
+
+/// Where a path under a profile folder is judged before an owner is known:
+/// a profile no account can be named (`<` and `>` are in no user name), where
+/// profiles live by default. Enforcement judges the real place again.
+fn probe_root(style: PathStyle) -> &'static [&'static str] {
+    match style {
+        PathStyle::Windows => &["c:", "users", "<profile>"],
+        PathStyle::Linux => &["home", "<profile>"],
+        PathStyle::MacOS => &["users", "<profile>"],
+    }
 }
 
 /// Which programs a path rule names.
@@ -212,11 +328,19 @@ pub enum AppPathError {
     /// Climbs with `..`, holds a stray `:` or a control character, or is past
     /// the bounds.
     Malformed,
+    /// Starts from a variable this platform does not read in a rule
+    /// (`%TEMP%`, `$HOME`, `~user`).
+    UnknownVariable,
 }
 
 impl AppPathError {
     /// Every error, for exhaustive tables and locale checks.
-    pub const ALL: [Self; 3] = [Self::StarNotLast, Self::NotAbsolute, Self::Malformed];
+    pub const ALL: [Self; 4] = [
+        Self::StarNotLast,
+        Self::NotAbsolute,
+        Self::Malformed,
+        Self::UnknownVariable,
+    ];
 
     #[must_use]
     pub const fn slug(self) -> &'static str {
@@ -224,6 +348,7 @@ impl AppPathError {
             Self::StarNotLast => "path-star",
             Self::NotAbsolute => "path-not-absolute",
             Self::Malformed => "path-invalid",
+            Self::UnknownVariable => "path-unknown-variable",
         }
     }
 }
@@ -242,9 +367,15 @@ impl core::fmt::Display for AppPathError {
 pub struct AppPath {
     style: PathStyle,
     kind: AppPathKind,
-    /// The file, or the folder for the folder kinds.
+    /// The file, or the folder for the folder kinds. Under a profile folder,
+    /// at the probe profile ([`probe_root`]).
     segments: Vec<String>,
     text: String,
+    /// The owner's folder the path starts from, resolved when applied.
+    profile: Option<ProfileFolder>,
+    /// Under a profile folder: the path at the probe profile, the place a
+    /// check judges before an owner is known.
+    probe: Option<String>,
 }
 
 impl AppPath {
@@ -267,6 +398,9 @@ impl AppPath {
         let body = tree_body.unwrap_or(trimmed);
         if body.contains('*') {
             return Err(AppPathError::StarNotLast);
+        }
+        if let Some((folder, rest)) = profile_prefix(body, style)? {
+            return Self::under_profile(folder, rest, tree_body.is_some(), style);
         }
         if !starts_absolute(body, style) {
             return Err(AppPathError::NotAbsolute);
@@ -299,6 +433,120 @@ impl AppPath {
             kind,
             segments,
             text,
+            profile: None,
+            probe: None,
+        })
+    }
+
+    /// A path below `folder`; `rest` is empty or starts with a separator.
+    fn under_profile(
+        folder: ProfileFolder,
+        rest: &str,
+        tree: bool,
+        style: PathStyle,
+    ) -> Result<Self, AppPathError> {
+        // `rest` read as if it hung from a root, which is then left out.
+        let rooted = match style {
+            PathStyle::Windows => format!("c:{rest}"),
+            PathStyle::Linux | PathStyle::MacOS if rest.is_empty() => "/".to_string(),
+            PathStyle::Linux | PathStyle::MacOS => rest.to_string(),
+        };
+        let below = path_segments(&rooted, style, false).ok_or(AppPathError::Malformed)?;
+        let below = below.get(style.root_len()..).unwrap_or_default();
+        let trailing = rest
+            .chars()
+            .next_back()
+            .is_some_and(|c| style.is_separator(c));
+        let kind = if tree {
+            AppPathKind::FolderTree
+        } else if trailing || below.is_empty() {
+            AppPathKind::Folder
+        } else {
+            match style {
+                PathStyle::Windows if below.last().is_some_and(|l| l.ends_with(".exe")) => {
+                    AppPathKind::File
+                }
+                PathStyle::Windows => AppPathKind::Folder,
+                PathStyle::Linux | PathStyle::MacOS => AppPathKind::FileOrFolder,
+            }
+        };
+        let segments: Vec<String> = probe_root(style)
+            .iter()
+            .chain(folder.below_profile())
+            .map(|s| (*s).to_string())
+            .chain(below.iter().cloned())
+            .collect();
+        if segments.len() > MAX_PATH_SEGMENTS {
+            return Err(AppPathError::Malformed);
+        }
+        let mut text = folder.token().to_string();
+        let sep = style.separator();
+        for segment in below {
+            text.push(sep);
+            text.push_str(segment);
+        }
+        match kind {
+            AppPathKind::File | AppPathKind::FileOrFolder => {}
+            AppPathKind::Folder => text.push(sep),
+            AppPathKind::FolderTree => {
+                text.push(sep);
+                text.push('*');
+            }
+        }
+        Ok(Self {
+            style,
+            kind,
+            probe: Some(render(style, kind, &segments)),
+            segments,
+            text,
+            profile: Some(folder),
+        })
+    }
+
+    /// The owner's folder this path starts from; `None` for a full path.
+    #[must_use]
+    pub const fn profile_folder(&self) -> Option<ProfileFolder> {
+        self.profile
+    }
+
+    /// This path for the owner whose profile (or home) folder is `profile`:
+    /// a full path of the same form. A full path is returned as it is.
+    ///
+    /// # Errors
+    ///
+    /// [`AppPathError::Malformed`] when `profile` is no absolute folder below
+    /// a root, or the result is past the bounds.
+    pub fn for_profile(&self, profile: &str) -> Result<Self, AppPathError> {
+        if self.profile.is_none() {
+            return Ok(self.clone());
+        }
+        if !starts_absolute(profile.trim(), self.style) {
+            return Err(AppPathError::Malformed);
+        }
+        let mut segments =
+            path_segments(profile, self.style, false).ok_or(AppPathError::Malformed)?;
+        if segments.len() <= self.style.root_len() {
+            return Err(AppPathError::Malformed);
+        }
+        let below = self
+            .segments
+            .get(probe_root(self.style).len()..)
+            .unwrap_or_default();
+        segments.extend(below.iter().cloned());
+        if segments.len() > MAX_PATH_SEGMENTS {
+            return Err(AppPathError::Malformed);
+        }
+        let text = render(self.style, self.kind, &segments);
+        if text.len() > MAX_PATH_BYTES {
+            return Err(AppPathError::Malformed);
+        }
+        Ok(Self {
+            style: self.style,
+            kind: self.kind,
+            segments,
+            text,
+            profile: None,
+            probe: None,
         })
     }
 
@@ -326,10 +574,12 @@ impl AppPath {
     }
 
     /// The file or folder itself, without the `*` of a folder with
-    /// subfolders: what a check of the place it names reads.
+    /// subfolders: what a check of the place it names reads. Under a profile
+    /// folder, the place at the probe profile.
     #[must_use]
     pub fn place(&self) -> &str {
-        self.text.strip_suffix('*').unwrap_or(&self.text)
+        let text = self.probe.as_deref().unwrap_or(&self.text);
+        text.strip_suffix('*').unwrap_or(text)
     }
 
     /// This rule as the disk has it: the same form at `place`, the real path
@@ -357,14 +607,20 @@ impl AppPath {
             kind,
             segments,
             text,
+            profile: None,
+            probe: None,
         })
     }
 
     /// Whether the program whose image is `image` — a full path as the OS
     /// reports it — is one this path names, and how: as the file itself or
-    /// as a program of the folder.
+    /// as a program of the folder. A path under a profile folder names no
+    /// image until it is resolved for an owner ([`Self::for_profile`]).
     #[must_use]
     pub fn match_image(&self, image: &str) -> Option<AppPathKind> {
+        if self.profile.is_some() {
+            return None;
+        }
         let observed = path_segments(image, self.style, false)?;
         let (_, folder) = observed.split_last()?;
         if folder.len() < self.style.root_len() {
@@ -387,6 +643,27 @@ impl AppPath {
                     in_folder.then_some(AppPathKind::Folder)
                 }
             }
+        }
+    }
+
+    /// Whether the files lying directly in `folder` are ones this path names:
+    /// a class-path folder a program loads its code from.
+    #[must_use]
+    pub fn holds_files_in(&self, folder: &str) -> bool {
+        // Like `match_image`: an unresolved profile path names no folder yet.
+        if self.profile.is_some() {
+            return false;
+        }
+        let Some(observed) = path_segments(folder, self.style, false) else {
+            return false;
+        };
+        if observed.len() < self.style.root_len() {
+            return false;
+        }
+        match self.kind {
+            AppPathKind::File => false,
+            AppPathKind::Folder | AppPathKind::FileOrFolder => observed == self.segments,
+            AppPathKind::FolderTree => observed.starts_with(&self.segments),
         }
     }
 }

@@ -811,6 +811,21 @@ pub enum StatusUpdateEvent {
         /// Verdicts the user has not dismissed yet.
         pending_count: u64,
     },
+    /// `sid`'s confirmations of rules the protection of system programs
+    /// refuses changed: granted, taken back, or ended. Clients re-read the
+    /// snapshot's `rule-overrides`; `expired` names the values whose term ran
+    /// out, so the protection is back for them and the user is told. `cause`
+    /// is empty for an ordinary change, `crash-loop` when every confirmation
+    /// was withdrawn because the service kept stopping unexpectedly, and
+    /// `services-changed` when `expired` names rules whose confirmation no
+    /// longer covers what they take.
+    RuleOverridesChanged {
+        sid: String,
+        #[serde(default)]
+        expired: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        cause: String,
+    },
     /// Whether this SID's policy is actually being enforced, and what the user
     /// has to do when it is not.
     ///
@@ -907,6 +922,7 @@ impl StatusUpdateEvent {
             | Self::BlockNoticeRaised { sid, .. }
             | Self::BlockNoticeMutesChanged { sid }
             | Self::VerifyVerdictsChanged { sid, .. }
+            | Self::RuleOverridesChanged { sid, .. }
             | Self::EnforcementStatusChanged { sid, .. }
             | Self::RoutesHeldByAnotherUser { sid, .. }
             | Self::TrafficCarriedByAnotherUser { sid, .. }
@@ -1058,6 +1074,12 @@ pub struct SnapshotInitialResponse {
     /// key: `unenforced-app-rules`.
     #[serde(default)]
     pub unenforced_app_rules: Vec<String>,
+    /// Why some of `unenforced_app_rules` are not applied: the entry, then a
+    /// protection reason slug (`ProtectionReason`) or `other-users-folder`.
+    /// An entry absent here found no program. Wire key:
+    /// `unenforced-app-reasons`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub unenforced_app_reasons: std::collections::BTreeMap<String, String>,
     /// How many secondary-destined IPs the "smart"
     /// kill-switch excluded from its per-IP pin/block set this compute because
     /// the shared-IP census saw them on direct (non-rule) hosts too. `0` under
@@ -1109,6 +1131,10 @@ pub struct SnapshotInitialResponse {
     /// `pending-vpn-clients`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_vpn_clients: Vec<PendingVpnClientDto>,
+    /// The caller's rules applied despite the protection of system programs
+    /// and folders, each with its term. Wire key: `rule-overrides`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_overrides: Vec<RuleOverrideDto>,
 }
 
 /// The payload of [`StatusUpdateEvent::RoutesHeldByAnotherUser`] without the SID.
@@ -1204,9 +1230,18 @@ pub enum RuleConflictKind {
     /// additional route, so it is not applied; `reason` says which protection.
     /// `ip` is empty and `count` zero.
     ProtectedTarget,
+    /// A protected rule written with `+override`: it asks to apply anyway and
+    /// waits for its owner to confirm it, or to confirm it again because it
+    /// now takes a critical program the confirmation did not name. `reason`
+    /// says which protection. `ip` is empty and `count` zero.
+    OverrideNeedsConfirmation,
     /// A rule by folder covers the first `count` programs of a folder that
     /// holds more; the rest are not covered. `ip` is empty.
     FolderOverCap,
+    /// A rule by path names a folder in another user's profile, which is
+    /// never read for its owner, so it is not applied. `ip` is empty and
+    /// `count` zero.
+    OtherUsersFolder,
 }
 
 /// Compact summary of a revision row surfaced in
@@ -1254,6 +1289,10 @@ mod conn_history;
 pub use conn_history::*;
 mod site_check;
 pub use site_check::*;
+mod app_path_coverage;
+pub use app_path_coverage::*;
+mod rule_override;
+pub use rule_override::*;
 // ── Serde defaults shared by more than one payload group ─────────────────
 //
 // A default named by two groups belongs to neither: a child module cannot

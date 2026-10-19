@@ -604,6 +604,38 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
+            IpcOperationName::RulesAppPathCoverageGet => match deps.app_path_coverage.clone() {
+                Some(coverage) => {
+                    registry.register_checked(op, AppPathCoverageHandler::new(coverage));
+                }
+                None => {
+                    registry.register_checked(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::RulesOverridePreview => match deps.rule_override.clone() {
+                Some(overrides) => {
+                    registry.register(op, RuleOverridePreviewHandler::new(overrides));
+                }
+                None => {
+                    registry.register_checked(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::RulesOverrideGrant => match deps.rule_override.clone() {
+                Some(overrides) => {
+                    registry.register_checked(op, RuleOverrideGrantHandler::new(overrides));
+                }
+                None => {
+                    registry.register_checked(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::RulesOverrideRevoke => match deps.rule_override.clone() {
+                Some(overrides) => {
+                    registry.register_checked(op, RuleOverrideRevokeHandler::new(overrides));
+                }
+                None => {
+                    registry.register_checked(op, UnimplementedHandler::new(op));
+                }
+            },
             IpcOperationName::AutoRuleCandidatesProbe => match deps.auto_rule_probe.clone() {
                 Some(runner) => {
                     registry.register_checked(op, AutoRuleCandidatesProbeHandler::new(runner));

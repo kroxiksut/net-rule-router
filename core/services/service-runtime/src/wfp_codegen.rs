@@ -484,6 +484,8 @@ pub enum CodegenDiagnostic {
     PathRuleProtected {
         rule_id: String,
         reason: nrr_domain::protected_places::ProtectionReason,
+        /// The rule asks to apply anyway and waits for a confirmation.
+        override_pending: bool,
     },
     /// A rule by folder covers the first `covered` programs of a folder that
     /// holds more.
@@ -492,6 +494,9 @@ pub enum CodegenDiagnostic {
         folder: String,
         covered: usize,
     },
+    /// A rule by path names a folder in another user's profile: it is not
+    /// read for this owner and emitted nothing.
+    PathInOtherUsersProfile { rule_id: String },
     /// Fail-closed catch-all `Block` filter was emitted. Exactly
     /// one of these appears per codegen output when
     /// `behavior_mode == StrictSecondaryFailClosed`. Useful for
@@ -547,9 +552,14 @@ impl CodegenDiagnostic {
                 pieces: *pieces,
                 cap: *cap,
             }),
-            Self::PathRuleProtected { rule_id, reason } => Some(RuleConflict::PathProtected {
+            Self::PathRuleProtected {
+                rule_id,
+                reason,
+                override_pending,
+            } => Some(RuleConflict::PathProtected {
                 rule_id: rule_id.clone(),
                 reason: *reason,
+                override_pending: *override_pending,
             }),
             Self::AppFolderOverCap {
                 rule_id, covered, ..
@@ -557,6 +567,11 @@ impl CodegenDiagnostic {
                 rule_id: rule_id.clone(),
                 covered: *covered,
             }),
+            Self::PathInOtherUsersProfile { rule_id } => {
+                Some(RuleConflict::PathInOtherUsersProfile {
+                    rule_id: rule_id.clone(),
+                })
+            }
             _ => None,
         }
     }
@@ -604,14 +619,23 @@ impl From<crate::rule_conflicts::RuleConflict> for CodegenDiagnostic {
                 pieces,
                 cap,
             },
-            RuleConflict::PathProtected { rule_id, reason } => {
-                Self::PathRuleProtected { rule_id, reason }
-            }
+            RuleConflict::PathProtected {
+                rule_id,
+                reason,
+                override_pending,
+            } => Self::PathRuleProtected {
+                rule_id,
+                reason,
+                override_pending,
+            },
             RuleConflict::FolderOverCap { rule_id, covered } => Self::AppFolderOverCap {
                 rule_id,
                 folder: String::new(),
                 covered,
             },
+            RuleConflict::PathInOtherUsersProfile { rule_id } => {
+                Self::PathInOtherUsersProfile { rule_id }
+            }
         }
     }
 }
@@ -1220,6 +1244,7 @@ fn emit_for_app_match(
                 path,
                 sid,
                 effect,
+                app.override_requested,
                 app_resolver,
                 gate,
                 crate::protected_rules::places(),
@@ -1228,7 +1253,15 @@ fn emit_for_app_match(
                 out.diagnostics.push(CodegenDiagnostic::PathRuleProtected {
                     rule_id: rule.id.as_str().to_string(),
                     reason,
+                    override_pending: targets.override_pending,
                 });
+                return;
+            }
+            if targets.outcome == nrr_platform_api::app_folders::PathOutcome::OtherUsersFolder {
+                out.diagnostics
+                    .push(CodegenDiagnostic::PathInOtherUsersProfile {
+                        rule_id: rule.id.as_str().to_string(),
+                    });
                 return;
             }
             if targets.over_cap {
@@ -1363,7 +1396,12 @@ fn emit_for_app_match(
         // conn observer saw, and it has no v6 half yet.
         let mut observed = Vec::new();
         for ip in ips.into_iter().take(PER_HOSTNAME_IP_CAP) {
-            if app_pair_covers && !out.app_observed_secondary_ips.contains(&ip) {
+            // A script's interpreter is outside the pair, so the address
+            // its script taught keeps its own guard.
+            if app_pair_covers
+                && !gate.learnt_from_scripts(&pattern_str, ip)
+                && !out.app_observed_secondary_ips.contains(&ip)
+            {
                 out.app_observed_secondary_ips.push(ip);
             }
             observed.push(IpAddr::V4(ip));

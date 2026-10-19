@@ -159,9 +159,9 @@ pub(super) fn parse_rule_line(
         None => (body, ""),
     };
 
-    // Words rejoined and the flag taken off before the disabled-rule check,
+    // Words rejoined and the flags taken off before the disabled-rule check,
     // which would read `exe +children` as a file extension and drop the rule.
-    let (match_value, children) = split_children_flag(match_value);
+    let (match_value, flags) = split_rule_flags(match_value);
     let comment = comment.trim();
 
     // `?` is read where values are host names or single addresses; elsewhere
@@ -207,7 +207,8 @@ pub(super) fn parse_rule_line(
         comment,
         blocked: markers.deny,
         verify_primary: markers.verify,
-        children,
+        children: flags.children,
+        override_requested: flags.override_requested,
         origin,
         line_number,
     })
@@ -215,20 +216,41 @@ pub(super) fn parse_rule_line(
 
 /// Per-rule child-process flag (docs/en/rules-file-format.md Child process
 /// tracking): a word after the value, before any inline `#`. Both parsers take
-/// it off in every section through [`split_children_flag`]; nothing acts on it
+/// it off in every section through [`split_rule_flags`]; nothing acts on it
 /// yet, the matcher has no process tree to follow.
 pub const CHILDREN_FLAG: &str = "+children";
 
+/// Per-rule request to apply a program rule the protection of system programs
+/// and folders refuses (docs/en/rules-file-format.md Overriding the
+/// protection). A request only: the rule stays unapplied until its owner
+/// confirms it in the window or the terminal, and the file never carries the
+/// confirmation.
+pub const OVERRIDE_FLAG: &str = "+override";
+
+/// The flags written after a rule's value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuleFlags {
+    /// [`CHILDREN_FLAG`].
+    pub children: bool,
+    /// [`OVERRIDE_FLAG`].
+    pub override_requested: bool,
+}
+
 /// `value` with its words rejoined by one space and every [`CHILDREN_FLAG`]
-/// after the first word taken off, and whether there was one. Any other later
-/// word, the retired `+block` among them, stays for validation to judge.
+/// and [`OVERRIDE_FLAG`] after the first word taken off, and which there were.
+/// Any other later word, the retired `+block` among them, stays for validation
+/// to judge.
 #[must_use]
-pub fn split_children_flag(value: &str) -> (String, bool) {
+pub fn split_rule_flags(value: &str) -> (String, RuleFlags) {
     let mut out = String::with_capacity(value.len());
-    let mut children = false;
+    let mut flags = RuleFlags::default();
     for (idx, token) in value.split_whitespace().enumerate() {
         if idx > 0 && token == CHILDREN_FLAG {
-            children = true;
+            flags.children = true;
+            continue;
+        }
+        if idx > 0 && token == OVERRIDE_FLAG {
+            flags.override_requested = true;
             continue;
         }
         if !out.is_empty() {
@@ -236,28 +258,36 @@ pub fn split_children_flag(value: &str) -> (String, bool) {
         }
         out.push_str(token);
     }
-    (out, children)
+    (out, flags)
 }
 
 /// The value a rules table keeps for a parsed rule: `value`, with ` +children`
-/// after a program's name when its line carried the flag, so a file written
-/// back from the table keeps it. Elsewhere the flag means nothing and is gone,
-/// as the service reads it.
+/// and ` +override` after a program when its line carried them, so a file
+/// written back from the table keeps them. Elsewhere the flags mean nothing and
+/// are gone, as the service reads them.
 #[must_use]
-pub fn stored_rule_value(rule_type: ParsedRuleType, value: &str, children: bool) -> String {
-    if children && rule_type == ParsedRuleType::Application {
-        format!("{value} {CHILDREN_FLAG}")
-    } else {
-        value.to_owned()
+pub fn stored_rule_value(rule_type: ParsedRuleType, value: &str, flags: RuleFlags) -> String {
+    if rule_type != ParsedRuleType::Application {
+        return value.to_owned();
     }
+    let mut out = value.to_owned();
+    if flags.children {
+        out.push(' ');
+        out.push_str(CHILDREN_FLAG);
+    }
+    if flags.override_requested {
+        out.push(' ');
+        out.push_str(OVERRIDE_FLAG);
+    }
+    out
 }
 
-/// A table's value without the flag [`stored_rule_value`] keeps on it: what
+/// A table's value without the flags [`stored_rule_value`] keeps on it: what
 /// the service matches, as the file reader hands it over.
 #[must_use]
-pub fn without_children_flag(value: &str) -> std::borrow::Cow<'_, str> {
-    let (bare, children) = split_children_flag(value);
-    if children {
+pub fn without_rule_flags(value: &str) -> std::borrow::Cow<'_, str> {
+    let (bare, flags) = split_rule_flags(value);
+    if flags != RuleFlags::default() {
         std::borrow::Cow::Owned(bare)
     } else {
         std::borrow::Cow::Borrowed(value)

@@ -548,6 +548,22 @@ pub(crate) fn build_ipc_server(
                     Arc::clone(&stack.block_notice_center),
                     Arc::clone(&stack.block_notice_journal),
                 );
+                // The daemon's confirmations; an enforcement pass before this
+                // saw none, so the protection held.
+                nrr_service_runtime::crash_series::withdraw_on_crash_loop(
+                    &artifacts.topology.data_dir,
+                    &surface.override_grants,
+                    nrr_service_runtime::timed_window::now_ms(),
+                );
+                nrr_service_runtime::override_grants::install(Arc::clone(&surface.override_grants));
+                // The service accounts a confirmation covers are read again when
+                // the set of units changes, never on an enforcement pass.
+                if let Some(rule_override) = surface.deps.rule_override.as_ref() {
+                    nrr_service_runtime::override_recheck::start_for_service(
+                        Arc::clone(rule_override),
+                        &nrr_platform_linux::service_set_change::LinuxServiceSetChangeObserver::default(),
+                    );
+                }
                 let mut registry = nrr_service_runtime::IpcHandlerRegistry::new();
                 nrr_service_runtime::ipc_handlers::register_production_handlers(
                     &mut registry,
@@ -1391,7 +1407,7 @@ pub(crate) fn build_policy_stack(
     let pass_inputs = {
         use nrr_platform_api::route_table::RouteTablePort;
         use nrr_service_runtime::pass_inputs::{
-            applying_revision, hashed, table_writes, verify_verdicts, PassInputs,
+            applying_revision, hashed, rule_overrides, table_writes, verify_verdicts, PassInputs,
             PLAN_BLIND_STATE_TABLES,
         };
         let cache = Arc::clone(&cache_store);
@@ -1399,6 +1415,7 @@ pub(crate) fn build_policy_stack(
         PassInputs::new()
             .with_source("applying", applying_revision())
             .with_source("verdicts", verify_verdicts())
+            .with_source("overrides", rule_overrides())
             .with_source(
                 "state",
                 table_writes(

@@ -138,6 +138,9 @@ pub struct AppState {
     pub rules: crate::screens::rules::RulesState,
     /// A language the user picked; the loop reloads the texts in it.
     pub language_change: Option<String>,
+    /// Something the service reports in the snapshot (conflicts, enforcement)
+    /// changed under this session; the loop reads the snapshot again.
+    pub snapshot_refresh_due: bool,
     /// "Restore my settings": what a service that lost them lacks.
     pub restore: crate::restore::RestoreState,
     /// The Settings screen's sections, what they read and the terminal's own
@@ -180,6 +183,7 @@ impl AppState {
             wizard: crate::screens::wizard::WizardState::default(),
             rules: crate::screens::rules::RulesState::default(),
             language_change: None,
+            snapshot_refresh_due: false,
             restore: crate::restore::RestoreState::default(),
             settings: crate::screens::settings::SettingsState::default(),
             vpn_trust: crate::vpn_trust::VpnTrustState::default(),
@@ -253,6 +257,9 @@ impl AppState {
                     .chain(crate::primary_suggestion::announce(self, texts, now))
                     .chain(crate::block_backlog::announce(self, texts, now))
                     .chain(crate::local_network_offer::announce(self, texts, now));
+                if std::mem::take(&mut self.snapshot_refresh_due) {
+                    effects.push(Effect::Refresh);
+                }
                 for effect in later {
                     if !effects.contains(&effect) {
                         effects.push(effect);
@@ -270,6 +277,7 @@ impl AppState {
                     .map(|report| report.link.clone());
                 self.vpn_trust.pending = snapshot.pending_vpn_clients.clone();
                 self.snapshot = Some(*snapshot);
+                crate::screens::rules::overrides::on_snapshot(self);
                 self.fetch_error = None;
                 crate::screens::wizard::snapshot_arrived(self);
                 crate::restore::on_snapshot(self);
@@ -329,6 +337,14 @@ impl AppState {
             StatusUpdateEvent::VerifyVerdictsChanged { .. } => {
                 crate::screens::rules::verdicts::load(self);
                 Vec::new()
+            }
+            StatusUpdateEvent::RuleOverridesChanged { expired, cause, .. } => {
+                // The marks follow the snapshot; an end or a withdrawal is said.
+                let mut effects = vec![Effect::Refresh];
+                effects.extend(crate::screens::rules::overrides::announce_ended(
+                    self, &expired, &cause, texts, now,
+                ));
+                effects
             }
             StatusUpdateEvent::RoutesHeldByAnotherUser { count, sample, .. } => {
                 let held = (count > 0).then_some(RoutesHeldDto { count, sample });
@@ -401,7 +417,7 @@ impl AppState {
             }
             StatusUpdateEvent::RevisionStatusChanged { .. } => {
                 crate::screens::rules::on_revision_changed(self);
-                Vec::new()
+                vec![Effect::Refresh]
             }
             StatusUpdateEvent::BlockNoticeRaised {
                 destination,

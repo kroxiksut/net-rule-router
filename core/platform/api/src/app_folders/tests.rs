@@ -300,3 +300,15 @@ fn a_hostile_buffer_never_panics() {
     }
     assert!(notify_records(&crawl).len() <= MAX_NOTIFY_RECORDS);
 }
+
+/// `/tmp` lets anyone create a folder first, so nothing below it vouches for
+/// the program it holds, missing or not; a system folder does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_folder_below_tmp_is_writable_by_anyone_and_a_system_folder_is_not() {
+    assert!(writable_by_anyone_unix(Path::new("/tmp")));
+    assert!(writable_by_anyone_unix(Path::new("/tmp/nrr-absent/app")));
+    assert!(!writable_by_anyone_unix(Path::new("/usr/bin")));
+    let folders = StdProgramFolders::new(PathStyle::Linux);
+    assert!(!folders.writable_by_anyone(Path::new("/usr/bin")));
+}

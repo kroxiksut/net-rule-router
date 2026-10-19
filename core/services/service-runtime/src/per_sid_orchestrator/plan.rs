@@ -52,7 +52,13 @@ impl PerSidApplyOrchestrator {
                     // whose leak-guard is no longer armed.
                     self.update_killswitch_registry(sid, KillswitchBlockIds::default());
                 }
-                return Ok(ComputedFilterSet::NoPolicy);
+                // Routing needs connections; a deny does not.
+                return self.compute_deny_filters_without_policy(
+                    sid,
+                    log_unresolved,
+                    rules_override,
+                    intent,
+                );
             }
         };
         // ONE read of the FQDN cache for the whole pass. Every mechanism below

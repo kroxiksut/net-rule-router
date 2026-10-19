@@ -2,11 +2,13 @@
 //! An application value from a user-writable rules file, and the search-path
 //! lists a machine reports: whatever the bytes, the protection's verdict never
 //! panics, says the same twice, and a path that climbs with `..` never slips
-//! past it.
+//! past it. The same bytes as the program names a folder holds: what a
+//! confirmation names stays bounded.
 
 use libfuzzer_sys::fuzz_target;
 use nrr_domain::protected_places::{
-    protection_verdict, AppTarget, ProtectedPlaces, ProtectionVerdict, RuleEffect,
+    critical_processes_covered, protection_verdict, AppTarget, ProtectedPlaces,
+    ProtectionVerdict, RuleEffect, MAX_CRITICAL_NAMED,
 };
 use nrr_domain::rules_file::HostPlatform;
 use nrr_platform_api::protected_places::{
@@ -53,6 +55,10 @@ fuzz_target!(|data: &[u8]| {
             ] {
                 let verdict = protection_verdict(target, effect, &places);
                 assert_eq!(verdict, protection_verdict(target, effect, &places));
+                let programs: Vec<&str> = text.lines().take(4096).collect();
+                let critical = critical_processes_covered(target, &programs, platform);
+                assert!(critical.len() <= MAX_CRITICAL_NAMED);
+                assert!(critical.windows(2).all(|w| w[0] < w[1]), "{critical:?}");
                 let is_path = !matches!(target, AppTarget::Name(_) | AppTarget::NameGlob(_));
                 if is_path && climbs {
                     assert!(

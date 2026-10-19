@@ -201,6 +201,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "process_command_line"
+path = "fuzz_targets/process_command_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "site_check_http"
 path = "fuzz_targets/site_check_http.rs"
 test = false

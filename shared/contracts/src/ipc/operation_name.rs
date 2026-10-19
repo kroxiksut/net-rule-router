@@ -367,10 +367,36 @@ pub enum IpcOperationName {
     /// [`crate::ipc_payloads::SiteCheckResultRequest`] →
     /// [`crate::ipc_payloads::SiteCheckStatus`].
     SiteCheckResultGet,
+    /// What an application rule by program path would cover for the caller
+    /// now: how many programs, whether the folder holds more than one rule
+    /// covers, whether anyone may write there, and why it may not be saved.
+    /// Asked by the rule form; reads only the caller's own folders and lists
+    /// within the bounds of one rule. Query op, no elevation.
+    /// [`crate::ipc_payloads::AppPathCoverageRequest`] →
+    /// [`crate::ipc_payloads::AppPathCoverageResponse`].
+    RulesAppPathCoverageGet,
+    /// What confirming one of the caller's rules the protection of system
+    /// programs refuses (`+override`) would let it take, and a token for the
+    /// confirmation. Reads only; no elevation.
+    /// [`crate::ipc_payloads::RuleOverridePreviewRequest`] →
+    /// [`crate::ipc_payloads::RuleOverridePreviewResponse`].
+    RulesOverridePreview,
+    /// Confirm a previewed rule for a term: the rule applies despite the
+    /// protection until the term ends. Needs an administrator when the rule
+    /// reaches past the caller (system folders and processes, service
+    /// accounts, other users).
+    /// [`crate::ipc_payloads::RuleOverrideGrantRequest`] →
+    /// [`crate::ipc_payloads::RuleOverrideGrantResponse`].
+    RulesOverrideGrant,
+    /// Take a confirmation back; the protection holds the rule again.
+    /// User-scoped, not elevated.
+    /// [`crate::ipc_payloads::RuleOverrideRevokeRequest`] →
+    /// [`crate::ipc_payloads::RuleOverrideRevokeResponse`].
+    RulesOverrideRevoke,
 }
 
 impl IpcOperationName {
-    pub const ALL: [Self; 82] = [
+    pub const ALL: [Self; 86] = [
         Self::ContractNegotiate,
         Self::ServiceHealthGet,
         Self::SnapshotInitialGet,
@@ -453,6 +479,10 @@ impl IpcOperationName {
         Self::ConnHistorySettingsSet,
         Self::SiteCheckRun,
         Self::SiteCheckResultGet,
+        Self::RulesAppPathCoverageGet,
+        Self::RulesOverridePreview,
+        Self::RulesOverrideGrant,
+        Self::RulesOverrideRevoke,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -539,6 +569,10 @@ impl IpcOperationName {
             Self::ConnHistorySettingsSet => "conn-history.settings.set",
             Self::SiteCheckRun => "diagnostics.site-check.run",
             Self::SiteCheckResultGet => "diagnostics.site-check.result",
+            Self::RulesAppPathCoverageGet => "rules.app-path-coverage.get",
+            Self::RulesOverridePreview => "rules.override.preview",
+            Self::RulesOverrideGrant => "rules.override.grant",
+            Self::RulesOverrideRevoke => "rules.override.revoke",
         }
     }
 

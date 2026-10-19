@@ -132,6 +132,18 @@ mod tests {
         vec!["en".to_string(), "ru".to_string()]
     }
 
+    /// The loaded texts are in the language the flag names, whatever the
+    /// system says.
+    #[test]
+    fn the_flag_picks_the_texts_not_only_the_id() {
+        let ru = Texts::load(Some("ru"), &["en-US".into()]);
+        let en = Texts::load(Some("en"), &["ru-RU".into()]);
+        assert_eq!((ru.language(), en.language()), ("ru", "en"));
+        let key = crate::keys::APP_UNRESOLVED_TITLE;
+        assert_ne!(ru.get(key), en.get(key));
+        assert_eq!(en.get(key), key.en);
+    }
+
     #[test]
     fn the_flag_outranks_the_system() {
         assert_eq!(

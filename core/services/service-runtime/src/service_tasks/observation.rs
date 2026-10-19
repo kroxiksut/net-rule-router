@@ -110,6 +110,9 @@ pub struct AppObservationWiring {
     /// batch in place of `trace` and the bare fold into `store`: notices, the
     /// outage list and the learners need the verdict the tee ignores.
     pub consumer: Option<Arc<crate::conn_observation_consumer::ConnectionObservationConsumer>>,
+    /// Where the bare fold runs, what lets a rule by folder follow its
+    /// scripts there too; the consumer holds its own.
+    pub scripts: Option<Arc<crate::script_launches::ScriptLaunches>>,
 }
 
 /// Fold observed connections into the destinations application rules route.
@@ -196,6 +199,16 @@ pub fn fold_observations(wiring: &AppObservationWiring) -> usize {
             };
             if store.record(path, ip) {
                 learnt += 1;
+            }
+            // Kept per user, the scoped store is the owner's own; a shared one
+            // credits nobody's script.
+            if let Some(scripts) = wiring.scripts.as_ref() {
+                if wiring.store.keeps_per_principal() {
+                    let rules = scripts.rule_paths_run_by(&store, observation.pid, path);
+                    if store.record_for_rule_paths(&rules, ip) {
+                        learnt += 1;
+                    }
+                }
             }
         }
     }

@@ -14,6 +14,8 @@
 //! - [`rules_overlaps`] — overlaps the user made on purpose.
 //! - [`rule_value_class`] — what kind of rule a value is, and the section a
 //!   value written under the wrong one belongs in.
+//! - [`rebase`] — the user's unsaved edits laid over rules that changed
+//!   elsewhere meanwhile.
 //! - [`recent_changes`] — the «Recent» filter's periods and times.
 //! - [`rule_sets`] — the user's rule-set folder and the set moving into it.
 //! - [`restore`] — the user's recorded settings brought back to a service
@@ -49,6 +51,7 @@ pub mod forwarded;
 mod js;
 pub mod notice_mutes;
 pub mod placeholders;
+pub mod rebase;
 pub mod recent_changes;
 pub mod restore;
 pub mod review;

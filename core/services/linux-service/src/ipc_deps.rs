@@ -101,6 +101,9 @@ pub(crate) struct IpcSurface {
     /// The automatic main-link pass over the SAME runner the button uses, so
     /// both share one repeat suppression. `None` without the suggestions engine.
     pub auto_probe: Option<nrr_service_runtime::service_tasks::AutoProbeWiring>,
+    /// The confirmations this surface's handlers use; the daemon installs
+    /// them for the enforcement path.
+    pub override_grants: Arc<nrr_service_runtime::override_grants::OverrideGrants>,
 }
 
 /// Turns an approved revision into kernel state by running one enforcement pass.
@@ -370,6 +373,20 @@ pub(crate) fn build_ipc_surface(
     let coordinator = Arc::new(signing.sign(coordinator));
     // Before the first enforcement pass reads the rules.
     let revision_watch = signing.enforce_and_watch(Some(&coordinator));
+    // Confirmed overrides of the protection of system programs, honoured only
+    // under the key their rows were signed with. The daemon makes them the
+    // process's (`build_ipc_server`); a surface built and dropped, as in
+    // tests, must not leave its audit writer, and with it the chain lock,
+    // behind in a global.
+    let override_grants = nrr_service_runtime::override_grants::OverrideGrants::open(
+        Arc::clone(&state_conn),
+        signing.signing_key().map(<[u8]>::to_vec),
+        audit_writer
+            .as_ref()
+            .map(|w| Arc::clone(w) as Arc<AuditTrail>),
+        nrr_service_runtime::timed_window::now_ms(),
+    );
+    override_grants.attach_events(Arc::clone(&event_bus));
 
     // No tray feeds the registry here: logind says whose policy is live, so a
     // pause reaches the pass for every signed-in user, tray or not.
@@ -407,6 +424,8 @@ pub(crate) fn build_ipc_surface(
             ),
         ))
         .with_state_conn(Arc::clone(&state_conn))
+        // A new rule naming another user's folder is refused too.
+        .with_path_coverage(app_path_coverage())
         .with_event_bus(Arc::clone(&event_bus))
         .with_pause_coordinator(Arc::clone(&pause_coordinator))
         .with_stability_provider(Arc::new(ProductionServiceStability::new(Arc::clone(
@@ -566,6 +585,8 @@ pub(crate) fn build_ipc_surface(
         .with_system_info(nrr_platform_linux::system_info::collect())
         .with_file_handoff(Arc::new(nrr_platform_linux::file_handoff::ChownFileHandoff))
         .with_conn_trace_ring(Arc::clone(&conn_trace_ring))
+        // The rule form's count of what a rule by path covers for the caller.
+        .with_app_path_coverage(app_path_coverage())
         // Tells a daemon's connections from a person's for the VPN-gateway read.
         .with_unix_sys_uid_max(nrr_platform_linux::service_account_uids::read_sys_uid_max())
         // The same status the planner publishes rule conflicts into.
@@ -581,6 +602,20 @@ pub(crate) fn build_ipc_surface(
                 .ok()
                 .and_then(|guard| nrr_storage::migration::read_schema_version(&guard).ok()),
         );
+    // Confirming a rule the protection of system programs refuses.
+    let deps = deps.with_rule_override(Arc::new(
+        nrr_service_runtime::ipc_handlers::RuleOverrideDeps {
+            grants: Arc::clone(&override_grants),
+            conn: Arc::clone(&stats_state_conn),
+            folders: Some(Arc::new(
+                nrr_platform_linux::app_folders::LinuxProgramFolders::new(),
+            )),
+            live: Some(Arc::new(
+                nrr_platform_linux::conn_observe::ProcfsLiveConnections::new(),
+            )),
+            unix_sys_uid_max: nrr_platform_linux::service_account_uids::read_sys_uid_max(),
+        },
+    ));
     // OS-neutral handlers over the state database. Left unwired, "Save to
     // file", the drift merge, the full settings export, the full reset and the
     // DoH list each came back as an unimplemented operation.
@@ -748,6 +783,7 @@ pub(crate) fn build_ipc_surface(
         coordinator,
         revision_watch,
         auto_probe,
+        override_grants,
     }
 }
 
@@ -898,6 +934,16 @@ fn main_link_probe(
 
 /// "Is it us or the site?" over the same link-bound probe and stored bindings,
 /// with the caller's own trace and ledger, and the explain probe's routes.
+/// What a rule by program path covers for one person, read once per ask.
+fn app_path_coverage() -> Arc<nrr_service_runtime::app_path_coverage::AppPathCoverage> {
+    Arc::new(
+        nrr_service_runtime::app_path_coverage::AppPathCoverage::new(
+            Arc::new(nrr_platform_linux::app_folders::LinuxProgramFolders::new()),
+            nrr_platform_api::enforcement::EnforcementCapabilities::current().app_path_rules,
+        ),
+    )
+}
+
 fn site_check(
     engine: Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>,
     cache: Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>,

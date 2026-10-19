@@ -94,6 +94,7 @@ fn app_rule(id: &str, process: &str) -> Rule {
             pattern: AppMatchPattern::Exact(process.to_string()),
             include_child_processes: false,
             windows_service_name: None,
+            override_requested: false,
         }),
         comment: String::new(),
         action: crate::canonical::RuleAction::Route,
@@ -388,6 +389,7 @@ fn process_name_exact_uppercased_lowercased() {
         pattern: AppMatchPattern::Exact("Chrome.EXE".to_string()),
         include_child_processes: false,
         windows_service_name: None,
+        override_requested: false,
     };
     let mut warnings = Vec::new();
     let result = normalize_app_match(
@@ -407,6 +409,7 @@ fn process_name_exact_missing_exe_gets_appended_with_warning() {
         pattern: AppMatchPattern::Exact("chrome".to_string()),
         include_child_processes: false,
         windows_service_name: None,
+        override_requested: false,
     };
     let mut warnings = Vec::new();
     let result = normalize_app_match(
@@ -439,6 +442,7 @@ fn unix_rules_keep_their_names_and_raise_no_suffix_warning() {
                         pattern: AppMatchPattern::Glob("Codex*".to_string()),
                         include_child_processes: false,
                         windows_service_name: None,
+                        override_requested: false,
                     }),
                     ..app_rule("r-3", "")
                 },
@@ -533,6 +537,7 @@ fn a_value_with_a_separator_is_a_path() {
             pattern: AppMatchPattern::Exact(raw.to_string()),
             include_child_processes: false,
             windows_service_name: None,
+            override_requested: false,
         };
         let mut warnings = Vec::new();
         let result = normalize_app_match(&app, platform, &RuleId("r-1".to_string()), &mut warnings)
@@ -571,6 +576,16 @@ fn a_path_that_names_no_program_is_refused_with_its_reason() {
             r"C:\Games\..\Windows\",
             HostPlatform::Windows,
             AppPathError::Malformed,
+        ),
+        (
+            r"%TEMP%\app.exe",
+            HostPlatform::Windows,
+            AppPathError::UnknownVariable,
+        ),
+        (
+            "~bob/apps/",
+            HostPlatform::Linux,
+            AppPathError::UnknownVariable,
         ),
     ] {
         let result = canonical_app_pattern(
@@ -630,6 +645,7 @@ fn process_name_glob_is_lowercased() {
         pattern: AppMatchPattern::Glob("*VPN*.EXE".to_string()),
         include_child_processes: false,
         windows_service_name: None,
+        override_requested: false,
     };
     let mut warnings = Vec::new();
     let result = normalize_app_match(
@@ -649,6 +665,7 @@ fn process_name_glob_bare_star_is_rejected() {
         pattern: AppMatchPattern::Glob("*".to_string()),
         include_child_processes: false,
         windows_service_name: None,
+        override_requested: false,
     };
     let mut warnings = Vec::new();
     let result = normalize_app_match(
@@ -754,6 +771,7 @@ fn process_name_glob_accepted_no_exe_appended() {
         pattern: AppMatchPattern::Glob("nord*".to_string()),
         include_child_processes: false,
         windows_service_name: None,
+        override_requested: false,
     };
     let mut warnings = Vec::new();
     let result = normalize_app_match(

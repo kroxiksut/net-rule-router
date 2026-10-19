@@ -146,6 +146,9 @@ pub struct ProductionMutationExecutor {
     /// Screens new network rules against this machine's links and pool.
     /// `None` accepts them on their values alone.
     network_screen: Option<Arc<dyn NetworkRuleScreen>>,
+    /// Refuses a new rule naming a folder in another user's profile. `None`
+    /// accepts such rules, which enforcement then leaves unread.
+    path_coverage: Option<Arc<crate::app_path_coverage::AppPathCoverage>>,
 }
 
 impl ProductionMutationExecutor {
@@ -162,12 +165,22 @@ impl ProductionMutationExecutor {
             stability: None,
             audit_writer: None,
             network_screen: None,
+            path_coverage: None,
         }
     }
 
     /// Attach the runtime screen for new network rules.
     pub fn with_network_screen(mut self, screen: Arc<dyn NetworkRuleScreen>) -> Self {
         self.network_screen = Some(screen);
+        self
+    }
+
+    /// Attach the profile check for new rules by program path.
+    pub fn with_path_coverage(
+        mut self,
+        coverage: Arc<crate::app_path_coverage::AppPathCoverage>,
+    ) -> Self {
+        self.path_coverage = Some(coverage);
         self
     }
 
@@ -456,6 +469,10 @@ impl ProductionMutationExecutor {
         }
         if let Some(refusal) = self.submission_gate_refusal(&parsed.rules_json, principal) {
             return refusal;
+        }
+        // Edits only: a file read in keeps such a line (`profile_paths`).
+        if let Some(e) = self.foreign_profile_refusal(&parsed.rules_json, principal) {
+            return refused_summary(&e);
         }
         if let Some(e) =
             self.moved_rules_refusal(&parsed.rules_json, base_revision_in(payload), principal)
@@ -1817,6 +1834,8 @@ mod activation_drive;
 mod alerts;
 mod audit_chain;
 mod preset_import;
+mod profile_paths;
+pub use profile_paths::PATH_IN_OTHER_USERS_PROFILE_CODE;
 #[cfg(test)]
 mod tests;
 mod unrecognized;

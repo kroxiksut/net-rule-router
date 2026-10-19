@@ -27,6 +27,7 @@ const PURGED_TABLES: &[&str] = &[
     "block_notice_journal",
     "app_observed_destinations",
     "conn_history_prefs",
+    "override_grants",
 ];
 
 /// Principals this database holds ANY state for, excluding the shared
@@ -263,6 +264,13 @@ mod tests {
             params![sid],
         )
         .expect("conn_history_prefs");
+        conn.execute(
+            "INSERT INTO override_grants (sid, rule_value, effect, reason, granted_by,
+                 granted_at, row_hmac)
+             VALUES (?1, '/var/www/*', 'deny', 'shared-folder', ?1, 1, x'00')",
+            params![sid],
+        )
+        .expect("override_grants");
     }
 
     fn row_count(conn: &Connection, table: &str, sid: &str) -> i64 {

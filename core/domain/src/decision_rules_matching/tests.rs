@@ -69,6 +69,7 @@ fn app_exact(name: &str) -> CanonicalAppMatch {
     CanonicalAppMatch {
         pattern: CanonicalAppPattern::Exact(name.to_owned()),
         include_child_processes: false,
+        override_requested: false,
     }
 }
 
@@ -76,6 +77,7 @@ fn app_glob(pattern: &str) -> CanonicalAppMatch {
     CanonicalAppMatch {
         pattern: CanonicalAppPattern::Glob(pattern.to_owned()),
         include_child_processes: false,
+        override_requested: false,
     }
 }
 
@@ -992,6 +994,7 @@ fn app_path(raw: &str, style: nrr_shared::app_path::PathStyle) -> CanonicalAppMa
             nrr_shared::app_path::AppPath::parse(raw, style).expect("a path"),
         )),
         include_child_processes: false,
+        override_requested: false,
     }
 }
 

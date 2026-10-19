@@ -437,7 +437,9 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
     tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "build-deps", "boot stage entered");
     let deps = crate::runtime_deps::build_supervised_runtime_deps(&artifacts, verbosity_handle);
     tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "run-runtime", "boot stage entered");
+    let data_dir = artifacts.topology.data_dir.clone();
     run_supervised_runtime(&controller, &stop, artifacts, deps);
+    nrr_service_runtime::crash_series::end_run(&data_dir);
 
     // Net-event collection is a MACHINE-WIDE Base Filtering Engine setting, not
     // a property of our handle: left on, BFE goes on recording every classify

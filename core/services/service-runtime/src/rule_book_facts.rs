@@ -13,6 +13,17 @@ pub fn has_secondary_rules(book: &CanonicalRuleBook) -> bool {
         .any(|rule| rule.enabled && rule.action != RuleAction::Block)
 }
 
+/// Does the book hold an enabled deny? A deny needs no route, so it is the one
+/// kind of rule that is enforced for a user who bound no connection.
+#[must_use]
+pub fn has_deny_rules(book: &CanonicalRuleBook) -> bool {
+    book.primary
+        .rules()
+        .iter()
+        .chain(book.secondary.rules())
+        .any(|rule| rule.enabled && rule.action == RuleAction::Block)
+}
+
 /// Every host or domain name an enabled rule of either route names, as the
 /// rule stores it. Zones and addresses are not names.
 #[must_use]
@@ -79,6 +90,22 @@ mod tests {
         assert!(!has_secondary_rules(&blocks));
         let routes = book(vec![], vec![rule("s", fqdn("b.example"), true)]);
         assert!(has_secondary_rules(&routes));
+    }
+
+    #[test]
+    fn only_an_enabled_deny_counts_as_a_deny() {
+        assert!(!has_deny_rules(&book(
+            vec![rule("p", fqdn("a.example"), true)],
+            vec![]
+        )));
+        assert!(!has_deny_rules(&book(
+            vec![blocking(rule("p", fqdn("a.example"), false))],
+            vec![]
+        )));
+        assert!(has_deny_rules(&book(
+            vec![],
+            vec![blocking(rule("s", fqdn("a.example"), true))]
+        )));
     }
 
     #[test]

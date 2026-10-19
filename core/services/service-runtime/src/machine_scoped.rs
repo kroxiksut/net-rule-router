@@ -123,7 +123,11 @@ impl MachineScopedSetting {
             | Op::ConnHistoryClear
             | Op::ConnHistorySettingsSet
             | Op::SiteCheckRun
-            | Op::SiteCheckResultGet => None,
+            | Op::SiteCheckResultGet
+            | Op::RulesAppPathCoverageGet
+            | Op::RulesOverridePreview
+            | Op::RulesOverrideGrant
+            | Op::RulesOverrideRevoke => None,
         }
     }
 

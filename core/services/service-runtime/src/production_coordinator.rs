@@ -747,7 +747,7 @@ impl ProductionRulesApplyDispatcher {
         }
         // As the provider's enforcement read: a protected rule carried over
         // from the book in force is not applied.
-        snapshot.rule_book = crate::protected_rules::withhold(snapshot.rule_book).0;
+        snapshot.rule_book = crate::protected_rules::withhold_for(sid, snapshot.rule_book).0;
         Some(snapshot)
     }
 }

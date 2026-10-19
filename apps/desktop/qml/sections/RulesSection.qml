@@ -426,6 +426,11 @@ ColumnLayout {
             snapshot.recentMark = recent ? recent.kind : ""
             snapshot.recentAt = recent ? recent.at : 0
             snapshot.recentTip = recent ? recent.tip : ""
+            var grant = section.overrideFor(entry)
+            snapshot.overrideMark = grant ? "granted" : (section.asksOverride(entry) ? "pending" : "")
+            // -1: no deadline, until revoked.
+            snapshot.overrideUntil = grant && grant["until-ms"] !== undefined
+                ? Number(grant["until-ms"]) : -1
             arr.push(snapshot)
         }
         section._followSelection(indexByKey)
@@ -480,12 +485,118 @@ ColumnLayout {
         }
     }
 
+    // ── Rules applied despite the protection of system programs ──
+    // The service lists the caller's confirmations in the snapshot; a row and
+    // its confirmation meet through one key (`Rules.ruleOverrideKey`).
+    property var overrideByKey: ({})
+    property string _overridesSig: ""
+    /// The clock the "time left" marks read; moves once a minute.
+    property double overrideNow: Date.now()
+
+    function _platformOs() {
+        return root.platformProfile ? String(root.platformProfile.os || "") : ""
+    }
+    function _reindexOverrides() {
+        var list = (root.routingState && root.routingState.ruleOverrides) || []
+        var sig = JSON.stringify(list)
+        if (sig === section._overridesSig) return false
+        section._overridesSig = sig
+        var byKey = ({})
+        for (var i = 0; i < list.length; i += 1) {
+            var grant = list[i] || {}
+            var key = Rules.ruleOverrideKey("application", String(grant.value || ""),
+                String(grant.route || ""), section._platformOs())
+            if (key !== "") byKey[key] = grant
+        }
+        section.overrideByKey = byKey
+        return true
+    }
+    /// The confirmation the service holds for this row, or null.
+    function overrideFor(item) {
+        if (!item) return null
+        var key = Rules.ruleOverrideKey(String(item.ruleType || ""), String(item.matchValue || ""),
+            String(item.targetRoute || ""), section._platformOs())
+        return key !== "" && section.overrideByKey[key] ? section.overrideByKey[key] : null
+    }
+    /// The row asks to apply despite the protection and waits for it.
+    function asksOverride(item) {
+        return !!item && String(item.validationMessageKey || "")
+            === "rules.validation.match-value-warning.override-requested"
+    }
+    function overrideLeftText(until) {
+        var left = Rules.overrideRemaining(Number(until) >= 0 ? Number(until) : null,
+            section.overrideNow)
+        return root.tr("rules.override.left." + left.kind, left.kind)
+            .replace("{count}", String(left.count))
+    }
+    function overrideBadgeText(mark, until) {
+        if (String(mark) === "granted")
+            return root.tr("rules.override.badge.granted", "Allowed despite protection · {left}")
+                .replace("{left}", section.overrideLeftText(until))
+        if (String(mark) === "pending")
+            return root.tr("rules.override.badge.pending", "Needs your confirmation")
+        return ""
+    }
+    function openOverrideConfirm(masterIndex) {
+        if (masterIndex < 0 || !root.rulesModel || masterIndex >= root.rulesModel.count) return
+        var row = root.rulesModel.get(masterIndex)
+        overrideConfirmDialog.openFor(String(row.matchValue || ""), String(row.targetRoute || ""))
+    }
+    function revokeOverride(masterIndex) {
+        if (masterIndex < 0 || !root.rulesModel || masterIndex >= root.rulesModel.count) return
+        var row = root.rulesModel.get(masterIndex)
+        var value = String(row.matchValue || "")
+        var corr = root.rpc && typeof root.rpc.rpcRulesOverrideRevoke === "function"
+            ? root.rpc.rpcRulesOverrideRevoke(value, String(row.targetRoute || "")) : ""
+        if (!corr) {
+            root.statusLine = root.ipcErrorLabel("transport-disconnected")
+            return
+        }
+        root.rpc.registerRpcCallback(corr, function(ok, payload, code) {
+            if (!ok) {
+                root.statusLine = root.ipcErrorLabel(code)
+                return
+            }
+            root.statusLine = root.tr("rules.override.revoked", "The protection holds {value} again.")
+                .replace("{value}", Pure.displayText(value))
+            if (typeof root.refreshUnenforcedAppRules === "function") root.refreshUnenforcedAppRules()
+        })
+    }
+    Connections {
+        target: root
+        function onRoutingStateChanged() {
+            if (section._reindexOverrides()) section.scheduleRebuild()
+        }
+    }
+    Timer {
+        interval: 60000
+        repeat: true
+        running: section.visible && Object.keys(section.overrideByKey).length > 0
+        onTriggered: section.overrideNow = Date.now()
+    }
+    RuleOverrideConfirmDialog {
+        id: overrideConfirmDialog
+        ownerRoot: root
+        parent: Overlay.overlay
+        onGranted: function(grant) {
+            if (grant) {
+                root.statusLine = root.tr("rules.override.granted",
+                        "{value} applies despite the protection: {left}.")
+                    .replace("{value}", Pure.displayText(String(grant.value || "")))
+                    .replace("{left}", section.overrideLeftText(
+                        grant["until-ms"] !== undefined ? Number(grant["until-ms"]) : -1))
+            }
+            if (typeof root.refreshUnenforcedAppRules === "function") root.refreshUnenforcedAppRules()
+        }
+    }
+
     onFilterTypeChanged:    scheduleRebuild()
     onFilterEnabledChanged: scheduleRebuild()
     onFilterRouteChanged:   scheduleRebuild()
     onFilterAutoAddedOnlyChanged: scheduleRebuild()
     onSearchTextChanged:    scheduleRebuild()
     Component.onCompleted: {
+        section._reindexOverrides()
         rebuildDisplay()
         if (typeof root.refreshRulesOverlaps === "function") root.refreshRulesOverlaps()
     }
@@ -790,6 +901,7 @@ ColumnLayout {
         if (!item) return false
         if (filterEnabled === "enabled-only" && !item.enabled) return false
         if (filterEnabled === "disabled-only" && item.enabled) return false
+        if (filterEnabled === "overridden" && section.overrideFor(item) === null) return false
         if (filterEnabled === "with-errors") {
             // Rule is "with errors" iff the backend validator marked the
             // match value as invalid (status === "error"). Warnings don't
@@ -2317,7 +2429,7 @@ ColumnLayout {
             id: enabledFilterCombo
             theme: root.uiTheme
             implicitWidth: 220
-            model: [ "all", "enabled-only", "disabled-only", "with-errors" ]
+            model: [ "all", "enabled-only", "disabled-only", "with-errors", "overridden" ]
             function statusLabel(id) { return root.tr("rules.filter.enabled." + id, id) }
             labelResolver: function(item) { return enabledFilterCombo.statusLabel(item) }
             currentIndex: 0
@@ -3222,7 +3334,9 @@ ColumnLayout {
                 Label {
                     Layout.fillWidth: true
                     Layout.leftMargin: 28
-                    visible: ruleDelegate.validationError || ruleDelegate.validationWarning
+                    // A confirmed override is said by its own mark below.
+                    visible: (ruleDelegate.validationError || ruleDelegate.validationWarning)
+                        && String(model.overrideMark || "") !== "granted"
                     wrapMode: Text.WordWrap
                     font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                     color: ruleDelegate.validationError
@@ -3272,6 +3386,65 @@ ColumnLayout {
                             "Give this rule the type its value is. The line moves to that section of the rules file.")
                         : ""
                     onClicked: root.moveRuleToType(model.masterIndex)
+                }
+                // Applied despite the protection of system programs, or asking
+                // to be: the standing mark with the term left, and the one
+                // action that changes it.
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 28
+                    spacing: root.uiTheme.spacingSm
+                    visible: String(model.overrideMark || "") !== ""
+                    Rectangle {
+                        id: overrideBadge
+                        readonly property bool granted: String(model.overrideMark || "") === "granted"
+                        Layout.alignment: Qt.AlignVCenter
+                        radius: root.uiTheme.radiusSm
+                        color: "transparent"
+                        border.width: granted ? 2 : 1
+                        border.color: root.uiTheme.colorWarning
+                        implicitWidth: overrideBadgeLabel.implicitWidth + root.uiTheme.spacingSm * 2
+                        implicitHeight: overrideBadgeLabel.implicitHeight + root.uiTheme.spacingXxs * 2
+                        Label {
+                            id: overrideBadgeLabel
+                            anchors.centerIn: parent
+                            text: root.uiRevision >= 0
+                                ? section.overrideBadgeText(model.overrideMark, model.overrideUntil)
+                                : ""
+                            color: root.uiTheme.colorWarning
+                            font.bold: overrideBadge.granted
+                            font.pixelSize: Math.max(10, root.uiTheme.baseFontSizePx - 2)
+                        }
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: overrideBadgeLabel.text
+                    }
+                    ThemedButton {
+                        id: overrideActionButton
+                        theme: root.uiTheme
+                        Layout.fillWidth: false
+                        // Taking a confirmation back only restores the
+                        // protection, so a lock on rule edits does not hold it.
+                        enabled: overrideBadge.granted || !section.rulesLocked
+                        text: root.uiRevision >= 0
+                            ? (overrideBadge.granted
+                                ? root.tr("rules.override.revoke", "Revoke")
+                                : root.tr("rules.override.confirm", "Confirm…"))
+                            : ""
+                        Accessible.name: text
+                        Accessible.description: ToolTip.text
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 400
+                        ToolTip.text: root.uiRevision >= 0
+                            ? (overrideBadge.granted
+                                ? root.tr("rules.override.revoke-tooltip",
+                                    "Take the confirmation back: the protection holds the rule again.")
+                                : root.tr("rules.override.confirm-tooltip",
+                                    "See what the rule would take, then apply it despite the protection for a time you choose."))
+                            : ""
+                        onClicked: overrideBadge.granted
+                            ? section.revokeOverride(model.masterIndex)
+                            : section.openOverrideConfirm(model.masterIndex)
+                    }
                 }
                 // «Recent»: added or changed, and when. A changed rule says what
                 // it was before on hover.

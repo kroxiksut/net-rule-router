@@ -59,6 +59,7 @@ pub mod local_network_rules;
 pub mod log_retention_config;
 pub mod migration;
 pub mod mutation_tokens;
+pub mod override_grants;
 pub mod pause_state;
 pub mod policy_settings;
 pub mod principal_purge;

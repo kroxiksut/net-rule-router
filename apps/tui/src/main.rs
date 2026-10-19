@@ -60,7 +60,7 @@ fn main() -> ExitCode {
     );
     let explicit_lang = match &parsed {
         Ok(Invocation::Run(options)) => options.lang.clone(),
-        _ => None,
+        _ => args::lang_of(&argv),
     };
     let system = platform::system_locale()
         .map(|port| port.ui_language_candidates())

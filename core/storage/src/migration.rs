@@ -29,6 +29,7 @@ use crate::dto::{MigrationSummary, SchemaVerification};
 use crate::error::{StorageError, StorageResult};
 use crate::repository::MigrationRunner;
 use crate::schema::CONN_HISTORY_DB_V1_DDL;
+use crate::schema::STATE_DB_V77_DDL;
 use crate::schema::{
     CACHE_DB_V1_DDL, CACHE_DB_V2_DDL, CACHE_DB_V3_DDL, CACHE_DB_V4_DDL, STATE_DB_V10_DDL,
     STATE_DB_V11_DDL, STATE_DB_V12_DDL, STATE_DB_V13_DDL, STATE_DB_V14_DDL, STATE_DB_V15_DDL,
@@ -661,6 +662,11 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         name: "add_conn_history_prefs",
         stmts: STATE_DB_V76_DDL,
     },
+    MigrationDef {
+        version: 77,
+        name: "add_override_grants",
+        stmts: STATE_DB_V77_DDL,
+    },
 ];
 
 // nrr_conn_history.db. Rebuildable and versioned on its own, like the traffic
@@ -767,6 +773,9 @@ const STATE_REQUIRED_TABLES: &[&str] = &[
     "install_policy",
     // State DB v76 — each user's connection-history choices.
     "conn_history_prefs",
+    // State DB v77 — confirmed overrides of the system-program protection.
+    "override_grants",
+    "override_revocations_pending",
 ];
 
 const STATE_REQUIRED_INDEXES: &[&str] = &[

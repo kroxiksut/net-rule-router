@@ -1243,6 +1243,18 @@
       "coverage-exact-only": "Covers {host} only. Type *.{host} to include its subdomains.",
       "coverage-any-zone": "Covers {host} in every zone ({host}.com, {host}.net and so on) with all subdomains. A rule naming the zone wins over it.",
       "include-subdomains": "Include subdomains",
+      "path": {
+        "choose-folder": "Choose folder...",
+        "choose-folder-title": "Choose the folder with the programs",
+        "include-subfolders": "Include subfolders",
+        "counting": "Counting the programs...",
+        "count": "Programs covered now: {count}.",
+        "count-more": "Programs covered now: the first {count}. The folder holds more than one rule covers.",
+        "missing": "Nothing is there yet: the rule takes effect once the program or folder appears.",
+        "place": "For you this is {place}.",
+        "unsupported": "This system does not apply rules by path yet.",
+        "anyone-can-write": "Anyone can put a program here, so the rule may cover programs you did not install. A program here is never exempt from leak protection."
+      },
       "verify": "Unsure — check where it works",
       "verify-hint": "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule.",
       "verify-any-zone": "A site in every zone is not checked: the check needs one host.",
@@ -1458,13 +1470,16 @@
       "duplicates-hint": "Each of these was enabled on both routes, so the merge kept the main route's copy and switched the other one off. Pick a different route if that is not what you meant — the other copy stays in your list, switched off.",
       "title": "Merge file and app rules",
       "edits-title": "Your edits and the rules now in force",
-      "edits-body": "Your rules were changed elsewhere while you were editing them. Combine your edits with the rules now in force: a rule on only one side is kept, and where both sides changed the same rule you pick the version that stays. A rule you deleted that is still in force is kept; delete it again after the merge.",
+      "edits-body": "Your rules were changed elsewhere while you were editing them. Your edits go on top of the rules now in force: a rule you added, changed or deleted is added, changed or deleted there too, and rules changed elsewhere stay. Where both sides changed the same rule you pick the version that stays.",
       "edits-loading": "Comparing your edits with the rules in force…",
       "edits-no-op": "Your edits already match the rules in force — nothing to merge.",
       "bucket-edits-only": "Only in your edits",
       "bucket-in-force-only": "Only in the rules in force",
       "pick-edits": "Your edit",
       "pick-in-force": "In force",
+      "bucket-edits-changed": "Changed by you",
+      "bucket-edits-deleted": "Deleted by you",
+      "side-deleted": "deleted",
       "body": "Combine your linked rules file with the rules the service is currently enforcing. Rules on only one side are always kept; rules that exist on both but differ are shown as conflicts.",
       "bucket-file-only": "Only in the file",
       "bucket-service-only": "Only in the app",
@@ -1763,6 +1778,7 @@
     "network-recovery": {
       "title": "Restore network?",
       "body": "The packet filters, DNS redirect and routes the service applied will be removed, leak protection included. Connections open right now may drop, and until the service applies its rules again, routing is off and sites meant for the additional adapter can go over the main connection. Administrator rights are required.",
+      "overrides": "Rules you confirmed despite the protection of system programs are revoked.",
       "body-stop": "The service will be stopped, and ended if it does not stop in half a minute; then the packet filters, DNS redirect and routes it applied are removed, leak protection included. Connections open right now may drop, and until the service is started again, routing is off and sites meant for the additional adapter can go over the main connection. Administrator rights are required.",
       "confirm": "Restore network"
     },
@@ -2418,6 +2434,8 @@
       "ip-range": "IP range"
     },
     "application-not-leakproof": "On this system an application rule is not airtight: connections the app makes before it is recognised can still get through.",
+    "application-folder-scripts": "Scripts from this folder follow the rule too, even when an interpreter installed elsewhere runs them (a .py, .ps1, .bat, .sh or .jar file, say): from the moment their first connection is seen.",
+    "application-folder-scripts-deny": "A deny by folder stops the programs in it, but not for certain a script from it that an interpreter installed elsewhere runs.",
     "application-routing-note": "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe.",
     "application-routing-note-linux": "Routes everything this program connects to through the additional connection. NetRuleRouter learns the program's destinations by watching its connections, so routing fills in as it connects. Enter the process name, e.g. browser.",
     "app-browse-title": "Select the application executable",
@@ -2480,7 +2498,8 @@
         "all": "All",
         "enabled-only": "Enabled only",
         "disabled-only": "Disabled only",
-        "with-errors": "With errors"
+        "with-errors": "With errors",
+        "overridden": "Allowed despite protection"
       },
       "type": {
         "label": "Type",
@@ -2558,6 +2577,8 @@
         "path-star": "In a path, * may stand only as the whole last part, \\* or /*: the folder with its subfolders. To match programs by name, write a name pattern without a path.",
         "path-not-absolute": "Write the full path, starting from a drive (C:\\), a network share (\\\\server\\share) or /.",
         "path-invalid": "This path names no program: it contains “..” or a stray “:”, or it is too deep.",
+        "path-in-other-users-profile": "This folder is in another user's profile. A rule decides only for your own programs. To cover each user's own folder, start the path from %LOCALAPPDATA%, %APPDATA% or %USERPROFILE% on Windows, or from ~ on Linux and macOS.",
+        "path-unknown-variable": "A path may start only from your own profile folders: %LOCALAPPDATA%, %APPDATA% or %USERPROFILE% on Windows, ~ on Linux and macOS. Write any other folder in full.",
         "subnet": "Enter a network such as 10.0.0.0/8 or 2001:db8::/32.",
         "ip-range": "Enter a range such as 10.0.0.5-10.0.0.40 (both ends of the same family, first ≤ last).",
         "is-exact-ip": "This is a single address — choose the type “Exact IP”.",
@@ -2586,7 +2607,8 @@
         "network-wide": "Routed, but not blocked when the additional connection drops: leak protection holds networks up to /{prefix}.",
         "network-wide-public": "Routed, but not blocked when the additional connection drops: leak protection holds networks up to /{prefix}. This is a large public network — make sure you meant it.",
         "subnet-host-bits": "Saved as the network {network}.",
-        "protected-file-in-system-folder": "A program from a system folder: other parts of the system may rely on it reaching the network."
+        "protected-file-in-system-folder": "A program from a system folder: other parts of the system may rely on it reaching the network.",
+        "override-requested": "Not applied: the protection of system programs holds this rule until you confirm it (+override)."
       }
     },
     "file-sync": {
@@ -2818,7 +2840,9 @@
         "unsupported-shape": "{rule} for {app} is not enforced: a rule that limits an address to one application cannot be carried out yet, so it is skipped rather than applied to every application.",
         "carving-over-cap": "{rule} holds more narrower rules than can be carved out of it, so it applies to its whole network and the narrower rules inside it do not take effect. Split it into smaller networks.",
         "protected": "The rule {rule} is not applied. {reason}",
-        "folder-over-cap": "{rule} covers the first {count} programs of its folder. The folder holds more, and those are not covered: name the folder of the program you mean instead."
+        "override-pending": "The rule {rule} asks to apply despite the protection and is not applied until you confirm it in the rules list. {reason}",
+        "folder-over-cap": "{rule} covers the first {count} programs of its folder. The folder holds more, and those are not covered: name the folder of the program you mean instead.",
+        "other-users-folder": "The rule {rule} is not applied: its folder is in another user's profile, and a rule decides only for its owner's programs. To cover each user's own folder, start the path from %LOCALAPPDATA%, %APPDATA% or %USERPROFILE% on Windows, or from ~ on Linux and macOS."
       },
       "intersecting": "{winner} and {loser} on {loser-route} share some addresses. Each shared address takes the narrower rule; most of them go over {winner-route}.",
       "send-over-whole": "This moves the whole rule, including addresses the other rule does not cover."
@@ -2869,6 +2893,70 @@
       "restore-tooltip": "Put the rule back with the route, switch and note it had.",
       "restore-present": "A rule with this type and value is already in the list.",
       "restored": "Rule put back: {value}. Apply the changes to bring it into force."
+    },
+    "override": {
+      "badge": {
+        "granted": "Allowed despite protection · {left}",
+        "pending": "Needs your confirmation"
+      },
+      "left": {
+        "minutes": "{count} min left",
+        "hours": "{count} h left",
+        "days": "{count} d left",
+        "until-revoked": "until revoked",
+        "ended": "ended"
+      },
+      "confirm": "Confirm…",
+      "confirm-tooltip": "See what the rule would take, then apply it despite the protection for a time you choose.",
+      "revoke": "Revoke",
+      "revoke-tooltip": "Take the confirmation back: the protection holds the rule again.",
+      "granted": "{value} applies despite the protection: {left}.",
+      "revoked": "The protection holds {value} again.",
+      "dialog": {
+        "title": "Apply despite the protection?",
+        "reading": "Reading what the rule would take...",
+        "programs": "Programs it takes: {count}.",
+        "programs-over-cap": "Programs it takes: more than {count}.",
+        "critical": "System processes it takes: {list}.",
+        "accounts": "Running under service accounts: {list}.",
+        "other-users": "Other users run what it takes: {count}.",
+        "breaks": "What may stop working: {list}.",
+        "administrator": "It reaches past your own programs, so confirming it needs administrator rights.",
+        "type": "To confirm, type the rule's value: {value}",
+        "type-label": "The rule's value",
+        "term": "Applies for",
+        "confirm": "Apply despite the protection"
+      },
+      "status": {
+        "not-requested": "Save the rule with +override after its value first; then confirm it here.",
+        "not-protected": "Nothing to confirm: the protection does not hold this rule.",
+        "not-allowed": "This rule cannot be applied despite the protection.",
+        "unavailable": "The service cannot keep confirmations right now, so none can be given."
+      },
+      "term": {
+        "one-hour": "1 hour",
+        "one-day": "1 day",
+        "one-week": "1 week",
+        "until-revoked": "Until revoked"
+      },
+      "breaks": {
+        "network": "the connection itself",
+        "dhcp": "getting an address from the network (DHCP)",
+        "dns": "resolving names (DNS)",
+        "time": "keeping the clock right",
+        "updates": "system and security updates",
+        "sign-in": "signing in to this computer",
+        "domain-sign-in": "signing in to a domain or a work account",
+        "protection": "the built-in malware protection",
+        "system-programs": "other programs of the system",
+        "other-programs": "programs of other applications in the same folder"
+      },
+      "account": {
+        "system": "the system (SYSTEM)",
+        "local-service": "LOCAL SERVICE",
+        "network-service": "NETWORK SERVICE",
+        "root": "root"
+      }
     }
   },
   "connection": {
@@ -4204,6 +4292,19 @@
       "prod-rules-codec-decode-failed": "Rules-JSON codec decode failed; treating as no active rules (origin: {origin}, error: {error}).",
       "stored-rules-dropped": "Dropped {dropped} stored rule(s) no rule set may hold: an address that is never a destination (this host or broadcast), or an application name that is too long, contains a control character or matches every process; the other rules are in force (origin: {origin}).",
       "protected-rules-not-applied": "{count} rule(s) not applied: they deny a system program or folder, send one over the additional route, or name a program by a path this system cannot apply yet ({rules}).",
+      "protection-override-read-failed": "Confirmed rules could not be read; none of them applies (error: {error}).",
+      "protection-override-no-key": "{count} confirmed rule(s) are not honoured this start: the signing key is unavailable, so the protection holds them.",
+      "protection-override-row-rejected": "A stored confirmation did not verify ({why}) and was removed; the protection holds its rule.",
+      "protection-override-granted": "A rule the protection of system programs refuses was confirmed and applies for its term: {rule} ({reason}, {term}).",
+      "protection-override-expired": "A confirmed rule reached the end of its term; the protection holds it again: {rule}.",
+      "protection-override-delete-failed": "An ended confirmation could not be removed from the database; it is not honoured (error: {error}).",
+      "protection-override-audit-failed": "The end of a confirmed rule could not be audited; it ended all the same (error: {error}).",
+      "protection-override-expiry-unarmed": "The timer of a confirmed rule could not start; the rule still ends on time at the next rules read (error: {error}).",
+      "protection-override-crash-loop": "The service stopped unexpectedly several times in a row; every confirmation of a protected rule is withdrawn.",
+      "protection-override-services-changed": "A service account now runs what a confirmed rule takes; the rule waits for a new confirmation: {rule}.",
+      "service-set-watch-unavailable": "Installed services are not watched; confirmed rules are re-checked on a timer (error: {error}).",
+      "service-set-watch-stopped": "The watch on installed services stopped (code {code}); confirmed rules are re-checked on a timer.",
+      "svc-run-state-write-failed": "The start could not be recorded, so repeated unexpected stops would go unnoticed (error: {error}).",
       "prod-rules-state-db-mutex-poisoned": "State database lock was poisoned; treating as no active rules.",
       "prod-rules-get-active-failed": "Reading the active revision failed; treating as no active rules (error: {error}).",
       "prod-networks-store-decision-failed": "Could not store the local-network decision for {cidr} ({error}).",
@@ -4453,6 +4554,7 @@
     "network-on-both-routes-named": "The network {network} is set on both routes. Each network takes one route, so the change was not applied. Remove it from one of them.",
     "folder-on-both-routes": "A program folder is set on both routes in the same form. Each folder takes one route, so the change was not applied. Remove it from one of them.",
     "folder-on-both-routes-named": "The program folder {folder} is set on both routes in the same form. Each folder takes one route, so the change was not applied. Remove it from one of them.",
+    "path-in-other-users-profile": "A rule names a folder in another user's profile. A rule decides only for its owner's own programs, so the change was not applied. To cover each user's own folder, start the path from %LOCALAPPDATA%, %APPDATA% or %USERPROFILE% on Windows, or from ~ on Linux and macOS.",
     "wrong-channel": "This change cannot be sent this way, so nothing was changed. If this keeps happening, update the app.",
     "malformed-revision-id": "The service could not tell which version of the rules to roll back to, so nothing was changed.",
     "rolled-back-on-failure": "The new rules could not be put into effect, so the previous rules were restored. Try again; if it fails again, the Diagnostics section shows why.",
@@ -4664,6 +4766,18 @@
     "rule-duplicates": {
       "title": "A rule is set on both routes",
       "body": "{count} of your rules are enabled on both routes, starting with {sample}. Which one carries the traffic is decided by evaluation order."
+    },
+    "rule-override-ended": {
+      "title": "The protection holds a rule again",
+      "body": "The term you confirmed has ended for {rules}. The rule is not applied until you confirm it again in the rules list."
+    },
+    "rule-override-withdrawn": {
+      "title": "Confirmations were withdrawn",
+      "body": "Confirmations of protected rules were withdrawn: the service stopped unexpectedly several times in a row. The rules are not applied until you confirm them again in the rules list."
+    },
+    "rule-override-recheck": {
+      "title": "A rule needs a new confirmation",
+      "body": "A service now runs what {rules} takes, which your confirmation did not cover. The rule is not applied until you confirm it again in the rules list."
     },
     "app-rule-learning": {
       "title": "New application rule is settling in",
@@ -4965,6 +5079,16 @@
       "phase-failed": "The service could not apply the rules: {error}",
       "busy": "Wait until the rules are applied; the list cannot change meanwhile.",
       "number-gone": "Rule {n} as it was listed is no longer in the list. Here is the list as it is now.",
+      "override": {
+        "granted": "{value} applies despite the protection for the term you chose.",
+        "failed": "The confirmation did not go through: {error}",
+        "nothing": "This rule does not ask to apply despite the protection: add +override after its value and apply the rules first.",
+        "needs-administrator": "This confirmation needs administrator rights: confirm it in the NetRuleRouter window, or start the terminal as administrator.",
+        "mismatch": "The value typed does not name the rule; type it in full.",
+        "sending": "Confirming... An administrator's password may be asked here.",
+        "keys": "Left and Right choose the term, Enter confirms once the value is typed, Esc cancels.",
+        "plain-prompt": "Type the rule's value to confirm, 1-4 to choose the term, ! to cancel"
+      },
       "changed-elsewhere": {
         "question": "Your rules were changed elsewhere since this list was read. Nothing was applied.",
         "detail": "Your edits can be put on top of the rules now in force; you review the result before it applies.",
@@ -5046,7 +5170,8 @@
         "move-to-type": "Shift+T: give the chosen rule the type its value is, when the value belongs to another type. Shift+M: do it for every such rule",
         "form": "In the rule form: Up and Down move between fields, Left and Right change a choice, Space switches the rule on or off, Enter saves, Esc cancels",
         "bulk": "Shift+A: add several rules at once, typed or pasted as lines of a rules file. F2 in the add form does the same",
-        "recent": "Shift+R: recent changes — the rules added or changed in the last hour, today or 7 days, newest first, and the deleted ones. Shift+U: put a deleted rule back"
+        "recent": "Shift+R: recent changes — the rules added or changed in the last hour, today or 7 days, newest first, and the deleted ones. Shift+U: put a deleted rule back",
+        "override": "Shift+P: apply a protected rule despite the protection (it needs +override after its value), or take the confirmation back"
       },
       "plain": {
         "add": "a: add a rule",
@@ -5066,7 +5191,8 @@
         "verdicts": "m: move the rules that work only on the other route. n: not now",
         "bulk": "A: add several rules at once",
         "move-to-type": "T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule",
-        "recent": "R: recent changes. U: put a deleted rule back"
+        "recent": "R: recent changes. U: put a deleted rule back",
+        "override": "P and a rule number: confirm a protected rule, or take the confirmation back"
       },
       "title-baseline": "Rules — baseline for every user",
       "baseline-note": "These rules are the baseline every user without rules of their own follows, as Set as baseline does in the window. b switches to your own rules.",
@@ -5080,6 +5206,7 @@
       "move-all-to-type": "Shift+M: move them all to the type their value is",
       "several-option": "Several rules at once (F2)",
       "form-switch-type": "Ctrl+T, or !t in line mode: move it to “{type}”",
+      "form-subfolders": "Ctrl+F, or !f in line mode: with subfolders or without",
       "bulk": {
         "text": "Rules, one per line ({count} lines):",
         "more-above": "{count} more lines above",

@@ -94,6 +94,7 @@ pub mod local_time;
 // inside the logon phase where an early arm costs the user a frozen screen.
 pub mod logon_session;
 pub mod network_change;
+pub mod service_set_change;
 // The service's own sockets, tagged so machine-scope filters let them through.
 pub mod own_traffic;
 // A probe held to the adapter its source address belongs to.
@@ -114,6 +115,9 @@ pub mod power;
 // Who started a blocked program. The walk over recorded starts is neutral; where
 // the starts come from (ETW, procfs) is per-OS.
 pub mod process_lineage;
+// Which file a process runs as a script, read from how it was started. The
+// reading is neutral; reading another process is per-OS.
+pub mod process_launch;
 // Where a process's own unstructured error output ends up. The decision (which
 // file) is the caller's; the mechanism (std-handle table / file descriptor) is
 // per-OS.

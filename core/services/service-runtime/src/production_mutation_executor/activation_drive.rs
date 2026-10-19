@@ -32,6 +32,9 @@ impl ProductionMutationExecutor {
         if let Some(e) = self.network_refusal(&parsed.rules_json, principal) {
             return MutationOutcome::Failed(e);
         }
+        if let Some(e) = self.foreign_profile_refusal(&parsed.rules_json, principal) {
+            return MutationOutcome::Failed(e);
+        }
         if let Some(noop) = self.baseline_already_in_force(&parsed.rules_json, principal) {
             return noop;
         }

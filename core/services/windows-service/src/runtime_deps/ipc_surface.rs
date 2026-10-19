@@ -427,6 +427,8 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                         exec = exec.with_recovery_audit_sink(Arc::clone(sink));
                     }
                     exec = exec.with_alerts_repo(Arc::clone(&alerts_repo));
+                    // A new rule naming another user's folder is refused too.
+                    exec = exec.with_path_coverage(app_path_coverage());
                     // A network over the tunnel server, an attached network or
                     // the fake-IP pool is refused where the submission lands.
                     let facts_coordinator = route_coordinator.clone();
@@ -918,6 +920,33 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
         deps = deps.with_third_party_integrity(Arc::new(
             nrr_platform_windows::fake_ip::WindowsThirdPartyIntegrity::new(),
         ));
+        // The rule form's count of what a rule by path covers for the caller.
+        deps = deps.with_app_path_coverage(app_path_coverage());
+        // Confirming a rule the protection of system programs refuses. Accounts
+        // here are SIDs; the uid ceiling only completes the description.
+        if let (Some(grants), Some(conn)) = (
+            nrr_service_runtime::override_grants::installed(),
+            settings_conn.as_ref(),
+        ) {
+            let rule_override = Arc::new(nrr_service_runtime::ipc_handlers::RuleOverrideDeps {
+                grants: Arc::clone(grants),
+                conn: Arc::clone(conn),
+                folders: Some(Arc::new(
+                    nrr_platform_windows::app_folders::WindowsProgramFolders::new(),
+                )),
+                live: Some(Arc::new(
+                    nrr_platform_windows::conn_observe::live::WindowsLiveConnections::new(),
+                )),
+                unix_sys_uid_max: nrr_service_runtime::ipc_handlers::DEFAULT_UNIX_SYS_UID_MAX,
+            });
+            // The service accounts a confirmation covers are read again when
+            // the set of services changes, never on an enforcement pass.
+            nrr_service_runtime::override_recheck::start_for_service(
+                Arc::clone(&rule_override),
+                &nrr_platform_windows::service_set_change::WindowsServiceSetChangeObserver,
+            );
+            deps = deps.with_rule_override(rule_override);
+        }
         // Wire the connection-trace ring so `conn-trace.entries.list`
         // serves recent observed connections (same Arc the observer feeds).
         if let Some(ring) = conn_trace_ring.clone() {
@@ -1022,4 +1051,14 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
         auto_probe_wiring,
         registry,
     }
+}
+
+/// What a rule by program path covers for one person, read once per ask.
+fn app_path_coverage() -> Arc<nrr_service_runtime::app_path_coverage::AppPathCoverage> {
+    Arc::new(
+        nrr_service_runtime::app_path_coverage::AppPathCoverage::new(
+            Arc::new(nrr_platform_windows::app_folders::WindowsProgramFolders::new()),
+            nrr_platform_api::enforcement::EnforcementCapabilities::current().app_path_rules,
+        ),
+    )
 }

@@ -78,6 +78,7 @@ pub fn rules_file_to_route_rule_set(
                         Some(AppMatch {
                             pattern,
                             include_child_processes,
+                            override_requested: entry.override_requested,
                             windows_service_name: None,
                         }),
                     )
@@ -222,6 +223,7 @@ pub fn canonical_rule_set_to_rules_file_parsed(
                 enabled: rule.enabled,
                 blocked,
                 verify_primary,
+                override_requested: false,
                 origin: if app_authored {
                     rule.origin.clone()
                 } else {
@@ -239,6 +241,7 @@ pub fn canonical_rule_set_to_rules_file_parsed(
                 enabled: rule.enabled,
                 blocked,
                 verify_primary: false,
+                override_requested: app.override_requested,
                 origin: rule.origin.clone(),
             });
         }

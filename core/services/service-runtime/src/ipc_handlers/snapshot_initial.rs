@@ -168,7 +168,8 @@ impl IpcHandler for SnapshotInitialHandler {
         let autostart = Some(self.autostart.get());
         let retention_settings = Some(self.retention.get());
         // The caller's own app rules whose exe resolved to no path.
-        let unenforced_app_rules = self.app_enforcement.unresolved(ctx.caller_stored());
+        let (unenforced_app_rules, unenforced_app_reasons) =
+            self.app_enforcement.unenforced_apps(ctx.caller_stored());
         // Smart-kill-switch shared-IP exclusion count for the GUI
         // "strictness reduced for N shared IPs" warning.
         let kill_switch_shared_ip_exemptions = self.shared_ip_exemptions.count();
@@ -201,6 +202,15 @@ impl IpcHandler for SnapshotInitialHandler {
         } else {
             crate::vpn_client_trust::global_pending_vpn_clients().dtos_for(ctx.caller_stored())
         };
+        // The caller's own confirmations of protected rules, with their terms.
+        let rule_overrides = match crate::override_grants::installed() {
+            Some(grants) if !ctx.caller_stored().is_empty() => grants
+                .grants_for(ctx.caller_stored())
+                .iter()
+                .map(crate::override_grants::Grant::dto)
+                .collect(),
+            _ => Vec::new(),
+        };
 
         let resp = SnapshotInitialResponse {
             health,
@@ -216,6 +226,7 @@ impl IpcHandler for SnapshotInitialHandler {
             autostart,
             retention_settings,
             unenforced_app_rules,
+            unenforced_app_reasons,
             kill_switch_shared_ip_exemptions,
             kill_switch_shared_ip_exemption_addresses,
             kill_switch_block_all_armed,
@@ -224,6 +235,7 @@ impl IpcHandler for SnapshotInitialHandler {
             routes_held_by_another_user,
             traffic_carried_by_another_user,
             pending_vpn_clients,
+            rule_overrides,
         };
         serde_json::to_value(resp).map_err(|e| IpcError {
             code: IpcErrorCode::Internal,

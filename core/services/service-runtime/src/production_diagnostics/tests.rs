@@ -1257,6 +1257,7 @@ fn a_winner_enforcement_cannot_carry_out_is_not_reported_as_enforced() {
                         value: "app.exe".into(),
                     },
                     include_child_processes: false,
+                    override_requested: false,
                 }),
                 comment: String::new(),
                 action: nrr_shared::rules_json::RuleAction::Route,

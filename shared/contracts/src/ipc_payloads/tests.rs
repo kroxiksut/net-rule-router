@@ -268,6 +268,11 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             sid: "S-1-5-21".into(),
             pending_count: 3,
         },
+        StatusUpdateEvent::RuleOverridesChanged {
+            sid: "S-1-5-21".into(),
+            expired: vec!["/var/www/*".into()],
+            cause: "crash-loop".into(),
+        },
         StatusUpdateEvent::RoutesHeldByAnotherUser {
             sid: "S-1-5-21".into(),
             count: 2,
@@ -1289,4 +1294,46 @@ fn a_verify_flag_is_elided_when_false() {
     };
     let json = serde_json::to_value(&checked).expect("serialise");
     assert_eq!(json["verify"], true);
+}
+
+/// The confirmation's wire: kebab-case keys, the default term one day, a
+/// term with no deadline absent rather than zero.
+#[test]
+fn a_rule_override_travels_as_the_clients_read_it() {
+    let grant: RuleOverrideGrantRequest =
+        serde_json::from_value(serde_json::json!({ "token": "t", "typed-value": "/var/www/*" }))
+            .expect("deserialise");
+    assert_eq!(grant.term, OverrideTerm::OneDay);
+    for term in OverrideTerm::ALL {
+        let json = serde_json::to_value(term).expect("serialise");
+        assert_eq!(json, serde_json::Value::String(term.slug().into()));
+    }
+    assert_eq!(OverrideTerm::UntilRevoked.window_ms(), None);
+    assert_eq!(OverrideTerm::OneWeek.window_ms(), Some(7 * 24 * 3_600_000));
+    let dto = RuleOverrideDto {
+        value: "/var/www/*".into(),
+        route: "block".into(),
+        reason: "shared-folder".into(),
+        until_ms: None,
+        granted_at_ms: 5,
+    };
+    let json = serde_json::to_value(&dto).expect("serialise");
+    assert!(json.get("until-ms").is_none());
+    assert_eq!(json["granted-at-ms"], 5);
+    let event = serde_json::to_value(StatusUpdateEvent::RuleOverridesChanged {
+        sid: "S-1".into(),
+        expired: vec!["/var/www/*".into()],
+        cause: String::new(),
+    })
+    .expect("serialise");
+    assert_eq!(event["type"], "rule-overrides-changed");
+    assert_eq!(event["expired"][0], "/var/www/*");
+    assert!(event.get("cause").is_none());
+    let older: StatusUpdateEvent =
+        serde_json::from_value(serde_json::json!({"type": "rule-overrides-changed", "sid": "S-1"}))
+            .expect("an event without a cause still reads");
+    assert!(matches!(
+        older,
+        StatusUpdateEvent::RuleOverridesChanged { cause, .. } if cause.is_empty()
+    ));
 }

@@ -11,6 +11,7 @@ use nrr_shared::rules_overlap::{find_route_overlaps, OverlapRule, RouteOverlap};
 
 use super::ace;
 use super::apply::book_of;
+use super::coverage::{self, Coverage};
 use super::table::{Row, Table, Verdict, VerdictStatus};
 
 /// The longest comment an import accepts (`MAX_INLINE_COMMENT_CHARS`).
@@ -130,6 +131,8 @@ pub struct Form {
     pub overlaps: Vec<Overlap>,
     /// What `overlaps` was found for; found again only when it changes.
     overlaps_for: Option<OverlapInputs>,
+    /// What a rule by path covers for the user, asked of the service.
+    pub coverage: Coverage,
 }
 
 impl Form {
@@ -146,6 +149,7 @@ impl Form {
             duplicate: None,
             overlaps: Vec::new(),
             overlaps_for: None,
+            coverage: Coverage::default(),
         }
     }
 
@@ -163,6 +167,7 @@ impl Form {
             duplicate: None,
             overlaps: Vec::new(),
             overlaps_for: None,
+            coverage: Coverage::default(),
         })
     }
 
@@ -259,6 +264,50 @@ impl Form {
         };
         self.set_type(target);
         self.field = Field::Value;
+        self.duplicate = None;
+        true
+    }
+
+    /// Whether the value is a folder rule, with its subfolders or without.
+    pub fn names_folder(&self) -> bool {
+        self.rule_type == RuleType::Application
+            && matches!(self.value_form(), "folder" | "folder-tree")
+    }
+
+    /// A folder rule that takes the folders below it too.
+    pub fn with_subfolders(&self) -> bool {
+        self.rule_type == RuleType::Application && self.value_form() == "folder-tree"
+    }
+
+    fn value_form(&self) -> &'static str {
+        nrr_client_logic::rule_value_class::app_value_form(
+            &self.value,
+            PlatformProfile::current().os,
+        )
+    }
+
+    /// Ctrl+F: a folder rule with its subfolders (`\*`, `/*`) or without.
+    pub fn toggle_subfolders(&mut self) -> bool {
+        if !self.names_folder() {
+            return false;
+        }
+        let tree = self.value_form() == "folder-tree";
+        let separator = match PlatformProfile::current().os {
+            "linux" | "macos" => '/',
+            _ => '\\',
+        };
+        let value = self.value.trim();
+        let (path, flags) = split_rule_flags(value);
+        let mut path = path.to_owned();
+        if tree {
+            path.pop();
+        } else {
+            if !path.ends_with(['/', separator]) {
+                path.push(separator);
+            }
+            path.push('*');
+        }
+        self.value = format!("{path}{flags}");
         self.duplicate = None;
         true
     }
@@ -403,6 +452,7 @@ impl Form {
         if self
             .verdict()
             .is_none_or(|v| v.status == VerdictStatus::Error)
+            || coverage::refused(self)
         {
             self.field = Field::Value;
             return Saved::Refused;
@@ -453,6 +503,24 @@ impl Form {
             }
         }
     }
+}
+
+/// `value` and the rule flags after it (` +children`), as they stand.
+fn split_rule_flags(value: &str) -> (&str, &str) {
+    let mut end = value.len();
+    while let Some(head) = value.get(..end) {
+        let head = head.trim_end();
+        let Some(at) = head.rfind(char::is_whitespace) else {
+            break;
+        };
+        let word = head.get(at..).unwrap_or_default().trim_start();
+        if word.len() < 2 || !word.starts_with('+') {
+            break;
+        }
+        end = at;
+    }
+    let path = value.get(..end).unwrap_or(value).trim_end();
+    (path, value.get(path.len()..).unwrap_or_default())
 }
 
 /// The pairs `candidate` takes part in once it stands in the list: in place of

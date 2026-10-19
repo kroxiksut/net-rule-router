@@ -440,12 +440,7 @@ pub fn classify_connection(
 /// account's connection, or one whose owner could not be read, follows the
 /// routing user, whose routes that traffic takes.
 pub fn suggestion_owner(owner: Option<&str>, routing: &ActiveSidFn) -> Option<String> {
-    let is_service_account = |o: &str| {
-        nrr_platform_api::types::SERVICE_ACCOUNT_SIDS
-            .iter()
-            .any(|sid| sid.eq_ignore_ascii_case(o))
-            || o.starts_with("S-1-5-80-")
-    };
+    let is_service_account = nrr_platform_api::types::is_service_account_sid;
     match owner.filter(|o| !o.is_empty() && !is_service_account(o)) {
         Some(owner) => Some(owner.to_owned()),
         None => routing(),
@@ -556,6 +551,9 @@ pub struct ConnectionObservationConsumer {
     /// names is a withdrawal of nothing. `None` disables the check entirely,
     /// which is the safe direction: no false withdrawals.
     routed_apps: Option<RoutedAppsFn>,
+    /// Reads which rule folders hold the script a connecting interpreter
+    /// runs, so a rule by folder follows its scripts. `None` recognises none.
+    script_launches: Option<Arc<crate::script_launches::ScriptLaunches>>,
 
     /// When wired, every resolved trace is pushed into
     /// this ring so the Diagnostics panel can read recent connections over IPC.
@@ -739,10 +737,12 @@ pub type RoutedAppsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 /// link (on the main link no pin is in effect), the process is identified, it is
 /// not this service (the relay dials an application's destinations over the
 /// tunnel on its behalf, which is the mechanism working), the process is not
-/// itself a routed application, and the owner is one.
+/// itself a routed application, and the owner is one. A process running a
+/// script of the rule paths `script_rules` is those rules' own program.
 fn collateral_pin_owners(
     store: &AppObservationStore,
     this_app: &str,
+    script_rules: &[String],
     own_process_key: &str,
     routed: &[String],
     role: EgressRole,
@@ -757,7 +757,10 @@ fn collateral_pin_owners(
     {
         return Vec::new();
     }
-    if routed.iter().any(|p| store.names_process(p, this_app)) {
+    if routed
+        .iter()
+        .any(|p| store.names_process_running(p, this_app, script_rules))
+    {
         return Vec::new();
     }
     store

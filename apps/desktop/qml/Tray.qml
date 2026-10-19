@@ -512,6 +512,9 @@ SystemTrayIcon {
             case "rule-duplicates-detected":
                 _onRuleDuplicatesDetected(event)
                 break
+            case "rule-overrides-changed":
+                _onRuleOverridesEnded(event)
+                break
             case "system-dns-not-restored":
                 _onSystemDnsReading(true)
                 break
@@ -2415,6 +2418,50 @@ SystemTrayIcon {
                         "{count} of your rules are enabled on both routes, starting with {sample}. Which one carries the traffic is decided by evaluation order.")
                     .replace("{count}", String(count))
                     .replace("{sample}", sample),
+                primaryAction: {
+                    label: tr("action.open-rules", "Open rules"),
+                    actionId: "rule-duplicates-open-rules",
+                    accent: true
+                },
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
+    /// A confirmed rule's term ran out: the protection of system programs holds
+    /// it again. Said once, with the window closed; the window says it itself.
+    function _onRuleOverridesEnded(event) {
+        var ended = []
+        var raw = event.expired || []
+        for (var i = 0; i < raw.length; i += 1) {
+            var value = String(raw[i] || "")
+            if (value !== "") ended.push(Pure.displayText(value))
+        }
+        var cause = String(event.cause || "")
+        var withdrawn = cause === "crash-loop"
+        var recheck = cause === "services-changed"
+        if ((ended.length === 0 && !withdrawn) || !showNotifications) return
+        if (_windowOnScreen()) return
+        _presentOrQueue("rule-override-ended", function() {
+            promptWindow.present({
+                titleText: withdrawn
+                    ? tr("notifications.rule-override-withdrawn.title",
+                        "Confirmations were withdrawn")
+                    : recheck
+                        ? tr("notifications.rule-override-recheck.title",
+                            "A rule needs a new confirmation")
+                        : tr("notifications.rule-override-ended.title",
+                            "The protection holds a rule again"),
+                bodyText: withdrawn
+                    ? tr("notifications.rule-override-withdrawn.body",
+                        "Confirmations of protected rules were withdrawn: the service stopped unexpectedly several times in a row. The rules are not applied until you confirm them again in the rules list.")
+                    : (recheck
+                        ? tr("notifications.rule-override-recheck.body",
+                            "A service now runs what {rules} takes, which your confirmation did not cover. The rule is not applied until you confirm it again in the rules list.")
+                        : tr("notifications.rule-override-ended.body",
+                            "The term you confirmed has ended for {rules}. The rule is not applied until you confirm it again in the rules list."))
+                    .replace("{rules}", ended.join(", ")),
                 primaryAction: {
                     label: tr("action.open-rules", "Open rules"),
                     actionId: "rule-duplicates-open-rules",

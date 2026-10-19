@@ -1,7 +1,9 @@
 // Writing a rules file back out, preserving unsupported sections.
 
 use super::*;
-use nrr_shared::preset_parser::{neutralize_field, DENY_PREFIX, VERIFY_PRIMARY_PREFIX};
+use nrr_shared::preset_parser::{
+    neutralize_field, DENY_PREFIX, OVERRIDE_FLAG, VERIFY_PRIMARY_PREFIX,
+};
 
 /// Serialises a [`RulesFileParsed`] (and optional unsupported sections) back to
 /// canonical rules-file text.
@@ -111,7 +113,12 @@ pub fn write_rules_file_with_passthrough(
         out.push_str(section.name());
         out.push('\n');
         for entry in *entries {
-            write_entry_line(&mut out, entry, section.carries_provenance());
+            write_entry_line(
+                &mut out,
+                entry,
+                section.carries_provenance(),
+                section.app_platform().is_some(),
+            );
         }
     }
 
@@ -125,7 +132,7 @@ pub fn write_rules_file_with_passthrough(
         out.push_str(&neutralize_field(&unknown_section.name));
         out.push('\n');
         for entry in &unknown_section.entries {
-            write_entry_line(&mut out, entry, false);
+            write_entry_line(&mut out, entry, false, false);
         }
     }
 
@@ -155,6 +162,8 @@ pub fn write_rules_file_with_passthrough(
 /// - Disabled rule: `# value` or `# value  # comment`.
 /// - "Check where it works": `?value`, or `# ?value` when disabled.
 /// - Deny: `!value`, or `# !value` when disabled. A deny takes no `?`.
+/// - A program's override request: `value +override`, in a program section
+///   only (`program_section`).
 ///
 /// The two-space separator before the inline `#` mirrors the canonical form
 /// shown in docs/en/rules-file-format.md Complete example examples.
@@ -163,7 +172,12 @@ pub fn write_rules_file_with_passthrough(
 /// tokens are rendered from the entry's typed fields and precede the free-text
 /// note, so a hand-edited file is normalised to canonical token order:
 /// `value  # auto:<slug> anchor:<host> added:<date> <note>`.
-fn write_entry_line(out: &mut String, entry: &RulesFileEntry, emit_origin: bool) {
+fn write_entry_line(
+    out: &mut String,
+    entry: &RulesFileEntry,
+    emit_origin: bool,
+    program_section: bool,
+) {
     if !entry.enabled {
         out.push_str("# ");
     }
@@ -174,6 +188,10 @@ fn write_entry_line(out: &mut String, entry: &RulesFileEntry, emit_origin: bool)
         out.push(VERIFY_PRIMARY_PREFIX);
     }
     out.push_str(&neutralize_field(&entry.match_value));
+    if program_section && entry.override_requested {
+        out.push(' ');
+        out.push_str(OVERRIDE_FLAG);
+    }
     let provenance = if emit_origin {
         entry
             .origin

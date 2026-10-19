@@ -156,6 +156,7 @@ impl AutoRuleAuthor for RecordingAuthor {
                             rule.value.clone(),
                         ),
                         include_child_processes: false,
+                        override_requested: false,
                     }
                 }),
                 comment: String::new(),

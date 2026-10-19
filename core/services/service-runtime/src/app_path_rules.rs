@@ -13,7 +13,8 @@
 use std::path::PathBuf;
 
 use nrr_domain::protected_places::{
-    protection_verdict, AppTarget, ProtectedPlaces, ProtectionReason, ProtectionVerdict, RuleEffect,
+    critical_processes_covered, protection_verdict, AppTarget, OverrideAsk, ProtectedPlaces,
+    ProtectionReason, ProtectionVerdict, RuleEffect,
 };
 use nrr_platform_api::app_folders::{AppPath, PathOutcome};
 use nrr_platform_api::AppPathResolver;
@@ -32,15 +33,21 @@ pub struct PathRuleTargets {
     pub outcome: PathOutcome,
     /// The place the disk revealed is protected: the rule applies nothing.
     pub refused: Option<ProtectionReason>,
+    /// Refused, and the rule asks to apply anyway: it waits for its owner's
+    /// confirmation (none yet, or one that no longer covers what it takes).
+    pub override_pending: bool,
 }
 
 /// The programs `path` covers for `owner` under `effect`, judged against
 /// `places`. The real place is handed to the observations through `gate`.
+/// A rule that asks to apply anyway (`override_requested`) does so where its
+/// owner's confirmation still covers the critical programs the place holds.
 #[must_use]
 pub fn path_rule_targets(
     path: &AppPath,
     owner: &str,
     effect: RuleEffect,
+    override_requested: bool,
     resolver: &dyn AppPathResolver,
     gate: &AppDestinationGate<'_>,
     places: &ProtectedPlaces,
@@ -48,16 +55,41 @@ pub fn path_rule_targets(
     let key = path.as_str().to_string();
     let found = resolver.path_programs(path, owner);
     if let Some(place) = found.place.as_ref() {
-        if let ProtectionVerdict::Refused(reason) =
-            protection_verdict(AppTarget::of_path(place), effect, places)
-        {
-            return PathRuleTargets {
-                key,
-                programs: Vec::new(),
-                over_cap: false,
-                outcome: found.outcome,
-                refused: Some(reason),
+        let target = AppTarget::of_path(place);
+        if let ProtectionVerdict::Refused(reason) = protection_verdict(target, effect, places) {
+            // A confirmation covers the place the rule names; a link that
+            // leads somewhere protected otherwise is refused outright.
+            let pending = override_requested
+                && reason.overridable()
+                && protection_verdict(AppTarget::of_path(path), effect, places)
+                    == ProtectionVerdict::Refused(reason);
+            let confirmed = pending && {
+                let programs: Vec<String> = found
+                    .programs
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                let critical = critical_processes_covered(target, &programs, places.platform());
+                crate::override_grants::honoured(
+                    owner,
+                    &OverrideAsk {
+                        value: &key,
+                        effect,
+                        reason,
+                        critical: &critical,
+                    },
+                )
             };
+            if !confirmed {
+                return PathRuleTargets {
+                    key,
+                    programs: Vec::new(),
+                    over_cap: false,
+                    outcome: found.outcome,
+                    refused: Some(reason),
+                    override_pending: pending,
+                };
+            }
         }
         gate.note_path_places(&key, std::slice::from_ref(place));
     }
@@ -72,6 +104,7 @@ pub fn path_rule_targets(
         over_cap: found.over_cap,
         outcome: found.outcome,
         refused: None,
+        override_pending: false,
     }
 }
 

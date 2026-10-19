@@ -146,6 +146,7 @@ fn disabled_app_scoped_and_address_rules_are_left_out() {
             value: "browser.exe".into(),
         },
         include_child_processes: false,
+        override_requested: false,
     });
     let ip = rule(
         "S3",

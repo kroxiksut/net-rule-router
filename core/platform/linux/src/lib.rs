@@ -76,6 +76,11 @@ pub mod dns_message;
 /// reads, so its tests run on any host against a fixture tree.
 pub mod process_lineage;
 
+/// How another process was started (arguments, working folder, start time),
+/// from procfs, so a rule by folder can follow the scripts it holds.
+#[cfg(target_os = "linux")]
+pub mod process_launch;
+
 /// Passive observation of DNS resolutions through systemd-resolved's query
 /// monitor — the Linux analog of the ETW DNS-Client source. Silent by design on
 /// a machine whose programs bypass resolved; the module doc says how to tell.
@@ -294,6 +299,9 @@ pub mod dns_config_change;
 /// it happens instead of at the next poll. Message framing is parsed by a pure
 /// function tested on every host; only the socket half is Linux-only.
 pub mod network_change;
+/// The set of installed services changing: inotify on the systemd unit
+/// directories, behind the neutral service-set-change port.
+pub mod service_set_change;
 // The IPv4 route table over rtnetlink — the mechanism behind `RouteTablePort`'s
 // route half.
 /// Per-user routing: a table per present user, picked by `ip rule uidrange`.

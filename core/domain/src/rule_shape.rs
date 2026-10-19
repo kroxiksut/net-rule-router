@@ -260,6 +260,7 @@ mod tests {
             app_match: app.then(|| CanonicalAppMatch {
                 pattern: CanonicalAppPattern::Exact("app.exe".into()),
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action,

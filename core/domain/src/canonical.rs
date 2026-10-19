@@ -118,6 +118,10 @@ pub struct CanonicalAppMatch {
     pub pattern: CanonicalAppPattern,
     /// When `true`, direct child processes are also matched.
     pub include_child_processes: bool,
+    /// The owner asks for the rule to apply although the protection of system
+    /// programs and folders refuses it (`+override`). A request: enforcement
+    /// honours it only beside a confirmation the service keeps itself.
+    pub override_requested: bool,
 }
 
 /// Normalized address match condition.
@@ -301,14 +305,19 @@ impl CanonicalRule {
     /// serialize identically, so no tie is left to input order — which is what
     /// made the same book, re-sorted in the GUI table, hash as a new revision.
     fn tie_break(&self, other: &Self) -> core::cmp::Ordering {
-        fn app(rule: &CanonicalRule) -> Option<(u8, &str, bool)> {
+        fn app(rule: &CanonicalRule) -> Option<(u8, &str, bool, bool)> {
             rule.app_match.as_ref().map(|m| {
                 let kind = match m.pattern {
                     CanonicalAppPattern::Exact(_) => 0u8,
                     CanonicalAppPattern::Glob(_) => 1u8,
                     CanonicalAppPattern::Path(_) => 2u8,
                 };
-                (kind, m.pattern.as_str(), m.include_child_processes)
+                (
+                    kind,
+                    m.pattern.as_str(),
+                    m.include_child_processes,
+                    m.override_requested,
+                )
             })
         }
         fn action(rule: &CanonicalRule) -> u8 {
@@ -775,6 +784,7 @@ mod tests {
             app_match: Some(CanonicalAppMatch {
                 pattern: CanonicalAppPattern::Exact(process.to_string()),
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action: crate::canonical::RuleAction::Route,
@@ -889,6 +899,7 @@ mod tests {
             app_match: Some(CanonicalAppMatch {
                 pattern: CanonicalAppPattern::Exact(app.to_string()),
                 include_child_processes: children,
+                override_requested: false,
             }),
             ..exact_fqdn_rule(id, "example.com")
         };
@@ -896,6 +907,7 @@ mod tests {
         glob.app_match = Some(CanonicalAppMatch {
             pattern: CanonicalAppPattern::Glob("chrome.exe".to_string()),
             include_child_processes: false,
+            override_requested: false,
         });
         let mut blocked = exact_fqdn_rule("r-b", "example.com");
         blocked.action = RuleAction::Block;
@@ -1234,6 +1246,7 @@ mod tests {
         r.app_match = Some(CanonicalAppMatch {
             pattern: CanonicalAppPattern::Exact("chrome.exe".to_string()),
             include_child_processes: false,
+            override_requested: false,
         });
         let book = CanonicalRuleBook {
             primary: CanonicalRuleSet::default(),

@@ -49,6 +49,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CMAKE_PREFIX_PATH");
     println!("cargo:rerun-if-env-changed=QT_HOST_PATH");
     println!("cargo:rerun-if-env-changed=NRR_QT_HOST_GENERATOR");
+    println!("cargo:rerun-if-env-changed=CMAKE_GENERATOR");
     println!("cargo:rerun-if-env-changed=NRR_QT_HOST_BUILD_TYPE");
     println!("cargo:rerun-if-env-changed=NRR_SKIP_QT_HOST");
 
@@ -121,16 +122,13 @@ fn main() {
         Ok(generator) => {
             configure.arg("-G").arg(generator);
         }
-        // Visual Studio is a multi-config generator, hence the architecture
-        // argument and the per-config output directory below. Elsewhere CMake's
-        // own default (Unix Makefiles / Ninja) is right, and forcing one here
-        // would fail on a machine that has the other.
-        Err(_) if cfg!(windows) => {
-            configure
-                .arg("-G")
-                .arg("Visual Studio 17 2022")
-                .arg("-A")
-                .arg(msvc.platform);
+        // CMake's default on Windows is the newest Visual Studio it finds, a
+        // multi-config generator, hence the architecture argument and the
+        // per-config output directory below. Naming one version breaks on a
+        // machine that carries only a newer one. Elsewhere CMake's own default
+        // (Unix Makefiles / Ninja) is right.
+        Err(_) if cfg!(windows) && env::var_os("CMAKE_GENERATOR").is_none() => {
+            configure.arg("-A").arg(msvc.platform);
         }
         Err(_) => {}
     }

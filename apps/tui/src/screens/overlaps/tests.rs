@@ -287,6 +287,28 @@ fn a_folder_larger_than_the_cap_says_how_much_it_covers() {
     assert!(!text.contains("Addresses affected"), "{text}");
 }
 
+/// A rules file line on another user's folder is listed as not applied, with
+/// the way to name each user's own folder.
+#[test]
+fn a_rule_on_another_users_folder_is_listed_as_not_applied() {
+    let conflict: RuleConflictDto = serde_json::from_value(json!({
+        "kind": "other-users-folder",
+        "rule-id": "R-11",
+        "rule-value": "/home/bob/tools/*",
+        "ip": "",
+        "count": 0,
+        "app": "/home/bob/tools/*"
+    }))
+    .expect("conflict");
+    let text = conflict_text(&conflict, &texts_en());
+    assert!(
+        text.starts_with("The rule /home/bob/tools/* is not applied"),
+        "{text}"
+    );
+    assert!(text.contains("~"), "{text}");
+    assert!(!text.contains("Addresses affected"), "{text}");
+}
+
 #[test]
 fn line_mode_offers_the_same_answers_by_number() {
     let fake = service();
@@ -327,4 +349,43 @@ fn a_failed_read_says_why() {
     let texts = texts_en();
     app.apply(BackendEvent::Link(Link::Stopped), &texts, Instant::now());
     assert!(render(&app, 200, 40).contains("No data from the service yet"));
+}
+
+/// A revision event makes the loop read the snapshot again (the conflicts
+/// come from it) and the rules list again (the pairs come from it).
+#[test]
+fn a_revision_event_reads_the_conflicts_and_the_rules_again() {
+    let fake = service();
+    let mut app = on_screen(&fake);
+    let before = fake.sent(IpcOperationName::RulesList).len();
+    let effects = app.apply(
+        BackendEvent::Push(crate::backend::PushEvent::Status(Box::new(
+            nrr_shared::ipc_payloads::StatusUpdateEvent::RevisionStatusChanged {
+                revision_id: "rev-2".into(),
+                status: "applied".into(),
+                sid: None,
+            },
+        ))),
+        &texts_en(),
+        Instant::now(),
+    );
+    assert!(effects.contains(&crate::state::Effect::Refresh));
+    drain(&mut app, &fake);
+    assert!(fake.sent(IpcOperationName::RulesList).len() > before);
+}
+
+/// An apply that finished asks for the snapshot, so the conflicts it caused
+/// show without a new session.
+#[test]
+fn a_finished_apply_asks_for_the_snapshot() {
+    let fake = service();
+    let mut app = on_screen(&fake);
+    app.snapshot_refresh_due = true;
+    let effects = app.apply(
+        BackendEvent::Reply(crate::backend::Reply::new(|_| {})),
+        &texts_en(),
+        Instant::now(),
+    );
+    assert!(effects.contains(&crate::state::Effect::Refresh));
+    assert!(!app.snapshot_refresh_due);
 }

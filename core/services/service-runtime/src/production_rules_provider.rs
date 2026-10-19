@@ -82,6 +82,8 @@ struct ReadKey {
     verify_generation: u64,
     /// Generation of the sites `site.*` rules were seen under.
     any_zone_generation: u64,
+    /// Generation of the confirmed overrides of the protection.
+    override_generation: u64,
 }
 
 #[derive(Clone)]
@@ -134,6 +136,7 @@ impl PartialEq for ReadKey {
             && self.include_subdomains == other.include_subdomains
             && self.verify_generation == other.verify_generation
             && self.any_zone_generation == other.any_zone_generation
+            && self.override_generation == other.override_generation
     }
 }
 
@@ -143,6 +146,9 @@ struct DecodedRead {
     /// Stored rules kept out of `snapshot` by the protection of system
     /// programs and folders.
     withheld: Vec<nrr_domain::protected_places::ProtectedRule>,
+    /// When the earliest confirmation this decode honoured ends: from then on
+    /// the decode is stale, whether or not the confirmation's timer ran.
+    stale_at_ms: Option<i64>,
 }
 
 impl ProductionRulesProvider {
@@ -282,11 +288,17 @@ impl ProductionRulesProvider {
             } else {
                 0
             },
+            override_generation: if for_enforcement {
+                crate::override_grants::generation()
+            } else {
+                0
+            },
         };
         let mut decoded = self.decoded.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = crate::timed_window::now_ms();
         if let Some(hit) = decoded
             .get(principal)
-            .filter(|d| for_enforcement && d.key == key)
+            .filter(|d| for_enforcement && d.key == key && d.stale_at_ms.is_none_or(|at| now < at))
         {
             return match hit.snapshot.clone() {
                 Some(snapshot) => RulesRead::Rules(snapshot),
@@ -314,6 +326,7 @@ impl ProductionRulesProvider {
                         include_subdomains: key.include_subdomains,
                         verify_generation: key.verify_generation,
                         any_zone_generation: key.any_zone_generation,
+                        override_generation: key.override_generation,
                     },
                     Self::snapshot_from_record(&record),
                 ),
@@ -355,7 +368,7 @@ impl ProductionRulesProvider {
         snapshot.rule_book = crate::any_zone_sites::expand(snapshot.rule_book);
         // A stored rule that denies a system program, or sends one over the
         // additional route, stays in the book and out of enforcement.
-        let (book, withheld) = crate::protected_rules::withhold(snapshot.rule_book);
+        let (book, withheld) = crate::protected_rules::withhold_for(principal, snapshot.rule_book);
         snapshot.rule_book = book;
         let changed = decoded
             .get(principal)
@@ -369,6 +382,7 @@ impl ProductionRulesProvider {
                 key,
                 snapshot: Some(snapshot.clone()),
                 withheld,
+                stale_at_ms: crate::override_grants::earliest_end_for(principal),
             },
         );
         RulesRead::Rules(snapshot)
@@ -799,6 +813,7 @@ mod tests {
                             value: critical.into(),
                         },
                         include_child_processes: false,
+                        override_requested: false,
                     }),
                     comment: String::new(),
                     action: RuleAction::Block,
@@ -1021,6 +1036,7 @@ mod tests {
                     value: value.into(),
                 },
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action: nrr_shared::rules_json::RuleAction::Route,

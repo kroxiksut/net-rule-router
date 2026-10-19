@@ -99,6 +99,10 @@ impl AppPathResolver for LinuxAppPathResolver {
     fn path_programs(&self, path: &AppPath, owner: &str) -> PathPrograms {
         self.folders.programs(path, owner)
     }
+
+    fn writable_by_anyone(&self, path: &std::path::Path) -> bool {
+        self.folders.writable_by_anyone(path)
+    }
 }
 
 /// Root owns the file and the directory it sits in: what a package manager

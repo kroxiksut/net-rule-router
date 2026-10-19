@@ -18,6 +18,9 @@ Wi-Fi, Ethernet. Без собственного туннеля, без обла
 ![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fkroxiksut%2Fnet-rule-router%2Fmain%2Frust-toolchain.toml&query=%24.toolchain.channel&label=rust&color=orange)
 ![Platform: Windows, Linux в работе](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20(in%20progress)-0078D6.svg)
 ![Языки: английский, русский](https://img.shields.io/badge/languages-EN%20%7C%20RU-informational.svg)
+[![GUI: Qt 6 / QML](https://img.shields.io/badge/GUI-Qt%206%20%2F%20QML-41CD52.svg)](#быстрый-старт)
+[![TUI: ratatui](https://img.shields.io/badge/TUI-ratatui-8A2BE2.svg)](#терминальный-интерфейс)
+[![CLI: nrr-cli](https://img.shields.io/badge/CLI-nrr--cli-555555.svg)](#административная-консоль)
 ![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-red.svg)
 
 [English](README.md) · **Русский**

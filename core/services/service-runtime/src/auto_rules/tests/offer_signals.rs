@@ -206,6 +206,7 @@ fn a_program_already_named_by_a_rule_is_not_offered() {
             app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
                 pattern: nrr_domain::canonical::CanonicalAppPattern::Exact("messenger.exe".into()),
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action: RuleAction::Route,

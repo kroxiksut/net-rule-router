@@ -199,6 +199,36 @@ QString NrrNativeBridge::rpcRulesRecentChangesList(qint64 since) {
     return emitRpcRequest(QStringLiteral("rules.recent-changes.list"), obj);
 }
 
+QString NrrNativeBridge::rpcRulesAppPathCoverage(const QString &value, const QString &route) {
+    QJsonObject obj;
+    obj.insert(QStringLiteral("value"), value);
+    obj.insert(QStringLiteral("route"), route);
+    return emitRpcRequest(QStringLiteral("rules.app-path-coverage.get"), obj);
+}
+
+QString NrrNativeBridge::rpcRulesOverridePreview(const QString &value, const QString &route) {
+    QJsonObject obj;
+    obj.insert(QStringLiteral("value"), value);
+    obj.insert(QStringLiteral("route"), route);
+    return emitRpcRequest(QStringLiteral("rules.override.preview"), obj);
+}
+
+QString NrrNativeBridge::rpcRulesOverrideGrant(const QString &token, const QString &typedValue,
+                                               const QString &term) {
+    QJsonObject obj;
+    obj.insert(QStringLiteral("token"), token);
+    obj.insert(QStringLiteral("typed-value"), typedValue);
+    obj.insert(QStringLiteral("term"), term);
+    return emitRpcRequest(QStringLiteral("rules.override.grant"), obj);
+}
+
+QString NrrNativeBridge::rpcRulesOverrideRevoke(const QString &value, const QString &route) {
+    QJsonObject obj;
+    obj.insert(QStringLiteral("value"), value);
+    obj.insert(QStringLiteral("route"), route);
+    return emitRpcRequest(QStringLiteral("rules.override.revoke"), obj);
+}
+
 QString NrrNativeBridge::rpcRetentionSettingsGet() {
     return emitRpcRequest(QStringLiteral("settings.retention.get"), QJsonObject());
 }

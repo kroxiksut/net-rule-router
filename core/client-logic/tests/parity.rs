@@ -16,14 +16,15 @@ use nrr_client_logic::adapters::{self, RoleHint, UnroutableReason};
 use nrr_client_logic::placeholders::{
     fill_placeholders, format_log_line, list_summary, plural_category, PluralRule,
 };
+use nrr_client_logic::rebase::rebase_edits;
 use nrr_client_logic::review::{self, Outcome};
 use nrr_client_logic::route_policy;
 use nrr_client_logic::rules_table::{
     build_rules_file_text, drift_row_from_parsed_rule, drift_row_from_service_wire,
     file_row_from_service_wire, main_route_check_hosts, main_route_rank, normalize_host_input,
-    parsed_rule_target_route, parsed_rule_verify, rule_row_to_wire_dto, RowOrigin, RuleRow,
-    RuleType, RulesFileOptions, TargetRoute, WireDtoOptions, PRESET_FORMAT_VERSION,
-    RULES_FILE_HINT_KEYS,
+    override_remaining, parsed_rule_target_route, parsed_rule_verify, rule_override_key,
+    rule_row_to_wire_dto, RowOrigin, RuleRow, RuleType, RulesFileOptions, TargetRoute,
+    WireDtoOptions, PRESET_FORMAT_VERSION, RULES_FILE_HINT_KEYS,
 };
 use nrr_client_logic::Route;
 use nrr_shared::ipc_payloads::{
@@ -552,6 +553,51 @@ fn main_route_rank_matches_js() {
 }
 
 #[test]
+fn rule_override_key_matches_js() {
+    check(
+        "rule_override_key",
+        &mut JsLib::rules(),
+        |input| {
+            format!(
+                "ruleOverrideKey({}, {}, {}, {})",
+                arg(input, "ruleType"),
+                arg(input, "value"),
+                arg(input, "route"),
+                arg(input, "os")
+            )
+        },
+        |input| {
+            Value::from(rule_override_key(
+                text(input, "ruleType"),
+                text(input, "value"),
+                text(input, "route"),
+                text(input, "os"),
+            ))
+        },
+    );
+}
+
+#[test]
+fn override_remaining_matches_js() {
+    check(
+        "override_remaining",
+        &mut JsLib::rules(),
+        |input| {
+            format!(
+                "overrideRemaining({}, {})",
+                arg(input, "until"),
+                arg(input, "now")
+            )
+        },
+        |input| {
+            let (kind, count) =
+                override_remaining(input["until"].as_i64(), input["now"].as_i64().unwrap_or(0));
+            json!({ "kind": kind, "count": count })
+        },
+    );
+}
+
+#[test]
 fn main_route_check_hosts_matches_js() {
     check(
         "main_route_check_hosts",
@@ -583,6 +629,64 @@ fn row_identity_matches_js() {
         |input| {
             let row = row_from_js(&input["row"]);
             json!({ "mergeKey": row.merge_key(), "signature": row.signature() })
+        },
+    );
+}
+
+#[test]
+fn rebase_edits_matches_js() {
+    check(
+        "rebase_edits",
+        &mut JsLib::rules(),
+        |input| {
+            format!(
+                "(function (inp) {{ \
+                var line = function (r) {{ return r ? String(r.id || '') + ' ' + String(r.ruleType || '') \
+                + ' ' + String(r.matchValue || '') + ' ' + String(r.targetRoute || '') \
+                + ' ' + (r.enabled ? 'on' : 'off') + (r.verify ? ' ?' : '') \
+                + (r.comment ? ' #' + r.comment : '') : '-' }}; \
+                var out = rebaseEdits(inp.base, inp.edited, inp.fresh, inp.keep); \
+                return {{ rows: out.rows.map(line), added: out.added.map(line), \
+                changed: out.changed.map(line), removed: out.removed.map(line), \
+                conflicts: out.conflicts.map(function (c) {{ \
+                return c.key + ' ' + c.kind + ' ' + line(c.mine) + ' / ' + line(c.theirs) }}) }} }})({})",
+                lit(input)
+            )
+        },
+        |input| {
+            let out = rebase_edits(
+                &rows_from_js(&input["base"]),
+                &rows_from_js(&input["edited"]),
+                &rows_from_js(&input["fresh"]),
+                &strings(&input["keep"]),
+            );
+            let line = |row: &RuleRow| {
+                format!(
+                    "{} {} {} {} {}{}{}",
+                    row.id,
+                    row.rule_type.as_str(),
+                    row.match_value,
+                    row.target_route.as_str(),
+                    if row.enabled { "on" } else { "off" },
+                    if row.verify { " ?" } else { "" },
+                    if row.comment.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" #{}", row.comment)
+                    }
+                )
+            };
+            let side = |row: &Option<RuleRow>| row.as_ref().map_or("-".to_owned(), line);
+            let lines = |rows: &[RuleRow]| rows.iter().map(line).collect::<Vec<_>>();
+            json!({
+                "rows": lines(&out.rows),
+                "added": lines(&out.added),
+                "changed": lines(&out.changed),
+                "removed": lines(&out.removed),
+                "conflicts": out.conflicts.iter().map(|c| format!(
+                    "{} {} {} / {}", c.key, c.kind.slug(), side(&c.mine), side(&c.theirs)
+                )).collect::<Vec<_>>(),
+            })
         },
     );
 }

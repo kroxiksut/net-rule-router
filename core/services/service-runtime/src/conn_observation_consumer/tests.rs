@@ -55,7 +55,15 @@ fn owners_for(
     role: EgressRole,
     ip: Ipv4Addr,
 ) -> Vec<String> {
-    collateral_pin_owners(store, this_app, "nrr-service.exe", routed_apps, role, ip)
+    collateral_pin_owners(
+        store,
+        this_app,
+        &[],
+        "nrr-service.exe",
+        routed_apps,
+        role,
+        ip,
+    )
 }
 
 #[test]
@@ -1737,4 +1745,94 @@ fn a_service_account_drop_never_reaches_the_reverse_learner() {
         *named.lock().unwrap_or_else(|p| p.into_inner()),
         vec![Ipv4Addr::new(198, 51, 100, 4)]
     );
+}
+
+// ── Scripts of a rule folder ────────────────────────────────────────────
+
+const SCRIPT_OWNER: &str = "S-1-5-21-A";
+
+fn script_consumer(
+    store: &Arc<AppObservationStore>,
+    launches: &Arc<nrr_platform_api::process_launch::MockProcessLaunches>,
+) -> ConnectionObservationConsumer {
+    let scripts = crate::script_launches::ScriptLaunches::new(
+        Arc::clone(launches) as Arc<dyn nrr_platform_api::process_launch::ProcessLaunchReader>
+    )
+    .with_path_style(nrr_shared::app_path::PathStyle::Windows);
+    ConnectionObservationConsumer::with_egress(
+        Arc::new(nrr_platform_api::windows_api::MockWindowsApi::new()),
+        Arc::new(|_: &str| (None, None)),
+        Arc::new(|| Some(SCRIPT_OWNER.to_string())),
+        false,
+    )
+    .with_app_observations(Arc::clone(store))
+    .with_script_launches(Arc::new(scripts))
+}
+
+fn script_observation(
+    pid: u32,
+    image: &str,
+    owner: &str,
+    remote: Ipv4Addr,
+) -> ConnectionObservation {
+    let mut o = obs(Ipv4Addr::new(192, 168, 0, 50), remote);
+    o.pid = pid;
+    o.process_path = Some(image.to_string());
+    o.user_sid = Some(owner.to_string());
+    o.verdict = ConnectionVerdict::Unknown;
+    o
+}
+
+/// `python C:\Tools\sync.py` teaches the folder rule `C:\Tools\*`, not only
+/// the interpreter's name, and so does a script a machine account runs;
+/// another person's script, or an editor holding a file from the folder,
+/// teaches it nothing.
+#[test]
+fn a_folders_script_teaches_the_folder_rule_for_its_owner_only() {
+    use crate::app_observation_lookup::AppObservationLookup;
+    use nrr_platform_api::process_launch::{MockProcessLaunches, ProcessLaunch};
+    let folder = r"c:\tools\*";
+    let store = Arc::new(
+        AppObservationStore::new().with_path_style(nrr_shared::app_path::PathStyle::Windows),
+    );
+    assert!(store.ips_for_app(folder).is_empty());
+    let launches = Arc::new(MockProcessLaunches::default());
+    let run = |line: &str| ProcessLaunch {
+        args: nrr_platform_api::process_launch::split_windows_command_line(line),
+        raw: Some(line.to_string()),
+        cwd: Some(r"C:\Users\a".to_string()),
+    };
+    launches.set(41, 1, run(r#""C:\Python\python.exe" -u C:\Tools\sync.py"#));
+    launches.set(42, 1, run(r"notepad.exe C:\Tools\sync.py"));
+    launches.set(43, 1, run(r"powershell.exe -File C:\Tools\job.ps1"));
+    launches.set(44, 1, run(r"powershell.exe -File C:\Tools\task.ps1"));
+    let consumer = script_consumer(&store, &launches);
+
+    let script_ip = Ipv4Addr::new(203, 0, 113, 60);
+    let editor_ip = Ipv4Addr::new(203, 0, 113, 61);
+    let other_user_ip = Ipv4Addr::new(203, 0, 113, 62);
+    let system_ip = Ipv4Addr::new(203, 0, 113, 63);
+    let summary = consumer.consume(
+        &[
+            script_observation(41, r"C:\Python\python.exe", SCRIPT_OWNER, script_ip),
+            script_observation(42, r"C:\Windows\notepad.exe", SCRIPT_OWNER, editor_ip),
+            script_observation(
+                43,
+                r"C:\Windows\powershell.exe",
+                "S-1-5-21-B",
+                other_user_ip,
+            ),
+            // A scheduled task as LocalSystem follows the routing user's rules.
+            script_observation(44, r"C:\Windows\powershell.exe", "S-1-5-18", system_ip),
+        ],
+        SystemTime::now(),
+    );
+    assert_eq!(store.ips_for_app(folder), vec![script_ip, system_ip]);
+    assert_eq!(store.ips_for_app("python.exe"), vec![script_ip]);
+    assert!(summary.app_ips_added >= 2);
+    assert!(store.learnt_from_scripts(folder, script_ip));
+    // Its census entry is the folder rule's own program.
+    assert!(!store.destination_used_outside(&[folder.to_string()], script_ip));
+    // The editor's and the other person's command lines are never read.
+    assert_eq!(launches.reads(), 2);
 }

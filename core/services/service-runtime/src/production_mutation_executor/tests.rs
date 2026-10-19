@@ -1661,6 +1661,7 @@ fn a_linux_service_stores_app_names_without_the_windows_suffix() {
                 value: "Signal-Desktop".into(),
             },
             include_child_processes: false,
+            override_requested: false,
         }),
         comment: String::new(),
         action: nrr_shared::rules_json::RuleAction::Route,
@@ -1949,6 +1950,7 @@ fn shaped_rules_update(
                     value: "app.exe".into(),
                 },
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action,
@@ -3263,4 +3265,128 @@ fn a_write_that_waited_for_the_gate_is_checked_again_inside_it() {
         exec.coordinator.status_of(&id).expect("status"),
         RevisionStatus::Rejected
     );
+}
+
+// ── Rules on another user's folder ──────────────────────────────────────────
+
+/// Two people's profiles on a machine of the build's own platform.
+struct TwoProfiles;
+
+const ALICE_PRINCIPAL: &str = "S-1-5-21-1-2-3-1001";
+const BOB_PRINCIPAL: &str = "S-1-5-21-1-2-3-1002";
+
+fn profile_prefix(owner: &str) -> &'static str {
+    match (owner, cfg!(windows)) {
+        (ALICE_PRINCIPAL, true) => r"c:\users\alice",
+        (ALICE_PRINCIPAL, false) => "/home/alice",
+        (_, true) => r"c:\users\bob",
+        (_, false) => "/home/bob",
+    }
+}
+
+impl nrr_platform_api::app_folders::ProgramFolders for TwoProfiles {
+    fn path_style(&self) -> nrr_platform_api::app_folders::PathStyle {
+        HostPlatform::compiled().path_style()
+    }
+
+    fn place(&self, _path: &std::path::Path) -> nrr_platform_api::app_folders::PlaceOnDisk {
+        nrr_platform_api::app_folders::PlaceOnDisk::Missing
+    }
+
+    fn real_path(&self, _path: &std::path::Path) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn is_program(&self, _path: &std::path::Path) -> bool {
+        false
+    }
+
+    fn foreign_profile(&self, place: &std::path::Path, owner: &str) -> bool {
+        let place = place.to_string_lossy().to_lowercase();
+        [ALICE_PRINCIPAL, BOB_PRINCIPAL]
+            .iter()
+            .any(|who| *who != owner && place.starts_with(profile_prefix(who)))
+    }
+}
+
+fn path_book(path: &str) -> String {
+    serde_json::json!({
+        "schema-version": 5,
+        "primary": [{
+            "id": "r-path", "enabled": true,
+            "app-match": {
+                "pattern": { "kind": "path", "value": path },
+                "include-child-processes": false,
+            },
+        }],
+        "secondary": [],
+    })
+    .to_string()
+}
+
+/// One person's rule never names another person's folder, and the shared
+/// baseline names a person's folder only through a profile folder; a folder
+/// a book already holds stays editable.
+#[test]
+fn a_new_rule_on_another_users_folder_is_refused() {
+    let (exec, _conn) = build_test_executor();
+    let (bobs, alices, own) = if cfg!(windows) {
+        (
+            r"C:\Users\Bob\Apps\*",
+            r"C:\Users\Alice\Apps\*",
+            r"%LOCALAPPDATA%\Apps\*",
+        )
+    } else {
+        ("/home/bob/apps/*", "/home/alice/apps/*", "~/apps/*")
+    };
+    // Held before the check existed: carried, not refused.
+    let carol = "S-1-5-21-1-2-3-1003";
+    assert!(matches!(
+        exec.execute(rules_update(path_book(bobs)), carol),
+        MutationOutcome::Completed(_)
+    ));
+    let coverage = Arc::new(crate::app_path_coverage::AppPathCoverage::new(
+        Arc::new(TwoProfiles),
+        true,
+    ));
+    let exec = exec.with_path_coverage(coverage);
+
+    let error = exec
+        .foreign_profile_refusal(&path_book(bobs), ALICE_PRINCIPAL)
+        .expect("refused");
+    assert_eq!(error.code, PATH_IN_OTHER_USERS_PROFILE_CODE);
+    assert_eq!(error.args["rule"], "r-path");
+    assert!(exec
+        .foreign_profile_refusal(&path_book(alices), ALICE_PRINCIPAL)
+        .is_none());
+    assert!(exec
+        .foreign_profile_refusal(&path_book(own), ALICE_PRINCIPAL)
+        .is_none());
+    let baseline = nrr_storage::BASELINE_PRINCIPAL;
+    assert!(exec
+        .foreign_profile_refusal(&path_book(alices), baseline)
+        .is_some());
+    assert!(exec
+        .foreign_profile_refusal(&path_book(own), baseline)
+        .is_none());
+    assert!(
+        exec.foreign_profile_refusal(&path_book(bobs), BOB_PRINCIPAL)
+            .is_none(),
+        "one's own folder"
+    );
+    assert!(
+        exec.foreign_profile_refusal(&path_book(bobs), carol)
+            .is_none(),
+        "a folder the book in force holds"
+    );
+    match exec.execute(rules_update(path_book(bobs)), ALICE_PRINCIPAL) {
+        MutationOutcome::Failed(e) => assert_eq!(e.code, PATH_IN_OTHER_USERS_PROFILE_CODE),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let review = exec.preview(
+        MutationKind::RulesUpdate,
+        &rules_update(path_book(bobs)).payload,
+        ALICE_PRINCIPAL,
+    );
+    assert!(refused_with(&review, PATH_IN_OTHER_USERS_PROFILE_CODE));
 }

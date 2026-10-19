@@ -277,6 +277,10 @@ pub struct RulesFileEntry {
     /// that the route of this file works for it. Read in the domain and
     /// exact-IP sections of either file.
     pub verify_primary: bool,
+    /// `true` when a program line carried `+override`: the owner asks for the
+    /// rule to apply although the protection of system programs and folders
+    /// refuses it. A request only; the service applies it once confirmed.
+    pub override_requested: bool,
     /// Provenance of an app-authored entry, parsed from the structured
     /// `auto:… anchor:… added:…` prefix of the inline comment.
     ///
@@ -296,6 +300,7 @@ impl RulesFileEntry {
             enabled: true,
             blocked: false,
             verify_primary: false,
+            override_requested: false,
             origin: None,
         }
     }
@@ -311,6 +316,7 @@ impl RulesFileEntry {
             enabled: true,
             blocked: false,
             verify_primary: false,
+            override_requested: false,
             origin: None,
         }
     }
@@ -323,6 +329,7 @@ impl RulesFileEntry {
             enabled: false,
             blocked: false,
             verify_primary: false,
+            override_requested: false,
             origin: None,
         }
     }
@@ -336,6 +343,7 @@ impl RulesFileEntry {
             enabled: true,
             blocked: false,
             verify_primary: false,
+            override_requested: false,
             origin: Some(origin),
         }
     }

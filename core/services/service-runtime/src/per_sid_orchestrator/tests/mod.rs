@@ -238,6 +238,7 @@ fn rules_with_one_app(app_name: &str) -> ActiveRulesSnapshot {
         app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
             pattern: nrr_domain::canonical::CanonicalAppPattern::Exact(app_name.to_string()),
             include_child_processes: false,
+            override_requested: false,
         }),
         comment: String::new(),
         action: nrr_domain::RuleAction::Route,
@@ -475,6 +476,7 @@ mod apply;
 mod audit;
 mod blocking_scope;
 mod cleanup;
+mod deny_without_policy;
 mod kill_switch;
 mod machine_reading;
 mod membership;

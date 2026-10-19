@@ -46,6 +46,12 @@ const PROFILE_LIST_TTL: Duration = Duration::from_secs(60);
 /// Profiles read from the list; a machine with more is not one this guards.
 const MAX_PROFILES: usize = 512;
 
+/// How long starting a watch waits for its first request to be queued.
+const ARM_WAIT: Duration = Duration::from_secs(2);
+
+/// Missing folder levels climbed to find the one a folder would be created in.
+const MAX_WRITABLE_CHECK_LEVELS: usize = 64;
+
 /// Four-byte words `ReadDirectoryChangesW` may fill per call: 64 KiB, the most
 /// a network share accepts, and far more than one burst of names needs.
 const NOTIFY_BUFFER_WORDS: usize = 16 * 1024;
@@ -104,6 +110,29 @@ impl ProgramFolders for WindowsProgramFolders {
         self.profiles()
             .iter()
             .any(|(sid, profile)| !sid.eq_ignore_ascii_case(owner) && place.starts_with(profile))
+    }
+
+    fn owner_profile(&self, owner: &str) -> Option<PathBuf> {
+        self.profiles()
+            .into_iter()
+            .find(|(sid, _)| sid.eq_ignore_ascii_case(owner))
+            .map(|(_, profile)| PathBuf::from(profile.join(r"\")))
+    }
+
+    fn writable_by_anyone(&self, place: &Path) -> bool {
+        // A file is put there by whoever may write into its folder; a missing
+        // folder by whoever may create it in the nearest one that exists.
+        let start = if place.is_file() {
+            place.parent()
+        } else {
+            Some(place)
+        };
+        start
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .take(MAX_WRITABLE_CHECK_LEVELS)
+            .find(|level| !level.as_os_str().is_empty() && level.is_dir())
+            .is_some_and(|folder| crate::trusted_location::open_to_everyone(folder) == Ok(true))
     }
 
     fn watch(
@@ -206,17 +235,30 @@ impl DirectoryWatch {
             }
         };
         let (directory, stop) = (SendHandle::of(directory), SendHandle::of(stop));
+        let (armed_tx, armed_rx) = std::sync::mpsc::sync_channel(1);
         let spawned = std::thread::Builder::new()
             .name("nrr-app-folder-watch".to_string())
             .spawn(move || {
-                watch_until_stopped(directory.get(), subfolders, stop.get(), &on_change);
+                watch_until_stopped(
+                    directory.get(),
+                    subfolders,
+                    stop.get(),
+                    &on_change,
+                    armed_tx,
+                );
                 close(directory.get());
             });
         match spawned {
-            Ok(thread) => Ok(Self {
-                stop,
-                thread: Some(thread),
-            }),
+            Ok(thread) => {
+                // The OS keeps changes only once the first request is queued:
+                // a program written before that would never be reported.
+                // Bounded, so a stuck thread never holds the caller.
+                let _ = armed_rx.recv_timeout(ARM_WAIT);
+                Ok(Self {
+                    stop,
+                    thread: Some(thread),
+                })
+            }
             Err(e) => {
                 close(directory.get());
                 close(stop.get());
@@ -253,6 +295,7 @@ fn watch_until_stopped(
     subfolders: bool,
     stop: HANDLE,
     on_change: &NetworkChangeCallback,
+    armed: std::sync::mpsc::SyncSender<()>,
 ) {
     // SAFETY: no security attributes, no name; manual reset, cleared before
     // every request.
@@ -284,6 +327,8 @@ fn watch_until_stopped(
                 None,
             )
         };
+        // Sent once; later sends find the receiver gone or the slot full.
+        let _ = armed.try_send(());
         if queued.is_err() {
             break;
         }

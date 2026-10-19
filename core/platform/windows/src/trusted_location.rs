@@ -290,9 +290,51 @@ fn untrusted_rights(path: &Path, rights: u32) -> Result<Option<String>, String> 
     if dacl.is_null() {
         return Ok(Some("everyone (no DACL)".to_string()));
     }
-    // SAFETY: `dacl` is a valid ACL inside `descriptor`; each ACE pointer
-    // `GetAce` returns stays inside it, and only allow-type ACEs — whose layout
-    // is `ACCESS_ALLOWED_ACE` with the SID following the mask — are read.
+    // SAFETY: `dacl` points into `descriptor`, alive for the call.
+    unsafe { first_allowed(dacl, rights, &|sid| !is_trusted(sid)) }
+}
+
+/// Groups every account that signs in belongs to: Everyone, Authenticated
+/// Users, Users, Interactive, Guests, Anonymous.
+const ANYONE_SIDS: &[&str] = &[
+    "S-1-1-0",
+    "S-1-5-11",
+    "S-1-5-32-545",
+    "S-1-5-4",
+    "S-1-5-32-546",
+    "S-1-5-7",
+];
+
+/// Rights on a folder that let the holder put a program into it.
+const ADDS_PROGRAMS: u32 =
+    FILE_WRITE_DATA | FILE_APPEND_DATA | WRITE_DAC | WRITE_OWNER | GENERIC_ALL | GENERIC_WRITE;
+
+/// Whether a group every account belongs to may add files or folders to
+/// `dir`, as `C:\Users\Public` and most of `C:\ProgramData` let Users do.
+pub fn open_to_everyone(dir: &Path) -> Result<bool, String> {
+    let descriptor = SecurityDescriptor::of_file(dir)?;
+    let (_, dacl) = descriptor.owner_and_dacl()?;
+    if dacl.is_null() {
+        return Ok(true);
+    }
+    let anyone = |sid: &str| ANYONE_SIDS.iter().any(|a| a.eq_ignore_ascii_case(sid));
+    // SAFETY: `dacl` points into `descriptor`, alive for the call.
+    Ok(unsafe { first_allowed(dacl, ADDS_PROGRAMS, &anyone) }?.is_some())
+}
+
+/// The first account `dacl` allows any of `rights` that `counts` picks.
+///
+/// # Safety
+///
+/// `dacl` must point at a valid ACL that outlives the call.
+unsafe fn first_allowed(
+    dacl: *const ACL,
+    rights: u32,
+    counts: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>, String> {
+    // SAFETY: each ACE pointer `GetAce` returns stays inside the valid ACL,
+    // and only allow-type ACEs — whose layout is `ACCESS_ALLOWED_ACE` with the
+    // SID following the mask — are read.
     unsafe {
         for index in 0..u32::from((*dacl).AceCount) {
             let mut ace = std::ptr::null_mut();
@@ -308,7 +350,7 @@ fn untrusted_rights(path: &Path, rights: u32) -> Result<Option<String>, String> 
             }
             let sid = PSID(std::ptr::addr_of!(allowed.SidStart) as *mut core::ffi::c_void);
             let sid = sid_string(sid)?;
-            if !is_trusted(&sid) {
+            if counts(&sid) {
                 return Ok(Some(sid));
             }
         }
@@ -525,6 +567,23 @@ mod tests {
         assert_eq!(untrusted_rights(dir.path(), PLANTS_BESIDE), Ok(None));
         assert_eq!(untrusted_rights(&file, REPLACES_FILE), Ok(None));
         assert_eq!(std::fs::read(&file).expect("readable"), b"image");
+    }
+
+    /// A folder Users may write into lets anyone put a program there; the
+    /// system folder does not.
+    #[test]
+    fn a_folder_users_may_write_into_is_open_to_everyone() {
+        let system = crate::system_shell::system32_exe("icacls.exe");
+        let system_dir = system.parent().expect("System32");
+        assert_eq!(open_to_everyone(system_dir), Ok(false));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let done = std::process::Command::new(&system)
+            .arg(dir.path())
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)(W)", "/Q"])
+            .output()
+            .expect("run icacls");
+        assert!(done.status.success(), "icacls /grant: {done:?}");
+        assert_eq!(open_to_everyone(dir.path()), Ok(true));
     }
 
     #[test]

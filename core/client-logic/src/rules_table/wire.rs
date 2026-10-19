@@ -2,7 +2,9 @@
 
 use nrr_shared::auto_rule::{AutoRuleReason, RuleOrigin};
 use nrr_shared::ipc_payloads::RuleRowEntry;
-use nrr_shared::preset_parser::{first_forbidden_field_char, without_children_flag, ParsedRule};
+use nrr_shared::preset_parser::{
+    first_forbidden_field_char, split_rule_flags, without_rule_flags, ParsedRule,
+};
 use nrr_shared::rules_json::{AddressMatchDto, AppMatchDto, AppPatternDto, RuleDto};
 
 use super::{RowOrigin, RuleRow, RuleType, TargetRoute};
@@ -99,8 +101,10 @@ pub fn rule_row_to_wire_dto(
         }),
         RuleType::IpRange => Some(ip_range(&value)),
         RuleType::Application => {
-            // `+children` stays in the file, not in the name the service matches.
-            let value = without_children_flag(&value).into_owned();
+            // `+children` stays in the file, not in the name the service
+            // matches; `+override` travels as the request it is.
+            let override_requested = split_rule_flags(&value).1.override_requested;
+            let value = without_rule_flags(&value).into_owned();
             // A separator makes it a path, which the service reads in its
             // platform's spelling; otherwise a `*` makes it a pattern, exactly
             // as the preset parser reads it.
@@ -114,6 +118,7 @@ pub fn rule_row_to_wire_dto(
             app_match = Some(AppMatchDto {
                 pattern,
                 include_child_processes: false,
+                override_requested,
             });
             None
         }
@@ -246,12 +251,13 @@ pub fn parsed_rule_verify(rule: &ParsedRule) -> bool {
 }
 
 /// The routing part of one `preset.parse` rule read from the rules file of
-/// `file` (`driftRowFromParsedRule`).
+/// `file` (`driftRowFromParsedRule`). The value as a table keeps it: a
+/// program's `+override` is routing, whether the rule may apply.
 pub fn drift_row_from_parsed_rule(rule: &ParsedRule, file: Route) -> RuleRow {
     drift_row(
         rule.enabled,
         RuleType::from_slug(rule.rule_type.slug()),
-        rule.match_value.clone(),
+        rule.stored_value(),
         parsed_rule_target_route(rule, file),
         parsed_rule_verify(rule),
     )

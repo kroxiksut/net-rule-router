@@ -75,9 +75,9 @@ fn main() -> ExitCode {
         #[cfg(target_os = "linux")]
         Command::RestoreDns => restore_dns(),
         #[cfg(target_os = "linux")]
-        Command::Cleanup => run_cleanup(false),
+        Command::Cleanup => run_cleanup(false, true),
         #[cfg(target_os = "linux")]
-        Command::StopAndCleanup => run_cleanup(true),
+        Command::StopAndCleanup => run_cleanup(true, true),
         #[cfg(target_os = "linux")]
         Command::AfterCrash => run_after_crash(),
         #[cfg(target_os = "linux")]
@@ -152,7 +152,7 @@ fn run_after_crash() -> ExitCode {
         keep_rule_routes_on_stop: false,
     });
     if plan.filters == FilterTeardown::RemoveAll {
-        return run_cleanup(false);
+        return run_cleanup(false, false);
     }
     let dns = dns_stack::clear_dns_redirect(&data_dir);
     println!("NetRuleRouter: the service stopped for good; name resolution handed back.");
@@ -193,11 +193,13 @@ fn provision_stage(args: &[String]) -> ExitCode {
 }
 
 /// Undo what a dead daemon left behind; [`cleanup`] owns the exit codes.
+/// `revoke_overrides` for the person's own reset.
 #[cfg(target_os = "linux")]
-fn run_cleanup(stop_first: bool) -> ExitCode {
+fn run_cleanup(stop_first: bool, revoke_overrides: bool) -> ExitCode {
     let outcome = cleanup::cleanup(
         &cleanup::SystemHost {
             data_dir: nrr_platform_api::paths::production_data_root(),
+            revoke_overrides,
         },
         stop_first,
     );

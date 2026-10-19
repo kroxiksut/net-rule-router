@@ -48,6 +48,7 @@ fn registry_marks_app_only_blocks_as_app_scoped_and_destination_blocks_as_not() 
             app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
                 pattern: nrr_domain::canonical::CanonicalAppPattern::Exact("tg.exe".into()),
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action: nrr_domain::RuleAction::Route,
@@ -127,6 +128,7 @@ fn fixture_with_app_observation(
             app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
                 pattern: nrr_domain::canonical::CanonicalAppPattern::Exact("tg.exe".into()),
                 include_child_processes: false,
+                override_requested: false,
             }),
             comment: String::new(),
             action: nrr_domain::RuleAction::Route,

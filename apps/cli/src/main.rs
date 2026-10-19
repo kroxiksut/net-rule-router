@@ -541,6 +541,7 @@ fn reset_network(confirmed: bool, stop_service: bool, ctx: &Ctx<'_>) -> u8 {
     if !confirmed {
         eprintln!("`{exe} reset-network` drops the network state the service applied:");
         eprintln!("  packet filters, the DNS redirect, and the routes it added.");
+        eprintln!("Rules confirmed despite the protection of system programs are revoked.");
         if stop_service {
             eprintln!("A running service is stopped first, and ended if it hangs.");
         }

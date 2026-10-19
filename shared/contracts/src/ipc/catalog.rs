@@ -53,7 +53,7 @@ const CLIENTS_POLICY_SURFACES: [IpcClientProfile; 3] = [
     IpcClientProfile::Tui,
 ];
 
-const IPC_OPERATION_CATALOG: [IpcOperationSpec; 82] = [
+const IPC_OPERATION_CATALOG: [IpcOperationSpec; 86] = [
     IpcOperationSpec {
         name: IpcOperationName::ContractNegotiate,
         class: IpcInteractionClass::HealthCheck,
@@ -742,6 +742,43 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 82] = [
         name: IpcOperationName::SiteCheckResultGet,
         // The caller's own latest check, read from memory.
         class: IpcInteractionClass::Query,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    // ── What a rule by path covers ──────────────────────────────
+    IpcOperationSpec {
+        name: IpcOperationName::RulesAppPathCoverageGet,
+        // The rule form's count, over the caller's own folders. The tray adds
+        // no rule by path.
+        class: IpcInteractionClass::Query,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    // ── Applying a rule despite the protection of system programs ──
+    IpcOperationSpec {
+        name: IpcOperationName::RulesOverridePreview,
+        // What confirming would let the rule take. The window and the
+        // terminal confirm; the tray only names the rule.
+        class: IpcInteractionClass::Query,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::RulesOverrideGrant,
+        // The handler asks for an administrator itself when the rule reaches
+        // past the caller.
+        class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::RulesOverrideRevoke,
+        // Taking a confirmation back only restores the protection.
+        class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,

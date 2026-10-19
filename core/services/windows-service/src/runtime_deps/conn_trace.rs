@@ -261,7 +261,15 @@ pub(super) fn build_conn_trace_pair(
         // observed app→IP store the codegen reads for `Application` rules.
         .with_app_observations(
             nrr_service_runtime::app_observation_lookup::global_app_observations(),
-        );
+        )
+        // A rule by folder follows the scripts it holds: by the destinations
+        // learnt from them, since an app-id filter would catch every use of
+        // their interpreter.
+        .with_script_launches(Arc::new(
+            nrr_service_runtime::script_launches::ScriptLaunches::new(Arc::new(
+                nrr_platform_windows::process_launch::WindowsProcessLaunches,
+            )),
+        ));
     if let Some(forget) = app_destination_forget {
         consumer_builder = consumer_builder.with_app_destination_forget(forget);
     }

@@ -97,6 +97,10 @@ impl AppPathResolver for ConfirmedClientAppPathResolver {
     ) -> nrr_platform_api::app_folders::PathPrograms {
         self.inner.path_programs(path, owner)
     }
+
+    fn writable_by_anyone(&self, path: &Path) -> bool {
+        self.inner.writable_by_anyone(path)
+    }
 }
 
 #[cfg(test)]

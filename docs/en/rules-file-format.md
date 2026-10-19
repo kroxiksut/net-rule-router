@@ -21,6 +21,7 @@ details.
 | `# value` | Rule kept but turned off | `# example.com`, `# !example.com` |
 | `value  # text` | Rule with your note | `example.com  # updates` |
 | `value +children` | Application rule that also covers the programs it starts (§1.6) | `codex.exe +children` |
+| `value +override` | Program rule the protection of system programs holds, applied once you confirm it (§1.16) | `!/var/www/* +override` |
 | `# text` | Comment, ignored | `# my notes` |
 
 `!` and `?` go right before the value, after the `#` of a turned-off rule, and
@@ -203,7 +204,7 @@ Empty lines and lines containing only whitespace are ignored.
 ### 1.4 Complete example
 
 ```
-# NetRuleRouter rules file — version 10
+# NetRuleRouter rules file — version 11
 # Route: Primary (main network)
 
 --- Zones
@@ -245,7 +246,7 @@ rr3.example-cdn.net  # auto:site-companion anchor:example.org added:2026-07-31
 The additional-route file of the same pair:
 
 ```
-# NetRuleRouter rules file — version 10
+# NetRuleRouter rules file — version 11
 # Route: Additional (VPN)
 
 --- Domains
@@ -493,6 +494,8 @@ with one (`\` or `/` on Windows, `/` on Linux and macOS) is a path.
 | `/opt/tool/bin/tool` | That one program file, or the programs of that folder if it is one |
 | `/opt/tool/` | The programs directly in that folder |
 | `/opt/tool/*` | The programs in that folder and in every folder below it |
+| `%LOCALAPPDATA%\Discord\*` | For each user, the programs in their own `AppData\Local\Discord` and below it |
+| `~/apps/*` | For each user, the programs in `apps` of their own home folder and below it |
 
 A folder rule suits a program that keeps several executables of its own next
 to each other or in subfolders (helpers, updaters, a new version folder after
@@ -530,10 +533,41 @@ Paths:
   the folder later, such as a new version folder after an update, without a
   restart. A folder that holds more programs than one rule covers is covered
   in part, and the Overlaps tab says so.
+- On Windows and Linux a folder rule also covers the scripts kept in the
+  folder when an interpreter installed elsewhere runs them: `python tool.py`,
+  `powershell -File job.ps1`, a `.bat`, `.cmd` or `.vbs` file, `java -jar
+  app.jar` or a Java class path into the folder, and on Linux a script with a
+  `#!` line or the execute bit. "Run with PowerShell" from Explorer counts
+  too. Such a script follows the rule once its first connection has been
+  seen. On Windows a script that a service or a scheduled task runs follows
+  the rules of the user whose routes the machine uses; a script another
+  signed-in person runs does not count toward your folder rule.
+- A program that only opens a file from the folder, such as an editor, is not
+  covered, nor is code passed on the command line itself (`bash -c "…"`, a
+  PowerShell `-Command` that does anything but call one script). On Windows a
+  Java class path given only through the `CLASSPATH` variable is not
+  recognised.
+- A deny by folder holds the programs in the folder, but not for certain a
+  script from it that an interpreter installed elsewhere runs. Use it to stop
+  the folder's programs, not as a guarantee that nothing started from the
+  folder gets through.
 - A folder reached through a link or junction is judged where it really is:
   a link into a system folder is not applied, as the system folder itself is
   not.
-- One user's rule never covers the programs in another user's profile.
+- A path may start from a folder of the user's own profile: `%LOCALAPPDATA%`,
+  `%APPDATA%` or `%USERPROFILE%` on Windows, `~` on Linux and macOS. It stays
+  in the file as written and names each user's own folder, so one rule in the
+  shared configuration covers every user's own copy of a program. Any other
+  variable (`%TEMP%`, `$HOME`, `~name`) is a line error.
+- One user's rule never covers the programs in another user's profile. A new
+  rule written with the full path of a folder in another user's profile is
+  refused; the shared configuration names a user's folder only from a profile
+  folder as above. Such a line already in a rules file stays in it, and the
+  Overlaps tab shows it as not applied, with the reason.
+- A folder anyone may write into (`C:\Users\Public`, much of `C:\ProgramData`,
+  `/tmp`, `/var/tmp`, `/dev/shm`) gets a warning when the rule is entered:
+  anyone can put a program there. A program in such a folder is never exempt
+  from leak protection, not even after you confirm it.
 - macOS does not apply rules by path yet: such a rule stays in the file and
   in the rules list, and the Overlaps tab shows it as not applied, with the
   reason.
@@ -558,6 +592,10 @@ The Add dialog refuses such a rule before it is saved. One already in a rules
 file — written by hand or kept from an older version — stays in the file and
 in the rules list, is shown as not applied with the reason, and is not carried
 out until it is changed.
+
+When you do mean it, write `+override` after the value: the rule is then
+applied once you confirm it (§1.16). The root of a disk and the app's own
+programs can never be confirmed.
 
 ### 1.9 Forward compatibility — extended sections
 
@@ -614,11 +652,16 @@ The header line `# NetRuleRouter rules file — version N` (and the preset heade
 | 8 | A site in every zone (§1.8, `example.*`). |
 | 9 | Deny written as `!` before the value (§1.12); the `+block` flag of version 3 is gone. |
 | 10 | An application named by path: one file, a folder, a folder with its subfolders (§1.8). |
+| 11 | `+override` after a program rule's value (§1.16). |
 
 Version 2 was reserved for a nested `- destination` syntax under application
 rules. It was never implemented and no build reads or writes it; the number is
 left in place rather than reused, so a file from any build means the same thing
 in every build. Do not declare version 2 in a file.
+
+A file that uses `+override` declares **version 11**. An older build reads the
+flag as part of the value and does not apply the rule; the rest of the file
+works.
 
 A file that names an application by path declares **version 10**. An older
 build reads a file path there as the program's name alone and does not apply
@@ -822,6 +865,45 @@ Key properties:
 - **One rule per site in a file.** `?accounts.example.com` and
   `accounts.example.com` in the same file are the same rule; the line without
   the `?` is kept.
+
+### 1.16 Applying a rule despite the protection (`+override`)
+
+A deny or an additional-route rule that would take a program the system needs
+— a system folder, a folder many programs share, a critical system process
+(§1.8, System programs) — is not applied. When you do mean it, write
+**`+override`** after the value:
+
+```
+--- Linux
+!/var/www/* +override      # keep the site's programs off the network
+```
+
+Key properties:
+
+- **A request, not a permission.** The rule stays not applied, marked "needs
+  your confirmation", until you confirm it in the window's rules list or in
+  the terminal. Editing the file never confirms anything.
+- **You see what it takes.** The confirmation shows how many programs the
+  rule takes, the system processes and service accounts among them, other
+  users' programs, and what may stop working — getting an address (DHCP),
+  names (DNS), the clock, updates, signing in to a domain. You confirm by
+  typing the rule's value.
+- **For a time you choose.** 1 hour, 1 day (the default), 1 week or until you
+  revoke it. The term survives a restart; when it ends, the protection holds
+  the rule again and you are told.
+- **Administrator rights where it reaches past you.** A rule that takes system
+  folders or processes, service accounts or other users' programs needs an
+  administrator to confirm it.
+- **Visible while it lasts.** The rules list marks the rule "Allowed despite
+  protection" with the time left, filters by that mark, and takes the
+  confirmation back with one action. A new critical process under the rule
+  asks for a confirmation again.
+- **Undone by an emergency network reset.** Restoring the network revokes
+  every confirmation.
+- **Never for everything.** The root of a disk and the app's own programs
+  cannot be confirmed; `+override` there changes nothing.
+- **Program rules only.** On any other line the flag means nothing and is
+  dropped, as `+children` is.
 
 ---
 

@@ -269,6 +269,17 @@ pub const SERVICE_ACCOUNTS_PRINCIPAL: &str = "nrr:service-accounts";
 pub const SERVICE_ACCOUNT_SIDS: [&str; 5] =
     ["S-1-5-18", "S-1-5-19", "S-1-5-20", "S-1-5-6", "S-1-5-80-0"];
 
+/// Whether `principal` is a machine account: one of [`SERVICE_ACCOUNT_SIDS`]
+/// or a per-service `S-1-5-80-*` SID. Its traffic follows the route-table
+/// owner's rules.
+#[must_use]
+pub fn is_service_account_sid(principal: &str) -> bool {
+    SERVICE_ACCOUNT_SIDS
+        .iter()
+        .any(|sid| sid.eq_ignore_ascii_case(principal))
+        || principal.starts_with("S-1-5-80-")
+}
+
 /// Who an ALE filter applies to, read from [`WfpFilterSpec::user_sid`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WfpPrincipal<'a> {
@@ -595,4 +606,19 @@ pub enum RoutingAction {
 pub enum WfpFilterAction {
     AddFilter(WfpFilterSpec),
     DeleteFilter(WfpFilterId),
+}
+
+#[cfg(test)]
+mod service_account_tests {
+    use super::*;
+
+    #[test]
+    fn machine_accounts_are_told_from_people() {
+        for sid in ["S-1-5-18", "s-1-5-19", "S-1-5-20", "S-1-5-80-123-456"] {
+            assert!(is_service_account_sid(sid), "{sid}");
+        }
+        for sid in ["S-1-5-21-1-2-3-1001", "S-1-12-1-5", "", "unix:uid:0"] {
+            assert!(!is_service_account_sid(sid), "{sid}");
+        }
+    }
 }

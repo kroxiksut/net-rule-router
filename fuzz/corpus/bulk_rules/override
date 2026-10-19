@@ -1,0 +1,7 @@
+A--- Windows
+!svchost.exe +override
+C:\inetpub\* +children +override
+# !C:\Windows\* +override
+--- Linux
+!/var/www/* +override
++override

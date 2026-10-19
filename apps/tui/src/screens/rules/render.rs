@@ -17,8 +17,8 @@ pub const REVIEW_PAGE: usize = 12;
 /// Overlaps the form spells out before it counts the rest.
 const FORM_OVERLAPS: usize = 3;
 use super::{
-    bulk, gateway, main_route, recent, text, verdicts, Busy, Choice, ChoicePurpose, Input,
-    InputPurpose, Mode, Phase, SetList,
+    bulk, gateway, main_route, overrides, recent, text, verdicts, Busy, Choice, ChoicePurpose,
+    Input, InputPurpose, Mode, Phase, SetList,
 };
 use crate::i18n::Texts;
 use crate::keys;
@@ -71,6 +71,11 @@ pub fn view(app: &AppState, texts: &Texts) -> ScreenView {
         Mode::Bulk(form) => Panel {
             title: texts.get(text::MODE_SEVERAL),
             lines: bulk::lines(form, texts),
+            feed: false,
+        },
+        Mode::Override(confirm) => Panel {
+            title: texts.get(text::OVERRIDE_TITLE),
+            lines: overrides::lines(confirm, texts),
             feed: false,
         },
     };
@@ -302,16 +307,23 @@ fn row_lines(
         }
         segments
     };
-    if let Some(word) = verdict_word(&row.verdict, texts) {
+    let override_mark = overrides::mark(app, row, texts);
+    let confirmed = overrides::granted(app, row);
+    // A confirmed rule is said by its mark, not by the warning it overrides.
+    if let Some(word) = verdict_word(&row.verdict, texts).filter(|_| !confirmed) {
         first.push(Segment::plain(" — "));
         first.push(word);
+    }
+    if let Some(mark) = override_mark {
+        first.push(Segment::plain(" · "));
+        first.push(mark);
     }
     let mut lines = vec![ViewLine::new(first)];
     // The chosen row says the rest: what the validator found, what the main
     // route answered, who wrote it, and its note.
     if chosen {
         let mut details = Vec::new();
-        if row.verdict.status != VerdictStatus::Valid {
+        if row.verdict.status != VerdictStatus::Valid && !confirmed {
             details.push(verdict_message(&row.verdict, texts));
         }
         if let Some(target) = misplaced_target_type(&row.verdict.message_key) {
@@ -465,6 +477,24 @@ fn hint_suffix(rule_type: &RuleType) -> String {
     }
 }
 
+/// What a rule by folder says about the scripts its folder holds: they follow
+/// a route rule, and a deny cannot hold them for certain.
+fn folder_scripts_note(form: &Form) -> Option<crate::i18n::Key> {
+    let profile = PlatformProfile::current();
+    if form.rule_type != RuleType::Application || !profile.supports.app_path_scripts {
+        return None;
+    }
+    let form_of_value = nrr_client_logic::rule_value_class::app_value_form(&form.value, profile.os);
+    if !matches!(form_of_value, "folder" | "folder-tree" | "file-or-folder") {
+        return None;
+    }
+    Some(if form.route == TargetRoute::Block {
+        text::APP_FOLDER_SCRIPTS_DENY
+    } else {
+        text::APP_FOLDER_SCRIPTS
+    })
+}
+
 fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
     let mut lines = Vec::new();
     for field in Field::ALL {
@@ -586,12 +616,38 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
                         }
                     }
                 }
+                // A rule by path: what it covers for this user, said by the
+                // service, and the subfolders switch of a folder rule.
+                let verdict_key = form.verdict().map(|v| v.message_key);
+                lines.extend(super::coverage::lines(form, verdict_key.as_deref(), texts));
+                if form.names_folder() {
+                    let tick = texts.get(if form.with_subfolders() {
+                        text::TICKED
+                    } else {
+                        text::UNTICKED
+                    });
+                    lines.push(ViewLine::text(format!(
+                        "     {tick} {}",
+                        texts.get(text::PATH_INCLUDE_SUBFOLDERS)
+                    )));
+                    if current {
+                        lines.push(ViewLine::text(format!(
+                            "     {}",
+                            texts.get(text::PATH_SUBFOLDERS_KEY)
+                        )));
+                    }
+                }
                 if let Some(target) = form.switch_target() {
                     let label = type_label(&target, texts);
                     lines.push(ViewLine::text(format!(
                         "     {}",
                         texts.fill(text::FORM_SWITCH_TYPE, &[("type", label)])
                     )));
+                }
+                // A folder rule follows its scripts through what they are seen
+                // connecting to, so a deny cannot hold them for certain.
+                if let Some(note) = folder_scripts_note(form) {
+                    lines.push(ViewLine::text(format!("     {}", texts.get(note))));
                 }
                 let hint =
                     texts.dynamic(&format!("rules.hint.{}", hint_suffix(&form.rule_type)), "");
@@ -970,4 +1026,47 @@ fn review_lines(review: &Review, texts: &Texts) -> Vec<ViewLine> {
         texts.get(text::REVIEW_APPLY)
     )));
     lines
+}
+
+#[cfg(test)]
+mod folder_scripts_tests {
+    use super::*;
+
+    fn form(rule_type: RuleType, value: &str, route: TargetRoute) -> Form {
+        let mut form = Form::add();
+        form.rule_type = rule_type;
+        form.value = value.to_string();
+        form.route = route;
+        form
+    }
+
+    /// A folder rule says that the scripts its folder holds follow a route
+    /// and slip past a deny; a program by name, or another type, says nothing.
+    #[test]
+    fn a_folder_rule_speaks_of_its_scripts() {
+        if !PlatformProfile::current().supports.app_path_scripts {
+            return;
+        }
+        let folder = if cfg!(windows) {
+            r"C:\Tools\*"
+        } else {
+            "/opt/tools/*"
+        };
+        assert_eq!(
+            folder_scripts_note(&form(RuleType::Application, folder, TargetRoute::Secondary)),
+            Some(text::APP_FOLDER_SCRIPTS)
+        );
+        assert_eq!(
+            folder_scripts_note(&form(RuleType::Application, folder, TargetRoute::Block)),
+            Some(text::APP_FOLDER_SCRIPTS_DENY)
+        );
+        assert_eq!(
+            folder_scripts_note(&form(RuleType::Application, "tool.exe", TargetRoute::Block)),
+            None
+        );
+        assert_eq!(
+            folder_scripts_note(&form(RuleType::Domain, folder, TargetRoute::Secondary)),
+            None
+        );
+    }
 }
