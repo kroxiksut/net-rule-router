@@ -1,0 +1,149 @@
+{
+  "description": "pure.js coerceLeakProtection: a level as the default route offers it; routed sites under the additional connection becomes everything, an unknown value off",
+  "cases": [
+    {
+      "name": "off under prefer-primary",
+      "input": {
+        "route": "prefer-primary",
+        "current": "off"
+      },
+      "expected": "off"
+    },
+    {
+      "name": "sites under prefer-primary",
+      "input": {
+        "route": "prefer-primary",
+        "current": "sites"
+      },
+      "expected": "sites"
+    },
+    {
+      "name": "everything under prefer-primary",
+      "input": {
+        "route": "prefer-primary",
+        "current": "everything"
+      },
+      "expected": "everything"
+    },
+    {
+      "name": "empty under prefer-primary",
+      "input": {
+        "route": "prefer-primary",
+        "current": ""
+      },
+      "expected": "off"
+    },
+    {
+      "name": "Sites under prefer-primary",
+      "input": {
+        "route": "prefer-primary",
+        "current": "Sites"
+      },
+      "expected": "off"
+    },
+    {
+      "name": "block-all under prefer-primary",
+      "input": {
+        "route": "prefer-primary",
+        "current": "block-all"
+      },
+      "expected": "off"
+    },
+    {
+      "name": "off under prefer-secondary-when-available",
+      "input": {
+        "route": "prefer-secondary-when-available",
+        "current": "off"
+      },
+      "expected": "off"
+    },
+    {
+      "name": "sites under prefer-secondary-when-available",
+      "input": {
+        "route": "prefer-secondary-when-available",
+        "current": "sites"
+      },
+      "expected": "everything"
+    },
+    {
+      "name": "everything under prefer-secondary-when-available",
+      "input": {
+        "route": "prefer-secondary-when-available",
+        "current": "everything"
+      },
+      "expected": "everything"
+    },
+    {
+      "name": "empty under prefer-secondary-when-available",
+      "input": {
+        "route": "prefer-secondary-when-available",
+        "current": ""
+      },
+      "expected": "off"
+    },
+    {
+      "name": "Sites under prefer-secondary-when-available",
+      "input": {
+        "route": "prefer-secondary-when-available",
+        "current": "Sites"
+      },
+      "expected": "off"
+    },
+    {
+      "name": "block-all under prefer-secondary-when-available",
+      "input": {
+        "route": "prefer-secondary-when-available",
+        "current": "block-all"
+      },
+      "expected": "off"
+    },
+    {
+      "name": "off under an unset route",
+      "input": {
+        "route": "",
+        "current": "off"
+      },
+      "expected": "off"
+    },
+    {
+      "name": "sites under an unset route",
+      "input": {
+        "route": "",
+        "current": "sites"
+      },
+      "expected": "sites"
+    },
+    {
+      "name": "everything under an unset route",
+      "input": {
+        "route": "",
+        "current": "everything"
+      },
+      "expected": "everything"
+    },
+    {
+      "name": "empty under an unset route",
+      "input": {
+        "route": "",
+        "current": ""
+      },
+      "expected": "off"
+    },
+    {
+      "name": "Sites under an unset route",
+      "input": {
+        "route": "",
+        "current": "Sites"
+      },
+      "expected": "off"
+    },
+    {
+      "name": "block-all under an unset route",
+      "input": {
+        "route": "",
+        "current": "block-all"
+      },
+      "expected": "off"
+    }
+  ]
+}

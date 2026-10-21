@@ -10,18 +10,20 @@
 use nrr_storage::doh_lockdown::DohLockdownScope;
 
 /// The one decision both planners and the settings read-back share.
+/// `leak_protection_on` is `LeakProtection::is_on`: the `leak-protection-only`
+/// scope applies under `sites` and `everything` alike.
 #[must_use]
 pub fn doh_lockdown_active(
     auto: bool,
     enabled: bool,
     scope: DohLockdownScope,
-    kill_switch_enabled: bool,
+    leak_protection_on: bool,
     has_secondary_rules: bool,
 ) -> bool {
     if auto {
         return has_secondary_rules;
     }
-    enabled && (scope == DohLockdownScope::Always || kill_switch_enabled)
+    enabled && (scope == DohLockdownScope::Always || leak_protection_on)
 }
 
 #[cfg(test)]
@@ -36,27 +38,42 @@ mod tests {
                 DohLockdownScope::LeakProtectionOnly,
                 DohLockdownScope::Always,
             ] {
-                for kill_switch in [false, true] {
-                    assert!(doh_lockdown_active(true, enabled, scope, kill_switch, true));
-                    assert!(!doh_lockdown_active(
-                        true,
-                        enabled,
-                        scope,
-                        kill_switch,
-                        false
-                    ));
+                for protection in [
+                    nrr_domain::LeakProtection::Off,
+                    nrr_domain::LeakProtection::Sites,
+                    nrr_domain::LeakProtection::Everything,
+                ] {
+                    let on = protection.is_on();
+                    assert!(doh_lockdown_active(true, enabled, scope, on, true));
+                    assert!(!doh_lockdown_active(true, enabled, scope, on, false));
                 }
             }
         }
     }
 
-    /// A hand-set toggle keeps its old meaning: on, within its scope.
+    /// A hand-set toggle applies within its scope; `leak-protection-only`
+    /// follows any protection other than `off`.
     #[test]
     fn a_hand_set_toggle_keeps_its_scope() {
+        use nrr_domain::LeakProtection;
         let leak_only = DohLockdownScope::LeakProtectionOnly;
         assert!(!doh_lockdown_active(false, false, leak_only, true, true));
-        assert!(!doh_lockdown_active(false, true, leak_only, false, true));
-        assert!(doh_lockdown_active(false, true, leak_only, true, false));
+        assert!(!doh_lockdown_active(
+            false,
+            true,
+            leak_only,
+            LeakProtection::Off.is_on(),
+            true
+        ));
+        for protection in [LeakProtection::Sites, LeakProtection::Everything] {
+            assert!(doh_lockdown_active(
+                false,
+                true,
+                leak_only,
+                protection.is_on(),
+                false
+            ));
+        }
         assert!(doh_lockdown_active(
             false,
             true,

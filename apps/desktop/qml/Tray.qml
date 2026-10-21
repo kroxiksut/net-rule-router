@@ -4,6 +4,7 @@ import "components"
 import "flows"
 import "theme"
 import "lib/pure.js" as Pure
+import "lib/plurals.js" as Plurals
 
 SystemTrayIcon {
     id: tray
@@ -178,6 +179,8 @@ SystemTrayIcon {
         _noticeMuteKind = ""
         _silenceChoiceReplacedOffer = false
         _verifyVerdictOnScreen = false
+        // An unanswered confirmation leaves the level as it was.
+        _leakConfirmLevel = ""
         // A block notice nobody answered is not quieted: unseen is not seen.
         _blockNoticeShown = []
         _blockNoticeRows = []
@@ -459,9 +462,13 @@ SystemTrayIcon {
         if (serviceStatus === 4) {
             _refreshEnforcementState()
             verifyVerdicts.refresh()
+            // The service pushes only a count that changed, so a tray that
+            // starts after it reads the number once.
+            _refreshAutoRulePendingCount()
         } else {
             _enforcementKnown = false
         }
+        _onServiceStateForLoss()
     }
 
     // Single demux point for every server-pushed status event the tray cares
@@ -487,6 +494,9 @@ SystemTrayIcon {
                 break
             case "secondary-external-address-observed":
                 _onSecondaryExternalAddress(event)
+                break
+            case "secondary-external-address-cleared":
+                _withdrawSecondaryExternal()
                 break
             case "verify-verdicts-changed":
                 verifyVerdicts.refresh()
@@ -518,6 +528,9 @@ SystemTrayIcon {
             case "system-dns-not-restored":
                 _onSystemDnsReading(true)
                 break
+            case "rules-book-unreadable":
+                _onRulesBookReading(event.unreadable === true)
+                break
             case "adapters-changed":
                 _checkForwarded()
                 break
@@ -526,6 +539,9 @@ SystemTrayIcon {
                 break
             case "vpn-client-awaiting-confirmation":
                 _onVpnClientAwaitingConfirmation(event)
+                break
+            case "vpn-gateway-awaiting-confirmation":
+                _onVpnGatewayAwaitingConfirmation(event)
                 break
             case "protection-coverage-changed":
                 _onProtectionCoverageChanged(event)
@@ -537,11 +553,6 @@ SystemTrayIcon {
                 // Any writer, not a list of them: with the window closed the
                 // linked files follow the rules in force from here.
                 boundFileWriter.mirrorServiceIntoFiles()
-                _refreshEnforcementState()
-                break
-            case "health-changed":
-                // Both change the answer to "are rules being applied", which the
-                // tooltip states outright.
                 _refreshEnforcementState()
                 break
             case "mutation-progress":
@@ -693,6 +704,9 @@ SystemTrayIcon {
             tray._autoRuleFetchInFlight = false
             if (!ok || !payload) {
                 console.warn("auto-rule candidates fetch failed:", code, msg)
+                // A request left standing would turn a later unasked fetch into
+                // a "nothing is waiting" window.
+                tray._autoRuleShowAll = false
                 // The turn was spent without showing anything — let whatever is
                 // behind it through rather than stalling the queue on a failure.
                 tray._scheduleDrain()
@@ -723,16 +737,10 @@ SystemTrayIcon {
     /// it belongs to — printing the arrow anyway rendered as "this site
     /// needs itself", which is not a thing anyone can act on.
     ///
-    /// Read from the signal, with the structural check as a backstop: the
-    /// slugs are pinned in `nrr-shared::ipc_payloads`, and a slug added
-    /// there without reaching here must still not produce that row.
+    /// The shared decision, with its structural backstop for a slug this
+    /// build does not know.
     function _isSelfSigned(c) {
-        var signal = String((c || {}).signal || (c || {})["signal"] || "")
-        if (["placeholder-answer", "main-link-blocked", "app-main-link-blocked"]
-                .indexOf(signal) >= 0) return true
-        var candidateAnchor = String((c || {}).anchor || (c || {})["anchor"] || "")
-        var match = String((c || {})["proposed-match"] || (c || {}).proposedMatch || "")
-        return candidateAnchor !== "" && candidateAnchor === match
+        return Pure.autoRuleIsSelfSigned(c)
     }
 
     /// Row subtitle: the site the address was seen with, plus the route when
@@ -810,9 +818,8 @@ SystemTrayIcon {
         // How many of the shown rows are offers a host made about itself.
         // When that is all of them the notice is about sites that do not
         // open, not about addresses some other site needs.
-        var selfSignedCount = 0
-        // Of those, how many are whole programs rather than sites.
-        var appCount = 0
+        // The rows shown, for the shared decision on what the notice is about.
+        var shownRows = []
         // Group by site so rows of one site sit together; ties break on the
         // name, so the same set always lists in the same order.
         // Only what the inbox lists by default: a row the list hides is not
@@ -833,8 +840,7 @@ SystemTrayIcon {
                     : _autoRuleAnswered(id)) continue
             var candidateAnchor = String(c.anchor || c["anchor"] || "")
             var selfSigned = _isSelfSigned(c)
-            if (selfSigned) selfSignedCount += 1
-            if (String(c.signal || c["signal"] || "") === "app-main-link-blocked") appCount += 1
+            shownRows.push(c)
             // A host that signed its own offer is not a site whose
             // companions are being listed, so it must not become the
             // heading — that is what read as "this site needs itself".
@@ -900,30 +906,39 @@ SystemTrayIcon {
         var siteName = anchor !== ""
             ? Pure.displayText(anchor)
             : tr("tray.auto-rules.site-fallback", "a site you use")
-        // Every row is a site that will not open. Saying "addresses a site
-        // needs" over that list states the wrong problem: nobody is missing
-        // a companion, the main route is dropping the site itself.
-        var allSelfSigned = selfSignedCount === ids.length
-        var allApps = ids.length > 0 && appCount === ids.length
-        // Neither "sites" nor "programs" is true of a list holding both.
-        var mixedApps = appCount > 0 && !allApps
-        var titleText = allApps
+        // The heading states only what is true of every row: a site that will
+        // not open is not missing a companion, and a program out of reach of
+        // site rules is not failing on the main route.
+        var noticeKind = Pure.autoRuleNoticeKind(shownRows)
+        var programNames = items.map(function(it) { return it.primaryText }).join(", ")
+        var titleText = noticeKind === "programs-own-resolver"
+            ? tr("tray.auto-rules.title-app-own-resolver", "Programs your site rules do not reach")
+            : noticeKind === "assorted"
+            ? tr("tray.auto-rules.title-assorted", "Suggested rules")
+            : noticeKind === "programs-blocked"
             ? tr("tray.auto-rules.title-app-blocked", "Programs the main route will not carry")
-            : mixedApps
+            : noticeKind === "mixed-blocked"
             ? tr("tray.auto-rules.title-mixed-blocked", "Not getting through on the main route")
-            : allSelfSigned
+            : noticeKind === "sites-blocked"
             ? tr("tray.auto-rules.title-blocked",
                     "Sites the main route will not carry")
             : tr("tray.auto-rules.title", "Addresses a site needs")
         var bodyText
-        if (allApps) {
+        if (noticeKind === "programs-own-resolver") {
+            bodyText = tr("tray.auto-rules.body-app-own-resolver",
+                    "{name} looks up site names on its own, so rules by site name do not apply to it. A rule for the program sends all of its connections over the additional route.")
+                .replace("{name}", programNames)
+        } else if (noticeKind === "assorted") {
+            bodyText = tr("tray.auto-rules.body-assorted",
+                    "Each item below says why it is offered.")
+        } else if (noticeKind === "programs-blocked") {
             bodyText = tr("tray.auto-rules.body-app-blocked",
                     "No connection of {name} goes through on the main route.")
-                .replace("{name}", items.map(function(it) { return it.primaryText }).join(", "))
-        } else if (mixedApps) {
+                .replace("{name}", programNames)
+        } else if (noticeKind === "mixed-blocked") {
             bodyText = tr("tray.auto-rules.body-mixed-blocked",
                     "The programs and sites below keep failing on the main route.")
-        } else if (allSelfSigned) {
+        } else if (noticeKind === "sites-blocked") {
             bodyText = ids.length > 1
                 ? tr("tray.auto-rules.body-blocked-multi",
                         "Connections to {count} sites keep failing on the main route.")
@@ -1010,7 +1025,19 @@ SystemTrayIcon {
         if (observed !== "") {
             _externalSecondary = observed
             _externalSecondaryCachedAtMs = 0
+            _secondaryExternalWithdrawn = false
         }
+    }
+
+    /// The additional link went down or changed: the exit it had is not its
+    /// exit now. Only a fresh answer — the service's push after it reconnects,
+    /// or a check the user asks for — shows one again; neither a remembered
+    /// row nor the "last known" cache may stand in for it meanwhile.
+    property bool _secondaryExternalWithdrawn: false
+    function _withdrawSecondaryExternal() {
+        _externalSecondary = ""
+        _externalSecondaryCachedAtMs = 0
+        _secondaryExternalWithdrawn = true
     }
 
     // ── `?` rules that work only on the other route ──────────────────────────
@@ -1579,9 +1606,6 @@ SystemTrayIcon {
         switch (reason) {
             case "route-unavailable":
                 return tr("tray.block-notice.reason-short.route-unavailable", "Route is down")
-            case "not-covered-by-rules":
-                return tr("tray.block-notice.reason-short.not-covered-by-rules",
-                    "No rule for this address")
             case "blocked-by-rule":
                 return tr("tray.block-notice.reason-short.blocked-by-rule", "Denied by a rule")
             case "ipv6-blocked":
@@ -1601,9 +1625,6 @@ SystemTrayIcon {
                 return tr("tray.block-notice.reason.route-unavailable",
                     "The route these addresses are bound to is down right now, "
                     + "so none of them open. This is one notice for the whole route.")
-            case "not-covered-by-rules":
-                return tr("tray.block-notice.reason.not-covered-by-rules",
-                    "This app is confined to a route, and no rule covers this address there.")
             case "blocked-by-rule":
                 return tr("tray.block-notice.reason.blocked-by-rule",
                     "A rule blocks this address directly.")
@@ -1751,14 +1772,10 @@ SystemTrayIcon {
         nrrNativeBridge.openMainGuiFocused("outage-blocks", "", "")
     }
 
-    /// Whether adding a rule could do anything about this block. A route that
-    /// is down already HAS a rule pointing at it, and the IPv6 / encrypted-DNS
-    /// cuts are governed by a switch — routing those writes a rule that cannot
-    /// answer the cause.
+    /// Whether adding a rule could do anything about this block; the terminal
+    /// UI asks the same function.
     function _blockNoticeIsRouteable(reason) {
-        return reason !== "route-unavailable"
-            && reason !== "ipv6-blocked"
-            && reason !== "dns-lockdown"
+        return Pure.blockNoticeOffersRoute(reason)
     }
 
     /// The one reason behind every row, or "" when they differ. The mute
@@ -2346,6 +2363,116 @@ SystemTrayIcon {
         })
     }
 
+    /// This user's saved rules do not read, so the last applied ones hold:
+    /// said once while no window is on screen to say it, with the way to the
+    /// details; a notice still waiting goes once they read again.
+    property bool _rulesBookNoticeRaised: false
+    function _onRulesBookReading(unreadable) {
+        var step = Pure.rulesBookNoticeStep(_rulesBookNoticeRaised, unreadable)
+        _rulesBookNoticeRaised = step.raised
+        if (!step.raised) {
+            var kept = _noticeQueue.filter(function(n) { return n.kind !== "rules-book-unreadable" })
+            if (kept.length !== _noticeQueue.length) _noticeQueue = kept
+        }
+        if (!step.raise || !showNotifications || _windowOnScreen()) return
+        _presentOrQueue("rules-book-unreadable", function() {
+            if (!tray._rulesBookNoticeRaised) {
+                tray._scheduleDrain()
+                return
+            }
+            promptWindow.present({
+                titleText: tr("notifications.rules-book-unreadable.title",
+                    "Your saved rules cannot be read"),
+                bodyText: tr("notifications.rules-book-unreadable.body",
+                    "Your saved rules cannot be read; the last applied rules stay in force. Changes will not apply until this is fixed."),
+                primaryAction: {
+                    label: tr("action.open-diagnostics", "Open diagnostics"),
+                    actionId: "rules-book-open-diagnostics",
+                    accent: true
+                },
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
+    /// The push fires on change only: a tray that subscribed later reads the
+    /// standing state from the snapshot.
+    function _checkRulesBook() {
+        if (!bridgeAvailable || typeof nrrNativeBridge === "undefined"
+                || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") {
+            return
+        }
+        var corr = nrrNativeBridge.rpcSnapshotInitialGet()
+        if (!corr) return
+        rpc.registerRpcCallback(corr, function(ok, payload) {
+            if (!ok || !payload) return
+            tray._onRulesBookReading(payload["rules-book-unreadable"] === true)
+        })
+    }
+
+    /// A work VPN that lets only its own DNS answer pauses our name handling:
+    /// said once while no window is on screen to say it.
+    property bool _dnsForeignNoticeRaised: false
+    function _onDnsForeignReading(foreignOnly) {
+        var step = Pure.dnsUpstreamForeignNoticeStep(_dnsForeignNoticeRaised, foreignOnly)
+        _dnsForeignNoticeRaised = step.raised
+        if (!step.raise || !showNotifications || _windowOnScreen()) return
+        _presentOrQueue("dns-foreign-only", function() {
+            promptWindow.present({
+                titleText: tr("notifications.dns-foreign-only.title",
+                    "Name handling is paused by your VPN"),
+                bodyText: tr("notifications.dns-foreign-only.body",
+                    "Your work VPN only lets its own DNS answer, so NetRuleRouter's name handling is paused until another DNS answers. Rules by site name may not apply meanwhile. Disconnect the VPN, or ask its administrator to allow other DNS servers."),
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
+    /// The service stopped though nobody here asked for it: said once, with the
+    /// two ways out. The window shows the same as a banner while it is open.
+    property bool _serviceWasRunning: false
+    property bool _serviceLossRaised: false
+    function _onServiceStateForLoss() {
+        var slug = _serviceStatusSlug(serviceStatus)
+        if (slug === "running") _serviceWasRunning = true
+        var expected = typeof nrrServiceController !== "undefined" && nrrServiceController
+            && typeof nrrServiceController.stopWasExpected === "function"
+            && nrrServiceController.stopWasExpected()
+        var step = Pure.serviceLossStep(_serviceLossRaised, slug, _serviceWasRunning,
+            expected === true, supports("killSwitch"))
+        _serviceLossRaised = step.raised
+        if (!step.raise || !showNotifications || _windowOnScreen()) return
+        var canRestore = step.actions.indexOf("restore-network") >= 0
+        _presentOrQueue("service-lost", function() {
+            var config = {
+                titleText: tr("notifications.service-lost.title",
+                    "The service stopped"),
+                bodyText: canRestore
+                    ? tr("notifications.service-lost.body",
+                        "The NetRuleRouter service stopped unexpectedly, so your rules are not applied. Start it again, or restore network access if the connection is cut.")
+                    : tr("notifications.service-lost.body-start-only",
+                        "The NetRuleRouter service stopped unexpectedly, so your rules are not applied. Start it again."),
+                primaryAction: {
+                    label: tr("tray.menu.start-service", "Start service"),
+                    actionId: "service-lost-start",
+                    accent: true
+                },
+                dismissActionId: "service-lost-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            }
+            if (canRestore) {
+                config.secondaryAction = {
+                    label: tr("settings.service.recovery.action", "Restore network"),
+                    actionId: "service-lost-restore"
+                }
+            }
+            promptWindow.present(config)
+        })
+    }
+
     /// A forwarded network (WSL, a container or VM bridge) came up and the user
     /// has not said what it gets while the tunnel is down: asked while no window
     /// is on screen. Read on an adapter change, the policy only once one is up.
@@ -2523,6 +2650,31 @@ SystemTrayIcon {
         })
     }
 
+    /// Another VPN's server stopped on the main link: asked in the window,
+    /// announced here only while the window is not on screen.
+    function _onVpnGatewayAwaitingConfirmation(event) {
+        var offers = Pure.vpnGatewayOffers(event.gateways || [])
+        if (offers.length === 0 || !showNotifications) return
+        if (_windowOnScreen()) return
+        var addresses = []
+        for (var i = 0; i < offers.length; i += 1) addresses.push(Pure.displayText(offers[i].address))
+        _presentOrQueue("vpn-gateway-trust", function() {
+            promptWindow.present({
+                titleText: tr("notifications.vpn-gateway-trust.title", "Let this VPN connect?"),
+                bodyText: tr("notifications.vpn-gateway-trust.tray-body",
+                        "A VPN is waiting for your answer in the NetRuleRouter window: leak protection stopped it from reaching its server {addresses}.")
+                    .replace("{addresses}", addresses.join(", ")),
+                primaryAction: {
+                    label: tr("action.open-main-window", "Open NetRuleRouter"),
+                    actionId: "vpn-client-trust-open-window",
+                    accent: true
+                },
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
     /// Leak protection is not what the user's settings ask for, or is in force
     /// because of another user's. The reason picks the sentence; one this
     /// build does not know has none and is dropped rather than shown raw.
@@ -2554,19 +2706,45 @@ SystemTrayIcon {
     function _protectionCoverageText(reason) {
         if (reason === "blanket-block-not-armed")
             return tr("status.protection.blanket-block-not-armed",
-                "Full blocking is not switched on: the address of the additional link is unknown, and blocking everything without it would cut the link itself. Traffic outside your rules is not blocked.")
+                "Leak protection \"Everything\" is not in force yet: the address of the additional connection is unknown, and blocking everything without it would cut that connection too. Traffic outside your rules is not blocked.")
         if (reason === "machine-wide-cut-by-another-user")
             return tr("status.protection.machine-wide-cut-by-another-user",
                 "Another user of this computer switched on leak protection. Part of it cannot be limited to one account, so IPv6 and ping are off for everyone until they switch it off.")
         return ""
     }
 
-    /// The client dropped frames, or re-subscribed after a reconnect: whatever
-    /// the tray derived from pushes may be behind, so it is re-read.
-    function _onPushGap() {
+    /// Frames were dropped (by the client or the service), or the client
+    /// re-subscribed after a reconnect: whatever the tray derived from pushes
+    /// may be behind, so it is re-read, once per burst of gaps.
+    function _onPushGap() { _pushGapRereadTimer.restart() }
+
+    property Timer _pushGapRereadTimer: Timer {
+        interval: 500
+        repeat: false
+        onTriggered: tray._rereadAfterPushGap()
+    }
+
+    function _rereadAfterPushGap() {
         _refreshRoutingPaused()
         _refreshEnforcementState()
         verifyVerdicts.refresh()
+        _checkForwarded()
+        _checkRulesBook()
+        _refreshAutoRulePendingCount()
+        // A lost revision change: with the window closed the linked files
+        // still follow the rules in force.
+        boundFileWriter.mirrorServiceIntoFiles()
+    }
+
+    /// The menu's count of waiting suggestions, without raising the prompt.
+    function _refreshAutoRulePendingCount() {
+        if (!bridgeAvailable || !rpc
+                || typeof rpc.rpcAutoRuleCandidatesList !== "function") return
+        var corr = rpc.rpcAutoRuleCandidatesList()
+        if (!corr || corr === "") return
+        rpc.registerRpcCallback(corr, function(ok, payload) {
+            if (ok && payload) tray._autoRulePendingCount = Number(payload["pending-count"] || 0)
+        })
     }
 
     function _refreshRoutingPaused() {
@@ -2672,6 +2850,7 @@ SystemTrayIcon {
     function _onEnforcementStatusChanged(event) {
         var status = String(event.status || "")
         var role = String(event.role || "")
+        if (Pure.secondaryLinkEnded(status, role)) _withdrawSecondaryExternal()
         var wasDown = _enforcementDownRoles.indexOf(role) >= 0
         if (status === "" || status === "ok") {
             _clearEnforcementNotice(role)
@@ -3046,8 +3225,6 @@ SystemTrayIcon {
         switch (reason) {
             case "route-unavailable":
                 return tr("block-reason.route-unavailable", "Route outages")
-            case "not-covered-by-rules":
-                return tr("block-reason.not-covered-by-rules", "Addresses no rule covers")
             case "blocked-by-rule":
                 return tr("block-reason.blocked-by-rule", "Denied by rules")
             case "ipv6-blocked":
@@ -3129,6 +3306,13 @@ SystemTrayIcon {
     /// pressing Esc arrives here as the dismiss action id.
     function _onPromptAction(actionId, selectedIndexes) {
         var action = String(actionId)
+        if (action === "leak-protection-confirm" || action === "leak-protection-cancel") {
+            var level = _leakConfirmLevel
+            _leakConfirmLevel = ""
+            if (action === "leak-protection-confirm" && level !== "") _setLeakProtection(level, true)
+            _scheduleDrain()
+            return
+        }
         // "Details" expands the evidence under each row and leaves the notice
         // standing — looking at something must not throw away the answer in
         // progress. Nothing is recorded, nothing is cleared. It used to open
@@ -3246,6 +3430,30 @@ SystemTrayIcon {
             _scheduleDrain()
             return
         }
+        if (action === "service-lost-start") {
+            if (typeof nrrServiceController !== "undefined" && nrrServiceController)
+                nrrServiceController.startService()
+            _scheduleDrain()
+            return
+        }
+        if (action === "service-lost-dismiss") {
+            _scheduleDrain()
+            return
+        }
+        if (action === "service-lost-restore") {
+            if (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
+                    && typeof nrrNativeBridge.openMainGuiFocused === "function")
+                nrrNativeBridge.openMainGuiFocused("settings", "restore-network", "{}")
+            else
+                triggerAction("settings")
+            _scheduleDrain()
+            return
+        }
+        if (action === "rules-book-open-diagnostics") {
+            triggerAction("diagnostics")
+            _scheduleDrain()
+            return
+        }
         if (action === "system-dns-open-restore-network") {
             if (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
                     && typeof nrrNativeBridge.openMainGuiFocused === "function")
@@ -3284,7 +3492,8 @@ SystemTrayIcon {
             _scheduleDrain()
             return
         }
-        if (action === "enforcement-restored-dismiss") {
+        if (action === "enforcement-restored-dismiss"
+                || action === "auto-rules-mode-failed-dismiss") {
             _scheduleDrain()
             return
         }
@@ -3523,35 +3732,80 @@ SystemTrayIcon {
 
     /// Write the per-SID `auto-rules-mode`, leaving every other policy field as
     /// the service holds it (the update is a FULL write). `onWritten` runs only
-    /// on success.
-    function _setAutoRulesMode(mode, onWritten) {
+    /// on success. A busy service gets the write again; a failure that stays is
+    /// told to the user, since the menu click has no other answer.
+    function _setAutoRulesMode(mode, onWritten, attemptsMade) {
         if (!bridgeAvailable
                 || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
                 || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function"
                 || typeof nrrNativeBridge.rpcRoutePolicyUpdate !== "function") {
             return
         }
-        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
-        rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
-            if (!ok) {
-                console.warn("auto-rule mode read failed:", code, msg)
+        var attempt = Number(attemptsMade || 0)
+        // A new click supersedes a repeat still waiting and any answer still due.
+        if (attempt === 0) {
+            tray._autoRulesModeRetryTimer.stop()
+            tray._autoRulesModeGeneration += 1
+        }
+        var generation = tray._autoRulesModeGeneration
+        var failed = function(stage, code, msg) {
+            if (generation !== tray._autoRulesModeGeneration) return
+            var delay = Pure.busyRetryDelayMs(code, attempt)
+            if (delay >= 0) {
+                console.log("auto-rule mode", stage, "got no answer in time; again in", delay, "ms")
+                tray._autoRulesModeRetry = function() {
+                    tray._setAutoRulesMode(mode, onWritten, attempt + 1)
+                }
+                tray._autoRulesModeRetryTimer.interval = delay
+                tray._autoRulesModeRetryTimer.restart()
                 return
             }
+            console.warn("auto-rule mode", stage, "failed:", code, msg)
+            tray._noteAutoRulesModeFailed(code)
+        }
+        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
+        if (!readCorr) { failed("read", "bridge-unavailable", ""); return }
+        rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
+            if (!ok) { failed("read", code, msg); return }
+            if (generation !== tray._autoRulesModeGeneration) return
             var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
             var req = tray._buildFullRoutePolicyReq(cur)
             req["auto-rules-mode"] = String(mode)
             // The window may be writing other fields meanwhile; name ours.
             req["apply-only"] = ["auto-rules-mode"]
             var writeCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
+            if (!writeCorr) { failed("write", "bridge-unavailable", ""); return }
             tray.rpc.registerRpcCallback(writeCorr, function(ok2, p2, code2, msg2) {
-                if (!ok2) {
-                    console.warn("auto-rule mode write failed:", code2, msg2)
-                    return
-                }
+                if (!ok2) { failed("write", code2, msg2); return }
                 tray._autoRulesMode = String(mode)
                 tray._recordIntent({ "namespace": "route-policy",
                                      "merge": { "auto-rules-mode": String(mode) } })
                 if (typeof onWritten === "function") onWritten()
+            })
+        })
+    }
+
+    property var _autoRulesModeRetry: null
+    property int _autoRulesModeGeneration: 0
+    property Timer _autoRulesModeRetryTimer: Timer {
+        repeat: false
+        onTriggered: {
+            var again = tray._autoRulesModeRetry
+            tray._autoRulesModeRetry = null
+            if (typeof again === "function") again()
+        }
+    }
+
+    function _noteAutoRulesModeFailed(code) {
+        var body = tray.tr("status.auto-rules-failed",
+                "Could not update the auto-rules setting: ")
+            + Pure.ipcErrorLabel(code, null, tray.tr)
+        tray._presentOrQueue("auto-rules-mode-failed", function() {
+            promptWindow.present({
+                titleText: tray.tr("tray.auto-rules.title", "Addresses a site needs"),
+                bodyText: body,
+                dismissActionId: "auto-rules-mode-failed-dismiss",
+                autoRetireMs: tray._infoNoticeMs
             })
         })
     }
@@ -3635,7 +3889,8 @@ SystemTrayIcon {
                 tray._externalPrimaryCachedAtMs = primary.at
             }
             var secondary = take("secondary")
-            if (tray._externalSecondary === "" && secondary.ip !== "") {
+            if (tray._externalSecondary === "" && secondary.ip !== ""
+                    && !tray._secondaryExternalWithdrawn) {
                 tray._externalSecondary = secondary.ip
                 tray._externalSecondaryCachedAtMs = secondary.at
             }
@@ -3714,9 +3969,21 @@ SystemTrayIcon {
     /// for: with `auto` nothing is ever suggested.
     property string _autoRulesMode: "suggest"
 
-    /// Kill-switch on/off, as the service currently holds it. The user
-    /// configures HOW it behaves in the window; the tray only flips it.
-    property bool _killSwitchEnabled: false
+    /// Leak protection and the default route, as the service currently holds
+    /// them. The window explains the levels; the tray only picks one.
+    property string _leakProtection: "off"
+    property string _routeMode: "prefer-primary"
+    on_LeakProtectionChanged: _syncLeakMenu()
+    on_RouteModeChanged: _syncLeakMenu()
+
+    /// A triggered checkable item flips its own `checked`, which drops any
+    /// binding; the three are therefore set from the held value every time.
+    function _syncLeakMenu() {
+        var level = Pure.coerceLeakProtection(_routeMode, _leakProtection)
+        leakOffMenuItem.checked = level === "off"
+        leakSitesMenuItem.checked = level === "sites"
+        leakEverythingMenuItem.checked = level === "everything"
+    }
 
     /// Everything the menu needs that is not already pushed to us. Cheap reads
     /// only, on an explicit menu open.
@@ -3734,40 +4001,123 @@ SystemTrayIcon {
             var policy = payload["route-policy"] || payload.routePolicy || {}
             var mode = String(policy["auto-rules-mode"] || "")
             if (mode !== "") tray._autoRulesMode = mode
-            tray._killSwitchEnabled = policy["kill-switch-enabled"] === true
+            var standing = payload["enforcement-status"] || []
+            for (var s = 0; s < standing.length; s += 1) {
+                var report = standing[s] || {}
+                if (Pure.secondaryLinkEnded(report.status, report.role))
+                    tray._withdrawSecondaryExternal()
+            }
+            tray._routeMode = Pure.routePolicyEffective(policy, "mode")
+            tray._leakProtection = Pure.routePolicyEffective(policy, "leak-protection")
+            tray._syncLeakMenu()
         })
     }
 
-    /// Turn the kill-switch on or off, leaving every other field of the policy
-    /// exactly as the service holds it: the update is a FULL write, so anything
-    /// omitted would silently revert to a default.
-    function _setKillSwitch(want) {
+    /// The level picked in the menu, held while its confirmation is on screen.
+    property string _leakConfirmLevel: ""
+
+    /// Set leak protection, leaving every other field of the policy exactly
+    /// as the service holds it: the update is a FULL write, so anything
+    /// omitted would silently revert to a default. A level that must be
+    /// confirmed first (`leakProtectionConfirmSlug`) is asked about, and only
+    /// a yes (`confirmed`) writes it.
+    function _setLeakProtection(level, confirmed) {
         if (!bridgeAvailable || typeof nrrNativeBridge === "undefined"
                 || nrrNativeBridge === null
                 || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function"
                 || typeof nrrNativeBridge.rpcRoutePolicyUpdate !== "function") {
+            tray._syncLeakMenu()
             return
         }
         var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
         rpc.registerRpcCallback(readCorr, function(ok, payload, code, msg) {
             if (!ok) {
-                console.warn("tray kill-switch: policy read failed:", code, msg)
+                console.warn("tray leak protection: policy read failed:", code, msg)
+                tray._syncLeakMenu()
                 return
             }
             var cur = (payload && (payload["route-policy"] || payload.routePolicy)) || {}
-            var req = tray._buildFullRoutePolicyReq(cur)
-            req["kill-switch-enabled"] = (want === true)
-            req["apply-only"] = ["kill-switch-enabled"]
-            var writeCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
-            tray.rpc.registerRpcCallback(writeCorr, function(ok2, p2, code2, msg2) {
-                if (!ok2) {
-                    console.warn("tray kill-switch: write failed:", code2, msg2)
+            if (confirmed === true
+                    || typeof nrrNativeBridge.rpcSnapshotInterfacesGet !== "function") {
+                tray._writeLeakProtection(cur, level)
+                return
+            }
+            var rowsCorr = nrrNativeBridge.rpcSnapshotInterfacesGet()
+            rpc.registerRpcCallback(rowsCorr, function(rowsOk, rowsPayload) {
+                var rows = (rowsOk && rowsPayload && rowsPayload.rows) || []
+                var i = Pure.boundWireRowIndex(rows, cur["secondary"] || null)
+                var row = i >= 0 ? Pure.mapWireInterfaceRow(rows[i]) : null
+                var mode = Pure.routePolicyEffective(cur, "mode")
+                var why = Pure.leakProtectionConfirmSlug(
+                    Pure.coerceLeakProtection(mode, Pure.routePolicyEffective(cur, "leak-protection")),
+                    Pure.coerceLeakProtection(mode, level), row)
+                if (why === "") {
+                    tray._writeLeakProtection(cur, level)
                     return
                 }
-                tray._killSwitchEnabled = (want === true)
-                tray._recordIntent({ "namespace": "route-policy",
-                                     "merge": { "kill-switch-enabled": want === true } })
+                tray._syncLeakMenu()
+                tray._confirmLeakProtection(level, why, row)
             })
+        })
+    }
+
+    /// The yes/no before a level that holds traffic, in the tray's own window:
+    /// a native menu cannot carry a dialog. Same wording as the main window.
+    function _confirmLeakProtection(level, why, row) {
+        var holdsNow = why === "holds-now"
+        var body = holdsNow
+            ? tr("dialog.leak-holds-now.body",
+                "With leak protection set to Everything, traffic is held right away: the internet stops until the additional connection returns.")
+                + "\n" + tr("dialog.leak-holds-now.effect",
+                    "Your local network and what your rules send over the main connection keep working.")
+            : tr("dialog.unroutable-secondary.adapter-line", "Adapter: {name}")
+                    .replace("{name}", Pure.adapterDisplayName(row || {}))
+                + "\n" + tr("dialog.unroutable-secondary.body-kill-switch",
+                    "It is currently assigned as your additional route.")
+                + " " + (Pure.unroutableInterfaceReasonSlug(row) === "virtual-host-only"
+                    ? tr("dialog.unroutable-secondary.reason-virtual-host-only",
+                        "It looks like a host-only virtual adapter (VirtualBox, VMware or Hyper-V internal) and it has no gateway, so it has no way out to the network.")
+                    : tr("dialog.unroutable-secondary.reason-no-forwarding-path",
+                        "It has no gateway and no route out, so there is nowhere for it to send traffic."))
+                + "\n" + tr("dialog.unroutable-secondary.effect-kill-switch-arming",
+                    "Once leak protection is on, those destinations are BLOCKED instead: the sites behind those rules stop loading.")
+        _presentOrQueue("leak-protection-confirm", function() {
+            tray._leakConfirmLevel = level
+            promptWindow.present({
+                titleText: holdsNow
+                    ? tr("dialog.leak-holds-now.title", "The additional connection is not available")
+                    : tr("dialog.unroutable-secondary.title", "This adapter cannot carry traffic out"),
+                bodyText: body,
+                primaryAction: {
+                    label: tr("dialog.unroutable-secondary.confirm-kill-switch", "Turn it on anyway"),
+                    actionId: "leak-protection-confirm",
+                    accent: true
+                },
+                dismissAction: {
+                    label: tr("action.cancel", "Cancel"),
+                    actionId: "leak-protection-cancel"
+                },
+                autoRetireMs: tray._promptAutoRetireMs
+            })
+        })
+    }
+
+    function _writeLeakProtection(cur, level) {
+        var req = tray._buildFullRoutePolicyReq(cur)
+        req["leak-protection"] = Pure.coerceLeakProtection(req["mode"], level)
+        req["apply-only"] = ["leak-protection"]
+        var writeCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
+        tray.rpc.registerRpcCallback(writeCorr, function(ok, p, code, msg) {
+            if (!ok) {
+                console.warn("tray leak protection: write failed:", code, msg)
+                tray._syncLeakMenu()
+                return
+            }
+            tray._routeMode = String(req["mode"])
+            tray._leakProtection = req["leak-protection"]
+            tray._syncLeakMenu()
+            tray._recordIntent({ "namespace": "route-policy",
+                                 "merge": { "leak-protection": req["leak-protection"] } })
         })
     }
 
@@ -3802,29 +4152,30 @@ SystemTrayIcon {
                 console.warn("tray external-address probe failed:", code, msg)
                 return
             }
-            tray._applyExternalAddressRows(payload)
+            tray._applyExternalAddressRows(payload, true)
         })
     }
 
     /// The service leaves `selected-role` empty, so which row is which route
-    /// comes from the user's bindings, read fresh beside the rows.
-    function _applyExternalAddressRows(payload) {
+    /// comes from the user's bindings, read fresh beside the rows. `fresh`:
+    /// the rows answer a check made just now, not a remembered one.
+    function _applyExternalAddressRows(payload, fresh) {
         var rows = (payload && payload.rows) || []
         if (!bridgeAvailable || typeof nrrNativeBridge === "undefined"
                 || nrrNativeBridge === null
                 || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") {
-            _takeRouteExternalAddresses(rows, null)
+            _takeRouteExternalAddresses(rows, null, fresh === true)
             return
         }
         var corr = nrrNativeBridge.rpcSnapshotInitialGet()
         rpc.registerRpcCallback(corr, function(ok, snapshot) {
             var policy = ok && snapshot
                 ? (snapshot["route-policy"] || snapshot.routePolicy || null) : null
-            tray._takeRouteExternalAddresses(rows, policy)
+            tray._takeRouteExternalAddresses(rows, policy, fresh === true)
         })
     }
 
-    function _takeRouteExternalAddresses(rows, policy) {
+    function _takeRouteExternalAddresses(rows, policy, fresh) {
         var addressOf = function(role) {
             var i = Pure.boundWireRowIndex(rows, policy ? policy[role] : null)
             if (i < 0) return ""
@@ -3839,9 +4190,10 @@ SystemTrayIcon {
         }
         // The push event is the fresher source for the additional link, so an
         // empty row must not erase what it told us.
-        if (secondary !== "") {
+        if (secondary !== "" && (fresh || !_secondaryExternalWithdrawn)) {
             _externalSecondary = secondary
             _externalSecondaryCachedAtMs = 0
+            _secondaryExternalWithdrawn = false
         }
         // Nothing live for a route this time: fall back to what was last
         // known rather than showing an empty menu.
@@ -4069,6 +4421,7 @@ SystemTrayIcon {
             tray._enforcementActive = revision !== ""
             tray._enforcementKnown = true
             tray._onSystemDnsReading(Pure.systemDnsNotRestored(payload))
+            tray._onDnsForeignReading(Pure.dnsUpstreamForeignOnly(payload))
             tray.refreshTooltip()
         })
     }
@@ -4092,6 +4445,9 @@ SystemTrayIcon {
             return tr("tray.tooltip.service-pending", "Service changing state...")
         if (slug === "unknown")
             return tr("tray.tooltip.service-unknown", "Cannot read service status")
+        if (_contractSkew !== "")
+            return tr("tray.tooltip.contract-skew",
+                "App and service builds differ — changes are off")
         // The service runs. Whether anything is being applied is a separate
         // question, and answering it wrongly is what sent a user looking for a
         // connection problem that did not exist.
@@ -4293,9 +4649,11 @@ SystemTrayIcon {
     function _showBlockNoticeBacklog(summary) {
         var names = hideBlockNoticeAddresses ? [] : summary.shown
         var count = summary.count
-        var body = tr("notifications.block-notice.backlog.body",
-                "The service blocked {count} connection(s) while NetRuleRouter was not open.")
-            .replace("{count}", "<b>" + String(count) + "</b>")
+        // The sentence holds no other digits, so the first match is the count.
+        var body = Plurals.counted(tr, "notifications.block-notice.backlog.counted.", count,
+                "The service blocked {count} connection while NetRuleRouter was not open.",
+                "The service blocked {count} connections while NetRuleRouter was not open.")
+            .replace(String(count), "<b>" + String(count) + "</b>")
         if (names.length > 0) {
             var list = names.map(function(n) { return _escapeMarkup(Pure.displayText(n)) }).join(", ")
             if (summary.more > 0) {
@@ -4324,6 +4682,20 @@ SystemTrayIcon {
         })
     }
 
+    /// Which side is behind on the wire contract; writes are refused across it.
+    property string _contractSkew: ""
+    function _refreshContractSkew() {
+        if (typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcServiceInfo !== "function")
+            return
+        var corr = nrrNativeBridge.rpcServiceInfo()
+        rpc.registerRpcCallback(corr, function(ok, p) {
+            if (!ok || !p) return
+            tray._contractSkew = Pure.contractSkew(p, Pure.WIRE_CONTRACT_REVISION)
+            tray.refreshTooltip()
+        })
+    }
+
     function _subscribeStatusUpdatesTray() {
         if (!bridgeAvailable
                 || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
@@ -4348,8 +4720,10 @@ SystemTrayIcon {
                 // The event stream is live, so the tray can now say what is
                 // actually being enforced instead of guessing.
                 tray._refreshEnforcementState()
+                tray._refreshContractSkew()
                 tray._refreshNoticeMutes(null)
                 tray._scheduleSettingsLostCheck()
+                tray._checkRulesBook()
                 // Both surfaces drain the same backlog, and the main window
                 // does it immediately. Waiting lets its acknowledgement land
                 // first, so a user who has both up is told once, not twice.
@@ -4430,15 +4804,44 @@ SystemTrayIcon {
             onTriggered: tray.showAutoRuleSuggestions()
         }
         MenuSeparator {}
-        // How the kill-switch behaves is configured in the window; from here it
-        // is one switch, which is what a tray is for.
+        // Leak protection: the three levels as one exclusive group under a
+        // header row, not a submenu (Qt 6.10's D-Bus menu crashes the tray
+        // walking one). "Routed sites" is greyed out while unmatched traffic
+        // goes through the additional connection.
         MenuItem {
-            text: tray._killSwitchEnabled
-                ? tr("tray.menu.kill-switch-off", "Turn leak protection off")
-                : tr("tray.menu.kill-switch-on", "Turn leak protection on")
-            enabled: tray.serviceStatus === 4
-            onTriggered: tray._setKillSwitch(!tray._killSwitchEnabled)
+            text: tr("settings.routing.kill-switch.title", "Leak protection")
+            enabled: false
         }
+        MenuItemGroup {
+            id: leakMenuGroup
+            exclusive: true
+        }
+        MenuItem {
+            id: leakOffMenuItem
+            group: leakMenuGroup
+            checkable: true
+            text: tr("settings.routing.leak-protection.option-off", "Off")
+            enabled: tray.serviceStatus === 4
+            onTriggered: tray._setLeakProtection("off")
+        }
+        MenuItem {
+            id: leakSitesMenuItem
+            group: leakMenuGroup
+            checkable: true
+            text: tr("settings.routing.leak-protection.option-sites", "Routed sites")
+            enabled: tray.serviceStatus === 4
+                && Pure.leakProtectionChoices(tray._routeMode).indexOf("sites") >= 0
+            onTriggered: tray._setLeakProtection("sites")
+        }
+        MenuItem {
+            id: leakEverythingMenuItem
+            group: leakMenuGroup
+            checkable: true
+            text: tr("settings.routing.leak-protection.option-everything", "Everything")
+            enabled: tray.serviceStatus === 4
+            onTriggered: tray._setLeakProtection("everything")
+        }
+        MenuSeparator {}
         MenuItem {
             text: tray.routingPaused
                 ? tr("action.resume-rules", "Enable rules")

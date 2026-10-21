@@ -31,6 +31,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::boot_clock::BootInstant;
 use crate::ipc::{
     CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcOperationClass,
     IpcRequestContext, IpcRequestEnvelope, Prechecked,
@@ -314,6 +315,15 @@ fn preview_principal(caller_sid: &str) -> String {
     }
 }
 
+/// Whether a kind-specific payload names the shared admin baseline; the same
+/// flag the wire classifier reads to pick the confirm's class.
+fn names_admin_baseline(payload: &serde_json::Value) -> bool {
+    payload
+        .get("admin-baseline")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 impl MutationSubmitHandler {
     /// Class consistency: dry-run intentionally bypasses the router-level
     /// token gate by declaring `ReadSnapshot`. A mismatched envelope is almost
@@ -347,12 +357,7 @@ impl MutationSubmitHandler {
         // if the admin has its own diverged per-SID rules. The dry-run
         // itself is read-only (no elevation needed to preview baseline);
         // the commit is gated by the `mutation-request` class on confirm.
-        let admin_baseline = body
-            .payload
-            .get("admin-baseline")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let principal = if admin_baseline {
+        let principal = if names_admin_baseline(&body.payload) {
             nrr_storage::BASELINE_PRINCIPAL.to_string()
         } else {
             preview_principal(ctx.caller_stored())
@@ -366,11 +371,10 @@ impl MutationSubmitHandler {
                 .unverified_rows(body.mutation_kind, &body.payload),
             _ => Vec::new(),
         };
-        let now = Instant::now();
         let token = self.token_store.issue(
             IpcOperationName::MutationSubmit,
             StoredMutation::from_request(&body, ctx.caller_stored(), ctx.caller_is_elevated),
-            now + self.token_ttl,
+            BootInstant::now() + self.token_ttl,
         );
 
         let resp = MutationDryRunResponse {
@@ -431,7 +435,7 @@ impl MutationSubmitHandler {
             .consume(
                 confirm_token(request)?,
                 IpcOperationName::MutationSubmit,
-                Instant::now(),
+                BootInstant::now(),
             )
             .map_err(IpcError::from)?;
         token_matches(
@@ -441,6 +445,16 @@ impl MutationSubmitHandler {
             stored.kind,
             body.mutation_kind,
         )?;
+        // The partition follows the confirm, the content follows the token:
+        // a preview of one partition must not be committed to the other.
+        if names_admin_baseline(&stored.payload) != names_admin_baseline(&body.payload) {
+            return Err(IpcError {
+                code: IpcErrorCode::PreconditionFailed,
+                message: "mutation.submit confirm targets a different rules set than its dry-run"
+                    .into(),
+                diagnostics_id: None,
+            });
+        }
         Ok((principal, stored))
     }
 
@@ -777,6 +791,33 @@ mod tests {
             .expect_err("expired");
         assert_eq!(err.code, IpcErrorCode::ConfirmationExpired);
         assert_eq!(tokens.len(), 0, "expired token must still be removed");
+    }
+
+    /// A preview left open over a night in suspend: no waking time passes, so a
+    /// deadline on Linux's `Instant` (frozen while suspended) would accept it.
+    #[test]
+    fn a_token_from_before_a_long_sleep_is_expired_on_confirm() {
+        let (h, tokens, _ops, exec) = make_handler();
+        let body = serde_json::json!({
+            "mutation-kind": "rules-update",
+            "payload": { "route": "primary", "rules": [] },
+        });
+        let mut dry_body = body.clone();
+        dry_body["dry-run"] = serde_json::json!(true);
+        let dry: MutationDryRunResponse =
+            serde_json::from_value(h.handle(&dry_run_envelope(dry_body), &ctx()).unwrap()).unwrap();
+        crate::boot_clock::simulate_sleep(Duration::from_secs(8 * 3600));
+        let mut confirm_body = body;
+        confirm_body["dry-run"] = serde_json::json!(false);
+        let err = h
+            .handle(
+                &confirm_envelope(confirm_body, &dry.confirmation_token),
+                &ctx(),
+            )
+            .expect_err("expired by the sleep");
+        assert_eq!(err.code, IpcErrorCode::ConfirmationExpired);
+        assert_eq!(tokens.len(), 0);
+        assert_eq!(exec.executed_count(), 0);
     }
 
     #[test]
@@ -1417,5 +1458,65 @@ mod tests {
             &ctx_sid("S-1-5-21-KID"),
         )
         .expect("alert acknowledgement is not a rule change");
+    }
+
+    fn baseline_body(dry_run: bool, baseline: bool) -> serde_json::Value {
+        serde_json::json!({
+            "mutation-kind": "rules-update",
+            "payload": { "route": "primary", "rules": [], "admin-baseline": baseline },
+            "dry-run": dry_run,
+        })
+    }
+
+    #[test]
+    fn confirm_refuses_a_baseline_commit_of_a_non_baseline_dry_run() {
+        let (h, _tokens, _ops, exec) = make_handler();
+        let dry: MutationDryRunResponse = serde_json::from_value(
+            h.handle(&dry_run_envelope(baseline_body(true, false)), &ctx())
+                .unwrap(),
+        )
+        .unwrap();
+        let err = h
+            .handle(
+                &confirm_envelope(baseline_body(false, true), &dry.confirmation_token),
+                &ctx(),
+            )
+            .expect_err("a user-set preview must not land in the baseline");
+        assert_eq!(err.code, IpcErrorCode::PreconditionFailed);
+        assert_eq!(exec.executed_count(), 0);
+    }
+
+    #[test]
+    fn confirm_refuses_an_own_commit_of_a_baseline_dry_run() {
+        let (h, _tokens, _ops, exec) = make_handler();
+        let dry: MutationDryRunResponse = serde_json::from_value(
+            h.handle(&dry_run_envelope(baseline_body(true, true)), &ctx())
+                .unwrap(),
+        )
+        .unwrap();
+        let err = h
+            .handle(
+                &user_scoped_confirm_envelope(baseline_body(false, false), &dry.confirmation_token),
+                &ctx_sid("S-1-5-21-1-2-3-1001"),
+            )
+            .expect_err("a baseline preview must not land in the user's own rules");
+        assert_eq!(err.code, IpcErrorCode::PreconditionFailed);
+        assert_eq!(exec.executed_count(), 0);
+    }
+
+    #[test]
+    fn confirm_accepts_a_baseline_commit_of_a_baseline_dry_run() {
+        let (h, _tokens, _ops, exec) = make_handler();
+        let dry: MutationDryRunResponse = serde_json::from_value(
+            h.handle(&dry_run_envelope(baseline_body(true, true)), &ctx())
+                .unwrap(),
+        )
+        .unwrap();
+        h.handle(
+            &confirm_envelope(baseline_body(false, true), &dry.confirmation_token),
+            &ctx(),
+        )
+        .expect("matching sets confirm");
+        assert_eq!(exec.executed_count(), 1);
     }
 }

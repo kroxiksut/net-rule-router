@@ -22,6 +22,7 @@
 //! files through [`DnsFiles`], so every mechanism is tested against fakes.
 
 mod capture;
+mod name_cache;
 mod network_manager;
 pub(crate) mod resolv_conf;
 mod resolvconf;
@@ -42,7 +43,9 @@ pub use resolvconf::{
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
-use nrr_platform_api::dns::{SystemDnsServersPort, UpstreamDnsCandidate};
+use nrr_platform_api::dns::{
+    once_per_link, once_per_server, SystemDnsServersPort, UpstreamDnsCandidate,
+};
 use nrr_platform_api::dns_redirect::{
     DnsNamespaceExemption, RedirectHandle, RedirectState, SystemDnsRedirectPort,
 };
@@ -361,14 +364,27 @@ impl<C: DnsCommands> ResolvedDnsRedirect<C> {
         self.checked("resolvectl", &args, "set a link's routing domains")
     }
 
-    fn remember_taken(&self, links: &[String]) -> Result<(), PlatformError> {
+    /// The names go in the file the stop hook and the reset script read; the
+    /// interface indexes beside it tell a link that came back from another one
+    /// that reuses the name.
+    fn remember_taken(&self, links: &[(String, u32)]) -> Result<(), PlatformError> {
         let mut known = read_taken(&self.taken_file);
-        for link in links {
-            if !known.contains(link) {
-                known.push(link.clone());
+        let mut indexes = read_taken_indexes(&self.indexes_file());
+        for (name, index) in links {
+            if !known.contains(name) {
+                known.push(name.clone());
             }
+            indexes.insert(name.clone(), *index);
         }
-        write_taken(&self.taken_file, &known)
+        write_taken(&self.taken_file, &known)?;
+        write_taken_indexes(&self.indexes_file(), &indexes);
+        Ok(())
+    }
+
+    fn indexes_file(&self) -> PathBuf {
+        let mut name = self.taken_file.clone().into_os_string();
+        name.push(".index");
+        PathBuf::from(name)
     }
 
     /// Hand `~.` back to every link we took it from that still exists.
@@ -378,10 +394,15 @@ impl<C: DnsCommands> ResolvedDnsRedirect<C> {
             return Ok(());
         }
         let current = self.links("domain")?;
+        let indexes = read_taken_indexes(&self.indexes_file());
         for name in &taken {
             let Some(link) = current.iter().find(|l| &l.name == name) else {
                 continue; // The connection is gone; it reclaims on its return.
             };
+            // Same name, another interface: it never held `~.` through us.
+            if indexes.get(name).is_some_and(|index| *index != link.index) {
+                continue;
+            }
             if link.values.iter().any(|v| v == CATCH_ALL) {
                 continue;
             }
@@ -390,6 +411,7 @@ impl<C: DnsCommands> ResolvedDnsRedirect<C> {
             self.set_domains(name, &domains)?;
         }
         let _ = std::fs::remove_file(&self.taken_file);
+        let _ = std::fs::remove_file(self.indexes_file());
         Ok(())
     }
 
@@ -471,11 +493,11 @@ impl<C: DnsCommands> ResolvedDnsRedirect<C> {
     fn redirect_steps(&self) -> Result<(), PlatformError> {
         self.prepare_link()?;
         // Write down whose `~.` we take before taking it.
-        let claimants: Vec<String> = self
+        let claimants: Vec<(String, u32)> = self
             .links("domain")?
             .into_iter()
             .filter(|l| l.name != REDIRECT_LINK && l.values.iter().any(|v| v == CATCH_ALL))
-            .map(|l| l.name)
+            .map(|l| (l.name, l.index))
             .collect();
         self.remember_taken(&claimants)?;
         let listener_ip = LISTENER_V4.to_string();
@@ -569,6 +591,28 @@ fn read_taken(path: &std::path::Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn read_taken_indexes(path: &std::path::Path) -> std::collections::HashMap<String, u32> {
+    std::fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .filter_map(|l| {
+                    let (index, name) = l.split_once(' ')?;
+                    Some((name.trim().to_string(), index.parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Best effort: without it a returning link is judged by name alone.
+fn write_taken_indexes(path: &std::path::Path, indexes: &std::collections::HashMap<String, u32>) {
+    let mut text = String::new();
+    for (name, index) in indexes {
+        text.push_str(&format!("{index} {name}\n"));
+    }
+    let _ = std::fs::write(path, text);
+}
+
 fn write_taken(path: &std::path::Path, links: &[String]) -> Result<(), PlatformError> {
     let mut text = links.join("\n");
     text.push('\n');
@@ -605,8 +649,9 @@ impl<C: DnsCommands> nrr_platform_api::DnsCacheControlPort for ResolvedDnsCacheC
 
 pub struct ResolvedDnsServers<C: DnsCommands>(pub C);
 
-impl<C: DnsCommands> SystemDnsServersPort for ResolvedDnsServers<C> {
-    fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
+impl<C: DnsCommands> ResolvedDnsServers<C> {
+    /// Every link's servers, a server repeated for each link that lists it.
+    fn per_link_pairs(&self) -> Vec<UpstreamDnsCandidate> {
         let Ok(reply) = self.0.run("resolvectl", &["dns"]) else {
             return Vec::new();
         };
@@ -620,16 +665,23 @@ impl<C: DnsCommands> SystemDnsServersPort for ResolvedDnsServers<C> {
             }
             for server in link.values.iter().filter_map(|v| server_ip(v)) {
                 // `0.0.0.0` is delivered to this machine, as loopback is.
-                if server.is_loopback()
-                    || server.is_unspecified()
-                    || out.iter().any(|c| c.server == server)
-                {
+                if server.is_loopback() || server.is_unspecified() {
                     continue;
                 }
                 out.push(UpstreamDnsCandidate::new(Some(link.index), server));
             }
         }
         out
+    }
+}
+
+impl<C: DnsCommands> SystemDnsServersPort for ResolvedDnsServers<C> {
+    fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
+        once_per_server(self.per_link_pairs(), |c| c.server)
+    }
+
+    fn upstream_candidates_v4_per_link(&self) -> Vec<UpstreamDnsCandidate> {
+        once_per_link(self.per_link_pairs())
     }
 }
 

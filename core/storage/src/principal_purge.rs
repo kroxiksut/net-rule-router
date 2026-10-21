@@ -28,6 +28,7 @@ const PURGED_TABLES: &[&str] = &[
     "app_observed_destinations",
     "conn_history_prefs",
     "override_grants",
+    "vpn_gateway_confirmations",
 ];
 
 /// Principals this database holds ANY state for, excluding the shared
@@ -41,11 +42,15 @@ const PURGED_TABLES: &[&str] = &[
 /// never touched a rule: their state survived a "reset everything", and the
 /// "N other users lose data" count shown before the reset was short by however
 /// many such users there were.
+///
+/// A user with only undelivered block notices is not listed: a backlog is not
+/// something they set up, and it ages out on its own.
 pub fn principals_with_state(conn: &Connection) -> StorageResult<Vec<String>> {
     let mut selects = vec!["SELECT principal AS p FROM revisions".to_string()];
     selects.extend(
         PURGED_TABLES
             .iter()
+            .filter(|t| **t != "block_notice_journal")
             .map(|t| format!("SELECT sid AS p FROM {t}")),
     );
     let sql = format!(
@@ -162,6 +167,30 @@ pub fn purge_principal_data(
     })
 }
 
+/// Machine-wide tables that record what users' programs did, with no owner
+/// column. Only the reset of every user can clear them. `vpn_bootstrap_endpoints`
+/// and `vpn_client_apps` are left out on purpose: they describe the machine's
+/// VPN client and feed the block-all exemptions, so clearing them under an
+/// armed guard would cut the permits the client needs to reconnect.
+const MACHINE_TRACE_TABLES: &[&str] = &["fake_ip_heal_exclusions", "app_pattern_resolutions"];
+
+/// Empties [`MACHINE_TRACE_TABLES`] in one transaction; returns rows deleted.
+pub fn purge_machine_traces(conn: &mut Connection) -> StorageResult<u64> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| StorageError::Internal(format!("machine traces purge begin: {e}")))?;
+    let mut rows: u64 = 0;
+    for table in MACHINE_TRACE_TABLES {
+        let deleted = tx
+            .execute(&format!("DELETE FROM {table}"), [])
+            .map_err(|e| StorageError::Internal(format!("machine traces purge {table}: {e}")))?;
+        rows = rows.saturating_add(deleted as u64);
+    }
+    tx.commit()
+        .map_err(|e| StorageError::Internal(format!("machine traces purge commit: {e}")))?;
+    Ok(rows)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -190,8 +219,8 @@ mod tests {
         )
         .expect("behavior_mode");
         conn.execute(
-            "INSERT INTO secondary_block_policy (sid, block_secondary_when_unavailable, updated_at)
-             VALUES (?1, 0, 1)",
+            "INSERT INTO secondary_block_policy (sid, updated_at)
+             VALUES (?1, 1)",
             params![sid],
         )
         .expect("secondary_block_policy");
@@ -271,6 +300,12 @@ mod tests {
             params![sid],
         )
         .expect("override_grants");
+        conn.execute(
+            "INSERT INTO vpn_gateway_confirmations (sid, address, program, confirmed_at)
+             VALUES (?1, '203.0.113.20', '', 1)",
+            params![sid],
+        )
+        .expect("vpn_gateway_confirmations");
     }
 
     fn row_count(conn: &Connection, table: &str, sid: &str) -> i64 {
@@ -292,6 +327,43 @@ mod tests {
         seed_sid(&conn, "S-NO-RULES");
         let listed = principals_with_state(&conn).expect("list");
         assert_eq!(listed, vec!["S-NO-RULES".to_string()]);
+    }
+
+    #[test]
+    fn a_principal_with_only_a_notice_backlog_is_not_listed() {
+        let conn = migrated_conn();
+        conn.execute(
+            "INSERT INTO block_notice_journal (sid, raised_at, destination, app, reason, attempts)
+             VALUES ('S-JOURNAL', 1, 'h.example', '', 'blocked-by-rule', 1)",
+            [],
+        )
+        .expect("journal row");
+        assert!(principals_with_state(&conn).expect("list").is_empty());
+    }
+
+    #[test]
+    fn the_machine_trace_purge_empties_the_traces_and_keeps_the_vpn_client_tables() {
+        let mut conn = migrated_conn();
+        for sql in [
+            "INSERT INTO fake_ip_heal_exclusions (hostname, learned_at) VALUES ('h.example', 1)",
+            "INSERT INTO vpn_bootstrap_endpoints (ip, port, protocol, source, learned_at)
+             VALUES ('203.0.113.9', 443, 'tcp', 'observed', 1)",
+            "INSERT INTO vpn_client_apps (exe_path, learned_at) VALUES ('/home/a/vpn', 1)",
+            "INSERT INTO app_pattern_resolutions (pattern, resolved_path, resolved_at)
+             VALUES ('*/vpn', '/home/a/vpn', 1)",
+        ] {
+            conn.execute(sql, []).expect("seed");
+        }
+        assert_eq!(purge_machine_traces(&mut conn).expect("purge"), 2);
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .expect("count")
+        };
+        for table in MACHINE_TRACE_TABLES {
+            assert_eq!(count(table), 0, "{table} not cleared");
+        }
+        assert_eq!(count("vpn_bootstrap_endpoints"), 1);
+        assert_eq!(count("vpn_client_apps"), 1);
     }
 
     #[test]

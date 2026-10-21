@@ -107,6 +107,28 @@ impl SecondaryRouteCoordinator {
             != Some(next_hop)
     }
 
+    /// `true` the first time `sid`'s derived primary is `(ifindex, gateway)`,
+    /// `false` while it stays so.
+    pub(super) fn note_primary_derived_once(
+        &self,
+        sid: &str,
+        ifindex: u32,
+        gateway: std::net::Ipv4Addr,
+    ) -> bool {
+        let mut guard = self
+            .no_next_hop_logged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // One entry per user: the key carries the current answer, the old one goes.
+        let prefix = format!("{sid}|derived-primary|");
+        let key = format!("{prefix}{ifindex}|{gateway}");
+        if guard.contains(&key) {
+            return false;
+        }
+        guard.retain(|k| !k.starts_with(&prefix));
+        guard.insert(key)
+    }
+
     /// Re-arm [`Self::note_not_usable_once`] for `(sid, role)` — called once
     /// the binding resolves to a usable adapter again, so the next
     /// usable→not-usable transition warns instead of staying silent forever.

@@ -333,7 +333,7 @@ pub fn replacement_candidates(infos: &[AdapterInfo], tunnels_first: bool) -> Vec
     // Our own fake-IP adapter carries traffic back into us; it is never a route.
     let usable = infos.iter().filter(|i| {
         classify_availability(i) == Some(AdapterAvailability::Available)
-            && i.friendly_name.trim() != nrr_shared::product_identity::TUN_ADAPTER_NAME
+            && !crate::uplink::is_own_fake_ip_adapter(i)
     });
     if !tunnels_first {
         return usable

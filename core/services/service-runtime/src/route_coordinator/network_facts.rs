@@ -27,7 +27,10 @@ impl SecondaryRouteCoordinator {
         match self.api.get_ip_forward_table() {
             Ok(routes) => {
                 let routes = self.stamped_with_ownership(routes);
-                self.network_facts_from(&resolution, &routes, true)
+                let adapters = self.adapters_for_facts();
+                let policy = self.route_source.load_for_sid(sid);
+                self.network_facts_from(sid, &resolution, policy.as_ref(), &routes, &adapters, true)
+                    .0
             }
             Err(e) => {
                 tracing::warn!(
@@ -41,29 +44,42 @@ impl SecondaryRouteCoordinator {
         }
     }
 
-    /// The facts from one reading of the table. `remembered` adds the servers
-    /// persisted by an earlier run, which costs a storage read — the
+    /// The facts from one reading of the table and the links, plus `sid`'s
+    /// foreign tunnels named from the same reading. `remembered` adds the
+    /// servers persisted by an earlier run, which costs a storage read — the
     /// submission check pays it, the reconcile does not.
     pub(super) fn network_facts_from(
         &self,
+        sid: &str,
         resolution: &RouteResolution,
+        policy: Option<&PerSidPolicySnapshot>,
         routes: &[RouteEntry],
+        adapters: &[AdapterInfo],
         remembered: bool,
-    ) -> NetworkRouteFacts {
-        let adapters = self.api.get_adapter_infos().unwrap_or_else(|e| {
-            // Without adapters the attached networks are unknown; their own
-            // routes are longer than any rule piece around them, so only a
-            // rule INSIDE one loses its protection until the next read.
+    ) -> (NetworkRouteFacts, Vec<u32>) {
+        let tunnel = resolution.secondary.map(|s| s.interface_index);
+        let servers = self.known_tunnel_servers(resolution, routes, remembered);
+        let foreign =
+            self.foreign_tunnel_interfaces(resolution, policy, Some(routes), Some(adapters));
+        let facts = NetworkRouteFacts::read(routes, adapters, tunnel, servers)
+            .with_foreign_tunnels(routes, &foreign);
+        crate::kept_direct::publish(sid, &facts);
+        (facts, foreign)
+    }
+
+    /// The links for [`Self::network_facts_from`]. Unreadable, they are none:
+    /// the attached networks are then unknown — their own routes are longer
+    /// than any rule piece around them, so only a rule INSIDE one loses its
+    /// protection until the next read — and no tunnel is called foreign.
+    pub(super) fn adapters_for_facts(&self) -> Vec<AdapterInfo> {
+        self.adapters_now().unwrap_or_else(|e| {
             tracing::warn!(
                 target: "nrr::route-coordinator",
                 error = %e,
                 "adapters could not be read; network routes are planned without the attached networks",
             );
             Vec::new()
-        });
-        let tunnel = resolution.secondary.map(|s| s.interface_index);
-        let servers = self.known_tunnel_servers(resolution, routes, remembered);
-        NetworkRouteFacts::read(routes, &adapters, tunnel, servers)
+        })
     }
 
     /// Every tunnel server this coordinator knows: the live bootstrap routes,

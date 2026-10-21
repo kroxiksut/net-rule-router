@@ -17,9 +17,10 @@
 //! route-to-secondary rule behave as a block — the traffic followed the default
 //! path and met its own leak-guard drop.
 //!
-//! The catch-all block-all of the always-on modes is planned too, but only when
-//! the machine can say what it must not cut: the tunnel's own server addresses
-//! and the attached subnets, read off the route table
+//! Which guard arms is [`nrr_domain::protection_posture`]'s answer, the table
+//! the Windows engine reads too. The blanket postures are planned only when
+//! the machine can say what they must not cut: the tunnel's own server
+//! addresses and the attached subnets, read off the route table
 //! ([`crate::catch_all_exemptions`]). Without them the plan falls back to the
 //! per-destination guard and says so — a blanket block that seals the tunnel's
 //! reconnect turns an outage into a permanent one.
@@ -31,7 +32,7 @@
 use std::sync::{Arc, Mutex};
 
 use nrr_domain::user_principal::UserPrincipal;
-use nrr_domain::RouteBehaviorMode;
+use nrr_domain::{protection_posture, ProtectionPosture, RouteBehaviorMode};
 use nrr_platform_api::app_path_resolver::AppPathResolver;
 use nrr_platform_api::enforcement::{
     AppScope, ChannelAvailability, DstMatch, EgressBinding, EgressBindingSource, EgressConstraint,
@@ -54,7 +55,7 @@ use crate::enforcement_planner::{plan_route_rules, plan_routes_with, PlannerInpu
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::per_sid_orchestrator::{behavior_mode_for_codegen, RoutePolicySource, RulesProvider};
 use crate::principal_enforcement::{PlannedPolicy, PrincipalPlanSource};
-use crate::route_codegen::network_routes::{names_networks, NetworkRouteFacts};
+use crate::route_codegen::network_routes::NetworkRouteFacts;
 use crate::tunnel_server_memory::TunnelServerMemory;
 use nrr_platform_api::tunnel_endpoints::TunnelEndpointSource;
 
@@ -112,6 +113,21 @@ pub struct ProductionPrincipalPlanSource {
     /// tells nobody.
     events: Option<Arc<crate::ipc_handlers::event_bus::EventBus>>,
     too_wide_notices: crate::catch_all_exemptions::TooWideLocalNetworkNotices,
+    /// The user's answers about local networks, laid over the exemptions.
+    /// `None` exempts what the machine reports and nothing the user decided.
+    local_networks: Option<Arc<crate::local_network_source::PolicyLocalNetworkSource>>,
+    /// The route-table owner this pass was told of. `None` until a pass says;
+    /// then every principal is planned as if it were the owner.
+    pass_owner: Mutex<Option<Option<UserPrincipal>>>,
+    /// Each planned user's links this pass, published as one view at its end.
+    pass_links: Mutex<std::collections::BTreeMap<String, PassLinks>>,
+}
+
+/// One user's foreign tunnels and additional-route links, from the pass's
+/// reading.
+struct PassLinks {
+    foreign: Vec<u32>,
+    own: Vec<u32>,
 }
 
 /// Whether a route table is one only this product writes.
@@ -174,6 +190,17 @@ impl ProductionPrincipalPlanSource {
             shared_ip_exemptions: None,
             events: None,
             too_wide_notices: Default::default(),
+            local_networks: None,
+            pass_owner: Mutex::new(None),
+            pass_links: Mutex::new(Default::default()),
+        }
+    }
+
+    /// Whether `stored` speaks for the service accounts this pass.
+    fn is_route_table_owner(&self, stored: &str) -> bool {
+        match &*self.pass_owner.lock().unwrap_or_else(|p| p.into_inner()) {
+            None => true,
+            Some(owner) => owner.as_ref().is_some_and(|o| o.as_stored() == stored),
         }
     }
 
@@ -182,6 +209,17 @@ impl ProductionPrincipalPlanSource {
     #[must_use]
     pub fn with_event_bus(mut self, events: Arc<crate::ipc_handlers::event_bus::EventBus>) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// Honour the networks the user kept or refused: the blanket block's
+    /// exemptions follow the same answers the "Local networks" list shows.
+    #[must_use]
+    pub fn with_local_networks(
+        mut self,
+        source: Arc<crate::local_network_source::PolicyLocalNetworkSource>,
+    ) -> Self {
+        self.local_networks = Some(source);
         self
     }
 
@@ -316,11 +354,14 @@ impl ProductionPrincipalPlanSource {
         // and a plan built without that would pin nothing.
         // Without a policy or rules nothing is planned, so nothing conflicts.
         let Some(policy) = self.policy.load_for_sid(stored) else {
+            publish_ipv6_disposition(stored, None);
             // Routing needs connections; a deny does not.
             return self.plan_denies_without_policy(principal);
         };
         timings.mark("policy");
+        self.note_pass_links(stored, &policy);
         let Some(rules) = self.rules.active_rules_for(stored) else {
+            publish_ipv6_disposition(stored, None);
             self.publish_conflicts(stored, None);
             return None;
         };
@@ -328,6 +369,16 @@ impl ProductionPrincipalPlanSource {
         // The user's mode, from the same policy row the Windows planner reads;
         // the rules snapshot only carries a placeholder.
         let behavior_mode = behavior_mode_for_codegen(&policy);
+        let posture = protection_posture(
+            behavior_mode,
+            policy.leak_protection,
+            availability.secondary,
+        );
+        // One reading of the cache for the whole plan: the book walks below ask
+        // it per host, and against SQLite each ask is a locked query.
+        let snapshot = self.fqdn_cache.snapshot_for_compute();
+        let cache =
+            crate::fqdn_cache_lookup::snapshot_or_live(snapshot.as_ref(), self.fqdn_cache.as_ref());
 
         // The shared-IP policy decides which addresses the tunnel may claim,
         // and the plan has to be built behind the same decision the Windows
@@ -335,45 +386,46 @@ impl ProductionPrincipalPlanSource {
         // declined.
         let secondary_ip_denylist = crate::secondary_ip_policy::secondary_ip_denylist(
             &rules.rule_book.secondary,
-            self.fqdn_cache.as_ref(),
+            cache,
             policy.shared_ip_policy,
         );
         timings.mark("denylist");
         // What policy may do about IPv6: naming the family and STEERING it are
         // separate answers, and only the machine reading knows either.
         let ipv6 = self.ipv6_guard(&policy);
+        publish_ipv6_disposition(stored, Some(ipv6));
         // Every pass, whatever the book needs: the screen of a rule submitted
         // while the tunnel is down reads what was noted here.
-        self.remember_tunnel_servers(&policy);
+        self.remember_tunnel_servers(stored, &policy);
         self.warn_too_wide_local_networks(stored, &policy);
         // Where observations are kept per user, this user's programs alone
         // decide where their application rules send traffic.
         let own_observations = self.app_observations.for_principal(stored);
+        let observations = own_observations
+            .as_deref()
+            .unwrap_or(self.app_observations.as_ref());
         let input = PlannerInput {
-            fqdn_cache: self.fqdn_cache.as_ref(),
+            fqdn_cache: cache,
             app_resolver: self.app_resolver.as_ref(),
-            app_observations: own_observations
-                .as_deref()
-                .unwrap_or(self.app_observations.as_ref()),
+            app_observations: observations,
             zone_priority_over_ip: policy.zone_priority_over_ip,
             app_rules_take_all_addresses: policy.app_rules_take_all_addresses,
             secondary_ip_denylist: &secondary_ip_denylist,
             ipv6,
             packet_blocks: self.rules.rules_are_baseline_for(stored),
         };
-        let (mut flows, plan_report) =
-            plan_route_rules(&rules.rule_book, stored, behavior_mode, &input);
+        let (mut flows, plan_report) = plan_route_rules(&rules.rule_book, stored, &input);
         // Before the early return below: a book whose every rule was skipped
         // plans nothing, and those skips are exactly what the user must see.
         self.publish_conflicts(stored, Some((&plan_report, &rules.rule_book)));
         timings.mark("planner");
-        // An empty rule set is not the same as "nothing to enforce". In the
-        // tunnel-default modes the protection is the blanket block and the
-        // leak-guard, and neither is rule-driven: returning early here left a
-        // principal in Strict with an empty book completely unprotected, and
-        // the caller counted them as planned rather than as unprotected, so
-        // nothing reported it either.
-        if flows.is_empty() && behavior_mode == RouteBehaviorMode::PreferPrimary {
+        // An empty rule set is not "nothing to enforce" wherever the protection
+        // is not rule-driven: the tunnel-default route, and the hold of
+        // "everything" once the tunnel is gone.
+        if flows.is_empty()
+            && behavior_mode == RouteBehaviorMode::PreferPrimary
+            && !is_blanket(posture)
+        {
             return None;
         }
         // Who owns which address, from the one arbiter. A block is never one of
@@ -381,28 +433,21 @@ impl ProductionPrincipalPlanSource {
         // the address, in any mode.
         let ownership = crate::address_ownership::AddressOwnership::resolve_for(
             &rules.rule_book,
-            self.fqdn_cache.as_ref(),
+            cache,
             crate::address_ownership::OwnershipSettings::from_policy(
                 policy.zone_priority_over_ip,
                 policy.app_rules_take_all_addresses,
             ),
             crate::wfp_codegen::current_rule_shape_support(),
-            self.app_observations.as_ref(),
+            observations,
         );
         let rule_driven_flows = flows.len();
         timings.mark("ownership");
 
-        // The blanket block, when the settings ask for it AND the machine can
+        // The blanket block, when the posture asks for it AND the machine can
         // say what it must not cut. It supersedes the per-destination guard:
         // both installed would be one policy stated twice.
-        let blanket = self.blanket_block(
-            stored,
-            &policy,
-            behavior_mode,
-            availability,
-            &flows,
-            &ownership,
-        );
+        let blanket = self.blanket_block(stored, &policy, posture, &flows, &ownership);
         let block_all_armed = !blanket.is_empty();
         let forwarded_blanket =
             if block_all_armed && !availability.secondary && policy.guard_forwarded_traffic {
@@ -422,28 +467,17 @@ impl ProductionPrincipalPlanSource {
         flows.extend(blanket);
         flows.extend(forwarded_blanket);
 
-        // The strict mode's default catch-all (planned with the rules, above)
-        // blocks everything no rule permitted — loopback, DHCP, the link's own
-        // control traffic and the tunnel's handshake included. The blanket
-        // posture brings its own floor; when it is not armed, nothing else
-        // does, and the block stands over an empty floor. Windows never showed
-        // it because the orchestrator carried a branch of its own.
-        if behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed && !block_all_armed {
-            let exemptions = self.exemptions_for(&policy);
-            flows.extend(crate::enforcement_planner::plan_default_block_exemptions(
-                stored,
-                &exemptions.server_ips,
-                &exemptions.local_subnets,
-                crate::enforcement_planner::Ipv6Exemptions {
-                    server_ips: &exemptions.server_ips_v6,
-                    local_subnets: &exemptions.local_subnets_v6,
-                },
-            ));
-        }
-
         // The addresses the leak-guard may act on, under the same shared-address
         // rule as the Windows guard: smart spares what a direct host shares.
-        let spared = self.shared_ips_spared(&policy);
+        // The main link's own segments too, read once: nothing to read when off.
+        let spared = Spared {
+            shared: self.shared_ips_spared(&policy, cache),
+            floor: if matches!(posture, ProtectionPosture::Open) {
+                CatchAllExemptions::default()
+            } else {
+                self.exemptions_for(stored, &policy)
+            },
+        };
 
         // A rule the tunnel cannot carry over IPv6 is BLOCKED, not leaked.
         //
@@ -460,41 +494,76 @@ impl ProductionPrincipalPlanSource {
             self.unroutable_v6_blocks(stored, &policy, ipv6, &flows, &ownership, &spared);
         flows.extend(unroutable_v6);
 
-        // The leak-guard: the pin while the link is up, the block once it is
-        // gone. A blanket block already states both.
-        let (guard, fail_closed_blocks) = if block_all_armed {
-            self.network_hold_log.forget(stored);
-            (Vec::new(), 0)
-        } else if availability.secondary {
-            (
-                self.pin_to_tunnel(stored, &policy, &mut flows, &ownership, &spared),
-                0,
-            )
-        } else {
-            let fail_closed = self.fail_closed_flows(stored, &policy, &flows, &ownership, &spared);
-            let blocks = fail_closed
-                .iter()
-                .filter(|flow| flow.verdict == Verdict::Block)
-                .count();
-            (fail_closed, blocks)
+        // The per-destination guard: the pin while the link is up, the block
+        // once it is gone. An armed blanket already states both; a blanket the
+        // machine refused falls back to it.
+        let per_destination = !block_all_armed && !matches!(posture, ProtectionPosture::Open);
+        let (guard, fail_closed_blocks) = match posture {
+            ProtectionPosture::PinRuleDestinations | ProtectionPosture::CatchAllThroughTunnel
+                if per_destination =>
+            {
+                (
+                    self.pin_to_tunnel(stored, &policy, &mut flows, &ownership, &spared),
+                    0,
+                )
+            }
+            ProtectionPosture::BlockRuleDestinations | ProtectionPosture::BlockAll
+                if per_destination =>
+            {
+                let fail_closed =
+                    self.fail_closed_flows(stored, &policy, &flows, &ownership, &spared);
+                let blocks = fail_closed
+                    .iter()
+                    .filter(|flow| flow.verdict == Verdict::Block)
+                    .count();
+                (fail_closed, blocks)
+            }
+            _ => {
+                self.network_hold_log.forget(stored);
+                (Vec::new(), 0)
+            }
         };
         flows.extend(guard);
-        self.publish_shared_ip_exemptions(
-            stored,
-            &policy,
-            block_all_armed,
-            &flows,
-            &ownership,
-            &spared,
-        );
+        self.publish_shared_ip_exemptions(stored, per_destination, &flows, &ownership, &spared);
         let service =
-            self.service_account_flows(stored, &policy, availability, &flows, &ownership, &spared);
+            self.service_account_flows(stored, &policy, posture, &flows, &ownership, &spared);
         flows.extend(service);
+        // Whatever blocked above, a corporate tunnel beside ours keeps the
+        // networks it carries.
+        let foreign = crate::enforcement_planner::plan_foreign_tunnel_permits(
+            stored,
+            &flows,
+            &self.foreign_tunnels_for(&policy),
+        );
+        flows.extend(foreign);
+        // Another VPN's handshake, before the lockdown joins `flows`. nft has
+        // no per-program match: the IKE daemons are known by the system uids
+        // they run as.
+        let handshake = crate::enforcement_planner::plan_vpn_handshake_permits(
+            stored,
+            &flows,
+            &crate::vpn_gateway_confirm::global_vpn_gateways().confirmed_addresses(stored),
+        );
+        let ike = crate::enforcement_planner::plan_ike_service_permits(
+            &flows,
+            crate::enforcement_planner::IkeServiceMatch::AnyServiceProgram,
+        );
+        // A policy-based IPsec VPN has no interface for the foreign permits
+        // above: its networks are spared by the kernel's own IPsec decision.
+        let ipsec = crate::enforcement_planner::plan_ipsec_policy_permits(stored, &flows);
+        flows.extend(handshake);
+        flows.extend(ike);
+        flows.extend(ipsec);
 
         // Browser DoH hides the names wildcard rules learn from, so blocking it
         // sends the browser back to plaintext DNS. Same gate as the codegen.
         if doh_lockdown_active(&policy, &rules.rule_book) {
-            flows.extend(plan_doh_dot_block(stored, &policy.doh_resolver_ips, true));
+            let doh = plan_doh_dot_block(stored, &policy.doh_resolver_ips, true);
+            // A corporate link's permits would outrank the lockdown for a
+            // resolver that link routes; the lockdown is restated above them.
+            let vetoes = crate::enforcement_planner::plan_doh_foreign_vetoes(stored, &doh, &flows);
+            flows.extend(doh);
+            flows.extend(vetoes);
         }
         timings.mark("guards");
 
@@ -503,10 +572,13 @@ impl ProductionPrincipalPlanSource {
         // which keeps "no route installed" a stated fact rather than a silent
         // omission in the plan.
         let routes = self.routes_for(
+            stored,
             &policy,
             behavior_mode,
             &rules.rule_book,
             availability.primary,
+            cache,
+            observations,
             // The same addresses the filters were planned without: a route to
             // the tunnel for an address the policy declined would carry a
             // direct host's traffic there, as the route codegen elsewhere avoids.
@@ -523,14 +595,16 @@ impl ProductionPrincipalPlanSource {
             ),
         );
 
-        let guard_holding = !availability.secondary
-            && (block_all_armed || (policy.kill_switch_enabled && policy.kill_switch_fail_closed));
+        let guard_holding = matches!(
+            posture,
+            ProtectionPosture::BlockRuleDestinations | ProtectionPosture::BlockAll
+        );
         let coverage = PlanCoverage {
             rule_driven_flows,
             fail_closed_blocks,
             guard_holding,
             route_intents: routes.len(),
-            kill_switch_complete: !wants_block_all(&policy, behavior_mode) || block_all_armed,
+            kill_switch_complete: !is_blanket(posture) || block_all_armed,
         };
         Some((
             EnforcementPlan {
@@ -560,9 +634,12 @@ impl ProductionPrincipalPlanSource {
             self.publish_conflicts(stored, None);
             return None;
         };
+        let snapshot = self.fqdn_cache.snapshot_for_compute();
+        let cache =
+            crate::fqdn_cache_lookup::snapshot_or_live(snapshot.as_ref(), self.fqdn_cache.as_ref());
         let secondary_ip_denylist = crate::secondary_ip_policy::secondary_ip_denylist(
             &rules.rule_book.secondary,
-            self.fqdn_cache.as_ref(),
+            cache,
             nrr_domain::shared_ip::SharedIpPolicy::default(),
         );
         let ipv6 = match self.machine_reading() {
@@ -574,7 +651,7 @@ impl ProductionPrincipalPlanSource {
         };
         let own_observations = self.app_observations.for_principal(stored);
         let input = PlannerInput {
-            fqdn_cache: self.fqdn_cache.as_ref(),
+            fqdn_cache: cache,
             app_resolver: self.app_resolver.as_ref(),
             app_observations: own_observations
                 .as_deref()
@@ -585,12 +662,7 @@ impl ProductionPrincipalPlanSource {
             ipv6,
             packet_blocks: self.rules.rules_are_baseline_for(stored),
         };
-        let (mut flows, report) = plan_route_rules(
-            &rules.rule_book,
-            stored,
-            RouteBehaviorMode::PreferPrimary,
-            &input,
-        );
+        let (mut flows, report) = plan_route_rules(&rules.rule_book, stored, &input);
         self.publish_conflicts(stored, Some((&report, &rules.rule_book)));
         // A permit rides a route or carves a hole in a guard; neither exists
         // here, and a narrower rule inside a deny is already cut out of it.
@@ -695,29 +767,27 @@ impl ProductionPrincipalPlanSource {
 
     /// The blanket block-all, or nothing.
     ///
-    /// Two postures share one shape. With the tunnel UP and an always-on mode,
-    /// the block is what makes "everything goes through the tunnel" true rather
-    /// than merely intended. With the tunnel GONE, it is the fail-closed
-    /// posture: hold the traffic instead of letting it out the way the user
-    /// asked it not to go.
+    /// Two postures share one shape. With the tunnel UP and the tunnel as the
+    /// default route, the block is what makes "everything goes through the
+    /// tunnel" true rather than merely intended. With the tunnel GONE, it holds
+    /// the traffic instead of letting it out the way the user asked it not to go.
     ///
     /// Both refuse to arm without a tunnel-server exemption — that block would
-    /// seal the tunnel's own reconnect, and nothing on the machine could lift it
-    /// (see the acceptance run where a well-meant blanket rule closed a working
-    /// site). The caller then reports incomplete protection.
+    /// seal the tunnel's own reconnect, and nothing on the machine could lift
+    /// it. The caller then falls back to the per-destination guard and reports
+    /// incomplete protection.
     fn blanket_block(
         &self,
         stored: &str,
         policy: &PerSidPolicySnapshot,
-        mode: RouteBehaviorMode,
-        availability: ChannelAvailability,
+        posture: ProtectionPosture,
         rule_flows: &[FlowRule],
         ownership: &crate::address_ownership::AddressOwnership,
     ) -> Vec<FlowRule> {
-        if !wants_block_all(policy, mode) {
+        if !is_blanket(posture) {
             return Vec::new();
         }
-        let exemptions = self.exemptions_for(policy);
+        let exemptions = self.exemptions_for(stored, policy);
         // A remembered server alone is no licence: without the primary the
         // attached subnets are unknown, and the block would cut the LAN.
         if !exemptions.can_arm() || !self.links_resolve(policy) {
@@ -730,7 +800,7 @@ impl ProductionPrincipalPlanSource {
             return Vec::new();
         }
         let protocols = KillSwitchProtocols::from_bits(policy.kill_switch_protocols);
-        if availability.secondary {
+        if matches!(posture, ProtectionPosture::CatchAllThroughTunnel) {
             plan_catch_all_kill_switch(
                 stored,
                 &exemptions.server_ips,
@@ -742,7 +812,7 @@ impl ProductionPrincipalPlanSource {
                 protocols,
             )
         } else {
-            plan_fail_closed_block_all(
+            crate::enforcement_planner::plan_fail_closed_block_all_with_dns(
                 stored,
                 &exemptions.server_ips,
                 // No liveness probe on this path, and no shared-IP census: an
@@ -756,7 +826,7 @@ impl ProductionPrincipalPlanSource {
                     local_subnets: &exemptions.local_subnets_v6,
                 },
                 policy.allow_dns_over_primary,
-                &self.primary_dns_v4(),
+                &self.primary_dns(),
                 protocols,
             )
         }
@@ -773,12 +843,15 @@ impl ProductionPrincipalPlanSource {
         rule_flows: &[FlowRule],
         ownership: &crate::address_ownership::AddressOwnership,
     ) -> Vec<FlowRule> {
-        let exemptions = self.exemptions_for(policy);
+        let exemptions = self.exemptions_for(stored, policy);
         let mut direct = primary_destinations(rule_flows, ownership);
-        direct.extend(self.primary_dns_v4());
+        direct.extend(self.primary_dns().into_iter().filter_map(|ip| match ip {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        }));
         direct.sort_unstable();
         direct.dedup();
-        crate::enforcement_planner::plan_forwarded_block_all(plan_fail_closed_block_all(
+        let mut blanket = plan_fail_closed_block_all(
             stored,
             &exemptions.server_ips,
             &[],
@@ -792,22 +865,22 @@ impl ProductionPrincipalPlanSource {
             false,
             &[],
             KillSwitchProtocols::ALL,
-        ))
+        );
+        blanket.extend(primary_network_permits(rule_flows));
+        // The blanket spares no foreign tunnel whole; the narrowed permits
+        // below are all a guest keeps through one.
+        crate::enforcement_planner::plan_forwarded_block_all_with_foreign(
+            blanket,
+            &self.foreign_tunnels_for(policy),
+        )
     }
 
-    /// The main link's resolvers, the only hosts the DNS permit may name.
-    fn primary_dns_v4(&self) -> Vec<std::net::Ipv4Addr> {
+    /// The main link's resolvers of both families, the only hosts the DNS
+    /// permit may name; a v6-only network keeps its resolvers too.
+    fn primary_dns(&self) -> Vec<std::net::IpAddr> {
         self.service_accounts
             .as_ref()
-            .map(|primary_dns| {
-                primary_dns()
-                    .into_iter()
-                    .filter_map(|ip| match ip {
-                        std::net::IpAddr::V4(v4) => Some(v4),
-                        std::net::IpAddr::V6(_) => None,
-                    })
-                    .collect()
-            })
+            .map(|primary_dns| primary_dns())
             .unwrap_or_default()
     }
 
@@ -817,7 +890,17 @@ impl ProductionPrincipalPlanSource {
     /// what the links carry, naming the family would pin destinations on a
     /// guess.
     fn ipv6_guard(&self, policy: &PerSidPolicySnapshot) -> crate::enforcement_planner::Ipv6Guard {
-        Self::ipv6_guard_from(self.machine_reading(), policy)
+        use crate::enforcement_planner::Ipv6Guard;
+        match self.machine_reading() {
+            Some(reading) => Self::ipv6_guard_from(Some(reading), policy),
+            // Links that cannot be read are not links without IPv6: under leak
+            // protection the family is named so a rule host's v6 addresses are
+            // pinned, never left open for this pass.
+            None if self.machine.is_some() && policy.leak_protection.is_on() => {
+                Ipv6Guard::FiltersOnly
+            }
+            None => Ipv6Guard::Off,
+        }
     }
 
     /// [`Self::ipv6_guard`] from the last pass's reading, taking none: `Off`
@@ -879,22 +962,25 @@ impl ProductionPrincipalPlanSource {
     #[allow(clippy::too_many_arguments)]
     fn routes_for(
         &self,
+        stored: &str,
         policy: &PerSidPolicySnapshot,
         mode: RouteBehaviorMode,
         book: &nrr_domain::canonical::CanonicalRuleBook,
         has_primary: bool,
+        cache: &dyn FqdnCacheLookup,
+        observations: &dyn AppObservationLookup,
         denied: &std::collections::HashSet<std::net::Ipv4Addr>,
         families: crate::enforcement_planner::FamilyScope,
         support: nrr_domain::rule_shape::RuleShapeSupport,
     ) -> Vec<nrr_platform_api::enforcement::RouteIntent> {
         let catch_alls = self.tunnel_catch_alls(policy);
-        let networks = self.network_route_facts(policy, book, support, &catch_alls);
+        let networks = self.network_route_facts(stored, policy, &catch_alls);
         plan_routes_with(
             mode,
             book,
             has_primary,
-            self.fqdn_cache.as_ref(),
-            self.app_observations.as_ref(),
+            cache,
+            observations,
             denied,
             families,
             crate::address_ownership::OwnershipSettings::from_policy(
@@ -945,21 +1031,22 @@ impl ProductionPrincipalPlanSource {
             .fqdn_cache
             .snapshot_for_compute()
             .map(|full| full.scoped_to(addresses));
-        let cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup = match scoped.as_ref() {
-            Some(scoped) => scoped,
-            None => self.fqdn_cache.as_ref(),
-        };
+        let cache =
+            crate::fqdn_cache_lookup::snapshot_or_live(scoped.as_ref(), self.fqdn_cache.as_ref());
         let denied = crate::secondary_ip_policy::secondary_ip_denylist(
             &rules.rule_book.secondary,
             cache,
             policy.shared_ip_policy,
         );
+        let own_observations = self.app_observations.for_principal(stored);
         plan_routes_with(
             behavior_mode_for_codegen(&policy),
             &rules.rule_book,
             availability.primary,
             cache,
-            self.app_observations.as_ref(),
+            own_observations
+                .as_deref()
+                .unwrap_or(self.app_observations.as_ref()),
             &denied,
             families,
             crate::address_ownership::OwnershipSettings::from_policy(
@@ -967,7 +1054,7 @@ impl ProductionPrincipalPlanSource {
                 policy.app_rules_take_all_addresses,
             ),
             &[],
-            &NetworkRouteFacts::default(),
+            &crate::kept_direct::published_facts(stored),
             crate::wfp_codegen::current_rule_shape_support(),
         )
         .into_iter()
@@ -984,19 +1071,16 @@ impl ProductionPrincipalPlanSource {
 
     /// What a network rule's routes must respect, from the pass's reading: the
     /// tunnel's routes, the attached networks and the tunnel's servers. Only
-    /// the catch-alls when no network rule would use the rest, which keeps a
-    /// host-only book's plan exactly what it was.
+    /// the catch-alls when the machine cannot be read. Host routes use the
+    /// attached networks and foreign tunnels too, so the reading is not gated
+    /// on the book.
     fn network_route_facts(
         &self,
+        stored: &str,
         policy: &PerSidPolicySnapshot,
-        book: &nrr_domain::canonical::CanonicalRuleBook,
-        support: nrr_domain::rule_shape::RuleShapeSupport,
         catch_alls: &[(std::net::Ipv4Addr, u8)],
     ) -> NetworkRouteFacts {
         let fallback = || NetworkRouteFacts::from_catch_alls(catch_alls);
-        if !names_networks(book, support) {
-            return fallback();
-        }
         let Some(reading) = self.machine_reading() else {
             return fallback();
         };
@@ -1020,13 +1104,92 @@ impl ProductionPrincipalPlanSource {
                     .iter()
                     .map(|ip| std::net::IpAddr::V6(*ip)),
             )
-            .chain(self.known_tunnel_servers())
+            .chain(self.known_tunnel_servers(stored))
             .collect();
-        NetworkRouteFacts::read(
-            reading.routes().unwrap_or_default(),
+        let routes = reading.routes().unwrap_or_default();
+        let foreign: Vec<u32> = match reading.routes() {
+            Some(routes) => {
+                let ours =
+                    crate::route_coordinator::own_link_indexes(adapters, &[], bindings_of(policy));
+                let additional = crate::route_coordinator::own_link_indexes(
+                    adapters,
+                    &[],
+                    policy.secondary.iter(),
+                );
+                crate::route_coordinator::foreign_tunnel_indexes(
+                    adapters,
+                    &ours,
+                    &additional,
+                    routes,
+                )
+            }
+            None => Vec::new(),
+        };
+        let facts = NetworkRouteFacts::read(routes, adapters, tunnel, servers)
+            .with_foreign_tunnels(routes, &foreign);
+        crate::kept_direct::publish(stored, &facts);
+        facts
+    }
+
+    /// Name `stored`'s foreign tunnels and own links from the pass's reading,
+    /// for [`Self::publish_pass_links`]. Nothing is recorded while the machine
+    /// cannot be read: doubt is "not foreign".
+    fn note_pass_links(&self, stored: &str, policy: &PerSidPolicySnapshot) {
+        let Some(reading) = self.machine_reading() else {
+            return;
+        };
+        let (Some(adapters), Some(routes)) = (reading.adapters(), reading.routes()) else {
+            return;
+        };
+        let ours = crate::route_coordinator::own_link_indexes(adapters, &[], bindings_of(policy));
+        let own =
+            crate::route_coordinator::own_link_indexes(adapters, &[], policy.secondary.iter());
+        let foreign =
+            crate::route_coordinator::foreign_tunnel_indexes(adapters, &ours, &own, routes);
+        self.pass_links
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(stored.to_owned(), PassLinks { foreign, own });
+    }
+
+    /// Publish the pass's links into `cell`, once for every planned user. A
+    /// pass that planned nobody, or could not read the machine, leaves the
+    /// cell as it was.
+    fn publish_pass_links(&self, cell: &crate::foreign_tunnels::ForeignTunnelCell) {
+        let links = std::mem::take(&mut *self.pass_links.lock().unwrap_or_else(|p| p.into_inner()));
+        if links.is_empty() {
+            return;
+        }
+        let Some(reading) = self.machine_reading() else {
+            return;
+        };
+        let foreign: Vec<Vec<u32>> = links.values().map(|l| l.foreign.clone()).collect();
+        let own: Vec<u32> = links.values().flat_map(|l| l.own.iter().copied()).collect();
+        cell.publish_served(
+            reading.routes(),
+            reading.adapters().unwrap_or_default(),
+            &foreign,
+            &own,
+        );
+    }
+
+    /// The tunnels beside this principal's bound links, from the pass's
+    /// reading; none when the machine cannot be read.
+    fn foreign_tunnels_for(
+        &self,
+        policy: &PerSidPolicySnapshot,
+    ) -> Vec<crate::enforcement_planner::ForeignTunnelLink> {
+        let Some(reading) = self.machine_reading() else {
+            return Vec::new();
+        };
+        let Some(adapters) = reading.adapters() else {
+            return Vec::new();
+        };
+        crate::catch_all_exemptions::foreign_tunnel_links(
+            reading.routes(),
             adapters,
-            tunnel,
-            servers,
+            policy.primary.as_ref(),
+            policy.secondary.as_ref(),
         )
     }
 
@@ -1035,7 +1198,7 @@ impl ProductionPrincipalPlanSource {
     ///
     /// The known servers join even while the links are unresolved: every use
     /// of a server here opens, and a stale one only permits a little more.
-    fn exemptions_for(&self, policy: &PerSidPolicySnapshot) -> CatchAllExemptions {
+    fn exemptions_for(&self, stored: &str, policy: &PerSidPolicySnapshot) -> CatchAllExemptions {
         let Some(reading) = self.machine_reading() else {
             return CatchAllExemptions::default();
         };
@@ -1045,7 +1208,22 @@ impl ProductionPrincipalPlanSource {
             policy.primary.as_ref().map(|b| b.display_name.as_str()),
             policy.secondary.as_ref().map(|b| b.display_name.as_str()),
         );
-        for ip in self.known_tunnel_servers() {
+        // Unresolved links yield no exemptions at all, and the answers do not
+        // change that.
+        if let Some(networks) = self
+            .local_networks
+            .as_ref()
+            .filter(|_| self.links_resolve(policy))
+        {
+            networks.apply_to_exemptions(
+                stored,
+                policy,
+                reading.routes().unwrap_or_default(),
+                reading.adapters().unwrap_or_default(),
+                &mut exemptions,
+            );
+        }
+        for ip in self.known_tunnel_servers(stored) {
             match ip {
                 std::net::IpAddr::V4(v4) if !exemptions.server_ips.contains(&v4) => {
                     exemptions.server_ips.push(v4);
@@ -1069,7 +1247,7 @@ impl ProductionPrincipalPlanSource {
         let Some(primary) = policy.primary.as_ref() else {
             return;
         };
-        let too_wide = self.exemptions_for(policy).too_wide;
+        let too_wide = self.exemptions_for(stored, policy).too_wide;
         self.too_wide_notices.publish(
             bus,
             stored,
@@ -1093,7 +1271,7 @@ impl ProductionPrincipalPlanSource {
 
     /// Note the tunnel servers this principal's links show live: the bound
     /// tunnel's host routes and the kernel tunnels' peers.
-    fn remember_tunnel_servers(&self, policy: &PerSidPolicySnapshot) {
+    fn remember_tunnel_servers(&self, stored: &str, policy: &PerSidPolicySnapshot) {
         let Some(sources) = self.tunnel_servers.as_ref() else {
             return;
         };
@@ -1111,14 +1289,14 @@ impl ProductionPrincipalPlanSource {
             std::net::IpAddr::V4(v4) => Some(*v4),
             std::net::IpAddr::V6(_) => None,
         }));
-        sources.memory.observe(&live);
+        sources.memory.observe(stored, &live);
     }
 
     /// The servers known beyond the live host routes: the kernel tunnels'
-    /// peers and the remembered ones. Never an address a dropped connection
+    /// peers and the ones remembered for this principal alone. Never an address a dropped connection
     /// named: a CDN front a rule host shares would become a hole in the guard.
     /// The only thing a drop may earn is the client's own process.
-    fn known_tunnel_servers(&self) -> Vec<std::net::IpAddr> {
+    fn known_tunnel_servers(&self, stored: &str) -> Vec<std::net::IpAddr> {
         let Some(sources) = self.tunnel_servers.as_ref() else {
             return Vec::new();
         };
@@ -1129,7 +1307,7 @@ impl ProductionPrincipalPlanSource {
             .chain(
                 sources
                     .memory
-                    .remembered()
+                    .remembered(stored)
                     .into_iter()
                     .map(std::net::IpAddr::V4),
             )
@@ -1139,9 +1317,8 @@ impl ProductionPrincipalPlanSource {
     /// Blocks over the secondary rules' IPv6 destinations when the tunnel
     /// cannot carry the family at all.
     ///
-    /// Gated on the leak-guard exactly like [`Self::fail_closed_flows`]: a user
-    /// who turned the guard off has said they prefer a leak to an outage, and
-    /// this is that same trade on a different axis.
+    /// Gated on leak protection: a user who turned it off has said they prefer
+    /// a leak to an outage, and this is that same trade on a different axis.
     fn unroutable_v6_blocks(
         &self,
         stored: &str,
@@ -1149,11 +1326,10 @@ impl ProductionPrincipalPlanSource {
         ipv6: crate::enforcement_planner::Ipv6Guard,
         rule_flows: &[FlowRule],
         ownership: &crate::address_ownership::AddressOwnership,
-        spared: &SharedIps,
+        spared: &Spared,
     ) -> Vec<FlowRule> {
         if ipv6 != crate::enforcement_planner::Ipv6Guard::FiltersOnly
-            || !policy.kill_switch_enabled
-            || !policy.kill_switch_fail_closed
+            || !policy.leak_protection.is_on()
         {
             return Vec::new();
         }
@@ -1188,10 +1364,10 @@ impl ProductionPrincipalPlanSource {
         policy: &PerSidPolicySnapshot,
         flows: &mut [FlowRule],
         ownership: &crate::address_ownership::AddressOwnership,
-        spared: &SharedIps,
+        spared: &Spared,
     ) -> Vec<FlowRule> {
         let protocols = KillSwitchProtocols::from_bits(policy.kill_switch_protocols);
-        if !policy.kill_switch_enabled || !(protocols.tcp || protocols.udp) {
+        if !(protocols.tcp || protocols.udp) {
             self.network_hold_log.forget(stored);
             return Vec::new();
         }
@@ -1219,44 +1395,42 @@ impl ProductionPrincipalPlanSource {
             flow.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
             pinned.push(ip);
         }
-        let holds = NetworkHolds::for_pass(ownership, &pinned, || {
-            never_blocked(&self.exemptions_for(policy))
-        });
+        let holds = NetworkHolds::for_pass(ownership, &pinned, || never_blocked(&spared.floor));
         self.network_hold_log.note(stored, &holds);
         plan_kill_switch_networks(stored, &holds, protocols)
     }
 
     /// The per-destination and per-network blocks that arm while the secondary
-    /// is unreachable.
-    ///
-    /// Empty unless the user actually armed the leak-guard: it is opt-in, and
-    /// blocking traffic nobody asked to have blocked is the one failure mode a
-    /// routing product must never have. Empty too under fail-OPEN, where the
-    /// user has decided a leak is preferable to an outage. The master toggle is
-    /// the whole gate, as on Windows: the older `block_secondary_when_unavailable`
-    /// has no control in any client, so gating on it disarmed the guard exactly
-    /// when a tunnel took its interface down with it.
+    /// is unreachable. The posture is the gate, as on Windows.
     fn fail_closed_flows(
         &self,
         stored: &str,
         policy: &PerSidPolicySnapshot,
         rule_flows: &[FlowRule],
         ownership: &crate::address_ownership::AddressOwnership,
-        spared: &SharedIps,
+        spared: &Spared,
     ) -> Vec<FlowRule> {
-        if !policy.kill_switch_enabled || !policy.kill_switch_fail_closed {
-            self.network_hold_log.forget(stored);
-            return Vec::new();
-        }
         let (protected, _) = guarded_destinations(rule_flows, ownership, spared);
-        let holds = NetworkHolds::for_pass(ownership, &protected, || {
-            never_blocked(&self.exemptions_for(policy))
-        });
+        let holds = NetworkHolds::for_pass(ownership, &protected, || never_blocked(&spared.floor));
         self.network_hold_log.note(stored, &holds);
         let protocols = KillSwitchProtocols::from_bits(policy.kill_switch_protocols);
         let mut flows = plan_fail_closed_destinations(stored, &protected, protocols);
         flows.extend(plan_fail_closed_networks(stored, &holds, protocols));
         flows
+    }
+}
+
+/// Leave `guard` where the DNS path reads it for `stored`'s AAAA answers;
+/// `None` is "nothing routes or pins this principal's IPv6". A preview leaves
+/// the board alone, as on Windows.
+fn publish_ipv6_disposition(stored: &str, guard: Option<crate::enforcement_planner::Ipv6Guard>) {
+    if crate::applying_revision_overlay::previewing() {
+        return;
+    }
+    let board = crate::ipv6_disposition::global_ipv6_dispositions();
+    match guard {
+        Some(guard) => board.set(stored, guard),
+        None => board.forget(stored),
     }
 }
 
@@ -1268,23 +1442,27 @@ impl ProductionPrincipalPlanSource {
     /// block there cuts that host for every program, and the tunnel-bound
     /// site still has its route. Empty under the strict setting. The census
     /// counts IPv4 co-tenancy only, so a v6 address is never spared.
-    fn shared_ips_spared(&self, policy: &PerSidPolicySnapshot) -> SharedIps {
+    fn shared_ips_spared(
+        &self,
+        policy: &PerSidPolicySnapshot,
+        cache: &dyn FqdnCacheLookup,
+    ) -> SharedIps {
         if policy.kill_switch_strict_shared_ips {
             return SharedIps::new();
         }
-        self.fqdn_cache.shared_direct_ips()
+        cache.shared_direct_ips()
     }
 
-    /// Report the spared addresses while the guard is what protects them;
-    /// under a blanket block or a disarmed guard nothing was left out.
+    /// Report the spared addresses while the per-destination guard is what
+    /// protects them; under a blanket block or no protection nothing was left
+    /// out.
     fn publish_shared_ip_exemptions(
         &self,
         stored: &str,
-        policy: &PerSidPolicySnapshot,
-        block_all_armed: bool,
+        per_destination: bool,
         rule_flows: &[FlowRule],
         ownership: &crate::address_ownership::AddressOwnership,
-        spared: &SharedIps,
+        spared: &Spared,
     ) {
         if crate::applying_revision_overlay::previewing() {
             return;
@@ -1292,7 +1470,7 @@ impl ProductionPrincipalPlanSource {
         let Some(status) = self.shared_ip_exemptions.as_ref() else {
             return;
         };
-        let (protected, excluded) = if policy.kill_switch_enabled && !block_all_armed {
+        let (protected, excluded) = if per_destination {
             guarded_destinations(rule_flows, ownership, spared)
         } else {
             (Vec::new(), Vec::new())
@@ -1312,39 +1490,40 @@ impl ProductionPrincipalPlanSource {
     }
 
     /// The service accounts' share of this principal's guard: the pins while
-    /// the tunnel is up, the address blocks once it is gone and the guard fails
-    /// closed — never the blanket either posture may give the user.
+    /// the tunnel is up, the address blocks once it is gone — never the
+    /// blanket either posture may give the user.
     fn service_account_flows(
         &self,
         stored: &str,
         policy: &PerSidPolicySnapshot,
-        availability: ChannelAvailability,
+        posture: ProtectionPosture,
         rule_flows: &[FlowRule],
         ownership: &crate::address_ownership::AddressOwnership,
-        spared: &SharedIps,
+        spared: &Spared,
     ) -> Vec<FlowRule> {
         use crate::enforcement_planner::{
-            plan_forwarded_flows, plan_service_account_flows, service_account_guard,
-            ServiceAccountInput, ServiceAccountPosture,
+            plan_forwarded_flows_with_foreign, plan_service_account_flows_with_foreign,
+            service_account_guard, ServiceAccountInput, ServiceAccountPosture,
         };
         let Some(primary_dns) = self.service_accounts.as_ref() else {
             return Vec::new();
         };
-        let posture = if !policy.kill_switch_enabled {
-            None
-        } else if availability.secondary {
-            Some(ServiceAccountPosture::Pin)
-        } else if policy.kill_switch_fail_closed {
-            Some(ServiceAccountPosture::Block)
-        } else {
-            None
-        };
-        let Some(posture) = posture else {
+        // Lowering keeps only the owner's; the others' would be built for nothing.
+        if !self.is_route_table_owner(stored) {
             return Vec::new();
+        }
+        let posture = match posture {
+            ProtectionPosture::Open => return Vec::new(),
+            ProtectionPosture::PinRuleDestinations | ProtectionPosture::CatchAllThroughTunnel => {
+                ServiceAccountPosture::Pin
+            }
+            ProtectionPosture::BlockRuleDestinations | ProtectionPosture::BlockAll => {
+                ServiceAccountPosture::Block
+            }
         };
         let (protected, _) = guarded_destinations(rule_flows, ownership, spared);
-        let exemptions = self.exemptions_for(policy);
-        let holds = NetworkHolds::for_pass(ownership, &protected, || never_blocked(&exemptions));
+        let exemptions = &spared.floor;
+        let holds = NetworkHolds::for_pass(ownership, &protected, || never_blocked(exemptions));
         let servers: Vec<std::net::IpAddr> = exemptions
             .server_ips
             .iter()
@@ -1383,14 +1562,16 @@ impl ProductionPrincipalPlanSource {
         self.service_account_dns_log.note(&guard.dns_spared);
         // No per-program match on this platform: the service's own traffic
         // leaves by its mark, and the tunnel's servers are subtracted above.
-        let mut flows = plan_service_account_flows(
+        let foreign = self.foreign_tunnels_for(policy);
+        let mut flows = plan_service_account_flows_with_foreign(
             stored,
             &guard,
             KillSwitchProtocols::from_bits(policy.kill_switch_protocols),
             &[],
+            &foreign,
         );
         if policy.guard_forwarded_traffic {
-            flows.extend(plan_forwarded_flows(stored, &guard));
+            flows.extend(plan_forwarded_flows_with_foreign(stored, &guard, &foreign));
         }
         flows
     }
@@ -1419,12 +1600,51 @@ fn never_blocked(exemptions: &CatchAllExemptions) -> Vec<nrr_shared::ip_block::I
     )
 }
 
-/// Whether the smart leak-guard leaves `ip` alone.
-fn is_spared(ip: std::net::IpAddr, spared: &SharedIps) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => spared.contains(&v4),
-        std::net::IpAddr::V6(_) => false,
+/// What the leak-guard leaves alone: an address a direct host shares, and the
+/// main link's own segments, where a rule host keeps its direct route.
+#[derive(Default)]
+struct Spared {
+    shared: SharedIps,
+    /// The floor the blanket would keep open; empty while protection is off.
+    floor: CatchAllExemptions,
+}
+
+impl Spared {
+    fn on_local_segment(&self, ip: std::net::IpAddr) -> bool {
+        crate::enforcement_planner::on_attached_segment(
+            ip,
+            &self.floor.local_subnets,
+            &self.floor.local_subnets_v6,
+        )
     }
+}
+
+/// Whether the leak-guard leaves `ip` alone.
+fn is_spared(ip: std::net::IpAddr, spared: &Spared) -> bool {
+    spared.on_local_segment(ip)
+        || match ip {
+            std::net::IpAddr::V4(v4) => spared.shared.contains(&v4),
+            std::net::IpAddr::V6(_) => false,
+        }
+}
+
+/// The networks the PRIMARY rules route, as their own permits. Already carved
+/// around every narrower claim, and kept in the rule band, so the forwarded
+/// blanket opens them as it does for the owner and a tunnel-bound address
+/// inside stays held.
+fn primary_network_permits(flows: &[FlowRule]) -> impl Iterator<Item = FlowRule> + '_ {
+    flows
+        .iter()
+        .filter(|flow| {
+            flow.verdict == Verdict::Permit
+                && flow.precedence.class == PrecedenceClass::RouteRule(RouteRole::Primary)
+                && flow.app == AppScope::Any
+                && matches!(
+                    flow.flow.dst,
+                    DstMatch::SubnetV4 { .. } | DstMatch::SubnetV6 { .. }
+                )
+        })
+        .cloned()
 }
 
 /// The secondary destinations the guard may pin or block, and the ones the
@@ -1434,16 +1654,16 @@ fn is_spared(ip: std::net::IpAddr, spared: &SharedIps) -> bool {
 fn guarded_destinations(
     flows: &[FlowRule],
     ownership: &crate::address_ownership::AddressOwnership,
-    spared: &SharedIps,
+    spared: &Spared,
 ) -> (Vec<std::net::IpAddr>, Vec<std::net::Ipv4Addr>) {
     let mut protected = Vec::new();
     let mut excluded = Vec::new();
     for ip in secondary_destinations(flows) {
-        if !ownership.may_block(ip) {
+        if !ownership.may_block(ip) || spared.on_local_segment(ip) {
             continue;
         }
         match ip {
-            std::net::IpAddr::V4(v4) if spared.contains(&v4) => excluded.push(v4),
+            std::net::IpAddr::V4(v4) if spared.shared.contains(&v4) => excluded.push(v4),
             _ => protected.push(ip),
         }
     }
@@ -1519,6 +1739,19 @@ impl PrincipalPlanSource for ProductionPrincipalPlanSource {
         if let Some(sources) = self.tunnel_servers.as_ref() {
             *sources.pass_peers.lock().unwrap_or_else(|p| p.into_inner()) = None;
         }
+        *self.pass_owner.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.pass_links
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    fn end_pass(&self) {
+        self.publish_pass_links(&crate::foreign_tunnels::global_foreign_tunnels());
+    }
+
+    fn set_route_table_owner(&self, owner: Option<&UserPrincipal>) {
+        *self.pass_owner.lock().unwrap_or_else(|p| p.into_inner()) = Some(owner.cloned());
     }
 
     fn plan_for(
@@ -1547,20 +1780,19 @@ impl PrincipalPlanSource for ProductionPrincipalPlanSource {
         if let RulesRead::Unreadable(reason) = self.rules.rules_read_for(principal.as_stored()) {
             return PlanRead::Unreadable(reason);
         }
-        match self.plan_for(principal, availability) {
+        let planned = self.plan_for(principal, availability);
+        // A policy that could not be read answered like an absent one, and the
+        // denies-only plan it produced would withdraw the rest.
+        if let Some(reason) = self.policy.read_failure_for(principal.as_stored()) {
+            return PlanRead::Unreadable(reason);
+        }
+        match planned {
             Some(planned) => PlanRead::Planned(planned),
             None => PlanRead::NoPolicy,
         }
     }
 }
 
-/// Whether the user's settings call for the catch-all block-all — the posture
-/// this platform cannot arm safely yet.
-///
-/// True in the always-on modes, and in split mode when the user asked for
-/// block-all explicitly. Reported, never acted on: arming a blanket block
-/// without the tunnel-server and local-subnet exemptions cuts the reconnect that
-/// would end the outage, and the LAN with it.
 fn doh_lockdown_active(
     policy: &PerSidPolicySnapshot,
     rule_book: &nrr_domain::canonical::CanonicalRuleBook,
@@ -1569,20 +1801,17 @@ fn doh_lockdown_active(
         policy.doh_lockdown_auto,
         policy.doh_lockdown_enabled,
         policy.doh_lockdown_scope,
-        policy.kill_switch_enabled,
+        policy.leak_protection.is_on(),
         crate::rule_book_facts::has_secondary_rules(rule_book),
     )
 }
 
-fn wants_block_all(policy: &PerSidPolicySnapshot, mode: RouteBehaviorMode) -> bool {
-    if !policy.kill_switch_enabled {
-        return false;
-    }
-    match mode {
-        RouteBehaviorMode::PreferPrimary => policy.kill_switch_block_all,
-        RouteBehaviorMode::PreferSecondaryWhenAvailable
-        | RouteBehaviorMode::StrictSecondaryFailClosed => true,
-    }
+/// The postures that hold everything rather than the rules' destinations.
+fn is_blanket(posture: ProtectionPosture) -> bool {
+    matches!(
+        posture,
+        ProtectionPosture::BlockAll | ProtectionPosture::CatchAllThroughTunnel
+    )
 }
 
 /// The saved adapter bindings of a principal, read from the same per-user policy
@@ -1699,13 +1928,21 @@ pub fn cache_lookup_over(
     ))
 }
 
+/// The links a principal bound, for the "ours" every foreign-tunnel question
+/// starts from.
+fn bindings_of(
+    policy: &PerSidPolicySnapshot,
+) -> impl Iterator<Item = &crate::per_sid_orchestrator::PerSidBinding> {
+    policy.primary.iter().chain(policy.secondary.iter())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nrr_domain::canonical::{
         CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
     };
-    use nrr_domain::{RuleAction, RuleId};
+    use nrr_domain::{LeakProtection, RuleAction, RuleId};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use crate::per_sid_orchestrator::{ActiveRulesSnapshot, PerSidBehaviorMode, PerSidBinding};
@@ -1746,7 +1983,6 @@ mod tests {
                         origin: None,
                     }]),
                 },
-                // The placeholder the rules provider ships; the mode is the policy's.
             })
         }
     }
@@ -1754,38 +1990,43 @@ mod tests {
     /// The settings under test; everything else at its default.
     struct Policy {
         mode: PerSidBehaviorMode,
-        enabled: bool,
-        block_when_unavailable: bool,
-        fail_closed: bool,
-        block_all: bool,
+        protection: LeakProtection,
+        dns_over_primary: bool,
         strict_shared_ips: bool,
         /// `Some` = DoH lockdown on with scope `Always`, over these resolvers.
         doh_always: Option<Vec<IpAddr>>,
+        auto_accept: bool,
+        /// The forwarded-traffic answer is anything but "do not protect".
+        guard_forwarded: bool,
     }
 
     impl Policy {
+        /// Main connection by default, the routed sites protected.
         fn armed() -> Self {
             Self {
                 mode: PerSidBehaviorMode::PreferPrimary,
-                enabled: true,
-                block_when_unavailable: true,
-                fail_closed: true,
-                block_all: false,
+                protection: LeakProtection::Sites,
+                dns_over_primary: false,
                 strict_shared_ips: false,
                 doh_always: None,
+                auto_accept: false,
+                guard_forwarded: true,
             }
         }
 
-        fn strict() -> Self {
+        /// Main connection by default, everything protected.
+        fn everything() -> Self {
             Self {
-                mode: PerSidBehaviorMode::StrictSecondaryFailClosed,
+                protection: LeakProtection::Everything,
                 ..Self::armed()
             }
         }
 
+        /// The additional connection by default, everything protected.
         fn prefer_secondary() -> Self {
             Self {
                 mode: PerSidBehaviorMode::PreferSecondaryWhenAvailable,
+                protection: LeakProtection::Everything,
                 ..Self::armed()
             }
         }
@@ -1793,7 +2034,7 @@ mod tests {
         /// The user chose leak-over-outage: the guard installs nothing.
         fn disarmed() -> Self {
             Self {
-                enabled: false,
+                protection: LeakProtection::Off,
                 ..Self::armed()
             }
         }
@@ -1811,15 +2052,11 @@ mod tests {
                 primary: Some(binding("eth0")),
                 secondary: Some(binding("tun0")),
                 mode: self.mode,
-                block_secondary_when_unavailable: self.block_when_unavailable,
-                kill_switch_fail_closed: self.fail_closed,
+                leak_protection: self.protection,
                 kill_switch_protocols: 0x7F,
-                kill_switch_block_all: self.block_all,
-                kill_switch_enabled: self.enabled,
-                allow_dns_over_primary: false,
+                allow_dns_over_primary: self.dns_over_primary,
                 shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
                 kill_switch_strict_shared_ips: self.strict_shared_ips,
-                mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy::PerIp,
                 link_provider_exe_paths: Vec::new(),
                 doh_lockdown_enabled: self.doh_always.is_some(),
                 doh_lockdown_scope: if self.doh_always.is_some() {
@@ -1834,10 +2071,10 @@ mod tests {
                 primary_probe_timeout_ms: 1500,
                 primary_probe_max_targets: 8,
                 primary_probe_repeat_secs: 300,
-                local_networks_auto_accept: false,
+                local_networks_auto_accept: self.auto_accept,
                 zone_priority_over_ip: false,
                 app_rules_take_all_addresses: false,
-                guard_forwarded_traffic: true,
+                guard_forwarded_traffic: self.guard_forwarded,
             })
         }
     }
@@ -1996,7 +2233,6 @@ mod tests {
                     primary: CanonicalRuleSet::from_rules(Vec::new()),
                     secondary: CanonicalRuleSet::from_rules(Vec::new()),
                 },
-                // The placeholder the rules provider ships; the mode is the policy's.
             })
         }
         fn active_rules_for(&self, _sid: &str) -> Option<ActiveRulesSnapshot> {
@@ -2138,10 +2374,8 @@ mod tests {
 
     #[test]
     fn an_empty_book_in_a_tunnel_mode_still_gets_its_guard() {
-        // Strict is not the case to test with: it always emits its own
-        // catch-all, so the plan is never empty there and the early return is
-        // never reached. Mode B is where the book being empty made the whole
-        // plan empty - and with it the blanket block and the leak-guard.
+        // The tunnel-default route is where an empty book made the whole plan
+        // empty - and with it the blanket block and the leak-guard.
         let (plan, _) = plan(NoRulesButBound, Policy::prefer_secondary(), false);
         // The plan EXISTS - that is the point. Whether it carries blocks is a
         // separate question (with no rules there is no per-destination set to
@@ -2282,6 +2516,47 @@ mod tests {
         assert_eq!(read.secondary.as_deref(), Some("tun0"));
     }
 
+    /// A planned principal leaves its IPv6 disposition where the DNS path
+    /// reads it; a preview of a revision does not, and a principal without a
+    /// policy row reads `Off`, never "first plan pending".
+    #[test]
+    fn a_plan_publishes_its_ipv6_disposition_and_a_preview_does_not() {
+        use crate::enforcement_planner::Ipv6Guard;
+        // Its own principal: the board is process-wide.
+        let principal = UserPrincipal::from_linux_uid(4242);
+        let stored = principal.as_stored();
+        let board = crate::ipv6_disposition::global_ipv6_dispositions();
+        let planner = source(Arc::new(OneSecondaryRule), Arc::new(Policy::armed()));
+        let expected = planner.ipv6_guard(&Policy::armed().load_for_sid(stored).expect("policy"));
+        let other = if expected == Ipv6Guard::Off {
+            Ipv6Guard::FiltersOnly
+        } else {
+            Ipv6Guard::Off
+        };
+
+        board.set(stored, other);
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let conn = rusqlite::Connection::open(dir.path().join("state.db")).expect("open");
+        {
+            let _preview =
+                crate::applying_revision_overlay::preview_on_this_thread(&conn, stored, "{}");
+            assert!(
+                crate::applying_revision_overlay::previewing(),
+                "fixture guard"
+            );
+            let _ = planner.plan_with_coverage(&principal, availability(true));
+        }
+        assert_eq!(board.of(stored), Some(other), "a preview published");
+
+        let _ = planner.plan_with_coverage(&principal, availability(true));
+        assert_eq!(board.of(stored), Some(expected));
+
+        board.set(stored, other);
+        let _ = source(Arc::new(OneSecondaryRule), Arc::new(NoPolicy))
+            .plan_with_coverage(&principal, availability(true));
+        assert_eq!(board.of(stored), Some(Ipv6Guard::Off));
+    }
+
     /// While the tunnel is up the guard is the pin, not a block.
     #[test]
     fn a_live_secondary_needs_no_fail_closed_blocks() {
@@ -2321,155 +2596,208 @@ mod tests {
     /// blocked is the one failure a routing product must not have.
     #[test]
     fn a_disarmed_guard_blocks_nothing_when_the_secondary_drops() {
-        let (plan, coverage) = plan(
-            OneSecondaryRule,
-            Policy {
-                enabled: false,
-                ..Policy::armed()
-            },
-            false,
-        );
+        let (plan, coverage) = plan(OneSecondaryRule, Policy::disarmed(), false);
 
         assert_eq!(coverage.fail_closed_blocks, 0);
         assert_eq!(blocks_on(&plan, SECONDARY_HOST), 0);
         assert!(!coverage.guard_holding);
     }
 
-    /// A blanket block with nothing underneath it takes the machine off its own
-    /// network: loopback, DHCP, the link's control traffic and the tunnel's
-    /// handshake are all "traffic no rule permitted". The strict mode's default
-    /// catch-all is planned with the rules, so its floor has to be planned too —
-    /// including on the path where the blanket posture never arms.
-    #[test]
-    fn the_strict_default_block_never_stands_without_its_floor() {
-        for with_server_route in [false, true] {
-            let (plan, _) =
-                plan_on_machine(OneSecondaryRule, Policy::strict(), true, with_server_route);
+    /// What a plan holds, read off its flows.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Held {
+        Nothing,
+        /// The rule hosts may leave only through the tunnel.
+        Pins,
+        /// The rule hosts are blocked.
+        RuleBlocks,
+        /// Everything is held but the floor.
+        Everything,
+        /// Everything that does not leave through the tunnel is held.
+        EverythingOffTunnel,
+    }
 
-            let has_default_block = plan.flows.iter().any(|f| {
-                f.verdict == Verdict::Block
-                    && f.precedence.class == PrecedenceClass::DefaultCatchAll
-            });
-            assert!(
-                has_default_block,
-                "strict mode is the mode that emits the default block"
-            );
-
-            let exempts_loopback = plan.flows.iter().any(|f| {
-                f.verdict == Verdict::Permit
-                    && f.precedence.class == PrecedenceClass::CatchAllExempt
-                    && matches!(
-                        f.flow.dst,
-                        DstMatch::SubnetV4 { net, prefix }
-                            if net == std::net::Ipv4Addr::new(127, 0, 0, 0) && prefix == 8
-                    )
-            });
-            assert!(
-                exempts_loopback,
-                "with_server_route={with_server_route}: the block stands over an empty floor"
-            );
+    fn held(plan: &EnforcementPlan) -> Held {
+        let tunnel_egress = plan.flows.iter().any(|f| {
+            f.verdict == Verdict::Permit
+                && f.precedence.class == PrecedenceClass::CatchAllExempt
+                && f.flow.dst == DstMatch::Any
+                && f.egress == EgressConstraint::OnlyVia(EgressRef::Secondary)
+        });
+        let pinned = plan.flows.iter().any(|f| {
+            f.flow.dst == DstMatch::HostV4(SECONDARY_HOST)
+                && f.egress == EgressConstraint::OnlyVia(EgressRef::Secondary)
+        });
+        match (blanket_blocks(plan) > 0, tunnel_egress) {
+            (true, true) => Held::EverythingOffTunnel,
+            (true, false) => Held::Everything,
+            _ if blocks_on(plan, SECONDARY_HOST) > 0 => Held::RuleBlocks,
+            _ if pinned => Held::Pins,
+            _ => Held::Nothing,
         }
     }
 
-    /// The mode is the user's, from the policy row the Windows planner reads
-    /// too, never the placeholder the rules snapshot carries. Each mode has a
-    /// posture of its own: the strict default block, the blanket block while
-    /// the tunnel is up, and the hold once it is gone.
+    /// The one decision table, end to end on this platform: default route ×
+    /// leak protection × tunnel up or down. The mode comes from the policy row
+    /// the Windows planner reads too, never the rules snapshot's placeholder.
     #[test]
-    fn the_plan_takes_the_users_mode_from_the_policy_as_windows_does() {
-        for mode in [
-            PerSidBehaviorMode::PreferPrimary,
-            PerSidBehaviorMode::PreferSecondaryWhenAvailable,
-            PerSidBehaviorMode::StrictSecondaryFailClosed,
-        ] {
-            let policy = || Policy {
+    fn each_default_route_and_protection_holds_what_the_table_says() {
+        use LeakProtection::{Everything, Off, Sites};
+        use PerSidBehaviorMode::{
+            PreferPrimary as Main, PreferSecondaryWhenAvailable as Additional,
+        };
+        let table = [
+            (Main, Off, true, Held::Nothing),
+            (Main, Off, false, Held::Nothing),
+            (Main, Sites, true, Held::Pins),
+            (Main, Sites, false, Held::RuleBlocks),
+            (Main, Everything, true, Held::Pins),
+            (Main, Everything, false, Held::Everything),
+            (Additional, Off, true, Held::Nothing),
+            (Additional, Off, false, Held::Nothing),
+            // Not offered under this route; stored, it means everything.
+            (Additional, Sites, true, Held::EverythingOffTunnel),
+            (Additional, Sites, false, Held::Everything),
+            (Additional, Everything, true, Held::EverythingOffTunnel),
+            (Additional, Everything, false, Held::Everything),
+        ];
+        for (mode, protection, up, expected) in table {
+            let case = format!("{mode:?} / {protection:?} / tunnel up: {up}");
+            let policy = Policy {
                 mode,
+                protection,
                 ..Policy::armed()
             };
-            let decided = policy()
-                .load_for_sid(user().as_stored())
-                .map(|snapshot| behavior_mode_for_codegen(&snapshot))
-                .expect("the policy loads");
-            let strict = decided == RouteBehaviorMode::StrictSecondaryFailClosed;
-            let tunnel_default = decided != RouteBehaviorMode::PreferPrimary;
-
-            let (up, _) = plan_on_machine(OneSecondaryRule, policy(), true, true);
-            let has_default_block = up.flows.iter().any(|f| {
-                f.verdict == Verdict::Block
-                    && f.precedence.class == PrecedenceClass::DefaultCatchAll
-            });
-            assert_eq!(has_default_block, strict, "{mode:?}: strict default block");
+            let (plan, coverage) = plan_on_machine(OneSecondaryRule, policy, up, true);
+            assert_eq!(held(&plan), expected, "{case}");
             assert_eq!(
-                blanket_blocks(&up) > 0,
-                tunnel_default,
-                "{mode:?}: the blanket block of the tunnel-default modes"
-            );
-
-            let (down, coverage) = plan_on_machine(OneSecondaryRule, policy(), false, true);
-            assert_eq!(
-                blanket_blocks(&down) > 0,
-                tunnel_default,
-                "{mode:?}: the hold once the tunnel is gone"
+                coverage.guard_holding,
+                matches!(expected, Held::RuleBlocks | Held::Everything),
+                "{case}"
             );
             assert_eq!(
                 coverage.fail_closed_blocks > 0,
-                !tunnel_default,
-                "{mode:?}: split mode guards per address, the others hold everything"
+                expected == Held::RuleBlocks,
+                "{case}: a blanket and the per-address blocks are one policy stated twice"
             );
+            assert!(coverage.kill_switch_complete, "{case}");
+        }
+    }
+
+    /// "Everything" under the main-connection route while the tunnel is up:
+    /// the rule hosts are pinned to it and nothing else is held, so the sites
+    /// the main connection carries keep working.
+    #[test]
+    fn everything_under_the_main_route_leaves_the_main_links_internet_open_while_the_tunnel_is_up()
+    {
+        let (plan, coverage) = plan_on_machine(OneSecondaryRule, Policy::everything(), true, true);
+
+        assert_eq!(blanket_blocks(&plan), 0, "the main link's internet is cut");
+        assert!(
+            !plan
+                .flows
+                .iter()
+                .any(|f| f.verdict == Verdict::Block && f.flow.dst == DstMatch::Any),
+            "unmatched traffic is blocked: {:?}",
+            plan.flows
+        );
+        assert_eq!(held(&plan), Held::Pins);
+        assert!(!coverage.guard_holding);
+        assert!(coverage.kill_switch_complete);
+    }
+
+    /// The hold of "everything" keeps name resolution over the main connection
+    /// open when the user allowed it, under either default route, and only then.
+    #[test]
+    fn a_lost_tunnel_under_everything_keeps_dns_over_the_main_link_only_when_allowed() {
+        use nrr_platform_api::enforcement::PrincipalScope;
+        const RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 53);
+        for mode in [
+            PerSidBehaviorMode::PreferPrimary,
+            PerSidBehaviorMode::PreferSecondaryWhenAvailable,
+        ] {
+            for allowed in [true, false] {
+                let (api, links) = machine(true);
+                let policy = Policy {
+                    mode,
+                    dns_over_primary: allowed,
+                    ..Policy::everything()
+                };
+                let (plan, _) = source(Arc::new(OneSecondaryRule), Arc::new(policy))
+                    .with_machine_facts(
+                        api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                        links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+                    )
+                    .with_service_accounts(Arc::new(|| vec![IpAddr::V4(RESOLVER)]))
+                    .plan_with_coverage(&user(), availability(false))
+                    .expect("the rule must plan");
+
+                assert_eq!(held(&plan), Held::Everything, "{mode:?}");
+                let dns_open = plan.flows.iter().any(|f| {
+                    f.verdict == Verdict::Permit
+                        && f.precedence.class == PrecedenceClass::CatchAllExempt
+                        && !matches!(
+                            f.principal,
+                            PrincipalScope::ServiceAccounts | PrincipalScope::Forwarded
+                        )
+                        && f.flow.dst == DstMatch::HostV4(RESOLVER)
+                        && f.flow.dst_port == Some(53)
+                });
+                assert_eq!(dns_open, allowed, "{mode:?}, allowed: {allowed}");
+            }
         }
     }
 
     const SERVER_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7);
 
-    /// The default block judges both families on a backend with one chain, so
-    /// its floor opens the IPv6 link scope and the tunnel's v6 endpoint too —
-    /// with the guard off, where nothing else would.
+    /// The blanket judges both families on a backend with one chain, so it
+    /// leaves the IPv6 link scope and the tunnel's v6 endpoint open.
     #[test]
-    fn the_strict_floor_leaves_the_ipv6_link_scope_and_the_tunnels_v6_server_open() {
+    fn the_blanket_leaves_the_ipv6_link_scope_and_the_tunnels_v6_server_open() {
         struct V6Peer;
         impl TunnelEndpointSource for V6Peer {
             fn tunnel_endpoints(&self) -> Vec<IpAddr> {
                 vec![IpAddr::V6(SERVER_V6)]
             }
         }
-        let (api, links) = machine(false);
-        let policy = Policy {
-            enabled: false,
-            ..Policy::strict()
-        };
-        let (plan, _) = source(Arc::new(OneSecondaryRule), Arc::new(policy))
+        for up in [true, false] {
+            let (api, links) = machine(true);
+            let (plan, _) = source(
+                Arc::new(OneSecondaryRule),
+                Arc::new(Policy::prefer_secondary()),
+            )
             .with_machine_facts(
                 api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
                 links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
             )
             .with_tunnel_servers(remembering(Vec::new()), Some(Arc::new(V6Peer)))
-            .plan_with_coverage(&user(), availability(true))
+            .plan_with_coverage(&user(), availability(up))
             .expect("the rule must plan");
 
-        assert_eq!(blanket_blocks(&plan), 0, "fixture guard: the guard is off");
-        let has_default_block = plan.flows.iter().any(|f| {
-            f.verdict == Verdict::Block && f.precedence.class == PrecedenceClass::DefaultCatchAll
-        });
-        assert!(has_default_block, "fixture guard: strict mode's block");
-        for dst in [
-            DstMatch::SubnetV6 {
-                net: Ipv6Addr::LOCALHOST,
-                prefix: 128,
-            },
-            DstMatch::SubnetV6 {
-                net: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
-                prefix: 10,
-            },
-            DstMatch::SubnetV6 {
-                net: Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0),
-                prefix: 16,
-            },
-            DstMatch::SubnetV6 {
-                net: SERVER_V6,
-                prefix: 128,
-            },
-        ] {
-            assert!(exempts(&plan, dst), "the floor cuts {dst:?}");
+            assert!(blanket_blocks(&plan) > 0, "fixture guard: the blanket arms");
+            for dst in [
+                DstMatch::SubnetV6 {
+                    net: Ipv6Addr::LOCALHOST,
+                    prefix: 128,
+                },
+                DstMatch::SubnetV6 {
+                    net: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
+                    prefix: 10,
+                },
+                DstMatch::SubnetV6 {
+                    net: Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0),
+                    prefix: 16,
+                },
+                DstMatch::SubnetV6 {
+                    net: SERVER_V6,
+                    prefix: 128,
+                },
+            ] {
+                assert!(
+                    exempts(&plan, dst),
+                    "tunnel up: {up}: the blanket cuts {dst:?}"
+                );
+            }
         }
     }
 
@@ -2478,7 +2806,11 @@ mod tests {
     /// host a VPN client dialled through the guard stays blocked.
     #[test]
     fn a_rule_host_a_vpn_client_dialled_stays_blocked_while_the_tunnel_is_down() {
-        for policy in [Policy::armed(), Policy::strict()] {
+        for policy in [
+            Policy::armed(),
+            Policy::everything(),
+            Policy::prefer_secondary(),
+        ] {
             let (plan, coverage) = plan_on_machine(OneSecondaryRule, policy, false, true);
             assert!(
                 !exempts(&plan, DstMatch::HostV4(SECONDARY_HOST)),
@@ -2513,12 +2845,15 @@ mod tests {
         let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
         let sid = user().as_stored().to_string();
         let sub = bus.subscribe_as("test".to_string(), Some(sid.clone()), None);
-        let source = source(Arc::new(OneSecondaryRule), Arc::new(Policy::strict()))
-            .with_machine_facts(
-                api as Arc<dyn RouteTablePort>,
-                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
-            )
-            .with_event_bus(Arc::clone(&bus));
+        let source = source(
+            Arc::new(OneSecondaryRule),
+            Arc::new(Policy::prefer_secondary()),
+        )
+        .with_machine_facts(
+            api as Arc<dyn RouteTablePort>,
+            links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+        )
+        .with_event_bus(Arc::clone(&bus));
         for _ in 0..3 {
             source.begin_pass();
             source
@@ -2749,62 +3084,36 @@ mod tests {
         assert!(pinned_via_tunnel(&strict_up, SHARED_HOST));
     }
 
-    /// The master toggle alone arms the guard: no client sets the older
-    /// `block_secondary_when_unavailable`, and a tunnel that removes its
-    /// interface on disconnect left every user who armed it after that field
-    /// lost its control leaking over the primary.
+    /// Protection of the routed sites alone arms the guard, so a tunnel that
+    /// removes its interface on disconnect cannot leave the user leaking over
+    /// the primary.
     #[test]
-    fn the_master_toggle_alone_blocks_when_the_secondary_drops() {
-        let (plan, coverage) = plan(
-            OneSecondaryRule,
-            Policy {
-                block_when_unavailable: false,
-                ..Policy::armed()
-            },
-            false,
-        );
+    fn routed_sites_protection_alone_blocks_when_the_secondary_drops() {
+        let (plan, coverage) = plan(OneSecondaryRule, Policy::armed(), false);
 
         assert!(coverage.fail_closed_blocks > 0);
         assert!(blocks_on(&plan, SECONDARY_HOST) > 0);
     }
 
-    /// Fail-OPEN is a decision the user made: a leak is preferable to an outage.
-    #[test]
-    fn fail_open_lets_the_traffic_out_rather_than_blocking_it() {
-        let (plan, _) = plan(
-            OneSecondaryRule,
-            Policy {
-                fail_closed: false,
-                ..Policy::armed()
-            },
-            false,
-        );
-
-        assert_eq!(blocks_on(&plan, SECONDARY_HOST), 0);
-    }
-
     /// With no reading of the machine there are no exemptions, so the blanket
     /// block cannot be armed safely. The plan must ADMIT the shortfall — silence
-    /// here would read as protection the user does not have.
+    /// here would read as protection the user does not have — and still hold
+    /// the rule hosts.
     #[test]
     fn an_always_on_mode_reports_its_protection_as_incomplete() {
-        let (_, coverage) = plan(OneSecondaryRule, Policy::strict(), false);
+        let (plan, coverage) = plan(OneSecondaryRule, Policy::prefer_secondary(), false);
 
         assert!(!coverage.kill_switch_complete);
+        assert!(blocks_on(&plan, SECONDARY_HOST) > 0);
+        assert!(coverage.guard_holding);
     }
 
-    /// Split mode with the block-all flag set asks for the same posture, and
-    /// without machine facts it is equally unavailable.
+    /// The main-connection route with everything protected asks for the same
+    /// hold once the tunnel is gone, and without machine facts it is equally
+    /// unavailable.
     #[test]
-    fn split_mode_asking_for_block_all_reports_incomplete_too() {
-        let (_, coverage) = plan(
-            OneSecondaryRule,
-            Policy {
-                block_all: true,
-                ..Policy::armed()
-            },
-            false,
-        );
+    fn split_mode_protecting_everything_reports_incomplete_too() {
+        let (_, coverage) = plan(OneSecondaryRule, Policy::everything(), false);
 
         assert!(!coverage.kill_switch_complete);
     }
@@ -2814,7 +3123,8 @@ mod tests {
     /// would be a trap rather than a guard.
     #[test]
     fn a_live_tunnel_in_an_always_on_mode_arms_the_blanket_block() {
-        let (plan, coverage) = plan_on_machine(OneSecondaryRule, Policy::strict(), true, true);
+        let (plan, coverage) =
+            plan_on_machine(OneSecondaryRule, Policy::prefer_secondary(), true, true);
 
         assert!(
             blanket_blocks(&plan) > 0,
@@ -2837,22 +3147,157 @@ mod tests {
         assert!(coverage.kill_switch_complete);
     }
 
+    /// The plan of a tunnel-default principal on [`machine`], with the stored
+    /// local-network answers laid over its exemptions, and the public prefix
+    /// the main link carries besides the LAN.
+    fn plan_with_local_answers(
+        answers: crate::route_coordinator::LocalNetworkPolicy,
+        auto_accept: bool,
+    ) -> EnforcementPlan {
+        let (api, links) = machine(true);
+        let mut routes =
+            nrr_platform_api::route_table::RouteTablePort::get_ip_forward_table(api.as_ref())
+                .expect("routes");
+        routes.push(nrr_platform_api::types::RouteEntry {
+            destination: IpAddr::V6(PUBLIC_V6.0),
+            prefix_length: PUBLIC_V6.1,
+            next_hop: IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            interface_index: 2,
+            metric: 0,
+            is_ours: false,
+            table: nrr_platform_api::RouteTableRef::Main,
+        });
+        api.set_route_table(routes);
+        let routes_port: Arc<dyn nrr_platform_api::route_table::RouteTablePort> = api;
+        let links_port: Arc<dyn nrr_platform_api::adapters::AdapterEventSource> = links;
+        let policy = || Policy {
+            auto_accept,
+            ..Policy::prefer_secondary()
+        };
+        let networks = crate::local_network_source::PolicyLocalNetworkSource::new(
+            Arc::clone(&routes_port),
+            Arc::clone(&links_port),
+            Arc::new(policy()),
+            Arc::new(OneSecondaryRule),
+            Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::default()),
+            Arc::new(move |_: &str| answers.clone()),
+        );
+        source(Arc::new(OneSecondaryRule), Arc::new(policy()))
+            .with_machine_facts(routes_port, links_port)
+            .with_local_networks(Arc::new(networks))
+            .plan_with_coverage(&user(), availability(true))
+            .expect("the rule must plan")
+            .0
+    }
+
+    const PUBLIC_V6: (std::net::Ipv6Addr, u8) = (
+        std::net::Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0, 0, 0, 0, 0),
+        64,
+    );
+
+    fn lan() -> DstMatch {
+        DstMatch::SubnetV4 {
+            net: Ipv4Addr::new(192, 168, 1, 0),
+            prefix: 24,
+        }
+    }
+
+    fn public_prefix() -> DstMatch {
+        DstMatch::SubnetV6 {
+            net: PUBLIC_V6.0,
+            prefix: PUBLIC_V6.1,
+        }
+    }
+
+    /// The user said no to the home network: it is blocked with the rest, and
+    /// a network they typed in stays reachable.
+    #[test]
+    fn a_refused_local_network_is_blocked_and_a_typed_one_stays_direct() {
+        use crate::route_coordinator::LocalNetworkPolicy;
+        let plan = plan_with_local_answers(LocalNetworkPolicy::default(), false);
+        assert!(exempts(&plan, lan()), "an unanswered LAN is kept");
+
+        let plan = plan_with_local_answers(
+            LocalNetworkPolicy {
+                refused: vec![
+                    nrr_domain::ipv4_network::Ipv4Network::parse("192.168.1.0/24").expect("net"),
+                ],
+                allowed: vec![
+                    nrr_domain::ipv4_network::Ipv4Network::parse("10.9.0.0/16").expect("net")
+                ],
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(!exempts(&plan, lan()), "a refused network stays blocked");
+        assert!(
+            exempts(
+                &plan,
+                DstMatch::SubnetV4 {
+                    net: Ipv4Addr::new(10, 9, 0, 0),
+                    prefix: 16,
+                },
+            ),
+            "the network the user named is kept direct",
+        );
+    }
+
+    /// A public IPv6 prefix is the user's to vouch for: closed until they say
+    /// yes. Under "everything" auto-accept does not stand in for that answer.
+    #[test]
+    fn a_public_v6_prefix_opens_only_on_the_users_answer_under_everything() {
+        use crate::route_coordinator::LocalNetworkPolicy;
+        let block = nrr_shared::ip_block::IpBlock::new(IpAddr::V6(PUBLIC_V6.0), PUBLIC_V6.1)
+            .expect("block");
+        assert!(!exempts(
+            &plan_with_local_answers(LocalNetworkPolicy::default(), false),
+            public_prefix()
+        ));
+        let yes = LocalNetworkPolicy {
+            answers_v6: vec![(block, true)],
+            ..Default::default()
+        };
+        assert!(exempts(
+            &plan_with_local_answers(yes, false),
+            public_prefix()
+        ));
+        let no = LocalNetworkPolicy {
+            answers_v6: vec![(block, false)],
+            ..Default::default()
+        };
+        assert!(!exempts(
+            &plan_with_local_answers(no, true),
+            public_prefix()
+        ));
+        assert!(
+            !exempts(
+                &plan_with_local_answers(LocalNetworkPolicy::default(), true),
+                public_prefix()
+            ),
+            "a silent answer would be a silent exemption"
+        );
+    }
+
     /// The refusal that keeps an outage from becoming permanent: without the
     /// server's address the blanket block would seal the tunnel's own reconnect,
-    /// so it is not armed and the shortfall is reported.
+    /// so it is not armed and the shortfall is reported. The rule hosts stay
+    /// pinned to the live tunnel rather than blocked outright: a block there
+    /// would cut them through a working tunnel.
     #[test]
     fn without_a_server_route_the_blanket_block_is_refused() {
-        let (plan, coverage) = plan_on_machine(OneSecondaryRule, Policy::strict(), true, false);
+        let (plan, coverage) =
+            plan_on_machine(OneSecondaryRule, Policy::prefer_secondary(), true, false);
 
         assert_eq!(blanket_blocks(&plan), 0);
         assert!(!coverage.kill_switch_complete);
+        assert_eq!(held(&plan), Held::Pins);
     }
 
     /// A memory that already holds `servers` and writes nowhere.
     fn remembering(servers: Vec<Ipv4Addr>) -> Arc<TunnelServerMemory> {
         Arc::new(TunnelServerMemory::new(
-            Arc::new(|_: &[Ipv4Addr]| {}),
-            Arc::new(move || servers.clone()),
+            Arc::new(|_: &str, _: &[Ipv4Addr]| {}),
+            Arc::new(move |_: &str| servers.clone()),
         ))
     }
 
@@ -2862,18 +3307,265 @@ mod tests {
     #[test]
     fn a_remembered_server_lets_the_blanket_block_arm_without_its_route() {
         let (api, links) = machine(false);
-        let (plan, coverage) = source(Arc::new(OneSecondaryRule), Arc::new(Policy::strict()))
-            .with_machine_facts(
-                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
-                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
-            )
-            .with_tunnel_servers(remembering(vec![SERVER]), None)
-            .plan_with_coverage(&user(), availability(true))
-            .expect("the rule must plan");
+        let (plan, coverage) = source(
+            Arc::new(OneSecondaryRule),
+            Arc::new(Policy::prefer_secondary()),
+        )
+        .with_machine_facts(
+            api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+            links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+        )
+        .with_tunnel_servers(remembering(vec![SERVER]), None)
+        .plan_with_coverage(&user(), availability(true))
+        .expect("the rule must plan");
 
         assert!(blanket_blocks(&plan) > 0);
         assert!(exempts(&plan, DstMatch::HostV4(SERVER)));
         assert!(coverage.kill_switch_complete);
+    }
+
+    /// A policy store that answers nothing, for the reason given.
+    struct NothingBecause(Option<&'static str>);
+    impl RoutePolicySource for NothingBecause {
+        fn load_for_sid(&self, _sid: &str) -> Option<PerSidPolicySnapshot> {
+            None
+        }
+        fn read_failure_for(&self, _sid: &str) -> Option<String> {
+            self.0.map(str::to_owned)
+        }
+    }
+
+    /// "No policy" removes what is installed; "the policy did not read" keeps it.
+    #[test]
+    fn a_policy_that_did_not_read_is_not_a_policy_that_is_absent() {
+        use crate::principal_enforcement::PlanRead;
+        let read = |reason: Option<&'static str>| {
+            source(Arc::new(OneSecondaryRule), Arc::new(NothingBecause(reason)))
+                .plan_read_for(&user(), availability(true))
+        };
+        assert!(matches!(
+            read(None),
+            PlanRead::NoPolicy | PlanRead::Planned(_)
+        ));
+        assert!(matches!(
+            read(Some("disk I/O error")),
+            PlanRead::Unreadable(reason) if reason == "disk I/O error"
+        ));
+    }
+
+    fn bob() -> UserPrincipal {
+        UserPrincipal::from_linux_uid(1001)
+    }
+
+    /// A tunnel server one user's links showed is that user's alone: another
+    /// user's blanket block must not arm on a hole their tunnel never had.
+    #[test]
+    fn a_server_remembered_for_one_user_does_not_arm_another_users_block() {
+        let alice = user();
+        let remembered_for = alice.as_stored().to_owned();
+        let memory = Arc::new(TunnelServerMemory::new(
+            Arc::new(|_: &str, _: &[Ipv4Addr]| {}),
+            Arc::new(move |sid: &str| {
+                if sid == remembered_for {
+                    vec![SERVER]
+                } else {
+                    Vec::new()
+                }
+            }),
+        ));
+        let plan_for = |principal: &UserPrincipal| {
+            let (api, links) = machine(false);
+            source(
+                Arc::new(OneSecondaryRule),
+                Arc::new(Policy::prefer_secondary()),
+            )
+            .with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            )
+            .with_tunnel_servers(Arc::clone(&memory), None)
+            .plan_with_coverage(principal, availability(true))
+            .expect("the rule must plan")
+        };
+
+        let (own, own_coverage) = plan_for(&alice);
+        assert!(blanket_blocks(&own) > 0);
+        assert!(exempts(&own, DstMatch::HostV4(SERVER)));
+        assert!(own_coverage.kill_switch_complete);
+
+        let (other, other_coverage) = plan_for(&bob());
+        assert_eq!(blanket_blocks(&other), 0, "armed on another user's server");
+        assert!(!exempts(&other, DstMatch::HostV4(SERVER)));
+        assert!(!other_coverage.kill_switch_complete);
+    }
+
+    fn service_account_flows_of(plan: &EnforcementPlan) -> usize {
+        use nrr_platform_api::enforcement::PrincipalScope;
+        plan.flows
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.principal,
+                    PrincipalScope::ServiceAccounts | PrincipalScope::Forwarded
+                )
+            })
+            .count()
+    }
+
+    /// Lowering keeps only the route-table owner's service-account rules, so
+    /// the others' are not built at all.
+    #[test]
+    fn only_the_route_table_owners_plan_carries_service_account_rules() {
+        let plan_told = |told: Option<Option<UserPrincipal>>| {
+            let source = source(Arc::new(OneSecondaryRule), Arc::new(Policy::armed()))
+                .with_service_accounts(Arc::new(Vec::new));
+            source.begin_pass();
+            if let Some(owner) = told {
+                source.set_route_table_owner(owner.as_ref());
+            }
+            source
+                .plan_with_coverage(&user(), availability(true))
+                .expect("the rule must plan")
+                .0
+        };
+
+        let as_owner = plan_told(Some(Some(user())));
+        assert!(
+            service_account_flows_of(&as_owner) > 0,
+            "fixture guard: the owner's guard speaks for the service accounts"
+        );
+        assert_eq!(
+            service_account_flows_of(&plan_told(None)),
+            service_account_flows_of(&as_owner)
+        );
+        assert_eq!(service_account_flows_of(&plan_told(Some(Some(bob())))), 0);
+        assert_eq!(service_account_flows_of(&plan_told(Some(None))), 0);
+    }
+
+    /// What the machine forwards for containers and guests is held with the
+    /// owner's own traffic once the tunnel is gone, and left alone when the
+    /// user answered "do not protect".
+    #[test]
+    fn forwarded_traffic_is_held_with_the_owner_unless_left_unprotected() {
+        use nrr_platform_api::enforcement::PrincipalScope;
+        let forwarded_blocks = |policy: Policy| -> Vec<FlowRule> {
+            let (api, links) = machine(true);
+            let (plan, _) = source(Arc::new(OneSecondaryRule), Arc::new(policy))
+                .with_machine_facts(
+                    api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                    links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+                )
+                .with_service_accounts(Arc::new(Vec::new))
+                .plan_with_coverage(&user(), availability(false))
+                .expect("the rule must plan");
+            plan.flows
+                .into_iter()
+                .filter(|f| f.principal == PrincipalScope::Forwarded && f.verdict == Verdict::Block)
+                .collect()
+        };
+
+        let sites = forwarded_blocks(Policy::armed());
+        assert!(
+            sites
+                .iter()
+                .any(|f| f.flow.dst == DstMatch::HostV4(SECONDARY_HOST)),
+            "a container reaches the routed site over the main link: {sites:?}"
+        );
+        let everything = forwarded_blocks(Policy::everything());
+        assert!(
+            everything
+                .iter()
+                .any(|f| f.precedence.class == PrecedenceClass::CatchAllBlock),
+            "a container keeps the internet the owner lost: {everything:?}"
+        );
+
+        for policy in [Policy::armed(), Policy::everything()] {
+            let unprotected = forwarded_blocks(Policy {
+                guard_forwarded: false,
+                ..policy
+            });
+            assert!(unprotected.is_empty(), "{unprotected:?}");
+        }
+    }
+
+    struct MessengerRule;
+    impl RulesProvider for MessengerRule {
+        fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+            Some(ActiveRulesSnapshot {
+                rule_book: CanonicalRuleBook {
+                    primary: CanonicalRuleSet::from_rules(Vec::new()),
+                    secondary: CanonicalRuleSet::from_rules(vec![CanonicalRule {
+                        id: RuleId("s-app".into()),
+                        enabled: true,
+                        address_match: None,
+                        app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
+                            pattern: nrr_domain::canonical::CanonicalAppPattern::Exact(
+                                "messenger.exe".into(),
+                            ),
+                            include_child_processes: false,
+                            override_requested: false,
+                        }),
+                        comment: String::new(),
+                        action: RuleAction::Route,
+                        origin: None,
+                    }]),
+                },
+            })
+        }
+    }
+
+    /// Where programs are observed per user, a user's application rule routes
+    /// the addresses their own programs used and nobody else's: the routes,
+    /// like the filters, read the user's own store.
+    #[test]
+    fn an_application_rule_routes_what_the_users_own_programs_used() {
+        use crate::app_observation_lookup::AppObservationStore;
+        let (alice_ip, bob_ip) = (
+            Ipv4Addr::new(198, 51, 100, 9),
+            Ipv4Addr::new(198, 51, 100, 10),
+        );
+        let store = Arc::new(AppObservationStore::per_principal());
+        for (principal, ip) in [(user(), alice_ip), (bob(), bob_ip)] {
+            let own = store
+                .scope_for(Some(principal.as_stored()))
+                .expect("own store");
+            assert!(own.record("messenger.exe", ip));
+        }
+        let source = ProductionPrincipalPlanSource::new(
+            Arc::new(MessengerRule),
+            Arc::new(Policy::armed()),
+            Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::default()),
+            Arc::new(nrr_platform_api::app_path_resolver::NoopAppPathResolver),
+            store,
+        );
+        let routed = |principal: &UserPrincipal| -> Vec<Ipv4Addr> {
+            let (plan, _) = source
+                .plan_with_coverage(principal, availability(true))
+                .expect("the rule must plan");
+            plan.routes
+                .iter()
+                .filter_map(|r| match r.dst {
+                    DstMatch::HostV4(ip) => Some(ip),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let alices = routed(&user());
+        assert!(
+            alices.contains(&alice_ip),
+            "own destination routed: {alices:?}"
+        );
+        assert!(
+            !alices.contains(&bob_ip),
+            "another user's destination: {alices:?}"
+        );
+        let bobs = routed(&bob());
+        assert!(bobs.contains(&bob_ip), "own destination routed: {bobs:?}");
+        assert!(
+            !bobs.contains(&alice_ip),
+            "another user's destination: {bobs:?}"
+        );
     }
 
     /// Our own host route via the main gateway has a server's shape. Read as
@@ -2896,13 +3588,16 @@ mod tests {
                 table: nrr_platform_api::RouteTableRef::Main,
             });
             api.set_route_table(table);
-            source(Arc::new(OneSecondaryRule), Arc::new(Policy::strict()))
-                .with_machine_facts(
-                    api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
-                    links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
-                )
-                .plan_with_coverage(&user(), availability(true))
-                .expect("the rule must plan")
+            source(
+                Arc::new(OneSecondaryRule),
+                Arc::new(Policy::prefer_secondary()),
+            )
+            .with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            )
+            .plan_with_coverage(&user(), availability(true))
+            .expect("the rule must plan")
         };
 
         let (plan, coverage) = plan_with(crate::route_codegen::SECONDARY_ROUTE_METRIC);
@@ -2938,11 +3633,14 @@ mod tests {
                 table: users_table.clone(),
             });
             api.set_route_table(table);
-            let source = source(Arc::new(OneSecondaryRule), Arc::new(Policy::strict()))
-                .with_machine_facts(
-                    api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
-                    links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
-                );
+            let source = source(
+                Arc::new(OneSecondaryRule),
+                Arc::new(Policy::prefer_secondary()),
+            )
+            .with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            );
             let source = match own {
                 Some(own) => source.with_own_route_tables(own),
                 None => source,
@@ -2974,14 +3672,17 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|a| a.friendly_name != "tun0");
-        let (plan, coverage) = source(Arc::new(OneSecondaryRule), Arc::new(Policy::strict()))
-            .with_machine_facts(
-                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
-                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
-            )
-            .with_tunnel_servers(remembering(vec![SERVER]), None)
-            .plan_with_coverage(&user(), availability(false))
-            .expect("the rule must plan");
+        let (plan, coverage) = source(
+            Arc::new(OneSecondaryRule),
+            Arc::new(Policy::prefer_secondary()),
+        )
+        .with_machine_facts(
+            api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+            links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+        )
+        .with_tunnel_servers(remembering(vec![SERVER]), None)
+        .plan_with_coverage(&user(), availability(false))
+        .expect("the rule must plan");
 
         assert!(blanket_blocks(&plan) > 0);
         assert!(exempts(&plan, DstMatch::HostV4(SERVER)));
@@ -3005,34 +3706,72 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|a| a.friendly_name != "eth0");
-        let (plan, coverage) = source(Arc::new(OneSecondaryRule), Arc::new(Policy::strict()))
-            .with_machine_facts(
-                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
-                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
-            )
-            .with_tunnel_servers(remembering(vec![SERVER]), None)
-            .plan_with_coverage(&user(), availability(false))
-            .expect("the rule must plan");
+        let (plan, coverage) = source(
+            Arc::new(OneSecondaryRule),
+            Arc::new(Policy::prefer_secondary()),
+        )
+        .with_machine_facts(
+            api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+            links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+        )
+        .with_tunnel_servers(remembering(vec![SERVER]), None)
+        .plan_with_coverage(&user(), availability(false))
+        .expect("the rule must plan");
 
         assert_eq!(blanket_blocks(&plan), 0);
         assert!(!coverage.kill_switch_complete);
     }
 
-    /// Tunnel gone, block-all asked for: the traffic is held rather than let out
-    /// the way the user asked it not to go — and the per-destination guard is
-    /// NOT added on top, because one policy stated twice is two things to keep
-    /// in agreement.
+    /// A policy-based IPsec VPN keeps its private networks wherever the main
+    /// link is blanket-blocked, and nothing is spared where nothing cuts them.
     #[test]
-    fn a_lost_tunnel_under_block_all_holds_everything_and_does_not_double_up() {
-        let (plan, coverage) = plan_on_machine(
-            OneSecondaryRule,
-            Policy {
-                block_all: true,
-                ..Policy::armed()
-            },
-            false,
-            true,
-        );
+    fn ipsec_protected_networks_are_spared_only_under_the_blanket_block() {
+        let spared = |plan: &EnforcementPlan| -> Vec<FlowRule> {
+            plan.flows
+                .iter()
+                .filter(|f| f.egress == EgressConstraint::UnderIpsecPolicy)
+                .cloned()
+                .collect()
+        };
+        for (policy, up) in [
+            (Policy::prefer_secondary(), true),
+            (Policy::everything(), false),
+        ] {
+            let (plan, _) = plan_on_machine(OneSecondaryRule, policy, up, true);
+            assert!(blanket_blocks(&plan) > 0, "fixture: the blanket is armed");
+            let spared = spared(&plan);
+            assert!(!spared.is_empty(), "the IPsec networks are cut");
+            for flow in &spared {
+                assert_eq!(flow.verdict, Verdict::Permit);
+                assert_eq!(flow.precedence.class, PrecedenceClass::CatchAllExempt);
+                assert_eq!(
+                    flow.principal,
+                    nrr_platform_api::enforcement::PrincipalScope::User(user())
+                );
+                assert!(
+                    !matches!(flow.flow.dst, DstMatch::Any),
+                    "never to any destination"
+                );
+            }
+        }
+        for (policy, up) in [
+            (Policy::armed(), true),
+            (Policy::armed(), false),
+            (Policy::disarmed(), true),
+            (Policy::disarmed(), false),
+        ] {
+            let (plan, _) = plan_on_machine(OneSecondaryRule, policy, up, true);
+            assert!(spared(&plan).is_empty(), "{:?}", spared(&plan));
+        }
+    }
+
+    /// Tunnel gone, everything protected: the traffic is held rather than let
+    /// out the way the user asked it not to go — and the per-destination guard
+    /// is NOT added on top, because one policy stated twice is two things to
+    /// keep in agreement.
+    #[test]
+    fn a_lost_tunnel_under_everything_holds_everything_and_does_not_double_up() {
+        let (plan, coverage) = plan_on_machine(OneSecondaryRule, Policy::everything(), false, true);
 
         assert!(blanket_blocks(&plan) > 0);
         assert!(exempts(&plan, DstMatch::HostV4(SERVER)));
@@ -3302,7 +4041,10 @@ mod tests {
                 &armed(),
                 &[],
                 &ownership_with_networks(&network_book()),
-                &SharedIps::default(),
+                &Spared {
+                    floor: source.exemptions_for(user().as_stored(), &armed()),
+                    ..Spared::default()
+                },
             )
         }
 
@@ -3343,6 +4085,69 @@ mod tests {
             assert_eq!(
                 verdict(&flows, Ipv4Addr::new(198, 51, 100, 9)),
                 Some(Verdict::Block)
+            );
+        }
+
+        /// With the tunnel gone and everything held, a container still reaches
+        /// a network the main link's rules route, but neither a tunnel-bound
+        /// address inside it nor the rest of the internet.
+        #[test]
+        fn the_forwarded_blanket_keeps_main_link_networks_open() {
+            use nrr_platform_api::enforcement::PrincipalScope;
+            const INSIDE: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 9);
+            let book = CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(vec![route(
+                    "p-24",
+                    subnet("203.0.113.0/24"),
+                )]),
+                secondary: CanonicalRuleSet::from_rules(vec![route(
+                    "s-host",
+                    CanonicalAddressMatch::ExactIp(IpAddr::V4(INSIDE)),
+                )]),
+            };
+            let (api, links) = machine(true);
+            let (plan, _) = source(Arc::new(Book(book)), Arc::new(Policy::everything()))
+                .with_machine_facts(
+                    api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                    links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+                )
+                .with_service_accounts(Arc::new(Vec::new))
+                .plan_with_coverage(&user(), availability(false))
+                .expect("the rules must plan");
+            let forwarded: Vec<FlowRule> = plan
+                .flows
+                .into_iter()
+                .filter(|f| f.principal == PrincipalScope::Forwarded)
+                .collect();
+            // The blanket matches any destination, so it is judged here too.
+            let judged = |ip: Ipv4Addr| {
+                forwarded
+                    .iter()
+                    .filter(|f| {
+                        f.coverage == Coverage::ConnectOnly
+                            && (f.flow.dst == DstMatch::Any
+                                || dst_block(f.flow.dst)
+                                    .is_some_and(|b| b.contains(IpAddr::V4(ip))))
+                    })
+                    .reduce(|best, flow| {
+                        if flow.precedence.is_higher_priority_than(best.precedence) {
+                            flow
+                        } else {
+                            best
+                        }
+                    })
+                    .map(|flow| flow.verdict)
+            };
+            assert_eq!(
+                judged(Ipv4Addr::new(203, 0, 113, 50)),
+                Some(Verdict::Permit),
+                "{forwarded:?}"
+            );
+            assert_eq!(judged(INSIDE), Some(Verdict::Block), "{forwarded:?}");
+            assert_eq!(
+                judged(Ipv4Addr::new(192, 0, 2, 80)),
+                Some(Verdict::Block),
+                "{forwarded:?}"
             );
         }
 
@@ -3395,7 +4200,7 @@ mod tests {
         #[test]
         fn both_mechanisms_hold_and_open_the_same_networks() {
             let source = on_machine();
-            let read = source.exemptions_for(&armed());
+            let read = source.exemptions_for("", &armed());
             assert!(!read.server_ips.is_empty(), "fixture guard");
             let exemptions = crate::killswitch_codegen::FailClosedExemptions {
                 bootstrap_server_ips: read.server_ips.clone(),
@@ -3527,6 +4332,126 @@ mod tests {
             assert!(!plan.flows.iter().any(|f| f.egress == PINNED
                 && dst_block(f.flow.dst).is_some_and(|b| b.prefix_len() == 12)));
         }
+
+        /// "Everything", tunnel gone: the blanket sits below the main-link
+        /// band, so nothing of the main link may cover the tunnel's network.
+        /// A main-link program's observed address inside it and a wider
+        /// main-link network around it both leave it to the blanket.
+        #[test]
+        fn a_main_link_program_does_not_reach_a_tunnel_network_while_the_tunnel_is_down() {
+            use nrr_domain::canonical::{CanonicalAppMatch, CanonicalAppPattern};
+            const MAIL: &str = "mail";
+            let inside = Ipv4Addr::new(198, 51, 100, 9);
+            let own = Ipv4Addr::new(192, 0, 2, 50);
+            let wide_main = Ipv4Addr::new(198, 51, 7, 7);
+            let program = CanonicalRule {
+                address_match: None,
+                app_match: Some(CanonicalAppMatch {
+                    pattern: CanonicalAppPattern::Exact(MAIL.into()),
+                    include_child_processes: false,
+                    override_requested: false,
+                }),
+                ..route("p-app", subnet("192.0.2.0/24"))
+            };
+            let book = CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(vec![
+                    program,
+                    route("p-16", subnet("198.51.0.0/16")),
+                ]),
+                secondary: CanonicalRuleSet::from_rules(vec![route(
+                    "s-24",
+                    subnet("198.51.100.0/24"),
+                )]),
+            };
+            let apps = Arc::new(crate::app_observation_lookup::MockAppObservationLookup::default());
+            apps.set_ips(MAIL, vec![inside, own]);
+            let (api, links) = machine(true);
+            let source = ProductionPrincipalPlanSource::new(
+                Arc::new(Book(book)),
+                Arc::new(Policy::everything()),
+                Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::default()),
+                Arc::new(nrr_platform_api::app_path_resolver::NoopAppPathResolver),
+                apps,
+            )
+            .with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            );
+            let (plan, _) = source
+                .plan_with_coverage(&user(), availability(false))
+                .expect("the rules must plan");
+
+            assert!(
+                blanket_blocks(&plan) > 0,
+                "fixture guard: the blanket is armed"
+            );
+            assert_eq!(
+                top(&plan.flows, own).map(|f| f.verdict),
+                Some(Verdict::Permit),
+                "fixture guard: the program's own address passes"
+            );
+            assert_eq!(
+                top(&plan.flows, wide_main).map(|f| f.verdict),
+                Some(Verdict::Permit),
+                "the wider main-link network keeps the rest of itself"
+            );
+            assert!(
+                top(&plan.flows, inside).is_none_or(|f| f.verdict == Verdict::Block),
+                "a main-link pass covers the tunnel's network: {:?}",
+                top(&plan.flows, inside)
+            );
+        }
+
+        /// A name of the tunnel's rules resolving onto the main link's own
+        /// segment (split horizon, a home NAS) keeps its direct route, so the
+        /// guard neither pins nor blocks it; a host elsewhere stays guarded.
+        #[test]
+        fn a_rule_host_on_the_home_network_is_neither_pinned_nor_blocked() {
+            let nas = Ipv4Addr::new(192, 168, 1, 5);
+            let book = CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(Vec::new()),
+                secondary: CanonicalRuleSet::from_rules(vec![
+                    route(
+                        "s-nas",
+                        CanonicalAddressMatch::ExactFqdn("nas.home.example".into()),
+                    ),
+                    route(
+                        "s-host",
+                        CanonicalAddressMatch::ExactIp(IpAddr::V4(SECONDARY_HOST)),
+                    ),
+                ]),
+            };
+            let cache = Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::default());
+            cache.set_ips("nas.home.example", vec![nas]);
+            for up in [true, false] {
+                let (api, links) = machine(true);
+                let (plan, _) = source_with_cache(
+                    Arc::new(Book(book.clone())),
+                    Arc::new(Policy::armed()),
+                    Arc::clone(&cache) as Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
+                )
+                .with_machine_facts(
+                    api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                    links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+                )
+                .plan_with_coverage(&user(), availability(up))
+                .expect("the rules must plan");
+
+                let guarded = |ip: Ipv4Addr| {
+                    plan.flows.iter().any(|f| {
+                        f.flow.dst == DstMatch::HostV4(ip)
+                            && (f.verdict == Verdict::Block || f.egress == PINNED)
+                    })
+                };
+                assert!(guarded(SECONDARY_HOST), "tunnel up: {up}: fixture guard");
+                assert!(!guarded(nas), "tunnel up: {up}: the NAS is cut");
+                assert!(
+                    !plan.routes.iter().any(|r| r.dst == DstMatch::HostV4(nas)
+                        && r.egress == nrr_platform_api::enforcement::EgressRef::Secondary),
+                    "tunnel up: {up}: the NAS is routed into the tunnel"
+                );
+            }
+        }
     }
 
     /// Network routes on this path, planned around the machine's own links.
@@ -3648,10 +4573,13 @@ mod tests {
             support: RuleShapeSupport,
         ) -> Vec<RouteIntent> {
             source.routes_for(
+                "principal",
                 &policy(),
                 mode,
                 book,
                 true,
+                source.fqdn_cache.as_ref(),
+                source.app_observations.as_ref(),
                 &HashSet::new(),
                 FamilyScope::V4Only,
                 support,
@@ -3670,24 +4598,77 @@ mod tests {
                 .collect()
         }
 
+        /// A corporate WireGuard link beside the bound ones, carrying a
+        /// `/24` of its own.
+        fn machine_with_corporate_tunnel() -> ProductionPrincipalPlanSource {
+            use nrr_platform_api::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
+            let (api, links) = machine_parts(true);
+            let corporate = AdapterInfo {
+                index: 9,
+                adapter_name: "corp0".to_owned(),
+                description: "WireGuard Tunnel".to_owned(),
+                friendly_name: "corp0".to_owned(),
+                mac: None,
+                interface_type: InterfaceType::Ethernet,
+                oper_status: IfOperStatus::Up,
+                ipv4_addresses: vec![Ipv4Addr::new(172, 31, 0, 2)],
+                ipv6_addresses: Vec::new(),
+                gateways: Vec::new(),
+            };
+            let mut adapters = links.adapters.lock().unwrap_or_else(|p| p.into_inner());
+            adapters.push(corporate);
+            api.set_adapter_infos(adapters.clone());
+            drop(adapters);
+            let mut table =
+                nrr_platform_api::route_table::RouteTablePort::get_ip_forward_table(api.as_ref())
+                    .expect("table");
+            table.push(nrr_platform_api::types::RouteEntry {
+                destination: IpAddr::V4(Ipv4Addr::new(172, 31, 0, 0)),
+                prefix_length: 24,
+                next_hop: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                interface_index: 9,
+                metric: 0,
+                is_ours: false,
+                table: nrr_platform_api::RouteTableRef::Main,
+            });
+            api.set_route_table(table);
+            source(Arc::new(NoRules), Arc::new(Policy::armed())).with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            )
+        }
+
+        #[test]
+        fn a_pass_publishes_the_corporate_tunnel_and_the_users_own_link_once() {
+            let source = machine_with_corporate_tunnel();
+            let cell = crate::foreign_tunnels::ForeignTunnelCell::new();
+            source.begin_pass();
+            source.note_pass_links("principal", &policy());
+            source.note_pass_links("other", &policy());
+            source.publish_pass_links(&cell);
+            assert_eq!(cell.interfaces(), Some(vec![9]));
+            assert_eq!(cell.own_links(), vec![5], "the bound tunnel is ours");
+            assert!(cell.carries(Ipv4Addr::new(172, 31, 0, 8)));
+        }
+
+        #[test]
+        fn a_pass_that_planned_nobody_leaves_the_cell_as_it_was() {
+            let source = machine_with_corporate_tunnel();
+            let cell = crate::foreign_tunnels::ForeignTunnelCell::new();
+            source.begin_pass();
+            source.publish_pass_links(&cell);
+            assert_eq!(cell.interfaces(), None);
+        }
+
         #[test]
         fn the_facts_come_from_the_pass_reading() {
             let source = on_machine();
-            let book = CanonicalRuleBook {
-                primary: CanonicalRuleSet::from_rules(Vec::new()),
-                secondary: CanonicalRuleSet::from_rules(vec![subnet("s", "10.20.0.0/16")]),
-            };
-            let facts = source.network_route_facts(&policy(), &book, networks(), &[]);
+            let facts = source.network_route_facts("principal", &policy(), &[]);
             assert_eq!(
                 facts.local_networks,
                 vec![net("10.8.0.0/24"), net("10.20.1.0/24")]
             );
             assert_eq!(facts.tunnel_servers, vec![IpAddr::V4(TUNNEL_SERVER)]);
-            // Nothing to route: the reading is not even consulted.
-            assert_eq!(
-                source.network_route_facts(&policy(), &book, RuleShapeSupport::NONE, &[]),
-                NetworkRouteFacts::default()
-            );
         }
 
         /// A tunnel `/16` holding the LAN and the tunnel's server: the LAN
@@ -3782,7 +4763,6 @@ mod tests {
             for mode in [
                 RouteBehaviorMode::PreferPrimary,
                 RouteBehaviorMode::PreferSecondaryWhenAvailable,
-                RouteBehaviorMode::StrictSecondaryFailClosed,
             ] {
                 for &(book, support) in &cases {
                     let before = crate::enforcement_planner::plan_routes(
@@ -3861,9 +4841,9 @@ mod tests {
                 Arc::clone(&memory),
                 Some(Arc::new(Peers(vec![IpAddr::V4(peer)]))),
             );
-            source.remember_tunnel_servers(&policy());
-            assert_eq!(memory.remembered(), vec![peer]);
-            let facts = source.network_route_facts(&policy(), &sixteen(), networks(), &[]);
+            source.remember_tunnel_servers("principal", &policy());
+            assert_eq!(memory.remembered("principal"), vec![peer]);
+            let facts = source.network_route_facts("principal", &policy(), &[]);
             assert_eq!(facts.tunnel_servers, vec![IpAddr::V4(peer)]);
         }
 
@@ -3874,7 +4854,7 @@ mod tests {
         fn a_server_seen_live_is_refused_and_spared_after_the_tunnel_drops() {
             use crate::network_rule_screen::{facts_with_remembered_servers, screen_network};
             use crate::production_mutation_executor::NetworkRuleConflict;
-            use crate::tunnel_server_memory::persisted_servers;
+            use crate::tunnel_server_memory::persisted_servers_by_principal;
             use nrr_storage::{
                 open_connection, repository::MigrationRunner, SqliteMigrationRunner,
             };
@@ -3889,12 +4869,12 @@ mod tests {
 
             on_machine()
                 .with_tunnel_servers(Arc::clone(&memory), None)
-                .remember_tunnel_servers(&policy());
+                .remember_tunnel_servers("principal", &policy());
 
             let (down_api, _) = machine_parts(false);
             let screen = facts_with_remembered_servers(
                 down_api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
-                persisted_servers(Arc::clone(&state)),
+                persisted_servers_by_principal(Arc::clone(&state)),
             );
             let facts = screen("principal");
             assert!(matches!(
@@ -3914,7 +4894,7 @@ mod tests {
             let (down_api, _) = machine_parts(false);
             let screen = crate::network_rule_screen::facts_with_remembered_servers(
                 down_api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
-                Arc::new(Vec::<Ipv4Addr>::new),
+                Arc::new(|_: &str| Vec::<Ipv4Addr>::new()),
             );
             assert_eq!(
                 crate::network_rule_screen::screen_network(

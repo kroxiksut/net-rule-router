@@ -45,6 +45,7 @@ impl AutoRulesEngine {
             verify: Mutex::new(HashMap::new()),
             verify_watches_ips: std::sync::atomic::AtomicBool::new(false),
             verify_wiring: OnceLock::new(),
+            verify_runner: verify_primary::VerifyRunner::default(),
         }
     }
 

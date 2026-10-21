@@ -132,6 +132,109 @@ browser.exe
     );
 }
 
+/// A program in quotes is a rule whether the line is on or off, the quotes
+/// taken off; a bare spaced name with no extension is still a note.
+#[test]
+fn a_quoted_program_is_a_rule_on_or_off() {
+    let result = parse_canonical_rules(&format!(
+        "--- {NATIVE_APP}
+# \"Web Content\" +children   # note
+# \"/opt/My Apps/tool\"
+\"Enabled App\"
+# !\"Denied App\"
+# Web Content
+# \"\"
+--- Domains
+\"example.com\"
+"
+    ));
+    let read: Vec<(&str, bool, bool, bool, &str)> = result
+        .rules
+        .iter()
+        .map(|r| {
+            (
+                r.match_value.as_str(),
+                r.enabled,
+                r.blocked,
+                r.children,
+                r.comment.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            ("Web Content", false, false, true, "note"),
+            ("/opt/My Apps/tool", false, false, false, ""),
+            ("Enabled App", true, false, false, ""),
+            ("Denied App", false, true, false, ""),
+            // Encloses nothing: the value is the two quotes, for validation.
+            ("\"\"", false, false, false, ""),
+            // Quotes mean nothing outside a program section.
+            ("\"example.com\"", true, false, false, ""),
+        ]
+    );
+}
+
+/// What a writer puts on a program line reads back as the same value, on or
+/// off; a value that read back bare keeps its bytes.
+#[test]
+fn a_program_value_on_its_line_reads_back_whole() {
+    let cases: [(&str, bool, &str); 11] = [
+        ("Web Content", false, "\"Web Content\""),
+        ("/opt/My Apps/tool", false, "\"/opt/My Apps/tool\""),
+        ("Web Content +children", false, "\"Web Content\" +children"),
+        ("Web Content", true, "Web Content"),
+        ("firefox", false, "firefox"),
+        ("Adobe Reader.exe", false, "Adobe Reader.exe"),
+        (
+            "C:\\Program Files\\App\\*",
+            false,
+            "C:\\Program Files\\App\\*",
+        ),
+        ("/opt/My Apps/", false, "/opt/My Apps/"),
+        ("\"Quoted\"", true, "\"\"Quoted\"\""),
+        ("My \"Big\" App", false, "\"My \"Big\" App\""),
+        ("\"half", false, "\"half"),
+    ];
+    for (value, enabled, written) in cases {
+        let spelled = program_value_on_line(value, enabled);
+        assert_eq!(spelled, written, "{value}");
+        let line = if enabled {
+            spelled.into_owned()
+        } else {
+            format!("# {spelled}")
+        };
+        let result = parse_canonical_rules(&format!("--- {NATIVE_APP}\n{line}\n"));
+        let back: Vec<(String, bool)> = result
+            .rules
+            .iter()
+            .map(|r| {
+                let flags = RuleFlags {
+                    children: r.children,
+                    override_requested: r.override_requested,
+                };
+                let value = stored_rule_value(r.rule_type, &r.match_value, flags);
+                (value, r.enabled)
+            })
+            .collect();
+        assert_eq!(back, vec![(value.to_owned(), enabled)], "{line}");
+    }
+}
+
+#[test]
+fn unquote_takes_off_one_outer_pair_only() {
+    assert_eq!(
+        unquote_program_value("\"Web Content\""),
+        Some("Web Content")
+    );
+    assert_eq!(unquote_program_value("\"\"x\"\""), Some("\"x\""));
+    assert_eq!(unquote_program_value("\" x \""), Some("x"));
+    for bare in ["\"", "\"\"", "\" \"", "x", "\"x", "x\""] {
+        assert_eq!(unquote_program_value(bare), None, "{bare}");
+    }
+}
+
 /// An enabled network line may be spaced out; unticking it must keep the rule.
 #[test]
 fn a_disabled_spaced_network_is_a_rule_not_prose() {

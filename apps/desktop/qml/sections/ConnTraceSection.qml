@@ -4,6 +4,7 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import "../components"
 import "../lib/pure.js" as Pure
+import "../lib/plurals.js" as Plurals
 
 // Live connection trace. Its state lives here, so the Loader keeps the section
 // resident once opened: the list survives a trip to Rules and back, while the
@@ -331,18 +332,22 @@ ScrollView {
         if (slug === "folder") return root.tr("diag.conn-trace.group-folder", "By folder")
         return root.tr("diag.conn-trace.group-program", "By program")
     }
+    function _connCountText(n) {
+        return Plurals.counted(root.tr, "diag.conn-trace.group-connections.", n,
+            "{count} connection", "{count} connections")
+    }
     // Header text of a group: the program or the folder, and its counts.
     function _connGroupHeaderText(h) {
         var count = Number((h && h._count) || 0)
         if (h && h._groupKind === "program")
-            return Pure.displayText(h._groupLabel || "—") + "  ·  " + count + " "
-                + root.tr("diag.conn-trace.group-count", "connection(s)")
+            return Pure.displayText(h._groupLabel || "—") + "  ·  " + _connCountText(count)
         var label = (h && h._groupKind === "folder")
             ? Pure.displayText(h._groupLabel)
             : root.tr("diag.conn-trace.group-no-path", "Programs without a known path")
-        return label + "  ·  " + root.tr("diag.conn-trace.group-folder-counts",
-            "%1 program(s)  ·  %2 connection(s)")
-            .arg(Number((h && h._programs) || 0)).arg(count)
+        var programs = Number((h && h._programs) || 0)
+        return label + "  ·  " + Plurals.counted(root.tr, "diag.conn-trace.group-programs.",
+            programs, "{count} program", "{count} programs")
+            + "  ·  " + _connCountText(count)
     }
     // The existing rule window, filled with the folder and every folder below it.
     function _ruleForConnFolder(value) {

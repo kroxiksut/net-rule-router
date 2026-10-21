@@ -12,6 +12,7 @@ use nrr_platform_api::dns_redirect::{
 use nrr_platform_api::dns_scope::{InterfaceDnsScope, InterfaceDnsScopePort};
 use nrr_platform_api::error::PlatformError;
 
+use super::name_cache::FlushesNscd;
 use super::network_manager::{
     clear_network_manager_redirect, network_manager_redirect_available, NetworkManagerDnsRedirect,
     NetworkManagerDnsScopes, NetworkManagerDnsServers,
@@ -145,6 +146,16 @@ pub fn dns_capture_parts<C: DnsCommands + Clone + 'static>(
     commands: C,
     files: DnsFiles,
 ) -> DnsCaptureParts {
+    let mut parts = mechanism_parts(method, commands.clone(), files);
+    parts.redirect = Arc::new(FlushesNscd::new(parts.redirect, commands));
+    parts
+}
+
+fn mechanism_parts<C: DnsCommands + Clone + 'static>(
+    method: DnsCaptureMethod,
+    commands: C,
+    files: DnsFiles,
+) -> DnsCaptureParts {
     let ready: Arc<dyn Fn() -> Result<(), PlatformError> + Send + Sync> = Arc::new(|| Ok(()));
     match method {
         DnsCaptureMethod::Resolved => {
@@ -256,7 +267,7 @@ impl<C: DnsCommands + Clone + 'static> NetworkManagerOrNext<C> {
             );
             (
                 method,
-                dns_capture_parts(method, self.commands.clone(), self.files.clone()),
+                mechanism_parts(method, self.commands.clone(), self.files.clone()),
             )
         });
         debug_assert_eq!(
@@ -339,6 +350,20 @@ impl<P: SystemDnsServersPort> SystemDnsServersPort for FollowingNext<P> {
         match self.next.get() {
             Some((_, parts)) => parts.servers.upstream_candidates_v6(),
             None => self.own.upstream_candidates_v6(),
+        }
+    }
+
+    fn upstream_candidates_v4_per_link(&self) -> Vec<UpstreamDnsCandidate> {
+        match self.next.get() {
+            Some((_, parts)) => parts.servers.upstream_candidates_v4_per_link(),
+            None => self.own.upstream_candidates_v4_per_link(),
+        }
+    }
+
+    fn upstream_candidates_v6_per_link(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        match self.next.get() {
+            Some((_, parts)) => parts.servers.upstream_candidates_v6_per_link(),
+            None => self.own.upstream_candidates_v6_per_link(),
         }
     }
 

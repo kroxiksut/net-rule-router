@@ -176,6 +176,10 @@ mod tests {
             "XN--P1AI"
         ));
         assert!(row_matches_search(&row, "", "work"));
+        assert!(
+            row_matches_search(&row, "", "ПРИМЕР"),
+            "Cyrillic folds like Latin"
+        );
         assert!(row_matches_search(&row, "", "https://пример.рф/page"));
         assert!(!row_matches_search(&row, "", "other"));
         assert!(row_matches_search(&row, "", ""));

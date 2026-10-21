@@ -8,9 +8,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
 use nrr_platform_api::conn_observe::live::{LiveConnection, LiveConnectionSource};
-use windows::Win32::NetworkManagement::IpHelper::{
-    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_ESTAB,
-};
+use windows::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_ESTAB;
 
 use crate::flow_owner::read_tcp_owner_pid_table;
 
@@ -30,40 +28,45 @@ impl LiveConnectionSource for WindowsLiveConnections {
             return Vec::new();
         };
         let mut rows: Vec<(u32, Ipv4Addr)> = Vec::new();
-        // SAFETY: `read_tcp_owner_pid_table` fills the buffer with a valid
-        // `MIB_TCPTABLE_OWNER_PID`; its `dwNumEntries` header is followed by that
-        // many contiguous rows, and only those rows are read.
-        unsafe {
-            let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
-            let count = (*table).dwNumEntries as usize;
-            let first = std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>();
-            for i in 0..count {
-                let row = &*first.add(i);
-                if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32 {
-                    rows.push((
-                        row.dwOwningPid,
-                        Ipv4Addr::from(u32::from_be(row.dwRemoteAddr)),
-                    ));
-                }
+        for row in crate::flow_owner::tcp_rows(&buffer) {
+            if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32 {
+                rows.push((
+                    row.dwOwningPid,
+                    Ipv4Addr::from(u32::from_be(row.dwRemoteAddr)),
+                ));
             }
         }
-        let mut names: HashMap<u32, Option<String>> = HashMap::new();
-        rows.into_iter()
-            .filter(|(_, remote)| !remote.is_loopback() && !remote.is_unspecified())
-            .filter_map(|(pid, remote)| {
-                let name = names
-                    .entry(pid)
-                    .or_insert_with(|| crate::app_path_resolver::image_name_for_pid(pid))
-                    .clone()?;
-                // Windows routes are machine-wide: one store serves everyone.
-                Some(LiveConnection {
-                    process_path: name,
-                    remote,
-                    owner: None,
-                })
-            })
-            .collect()
+        connections_of(
+            rows,
+            crate::app_path_resolver::image_name_for_pid,
+            crate::win32_ffi::console_session::process_user_sid,
+        )
     }
+}
+
+/// Listed connections with program and owner, each looked up once per process
+/// in this pass. A protected process whose token cannot be read has no owner;
+/// its connection is still listed.
+fn connections_of(
+    rows: Vec<(u32, Ipv4Addr)>,
+    name_of: impl Fn(u32) -> Option<String>,
+    owner_of: impl Fn(u32) -> Option<String>,
+) -> Vec<LiveConnection> {
+    let mut seen: HashMap<u32, Option<(String, Option<String>)>> = HashMap::new();
+    rows.into_iter()
+        .filter(|(_, remote)| !remote.is_loopback() && !remote.is_unspecified())
+        .filter_map(|(pid, remote)| {
+            let (process_path, owner) = seen
+                .entry(pid)
+                .or_insert_with(|| name_of(pid).map(|name| (name, owner_of(pid))))
+                .clone()?;
+            Some(LiveConnection {
+                process_path,
+                remote,
+                owner,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -71,6 +74,40 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::net::TcpStream;
+
+    #[test]
+    fn each_connection_carries_its_processes_owner_looked_up_once() {
+        use std::cell::Cell;
+        let owner_calls = Cell::new(0);
+        let remote = |d| Ipv4Addr::new(203, 0, 113, d);
+        let rows = vec![
+            (10, remote(1)),
+            (10, remote(2)),
+            (11, remote(3)),
+            (12, remote(4)),
+        ];
+        let out = connections_of(
+            rows,
+            |pid| (pid != 12).then(|| format!("p{pid}.exe")),
+            |pid| {
+                owner_calls.set(owner_calls.get() + 1);
+                (pid == 10).then(|| "S-1-5-19".to_string())
+            },
+        );
+        assert_eq!(out.len(), 3, "an unnamed program is left out");
+        assert_eq!(out[0].owner.as_deref(), Some("S-1-5-19"));
+        assert_eq!(out[1].owner.as_deref(), Some("S-1-5-19"));
+        assert_eq!(
+            out[2].owner, None,
+            "an unreadable token leaves only that one unowned"
+        );
+        assert_eq!(out[2].process_path, "p11.exe");
+        assert_eq!(
+            owner_calls.get(),
+            2,
+            "one token read per named process, none for an unnamed one"
+        );
+    }
 
     /// A connection this test process holds must be listed under its own
     /// image name. Loopback is left out by design, so the check is that the
@@ -83,5 +120,9 @@ mod tests {
         let live = WindowsLiveConnections::new().established();
         assert!(live.iter().all(|c| !c.remote.is_loopback()));
         assert!(live.iter().all(|c| !c.process_path.is_empty()));
+        assert!(
+            live.iter().any(|c| c.owner.is_some()),
+            "a readable process names its account"
+        );
     }
 }

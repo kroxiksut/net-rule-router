@@ -1116,6 +1116,77 @@
         "counts": "3/0/0/0",
         "remaining": ""
       }
+    },
+    {
+      "name": "a program in quotes is a rule on or off, read without them",
+      "input": {
+        "text": "--- Linux\n# \"Web Content\" +children  # note\n# \"/opt/My Apps/tool\"\n\"Enabled App\"\n# !\"Denied App\"\n# Web Content\n# firefox\n",
+        "route": "secondary",
+        "os": "linux",
+        "verdicts": {
+          "application|Web Content +children": {
+            "status": "valid"
+          },
+          "application|/opt/My Apps/tool": {
+            "status": "valid"
+          },
+          "application|Enabled App": {
+            "status": "valid"
+          },
+          "application|Denied App": {
+            "status": "valid"
+          },
+          "application|firefox": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 application ok add secondary off - - - - #note Web Content +children",
+          "3 application ok add secondary off - - - - - /opt/My Apps/tool",
+          "4 application ok add secondary on - - - - - Enabled App",
+          "5 application ok add block off - - - - - Denied App",
+          "7 application ok add secondary off - - - - - firefox"
+        ],
+        "lines": 7,
+        "excess": 0,
+        "bound": "",
+        "counts": "5/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "quotes on a windows program, and nowhere outside a program section",
+      "input": {
+        "text": "--- Windows\n# \"Web Content\"\n# Adobe Reader.exe\n--- Domains\n\"example.com\"\n",
+        "route": "primary",
+        "os": "windows",
+        "verdicts": {
+          "application|Web Content": {
+            "status": "valid"
+          },
+          "application|Adobe Reader.exe": {
+            "status": "valid"
+          },
+          "domain|\"example.com\"": {
+            "status": "error",
+            "message-key": "rules.validation.match-value-invalid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 application ok add primary off - - - - - Web Content",
+          "3 application ok add primary off - - - - - Adobe Reader.exe",
+          "5 domain error keep primary on - rules.validation.match-value-invalid - - - \"example.com\""
+        ],
+        "lines": 5,
+        "excess": 0,
+        "bound": "",
+        "counts": "2/0/1/0",
+        "remaining": "--- Domains\n\"example.com\""
+      }
     }
   ]
 }

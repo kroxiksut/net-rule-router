@@ -65,6 +65,7 @@ fn rule_band() -> Vec<WfpFilterSpec> {
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     };
     vec![
         permit(

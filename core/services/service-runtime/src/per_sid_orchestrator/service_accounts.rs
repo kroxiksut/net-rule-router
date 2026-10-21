@@ -28,8 +28,14 @@ pub(super) struct OwnerGuard<'a> {
     pub protocols: KillSwitchProtocols,
     /// The owner keeps forwarded traffic (WSL) under the guard too.
     pub guard_forwarded: bool,
+    /// Networks of somebody else's tunnels, which service accounts and
+    /// forwarded traffic reach as the owner does.
+    pub foreign_networks: &'a [crate::killswitch_codegen::ForeignTunnelNetwork],
     /// The owner's blanket block with the tunnel gone, and what it leaves open.
     pub block_all: Option<&'a crate::killswitch_codegen::FailClosedExemptions>,
+    /// The networks the owner's main-link rules route, which that blanket
+    /// leaves open as the owner's rule filters do.
+    pub main_networks: &'a [IpBlock],
 }
 
 /// What the owner's guard hands out beyond the owner.
@@ -65,20 +71,13 @@ impl OwnerGuard<'_> {
 }
 
 impl PerSidApplyOrchestrator {
-    /// The main link's IPv4 resolvers, the only hosts the DNS permit under a
-    /// block-all may name. Empty without the wiring, which permits nothing.
-    pub(super) fn primary_dns_v4(&self) -> Vec<std::net::Ipv4Addr> {
+    /// The main link's resolvers, both families, the only hosts the DNS permit
+    /// under a block-all may name. Empty without the wiring, which permits
+    /// nothing.
+    pub(super) fn primary_dns(&self) -> Vec<IpAddr> {
         self.service_accounts
             .as_ref()
-            .map(|wiring| {
-                (wiring.primary_dns)()
-                    .into_iter()
-                    .filter_map(|ip| match ip {
-                        IpAddr::V4(v4) => Some(v4),
-                        IpAddr::V6(_) => None,
-                    })
-                    .collect()
-            })
+            .map(|wiring| (wiring.primary_dns)())
             .unwrap_or_default()
     }
 
@@ -128,6 +127,7 @@ impl PerSidApplyOrchestrator {
                     sid,
                     exemptions,
                     &primary_dns,
+                    owner.main_networks,
                 )
             }
             _ => Vec::new(),
@@ -155,7 +155,12 @@ impl PerSidApplyOrchestrator {
             return only_block_all();
         }
         let mut forwarded = if owner.guard_forwarded {
-            crate::killswitch_codegen::forwarded_guard_filters(sid, &guard, owner.secondary_luid)
+            crate::killswitch_codegen::forwarded_guard_filters(
+                sid,
+                &guard,
+                owner.secondary_luid,
+                owner.foreign_networks,
+            )
         } else {
             Vec::new()
         };
@@ -176,16 +181,18 @@ impl PerSidApplyOrchestrator {
                 .cloned()
                 .collect()
         };
-        OwnerShares {
-            service: crate::killswitch_codegen::service_account_filters(
-                sid,
-                &guard,
-                owner.secondary_luid,
-                owner.protocols,
-                &exempt,
-            ),
-            forwarded,
-        }
+        let mut service = crate::killswitch_codegen::service_account_filters(
+            sid,
+            &guard,
+            owner.secondary_luid,
+            owner.protocols,
+            &exempt,
+            owner.foreign_networks,
+        );
+        let ike =
+            crate::killswitch_codegen::ike_service_filters(sid, &service, &self.ike_service_images);
+        service.extend(ike);
+        OwnerShares { service, forwarded }
     }
 
     /// Re-derive the owners who left and those who arrived, so each one's

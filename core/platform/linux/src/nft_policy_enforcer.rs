@@ -31,11 +31,12 @@ use nrr_platform_api::enforcement::{
 };
 use nrr_platform_api::fake_ip::stale_flows::FlowLinks;
 
+use crate::kernel_capabilities::{self, KernelCapability};
 use crate::lower_linux::{
     lower_scoped_with, EgressNames, LoweredPlan, ScopedPlan, ServiceAccountScope,
 };
-use crate::nft_apply::{NftApplyError, NftCliEnforcement};
-use crate::nft_ir::NftRuleset;
+use crate::nft_apply::{NftApplyError, NftApplyOutcome, NftCliEnforcement};
+use crate::nft_ir::{NftMatch, NftRule, NftRuleset};
 
 /// How long an unchanged ruleset is trusted to still be in the kernel without
 /// asking. Past it the next pass lists our chain (a terse `nft list`, far
@@ -49,6 +50,10 @@ struct Applied {
     ruleset: NftRuleset,
     verified_at: Instant,
     rules: usize,
+    /// Notes for the rules the kernel refused. Remembered with the ruleset so
+    /// an unchanged pass does not repeat the refusal search; an explicit apply
+    /// searches again, in case what the kernel lacked has appeared.
+    refused_notes: Vec<String>,
 }
 
 pub struct NftPolicyEnforcer {
@@ -250,8 +255,28 @@ impl NftPolicyEnforcer {
             .unwrap_or_default();
         let mut lowered = lower_scoped_with(&scoped, &service_accounts);
         lowered.ruleset.table.clone_from(&self.table);
+        // A kernel that refused the match once refuses it on every pass; without
+        // it the IPsec networks stay cut, as they would without these rules.
+        if !kernel_capabilities::is_available(KernelCapability::IpsecNetworks) {
+            lowered.ruleset.rules.retain(|rule| !matches_ipsec(rule));
+        }
         Ok(lowered)
     }
+}
+
+fn matches_ipsec(rule: &NftRule) -> bool {
+    rule.matches.contains(&NftMatch::RouteIpsec)
+}
+
+/// Takes the IPsec rules out of what the kernel refused: a refusal of theirs
+/// is a missing capability, reported once in the clients' list, not a rule
+/// failure on every report. Returns whether any was there.
+fn settle_ipsec_refusals(ruleset: &NftRuleset, outcome: &mut NftApplyOutcome) -> bool {
+    let before = outcome.skipped.len();
+    outcome
+        .skipped
+        .retain(|skipped| !ruleset.rules.get(skipped.index).is_some_and(matches_ipsec));
+    outcome.skipped.len() != before
 }
 
 /// Bounds `nft`'s words before they travel into a refusal the user reads and
@@ -289,7 +314,8 @@ impl PolicyEnforcer for NftPolicyEnforcer {
         let mut applied = self.applied.lock().unwrap_or_else(|p| p.into_inner());
         let verify_requested = self.verify_next.swap(false, Ordering::AcqRel);
         if let Some(last) = applied.as_mut() {
-            if last.ruleset == lowered.ruleset {
+            let search_again = verify_requested && !last.refused_notes.is_empty();
+            if last.ruleset == lowered.ruleset && !search_again {
                 let verify = verify_requested || last.verified_at.elapsed() >= UNCHANGED_RECHECK;
                 // Anything but "our chain, holding every rule" reapplies: a
                 // check that failed proves nothing about the kernel.
@@ -302,11 +328,13 @@ impl PolicyEnforcer for NftPolicyEnforcer {
                     if verify {
                         last.verified_at = Instant::now();
                     }
+                    let mut notes = notes_for_unsupported();
+                    notes.extend(last.refused_notes.iter().cloned());
                     return Ok(ApplyReport {
                         applied: last.rules,
-                        skipped: lowered.unsupported.len(),
+                        skipped: lowered.unsupported.len() + last.refused_notes.len(),
                         failed: 0,
-                        notes: notes_for_unsupported(),
+                        notes,
                     });
                 }
             }
@@ -317,31 +345,33 @@ impl PolicyEnforcer for NftPolicyEnforcer {
         // Best-effort for the same reason as the other enforcement entry: a
         // single rule the kernel refuses must not cost the user every other
         // rule they have.
-        let outcome = self
+        let mut outcome = self
             .cli
             .apply_best_effort(&lowered.ruleset)
             .map_err(failure)?;
+        if settle_ipsec_refusals(&lowered.ruleset, &mut outcome) {
+            kernel_capabilities::record(KernelCapability::IpsecNetworks, false);
+        }
         report_apply_cost(
             lowered_at.duration_since(started),
             lowered_at.elapsed(),
             lowered.ruleset.rules.len(),
         );
-        if outcome.skipped.is_empty() {
-            *applied = Some(Applied {
-                ruleset: lowered.ruleset.clone(),
-                verified_at: Instant::now(),
-                rules: outcome.applied,
-            });
-        }
+        let refused_notes: Vec<String> = outcome
+            .skipped
+            .iter()
+            .map(crate::nft_backend::note_for_skipped)
+            .collect();
+        *applied = Some(Applied {
+            ruleset: lowered.ruleset.clone(),
+            verified_at: Instant::now(),
+            rules: outcome.applied,
+            refused_notes: refused_notes.clone(),
+        });
         drop(applied);
 
         let mut notes = notes_for_unsupported();
-        notes.extend(
-            outcome
-                .skipped
-                .iter()
-                .map(crate::nft_backend::note_for_skipped),
-        );
+        notes.extend(refused_notes);
 
         Ok(ApplyReport {
             applied: outcome.applied,
@@ -366,7 +396,26 @@ impl PolicyEnforcer for NftPolicyEnforcer {
         if accepted {
             return Ok(());
         }
-        self.cli.check(&lowered.ruleset).map_err(|e| {
+        let checked = match self.cli.check(&lowered.ruleset) {
+            // An `nft` too old for the IPsec match refuses only those rules,
+            // which the apply would drop as well; nothing else is excused.
+            Err(refused)
+                if !matches!(refused, NftApplyError::TimedOut { .. })
+                    && lowered.ruleset.rules.iter().any(matches_ipsec) =>
+            {
+                let mut without = lowered.ruleset.clone();
+                without.rules.retain(|rule| !matches_ipsec(rule));
+                match self.cli.check(&without) {
+                    Ok(()) => {
+                        kernel_capabilities::record(KernelCapability::IpsecNetworks, false);
+                        Ok(())
+                    }
+                    Err(_) => Err(refused),
+                }
+            }
+            other => other,
+        };
+        checked.map_err(|e| {
             let bounded = bounded_detail(&e.to_string());
             match e {
                 NftApplyError::TimedOut { .. } => EnforcementFailure::transient(bounded),
@@ -601,6 +650,39 @@ mod tests {
         assert_eq!(logged(&log, "run"), 3, "a chain that differs was trusted");
     }
 
+    /// A rule the kernel refused is remembered with its ruleset: an unchanged
+    /// pass does not search for it again, an explicit apply does.
+    #[test]
+    fn a_refused_rule_does_not_make_every_unchanged_pass_search_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs");
+        let listing = dir.path().join("listing");
+        let enforcer = counting(&log, &listing);
+
+        enforcer.enforce(&[]).expect("first apply");
+        put_listing(&listing, installed_rules(&enforcer));
+        enforcer
+            .applied
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+            .expect("applied")
+            .refused_notes = vec!["refused".to_owned()];
+
+        let report = enforcer.enforce(&[]).expect("unchanged pass");
+        assert_eq!(logged(&log, "run"), 1, "an unchanged pass searched again");
+        assert_eq!(report.skipped, 1);
+        assert!(report.notes.iter().any(|n| n == "refused"));
+
+        enforcer.distrust_installed();
+        enforcer.enforce(&[]).expect("explicit apply");
+        assert_eq!(
+            logged(&log, "run"),
+            2,
+            "an explicit apply trusted the cache"
+        );
+    }
+
     /// The pass input: a flushed or altered table reads as a different value,
     /// and the pass it wakes reapplies at once instead of trusting the cache
     /// until the recheck window runs out.
@@ -773,6 +855,142 @@ mod tests {
         enforcer.enforce(&[]).expect("apply");
         enforcer.check(&[]).expect("the installed ruleset refused");
         assert_eq!(logged(&log, "check"), 1, "an installed ruleset was checked");
+    }
+
+    /// One user's catch-all plus the permit for what IPsec protects.
+    fn ipsec_plan() -> EnforcementPlan {
+        use nrr_platform_api::enforcement::{
+            AppScope, Coverage, DstMatch, EgressConstraint, FlowMatch, FlowRule, Precedence,
+            PrecedenceClass, PrincipalScope, Verdict,
+        };
+        let principal = UserPrincipal::from_linux_uid(1000);
+        let flow = |verdict, class, dst, egress| FlowRule {
+            verdict,
+            precedence: Precedence { class, ordinal: 0 },
+            flow: FlowMatch {
+                dst,
+                dst_port: None,
+                protocol: None,
+            },
+            principal: PrincipalScope::User(principal.clone()),
+            app: AppScope::Any,
+            egress,
+            coverage: Coverage::AllPackets,
+            observed_by_program: false,
+        };
+        EnforcementPlan {
+            principal: principal.clone(),
+            flows: vec![
+                flow(
+                    Verdict::Permit,
+                    PrecedenceClass::CatchAllExempt,
+                    DstMatch::SubnetV4 {
+                        net: std::net::Ipv4Addr::new(10, 0, 0, 0),
+                        prefix: 8,
+                    },
+                    EgressConstraint::UnderIpsecPolicy,
+                ),
+                flow(
+                    Verdict::Block,
+                    PrecedenceClass::CatchAllBlock,
+                    DstMatch::Any,
+                    EgressConstraint::Any,
+                ),
+            ],
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        }
+    }
+
+    /// An `nft` too old for `rt ipsec`: its check refuses any batch naming it.
+    fn without_rt_ipsec(log: &std::path::Path) -> NftPolicyEnforcer {
+        let script: &'static str = Box::leak(
+            format!(
+                "case \"$*\" in *--check*) echo check >> '{log}'; \
+                 if grep '\"ipsec\"' >/dev/null; then echo 'Error: syntax error' >&2; exit 1; fi;; \
+                 *) cat >/dev/null; echo run >> '{log}';; esac",
+                log = log.display(),
+            )
+            .into_boxed_str(),
+        );
+        let args: &'static [&'static str] = Box::leak(Box::new(["-c", script, "nft"]));
+        let mut enforcer =
+            NftPolicyEnforcer::new(Arc::new(Unbound), Arc::new(MockAdapterEventSource::new()));
+        enforcer.cli = NftCliEnforcement::with_program("/bin/sh", args, Duration::from_secs(10));
+        enforcer
+    }
+
+    /// A host without the IPsec match: the check still passes, the capability
+    /// is recorded missing, and later passes lower no IPsec rule at all.
+    #[test]
+    fn an_nft_without_the_ipsec_match_costs_only_those_rules() {
+        let _held = kernel_capabilities::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        kernel_capabilities::record(KernelCapability::IpsecNetworks, true);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs");
+        let enforcer = without_rt_ipsec(&log);
+        let plans = [ipsec_plan()];
+
+        let lowered = enforcer.lower(&plans).expect("lowered");
+        assert!(lowered.ruleset.rules.iter().any(matches_ipsec));
+
+        enforcer
+            .check(&plans)
+            .expect("the rest of the plan refused");
+        assert_eq!(logged(&log, "run"), 0, "a check touched the live table");
+        assert!(!kernel_capabilities::is_available(
+            KernelCapability::IpsecNetworks
+        ));
+        let lowered = enforcer.lower(&plans).expect("lowered");
+        assert!(!lowered.ruleset.rules.iter().any(matches_ipsec));
+        assert!(
+            lowered
+                .ruleset
+                .rules
+                .iter()
+                .any(|r| r.comment.starts_with("catch-all-block")),
+            "the catch-all stays"
+        );
+        kernel_capabilities::record(KernelCapability::IpsecNetworks, true);
+    }
+
+    /// A kernel that refused the IPsec rules on apply: the refusal moves to the
+    /// capability list and out of the rule failures.
+    #[test]
+    fn a_refused_ipsec_rule_is_a_missing_capability_not_a_rule_failure() {
+        use crate::nft_apply::SkippedNftRule;
+        let ruleset = NftRuleset {
+            family: crate::nft_ir::NftFamily::Inet,
+            table: "nrr".into(),
+            chain: "output".into(),
+            forward: Vec::new(),
+            rules: vec![
+                NftRule {
+                    matches: vec![NftMatch::SkUid(1000), NftMatch::RouteIpsec],
+                    verdict: crate::nft_ir::NftVerdict::Accept,
+                    comment: "catch-all-exempt#0".into(),
+                },
+                NftRule {
+                    matches: vec![NftMatch::SkUid(1000), NftMatch::DstPort(53)],
+                    verdict: crate::nft_ir::NftVerdict::Accept,
+                    comment: "route-primary#0".into(),
+                },
+            ],
+        };
+        let skipped = |index: usize| SkippedNftRule {
+            index,
+            comment: ruleset.rules[index].comment.clone(),
+        };
+        let mut outcome = NftApplyOutcome {
+            applied: 0,
+            skipped: vec![skipped(0), skipped(1)],
+        };
+        assert!(settle_ipsec_refusals(&ruleset, &mut outcome));
+        assert_eq!(outcome.skipped, vec![skipped(1)]);
+        assert!(!settle_ipsec_refusals(&ruleset, &mut outcome));
+        assert_eq!(outcome.skipped.len(), 1, "another rule's refusal stays");
     }
 
     #[test]

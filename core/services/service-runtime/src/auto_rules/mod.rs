@@ -312,6 +312,10 @@ struct PublishState {
     /// arrival that stays under the session's high-water mark.
     announced: HashSet<String>,
     announced_at: Option<SystemTime>,
+    /// The count the clients were last told, so a count that moves without
+    /// news (expiry, a covering rule, an answer from another surface) still
+    /// reaches every badge.
+    told_count: Option<u64>,
 }
 
 /// What one proposal tick did, for logging and tests.
@@ -324,7 +328,8 @@ pub struct TickSummary {
     /// Offers the inbox shows by default after the tick — see
     /// [`shown_by_default_count`].
     pub pending: usize,
-    /// An `AutoRuleCandidatesChanged` push was emitted.
+    /// An announcing `AutoRuleCandidatesChanged` push was emitted; a
+    /// count-only one is not counted here.
     pub published: bool,
 }
 
@@ -560,6 +565,8 @@ pub struct AutoRulesEngine {
     /// Set once at the composition root; without it `?` rules stay where they
     /// are written and are never checked.
     verify_wiring: OnceLock<VerifyPrimaryWiring>,
+    /// Runs the `?` checks off the tick.
+    verify_runner: verify_primary::VerifyRunner,
 }
 
 mod inbox;

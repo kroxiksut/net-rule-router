@@ -125,30 +125,6 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::from(e.exit_code())
             }
         },
-        #[cfg(windows)]
-        "update" => {
-            let new_binary = args.get(2).cloned().unwrap_or_default();
-            if new_binary.is_empty() {
-                eprintln!("update requires <new-binary-path> as second argument");
-                return std::process::ExitCode::from(1);
-            }
-            use nrr_service_runtime::UpdateConfig;
-            match scm::update_service(&UpdateConfig::default_for(std::path::PathBuf::from(
-                new_binary,
-            ))) {
-                Ok(outcome) => {
-                    println!("Service drained for update.");
-                    if let Some(bak) = outcome.state_db_backup {
-                        println!("State DB backed up to: {}", bak.display());
-                    }
-                    std::process::ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("update failed: {e}");
-                    std::process::ExitCode::from(1)
-                }
-            }
-        }
         // Re-point the registration at THIS binary and bring it back up. A
         // SINGLE-TOKEN verb on purpose: the broker runs one whitelisted argv
         // token and cannot pass `<path>`, and the path we want is the one this
@@ -327,9 +303,9 @@ fn main() -> std::process::ExitCode {
         _ => {
             eprintln!(
                 "unknown subcommand `{mode}`; expected one of: \
-                 install, uninstall, start, stop, restart, status, console, cleanup, \
-                 set-start-auto, set-start-demand, query-start-mode, update, \
-                 provision-check, provision-stage"
+                 install, reinstall, uninstall, start, stop, restart, status, console, \
+                 cleanup, after-crash, set-start-auto, set-start-demand, \
+                 query-start-mode, provision-check, provision-stage"
             );
             std::process::ExitCode::from(2)
         }
@@ -659,9 +635,7 @@ fn run_console() -> std::process::ExitCode {
     #[cfg(windows)]
     {
         let deps = runtime_deps::build_supervised_runtime_deps(&artifacts, verbosity_handle);
-        let data_dir = artifacts.topology.data_dir.clone();
         run_supervised_runtime(&ConsoleController, &stop, artifacts, deps);
-        nrr_service_runtime::crash_series::end_run(&data_dir);
         std::process::ExitCode::SUCCESS
     }
     // Console mode drives the same supervised runtime the SCM path does, and

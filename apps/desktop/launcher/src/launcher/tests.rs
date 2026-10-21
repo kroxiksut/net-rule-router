@@ -358,6 +358,49 @@ fn a_live_owner_earns_the_long_activation_wait() {
     let _ = std::fs::remove_file(&lock);
 }
 
+fn session(vars: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+    move |name| {
+        vars.iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_owned())
+    }
+}
+
+/// Only the tray goes through XWayland, only under Wayland with XWayland
+/// present, and never over a platform the user picked.
+#[test]
+fn the_tray_takes_xwayland_only_where_it_can_place_its_notice() {
+    use super::{
+        tray_platform_arguments as pick,
+        LauncherSurface::{MainGui, Tray},
+    };
+    let xcb = Some(["-platform", "xcb;wayland"]);
+    let gnome = session(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")]);
+    assert_eq!(pick(Tray, &gnome), xcb);
+    assert_eq!(pick(MainGui, &gnome), None, "the main window stays native");
+    let by_type = session(&[("XDG_SESSION_TYPE", "Wayland"), ("DISPLAY", ":0")]);
+    assert_eq!(pick(Tray, by_type), xcb);
+    assert_eq!(
+        pick(Tray, session(&[("WAYLAND_DISPLAY", "wayland-0")])),
+        None,
+        "no XWayland"
+    );
+    assert_eq!(
+        pick(
+            Tray,
+            session(&[("XDG_SESSION_TYPE", "x11"), ("DISPLAY", ":0")])
+        ),
+        None
+    );
+    let chosen = session(&[
+        ("WAYLAND_DISPLAY", "wayland-0"),
+        ("DISPLAY", ":0"),
+        ("QT_QPA_PLATFORM", "wayland"),
+    ]);
+    assert_eq!(pick(Tray, chosen), None, "the user's platform wins");
+    assert_eq!(pick(Tray, session(&[])), None, "Windows and macOS");
+}
+
 /// A scripted run's self-closing timer is a development aid: a release build
 /// starts the window it would start anyway, whatever the environment says.
 #[test]

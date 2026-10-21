@@ -9,6 +9,7 @@
 //! Same inherent impl, split across files.
 
 use super::*;
+use crate::killswitch_codegen::ForeignTunnelNetwork;
 
 impl SecondaryRouteCoordinator {
     /// What policy may do about IPv6 for `sid`'s bindings this pass.
@@ -136,22 +137,26 @@ impl SecondaryRouteCoordinator {
             &routes,
             resolution.primary.map(|p| p.interface_index),
         ));
+        let policy = self.route_source.load_for_sid(sid);
+        let (foreign_tunnel_luids, foreign_tunnel_networks) = self.foreign_tunnels_of(
+            &resolution,
+            policy.as_ref(),
+            Some(&routes),
+            reading.adapters(),
+        );
         Some(KillSwitchResolution {
             secondary_luid,
             bootstrap_server_ips: server_ips,
             bootstrap_server_ips_v6,
             local_subnets,
             local_subnets_v6,
-            foreign_tunnel_luids: self.foreign_tunnel_luids(
-                sid,
-                &resolution,
-                Some(&routes),
-                reading.adapters(),
-            ),
+            foreign_tunnel_luids,
+            foreign_tunnel_networks,
         })
     }
 
-    /// LUIDs of tunnels the user runs that are not our additional route.
+    /// LUIDs of tunnels the user runs that are not our additional route, and
+    /// the networks their own routes carry, each with its tunnel's LUID.
     ///
     /// A machine can hold several: ours, and the corporate one the person
     /// needs for work. Cutting the second is the product breaking something
@@ -161,41 +166,101 @@ impl SecondaryRouteCoordinator {
     /// `routes` or `adapters` is `None` when it could not be read. Nothing is
     /// then exempted: which link carries the default route is unknown, and
     /// [`foreign_tunnel_indexes`] resolves doubt to "not a foreign tunnel".
-    ///
-    /// The bound links count as ours even when they did not resolve to a
-    /// route target this pass (liveness-gated, no derivable next hop): an
-    /// unresolved binding is still the user's link, never somebody else's.
-    fn foreign_tunnel_luids(
+    fn foreign_tunnels_of(
         &self,
-        sid: &str,
         resolution: &RouteResolution,
+        policy: Option<&PerSidPolicySnapshot>,
         routes: Option<&[RouteEntry]>,
         adapters: Option<&[AdapterInfo]>,
-    ) -> Vec<u64> {
-        let (Some(routes), Some(adapters)) = (routes, adapters) else {
+    ) -> (Vec<u64>, Vec<ForeignTunnelNetwork>) {
+        let mut luids = Vec::new();
+        let mut networks = Vec::new();
+        for index in self.foreign_tunnel_interfaces(resolution, policy, routes, adapters) {
+            let Some(luid) = self
+                .api
+                .interface_luid_for_index(index)
+                .ok()
+                .filter(|luid| *luid != 0)
+            else {
+                continue;
+            };
+            luids.push(luid);
+            networks.extend(
+                crate::route_codegen::network_routes::foreign_tunnel_blocks(
+                    routes.unwrap_or_default(),
+                    &[index],
+                )
+                .into_iter()
+                .map(|network| ForeignTunnelNetwork { luid, network }),
+            );
+        }
+        (luids, networks)
+    }
+
+    /// Interface indexes of `sid`'s foreign tunnels, read off the machine now.
+    /// Nothing is named while the links or the table cannot be read.
+    pub fn foreign_tunnel_interface_indexes(&self, sid: &str) -> Vec<u32> {
+        let resolution = self.resolve(sid);
+        let (Ok(routes), Ok(adapters)) = (self.api.get_ip_forward_table(), self.adapters_now())
+        else {
             return Vec::new();
         };
         let policy = self.route_source.load_for_sid(sid);
-        let bindings = policy
-            .iter()
-            .flat_map(|p| p.primary.iter().chain(p.secondary.iter()));
-        let ours: Vec<u32> = resolution
+        self.foreign_tunnel_interfaces(&resolution, policy.as_ref(), Some(&routes), Some(&adapters))
+    }
+
+    /// `sid`'s foreign tunnels by interface index; none while the links or the
+    /// table cannot be read. `policy` is the pass's one load of `sid`'s policy.
+    pub(super) fn foreign_tunnel_interfaces(
+        &self,
+        resolution: &RouteResolution,
+        policy: Option<&PerSidPolicySnapshot>,
+        routes: Option<&[RouteEntry]>,
+        adapters: Option<&[AdapterInfo]>,
+    ) -> Vec<u32> {
+        let (Some(routes), Some(adapters)) = (routes, adapters) else {
+            return Vec::new();
+        };
+        let resolved: Vec<u32> = resolution
             .primary
             .iter()
             .chain(resolution.secondary.iter())
             .map(|t| t.interface_index)
-            .chain(bindings.flat_map(|b| {
-                adapters
-                    .iter()
-                    .filter(|a| binding_matches_live(a, &b.stable_id, &b.known_stable_ids))
-                    .map(|a| a.index)
-            }))
             .collect();
-        foreign_tunnel_indexes(adapters, &ours, routes)
-            .into_iter()
-            .filter_map(|index| self.api.interface_luid_for_index(index).ok())
-            .filter(|luid| *luid != 0)
-            .collect()
+        let bindings = policy
+            .iter()
+            .flat_map(|p| p.primary.iter().chain(p.secondary.iter()));
+        let ours = own_link_indexes(adapters, &resolved, bindings);
+        let resolved_secondary: Vec<u32> = resolution
+            .secondary
+            .iter()
+            .map(|t| t.interface_index)
+            .collect();
+        let additional = own_link_indexes(
+            adapters,
+            &resolved_secondary,
+            policy.iter().flat_map(|p| p.secondary.iter()),
+        );
+        foreign_tunnel_indexes(adapters, &ours, &additional, routes)
+    }
+
+    /// `sid`'s additional-route links: the secondary that resolved and every
+    /// adapter its stored binding names, resolved this pass or not.
+    pub(super) fn additional_links(
+        policy: Option<&PerSidPolicySnapshot>,
+        resolution: &RouteResolution,
+        adapters: &[AdapterInfo],
+    ) -> Vec<u32> {
+        let resolved: Vec<u32> = resolution
+            .secondary
+            .iter()
+            .map(|t| t.interface_index)
+            .collect();
+        own_link_indexes(
+            adapters,
+            &resolved,
+            policy.iter().flat_map(|p| p.secondary.iter()),
+        )
     }
 
     /// exemptions for the **fail-closed** block-all path
@@ -294,11 +359,11 @@ impl SecondaryRouteCoordinator {
         // back to healthy and the block-all never disarms. The echo is
         // kernel-originated (no app-id), so only this destination exemption
         // can cover it.
+        let policy = self.route_source.load_for_sid(sid);
         let probe_target_ips = match resolution.secondary {
             Some(t) => vec![t.gateway],
-            None => self
-                .route_source
-                .load_for_sid(sid)
+            None => policy
+                .as_ref()
                 .and_then(|policy| {
                     let binding = policy.secondary.as_ref()?;
                     let infos = reading.adapters()?;
@@ -322,17 +387,50 @@ impl SecondaryRouteCoordinator {
             &routes,
             resolution.primary.map(|p| p.interface_index),
         ));
+        let (foreign_tunnel_luids, foreign_tunnel_networks) = self.foreign_tunnels_of(
+            &resolution,
+            policy.as_ref(),
+            table_read.then_some(routes.as_slice()),
+            reading.adapters(),
+        );
+        // Ignores the user's refusals on purpose: a refused network is closed
+        // to the machine's own traffic, while this opens only the replies
+        // forwarded into a guest. An unreadable table names nothing, as no
+        // uplink can then be told apart.
+        let guest_network_luids = match (table_read, reading.adapters()) {
+            (true, Some(adapters)) => {
+                let resolved: Vec<u32> = resolution
+                    .primary
+                    .iter()
+                    .chain(resolution.secondary.iter())
+                    .map(|t| t.interface_index)
+                    .collect();
+                let ours = own_link_indexes(
+                    adapters,
+                    &resolved,
+                    policy
+                        .iter()
+                        .flat_map(|p| p.primary.iter().chain(p.secondary.iter())),
+                );
+                guest_network_indexes(adapters, &routes, &ours)
+                    .into_iter()
+                    .filter_map(|index| {
+                        self.api
+                            .interface_luid_for_index(index)
+                            .ok()
+                            .filter(|luid| *luid != 0)
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         FailClosedExemptions {
             bootstrap_server_ips,
             bootstrap_server_ips_v6,
             local_subnets,
             local_subnets_v6,
-            foreign_tunnel_luids: self.foreign_tunnel_luids(
-                sid,
-                &resolution,
-                table_read.then_some(routes.as_slice()),
-                reading.adapters(),
-            ),
+            foreign_tunnel_luids,
+            foreign_tunnel_networks,
             // the resolver has no rule/codegen context;
             // the orchestrator fills known-primary IPs at the block-all call site.
             primary_dest_ips: Vec::new(),
@@ -347,8 +445,67 @@ impl SecondaryRouteCoordinator {
             // block-all call site; the resolver has no LUID context.
             secondary_luid: 0,
             probe_target_ips,
+            guest_network_luids,
         }
     }
+}
+
+/// The host side of the machine's guest networks (WSL, Hyper-V, Docker
+/// Desktop), the interfaces a forwarded reply leaves by to reach a guest. Only
+/// a hypervisor adapter that is up and can be no way out qualifies: never a
+/// link the user bound (`ours`), a tunnel, our own adapter, one with a gateway
+/// or a default route, or one the table names the uplink. An external virtual
+/// switch carries the internet itself, and a permit on it would let every
+/// guest out.
+pub(crate) fn guest_network_indexes(
+    adapters: &[AdapterInfo],
+    routes: &[RouteEntry],
+    ours: &[u32],
+) -> Vec<u32> {
+    use nrr_platform_api::adapters::{IfOperStatus, InterfaceType};
+    let uplinks = nrr_platform_api::uplink::structural_uplinks(adapters, routes, &[]);
+    adapters
+        .iter()
+        .filter(|a| a.oper_status == IfOperStatus::Up && a.interface_type != InterfaceType::Tunnel)
+        .filter(|a| nrr_platform_api::adapters::is_virtual_machine_adapter(a))
+        .filter(|a| !nrr_platform_api::uplink::is_own_fake_ip_adapter(a))
+        .filter(|a| !ours.contains(&a.index) && !uplinks.contains(&a.index))
+        .filter(|a| !a.has_gateway())
+        .filter(|a| {
+            !routes
+                .iter()
+                .any(|r| r.interface_index == a.index && r.prefix_length == 0)
+        })
+        .map(|a| a.index)
+        .collect()
+}
+
+/// The links a user's own routing runs on: what resolved this pass, and every
+/// adapter the stored bindings name by identity or by display name. A binding
+/// that did not resolve this pass (liveness-gated, no next hop) is still the
+/// user's link, never somebody else's tunnel.
+pub(crate) fn own_link_indexes<'a>(
+    adapters: &[AdapterInfo],
+    resolved: &[u32],
+    bindings: impl IntoIterator<Item = &'a PerSidBinding>,
+) -> Vec<u32> {
+    let mut ours: Vec<u32> = resolved.to_vec();
+    for binding in bindings {
+        ours.extend(
+            adapters
+                .iter()
+                .filter(|a| {
+                    let named = !binding.display_name.is_empty()
+                        && (a.friendly_name == binding.display_name
+                            || a.adapter_name == binding.display_name);
+                    named || binding_matches_live(a, &binding.stable_id, &binding.known_stable_ids)
+                })
+                .map(|a| a.index),
+        );
+    }
+    ours.sort_unstable();
+    ours.dedup();
+    ours
 }
 
 /// Adapters that may keep their egress under a block-all as somebody else's
@@ -358,37 +515,60 @@ impl SecondaryRouteCoordinator {
 /// A permit on the uplink is no kill-switch at all, and a name cannot tell
 /// one from a tunnel: many providers deliver the internet itself over PPPoE,
 /// and a user may bind a link called "OpenVPN" as the primary. So the links
-/// ours are bound to (`ours`) never qualify, and neither does the SOLE holder
-/// of a default route in its address family — that link is the uplink. With
-/// two holders (the physical link plus a corporate full tunnel) the table
-/// cannot say which is which, and the name decides as before.
+/// ours are bound to (`ours`) never qualify, nor does our own fake-IP adapter,
+/// nor a link the table names the way out (`structural_uplinks`): the sole
+/// holder of a default route in its family or, with no holder left, the link
+/// carrying our tunnel's route to its server. With two holders (the physical
+/// link plus a corporate full tunnel) the table cannot say which is which, and
+/// the name decides as before.
+///
+/// `additional` are the user's additional-route links (a subset of `ours`).
+/// Their defaults are left out of the count: our full tunnel holds `/0` beside
+/// an L2TP/PPTP/SSTP home uplink, and counted, it would leave that uplink
+/// unnamed for its name to call foreign. A bound primary still counts, so a
+/// corporate tunnel holding a default beside it stays foreign.
 ///
 /// The name decision is `text_indicates_vpn_tunnel`, the same one that keeps
 /// a tunnel from being mistaken for a hypervisor network.
 pub(crate) fn foreign_tunnel_indexes(
     adapters: &[AdapterInfo],
     ours: &[u32],
+    additional: &[u32],
     routes: &[RouteEntry],
 ) -> Vec<u32> {
-    let available: Vec<&AdapterInfo> = adapters
+    let mut never = nrr_platform_api::uplink::structural_uplinks(adapters, routes, additional);
+    never.extend_from_slice(additional);
+    tunnel_like_indexes(adapters, ours, &never)
+}
+
+/// [`foreign_tunnel_indexes`] when the route table is unreadable: no uplink
+/// can be told apart, so every tunnel-looking link that is not ours counts.
+pub(crate) fn foreign_tunnel_indexes_without_routes(
+    adapters: &[AdapterInfo],
+    ours: &[u32],
+) -> Vec<u32> {
+    tunnel_like_indexes(adapters, ours, &[])
+}
+
+fn tunnel_like_indexes(adapters: &[AdapterInfo], ours: &[u32], spared: &[u32]) -> Vec<u32> {
+    use nrr_platform_api::adapters::{IfOperStatus, InterfaceType};
+    // Live means up with an address. Not `classify_availability`: it leaves
+    // tunnel-typed links out by design, and on Linux every tunnel (`wg0`,
+    // `tun0`) is one, so no foreign tunnel would ever be seen there.
+    adapters
         .iter()
+        .filter(|a| a.oper_status == IfOperStatus::Up && a.has_ipv4_address())
         .filter(|a| {
-            nrr_platform_api::classify_availability(a)
-                == Some(nrr_platform_api::AdapterAvailability::Available)
+            !nrr_platform_api::adapters::description_matches_virtual_software(&a.description)
         })
-        .collect();
-    let uplinks: Vec<u32> = [false, true]
-        .into_iter()
-        .filter_map(|v6| crate::routing_setup::sole_default_route_holder(adapters, routes, v6))
-        .collect();
-    available
-        .into_iter()
-        .filter(|a| !ours.contains(&a.index) && !uplinks.contains(&a.index))
+        .filter(|a| !nrr_platform_api::uplink::is_own_fake_ip_adapter(a))
+        .filter(|a| !ours.contains(&a.index) && !spared.contains(&a.index))
         .filter(|a| {
-            nrr_platform_api::adapters::text_indicates_vpn_tunnel(&format!(
-                "{} {}",
-                a.description, a.friendly_name
-            ))
+            a.interface_type == InterfaceType::Tunnel
+                || nrr_platform_api::adapters::text_indicates_vpn_tunnel(&format!(
+                    "{} {}",
+                    a.description, a.friendly_name
+                ))
         })
         .map(|a| a.index)
         .collect()

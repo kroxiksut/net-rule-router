@@ -526,6 +526,36 @@ fn fail_closed_falls_back_to_the_last_known_local_subnets() {
     );
 }
 
+/// A hostile access point hands the main link a `/1` beside the real LAN.
+/// Neither guard lets half the internet through as a "local network".
+#[test]
+fn a_half_internet_segment_on_the_main_link_is_exempted_by_neither_guard() {
+    let api = Arc::new(MockWindowsApi::new());
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
+    let vpn_id = vpn.stable_id();
+    let eth_id = eth.stable_id();
+    api.set_adapter_infos(vec![vpn, eth]);
+    api.set_route_table(vec![
+        route_entry([203, 0, 113, 7], 32, [192, 168, 1, 1], 12, 5),
+        route_entry([192, 168, 1, 0], 24, [0, 0, 0, 0], 12, 5),
+        route_entry([0, 0, 0, 0], 1, [0, 0, 0, 0], 12, 5),
+        route_entry([128, 0, 0, 0], 1, [0, 0, 0, 0], 12, 5),
+    ]);
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_primary("S-IVANOV", &eth_id);
+    policy.bind_secondary("S-IVANOV", &vpn_id);
+    let coord = coordinator_with_policy(Arc::clone(&api), Arc::new(FakeRules::new()), policy);
+
+    let lan = vec![(Ipv4Addr::new(192, 168, 1, 0), 24)];
+    let kill_switch = coord
+        .kill_switch_exemptions("S-IVANOV", &coord.read_machine())
+        .expect("exemptions resolve");
+    assert_eq!(kill_switch.local_subnets, lan);
+    let fail_closed = coord.fail_closed_exemptions("S-IVANOV", &coord.read_machine());
+    assert_eq!(fail_closed.local_subnets, lan);
+}
+
 #[test]
 fn kill_switch_exemptions_cache_keeps_server_ip_after_bootstrap_route_vanishes() {
     // The VPN client drops the bootstrap route while disconnected; the

@@ -242,6 +242,23 @@ mod tests {
         assert!(!hand_edited(&file, &rules), "nothing left to lose");
     }
 
+    /// The GUI compares this record with its own hash of the file: a spelling
+    /// that moved with the hash crate would call every file hand-edited.
+    #[test]
+    fn the_written_file_hash_is_pinned() {
+        let dir = Scratch::new("hash-pin");
+        let rules = dir.path().join("rules_primary.txt");
+        std::fs::write(&rules, "not json 19").expect("write");
+        assert_eq!(
+            rules_file_sha256(&rules).expect("read").as_deref(),
+            Some("0b4447295187b5a8357ab3aa6cb10dd0911a9bc45a613f7e40411b7626a3e0a4")
+        );
+        assert_eq!(
+            rules_file_sha256(&dir.path().join("absent.txt")).expect("read"),
+            None
+        );
+    }
+
     #[test]
     fn no_file_reads_as_no_folder() {
         let dir = Scratch::new("none");

@@ -26,7 +26,10 @@
 //!   make further runtime activity unsafe (apply controller, IPC
 //!   server in dispatch mode).
 //! - **`Recoverable`** — fail → mark `Degraded`, restart up to N times
-//!   with backoff. Used for periodic refreshers (cache, health pull).
+//!   with backoff, then retired and reported; a retired one is tried once more
+//!   on a network change or a resume ([`ReviveSignal`]), and every
+//!   [`RETIRED_REVIVE_AFTER`] failing that. Used for periodic refreshers
+//!   (cache, health pull).
 //! - **`Optional`** — fail → restart with exponential backoff
 //!   ([`RestartBackoff`]), never retired. The failure sink hears about the
 //!   outage and the recovery, so health can say which one is down meanwhile.
@@ -65,12 +68,87 @@
 //! every iteration.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::lifecycle::{StopToken, STOP_TIMEOUT};
 use crate::task_liveness::{TaskLiveness, DEFAULT_TICK_DEADLINE};
+
+/// How long a retired `Recoverable` task waits for its next attempt when no
+/// [`ReviveSignal`] event comes first.
+pub const RETIRED_REVIVE_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// The soonest a [`ReviveSignal`] event retries a retired task: a flapping link
+/// would otherwise turn every debounced change into a failed attempt and a log line.
+pub const RETIRED_EVENT_REVIVE_FLOOR: Duration = Duration::from_secs(30);
+
+/// Wakes retired `Recoverable` tasks ahead of their timer. A network change or a
+/// resume is what most often clears the fault that retired them (a driver back,
+/// an adapter re-created); waiting for the timer leaves the feature off for
+/// minutes after the fault is gone.
+#[derive(Debug, Default)]
+pub struct ReviveSignal {
+    state: Mutex<ReviveState>,
+    wake: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ReviveState {
+    generation: u64,
+    closed: bool,
+}
+
+impl ReviveSignal {
+    /// Give every retired task one more attempt. Cheap; safe from an OS callback.
+    pub fn revive(&self) {
+        {
+            let mut st = self.lock();
+            st.generation = st.generation.wrapping_add(1);
+        }
+        self.wake.notify_all();
+    }
+
+    fn lock(&self) -> MutexGuard<'_, ReviveState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    /// Releases every waiter for good. The stop token has its own condvar, so a
+    /// retired task waiting here learns of the stop only through this.
+    fn close(&self) {
+        self.lock().closed = true;
+        self.wake.notify_all();
+    }
+
+    /// Sleep of a retired task: until `timer` passes, the stop, or an event newer
+    /// than `seen` once `floor` has passed (an earlier event waits for the floor).
+    fn wait_retired(&self, stop: &StopToken, seen: u64, timer: Duration, floor: Duration) {
+        let start = Instant::now();
+        let deadline = start + timer;
+        let earliest = start + floor.min(timer);
+        let mut st = self.lock();
+        loop {
+            if st.closed || stop.is_stop_requested() {
+                return;
+            }
+            let now = Instant::now();
+            let evented = st.generation != seen;
+            if now >= deadline || (evented && now >= earliest) {
+                return;
+            }
+            let until = if evented { earliest } else { deadline };
+            st = self
+                .wake
+                .wait_timeout(st, until.saturating_duration_since(now))
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+    }
+}
 
 // ── Task taxonomy ────────────────────────────────────────────────────────────
 
@@ -373,6 +451,10 @@ pub struct ServiceSupervisor {
     /// Maximum total wait time during shutdown. Defaults to `STOP_TIMEOUT`.
     stop_timeout: Duration,
     optional_restart: RestartBackoff,
+    /// How long a retired `Recoverable` task waits before one more attempt.
+    revive_after: Duration,
+    revive: Arc<ReviveSignal>,
+    revive_floor: Duration,
     /// Where each tick's start and end are marked, so a hang is visible.
     liveness: Option<Arc<TaskLiveness>>,
 }
@@ -386,6 +468,9 @@ impl ServiceSupervisor {
             sink,
             stop_timeout: STOP_TIMEOUT,
             optional_restart: RestartBackoff::default(),
+            revive_after: RETIRED_REVIVE_AFTER,
+            revive: Arc::new(ReviveSignal::default()),
+            revive_floor: RETIRED_EVENT_REVIVE_FLOOR,
             liveness: None,
         }
     }
@@ -409,6 +494,25 @@ impl ServiceSupervisor {
         self
     }
 
+    /// Override how long a retired `Recoverable` task waits for its next attempt.
+    #[must_use]
+    pub fn with_revive_after(mut self, d: Duration) -> Self {
+        self.revive_after = d;
+        self
+    }
+
+    /// Override the soonest an event retries a retired task.
+    #[must_use]
+    pub fn with_event_revive_floor(mut self, d: Duration) -> Self {
+        self.revive_floor = d;
+        self
+    }
+
+    /// What the network-change and resume sources poke to retry retired tasks.
+    pub fn revive_signal(&self) -> Arc<ReviveSignal> {
+        Arc::clone(&self.revive)
+    }
+
     /// Spawn one task. Returns `Err` if the supervisor has already
     /// been shut down (`StopToken` already flipped).
     pub fn spawn(&self, mut task: ServiceTask) -> Result<(), &'static str> {
@@ -424,6 +528,9 @@ impl ServiceSupervisor {
         let interval = task.interval;
         let backoff = task.backoff;
         let optional_restart = self.optional_restart;
+        let revive_after = self.revive_after;
+        let revive = Arc::clone(&self.revive);
+        let revive_floor = self.revive_floor;
         let liveness = self.liveness.clone();
         let pulse = liveness
             .as_ref()
@@ -498,8 +605,23 @@ impl ServiceSupervisor {
                                 }
                                 TaskClass::Recoverable => {
                                     if attempt > max_restarts {
+                                        let seen = revive.generation();
                                         sink.task_terminated_fatal(&id, &msg);
-                                        break;
+                                        // Retired is not gone for good: a fault
+                                        // that cleared (a driver back, a lock
+                                        // released) would otherwise leave the
+                                        // feature off until the next restart.
+                                        // One attempt per round; a failure
+                                        // retires it again.
+                                        revive.wait_retired(
+                                            &stop,
+                                            seen,
+                                            revive_after,
+                                            revive_floor,
+                                        );
+                                        attempt = max_restarts;
+                                        down = true;
+                                        continue;
                                     }
                                     let delay = backoff.delay_for_attempt(attempt);
                                     sink.task_restart_scheduled(&id, class, attempt, delay, &msg);
@@ -547,6 +669,7 @@ impl ServiceSupervisor {
     /// overstating the problem and hiding the real straggler.
     pub fn shutdown(&self) -> ShutdownReport {
         self.stop.request_stop();
+        self.revive.close();
         if !self.started.load(Ordering::SeqCst) {
             return ShutdownReport {
                 total: 0,
@@ -755,6 +878,139 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         assert_eq!(sink.failures.load(Ordering::SeqCst), 3);
         assert_eq!(sink.fatal.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_retired_recoverable_task_gets_another_attempt_and_reports_its_recovery() {
+        let stop = StopToken::new();
+        let sink = counting_sink();
+        let supervisor =
+            ServiceSupervisor::new(stop.clone(), sink.clone() as Arc<dyn TaskFailureSink>)
+                .with_revive_after(Duration::from_millis(30));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        supervisor
+            .spawn(ServiceTask::periodic(
+                "heals",
+                TaskClass::Recoverable,
+                Duration::from_millis(5),
+                1,
+                move |_stop| {
+                    // Fails until the fault clears on the fifth attempt.
+                    if attempts_clone.fetch_add(1, Ordering::SeqCst) < 4 {
+                        TaskOutcome::Failed("boom".into())
+                    } else {
+                        TaskOutcome::Continue
+                    }
+                },
+            ))
+            .unwrap();
+        thread::sleep(Duration::from_millis(600));
+        let _ = supervisor.shutdown();
+        assert!(sink.fatal.load(Ordering::SeqCst) >= 1, "it retired first");
+        assert!(
+            attempts.load(Ordering::SeqCst) > 4,
+            "a retired task must be tried again once the revive delay passes"
+        );
+        assert!(
+            sink.recovered.load(Ordering::SeqCst) >= 1,
+            "the sink must hear that the task runs again"
+        );
+    }
+
+    /// A retired task that keeps failing until the fault clears, counting attempts.
+    fn spawn_retired_until(supervisor: &ServiceSupervisor, heals_after: usize) -> Arc<AtomicUsize> {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_in_task = Arc::clone(&attempts);
+        supervisor
+            .spawn(ServiceTask::periodic(
+                "retired-until-event",
+                TaskClass::Recoverable,
+                Duration::from_millis(5),
+                1,
+                move |_stop| {
+                    if attempts_in_task.fetch_add(1, Ordering::SeqCst) < heals_after {
+                        TaskOutcome::Failed("driver gone".into())
+                    } else {
+                        TaskOutcome::Continue
+                    }
+                },
+            ))
+            .expect("spawn");
+        attempts
+    }
+
+    #[test]
+    fn a_network_change_revives_a_retired_task_without_waiting_for_the_timer() {
+        let stop = StopToken::new();
+        let sink = counting_sink();
+        let supervisor =
+            ServiceSupervisor::new(stop.clone(), sink.clone() as Arc<dyn TaskFailureSink>)
+                .with_revive_after(Duration::from_secs(3600))
+                .with_event_revive_floor(Duration::ZERO);
+        let attempts = spawn_retired_until(&supervisor, 2);
+        assert!(wait_until(Duration::from_secs(2), || {
+            sink.fatal.load(Ordering::SeqCst) == 1
+        }));
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "retired, timer far off");
+
+        supervisor.revive_signal().revive();
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                sink.recovered.load(Ordering::SeqCst) == 1
+            }),
+            "the event must give the retired task its next attempt"
+        );
+        let _ = supervisor.shutdown();
+        assert_eq!(sink.fatal.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_event_inside_the_floor_retries_once_the_floor_passes_not_at_once() {
+        let stop = StopToken::new();
+        let sink = counting_sink();
+        let supervisor =
+            ServiceSupervisor::new(stop.clone(), sink.clone() as Arc<dyn TaskFailureSink>)
+                .with_revive_after(Duration::from_secs(3600))
+                .with_event_revive_floor(Duration::from_millis(400));
+        let attempts = spawn_retired_until(&supervisor, usize::MAX);
+        assert!(wait_until(Duration::from_secs(2), || {
+            sink.fatal.load(Ordering::SeqCst) == 1
+        }));
+        let signal = supervisor.revive_signal();
+        // A flapping link: a burst of changes right after the retirement.
+        for _ in 0..10 {
+            signal.revive();
+        }
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "held back by the floor");
+        assert!(wait_until(Duration::from_secs(3), || {
+            sink.fatal.load(Ordering::SeqCst) == 2
+        }));
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "the burst is one attempt"
+        );
+        let _ = supervisor.shutdown();
+    }
+
+    #[test]
+    fn a_retired_task_waiting_for_its_timer_exits_promptly_on_shutdown() {
+        let stop = StopToken::new();
+        let sink = counting_sink();
+        let supervisor =
+            ServiceSupervisor::new(stop.clone(), sink.clone() as Arc<dyn TaskFailureSink>)
+                .with_revive_after(Duration::from_secs(3600))
+                .with_stop_timeout(Duration::from_secs(2));
+        let _attempts = spawn_retired_until(&supervisor, usize::MAX);
+        assert!(wait_until(Duration::from_secs(2), || {
+            sink.fatal.load(Ordering::SeqCst) == 1
+        }));
+        let report = supervisor.shutdown();
+        assert!(!report.timed_out(), "{report:?}");
     }
 
     #[test]

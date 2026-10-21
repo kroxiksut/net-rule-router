@@ -165,6 +165,35 @@ fn both_families_of_one_host_coexist() {
     );
 }
 
+/// An IPv4-mapped answer is the IPv4 address it maps: one row, filed as v4,
+/// so the reader that pins the v4 address finds it.
+#[test]
+fn a_mapped_v6_answer_is_filed_as_its_v4_address() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let v4 = Ipv4Addr::new(203, 0, 113, 9);
+    store
+        .upsert_resolution(sample_resolution("mapped.example", v4))
+        .expect("v4");
+    store
+        .upsert_resolution(ResolutionEntry {
+            resolved_ips: vec![IpAddr::V6(v4.to_ipv6_mapped())],
+            ..sample_resolution("mapped.example", v4)
+        })
+        .expect("mapped");
+
+    let rows: Vec<(String, String)> = store
+        .conn
+        .borrow()
+        .prepare("SELECT address_family, canonical_ip FROM ip_addresses")
+        .and_then(|mut st| {
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        })
+        .expect("rows");
+    assert_eq!(rows, vec![("ipv4".to_string(), "203.0.113.9".to_string())]);
+}
+
 // ── Fixtures shared by more than one theme ───────────────────────────────
 
 /// A revision row for the baseline principal. Needed because the active

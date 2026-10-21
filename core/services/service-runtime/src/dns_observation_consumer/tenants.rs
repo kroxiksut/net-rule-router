@@ -97,29 +97,28 @@ impl DnsObservationConsumer {
     /// `hostname` changed, `refreshed` when the write merely renewed recency.
     /// The before/after view is [`FqdnCacheLookup::ips_for_hostname`] — the
     /// same confirmation-window read the codegen consumes — so "changed" means
-    /// exactly "the next recompute would derive something different".
+    /// exactly "the next recompute would derive something different". Both
+    /// families count: the codegen reads both, under the IPv6 guard.
     pub(super) fn upsert_counted(
         &self,
         hostname: &str,
-        ips: &[Ipv4Addr],
+        ips: impl IntoIterator<Item = IpAddr>,
         now: SystemTime,
         source: StorageResolutionSource,
         summary: &mut ConsumeSummary,
     ) {
-        let before: std::collections::HashSet<Ipv4Addr> = self
+        let before: HashSet<IpAddr> = self
             .fqdn_lookup
             .ips_for_hostname(hostname)
             .into_iter()
-            .filter_map(v4_only)
             .collect();
         if !self.upsert(hostname, ips, now, source) {
             return;
         }
-        let after: std::collections::HashSet<Ipv4Addr> = self
+        let after: HashSet<IpAddr> = self
             .fqdn_lookup
             .ips_for_hostname(hostname)
             .into_iter()
-            .filter_map(v4_only)
             .collect();
         if after == before {
             summary.refreshed = summary.refreshed.saturating_add(1);
@@ -131,14 +130,14 @@ impl DnsObservationConsumer {
     pub(super) fn upsert(
         &self,
         hostname: &str,
-        ips: &[Ipv4Addr],
+        ips: impl IntoIterator<Item = IpAddr>,
         now: SystemTime,
         source: StorageResolutionSource,
     ) -> bool {
         let entry = ResolutionEntry {
             canonical_hostname: hostname.to_string(),
             raw_hostname_sample: None,
-            resolved_ips: ips.iter().copied().map(IpAddr::V4).collect(),
+            resolved_ips: ips.into_iter().collect(),
             ttl_seconds: None,
             source,
             resolved_at: now,

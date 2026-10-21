@@ -60,6 +60,8 @@ pub struct BrowserHistorySeeder {
     /// Principals with a pass in flight. A second request for the same user
     /// would read the same history and resolve the same hosts twice over.
     in_flight: Mutex<HashSet<String>>,
+    /// Whose plan pins or routes IPv6: only they get `AAAA` asked for too.
+    ipv6: Arc<crate::ipv6_disposition::Ipv6Dispositions>,
 }
 
 /// One claimed seed pass for a principal. The claim is released when this is
@@ -104,7 +106,17 @@ impl BrowserHistorySeeder {
             cache,
             recompute: None,
             in_flight: Mutex::new(HashSet::new()),
+            ipv6: crate::ipv6_disposition::learning_ipv6_dispositions(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_ipv6_dispositions(
+        mut self,
+        board: Arc<crate::ipv6_disposition::Ipv6Dispositions>,
+    ) -> Self {
+        self.ipv6 = board;
+        self
     }
 
     /// Fire the route/WFP recompute after a successful seed so the new permits
@@ -160,17 +172,27 @@ impl BrowserHistorySeeder {
             .take(MAX_SEED_HOSTS)
             .collect();
         summary.rule_matching = matching.len();
+        let families: &[AddressFamily] = if self.ipv6.names_ipv6(sid) {
+            &[AddressFamily::Ipv4, AddressFamily::Ipv6]
+        } else {
+            &[AddressFamily::Ipv4]
+        };
 
         for host in &matching {
-            let Ok(record) = self.resolver.resolve(host, AddressFamily::Ipv4) else {
-                continue;
-            };
-            let routable: Vec<std::net::IpAddr> = record
-                .addresses
-                .iter()
-                .copied()
-                .filter(|ip| !is_non_routable(ip))
-                .collect();
+            let mut routable: Vec<std::net::IpAddr> = Vec::new();
+            let mut ttl_seconds = None;
+            for family in families {
+                let Ok(record) = self.resolver.resolve(host, *family) else {
+                    continue;
+                };
+                ttl_seconds = ttl_seconds.or(record.ttl_seconds);
+                routable.extend(
+                    record
+                        .addresses
+                        .into_iter()
+                        .filter(|ip| !is_non_routable(ip)),
+                );
+            }
             if routable.is_empty() {
                 continue;
             }
@@ -178,7 +200,7 @@ impl BrowserHistorySeeder {
                 canonical_hostname: host.clone(),
                 raw_hostname_sample: None,
                 resolved_ips: routable,
-                ttl_seconds: record.ttl_seconds,
+                ttl_seconds,
                 source: StorageResolutionSource::BrowserHistorySeed,
                 resolved_at: now,
                 active_revision_id: None,
@@ -417,5 +439,67 @@ mod tests {
             seeder.try_begin("S-1-5-21-A").is_some(),
             "the slot is released when the pass ends"
         );
+    }
+
+    /// A visited rule host's IPv6 is cached beside its IPv4 while the user's
+    /// plan pins or routes IPv6, and is not asked for otherwise.
+    #[test]
+    fn a_visited_rule_hosts_ipv6_is_cached_only_while_ipv6_is_enforced() {
+        use crate::enforcement_planner::Ipv6Guard;
+        use crate::ipv6_disposition::Ipv6Dispositions;
+        use nrr_platform_api::dns::MockDnsResolver;
+        let v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 100));
+        let v6: IpAddr = "2001:db8::100".parse().expect("v6");
+        for enforced in [false, true] {
+            let board = Arc::new(Ipv6Dispositions::default());
+            board.set(
+                "S-1-5-21-A",
+                if enforced {
+                    Ipv6Guard::FiltersAndRoutes
+                } else {
+                    Ipv6Guard::Off
+                },
+            );
+            let resolver = Arc::new(MockDnsResolver::new());
+            resolver.set_response(
+                "feed.example",
+                ResolvedRecord {
+                    canonical_hostname: "feed.example".into(),
+                    addresses: vec![v4, v6],
+                    ttl_seconds: Some(300),
+                },
+            );
+            let cache = in_memory_cache();
+            let seeder = BrowserHistorySeeder::new(
+                Arc::new(MockBrowserHistoryRead {
+                    hostnames: vec!["feed.example".into()],
+                }),
+                Arc::new(ScriptedRules(CanonicalRuleSet::from_rules(vec![
+                    zone_rule("r-zone", "example"),
+                ]))),
+                Arc::clone(&resolver) as Arc<dyn DnsResolverPort>,
+                Arc::clone(&cache),
+            )
+            .with_ipv6_dispositions(board);
+
+            assert_eq!(seeder.seed_for("S-1-5-21-A", SystemTime::now()).cached, 1);
+
+            assert_eq!(resolver.observed_queries().len(), 1 + usize::from(enforced));
+            let cached: Vec<IpAddr> = cache
+                .lock()
+                .unwrap()
+                .get_by_hostname(
+                    "feed.example",
+                    &nrr_domain::decision_lookup::FreshnessThresholds::default_production(),
+                    nrr_storage::resolution_source::CachePriorityStrategy::default(),
+                )
+                .expect("lookup")
+                .resolved_ips
+                .iter()
+                .map(|e| e.addr)
+                .collect();
+            assert!(cached.contains(&v4), "{cached:?}");
+            assert_eq!(cached.contains(&v6), enforced, "{cached:?}");
+        }
     }
 }

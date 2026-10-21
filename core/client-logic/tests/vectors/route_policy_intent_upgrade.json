@@ -1,0 +1,167 @@
+{
+  "description": "pure.js routePolicyIntentUpgrade: a record kept before leak protection was one choice, in this build's keys, mapped as the service's migration maps its rows",
+  "cases": [
+    {
+      "name": "a record in this build's keys is kept",
+      "input": {
+        "intent": {
+          "mode": "prefer-primary",
+          "leak-protection": "sites",
+          "include-subdomains": false
+        }
+      },
+      "expected": {
+        "mode": "prefer-primary",
+        "leak-protection": "sites",
+        "include-subdomains": false
+      }
+    },
+    {
+      "name": "the strict mode is the additional route with everything",
+      "input": {
+        "intent": {
+          "mode": "strict-secondary-fail-closed"
+        }
+      },
+      "expected": {
+        "mode": "prefer-secondary-when-available",
+        "leak-protection": "everything"
+      }
+    },
+    {
+      "name": "the strict mode wins over a guard that was off",
+      "input": {
+        "intent": {
+          "mode": "strict-secondary-fail-closed",
+          "kill-switch-enabled": false,
+          "kill-switch-fail-closed": false
+        }
+      },
+      "expected": {
+        "mode": "prefer-secondary-when-available",
+        "leak-protection": "everything"
+      }
+    },
+    {
+      "name": "a level chosen after the strict mode stands, the route still moves",
+      "input": {
+        "intent": {
+          "mode": "strict-secondary-fail-closed",
+          "leak-protection": "off"
+        }
+      },
+      "expected": {
+        "mode": "prefer-secondary-when-available",
+        "leak-protection": "off"
+      }
+    },
+    {
+      "name": "a guard that was off is off",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": false,
+          "kill-switch-block-all": true
+        }
+      },
+      "expected": {
+        "leak-protection": "off"
+      }
+    },
+    {
+      "name": "a guard that failed open is off",
+      "input": {
+        "intent": {
+          "mode": "prefer-primary",
+          "kill-switch-enabled": true,
+          "kill-switch-fail-closed": false
+        }
+      },
+      "expected": {
+        "mode": "prefer-primary",
+        "leak-protection": "off"
+      }
+    },
+    {
+      "name": "a guard on that failed closed by default is the routed sites",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": true,
+          "mode-a-coverage-strategy": "per-ip"
+        }
+      },
+      "expected": {
+        "leak-protection": "sites"
+      }
+    },
+    {
+      "name": "blocking all is everything",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": true,
+          "kill-switch-fail-closed": true,
+          "kill-switch-block-all": true
+        }
+      },
+      "expected": {
+        "leak-protection": "everything"
+      }
+    },
+    {
+      "name": "blocking unresolved traffic is everything",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": true,
+          "mode-a-coverage-strategy": "fail-closed-unknown"
+        }
+      },
+      "expected": {
+        "leak-protection": "everything"
+      }
+    },
+    {
+      "name": "the guard under the additional route is everything",
+      "input": {
+        "intent": {
+          "mode": "prefer-secondary-when-available",
+          "kill-switch-enabled": true
+        }
+      },
+      "expected": {
+        "mode": "prefer-secondary-when-available",
+        "leak-protection": "everything"
+      }
+    },
+    {
+      "name": "a level in the record was written after the guard and stands",
+      "input": {
+        "intent": {
+          "leak-protection": "off",
+          "kill-switch-enabled": true,
+          "kill-switch-block-all": true
+        }
+      },
+      "expected": {
+        "leak-protection": "off"
+      }
+    },
+    {
+      "name": "the setting nothing reads is dropped",
+      "input": {
+        "intent": {
+          "block-secondary-when-unavailable": true,
+          "doh-lockdown-enabled": true
+        }
+      },
+      "expected": {
+        "doh-lockdown-enabled": true
+      }
+    },
+    {
+      "name": "an empty record stays empty",
+      "input": {
+        "intent": {}
+      },
+      "expected": {}
+    }
+  ]
+}

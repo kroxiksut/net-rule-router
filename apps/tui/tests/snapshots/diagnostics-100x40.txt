@@ -5,7 +5,7 @@ Service: OK
   3 Interfaces and routes  The service started 2.4 s before this boot reached the sign-in screen.
   4 Rules                  Cache healthy · Entries: 42
   5 Overlaps               3 log file(s)
-  6 Suggested addresses    l: switch between diagnostics and the log
+  6 Suggested addresses    l: switch between diagnostics, the log and the audit trail
   7 Connection trace       Audit trail
   8 Cache                  Audit chain intact
 > 9 Diagnostics and logs   Security alerts requiring attention: 1

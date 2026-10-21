@@ -71,6 +71,9 @@ pub struct ContractNegotiateRequest {
     pub client_kind: ContractNegotiateClientKind,
     #[serde(default)]
     pub supported_features: Vec<String>,
+    /// The payload revision this client writes ([`crate::ipc::IPC_CONTRACT_REVISION`]).
+    #[serde(default = "crate::ipc::contract_revision_unstated")]
+    pub contract_revision: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +82,10 @@ pub struct ContractNegotiateResponse {
     pub server_version: u32,
     pub negotiated_protocol: u32,
     pub session_id: String,
+    /// The payload revision this service reads. A service that leaves it out
+    /// predates the field, which is what makes it detectable.
+    #[serde(default = "crate::ipc::contract_revision_unstated")]
+    pub contract_revision: u32,
     /// Semver of the running service binary
     /// (`env!("CARGO_PKG_VERSION")` of `nrr-windows-service`). Carried
     /// over the wire so the GUI can show "Service X.Y.Z vs App
@@ -136,8 +143,8 @@ pub struct FakeIpDatapathDto {
     pub zombies: u32,
 }
 
-/// Per-component health entry. Currently every response has an empty
-/// `components` vector; reserved for future wiring.
+/// One component of the health aggregator, as `HealthReporter::components`
+/// reports it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct HealthComponentResponse {
@@ -151,6 +158,16 @@ pub struct HealthComponentResponse {
 /// the system DNS back; clients read it through
 /// `nrr_client_logic::system_dns::not_restored`.
 pub const SYSTEM_DNS_NOT_RESTORED: &str = "system DNS could not be restored";
+
+/// Opens the `adapters` health message (Degraded) while the only DNS server
+/// that answers belongs to another VPN: name-based routing is off until a
+/// resolver of ours answers again.
+pub const DNS_ONLY_FOREIGN_RESOLVER: &str = "only another VPN's DNS server answers";
+
+/// Opens the `policy` health message (Degraded) while a stored rule book cannot
+/// be read and the last applied rules stay in force; clients read it through
+/// `nrr_client_logic::diagnostics::rules_book_unreadable`.
+pub const RULES_BOOK_UNREADABLE: &str = "a stored rule book could not be read";
 
 // ── SnapshotInterfaces ───────────────────────────────────────────────────────
 
@@ -527,6 +544,54 @@ pub struct ProductImpactDisableRequest {
     pub reason: String,
     #[serde(default)]
     pub dry_run: bool,
+    /// How long the pause lasts; the confirm must name the reviewed one.
+    #[serde(default)]
+    pub term: SafeDisableTerm,
+}
+
+/// How long a temporary disable lasts. A closed list: no client can ask for a
+/// pause that never ends by itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SafeDisableTerm {
+    FifteenMinutes,
+    OneHour,
+    FourHours,
+    /// Until the service next starts, a reboot included.
+    #[default]
+    UntilRestart,
+}
+
+impl SafeDisableTerm {
+    /// Every term, in the order the confirmation offers them.
+    pub const ALL: [Self; 4] = [
+        Self::FifteenMinutes,
+        Self::OneHour,
+        Self::FourHours,
+        Self::UntilRestart,
+    ];
+
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::FifteenMinutes => "fifteen-minutes",
+            Self::OneHour => "one-hour",
+            Self::FourHours => "four-hours",
+            Self::UntilRestart => "until-restart",
+        }
+    }
+
+    /// Length of a timed term; `None` for the one that ends with the service.
+    #[must_use]
+    pub const fn window_ms(self) -> Option<i64> {
+        const MINUTE_MS: i64 = 60_000;
+        match self {
+            Self::FifteenMinutes => Some(15 * MINUTE_MS),
+            Self::OneHour => Some(60 * MINUTE_MS),
+            Self::FourHours => Some(4 * 60 * MINUTE_MS),
+            Self::UntilRestart => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -581,6 +646,13 @@ pub struct StatusUpdatesSubscribeResponse {
     pub gap_detected: bool,
 }
 
+/// Wire `type` of the marker a client reads as "the stream has a hole, re-read
+/// the state". The IPC clients make it up on their own gaps; the service sends
+/// it when a subscriber falls behind the event ring. It is not a
+/// [`StatusUpdateEvent`] variant, so a client that predates the service-sent
+/// marker handles it exactly as it handles its own.
+pub const PUSH_GAP_EVENT_TYPE: &str = "push-gap";
+
 /// `RevisionStatusChanged::status` of a reset to the baseline. It names no
 /// revision: the user's own are gone and the baseline is in force again.
 pub const REVISION_STATUS_RESET_TO_BASELINE: &str = "reset-to-baseline";
@@ -602,12 +674,6 @@ pub const REVISION_STATUS_RESET_TO_BASELINE: &str = "reset-to-baseline";
     tag = "type"
 )]
 pub enum StatusUpdateEvent {
-    /// Service-level health changed (e.g. `Running` → `Degraded`). The
-    /// client should refresh its `ServiceHealthGet` snapshot.
-    HealthChanged {
-        service_state: String,
-        worst_severity: String,
-    },
     /// The protection in force for this principal does not match what their
     /// settings ask for, or is in force because of somebody ELSE's settings.
     ///
@@ -644,7 +710,16 @@ pub enum StatusUpdateEvent {
     },
     /// A SID's routing-pause state flipped. GUI flips the chip / tray
     /// menu without a re-snapshot.
-    RoutingPauseStateChanged { sid: String, paused: bool },
+    RoutingPauseStateChanged {
+        sid: String,
+        paused: bool,
+        /// When a temporary pause ends by itself (wall clock, UTC ms).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resumes_at_ms: Option<i64>,
+        /// The pause ends when the service next starts.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        until_restart: bool,
+    },
     /// The service-wide `ApplyFailurePolicy` was changed.
     ApplyFailurePolicyChanged { policy: String },
     /// Autostart configuration changed (toggle, registry observation,
@@ -684,17 +759,20 @@ pub enum StatusUpdateEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sid: Option<String>,
     },
-    /// A SID's set of pending auto-rule candidates changed — the service
-    /// noticed further hosts a routed site needs and parked them for review
-    /// (`auto-rules-mode = suggest`). The tray fetches the list and offers it;
-    /// `top_anchor` is the routed host most of the candidates were seen
-    /// alongside, used to name the site in the prompt.
+    /// A SID's pending auto-rule candidates changed: new offers were parked
+    /// for review, or only the count moved. `top_anchor` is the routed host
+    /// most of the candidates were seen alongside, used to name the site.
     AutoRuleCandidatesChanged {
         sid: String,
         /// Offers the inbox shows by default — the same number as
         /// `AutoRuleCandidatesListResponse::pending_count`.
         pending_count: u64,
         top_anchor: String,
+        /// `true` when the push carries offers the user has not been told
+        /// about; `false` when only the count moved, which updates every badge
+        /// and raises no notice.
+        #[serde(default = "default_true")]
+        announces: bool,
     },
     /// This SID's active rules name the same traffic on BOTH routes, with both
     /// copies enabled. Which one wins is then decided by evaluation order
@@ -732,6 +810,14 @@ pub enum StatusUpdateEvent {
         sid: String,
         clients: Vec<PendingVpnClientDto>,
     },
+    /// Leak protection stopped what looks like another VPN reaching its
+    /// gateway over the main link. Published on change with the caller's whole
+    /// pending list (empty once answered); the client asks whether to let that
+    /// VPN through, and the snapshot carries the same list for a later connect.
+    VpnGatewayAwaitingConfirmation {
+        sid: String,
+        gateways: Vec<VpnGatewayDto>,
+    },
     /// The additional route (re)connected and the service observed the address
     /// the outside world sees behind it. The tray shows it for a few seconds —
     /// an additional link whose own client cannot report its exit address is
@@ -748,7 +834,15 @@ pub enum StatusUpdateEvent {
         adapter_name: String,
         /// Dotted-quad IPv4 as observed from outside the local NAT.
         external_address: String,
+        /// A reconnect inside the quiet period after the previous notice:
+        /// the value is current again, but nothing is announced.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        quiet: bool,
     },
+    /// The additional route this SID was told the external address of went
+    /// down or changed identity, so that address no longer describes it.
+    /// Clients stop showing it until the next `SecondaryExternalAddressObserved`.
+    SecondaryExternalAddressCleared { sid: String },
     /// A tunnel came up while this SID has no additional route assigned, so
     /// nothing the rules send there can go anywhere.
     ///
@@ -787,8 +881,7 @@ pub enum StatusUpdateEvent {
         destination: String,
         /// Image name of the process that tried; empty when unknown.
         app: String,
-        /// Reason slug (`"route-unavailable"` / `"not-covered-by-rules"` /
-        /// `"blocked-by-rule"` / `"ipv6-blocked"` / `"dns-lockdown"` /
+        /// Reason slug (`"route-unavailable"` / `"blocked-by-rule"` / `"ipv6-blocked"` / `"dns-lockdown"` /
         /// `"unattributed"`), drives the notice wording.
         reason: String,
         /// Attempts folded into this episode so far.
@@ -894,6 +987,11 @@ pub enum StatusUpdateEvent {
     /// Everyone's news: the redirect is machine-wide. The standing state rides
     /// the health answer ([`SYSTEM_DNS_NOT_RESTORED`]).
     SystemDnsNotRestored,
+    /// This SID's stored rule book cannot be read, so the last applied rules
+    /// stay in force and a change does not apply. Published on change only;
+    /// `unreadable = false` ends it, and the standing value rides
+    /// `SnapshotInitialResponse::rules_book_unreadable`.
+    RulesBookUnreadable { sid: String, unreadable: bool },
 }
 
 impl StatusUpdateEvent {
@@ -916,7 +1014,9 @@ impl StatusUpdateEvent {
             | Self::HostUnreachableOnBothRoutes { sid, .. }
             | Self::AppRuleLearningDestinations { sid, .. }
             | Self::VpnClientAwaitingConfirmation { sid, .. }
+            | Self::VpnGatewayAwaitingConfirmation { sid, .. }
             | Self::SecondaryExternalAddressObserved { sid, .. }
+            | Self::SecondaryExternalAddressCleared { sid }
             | Self::UnassignedTunnelDetected { sid, .. }
             | Self::LocalNetworkTooWide { sid, .. }
             | Self::BlockNoticeRaised { sid, .. }
@@ -926,13 +1026,13 @@ impl StatusUpdateEvent {
             | Self::EnforcementStatusChanged { sid, .. }
             | Self::RoutesHeldByAnotherUser { sid, .. }
             | Self::TrafficCarriedByAnotherUser { sid, .. }
+            | Self::RulesBookUnreadable { sid, .. }
             | Self::AutostartStateChanged { sid, .. } => Some(sid.as_str()),
             // The baseline carries no SID and reaches everyone.
             Self::RevisionStatusChanged { sid, .. } | Self::MutationProgress { sid, .. } => {
                 sid.as_deref()
             }
-            Self::HealthChanged { .. }
-            | Self::ProtectionCoverageChanged { .. }
+            Self::ProtectionCoverageChanged { .. }
             | Self::AdaptersChanged { .. }
             | Self::SecurityAlertsChanged
             | Self::ApplyFailurePolicyChanged { .. }
@@ -1040,6 +1140,10 @@ pub struct SnapshotInitialResponse {
     /// case (read `MigrationStatusGet` first).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route_policy: Option<RoutePolicyDto>,
+    /// For a caller with no `route_policy` yet: what its first save starts
+    /// from. Absent once a policy is stored. Wire key: `first-policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_policy: Option<FirstPolicyDto>,
     // ── Settings snapshot ────────────────────────────────────────────
     /// Compact summaries of pending and recent revisions (most recent
     /// candidate + last few terminal entries). Empty on fresh installs
@@ -1057,6 +1161,12 @@ pub struct SnapshotInitialResponse {
     /// Whether the calling SID is currently routing-paused.
     #[serde(default)]
     pub routing_paused: bool,
+    /// When the caller's temporary pause ends by itself (wall clock, UTC ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_pause_resumes_at_ms: Option<i64>,
+    /// The caller's pause ends when the service next starts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub routing_pause_until_restart: bool,
     /// Caller's autostart configuration with the most recent registry
     /// observation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1095,9 +1205,9 @@ pub struct SnapshotInitialResponse {
     /// count is zero. Wire key: `kill-switch-shared-ip-exemption-addresses`.
     #[serde(default)]
     pub kill_switch_shared_ip_exemption_addresses: Vec<String>,
-    /// Whether the fail-closed catch-all block-all is
-    /// currently armed for any active user (kill-switch fail-closed + the
-    /// secondary adapter unresolved — e.g. it vanished after a reboot). The
+    /// Whether blocking everything is currently armed for any active user
+    /// (leak protection `everything` + the secondary adapter unresolved —
+    /// e.g. it vanished after a reboot). The
     /// GUI shows a warning banner: unknown traffic is being cut until the VPN
     /// reconnects / the adapter is re-bound. Dismissible via a UI preference —
     /// deliberately running the service with the VPN down is a legitimate
@@ -1125,12 +1235,25 @@ pub struct SnapshotInitialResponse {
     /// their own route. Wire key: `traffic-carried-by-another-user`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_carried_by_another_user: Option<TrafficCarriedDto>,
+    /// Whether the caller's own stored rule book cannot be read, so the last
+    /// applied rules stay in force: the standing twin of
+    /// `RulesBookUnreadable`. Wire key: `rules-book-unreadable`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rules_book_unreadable: bool,
     /// The caller's programs named like a VPN client that leak protection does
     /// not trust by place, awaiting confirmation as the link provider — the
     /// standing twin of `VpnClientAwaitingConfirmation`. Wire key:
     /// `pending-vpn-clients`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_vpn_clients: Vec<PendingVpnClientDto>,
+    /// The standing twin of `VpnGatewayAwaitingConfirmation`. Wire key:
+    /// `pending-vpn-gateways`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_vpn_gateways: Vec<VpnGatewayDto>,
+    /// The gateways the caller let through, for the list they revoke from.
+    /// Wire key: `confirmed-vpn-gateways`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirmed_vpn_gateways: Vec<VpnGatewayDto>,
     /// The caller's rules applied despite the protection of system programs
     /// and folders, each with its term. Wire key: `rule-overrides`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

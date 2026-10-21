@@ -34,20 +34,15 @@ impl FieldDefault {
 
 /// Every route-policy field this build writes, with its default.
 /// `binding-source` is absent on purpose: the writer always stamps it.
-pub const FIELD_DEFAULTS: [(&str, FieldDefault); 28] = [
-    ("mode", FieldDefault::Text("prefer-primary")),
-    (
-        "block-secondary-when-unavailable",
-        FieldDefault::Bool(false),
-    ),
-    ("kill-switch-fail-closed", FieldDefault::Bool(true)),
+/// `mode` and `leak-protection` have no wire default; theirs is the fallback
+/// for a snapshot that lacks them, and protection never reads as on by guess.
+pub const FIELD_DEFAULTS: [(&str, FieldDefault); 25] = [
+    ("mode", FieldDefault::Text(DEFAULT_ROUTE_MAIN)),
+    (LEAK_PROTECTION_KEY, FieldDefault::Text(LEAK_PROTECTION_OFF)),
     ("kill-switch-protocols", FieldDefault::Int(127)),
-    ("kill-switch-block-all", FieldDefault::Bool(false)),
-    ("kill-switch-enabled", FieldDefault::Bool(false)),
     ("allow-dns-over-primary", FieldDefault::Bool(true)),
     ("include-subdomains", FieldDefault::Bool(true)),
     ("shared-ip-policy", FieldDefault::Text("majority-of-ip")),
-    ("mode-a-coverage-strategy", FieldDefault::Text("per-ip")),
     ("resolve-hosts-bypass", FieldDefault::Bool(true)),
     ("doh-lockdown-enabled", FieldDefault::Bool(false)),
     (
@@ -69,12 +64,32 @@ pub const FIELD_DEFAULTS: [(&str, FieldDefault); 28] = [
     ("short-name-suffix", FieldDefault::Text("")),
     ("app-rules-take-all-addresses", FieldDefault::Bool(false)),
     ("forwarded-outage", FieldDefault::Text("")),
+    ("external-address-auto-check", FieldDefault::Bool(false)),
 ];
 
 /// Keys the snapshot carries but the request has no field for: each is
 /// written through its own operation.
 pub const SNAPSHOT_ONLY_KEYS: [&str; 2] =
     ["secondary-link-provider-apps", "doh-lockdown-effective"];
+
+/// Legal values of the slug fields; anything else reads as the default.
+pub const FIELD_CHOICES: [(&str, &[&str]); 1] = [(LEAK_PROTECTION_KEY, &LEAK_PROTECTION_LEVELS)];
+
+/// The default route that keeps unmatched traffic on the main connection.
+pub const DEFAULT_ROUTE_MAIN: &str = "prefer-primary";
+/// Every default route the service accepts.
+pub const DEFAULT_ROUTES: [&str; 2] = [DEFAULT_ROUTE_MAIN, "prefer-secondary-when-available"];
+/// The key of the leak-protection choice.
+pub const LEAK_PROTECTION_KEY: &str = "leak-protection";
+const LEAK_PROTECTION_OFF: &str = "off";
+const LEAK_PROTECTION_SITES: &str = "sites";
+const LEAK_PROTECTION_EVERYTHING: &str = "everything";
+/// Every leak-protection level, weakest first.
+pub const LEAK_PROTECTION_LEVELS: [&str; 3] = [
+    LEAK_PROTECTION_OFF,
+    LEAK_PROTECTION_SITES,
+    LEAK_PROTECTION_EVERYTHING,
+];
 
 /// The key of the leak-protection protocol bitmask.
 pub const KILL_SWITCH_PROTOCOLS_KEY: &str = "kill-switch-protocols";
@@ -116,8 +131,148 @@ pub fn coerce(key: &str, raw: &Value) -> Value {
             let valid = key != KILL_SWITCH_PROTOCOLS_KEY || is_protocol_selection(n);
             Value::from(if valid { n } else { fallback })
         }
-        FieldDefault::Text(_) => Value::String(js::to_display_string(raw)),
+        FieldDefault::Text(fallback) => {
+            let text = js::to_display_string(raw);
+            let refused = FIELD_CHOICES
+                .iter()
+                .find(|(name, _)| *name == key)
+                .is_some_and(|(_, choices)| !choices.contains(&text.as_str()));
+            Value::String(if refused { fallback.to_owned() } else { text })
+        }
     }
+}
+
+/// Whether `default_route` keeps unmatched traffic on the main connection; an
+/// unset one is the default, which does.
+fn is_main_route(default_route: &str) -> bool {
+    default_route.is_empty() || default_route == DEFAULT_ROUTE_MAIN
+}
+
+/// The leak-protection levels offered under `default_route`, weakest first.
+/// "Routed sites" only means something while unmatched traffic stays on the
+/// main connection; under the additional one it would be "Everything".
+pub fn leak_protection_choices(default_route: &str) -> Vec<&'static str> {
+    LEAK_PROTECTION_LEVELS
+        .into_iter()
+        .filter(|level| *level != LEAK_PROTECTION_SITES || is_main_route(default_route))
+        .collect()
+}
+
+/// `current` as a level `default_route` offers: "Routed sites" under the
+/// additional connection becomes "Everything", never weaker; an unknown value
+/// reads as off.
+pub fn coerce_leak_protection(default_route: &str, current: &str) -> &'static str {
+    match current {
+        LEAK_PROTECTION_SITES if is_main_route(default_route) => LEAK_PROTECTION_SITES,
+        LEAK_PROTECTION_SITES | LEAK_PROTECTION_EVERYTHING => LEAK_PROTECTION_EVERYTHING,
+        _ => LEAK_PROTECTION_OFF,
+    }
+}
+
+/// The levels a first save offers under `default_route` when the
+/// administrator set `floor` at install time: none weaker than it.
+pub fn leak_protection_choices_at_least(default_route: &str, floor: &str) -> Vec<&'static str> {
+    let least = leak_protection_rank(coerce_leak_protection(default_route, floor));
+    leak_protection_choices(default_route)
+        .into_iter()
+        .filter(|level| leak_protection_rank(level) >= least)
+        .collect()
+}
+
+/// `level` raised to `floor`, both as `default_route` offers them.
+pub fn raise_leak_protection(default_route: &str, level: &str, floor: &str) -> &'static str {
+    let level = coerce_leak_protection(default_route, level);
+    let floor = coerce_leak_protection(default_route, floor);
+    if leak_protection_rank(floor) > leak_protection_rank(level) {
+        floor
+    } else {
+        level
+    }
+}
+
+/// Why a change of leak protection needs a yes before it is sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeakProtectionConfirm {
+    /// "Everything" while the additional connection is not available: the
+    /// internet stops at once and waits for it.
+    HoldsNow,
+    /// Protection switched on over an additional adapter with no way out:
+    /// what the rules send there is blocked.
+    Unroutable,
+}
+
+impl LeakProtectionConfirm {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HoldsNow => "holds-now",
+            Self::Unroutable => "unroutable",
+        }
+    }
+}
+
+/// What moving from `current` to `next` (both as the default route settles
+/// them) must be confirmed for. `secondary` is the bound additional adapter's
+/// row, `None` when nothing is bound or the adapter is gone.
+pub fn leak_protection_confirm(
+    current: &str,
+    next: &str,
+    secondary: Option<&nrr_shared::ipc_payloads::InterfaceRowDto>,
+) -> Option<LeakProtectionConfirm> {
+    if next == current || next == LEAK_PROTECTION_OFF {
+        return None;
+    }
+    let up = secondary.is_some_and(|row| row.availability == "available");
+    if next == LEAK_PROTECTION_EVERYTHING && !up {
+        return Some(LeakProtectionConfirm::HoldsNow);
+    }
+    (current == LEAK_PROTECTION_OFF
+        && secondary.is_some_and(|row| crate::adapters::unroutable_reason(row).is_some()))
+    .then_some(LeakProtectionConfirm::Unroutable)
+}
+
+/// What moving the default route to `next_route` must be confirmed for while
+/// `level` is in force: the write itself raises "Routed sites" to
+/// "Everything" under the additional connection.
+pub fn default_route_change_confirm(
+    level: &str,
+    next_route: &str,
+    secondary: Option<&nrr_shared::ipc_payloads::InterfaceRowDto>,
+) -> Option<LeakProtectionConfirm> {
+    leak_protection_confirm(level, coerce_leak_protection(next_route, level), secondary)
+}
+
+/// Whether `level` holds the internet the moment it applies: "Everything"
+/// while the additional connection is not available. The first-run note.
+pub fn leak_protection_holds_now(
+    level: &str,
+    secondary: Option<&nrr_shared::ipc_payloads::InterfaceRowDto>,
+) -> bool {
+    leak_protection_confirm(LEAK_PROTECTION_OFF, level, secondary)
+        == Some(LeakProtectionConfirm::HoldsNow)
+}
+
+/// How strong a level is, for "only ever switched on" comparisons.
+pub(crate) fn leak_protection_rank(level: &str) -> usize {
+    LEAK_PROTECTION_LEVELS
+        .iter()
+        .position(|known| *known == level)
+        .unwrap_or(0)
+}
+
+/// Brings `request`'s leak protection in line with its own default route, so
+/// a write that changes either never carries a pair the service refuses
+/// (`settleLeakProtection`).
+pub fn settle_leak_protection(request: &mut Map<String, Value>) {
+    let mode = coerce("mode", request.get("mode").unwrap_or(&Value::Null));
+    let level = coerce(
+        LEAK_PROTECTION_KEY,
+        request.get(LEAK_PROTECTION_KEY).unwrap_or(&Value::Null),
+    );
+    let settled = coerce_leak_protection(
+        mode.as_str().unwrap_or_default(),
+        level.as_str().unwrap_or_default(),
+    );
+    request.insert(LEAK_PROTECTION_KEY.to_owned(), Value::from(settled));
 }
 
 /// The rule of `nrr_shared::ipc_payloads::is_valid_kill_switch_protocols`.
@@ -156,6 +311,7 @@ pub fn build_full_update_request(
         let value = coerce(key, request.get(key).unwrap_or(&Value::Null));
         request.insert(key.to_owned(), value);
     }
+    settle_leak_protection(&mut request);
     // `recovery` / `migrated-from-preferences` belong to the service and to
     // migration; echoing one back would misattribute a user edit.
     request.insert(

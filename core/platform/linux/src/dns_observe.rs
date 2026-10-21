@@ -30,28 +30,104 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::net::Ipv4Addr;
+use std::io::{BufRead, BufReader, Read};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use nrr_platform_api::dns_observe::{DnsObservation, DnsObservationSource};
+use nrr_platform_api::dns_observe::{
+    DnsObservation, DnsObservationSource, MAX_ADDRESSES_PER_FAMILY,
+};
 
-/// Resource-record type for an IPv4 address; anything else in the answer is not
-/// a destination this product can route to.
+use crate::restart::{Backoff, StopSignal};
+
+/// Resource-record types for an address; anything else in the answer is not a
+/// destination this product can route to.
 const TYPE_A: u64 = 1;
+const TYPE_AAAA: u64 = 28;
 const TYPE_CNAME: u64 = 5;
 const CLASS_IN: u64 = 1;
 /// A resolver follows at most a handful of aliases; a longer chain in one
 /// answer is a loop or garbage.
 const MAX_ALIAS_HOPS: usize = 16;
+/// Answer records read from one line; the rest are ignored. Far above any
+/// real answer, and it bounds the alias map and the per-record work.
+const MAX_ANSWER_RECORDS: usize = 512;
+/// A longer line is skipped unread: a DNS answer is at most 64 KiB on the
+/// wire, and its JSON rendering stays far below this.
+pub const MAX_MONITOR_LINE_BYTES: usize = 1024 * 1024;
 
-/// The reader is a `resolvectl` child; keeping the handle lets the observer stop
-/// it when it is dropped, rather than leaving a process attached to the monitor
-/// socket for the life of the machine.
+/// A resolved restart takes seconds; a resolved that stays down is asked
+/// about once a minute rather than spawned against every second.
+const RESPAWN_BACKOFF: Backoff = Backoff {
+    first: Duration::from_secs(1),
+    cap: Duration::from_secs(60),
+};
+
+/// The process behind one monitor stream.
+trait MonitorChild: Send {
+    fn kill(&mut self);
+    fn reap(&mut self);
+}
+
+impl MonitorChild for Child {
+    fn kill(&mut self) {
+        let _ = Child::kill(self);
+    }
+
+    fn reap(&mut self) {
+        let _ = self.wait();
+    }
+}
+
+/// Kills the monitor process if it still runs, and reaps it, however its run
+/// ends: no orphan stays attached to the monitor socket, no zombie is left.
+struct OwnedChild(Box<dyn MonitorChild>);
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        self.0.kill();
+        self.0.reap();
+    }
+}
+
+/// One running monitor: what it prints and its process.
+struct MonitorRun {
+    output: Box<dyn Read + Send>,
+    child: OwnedChild,
+}
+
+fn spawn_resolvectl() -> std::io::Result<MonitorRun> {
+    let mut child = crate::command::system_tool("resolvectl").and_then(|exe| {
+        crate::command::tool_command(exe)
+            .args(["monitor", "--json=short"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+    })?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other(
+            "resolvectl started without its output",
+        ));
+    };
+    Ok(MonitorRun {
+        output: Box::new(stdout),
+        child: OwnedChild(Box::new(child)),
+    })
+}
+
+/// Reads systemd-resolved's monitor through a `resolvectl` child, started
+/// again whenever its stream ends (resolved restarted), until dropped.
 pub struct ResolvedDnsObserver {
     buffered: Arc<Mutex<Vec<DnsObservation>>>,
-    child: Mutex<Option<Child>>,
+    feeding: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ResolvedDnsObserver {
@@ -60,15 +136,7 @@ impl ResolvedDnsObserver {
     /// observer that never produces anything must not be mistaken for a quiet
     /// network.
     pub fn start() -> Option<Self> {
-        let mut child = crate::command::system_tool("resolvectl")
-            .and_then(|exe| {
-                crate::command::tool_command(exe)
-                    .args(["monitor", "--json=short"])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .stdin(Stdio::null())
-                    .spawn()
-            })
+        let first = spawn_resolvectl()
             .map_err(|e| {
                 tracing::info!(
                     target: "nrr::dns",
@@ -79,44 +147,42 @@ impl ResolvedDnsObserver {
                 );
             })
             .ok()?;
-        let stdout = child.stdout.take()?;
+        Self::start_with(first, Box::new(spawn_resolvectl), RESPAWN_BACKOFF)
+    }
 
+    fn start_with(
+        first: MonitorRun,
+        mut respawn: Box<dyn FnMut() -> std::io::Result<MonitorRun> + Send>,
+        backoff: Backoff,
+    ) -> Option<Self> {
         let buffered = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&buffered);
-        std::thread::Builder::new()
+        let feeding = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(StopSignal::default());
+        let (sink, alive, thread_stop) = (
+            Arc::clone(&buffered),
+            Arc::clone(&feeding),
+            Arc::clone(&stop),
+        );
+        let reader = std::thread::Builder::new()
             .name("nrr-dns-monitor".to_owned())
             .spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    let mut observations = parse_monitor_line(&line).peekable();
-                    if observations.peek().is_some() {
-                        sink.lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .extend(observations);
-                    }
-                }
-                // The stream ending means resolved stopped or the monitor was
-                // closed. Said once, at the level of a fact rather than an error:
-                // a machine may legitimately stop its resolver.
-                tracing::info!(
-                    target: "nrr::dns",
-                    msg_key = "linux-dns-monitor-stream-ended",
-                    "the DNS query monitor stream ended; resolutions are no longer observed",
-                );
+                run_monitor(first, &mut *respawn, &sink, &alive, &thread_stop, backoff);
             })
             .ok()?;
-
         Some(Self {
             buffered,
-            child: Mutex::new(Some(child)),
+            feeding,
+            stop,
+            reader: Some(reader),
         })
     }
 }
 
 impl Drop for ResolvedDnsObserver {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        self.stop.stop();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
         }
     }
 }
@@ -125,6 +191,155 @@ impl DnsObservationSource for ResolvedDnsObserver {
     fn drain(&self) -> Vec<DnsObservation> {
         std::mem::take(&mut *self.buffered.lock().unwrap_or_else(|p| p.into_inner()))
     }
+
+    fn is_feeding(&self) -> bool {
+        self.feeding.load(Ordering::Acquire)
+    }
+}
+
+/// Follow the monitor across resolved restarts until `stop`: read one run to
+/// its end, reap its process, wait, start the next. `feeding` is false from a
+/// stream's end until the next one runs.
+fn run_monitor(
+    first: MonitorRun,
+    respawn: &mut (dyn FnMut() -> std::io::Result<MonitorRun> + Send),
+    sink: &Mutex<Vec<DnsObservation>>,
+    feeding: &AtomicBool,
+    stop: &StopSignal,
+    backoff: Backoff,
+) {
+    let mut run = Some(first);
+    let mut delay = backoff.first;
+    loop {
+        if let Some(MonitorRun { output, child }) = run.take() {
+            let child = Arc::new(Mutex::new(child));
+            let killer = Arc::clone(&child);
+            let armed = stop.arm(Box::new(move || {
+                killer.lock().unwrap_or_else(|p| p.into_inner()).0.kill();
+            }));
+            let started = Instant::now();
+            let saw_line = if armed {
+                feeding.store(true, Ordering::Release);
+                pump_lines(output, sink)
+            } else {
+                false
+            };
+            feeding.store(false, Ordering::Release);
+            // Disarmed, the interrupt held no other handle: this drop reaps.
+            stop.disarm();
+            drop(child);
+            if stop.is_stopped() {
+                return;
+            }
+            // Only a run that worked earns a quick restart and a log line: a
+            // resolved that stays down makes every new monitor exit at once.
+            if saw_line || started.elapsed() >= backoff.cap {
+                // Resolved stopped or restarted. Said at the level of a fact: a
+                // machine may legitimately stop its resolver.
+                tracing::info!(
+                    target: "nrr::dns",
+                    msg_key = "linux-dns-monitor-stream-ended",
+                    "the DNS query monitor stream ended; resolutions are not observed until it is started again",
+                );
+                delay = backoff.first;
+            } else {
+                delay = backoff.after(delay);
+            }
+        }
+        if stop.wait(delay) {
+            return;
+        }
+        match respawn() {
+            Ok(next) => {
+                tracing::debug!(target: "nrr::dns", "the DNS query monitor was started again");
+                run = Some(next);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "nrr::dns",
+                    error = %e,
+                    "the DNS query monitor could not be started again yet",
+                );
+                delay = backoff.after(delay);
+            }
+        }
+    }
+}
+
+/// Read monitor lines into `sink` until the stream ends; `true` when at least
+/// one line was read. An oversized or non-UTF-8 line costs only itself.
+fn pump_lines(output: impl Read, sink: &Mutex<Vec<DnsObservation>>) -> bool {
+    let mut reader = BufReader::new(output);
+    let mut buf = Vec::new();
+    let mut saw_line = false;
+    while let Ok(Some(line)) = next_line(&mut reader, &mut buf, MAX_MONITOR_LINE_BYTES) {
+        saw_line = true;
+        let Some(text) = line.and_then(|bytes| std::str::from_utf8(bytes).ok()) else {
+            continue;
+        };
+        let mut observations = parse_monitor_line(text).peekable();
+        if observations.peek().is_some() {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend(observations);
+        }
+    }
+    saw_line
+}
+
+/// The next line of at most `max` bytes, without its newline. `Some(None)`
+/// for a longer line, which is read past without being kept; `None` at the
+/// end of the stream.
+fn next_line<'a, R: BufRead>(
+    reader: &mut R,
+    buf: &'a mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<Option<Option<&'a [u8]>>> {
+    buf.clear();
+    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    if reader.by_ref().take(limit).read_until(b'\n', buf)? == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    } else if buf.len() > max {
+        skip_past_newline(reader)?;
+        return Ok(Some(None));
+    }
+    Ok(Some(Some(buf.as_slice())))
+}
+
+fn skip_past_newline<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        match chunk.iter().position(|b| *b == b'\n') {
+            Some(at) => {
+                reader.consume(at + 1);
+                return Ok(());
+            }
+            None => {
+                let len = chunk.len();
+                reader.consume(len);
+            }
+        }
+    }
+}
+
+/// The fuzz targets' entry for the stream half: every line of `data` through
+/// the bounded splitter and the parser, as the reader thread runs them.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_monitor_stream(data: &[u8]) -> usize {
+    let sink = Mutex::new(Vec::new());
+    pump_lines(data, &sink);
+    let observations = sink.into_inner().unwrap_or_else(|p| p.into_inner());
+    observations.len()
 }
 
 /// Whether resolutions on this machine actually pass through systemd-resolved.
@@ -154,9 +369,9 @@ pub fn probe_resolver_mode() -> Option<bool> {
 /// that was asked for and, when an alias chain led elsewhere, under the name
 /// the addresses belong to as well.
 ///
-/// Empty for anything that is not a successful A-record answer: a failed
-/// lookup, an AAAA-only answer, a line this build does not understand. Pure, so
-/// it is tested against real captured output on any host.
+/// Empty for anything that is not a successful A/AAAA answer: a failed lookup,
+/// a line this build does not understand. Pure, so it is tested against real
+/// captured output on any host.
 pub fn parse_monitor_line(line: &str) -> impl Iterator<Item = DnsObservation> {
     let (queried, answered) = match parse_answer(line) {
         Some((queried, answered)) => (Some(queried), answered),
@@ -167,15 +382,23 @@ pub fn parse_monitor_line(line: &str) -> impl Iterator<Item = DnsObservation> {
 
 /// The queried-name observation, plus the final-name one when the names differ.
 fn parse_answer(line: &str) -> Option<(DnsObservation, Option<DnsObservation>)> {
+    if line.len() > MAX_MONITOR_LINE_BYTES {
+        return None;
+    }
     let event: serde_json::Value = serde_json::from_str(line).ok()?;
     if event.get("state").and_then(|s| s.as_str()) != Some("success") {
         return None;
     }
 
-    let mut records: Vec<(String, Ipv4Addr)> = Vec::new();
+    let mut records: Vec<(String, IpAddr)> = Vec::new();
     // Alias target -> alias owner, to walk a chain back towards the question.
     let mut aliased_from: HashMap<String, String> = HashMap::new();
-    for answer in event.get("answer")?.as_array()? {
+    for answer in event
+        .get("answer")?
+        .as_array()?
+        .iter()
+        .take(MAX_ANSWER_RECORDS)
+    {
         let rr = answer.get("rr")?;
         let key = rr.get("key")?;
         if key.get("class").and_then(serde_json::Value::as_u64) != Some(CLASS_IN) {
@@ -184,15 +407,14 @@ fn parse_answer(line: &str) -> Option<(DnsObservation, Option<DnsObservation>)> 
         let owner = canonical(key.get("name")?.as_str()?);
         match key.get("type").and_then(serde_json::Value::as_u64) {
             Some(TYPE_A) => {
-                let octets = rr.get("address")?.as_array()?;
-                if octets.len() != 4 {
-                    continue;
+                if let Some(address) = octets::<4>(rr) {
+                    records.push((owner, IpAddr::V4(Ipv4Addr::from(address))));
                 }
-                let mut address = [0u8; 4];
-                for (slot, value) in address.iter_mut().zip(octets) {
-                    *slot = u8::try_from(value.as_u64()?).ok()?;
+            }
+            Some(TYPE_AAAA) => {
+                if let Some(address) = octets::<16>(rr) {
+                    records.push((owner, IpAddr::V6(Ipv6Addr::from(address)).to_canonical()));
                 }
-                records.push((owner, Ipv4Addr::from(address)));
             }
             Some(TYPE_CNAME) => {
                 if let Some(target) = rr.get("name").and_then(serde_json::Value::as_str) {
@@ -209,31 +431,63 @@ fn parse_answer(line: &str) -> Option<(DnsObservation, Option<DnsObservation>)> 
     let (final_name, _) = records.first()?;
     let final_name = final_name.clone();
     let queried = alias_origin(final_name.clone(), &aliased_from);
-    let mut queried_ipv4s = Vec::new();
-    let mut final_ipv4s = Vec::new();
+    let mut queried_answer = Addresses::default();
+    let mut final_answer = Addresses::default();
     for (owner, address) in records {
         if owner == final_name {
-            final_ipv4s.push(address);
+            final_answer.push(address);
         }
         if alias_origin(owner, &aliased_from) == queried {
-            queried_ipv4s.push(address);
+            queried_answer.push(address);
         }
     }
 
     // A reply on the wire names no program: the owner stays unknown.
-    let answered = (final_name != queried).then_some(DnsObservation {
-        hostname: final_name,
-        ipv4s: final_ipv4s,
-        owner: None,
-    });
-    Some((
+    let answered = (final_name != queried).then(|| final_answer.observation(final_name));
+    Some((queried_answer.observation(queried), answered))
+}
+
+/// One name's addresses, distinct and capped per family.
+#[derive(Default)]
+struct Addresses {
+    ipv4s: Vec<Ipv4Addr>,
+    ipv6s: Vec<Ipv6Addr>,
+}
+
+impl Addresses {
+    fn push(&mut self, address: IpAddr) {
+        fn add<T: PartialEq>(list: &mut Vec<T>, value: T) {
+            if list.len() < MAX_ADDRESSES_PER_FAMILY && !list.contains(&value) {
+                list.push(value);
+            }
+        }
+        match address {
+            IpAddr::V4(v4) => add(&mut self.ipv4s, v4),
+            IpAddr::V6(v6) => add(&mut self.ipv6s, v6),
+        }
+    }
+
+    fn observation(self, hostname: String) -> DnsObservation {
         DnsObservation {
-            hostname: queried,
-            ipv4s: queried_ipv4s,
+            hostname,
+            ipv4s: self.ipv4s,
+            ipv6s: self.ipv6s,
             owner: None,
-        },
-        answered,
-    ))
+        }
+    }
+}
+
+/// The `address` byte array of a record, when it is exactly `N` bytes.
+fn octets<const N: usize>(rr: &serde_json::Value) -> Option<[u8; N]> {
+    let values = rr.get("address")?.as_array()?;
+    if values.len() != N {
+        return None;
+    }
+    let mut address = [0u8; N];
+    for (slot, value) in address.iter_mut().zip(values) {
+        *slot = u8::try_from(value.as_u64()?).ok()?;
+    }
+    Some(address)
 }
 
 /// Follow CNAMEs from the record's owner back to the name that started the
@@ -283,14 +537,56 @@ mod tests {
         );
     }
 
-    /// A v6-only name resolves fine and routes nothing this product can pin, so
-    /// it is not an observation — recording it with no addresses would put an
-    /// empty answer in the cache.
+    /// The IPv6 half of an answer is learned like the IPv4 one.
     #[test]
-    fn an_answer_without_v4_addresses_is_not_an_observation() {
+    fn a_dual_stack_answer_yields_both_families() {
+        let observations = parsed(LIVE_LINE);
+
+        assert_eq!(
+            observations[0].ipv6s,
+            vec!["2001:db8::1".parse::<Ipv6Addr>().expect("v6")]
+        );
+    }
+
+    #[test]
+    fn a_v6_only_answer_is_an_observation() {
         let v6_only = r#"{"state":"success","question":[{"class":1,"type":28,"name":"ipv6.example"}],"answer":[{"rr":{"key":{"class":1,"type":28,"name":"ipv6.example"},"address":[32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1]},"ifindex":2}]}"#;
 
-        assert!(parsed(v6_only).is_empty());
+        let observations = parsed(v6_only);
+
+        assert_eq!(hostnames(&observations), vec!["ipv6.example"]);
+        assert!(observations[0].ipv4s.is_empty());
+        assert_eq!(observations[0].ipv6s.len(), 1);
+    }
+
+    /// `::ffff:a.b.c.d` is the IPv4 address it maps; a record of the wrong
+    /// length is no address at all.
+    #[test]
+    fn a_mapped_aaaa_is_ipv4_and_a_short_one_is_dropped() {
+        let line = r#"{"state":"success","answer":[{"rr":{"key":{"class":1,"type":28,"name":"m.example"},"address":[0,0,0,0,0,0,0,0,0,0,255,255,192,0,2,30]}},{"rr":{"key":{"class":1,"type":28,"name":"m.example"},"address":[32,1,13,184]}}]}"#;
+
+        let observations = parsed(line);
+
+        assert_eq!(observations[0].ipv4s, vec![Ipv4Addr::new(192, 0, 2, 30)]);
+        assert!(observations[0].ipv6s.is_empty());
+    }
+
+    #[test]
+    fn an_answer_keeps_a_bounded_number_of_addresses_per_family() {
+        let records: Vec<String> = (0..300u32)
+            .map(|i| {
+                format!(
+                    r#"{{"rr":{{"key":{{"class":1,"type":1,"name":"many.example"}},"address":[10,0,{},{}]}}}}"#,
+                    i / 256,
+                    i % 256
+                )
+            })
+            .collect();
+        let line = format!(r#"{{"state":"success","answer":[{}]}}"#, records.join(","));
+
+        let observations = parsed(&line);
+
+        assert_eq!(observations[0].ipv4s.len(), MAX_ADDRESSES_PER_FAMILY);
     }
 
     /// A rule may name what was asked for or the CDN suffix the alias chain
@@ -345,5 +641,201 @@ mod tests {
 
         assert!(!resolutions_pass_through_resolved(foreign));
         assert!(resolutions_pass_through_resolved(stub));
+    }
+
+    // ── The stream and its restarts ──────────────────────────────────────────
+
+    use std::sync::atomic::AtomicU32;
+    use std::sync::mpsc;
+
+    #[test]
+    fn an_oversized_and_a_non_utf8_line_cost_only_themselves() {
+        let mut stream = vec![b'x'; MAX_MONITOR_LINE_BYTES + 10];
+        stream.push(b'\n');
+        stream.extend_from_slice(b"\xff\xfe{\n");
+        stream.extend_from_slice(LIVE_LINE.as_bytes());
+        stream.push(b'\n');
+        let sink = Mutex::new(Vec::new());
+
+        assert!(pump_lines(stream.as_slice(), &sink));
+
+        let observations = sink.into_inner().expect("not poisoned");
+        assert_eq!(hostnames(&observations), vec!["example.com"]);
+    }
+
+    #[test]
+    fn a_line_is_kept_up_to_the_bound_and_skipped_past_it() {
+        let mut reader = std::io::Cursor::new(b"12345678\n123456789\nlast".to_vec());
+        let mut buf = Vec::new();
+        let kept = next_line(&mut reader, &mut buf, 8)
+            .expect("read")
+            .expect("a line");
+        assert_eq!(kept, Some(&b"12345678"[..]));
+        assert_eq!(
+            next_line(&mut reader, &mut buf, 8).expect("read"),
+            Some(None)
+        );
+        let last = next_line(&mut reader, &mut buf, 8)
+            .expect("read")
+            .expect("a line");
+        assert_eq!(last, Some(&b"last"[..]));
+        assert_eq!(next_line(&mut reader, &mut buf, 8).expect("read"), None);
+    }
+
+    /// A stream fed line by line; it ends when its sender goes.
+    struct ChannelReader {
+        lines: mpsc::Receiver<Vec<u8>>,
+        pending: std::collections::VecDeque<u8>,
+    }
+
+    impl Read for ChannelReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.pending.is_empty() {
+                match self.lines.recv() {
+                    Ok(line) => self.pending.extend(line),
+                    Err(_) => return Ok(0),
+                }
+            }
+            let n = out.len().min(self.pending.len());
+            for (slot, byte) in out.iter_mut().zip(self.pending.drain(..n)) {
+                *slot = byte;
+            }
+            Ok(n)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Counts {
+        kills: Arc<AtomicU32>,
+        reaps: Arc<AtomicU32>,
+    }
+
+    impl Counts {
+        fn reaps(&self) -> u32 {
+            self.reaps.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Killing it hangs up its output, as killing `resolvectl` closes the pipe.
+    struct FakeChild {
+        hangup: Option<mpsc::Sender<Vec<u8>>>,
+        counts: Counts,
+    }
+
+    impl MonitorChild for FakeChild {
+        fn kill(&mut self) {
+            self.counts.kills.fetch_add(1, Ordering::SeqCst);
+            self.hangup.take();
+        }
+
+        fn reap(&mut self) {
+            self.counts.reaps.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A run printing `lines`, then ending, or staying open until killed.
+    fn fake_run(lines: &[&str], stays_open: bool, counts: &Counts) -> MonitorRun {
+        let (tx, rx) = mpsc::channel();
+        for line in lines {
+            tx.send(format!("{line}\n").into_bytes())
+                .expect("receiver alive");
+        }
+        MonitorRun {
+            output: Box::new(ChannelReader {
+                lines: rx,
+                pending: std::collections::VecDeque::new(),
+            }),
+            child: OwnedChild(Box::new(FakeChild {
+                hangup: stays_open.then_some(tx),
+                counts: counts.clone(),
+            })),
+        }
+    }
+
+    const FAST: Backoff = Backoff {
+        first: Duration::from_millis(1),
+        cap: Duration::from_millis(4),
+    };
+
+    fn drain_until(observer: &ResolvedDnsObserver, count: usize) -> Vec<DnsObservation> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while seen.len() < count && Instant::now() < deadline {
+            seen.extend(observer.drain());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        seen
+    }
+
+    const SECOND_LINE: &str = r#"{"state":"success","answer":[{"rr":{"key":{"class":1,"type":1,"name":"after.example"},"address":[192,0,2,40]}}]}"#;
+
+    /// resolved restarts: the stream ends, the next monitor cannot start yet,
+    /// then does. The feed reads down exactly while no monitor runs, the first
+    /// process is reaped, and observations resume.
+    #[test]
+    fn a_monitor_whose_stream_ends_is_started_again() {
+        let first = Counts::default();
+        let second = Counts::default();
+        let (down_tx, down_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&attempts);
+        let respawned = second.clone();
+        let observer = ResolvedDnsObserver::start_with(
+            fake_run(&[LIVE_LINE], false, &first),
+            Box::new(move || match counted.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    let _ = down_tx.send(());
+                    let _ = go_rx.recv();
+                    Err(std::io::Error::other("resolved is restarting"))
+                }
+                1 => Ok(fake_run(&[SECOND_LINE], true, &respawned)),
+                _ => Err(std::io::Error::other("no third monitor")),
+            }),
+            FAST,
+        )
+        .expect("the reader starts");
+
+        down_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first stream ended");
+        assert!(!observer.is_feeding(), "no monitor runs");
+        assert_eq!(first.reaps(), 1, "the ended monitor is reaped");
+        go_tx.send(()).expect("respawner waits");
+
+        let seen = drain_until(&observer, 2);
+        assert_eq!(hostnames(&seen), vec!["example.com", "after.example"]);
+        assert!(observer.is_feeding());
+        assert_eq!(second.reaps(), 0, "the live monitor keeps running");
+
+        drop(observer);
+        assert_eq!(second.reaps(), 1, "dropping the observer reaps its monitor");
+        assert!(second.kills.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "nothing starts after the drop"
+        );
+    }
+
+    #[test]
+    fn dropping_the_observer_while_it_waits_to_restart_ends_the_thread() {
+        let counts = Counts::default();
+        let observer = ResolvedDnsObserver::start_with(
+            fake_run(&[], false, &counts),
+            Box::new(|| Err(std::io::Error::other("resolvectl is gone"))),
+            Backoff {
+                first: Duration::from_secs(3600),
+                cap: Duration::from_secs(3600),
+            },
+        )
+        .expect("the reader starts");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while observer.is_feeding() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!observer.is_feeding());
+        drop(observer);
+        assert_eq!(counts.reaps(), 1);
     }
 }

@@ -307,25 +307,17 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 .with_fake_ip_apply({
                     let controller = Arc::clone(&fake_ip_controller);
                     let replan = Arc::clone(&fake_ip_replan);
-                    Arc::new(move |req: FakeIpApplyRequest| {
-                        let controller = Arc::clone(&controller);
-                        let replan = Arc::clone(&replan);
-                        std::thread::spawn(move || {
+                    // One worker applies the latest request after a quiet spell, so a burst
+                    // of clicks never reaches the controller out of order.
+                    let queue = Arc::new(nrr_service_runtime::fake_ip::FakeIpApplyQueue::new(
+                        nrr_service_runtime::fake_ip::FAKE_IP_APPLY_QUIET,
+                        Arc::new(move |req: FakeIpApplyRequest| {
                             use nrr_platform_api::DnsCacheControlPort;
                             controller.apply(req.desired);
                             replan();
-                            // Either direction of a REAL transition leaves
-                            // the OS resolver cache full of answers from
-                            // the previous world (real addresses when
-                            // enabling, pool addresses when disabling —
-                            // the latter are unreachable once the TUN
-                            // route is gone). Flush so clients re-query
-                            // instead of riding stale answers until their
-                            // TTL expires — but ONLY when the writer
-                            // reports a resolve-affecting change: a save
-                            // that merely re-applies the current config
-                            // must not trigger a machine-wide re-resolve
-                            // wave (every CDN name re-queried at once).
+                            // A real transition leaves the OS cache answering from the previous
+                            // world; flush only when the writer names a resolve-affecting change,
+                            // so a plain re-save sets off no machine-wide re-resolve wave.
                             if req.dns_flush_reasons.is_empty() {
                                 return;
                             }
@@ -349,8 +341,9 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                                     "OS DNS resolver cache flush after fake-IP transition failed — stale answers persist until TTL",
                                 ),
                             }
-                        });
-                    })
+                        }),
+                    ));
+                    Arc::new(move |req: FakeIpApplyRequest| queue.submit(req))
                 })
                 // DNS-over-secondary — a toggle stores into the shared
                 // process flag the query sockets and the route coordinator
@@ -530,14 +523,6 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 Arc::clone(&autostart_helper),
                 tray_path.clone(),
             )) as Arc<dyn AutostartProvider>,
-            Arc::new(
-                ProductionAutostart::new(
-                    Arc::clone(conn),
-                    Arc::clone(&autostart_helper),
-                    tray_path.clone(),
-                )
-                .with_event_bus(Arc::clone(&event_bus)),
-            ) as Arc<dyn AutostartWriter>,
         )
         .with_alerts_repo(Arc::clone(&alerts_repo))
         // On the ordinary single-user machine the answer is "nobody else" and
@@ -645,6 +630,12 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
             Arc::clone(conn),
         ))
             as Arc<dyn nrr_service_runtime::ipc_handlers::providers::LinkProviderWriter>);
+        // The gateways of other VPNs each user let through, and the question
+        // that asks for them.
+        nrr_service_runtime::vpn_gateway_confirm::wire_production(
+            Arc::clone(conn),
+            Arc::clone(&event_bus),
+        );
         // Wire the full-reset auxiliary-state purger, same shape as the
         // route-policy writer above.
         // A full reset erases the user's connection history too.
@@ -701,15 +692,14 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
             history.discard_leftover_copies();
             let rules: Arc<dyn RulesProvider> =
                 Arc::new(ProductionRulesProvider::new(Arc::clone(conn)));
-            // The boot auto-seed reads one browser profile set: the
-            // longest-served user's.
-            let active_sid: nrr_service_runtime::dns_observation_consumer::ActiveSidFn = {
+            // The boot auto-seed runs for each served user who opted in, each
+            // from their own browser profiles.
+            let served_sids: nrr_service_runtime::dns_resolver_ports::ResolverPrincipalsFn = {
                 let reg = Arc::clone(&sid_registry);
                 let coord = route_coordinator.clone();
-                Arc::new(move || {
-                    coord
-                        .as_ref()
-                        .and_then(|c| c.effective_routing_sid(&reg.active_sids()))
+                Arc::new(move || match coord.as_ref() {
+                    Some(c) => c.served_sids(&reg.active_sids()),
+                    None => Vec::new(),
                 })
             };
             let resolver: Arc<dyn nrr_platform_api::dns::DnsResolverPort> =
@@ -736,7 +726,11 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                     .spawn(move || {
                         for _ in 0..12 {
                             std::thread::sleep(std::time::Duration::from_secs(5));
-                            let Some(sid) = active_sid() else { continue };
+                            let users = served_sids();
+                            if users.is_empty() {
+                                continue;
+                            }
+                            for sid in users {
                             let enabled = policy_conn
                                 .lock()
                                 .ok()
@@ -760,8 +754,9 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                                     let _ = run.run(std::time::SystemTime::now());
                                 }
                             }
-                            // SID resolved and the opt-in was consulted — done
-                            // either way (one boot pass, not a periodic loop).
+                            }
+                            // Everyone present was consulted — one boot pass,
+                            // not a periodic loop.
                             break;
                         }
                     });
@@ -909,7 +904,8 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
         if let (Some(conn), Some(coord)) = (settings_conn.as_ref(), route_coordinator.as_ref()) {
             deps = deps.with_local_networks(Arc::new(
                 nrr_service_runtime::production_local_networks::ProductionLocalNetworks::new(
-                    Arc::clone(coord),
+                    Arc::clone(coord)
+                        as Arc<dyn nrr_service_runtime::local_network_source::LocalNetworkSource>,
                     Arc::clone(conn),
                 ),
             ));

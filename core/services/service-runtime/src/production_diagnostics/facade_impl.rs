@@ -68,6 +68,11 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
             log_health,
             stale: false,
             origin: DiagnosticsDataOrigin::Service,
+            missing_capabilities: crate::platform_notices::current(),
+            dns_tamper: crate::dns_tamper_summary::current(matches!(
+                audience,
+                DiagnosticsAudience::Machine
+            )),
         }
     }
 
@@ -219,18 +224,14 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
                 bytes_freed += size;
                 continue;
             }
-            // Best-effort: a file held open by the writer can't be
-            // deleted on Windows. Skip such files silently; the
-            // operator can retry after the writer rotates.
+            // Best-effort: a file another process holds without delete
+            // sharing stays; the writer reopens its file on the next line.
             if std::fs::remove_file(&path).is_ok() {
                 files_deleted += 1;
                 bytes_freed += size;
             }
         }
-        // `include_archives` honouring deferred to follow-up — the
-        // archives directory is a sibling of `logs/` and uses the
-        // same Users:RX ACL; not implemented here to keep the scope
-        // tight.
+        // `include_archives` is not honoured: archives live beside `logs/`.
         Ok(ClearLogsResult {
             files_deleted,
             bytes_freed,

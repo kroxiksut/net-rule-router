@@ -103,12 +103,11 @@ pub enum Verdict {
 /// the shipped Windows weight bands (`killswitch_codegen`): exemption permits
 /// (`0x0050_0000`/`0x0060_0000`) > kill-switch permits (`0x0040_0000`) >
 /// kill-switch blocks (`0x0030_0000`) > route rules > the catch-all block
-/// (`0x0018_0000`) > the default. A [`PrecedenceClass::HardBlock`] is the
-/// terminal veto (the `CLEAR_ACTION_RIGHT` analog).
+/// (`0x0018_0000`). Unmatched traffic follows the default route. A
+/// [`PrecedenceClass::HardBlock`] is the terminal veto (the
+/// `CLEAR_ACTION_RIGHT` analog).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PrecedenceClass {
-    /// The base band: unmatched traffic follows the default route (allow).
-    DefaultCatchAll,
     /// A per-rule route pin for the given role (primary/secondary).
     RouteRule(RouteRole),
     /// The DoH/DoT lockdown band: per-resolver-IP blocks
@@ -146,7 +145,6 @@ impl PrecedenceClass {
     /// the tie (planner-owned canonical order).
     pub const fn rank(self) -> u16 {
         match self {
-            Self::DefaultCatchAll => 0,
             Self::CatchAllBlock => 10,
             Self::RouteRule(RouteRole::Secondary) => 20,
             Self::RouteRule(RouteRole::Primary) => 30,
@@ -185,6 +183,35 @@ pub const SLOTS_PER_RULE: u64 = 256;
 /// was observed using", and the two must not be packed together — they occupy
 /// different slot ranges by construction.
 pub const APP_PATH_FANOUT_CAP: u64 = 16;
+
+/// Last slot of a rule: a program deny's loopback permits sit here, above the
+/// deny's own slots and below the next rule's, so a denied program still
+/// reaches local services. Both lowerings place them by this one number.
+pub const DENY_LOOPBACK_SLOT: u64 = SLOTS_PER_RULE - 1;
+
+/// First ordinal of the vetoes that keep a pinned or fail-closed address cut
+/// inside a foreign tunnel's network. They sit in the hard-block class so they
+/// outrank the tunnel's permit, past every user rule's ordinal so a user's own
+/// verdict on the same address still comes first.
+pub const FOREIGN_PIN_VETO_ORDINAL_BASE: u32 = 0x4000_0000;
+
+/// First ordinal of the DoH/DoT lockdown restated per foreign tunnel. A `Block`
+/// of the hard-block class with an `OnlyVia` egress and an ordinal from here on
+/// means "drop what leaves through THAT link", not the pin pair a permit's
+/// `OnlyVia` means. Past the pin vetoes, so the two ranges never share a slot.
+pub const DOH_FOREIGN_VETO_ORDINAL_BASE: u32 = 0x5000_0000;
+
+/// First ordinal of the foreign-tunnel permits in the catch-all exemption
+/// class: past every exemption the blanket postures number.
+pub const FOREIGN_TUNNEL_ORDINAL_BASE: u32 = 0x0010_0000;
+
+/// First ordinal of another VPN's handshake permits in the catch-all
+/// exemption class, past the foreign-tunnel permits. A lowering tells them
+/// from the posture's own exemptions by this range alone.
+pub const VPN_HANDSHAKE_ORDINAL_BASE: u32 = 0x0018_0000;
+
+/// First ordinal of the OS IKE service's share of the handshake permits.
+pub const VPN_HANDSHAKE_IKE_ORDINAL_BASE: u32 = VPN_HANDSHAKE_ORDINAL_BASE + 0x100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Precedence {
@@ -284,6 +311,10 @@ pub enum EgressRef {
 pub enum EgressConstraint {
     Any,
     OnlyVia(EgressRef),
+    /// Only what the OS will encrypt under an IPsec policy, whichever link
+    /// carries it: a policy-based VPN has no interface to pin to. No guard
+    /// pair; a mechanism without the match emits nothing for the rule.
+    UnderIpsecPolicy,
 }
 
 /// How much of a flow a rule covers. `AllPackets` signals that the rule must
@@ -307,6 +338,10 @@ pub struct FlowRule {
     pub app: AppScope,
     pub egress: EgressConstraint,
     pub coverage: Coverage,
+    /// A host flow for an address an application was OBSERVED using, not one a
+    /// rule names. Such addresses sit in their own slot range after the
+    /// per-executable filters, so a lowering packs them apart from the rule's own.
+    pub observed_by_program: bool,
 }
 
 // ── Policy routing objects ───────────────────────────────────────────────────
@@ -798,6 +833,7 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::OnlyVia(EgressRef::Primary),
             coverage: Coverage::ConnectOnly,
+            observed_by_program: false,
         });
 
         // 2. Secondary suffix/zone fan-out — several resolved /32s pinned to the
@@ -825,6 +861,7 @@ mod tests {
                 app: AppScope::Any,
                 egress: EgressConstraint::OnlyVia(EgressRef::Secondary),
                 coverage: Coverage::ConnectOnly,
+                observed_by_program: false,
             });
         }
 
@@ -844,6 +881,7 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::OnlyVia(EgressRef::Secondary),
             coverage: Coverage::AllPackets,
+            observed_by_program: false,
         });
 
         // 3b. Exemption permits that survive the catch-all block: loopback,
@@ -871,6 +909,7 @@ mod tests {
                 app: AppScope::Any,
                 egress: EgressConstraint::Any,
                 coverage: Coverage::AllPackets,
+                observed_by_program: false,
             });
         }
         flows.push(FlowRule {
@@ -888,6 +927,7 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
+            observed_by_program: false,
         });
 
         // 3c. Multi-protocol packet-layer blocks (ICMP/IGMP/GRE/ESP) — the
@@ -911,6 +951,7 @@ mod tests {
                 app: AppScope::Any,
                 egress: EgressConstraint::Any,
                 coverage: Coverage::AllPackets,
+                observed_by_program: false,
             });
         }
 
@@ -933,6 +974,7 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::AllPackets,
+            observed_by_program: false,
         });
 
         // 3e. The IPv6 cut (all-v6 = ::/0) — Mode-B is IPv4-routed, so v6 is
@@ -955,6 +997,7 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::AllPackets,
+            observed_by_program: false,
         });
 
         // 4. A hard block (terminal veto) — a per-app block on a named program.
@@ -976,6 +1019,7 @@ mod tests {
             },
             egress: EgressConstraint::Any,
             coverage: Coverage::AllPackets,
+            observed_by_program: false,
         });
 
         // Routes + policy routing: a /32 pinned to the secondary in a
@@ -1098,7 +1142,6 @@ mod tests {
     fn precedence_order_is_total_and_realises_the_invariants() {
         // Strictly increasing rank over the whole ladder (a total order).
         let ladder = [
-            PrecedenceClass::DefaultCatchAll,
             PrecedenceClass::CatchAllBlock,
             PrecedenceClass::RouteRule(RouteRole::Secondary),
             PrecedenceClass::RouteRule(RouteRole::Primary),
@@ -1116,8 +1159,8 @@ mod tests {
             );
         }
 
-        // Invariant 1 — a block can veto the default.
-        assert!(PrecedenceClass::HardBlock.rank() > PrecedenceClass::DefaultCatchAll.rank());
+        // Invariant 1 — a hard block vetoes every other band.
+        assert!(PrecedenceClass::HardBlock.rank() > PrecedenceClass::CatchAllExempt.rank());
         // Invariant 2 — exemptions outrank the catch-all block (leak-proof
         // permit-over-block), and per-protocol permits outrank the fail-closed block.
         assert!(PrecedenceClass::CatchAllExempt.rank() > PrecedenceClass::CatchAllBlock.rank());
@@ -1141,7 +1184,7 @@ mod tests {
         assert!(!b.is_higher_priority_than(a));
         // Across classes, the higher band wins regardless of ordinal.
         let low_band_first = Precedence {
-            class: PrecedenceClass::DefaultCatchAll,
+            class: PrecedenceClass::CatchAllBlock,
             ordinal: 0,
         };
         assert!(b.is_higher_priority_than(low_band_first));
@@ -1182,6 +1225,7 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
+            observed_by_program: false,
         });
         let d = plan_delta(&base, &longer);
         assert_eq!(d.added.len(), 1);

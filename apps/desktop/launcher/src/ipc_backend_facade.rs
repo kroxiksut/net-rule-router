@@ -12,8 +12,7 @@
 //!    `list_security_alerts`: the trait types are the wire DTOs, so the
 //!    answer is the service's.
 //! 2. **Desktop-shaped** — `interfaces_snapshot` reads the service's rows and
-//!    applies the user's bindings; `rules_snapshot` still renders the preview
-//!    until the `rules.list` mapping exists.
+//!    applies the user's bindings.
 //!
 //! ## Failure modes
 //!
@@ -33,12 +32,9 @@ use serde_json::{json, Value};
 use nrr_application::backend_facade::{
     BackendConnectionStatus, BackendFacade, BackendProviderKind, MockBackendFacade,
 };
-use nrr_application::mock_backend::{
-    network_interfaces::{
-        decorate_interface_rows, InterfaceRouteRow, InterfacesDataSource,
-        InterfacesRoutesPreviewSnapshot, RouteSelectionRequest,
-    },
-    rules::{RulesScreenPreviewSnapshot, RulesScreenRequest},
+use nrr_application::mock_backend::network_interfaces::{
+    decorate_interface_rows, InterfaceRouteRow, InterfacesDataSource,
+    InterfacesRoutesPreviewSnapshot, RouteSelectionRequest,
 };
 use nrr_ipc_client::snapshot_cache::{CacheError, CacheKey, FileCache};
 use nrr_ipc_client::{ipc_operation_timeout, ConnectionStatus, IpcClient, IpcClientError};
@@ -57,7 +53,7 @@ use crate::backend_factory::ipc_status_to_backend_status;
 pub struct IpcBackendFacade {
     client: Arc<dyn IpcClient>,
     cache: Arc<FileCache>,
-    /// Local enumeration and the rules preview.
+    /// Local adapter enumeration.
     fallback: MockBackendFacade,
 }
 
@@ -270,12 +266,6 @@ impl BackendFacade for IpcBackendFacade {
             }
             _ => self.fallback.interfaces_snapshot(request),
         }
-    }
-
-    fn rules_snapshot(&self, request: RulesScreenRequest) -> RulesScreenPreviewSnapshot {
-        // TODO: issue RulesList with a RulesRouteFilter derived from the request
-        // and map RuleRowEntry[] to RuleRowPreview[]; the mock drives the GUI.
-        self.fallback.rules_snapshot(request)
     }
 }
 

@@ -695,7 +695,7 @@ fn rule_summary_enabled_is_default(enabled: &bool) -> bool {
 }
 
 /// Wire-form mirror of `nrr_domain::risk::RiskSignal`, plus the service's
-/// pre-apply findings (the variants after `FailClosedActivation`), so the
+/// pre-apply findings (the variants after `OverlappingRules`), so the
 /// review lists both.
 ///
 /// The GUI renders each `kind` through `risk.signal.<kind>` with the payload
@@ -743,9 +743,6 @@ pub enum RiskSignalDto {
     OverlappingRules {
         apex: String,
     },
-    /// `behavior_mode` is transitioning to
-    /// `StrictSecondaryFailClosed`.
-    FailClosedActivation,
     /// Application rules that match no installed executable: stored, enforce nothing.
     AppRuleUnenforceable {
         executables: Vec<String>,

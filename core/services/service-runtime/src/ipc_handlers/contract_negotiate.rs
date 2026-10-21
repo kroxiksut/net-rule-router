@@ -9,10 +9,18 @@ use crate::ipc::{
     IPC_PROTOCOL_VERSION,
 };
 use crate::ipc_handlers::payloads::{ContractNegotiateRequest, ContractNegotiateResponse};
+use nrr_shared::ipc::IPC_CONTRACT_REVISION;
 
 /// Lowest client protocol version this service binary still recognises.
 /// Bumped only on hard wire-format breaks; today we only ship v1.
 pub const MIN_SUPPORTED_CLIENT_VERSION: u32 = 1;
+
+/// Lowest payload revision a client may hold. Every revision bump is a shape an
+/// older client misreads (it showed protection off while it was on), so an
+/// older client is turned away at the handshake: that is the one answer an
+/// already-built client shows as "update". A newer client is let in and keeps
+/// itself to reads.
+pub const MIN_SUPPORTED_CLIENT_CONTRACT_REVISION: u32 = IPC_CONTRACT_REVISION;
 
 /// Semver of the running service binary, configured
 /// by the `nrr-windows-service` crate at startup via
@@ -83,10 +91,26 @@ impl IpcHandler for ContractNegotiateHandler {
             });
         }
 
+        if req.contract_revision < MIN_SUPPORTED_CLIENT_CONTRACT_REVISION {
+            // The trailing "service speaks vN" is what a client's mismatch
+            // banner parses, so an older one points at itself.
+            return Err(IpcError {
+                code: IpcErrorCode::InvalidVersion,
+                message: format!(
+                    "client payload revision {client} predates the service's {service}: restart \
+                     or update the client (client speaks v{client}, service speaks v{service})",
+                    client = req.contract_revision,
+                    service = IPC_CONTRACT_REVISION,
+                ),
+                diagnostics_id: None,
+            });
+        }
+
         let resp = ContractNegotiateResponse {
             server_version: IPC_PROTOCOL_VERSION,
             negotiated_protocol: IPC_PROTOCOL_VERSION,
             session_id: next_session_id(),
+            contract_revision: IPC_CONTRACT_REVISION,
             // Semver pulled from the OnceLock the
             // service binary configures at startup. Empty when the
             // setter wasn't called (test harnesses / older callers).
@@ -135,6 +159,7 @@ mod tests {
                 &req(serde_json::json!({
                     "client-version": 1,
                     "client-kind": "gui",
+                    "contract-revision": IPC_CONTRACT_REVISION,
                 })),
                 &ctx(),
             )
@@ -142,7 +167,51 @@ mod tests {
         let parsed: ContractNegotiateResponse = serde_json::from_value(resp).unwrap();
         assert_eq!(parsed.server_version, IPC_PROTOCOL_VERSION);
         assert_eq!(parsed.negotiated_protocol, IPC_PROTOCOL_VERSION);
+        assert_eq!(parsed.contract_revision, IPC_CONTRACT_REVISION);
         assert!(parsed.session_id.starts_with("sess-"));
+    }
+
+    /// A client built before the revision existed states none and reads the
+    /// route policy as it was then; it is told to update rather than served.
+    #[test]
+    fn a_client_older_than_the_payload_revision_is_told_to_update() {
+        let h = ContractNegotiateHandler::new();
+        for payload in [
+            serde_json::json!({ "client-version": 1, "client-kind": "tray" }),
+            serde_json::json!({
+                "client-version": 1,
+                "client-kind": "gui",
+                "contract-revision": IPC_CONTRACT_REVISION - 1,
+            }),
+        ] {
+            let err = h.handle(&req(payload), &ctx()).expect_err("refused");
+            assert_eq!(err.code, IpcErrorCode::InvalidVersion);
+            assert!(
+                err.message
+                    .ends_with(&format!("service speaks v{IPC_CONTRACT_REVISION})")),
+                "{}",
+                err.message
+            );
+        }
+    }
+
+    /// A newer client is let in; it sees the older revision in the answer and
+    /// keeps to reads on its own.
+    #[test]
+    fn a_newer_client_is_answered_with_this_services_revision() {
+        let h = ContractNegotiateHandler::new();
+        let resp = h
+            .handle(
+                &req(serde_json::json!({
+                    "client-version": 1,
+                    "client-kind": "gui",
+                    "contract-revision": IPC_CONTRACT_REVISION + 1,
+                })),
+                &ctx(),
+            )
+            .expect("answered");
+        let parsed: ContractNegotiateResponse = serde_json::from_value(resp).unwrap();
+        assert_eq!(parsed.contract_revision, IPC_CONTRACT_REVISION);
     }
 
     #[test]
@@ -175,7 +244,13 @@ mod tests {
     #[test]
     fn session_ids_are_unique_per_call() {
         let h = ContractNegotiateHandler::new();
-        let payload = || serde_json::json!({ "client-version": 1, "client-kind": "gui" });
+        let payload = || {
+            serde_json::json!({
+                "client-version": 1,
+                "client-kind": "gui",
+                "contract-revision": IPC_CONTRACT_REVISION,
+            })
+        };
         let r1: ContractNegotiateResponse =
             serde_json::from_value(h.handle(&req(payload()), &ctx()).unwrap()).unwrap();
         let r2: ContractNegotiateResponse =

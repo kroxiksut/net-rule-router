@@ -325,14 +325,6 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 86] = [
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
-        name: IpcOperationName::AutostartToggle,
-        // User-scoped — writes to per-user `HKCU\…\Run` only.
-        class: IpcInteractionClass::Command,
-        execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
-        requires_service_mutation_privilege: false,
-    },
-    IpcOperationSpec {
         name: IpcOperationName::ExplainGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
@@ -778,6 +770,15 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 86] = [
     IpcOperationSpec {
         name: IpcOperationName::RulesOverrideRevoke,
         // Taking a confirmation back only restores the protection.
+        class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::RouteVpnGatewaysSet,
+        // The caller's own answer to "let this VPN through". Asked in the
+        // window and the terminal; the tray only says a question is waiting.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_AND_TUI,

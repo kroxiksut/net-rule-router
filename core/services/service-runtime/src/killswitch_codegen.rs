@@ -57,12 +57,9 @@
 //!
 //! This is the **per-destination** kill-switch: it only ever touches the
 //! enumerated `protected_ips`. Destinations outside the set are never
-//! blocked — a deliberately bounded blast radius. (A catch-all "block
-//! everything that isn't egressing the secondary adapter" variant, for the
-//! "everything-via-secondary" mode B, reuses the same
-//! [`condition_local_interface`](nrr_platform_api) FFI primitive but
-//! a `remote_ip = None` scope; it carries a much higher blast radius and
-//! is deferred to the wiring slice so it can be verified on hardware.)
+//! blocked — a deliberately bounded blast radius. The catch-all variant
+//! ([`catch_all_kill_switch_filters`]) reuses the same egress condition with
+//! no destination scope.
 //!
 //! ## Safety valves
 //!
@@ -97,9 +94,8 @@ use crate::wfp_codegen::filter_id_for;
 /// Everything the kill-switch needs to know about the secondary (VPN)
 /// interface for a SID, resolved fresh on every apply.
 ///
-/// The per-destination kill-switch (mode A) uses only `secondary_luid`.
-/// The catch-all kill-switch (mode B) additionally needs the system
-/// exemptions so its block-everything-off-tunnel never traps the tunnel
+/// The per-destination kill-switch uses only `secondary_luid`. The
+/// catch-all kill-switch additionally needs the system exemptions so its block-everything-off-tunnel never traps the tunnel
 /// itself, DHCP, the local router/DNS, or the LAN.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct KillSwitchResolution {
@@ -117,6 +113,19 @@ pub struct KillSwitchResolution {
     /// Tunnels the user runs beside ours — see
     /// [`FailClosedExemptions::foreign_tunnel_luids`].
     pub foreign_tunnel_luids: Vec<u64>,
+    /// What those tunnels' own routes carry — see
+    /// [`FailClosedExemptions::foreign_tunnel_networks`].
+    pub foreign_tunnel_networks: Vec<ForeignTunnelNetwork>,
+}
+
+/// A network somebody else's tunnel carries by a route of its own, with the
+/// link that carries it. Never a default or redirect route: those name the
+/// whole internet, and a permit for them would carry the user's protected
+/// traffic into that tunnel once ours is down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForeignTunnelNetwork {
+    pub luid: u64,
+    pub network: nrr_shared::ip_block::IpBlock,
 }
 
 /// The pseudo-`role` slug stamped into kill-switch filter ids so they
@@ -341,6 +350,7 @@ fn doh_port_block(
             remote_subnet: None,
             remote_subnet_v6: None,
             ip_protocol: None,
+            remote_subnet_set: Vec::new(),
         },
     };
     spec.remote_port = Some(port);
@@ -591,6 +601,7 @@ fn permit_app_via_secondary(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -626,6 +637,7 @@ fn block_app_off_secondary(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -745,13 +757,14 @@ fn exempt_primary_app(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec {
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
-// ── Catch-all kill-switch (mode B) ──────────────────────────────────────────
+// ── Catch-all kill-switch ───────────────────────────────────────────────────
 
-/// Build the **catch-all** kill-switch filter set for mode B
-/// (everything-via-secondary). When the secondary adapter is up, all traffic egresses the
+/// Build the **catch-all** kill-switch filter set: leak protection
+/// "everything" with the additional connection as the default route. When the secondary adapter is up, all traffic egresses the
 /// tunnel and is permitted; when it drops, the catch-all block drops
 /// everything that isn't an exemption — with no race.
 ///
@@ -760,7 +773,7 @@ fn exempt_primary_app(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec {
 ///    loopback `127.0.0.0/8`, link-local `169.254.0.0/16`, limited
 ///    broadcast, each VPN server, each primary local subnet);
 /// 2. (the rule codegen's primary-rule permits at `0x0020_0000` — the
-///    mode-B exceptions — sit above the block and so still escape);
+///    exceptions — sit above the block and so still escape);
 /// 3. the catch-all `Block` at [`CATCHALL_BLOCK_WEIGHT`];
 /// 4. (the rule codegen's secondary-rule permits at `0x0010_0000` lose
 ///    to the block).
@@ -782,8 +795,24 @@ pub fn catch_all_kill_switch_filters(
     exemptions: &FailClosedExemptions,
     protocols: KillSwitchProtocols,
 ) -> Vec<WfpFilterSpec> {
+    catch_all_kill_switch_filters_for(sid, resolution, exemptions, protocols, false, false)
+}
+
+/// [`catch_all_kill_switch_filters`] for a caller that also permits the
+/// tunnel's own client by app id: that permit carries the reconnect, so a
+/// tunnel that installs no host route to its server can still be armed.
+/// `machine_has_other_principals` drops the machine-wide IPv6 packet block
+/// (see [`catch_all_v6_filters`]).
+pub fn catch_all_kill_switch_filters_for(
+    sid: &str,
+    resolution: &KillSwitchResolution,
+    exemptions: &FailClosedExemptions,
+    protocols: KillSwitchProtocols,
+    client_carries_reconnect: bool,
+    machine_has_other_principals: bool,
+) -> Vec<WfpFilterSpec> {
     if resolution.secondary_luid == 0
-        || resolution.bootstrap_server_ips.is_empty()
+        || (resolution.bootstrap_server_ips.is_empty() && !client_carries_reconnect)
         || !protocols.any()
     {
         return Vec::new();
@@ -795,14 +824,6 @@ pub fn catch_all_kill_switch_filters(
     // #1 — permit everything that egresses via the secondary adapter.
     filters.push(exempt_egress(sid, resolution.secondary_luid, weight));
     weight += 1;
-    // Somebody else's tunnel keeps what it carries, as under the fail-closed
-    // twin: a corporate VPN beside ours is not an exit off the tunnel.
-    filters.extend(foreign_tunnel_egress(
-        sid,
-        &exemptions.foreign_tunnel_luids,
-        resolution.secondary_luid,
-        &mut weight,
-    ));
     // The floor both postures share.
     filters.extend(base_ale_exemptions(
         sid,
@@ -832,7 +853,7 @@ pub fn catch_all_kill_switch_filters(
     }
     // The catch-all block — everything else this user sends off-tunnel.
     // Gated on the protocol mask exactly like its fail-closed twin, so
-    // unticking both TCP and UDP keeps the checkboxes meaningful in mode B.
+    // unticking both TCP and UDP keeps the checkboxes meaningful here too.
     // Narrowed to the single selected protocol when only one is ticked — the
     // ALE layer carries a protocol condition (the packet layers do not).
     if protocols.wants_ale_block() {
@@ -861,12 +882,6 @@ pub fn catch_all_kill_switch_filters(
             pw,
         ));
         pw += 1;
-        filters.extend(foreign_tunnel_packet_egress(
-            sid,
-            &exemptions.foreign_tunnel_luids,
-            resolution.secondary_luid,
-            &mut pw,
-        ));
         filters.extend(base_packet_exemptions(
             sid,
             TR,
@@ -907,17 +922,13 @@ pub fn catch_all_kill_switch_filters(
     // The blanket posture means "nothing leaves except through the tunnel", and
     // that has to hold for both families or the block is a v4 block wearing a
     // catch-all's name. Same exemption list as the v4 half, in v6 spelling.
+    // The tunnel's LUID comes from the resolution, as for the v4 egress permit.
     filters.extend(catch_all_v6_filters(
         sid,
-        exemptions.secondary_luid,
+        resolution.secondary_luid,
         &exemptions.bootstrap_server_ips_v6,
         &exemptions.local_subnets_v6,
-    ));
-    filters.extend(foreign_tunnel_egress_v6(
-        sid,
-        &exemptions.foreign_tunnel_luids,
-        resolution.secondary_luid,
-        true,
+        machine_has_other_principals,
     ));
 
     filters
@@ -958,6 +969,7 @@ pub fn fake_ip_pool_permit_filters(
         remote_subnet: Some((pool.v4_base, pool.v4_prefix_len)),
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }];
     if let Some(v6_base) = pool.v6_base {
         filters.push(WfpFilterSpec {
@@ -975,6 +987,7 @@ pub fn fake_ip_pool_permit_filters(
             remote_subnet: None,
             remote_subnet_v6: Some((v6_base, pool.v6_prefix_len)),
             ip_protocol: None,
+            remote_subnet_set: Vec::new(),
         });
     }
     // While the UDP relay setting is off (the default), hard-block UDP into
@@ -1000,6 +1013,7 @@ pub fn fake_ip_pool_permit_filters(
             remote_subnet: Some((pool.v4_base, pool.v4_prefix_len)),
             remote_subnet_v6: None,
             ip_protocol: Some(PROTO_UDP),
+            remote_subnet_set: Vec::new(),
         });
         if let Some(v6_base) = pool.v6_base {
             filters.push(WfpFilterSpec {
@@ -1017,6 +1031,7 @@ pub fn fake_ip_pool_permit_filters(
                 remote_subnet: None,
                 remote_subnet_v6: Some((v6_base, pool.v6_prefix_len)),
                 ip_protocol: Some(PROTO_UDP),
+                remote_subnet_set: Vec::new(),
             });
         }
     }
@@ -1048,6 +1063,7 @@ fn catch_all_block(sid: &str, ip_protocol: Option<u8>) -> WfpFilterSpec {
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -1079,14 +1095,16 @@ mod exemptions;
 
 use exemptions::{
     base_ale_exemptions, base_packet_exemptions, exempt_direct_host, exempt_dns_over_primary,
-    exempt_egress, exempt_probe_target, exempt_subnet, foreign_tunnel_egress,
-    foreign_tunnel_packet_egress,
+    exempt_egress, exempt_probe_target, exempt_subnet,
 };
-pub use exemptions::{default_block_exemptions, MAX_DNS_SERVER_PERMITS};
+pub use exemptions::{
+    destination_less_floor, doh_foreign_vetoes, foreign_luids_of, foreign_tunnel_permits,
+    foreign_tunnel_permits_counted, has_posture_block, ForeignPermits, MAX_DNS_SERVER_PERMITS,
+};
 
 mod v6;
 
-pub use v6::{catch_all_v6_filters, default_block_exemptions_v6, foreign_tunnel_egress_v6};
+pub use v6::{catch_all_v6_filters, destination_less_floor_v6};
 
 mod fail_closed;
 pub use fail_closed::*;
@@ -1096,6 +1114,8 @@ mod filters;
 use filters::*;
 mod service_accounts;
 pub use service_accounts::*;
+mod vpn_handshake;
+pub use vpn_handshake::*;
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

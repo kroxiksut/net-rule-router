@@ -6,10 +6,11 @@
 //! an admin (or a rogue process running with sufficient privilege)
 //! opening the SQLite file directly and writing a tampered
 //! `rules_json` (or any other column) outside the service's own
-//! write paths. The HMAC key lives in DPAPI-protected per-user
-//! storage owned by `LocalSystem`; without that key the attacker
-//! cannot forge a matching `row_hmac`, so the next read by the
-//! service surfaces the mismatch.
+//! write paths. The HMAC key is held by the platform key store: on Windows a
+//! DPAPI blob under `LocalSystem`, on Linux a `0600` file in a `0700`
+//! directory (permissions, not encryption — see `platform/linux/key_store.rs`).
+//! Without that key a non-privileged attacker cannot forge a matching
+//! `row_hmac`, so the next read by the service surfaces the mismatch.
 //!
 //! Does NOT defend against:
 //!
@@ -127,17 +128,7 @@ pub fn compute_pointer_hmac(row: &PointerFields<'_>, key: &[u8]) -> [u8; HMAC_BY
 /// column existed, not a forgery.
 #[must_use]
 pub fn verify_pointer(row: &PointerFields<'_>, stored_hmac: &[u8], key: &[u8]) -> HmacVerification {
-    if stored_hmac.is_empty() {
-        return HmacVerification::Unsigned;
-    }
-    let expected = compute_pointer_hmac(row, key);
-    // Same comparison as `verify`: tamper DETECTION, not authentication of an
-    // attacker-supplied tag, so ordinary equality is enough.
-    if stored_hmac.len() == expected.len() && stored_hmac == expected.as_slice() {
-        HmacVerification::Verified
-    } else {
-        HmacVerification::Tampered
-    }
+    verify_tag(stored_hmac, key, |mac| feed_pointer(mac, row))
 }
 
 /// The signed fields of a confirmed override of the protection of system
@@ -179,15 +170,7 @@ pub fn compute_grant_hmac(row: &GrantFields<'_>, key: &[u8]) -> [u8; HMAC_BYTE_L
 /// [`HmacVerification::Unsigned`], which a reader treats as no grant at all.
 #[must_use]
 pub fn verify_grant(row: &GrantFields<'_>, stored_hmac: &[u8], key: &[u8]) -> HmacVerification {
-    if stored_hmac.is_empty() {
-        return HmacVerification::Unsigned;
-    }
-    let expected = compute_grant_hmac(row, key);
-    if stored_hmac.len() == expected.len() && stored_hmac == expected.as_slice() {
-        HmacVerification::Verified
-    } else {
-        HmacVerification::Tampered
-    }
+    verify_tag(stored_hmac, key, |mac| feed_grant(mac, row))
 }
 
 /// Outcome of comparing a stored HMAC with one we just recomputed.
@@ -232,19 +215,7 @@ pub fn compute_hmac(row: &RowFields<'_>, key: &[u8]) -> [u8; HMAC_BYTE_LEN] {
 /// other length-mismatching blob is treated as tampered (the
 /// column is NOT NULL but technically could carry truncated data).
 pub fn verify(row: &RowFields<'_>, stored_hmac: &[u8], key: &[u8]) -> HmacVerification {
-    if stored_hmac.is_empty() {
-        return HmacVerification::Unsigned;
-    }
-    let expected = compute_hmac(row, key);
-    // Constant-time comparison via `subtle` would be the textbook
-    // move; for tamper-DETECTION (not authentication of an
-    // attacker-supplied tag) ordinary equality is fine — the
-    // attacker doesn't get a timing oracle into the cached HMAC.
-    if stored_hmac.len() == expected.len() && stored_hmac == expected.as_slice() {
-        HmacVerification::Verified
-    } else {
-        HmacVerification::Tampered
-    }
+    verify_tag(stored_hmac, key, |mac| feed_row(mac, row))
 }
 
 /// Key-independent SHA-256 over exactly the bytes [`compute_hmac`] signs.
@@ -272,6 +243,26 @@ pub fn pointer_fingerprint(row: &PointerFields<'_>) -> String {
 const ROW_FINGERPRINT_DOMAIN: &str = "row-content-fingerprint-v1";
 
 // ── helpers ─────────────────────────────────────────────────────────────
+
+/// Shared verdict for every tag kind. The comparison is the crate's constant-time
+/// `verify_slice`; a wrong-length blob is a mismatch, never a panic.
+fn verify_tag(
+    stored_hmac: &[u8],
+    key: &[u8],
+    feed: impl FnOnce(&mut HmacSha256),
+) -> HmacVerification {
+    if stored_hmac.is_empty() {
+        return HmacVerification::Unsigned;
+    }
+    let Ok(mut mac) = <HmacSha256 as Mac>::new_from_slice(key) else {
+        return HmacVerification::Tampered;
+    };
+    feed(&mut mac);
+    match mac.verify_slice(stored_hmac) {
+        Ok(()) => HmacVerification::Verified,
+        Err(_) => HmacVerification::Tampered,
+    }
+}
 
 /// Where the canonical encoding goes: the keyed tag or the plain fingerprint.
 trait Sink {
@@ -619,6 +610,18 @@ mod tests {
         }
     }
 
+    /// A stored grant tag must survive a crypto-crate upgrade bit for bit, or
+    /// every confirmed override stops applying. Expected value computed
+    /// outside this crate from the documented encoding.
+    #[test]
+    fn a_grant_tag_is_pinned() {
+        let key = [0x42u8; 32];
+        assert_eq!(
+            hex(&compute_grant_hmac(&sample_grant(), &key)),
+            "7a3e6080d463534c438c4dd70b16018099976c0ea3498b239e80a765ed401fd2"
+        );
+    }
+
     /// Any field moved breaks the tag: a grant cannot be re-homed, widened to
     /// another rule, or given a longer term past the service.
     #[test]
@@ -683,5 +686,49 @@ mod tests {
         }
         // Never interchangeable with a revision tag over the same key.
         assert_ne!(tag, compute_hmac(&sample_row(), &key));
+    }
+
+    #[test]
+    fn verify_rejects_an_oversize_blob_and_a_single_flipped_bit() {
+        let key = [0x42u8; 32];
+        let row = sample_row();
+        let mut tag = compute_hmac(&row, &key).to_vec();
+        tag.push(0);
+        assert_eq!(verify(&row, &tag, &key), HmacVerification::Tampered);
+        tag.pop();
+        tag[31] ^= 1;
+        assert_eq!(verify(&row, &tag, &key), HmacVerification::Tampered);
+    }
+
+    #[test]
+    fn pointer_and_grant_verdicts_share_the_three_way_answer() {
+        let key = [0x42u8; 32];
+        let pointer = PointerFields {
+            principal: "S-1-5-21-1-2-3-1001",
+            revision_id: "rev-001",
+            activated_at: 1_700_000_000,
+            apply_attempt_id: None,
+        };
+        let tag = compute_pointer_hmac(&pointer, &key);
+        assert_eq!(
+            verify_pointer(&pointer, &tag, &key),
+            HmacVerification::Verified
+        );
+        assert_eq!(
+            verify_pointer(&pointer, &[], &key),
+            HmacVerification::Unsigned
+        );
+        assert_eq!(
+            verify_pointer(&pointer, &tag[..31], &key),
+            HmacVerification::Tampered
+        );
+        let grant = sample_grant();
+        let tag = compute_grant_hmac(&grant, &key);
+        assert_eq!(verify_grant(&grant, &tag, &key), HmacVerification::Verified);
+        assert_eq!(verify_grant(&grant, &[], &key), HmacVerification::Unsigned);
+        assert_eq!(
+            verify_grant(&grant, &tag[..31], &key),
+            HmacVerification::Tampered
+        );
     }
 }

@@ -5,24 +5,14 @@
 # preset_version: 1
 
 --- Domains
-account.jetbrains.com
 ai.google.dev
 aistudio.google.com
 api.jetbrains.ai
-api.mistral.ai
-chat.mistral.ai
 copilot.microsoft.com
-data.services.jetbrains.com
 discord.gg
-download-cdn.jetbrains.com
-download.jetbrains.com
-downloads.marketplace.jetbrains.com
 gemini.google.com
-lechat.mistral.ai
 notebooklm.google.com
-plugins.jetbrains.com
 redd.it
-resources.jetbrains.com
 youtu.be
 *.anthropic.com
 *.bsky.app
@@ -81,7 +71,6 @@ facebook.*
 *.sc-cdn.net
 *.signal.me
 *.signal.org
-*.skype.com
 *.slack.com
 *.snapchat.com
 *.stability.ai
@@ -160,7 +149,6 @@ rider64.exe
 rubymine.exe
 rubymine64.exe
 signal.exe
-skype.exe
 slack.exe
 # teams.exe    # Microsoft Teams: имя процесса слишком общее, проверьте у себя
 telegram.exe

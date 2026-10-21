@@ -1,0 +1,144 @@
+{
+  "description": "pure.js vpnGatewayOffers: one question per gateway the service lists as stopped",
+  "cases": [
+    {
+      "name": "empty list",
+      "input": {
+        "pending": []
+      },
+      "expected": []
+    },
+    {
+      "name": "system connection has no program",
+      "input": {
+        "pending": [
+          {
+            "address": "203.0.113.20",
+            "program": ""
+          }
+        ]
+      },
+      "expected": [
+        {
+          "address": "203.0.113.20",
+          "program": "",
+          "name": ""
+        }
+      ]
+    },
+    {
+      "name": "program named by its file",
+      "input": {
+        "pending": [
+          {
+            "address": "198.51.100.4",
+            "program": "C:\\Corp\\agent.exe"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "address": "198.51.100.4",
+          "program": "C:\\Corp\\agent.exe",
+          "name": "agent.exe"
+        }
+      ]
+    },
+    {
+      "name": "blank address dropped and spaces trimmed",
+      "input": {
+        "pending": [
+          {
+            "address": "  ",
+            "program": "x"
+          },
+          {
+            "address": " 198.51.100.4 ",
+            "program": " /usr/sbin/charon "
+          }
+        ]
+      },
+      "expected": [
+        {
+          "address": "198.51.100.4",
+          "program": "/usr/sbin/charon",
+          "name": "charon"
+        }
+      ]
+    },
+    {
+      "name": "repeats folded without regard to case",
+      "input": {
+        "pending": [
+          {
+            "address": "2001:DB8::7",
+            "program": ""
+          },
+          {
+            "address": "2001:db8::7",
+            "program": "other"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "address": "2001:DB8::7",
+          "program": "",
+          "name": ""
+        }
+      ]
+    },
+    {
+      "name": "missing fields read as empty",
+      "input": {
+        "pending": [
+          {
+            "address": "203.0.113.20"
+          },
+          {}
+        ]
+      },
+      "expected": [
+        {
+          "address": "203.0.113.20",
+          "program": "",
+          "name": ""
+        }
+      ]
+    },
+    {
+      "name": "missing list reads as empty",
+      "input": {
+        "pending": null
+      },
+      "expected": []
+    },
+    {
+      "name": "order kept across distinct gateways",
+      "input": {
+        "pending": [
+          {
+            "address": "198.51.100.4",
+            "program": "/opt/vpn/bin/client"
+          },
+          {
+            "address": "203.0.113.20",
+            "program": ""
+          }
+        ]
+      },
+      "expected": [
+        {
+          "address": "198.51.100.4",
+          "program": "/opt/vpn/bin/client",
+          "name": "client"
+        },
+        {
+          "address": "203.0.113.20",
+          "program": "",
+          "name": ""
+        }
+      ]
+    }
+  ]
+}

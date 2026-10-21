@@ -3,6 +3,8 @@
 
 use super::*;
 
+pub(super) use crate::fqdn_cache_lookup::snapshot_or_live;
+
 impl SecondaryRouteCoordinator {
     /// active-probe liveness gate on the SECONDARY only
     /// (never the primary — the real link must never be probed / fail-closed).
@@ -18,7 +20,11 @@ impl SecondaryRouteCoordinator {
         raw: Option<SecondaryRouteTarget>,
     ) -> Option<SecondaryRouteTarget> {
         match raw {
-            Some(t) if self.liveness.is_dead(t.interface_index, Instant::now()) => {
+            Some(t)
+                if self
+                    .liveness
+                    .is_dead(t.interface_index, crate::boot_clock::BootInstant::now()) =>
+            {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
                     msg_key = "route-secondary-liveness-dead",
@@ -47,7 +53,7 @@ impl SecondaryRouteCoordinator {
         let Some(probe) = self.reachability_probe.as_ref() else {
             return;
         };
-        let infos = match self.api.get_adapter_infos() {
+        let infos = match self.adapters_now() {
             Ok(i) => i,
             Err(_) => return,
         };
@@ -87,8 +93,11 @@ impl SecondaryRouteCoordinator {
                         continue;
                     }
                     let reachable = probe.is_reachable(t.gateway, LIVENESS_PROBE_TIMEOUT);
-                    self.liveness
-                        .record(t.interface_index, reachable, Instant::now());
+                    self.liveness.record(
+                        t.interface_index,
+                        reachable,
+                        crate::boot_clock::BootInstant::now(),
+                    );
                 }
                 None => {
                     // The bound secondary is unprobeable right now (adapter
@@ -118,8 +127,9 @@ impl SecondaryRouteCoordinator {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn planned_routes(
         &self,
-        sid: &str,
+        _sid: &str,
         resolution: &RouteResolution,
+        stored_policy: Option<&PerSidPolicySnapshot>,
         secondary: &SecondaryRouteTarget,
         rule_book: &nrr_domain::canonical::CanonicalRuleBook,
         cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
@@ -129,20 +139,14 @@ impl SecondaryRouteCoordinator {
         // shared-IP denylist from the same enforcement rule
         // book + live cache, keyed on this SID's policy, so the route table and
         // the WFP set decline the same shared IPs.
-        let stored_policy = self.route_source.load_for_sid(sid);
         let shared_ip_policy = stored_policy
-            .as_ref()
             .map(|p| p.shared_ip_policy)
             .unwrap_or_default();
         // The arbiter's settings come from the same stored policy: the routes
         // and the filters must arbitrate one address identically.
         let ownership_settings = crate::address_ownership::OwnershipSettings::from_policy(
-            stored_policy
-                .as_ref()
-                .is_some_and(|p| p.zone_priority_over_ip),
-            stored_policy
-                .as_ref()
-                .is_some_and(|p| p.app_rules_take_all_addresses),
+            stored_policy.is_some_and(|p| p.zone_priority_over_ip),
+            stored_policy.is_some_and(|p| p.app_rules_take_all_addresses),
         );
         let denied = crate::secondary_ip_policy::secondary_ip_denylist(
             &rule_book.secondary,
@@ -213,19 +217,17 @@ impl SecondaryRouteCoordinator {
             .fqdn_cache
             .snapshot_for_compute()
             .map(|full| full.scoped_to(addresses));
-        let cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup = match scoped.as_ref() {
-            Some(scoped) => scoped,
-            None => self.fqdn_cache.as_ref(),
-        };
+        let cache = snapshot_or_live(scoped.as_ref(), self.fqdn_cache.as_ref());
         let wanted: Vec<RouteEntry> = self
             .planned_routes(
                 sid,
                 &resolution,
+                self.route_source.load_for_sid(sid).as_ref(),
                 &secondary,
                 &snapshot.rule_book,
                 cache,
                 &[],
-                &crate::route_codegen::network_routes::NetworkRouteFacts::default(),
+                &crate::kept_direct::published_facts(sid),
             )
             .routes
             .into_iter()

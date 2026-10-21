@@ -9,6 +9,7 @@
 mod args;
 mod backend;
 mod block_backlog;
+mod block_route;
 mod elevation_prompt;
 mod forwarded_traffic;
 mod full;
@@ -16,6 +17,8 @@ mod i18n;
 mod keys;
 mod link;
 mod local_network_offer;
+mod notice_mutes;
+mod paste;
 mod plain;
 mod platform;
 mod primary_suggestion;
@@ -25,6 +28,7 @@ mod state;
 #[cfg(test)]
 mod testing;
 mod view;
+mod vpn_gateway_trust;
 mod vpn_trust;
 
 use std::io::IsTerminal;
@@ -116,7 +120,10 @@ fn main() -> ExitCode {
     options.no_color |= saved.no_color;
     options.ascii |= saved.ascii;
 
-    match run(&options, &texts, saved, prefs_path) {
+    // Under `sudo -E` the path is the user's own folder: a root-owned file
+    // there would be unreadable for them, so root only reads.
+    let save_to = prefs_path.filter(|_| !platform::edits_baseline());
+    match run(&options, &texts, saved, save_to) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!(
@@ -176,6 +183,8 @@ fn run(
     if options.wizard {
         app.wizard.opened_by_request();
     }
+    start_licence_and_sheet(&mut app, texts);
+    app.delivery_gaps = delivery_gaps();
     let result = if options.plain {
         plain::run(&mut app, texts, &backend, events)
     } else {
@@ -193,4 +202,55 @@ fn run(
     drop(backend);
     client.shutdown();
     result
+}
+
+/// Parts of the package this binary reads that are not beside it. A user's own
+/// locale file does not count: the package still lacks the others.
+fn delivery_gaps() -> Vec<&'static str> {
+    let mut gaps = Vec::new();
+    if screens::rules::presets_root().is_none() {
+        gaps.push("presets");
+    }
+    let bundled_locale = nrr_shared::load_locale_state()
+        .reports
+        .iter()
+        .any(|report| {
+            report.source == nrr_shared::LocaleSource::Bundled
+                && report.status != nrr_shared::LocaleLoadStatus::Rejected
+        });
+    if !bundled_locale {
+        gaps.push("locales");
+    }
+    gaps
+}
+
+/// What the user's settings say about the agreement, and the installer's
+/// answer sheet. Without the user's own settings file (`sudo`) the agreement is
+/// asked every time rather than recorded in root's profile.
+fn start_licence_and_sheet(app: &mut AppState, texts: &Texts) {
+    let read = app
+        .rules
+        .settings_file
+        .clone()
+        .map(|file| nrr_shared::user_settings::UserSettingsStore::at(file).load());
+    app.settings_unreadable = matches!(read, Some(Err(_)));
+    let accepted = read
+        .and_then(Result::ok)
+        .flatten()
+        .map_or(0, |settings| settings.accepted_eula);
+    let executable = std::env::current_exe().ok();
+    let candidates = nrr_shared::first_run_sheet::candidate_paths(
+        executable.as_deref().and_then(std::path::Path::parent),
+        nrr_platform_api::paths::machine_first_run_dir().as_deref(),
+    );
+    let machine_files = platform::machine_files();
+    let sheet = nrr_shared::first_run_sheet::search(&candidates, &|path| {
+        machine_files.untrusted_because(path)
+    })
+    .found
+    .map(|loaded| loaded.answers);
+    app.wizard.at_startup(accepted, texts.language(), sheet);
+    if app.wizard.licence_pending() {
+        app.screen = ScreenId::Wizard;
+    }
 }

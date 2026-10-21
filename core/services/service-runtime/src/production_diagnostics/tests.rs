@@ -990,10 +990,6 @@ fn default_route_projection_maps_behavior_mode_to_route() {
         default_route_explain_projection(RouteBehaviorMode::PreferSecondaryWhenAvailable),
         ("secondary", "diag.explain.final-action.route-secondary")
     );
-    assert_eq!(
-        default_route_explain_projection(RouteBehaviorMode::StrictSecondaryFailClosed),
-        ("secondary", "diag.explain.final-action.route-secondary")
-    );
 }
 
 #[test]

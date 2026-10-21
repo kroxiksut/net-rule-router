@@ -1,6 +1,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "../lib/plurals.js" as Plurals
 import "../lib/pure.js" as Pure
 
 // Left navigation rail (extracted from Main.qml). Collapsible sidebar with the
@@ -205,9 +206,10 @@ Pane {
                                             text: String(navContent.pendingBadge)
                                             color: navButton.highlighted ? palette.highlightedText : root.accentColor
                                             font.bold: true
-                                            Accessible.name: root.tr("rules.nav.pending-badge",
-                                                "{n} item(s) in Rules waiting for an answer")
-                                                .replace("{n}", String(navContent.pendingBadge))
+                                            Accessible.name: Plurals.counted(root.tr, "rules.nav.pending-badge.",
+                                                navContent.pendingBadge,
+                                                "{count} item in Rules waiting for an answer",
+                                                "{count} items in Rules waiting for an answer")
                                         }
                                         Label {
                                             Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
@@ -367,8 +369,10 @@ Pane {
                                 text: root.tr("rules.overlaps.nav-label", "Overlaps")
                                 badge: root.ruleOverlapsController.pendingCount
                                 Accessible.description: root.ruleOverlapsController.pendingCount > 0
-                                    ? root.tr("rules.overlaps.pending-badge", "{n} overlap(s) not confirmed")
-                                        .replace("{n}", String(root.ruleOverlapsController.pendingCount))
+                                    ? Plurals.counted(root.tr, "rules.overlaps.pending-counted.",
+                                        root.ruleOverlapsController.pendingCount,
+                                        "{count} overlap not confirmed",
+                                        "{count} overlaps not confirmed")
                                     : ""
                                 onClicked: root.ruleOverlapsController.open()
                             }

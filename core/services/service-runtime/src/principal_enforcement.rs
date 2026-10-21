@@ -94,6 +94,15 @@ pub trait PrincipalPlanSource: Send + Sync {
     /// otherwise two users could be planned against two different readings of
     /// the same instant. Default: nothing to do.
     fn begin_pass(&self) {}
+
+    /// Called once after the pass's last `plan_for`, to publish what the pass
+    /// learned about the machine as one view. Default: nothing to do.
+    fn end_pass(&self) {}
+
+    /// Who the machine's service accounts follow this pass, told right after
+    /// [`Self::begin_pass`]. A source that plans their rules builds them for
+    /// that user alone. Default: nothing to do.
+    fn set_route_table_owner(&self, _owner: Option<&UserPrincipal>) {}
 }
 
 /// A plan together with how much of the user's asked-for protection it carries.
@@ -157,6 +166,31 @@ pub enum CycleOutcome {
     Stopped,
 }
 
+impl CycleOutcome {
+    /// Whether a pass the user just asked for left the machine as approved.
+    /// Filters without their routes are half a policy: reported, not Ok.
+    pub fn landed(&self) -> Result<(), String> {
+        match self {
+            Self::Applied { routes, .. } => {
+                match routes.as_ref().and_then(|r| r.failure.as_deref()) {
+                    Some(why) => Err(format!("filters applied but routes were not: {why}")),
+                    None => Ok(()),
+                }
+            }
+            Self::Unchanged => Ok(()),
+            Self::EnforcementFailed { reason, .. } | Self::RefusalStands { reason } => {
+                Err(reason.clone())
+            }
+            Self::AuthorityUnavailable { reason } => {
+                Err(format!("could not determine who is logged in: {reason}"))
+            }
+            Self::Stopped => {
+                Err("the service is stopping; the change was saved but not applied".to_owned())
+            }
+        }
+    }
+}
+
 /// The neutral enforcement cycle.
 pub struct PrincipalEnforcementCycle {
     principals: Arc<dyn ActivePrincipalSource>,
@@ -216,6 +250,13 @@ pub struct PrincipalEnforcementCycle {
     /// principal is left out of the pass entirely, so the platform drops their
     /// filters and routes on the pass that reads the flag. `None` = nobody.
     paused: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
+    /// Whether a pause keeps the user's rule routes (the stored stop setting,
+    /// read per pass). Their filters, fail-closed and block-all still go.
+    keep_routes_when_paused: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// The route-only plans last applied for paused principals who keep their
+    /// routes, carried while their book cannot be read. Only touched under the
+    /// pass lock.
+    paused_routes: Mutex<Vec<EnforcementPlan>>,
     /// Where each pass's verdict lands on `HealthComponent::Apply`. Set once,
     /// after construction, like the presence listener.
     health: std::sync::OnceLock<Arc<crate::health::HealthAggregator>>,
@@ -331,6 +372,8 @@ impl PrincipalEnforcementCycle {
             route_owner: Arc::default(),
             channel_status: None,
             paused: None,
+            keep_routes_when_paused: None,
+            paused_routes: Mutex::new(Vec::new()),
             health: std::sync::OnceLock::new(),
         }
     }
@@ -349,6 +392,17 @@ impl PrincipalEnforcementCycle {
         paused: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
         self.paused = Some(paused);
+        self
+    }
+
+    /// Read, once per pass, whether a paused principal keeps the routes their
+    /// rules ask for. Unset = a pause removes them with everything else.
+    #[must_use]
+    pub fn with_keep_routes_when_paused(
+        mut self,
+        keep: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        self.keep_routes_when_paused = Some(keep);
         self
     }
 
@@ -526,11 +580,26 @@ impl PrincipalEnforcementCycle {
         // A paused principal is not planned for, not routed, not an owner: the
         // pass treats them as signed out until they resume.
         let paused = self.paused.as_ref().map(|read| read()).unwrap_or_default();
-        let present: Vec<_> = present
+        let keep_paused_routes = !paused.is_empty()
+            && self
+                .keep_routes_when_paused
+                .as_ref()
+                .is_some_and(|read| read());
+        let (paused_present, present): (Vec<_>, Vec<_>) = present
             .into_iter()
-            .filter(|p| !paused.iter().any(|s| s == p.principal.as_stored()))
-            .collect();
+            .partition(|p| paused.iter().any(|s| s == p.principal.as_stored()));
         let owner = crate::route_table_owner::choose_route_table_owner(&present).cloned();
+        // Routes only: a lone paused user still owns the one-table pass.
+        let route_owner = if keep_paused_routes && owner.is_none() {
+            crate::route_table_owner::choose_route_table_owner(&paused_present).cloned()
+        } else {
+            owner.clone()
+        };
+        let paused_kept: Vec<UserPrincipal> = if keep_paused_routes {
+            paused_present.into_iter().map(|p| p.principal).collect()
+        } else {
+            Vec::new()
+        };
         let active: Vec<UserPrincipal> = present.into_iter().map(|p| p.principal).collect();
         let reports: Vec<ChannelReport> = active
             .iter()
@@ -550,7 +619,7 @@ impl PrincipalEnforcementCycle {
         let fingerprint = self
             .inputs
             .as_ref()
-            .and_then(|inputs| inputs.fingerprint(&(&active, &availability, &owner)));
+            .and_then(|inputs| inputs.fingerprint(&(&active, &availability, &owner, &paused_kept)));
         timings.mark("authority");
         if skip_if_unchanged && !self.retry_requested.load(Ordering::Acquire) {
             if let (Some(inputs), Some(fp)) = (self.inputs.as_ref(), fingerprint) {
@@ -560,6 +629,7 @@ impl PrincipalEnforcementCycle {
             }
         }
         self.plans.begin_pass();
+        self.plans.set_route_table_owner(owner.as_ref());
         let mut plans: Vec<EnforcementPlan> = Vec::new();
         let mut unprotected: Vec<String> = Vec::new();
         let mut wants_machine_wide_cut: std::collections::BTreeMap<String, bool> =
@@ -595,11 +665,17 @@ impl PrincipalEnforcementCycle {
                             if let Some(inputs) = self.inputs.as_ref() {
                                 inputs.unsettle();
                             }
+                            // Health is read by every client: who and why go to
+                            // the audience-scoped log only.
+                            tracing::warn!(
+                                target: "nrr::enforcement",
+                                sid = principal.as_stored(),
+                                reason = %reason,
+                                "rule book unreadable and nothing applied yet to keep"
+                            );
                             return CycleOutcome::EnforcementFailed {
                                 persistent: false,
-                                reason: format!(
-                                    "rule book unreadable for a present user and nothing applied yet to keep: {reason}"
-                                ),
+                                reason: "rule book unreadable for a present user and nothing applied yet to keep".to_owned(),
                             };
                         }
                     }
@@ -623,6 +699,7 @@ impl PrincipalEnforcementCycle {
             plans.push(planned.plan);
         }
 
+        self.plans.end_pass();
         let changed = last.as_deref().map(Vec::as_slice) != Some(plans.as_slice());
         timings.mark("plan");
 
@@ -666,10 +743,40 @@ impl PrincipalEnforcementCycle {
                 // steering, and the caller reports that rather than discarding
                 // a policy that is already half in force.
                 let routes = self.routes.as_ref().map(|applier| {
+                    // A paused user's plan reaches the routes without its
+                    // flows: the filters stay out of the enforcer's input.
+                    let mut route_plans = plans.clone();
+                    let mut route_present = active.clone();
+                    let mut kept = self.paused_routes.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut next_kept = Vec::with_capacity(paused_kept.len());
+                    for principal in &paused_kept {
+                        let availability = self.enforcer.channel_report(principal).availability();
+                        let plan = match self.plans.plan_read_for(principal, availability) {
+                            PlanRead::Planned(planned) => Some(planned.plan),
+                            PlanRead::NoPolicy => None,
+                            // An unreadable book keeps the routes last applied;
+                            // dropping them would undo the pause's own promise.
+                            PlanRead::Unreadable(_) => {
+                                held_back.push(principal.as_stored().to_owned());
+                                kept.iter()
+                                    .chain(last.as_deref().into_iter().flatten())
+                                    .find(|p| p.principal == *principal)
+                                    .cloned()
+                            }
+                        };
+                        if let Some(mut plan) = plan {
+                            plan.flows.clear();
+                            route_plans.push(plan.clone());
+                            route_present.push(principal.clone());
+                            next_kept.push(plan);
+                        }
+                    }
+                    *kept = next_kept;
+                    drop(kept);
                     let pass = crate::route_apply::RoutePass {
-                        plans: &plans,
-                        present: &active,
-                        owner: owner.as_ref(),
+                        plans: &route_plans,
+                        present: &route_present,
+                        owner: route_owner.as_ref(),
                     };
                     applier.apply_pass(pass).unwrap_or_else(|reason| {
                         crate::route_apply::RouteApplyReport {
@@ -862,7 +969,10 @@ impl PrincipalEnforcementCycle {
         // Somebody armed a cut the packet layer cannot scope. Everyone else
         // active loses ICMP and IPv6 without having asked for it, so they are
         // told - the alternative was that their network changed silently.
-        let anybody_cuts = wants_machine_wide_cut.values().any(|v| *v);
+        // Only where a cut cannot be limited to one account: per user elsewhere.
+        let anybody_cuts = !nrr_platform_api::enforcement::EnforcementCapabilities::current()
+            .per_user_all_protocol_scoping
+            && wants_machine_wide_cut.values().any(|v| *v);
         if !anybody_cuts {
             return;
         }
@@ -1100,6 +1210,27 @@ impl PrincipalEnforcementCycle {
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn a_pass_with_failed_routes_does_not_land() {
+        let outcome = |failure: Option<&str>| super::CycleOutcome::Applied {
+            principals: Vec::new(),
+            report: nrr_platform_api::enforcement::ApplyReport::default(),
+            changed: true,
+            delta: None,
+            unprotected: Vec::new(),
+            guarded: 0,
+            routes: Some(crate::route_apply::RouteApplyReport {
+                failure: failure.map(str::to_owned),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(outcome(None).landed(), Ok(()));
+        let err = outcome(Some("no gateway"))
+            .landed()
+            .expect_err("half a policy");
+        assert!(err.contains("no gateway"), "{err}");
+    }
+
     /// The packet layer carries no user context, so a cut one principal asks
     /// for lands on everyone. Before this the others just lost ICMP and IPv6
     /// with nothing to explain it.
@@ -1134,13 +1265,17 @@ mod tests {
             "the principal who asked for the cut needs no notice",
         );
         let for_bystander = bus.peek_pending_for(&bystander.subscription_id, 8);
-        assert!(
+        // Where the OS scopes every protocol per user, nobody else is cut.
+        let machine_wide = !nrr_platform_api::enforcement::EnforcementCapabilities::current()
+            .per_user_all_protocol_scoping;
+        assert_eq!(
             for_bystander.iter().any(|e| matches!(
                 &e.event,
                 StatusUpdateEvent::ProtectionCoverageChanged { reason }
                     if reason == "machine-wide-cut-by-another-user"
             )),
-            "the bystander must be told why their IPv6 stopped: {for_bystander:?}",
+            machine_wide,
+            "the bystander is told exactly when the cut is machine-wide: {for_bystander:?}",
         );
 
         // A plan that blocks only at the connect layer is per-principal and
@@ -1163,6 +1298,7 @@ mod tests {
                 app: nrr_platform_api::enforcement::AppScope::Any,
                 egress: nrr_platform_api::enforcement::EgressConstraint::Any,
                 coverage: Coverage::ConnectOnly,
+                observed_by_program: false,
             }],
             routes: Vec::new(),
             policy_rules: Vec::new(),
@@ -1769,6 +1905,7 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
+            observed_by_program: false,
         };
         let route = |last: u8| RouteIntent {
             dst: DstMatch::HostV4(std::net::Ipv4Addr::new(203, 0, 113, last)),
@@ -2011,6 +2148,7 @@ mod tests {
                             app: AppScope::Any,
                             egress: EgressConstraint::Any,
                             coverage: Coverage::ConnectOnly,
+                            observed_by_program: false,
                         }],
                         routes: Vec::new(),
                         policy_rules: Vec::new(),
@@ -2474,6 +2612,106 @@ mod tests {
             r.cycle.tick();
             assert!(r.shared_host_links().is_empty());
             assert_eq!(r.owner_uid(), None);
+        }
+
+        fn paused_rig(keep: bool) -> Rig {
+            let r = rig(vec![present(1000, true, Some(50))]);
+            Rig {
+                cycle: r
+                    .cycle
+                    .with_paused_principals(Arc::new(|| vec!["unix:uid:1000".to_owned()]))
+                    .with_keep_routes_when_paused(Arc::new(move || keep)),
+                ..r
+            }
+        }
+
+        #[test]
+        fn a_paused_user_keeps_their_rule_routes_but_not_their_filters_when_asked() {
+            let r = paused_rig(true);
+            r.cycle.tick();
+            assert_eq!(r.shared_host_links(), vec![TUN]);
+            assert_eq!(r.enforcer.calls(), vec![Vec::<String>::new()]);
+        }
+
+        #[test]
+        fn a_paused_user_loses_their_routes_when_the_setting_is_off() {
+            let r = paused_rig(false);
+            r.cycle.tick();
+            assert!(r.shared_host_links().is_empty());
+            assert_eq!(r.enforcer.calls(), vec![Vec::<String>::new()]);
+        }
+
+        /// A paused user who keeps their routes keeps them while their book
+        /// cannot be read, and the pass stays unsettled so the next one asks
+        /// again.
+        #[test]
+        fn a_paused_user_keeps_their_routes_while_the_book_is_unreadable() {
+            struct Flaky(AtomicBool);
+            impl PrincipalPlanSource for Flaky {
+                fn plan_for(
+                    &self,
+                    principal: &UserPrincipal,
+                    availability: ChannelAvailability,
+                ) -> Option<PlannedPolicy> {
+                    Disagreeing.plan_for(principal, availability)
+                }
+                fn plan_read_for(
+                    &self,
+                    principal: &UserPrincipal,
+                    availability: ChannelAvailability,
+                ) -> PlanRead {
+                    if self.0.load(Ordering::Acquire) {
+                        return PlanRead::Unreadable("damaged row".to_owned());
+                    }
+                    match self.plan_for(principal, availability) {
+                        Some(planned) => PlanRead::Planned(planned),
+                        None => PlanRead::NoPolicy,
+                    }
+                }
+            }
+            let r = rig(vec![present(1000, true, Some(50))]);
+            let flaky = Arc::new(Flaky(AtomicBool::new(false)));
+            let table = Arc::clone(&r.table);
+            let adapters = Arc::new(MockAdapterEventSource::new());
+            *adapters.adapters.lock().unwrap_or_else(|p| p.into_inner()) = vec![
+                link("eth0", ETH, Some(Ipv4Addr::new(192, 0, 2, 1))),
+                link("tun0", TUN, None),
+            ];
+            let cycle = PrincipalEnforcementCycle::new(
+                Arc::clone(&r.seats) as Arc<dyn ActivePrincipalSource>,
+                Arc::clone(&flaky) as Arc<dyn PrincipalPlanSource>,
+                Arc::clone(&r.enforcer) as Arc<dyn PolicyEnforcer>,
+            )
+            .with_routes(Arc::new(crate::route_apply::PlannedRouteApplier::new(
+                Arc::clone(&table) as Arc<dyn RouteTablePort>,
+                adapters,
+                Arc::new(BothBound),
+            )))
+            .with_paused_principals(Arc::new(|| vec!["unix:uid:1000".to_owned()]))
+            .with_keep_routes_when_paused(Arc::new(|| true))
+            .with_pass_inputs(
+                crate::pass_inputs::PassInputs::new().with_source("test", Arc::new(|| Some(1))),
+            );
+            let r = Rig { cycle, ..r };
+
+            r.cycle.tick();
+            assert_eq!(r.shared_host_links(), vec![TUN]);
+
+            flaky.0.store(true, Ordering::Release);
+            r.cycle.tick();
+            assert_eq!(
+                r.shared_host_links(),
+                vec![TUN],
+                "an unreadable book must not take the kept routes away"
+            );
+            assert!(
+                !matches!(
+                    r.cycle.tick_if_changed_logged("timer"),
+                    CycleOutcome::Unchanged
+                ),
+                "a held-back book is asked again"
+            );
+            assert_eq!(r.shared_host_links(), vec![TUN]);
         }
 
         /// Between two users who signed in at the same moment the seat decides

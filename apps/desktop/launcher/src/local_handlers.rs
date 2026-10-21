@@ -46,13 +46,10 @@ use nrr_ipc_client::IpcClient;
 use nrr_shared::client_error_codes as codes;
 use nrr_shared::rules_json::{to_canonical_string, CanonicalRulesJsonV1, RulesJsonCodecError};
 
-/// GUI/launcher protocol version. Mirrors
-/// `nrr_ipc_client::CLIENT_PROTOCOL_VERSION` which is a `pub(crate)`
-/// constant — we duplicate it here so the compatibility banner can
-/// report the number without making the constant public on the
-/// client API surface. Keep these two values in sync; if you bump
-/// one, bump the other.
-const GUI_PROTOCOL_VERSION: u32 = 1;
+/// The protocol and payload revision this launcher speaks: the client's own,
+/// from the one declaration both ends read.
+const GUI_PROTOCOL_VERSION: u32 = nrr_shared::ipc::IPC_PROTOCOL_VERSION;
+const GUI_CONTRACT_REVISION: u32 = nrr_shared::ipc::IPC_CONTRACT_REVISION;
 
 /// GUI/launcher semver. Pulled from this crate's `Cargo.toml` via
 /// `env!`. `nrr-launcher`'s `CARGO_PKG_VERSION` is the source of
@@ -391,6 +388,12 @@ fn vm_inventory_os() -> Vec<nrr_platform_api::HypervisorInventory> {
 /// hides the banner.
 fn handle_service_info(client: &dyn IpcClient) -> LocalHandlerResult {
     let info = client.negotiate_info();
+    // Zero while no handshake has happened: nothing to compare yet.
+    let service_contract = info.as_ref().map_or(0, |i| i.contract_revision);
+    let contract_skew = info
+        .as_ref()
+        .and_then(nrr_ipc_client::NegotiateInfo::contract_skew)
+        .map_or("", nrr_shared::ipc::ContractSkew::as_slug);
     let (service_protocol, service_version, session_id) = match info {
         Some(i) => (i.server_protocol, i.service_version, i.session_id),
         None => (0u32, String::new(), String::new()),
@@ -418,7 +421,11 @@ fn handle_service_info(client: &dyn IpcClient) -> LocalHandlerResult {
     Ok(json!({
         "gui-protocol":     GUI_PROTOCOL_VERSION,
         "gui-version":      GUI_SEMVER,
+        "gui-contract":     GUI_CONTRACT_REVISION,
         "service-protocol": service_protocol,
+        "service-contract": service_contract,
+        // `service-older` / `client-older` while changes are held back, else "".
+        "contract-skew":    contract_skew,
         "service-version":  service_version,
         "session-id":       session_id,
         "service-registered-path": registered
@@ -498,31 +505,11 @@ fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
     }
 }
 
-/// Numeric-component semver comparison, `true` only when `service` is provably
-/// behind `app`. Unknown, unparseable or equal versions answer `false`: an
-/// update prompt on a guess is worse than no prompt.
+/// `true` only when `service` is provably behind `app`, in the order the update
+/// offer uses. Unknown, unparseable or equal versions answer `false`: an update
+/// prompt on a guess is worse than no prompt.
 fn version_is_older(service: &str, app: &str) -> bool {
-    let parse = |raw: &str| -> Option<Vec<u64>> {
-        let core = raw.trim().trim_start_matches('v');
-        let core = core.split(['-', '+']).next()?;
-        let parts: Vec<u64> = core
-            .split('.')
-            .map(|p| p.parse::<u64>().ok())
-            .collect::<Option<_>>()?;
-        (!parts.is_empty()).then_some(parts)
-    };
-    let (Some(service), Some(app)) = (parse(service), parse(app)) else {
-        return false;
-    };
-    let len = service.len().max(app.len());
-    for i in 0..len {
-        let s = service.get(i).copied().unwrap_or(0);
-        let a = app.get(i).copied().unwrap_or(0);
-        if s != a {
-            return s < a;
-        }
-    }
-    false
+    nrr_desktop_gui::update_check::version_is_newer(app, service)
 }
 
 fn handle_canonical_rules_hash(payload: &Value) -> LocalHandlerResult {
@@ -1025,12 +1012,44 @@ mod tests {
                 server_protocol: 7,
                 service_version: "0.2.0".into(),
                 session_id: "sess-deadbeef".into(),
+                contract_revision: nrr_shared::ipc::IPC_CONTRACT_REVISION,
             }),
         };
         let resp = handle_local_request("local.service-info", &json!({}), &client).expect("ok");
         assert_eq!(resp["service-protocol"], 7);
         assert_eq!(resp["service-version"], "0.2.0");
         assert_eq!(resp["session-id"], "sess-deadbeef");
+        assert_eq!(resp["contract-skew"], "");
+    }
+
+    /// The window reads the skew from here to raise its banner and stop
+    /// offering changes; an older service is named as the one behind.
+    #[test]
+    fn service_info_names_the_side_behind_on_the_payload_revision() {
+        let at = |contract_revision: u32| FakeClient {
+            negotiate: Some(NegotiateInfo {
+                server_protocol: nrr_shared::ipc::IPC_PROTOCOL_VERSION,
+                service_version: "0.1.0".into(),
+                session_id: "sess-1".into(),
+                contract_revision,
+            }),
+        };
+        let current = nrr_shared::ipc::IPC_CONTRACT_REVISION;
+        for (service, skew) in [
+            (current - 1, "service-older"),
+            (current + 1, "client-older"),
+            (current, ""),
+        ] {
+            let resp =
+                handle_local_request("local.service-info", &json!({}), &at(service)).expect("ok");
+            assert_eq!(resp["contract-skew"], skew, "service revision {service}");
+            assert_eq!(resp["service-contract"], service);
+            assert_eq!(resp["gui-contract"], current);
+        }
+        let pending =
+            handle_local_request("local.service-info", &json!({}), &empty_client()).expect("ok");
+        assert_eq!(pending["contract-skew"], "");
+        assert_eq!(pending["service-contract"], 0);
     }
 
     #[test]
@@ -1038,8 +1057,9 @@ mod tests {
         assert!(version_is_older("0.1.0", "0.2.0"));
         assert!(version_is_older("0.1.9", "0.2.0"));
         assert!(version_is_older("1.2.3", "1.2.4"));
-        // Fewer components: the missing ones read as zero.
-        assert!(version_is_older("1.2", "1.2.1"));
+        // A prerelease is behind its own release, as the update offer orders it.
+        assert!(version_is_older("0.2.0-prealpha", "0.2.0"));
+        assert!(version_is_older("0.2.0-alpha", "0.2.0-beta"));
     }
 
     #[test]
@@ -1049,8 +1069,9 @@ mod tests {
         // Handshake has not happened yet — the field is empty.
         assert!(!version_is_older("", "0.2.0"));
         assert!(!version_is_older("nightly", "0.2.0"));
-        // Pre-release/build metadata is ignored, not guessed at.
-        assert!(!version_is_older("0.2.0-prealpha", "0.2.0"));
+        // A shape or a stage that cannot be ordered is not guessed at.
+        assert!(!version_is_older("1.2", "1.2.1"));
+        assert!(!version_is_older("0.2.0-dev", "0.2.0-alpha"));
     }
 
     #[test]

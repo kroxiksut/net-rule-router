@@ -148,3 +148,22 @@ fn the_window_reads_the_total_rather_than_the_delivered_length() {
         "the service-row mapping no longer takes the pinned count from the service's total"
     );
 }
+
+#[test]
+fn every_free_rule_type_is_offered_once() {
+    use nrr_shared::FreeRuleType;
+    // Six distinct entries for six variants: every type is offered.
+    assert_eq!(FreeRuleType::ALL.len(), 6, "a variant is missing from ALL");
+    for rule_type in FreeRuleType::ALL {
+        assert_eq!(rule_type.slug().parse::<FreeRuleType>(), Ok(rule_type));
+        assert_eq!(
+            FreeRuleType::ALL
+                .iter()
+                .filter(|t| **t == rule_type)
+                .count(),
+            1,
+            "{} is offered twice",
+            rule_type.slug()
+        );
+    }
+}

@@ -45,6 +45,18 @@ pub struct NetworkRouteFacts {
     /// a home NAS, a media server's own relay) is not sent into the tunnel
     /// unless a rule names the address itself.
     pub lan_segments: Vec<IpBlock>,
+    /// The narrow routes a foreign tunnel (a corporate VPN) carries. A name
+    /// resolving into one is the tunnel's destination, not ours to take.
+    pub foreign_tunnel_routes: Vec<IpBlock>,
+}
+
+/// Why a host route into the tunnel is withheld.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeptDirect {
+    /// The address sits on a segment a non-tunnel link is attached to.
+    LocalNetwork,
+    /// A foreign tunnel's routes carry the address.
+    ForeignTunnel,
 }
 
 impl NetworkRouteFacts {
@@ -114,6 +126,40 @@ impl NetworkRouteFacts {
             local_networks,
             tunnel_servers,
             lan_segments,
+            foreign_tunnel_routes: Vec::new(),
+        }
+    }
+
+    /// Add what the foreign tunnels `foreign` (interface indexes) route. The
+    /// caller names them: which links are foreign is the coordinator's one
+    /// definition, not re-derived here.
+    #[must_use]
+    pub fn with_foreign_tunnels(mut self, routes: &[RouteEntry], foreign: &[u32]) -> Self {
+        if foreign.is_empty() {
+            return self;
+        }
+        self.foreign_tunnel_routes = foreign_tunnel_blocks(routes, foreign);
+        self
+    }
+
+    /// The segments a host route is withheld inside, for the published view.
+    #[must_use]
+    pub fn kept_direct_blocks(&self) -> (Vec<IpBlock>, Vec<IpBlock>) {
+        (
+            self.lan_segments.clone(),
+            self.foreign_tunnel_routes.clone(),
+        )
+    }
+
+    /// Why `ip` stays out of the tunnel unless a rule names it, if it does.
+    #[must_use]
+    pub fn kept_direct_reason(&self, ip: IpAddr) -> Option<KeptDirect> {
+        if self.lan_segments.iter().any(|s| s.contains(ip)) {
+            Some(KeptDirect::LocalNetwork)
+        } else if self.foreign_tunnel_routes.iter().any(|s| s.contains(ip)) {
+            Some(KeptDirect::ForeignTunnel)
+        } else {
+            None
         }
     }
 
@@ -128,7 +174,7 @@ impl NetworkRouteFacts {
     /// and is honoured as written.
     #[must_use]
     pub fn keeps_host_direct(&self, rules: &CanonicalRuleSet, ip: IpAddr) -> bool {
-        self.lan_segments.iter().any(|s| s.contains(ip))
+        self.kept_direct_reason(ip).is_some()
             && !rules.rules().iter().any(|rule| {
                 rule.enabled
                     && matches!(
@@ -137,6 +183,75 @@ impl NetworkRouteFacts {
                     )
             })
     }
+}
+
+/// The networks the foreign tunnels `foreign` (interface indexes) carry, sorted
+/// and deduplicated. A default or def1 route, or anything wider than a rule may
+/// name, is the tunnel taking all traffic rather than a network of its own.
+#[must_use]
+pub fn foreign_tunnel_blocks(routes: &[RouteEntry], foreign: &[u32]) -> Vec<IpBlock> {
+    let mut blocks: Vec<IpBlock> = foreign
+        .iter()
+        .flat_map(|index| one_tunnels_networks(routes, *index))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    blocks
+}
+
+/// How many of the widest networks a rule may name a tunnel's public routes
+/// may add up to before the tunnel counts as taking the internet.
+const FULL_TUNNEL_SHARE: u128 = 16;
+
+/// One foreign tunnel's networks. In a family where the tunnel takes the
+/// internet — a route wider than a rule may name, or public routes adding up
+/// to [`FULL_TUNNEL_SHARE`] of the widest, as a full tunnel split around the
+/// private ranges is — only its private, shared and unique-local pieces are
+/// its own: the public ones are everybody's destinations.
+fn one_tunnels_networks(routes: &[RouteEntry], index: u32) -> Vec<IpBlock> {
+    let blocks: Vec<IpBlock> = routes
+        .iter()
+        .filter(|r| r.interface_index == index && is_foreign_main(r))
+        .filter_map(|r| IpBlock::new(r.destination, r.prefix_length))
+        .filter(|b| is_unicast(*b))
+        .collect();
+    let takes_the_internet = |v4: bool| {
+        let family = || blocks.iter().filter(move |b| b.network().is_ipv4() == v4);
+        if family().any(|b| wider_than_rule_allows(*b)) {
+            return true;
+        }
+        let public = family()
+            .filter(|b| !nrr_domain::ip_network_policy::is_private(**b))
+            .fold(0u128, |sum, b| sum.saturating_add(addresses_in(*b)));
+        let widest = addresses_in_prefix(nrr_domain::ip_network_policy::widest_rule_prefix(v4), v4);
+        public >= widest.saturating_mul(FULL_TUNNEL_SHARE)
+    };
+    let full_v4 = takes_the_internet(true);
+    let full_v6 = takes_the_internet(false);
+    blocks
+        .iter()
+        .copied()
+        .filter(|b| !wider_than_rule_allows(*b))
+        .filter(|b| {
+            let full = if b.network().is_ipv4() {
+                full_v4
+            } else {
+                full_v6
+            };
+            !full || nrr_domain::ip_network_policy::is_private(*b)
+        })
+        .collect()
+}
+
+fn addresses_in(block: IpBlock) -> u128 {
+    addresses_in_prefix(block.prefix_len(), block.network().is_ipv4())
+}
+
+fn addresses_in_prefix(prefix: u8, v4: bool) -> u128 {
+    let bits: u8 = if v4 { 32 } else { 128 };
+    1u128
+        .checked_shl(u32::from(bits.saturating_sub(prefix)))
+        .unwrap_or(u128::MAX)
 }
 
 /// A route the system or another program installed in the main table.

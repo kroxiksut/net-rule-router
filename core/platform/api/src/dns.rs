@@ -205,17 +205,17 @@ impl DnsCacheControlPort for MockDnsCacheControl {
 
 // ── OS resolver-cache read ──────────────────────────────────────────────────
 
-/// One A-record entry read from the OS resolver cache: a hostname and the
-/// IPv4 addresses currently cached for it.
+/// One entry read from the OS resolver cache: a hostname and the addresses
+/// (`A` and `AAAA`) currently cached for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OsCachedResolution {
     /// Canonical hostname (lower-cased, no trailing dot) as it appears in the
     /// OS cache.
     pub canonical_hostname: String,
-    /// IPv4 addresses the OS currently has cached for the hostname. May be
-    /// empty when the cached entry is a negative/CNAME-only record; callers
-    /// skip empties.
-    pub addresses: Vec<Ipv4Addr>,
+    /// Addresses of both families the OS currently has cached for the
+    /// hostname, an IPv4-mapped one as IPv4. May be empty when the cached
+    /// entry is a negative/CNAME-only record; callers skip empties.
+    pub addresses: Vec<IpAddr>,
 }
 
 /// Reasons an OS resolver-cache read can fail.
@@ -262,10 +262,22 @@ impl std::error::Error for DnsCacheReadError {}
 /// (policy/mechanism seam). Implementations MUST return hostnames in canonical
 /// form (lower-case, no trailing dot) and MUST NOT block on the network.
 pub trait DnsCacheReadPort: Send + Sync {
-    /// Enumerate the A-records currently in the OS resolver cache. The result
-    /// is a point-in-time snapshot; entries with no IPv4 addresses may be
-    /// omitted or returned with an empty `addresses` vec.
+    /// Enumerate the address records currently in the OS resolver cache. The result
+    /// is a point-in-time snapshot; entries with no address may be omitted or
+    /// returned with an empty `addresses` vec.
     fn read_resolver_cache(&self) -> Result<Vec<OsCachedResolution>, DnsCacheReadError>;
+
+    /// Like [`read_resolver_cache`](Self::read_resolver_cache) but only for names
+    /// `keep` accepts. An implementation that pays a per-name OS call overrides
+    /// this to filter before the call; the default filters the full snapshot.
+    fn read_resolver_cache_matching(
+        &self,
+        keep: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<OsCachedResolution>, DnsCacheReadError> {
+        let mut all = self.read_resolver_cache()?;
+        all.retain(|e| keep(&e.canonical_hostname));
+        Ok(all)
+    }
 }
 
 /// Default no-op implementation: reports an empty cache. Used by tests and as
@@ -399,6 +411,12 @@ pub trait SystemDnsServersPort: Send + Sync {
         Vec::new()
     }
 
+    /// [`Self::upstream_candidates_v6`] for a caller that must answer within
+    /// `budget`: empty when the list is not known in time.
+    fn upstream_candidates_v6_within(&self, _budget: Duration) -> Vec<UpstreamDnsServer> {
+        self.upstream_candidates_v6()
+    }
+
     /// Both families, IPv4 first: the caller probes, so order is a first guess.
     fn upstream_candidates(&self) -> Vec<UpstreamDnsServer> {
         let mut all: Vec<UpstreamDnsServer> = self
@@ -407,6 +425,31 @@ pub trait SystemDnsServersPort: Send + Sync {
             .map(UpstreamDnsServer::from)
             .collect();
         all.extend(self.upstream_candidates_v6());
+        all
+    }
+
+    /// [`Self::upstream_candidates_v4`] with a server listed once per link that
+    /// offers it, for a caller that weighs the link: barring one link must not
+    /// hide a server another link offers too. The plain lists keep each server
+    /// once, since their callers query them in turn. A mechanism that reports
+    /// one link per server keeps the default.
+    fn upstream_candidates_v4_per_link(&self) -> Vec<UpstreamDnsCandidate> {
+        self.upstream_candidates_v4()
+    }
+
+    /// The IPv6 twin of [`Self::upstream_candidates_v4_per_link`].
+    fn upstream_candidates_v6_per_link(&self) -> Vec<UpstreamDnsServer> {
+        self.upstream_candidates_v6()
+    }
+
+    /// Both families per link, IPv4 first.
+    fn upstream_candidates_per_link(&self) -> Vec<UpstreamDnsServer> {
+        let mut all: Vec<UpstreamDnsServer> = self
+            .upstream_candidates_v4_per_link()
+            .into_iter()
+            .map(UpstreamDnsServer::from)
+            .collect();
+        all.extend(self.upstream_candidates_v6_per_link());
         all
     }
 
@@ -432,9 +475,46 @@ impl<T: SystemDnsServersPort + ?Sized> SystemDnsServersPort for std::sync::Arc<T
         (**self).upstream_candidates_v6()
     }
 
+    fn upstream_candidates_v6_within(&self, budget: Duration) -> Vec<UpstreamDnsServer> {
+        (**self).upstream_candidates_v6_within(budget)
+    }
+
+    fn upstream_candidates_v4_per_link(&self) -> Vec<UpstreamDnsCandidate> {
+        (**self).upstream_candidates_v4_per_link()
+    }
+
+    fn upstream_candidates_v6_per_link(&self) -> Vec<UpstreamDnsServer> {
+        (**self).upstream_candidates_v6_per_link()
+    }
+
     fn report_all_unreachable(&self, servers: &[UpstreamDnsCandidate]) {
         (**self).report_all_unreachable(servers);
     }
+}
+
+/// Each server once, at the first link that offers it: the plain lists' shape
+/// for a mechanism that reads its servers per link.
+#[must_use]
+pub fn once_per_server<T, K: PartialEq>(listed: Vec<T>, server: impl Fn(&T) -> K) -> Vec<T> {
+    let mut out: Vec<T> = Vec::with_capacity(listed.len());
+    for item in listed {
+        if !out.iter().any(|kept| server(kept) == server(&item)) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// Each `(link, server)` pair once: the per-link lists' shape.
+#[must_use]
+pub fn once_per_link<T: PartialEq>(listed: Vec<T>) -> Vec<T> {
+    let mut out: Vec<T> = Vec::with_capacity(listed.len());
+    for item in listed {
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
 }
 
 /// Fixed candidate list. Production-usable as a manual override and the
@@ -644,6 +724,20 @@ mod tests {
     }
 
     #[test]
+    fn cache_read_matching_default_keeps_only_accepted_names() {
+        let r = MockDnsCacheRead::new();
+        let entry = |n: &str| OsCachedResolution {
+            canonical_hostname: n.into(),
+            addresses: vec![IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))],
+        };
+        r.set_entries(vec![entry("a.example"), entry("b.test")]);
+        let got = r
+            .read_resolver_cache_matching(&|n| n.ends_with(".example"))
+            .expect("mock read");
+        assert_eq!(got, vec![entry("a.example")]);
+    }
+
+    #[test]
     fn mock_default_response_is_nxdomain() {
         let r = MockDnsResolver::new();
         let err = r
@@ -750,7 +844,7 @@ mod tests {
         assert_eq!(r.read_resolver_cache(), Ok(Vec::new()));
         let entries = vec![OsCachedResolution {
             canonical_hostname: "shop.example".into(),
-            addresses: vec![Ipv4Addr::new(192, 0, 2, 4)],
+            addresses: vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4))],
         }];
         r.set_entries(entries.clone());
         assert_eq!(r.read_resolver_cache(), Ok(entries));

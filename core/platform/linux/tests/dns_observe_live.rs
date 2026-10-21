@@ -69,7 +69,7 @@ fn a_resolution_through_resolved_reaches_the_observer() {
         .find(|o| o.hostname == NAME)
         .unwrap_or_else(|| panic!("the resolution was not observed; saw {seen:?}"));
     assert!(
-        !observation.ipv4s.is_empty(),
+        !(observation.ipv4s.is_empty() && observation.ipv6s.is_empty()),
         "an observation must carry the addresses it learnt",
     );
 }

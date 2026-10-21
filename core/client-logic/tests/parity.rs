@@ -16,7 +16,7 @@ use nrr_client_logic::adapters::{self, RoleHint, UnroutableReason};
 use nrr_client_logic::placeholders::{
     fill_placeholders, format_log_line, list_summary, plural_category, PluralRule,
 };
-use nrr_client_logic::rebase::rebase_edits;
+use nrr_client_logic::rebase::{merge_view, rebase_edits};
 use nrr_client_logic::review::{self, Outcome};
 use nrr_client_logic::route_policy;
 use nrr_client_logic::rules_table::{
@@ -176,6 +176,216 @@ fn route_policy_tables_match_js() {
     assert_eq!(
         js.eval_json("ROUTE_POLICY_FIELD_MASKS"),
         Value::Object(masks)
+    );
+    let choices: Map<String, Value> = route_policy::FIELD_CHOICES
+        .iter()
+        .map(|(key, values)| ((*key).to_owned(), json!(values)))
+        .collect();
+    assert_eq!(
+        js.eval_json("ROUTE_POLICY_FIELD_CHOICES"),
+        Value::Object(choices)
+    );
+    assert_eq!(
+        js.eval_json("LEAK_PROTECTION_LEVELS"),
+        json!(route_policy::LEAK_PROTECTION_LEVELS)
+    );
+    assert_eq!(
+        js.eval_json("DEFAULT_ROUTES"),
+        json!(route_policy::DEFAULT_ROUTES)
+    );
+}
+
+#[test]
+fn leak_protection_choices_match_js() {
+    check(
+        "leak_protection_choices",
+        &mut JsLib::pure(),
+        |input| format!("leakProtectionChoices({})", arg(input, "route")),
+        |input| json!(route_policy::leak_protection_choices(text(input, "route"))),
+    );
+}
+
+#[test]
+fn coerce_leak_protection_matches_js() {
+    check(
+        "coerce_leak_protection",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "coerceLeakProtection({}, {})",
+                arg(input, "route"),
+                arg(input, "current")
+            )
+        },
+        |input| {
+            Value::from(route_policy::coerce_leak_protection(
+                text(input, "route"),
+                text(input, "current"),
+            ))
+        },
+    );
+}
+
+#[test]
+fn leak_protection_choices_at_least_match_js() {
+    check(
+        "leak_protection_choices_at_least",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "leakProtectionChoicesAtLeast({}, {})",
+                arg(input, "route"),
+                arg(input, "floor")
+            )
+        },
+        |input| {
+            json!(route_policy::leak_protection_choices_at_least(
+                text(input, "route"),
+                text(input, "floor"),
+            ))
+        },
+    );
+}
+
+#[test]
+fn raise_leak_protection_matches_js() {
+    check(
+        "raise_leak_protection",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "raiseLeakProtection({}, {}, {})",
+                arg(input, "route"),
+                arg(input, "level"),
+                arg(input, "floor")
+            )
+        },
+        |input| {
+            Value::from(route_policy::raise_leak_protection(
+                text(input, "route"),
+                text(input, "level"),
+                text(input, "floor"),
+            ))
+        },
+    );
+}
+
+#[test]
+fn leak_protection_confirm_matches_js() {
+    let (adapters_document, _) = load_vectors("adapters");
+    let base = &adapters_document["base-row"];
+    let (_, cases) = load_vectors("leak_protection_confirm");
+    let cases: Vec<Case> = cases
+        .into_iter()
+        .map(|case| {
+            let mut input = case.input.clone();
+            if !input["secondary"].is_null() {
+                input["secondary"] = merged(base, &case.input["secondary"]);
+            }
+            Case { input, ..case }
+        })
+        .collect();
+    check_cases(
+        "leak_protection_confirm",
+        &cases,
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "(function (w) {{ return leakProtectionConfirmSlug({}, {}, \
+                 w ? mapWireInterfaceRow(w) : null) }})({})",
+                arg(input, "current"),
+                arg(input, "next"),
+                lit(&input["secondary"])
+            )
+        },
+        |input| {
+            let row: Option<InterfaceRowDto> = (!input["secondary"].is_null()).then(|| {
+                serde_json::from_value(input["secondary"].clone())
+                    .expect("vector is an InterfaceRowDto")
+            });
+            Value::from(
+                route_policy::leak_protection_confirm(
+                    text(input, "current"),
+                    text(input, "next"),
+                    row.as_ref(),
+                )
+                .map_or("", route_policy::LeakProtectionConfirm::as_str),
+            )
+        },
+    );
+}
+
+/// The cases of `file`, each `secondary` patch laid over the adapters base row.
+fn cases_with_secondary_row(file: &str) -> Vec<Case> {
+    let (adapters_document, _) = load_vectors("adapters");
+    let base = &adapters_document["base-row"];
+    let (_, cases) = load_vectors(file);
+    cases
+        .into_iter()
+        .map(|case| {
+            let mut input = case.input.clone();
+            if !input["secondary"].is_null() {
+                input["secondary"] = merged(base, &case.input["secondary"]);
+            }
+            Case { input, ..case }
+        })
+        .collect()
+}
+
+fn secondary_row(input: &Value) -> Option<InterfaceRowDto> {
+    (!input["secondary"].is_null()).then(|| {
+        serde_json::from_value(input["secondary"].clone()).expect("vector is an InterfaceRowDto")
+    })
+}
+
+#[test]
+fn default_route_change_confirm_matches_js() {
+    check_cases(
+        "default_route_change_confirm",
+        &cases_with_secondary_row("default_route_change_confirm"),
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "(function (w) {{ return defaultRouteChangeConfirmSlug({}, {}, \
+                 w ? mapWireInterfaceRow(w) : null) }})({})",
+                arg(input, "level"),
+                arg(input, "route"),
+                lit(&input["secondary"])
+            )
+        },
+        |input| {
+            Value::from(
+                route_policy::default_route_change_confirm(
+                    text(input, "level"),
+                    text(input, "route"),
+                    secondary_row(input).as_ref(),
+                )
+                .map_or("", route_policy::LeakProtectionConfirm::as_str),
+            )
+        },
+    );
+}
+
+#[test]
+fn leak_protection_holds_now_matches_js() {
+    check_cases(
+        "leak_protection_holds_now",
+        &cases_with_secondary_row("leak_protection_holds_now"),
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "(function (w) {{ return leakProtectionHoldsNow({}, \
+                 w ? mapWireInterfaceRow(w) : null) }})({})",
+                arg(input, "level"),
+                lit(&input["secondary"])
+            )
+        },
+        |input| {
+            Value::from(route_policy::leak_protection_holds_now(
+                text(input, "level"),
+                secondary_row(input).as_ref(),
+            ))
+        },
     );
 }
 
@@ -686,6 +896,51 @@ fn rebase_edits_matches_js() {
                 "conflicts": out.conflicts.iter().map(|c| format!(
                     "{} {} {} / {}", c.key, c.kind.slug(), side(&c.mine), side(&c.theirs)
                 )).collect::<Vec<_>>(),
+            })
+        },
+    );
+}
+
+/// The merge review's buckets over the same cases as `rebase_edits`; their
+/// own expected output is the agreement of the two sides.
+#[test]
+fn rebase_merge_view_matches_js() {
+    let (_, cases) = load_vectors("rebase_edits");
+    let cases: Vec<Case> = cases
+        .into_iter()
+        .map(|case| Case {
+            expected: None,
+            ..case
+        })
+        .collect();
+    check_cases(
+        "rebase_merge_view",
+        &cases,
+        &mut JsLib::rules(),
+        |input| {
+            format!(
+                "(function (inp) {{ var item = function (i) {{ return i ? i['type-slug'] + ' ' + i.value : '-' }}; var view = rebaseMergeView(rebaseEdits(inp.base, inp.edited, inp.fresh, inp.keep)); return {{ added: view['file-only'].map(item), changed: view.changed.map(item), removed: view.removed.map(item), conflicts: view.conflicts.map(function (c) {{ return c['identity-key'] + ' ' + c.kind + ' ' + item(c.file) + ' / ' + item(c.service) }}), noop: view.noop }} }})({})",
+                lit(input)
+            )
+        },
+        |input| {
+            let view = merge_view(&rebase_edits(
+                &rows_from_js(&input["base"]),
+                &rows_from_js(&input["edited"]),
+                &rows_from_js(&input["fresh"]),
+                &strings(&input["keep"]),
+            ));
+            let item = |row: &RuleRow| format!("{} {}", row.rule_type.as_str(), row.match_value);
+            let side = |row: &Option<RuleRow>| row.as_ref().map_or("-".to_owned(), item);
+            let items = |rows: &[RuleRow]| rows.iter().map(item).collect::<Vec<_>>();
+            json!({
+                "added": items(&view.added),
+                "changed": items(&view.changed),
+                "removed": items(&view.removed),
+                "conflicts": view.conflicts.iter().map(|c| format!(
+                    "{} {} {} / {}", c.key, c.kind.slug(), side(&c.mine), side(&c.theirs)
+                )).collect::<Vec<_>>(),
+                "noop": view.is_noop(),
             })
         },
     );

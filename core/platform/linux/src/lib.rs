@@ -165,6 +165,11 @@ pub mod logrotate;
 /// outlives the terminal that started it.
 #[cfg(target_os = "linux")]
 pub mod logind;
+/// logind's sleep and user edges from the system bus, behind the power-event
+/// and logon-session ports. Frame parsing is pure and tested on every host.
+pub mod logind_signals;
+/// Backoff and stop for the readers that follow a restartable system stream.
+mod restart;
 
 /// `SO_MARK` on the service's own sockets, so machine-scope filters let them
 /// through.
@@ -251,6 +256,13 @@ pub mod vm_inventory;
 /// them with their owning uid, `SOCK_DESTROY` closes them. The netlink codec is
 /// pure and tested on every host; only the socket half is Linux-only.
 pub mod stale_flows;
+
+/// What this kernel can do here (connection reset, per-user routes, block
+/// reports), probed read-only at start and corrected by later failures.
+pub mod kernel_capabilities;
+
+/// `CLOCK_BOOTTIME`: a monotonic clock that counts suspended time.
+pub mod boot_clock;
 
 /// Linux fake-IP TUN seam. The kernel provides
 /// `/dev/net/tun` natively, so unlike Windows there is no third-party driver to

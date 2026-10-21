@@ -21,6 +21,9 @@ SpinBox {
     readonly property int _indicatorReserve: 24
 
     leftPadding: _indicatorReserve + theme.spacingXs
+    // Typed text outside `from`..`to` is not taken (the box keeps its last
+    // value on focus loss), so say so while it is still on screen.
+    readonly property bool inputOutOfRange: editable && !contentItem.acceptableInput
     rightPadding: _indicatorReserve + theme.spacingXs
 
     contentItem: TextInput {
@@ -46,12 +49,14 @@ SpinBox {
         color: !root.enabled
                    ? theme.stateDisabledFill
                    : theme.colorBase
-        border.width: theme.borderWidth
-        border.color: root.activeFocus
-                          ? theme.stateFocusedBorder
-                          : !root.enabled
-                              ? theme.stateDisabledBorder
-                              : theme.stateDefaultBorder
+        border.width: root.inputOutOfRange ? Math.max(2, theme.borderWidth) : theme.borderWidth
+        border.color: root.inputOutOfRange
+                          ? theme.colorDanger
+                          : root.activeFocus
+                              ? theme.stateFocusedBorder
+                              : !root.enabled
+                                  ? theme.stateDisabledBorder
+                                  : theme.stateDefaultBorder
     }
 
     up.indicator: Rectangle {

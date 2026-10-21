@@ -1,7 +1,7 @@
 //! Locale keys of the overlaps screen. The GUI's wording is reused wherever
 //! the GUI says the same thing; only terminal-only text is `tui.*`.
 
-use crate::i18n::{key, Key};
+use crate::i18n::{key, Key, Plural};
 
 pub const TITLE: Key = key("rules.overlaps.nav-label", "Overlaps");
 pub const INTRO: Key = key(
@@ -12,10 +12,11 @@ pub const PAIRS_TITLE: Key = key(
     "tui.overlaps.pairs-title",
     "Rules that cover the same sites",
 );
-pub const PENDING_COUNT: Key = key(
-    "rules.overlaps.pending-badge",
-    "{n} overlap(s) not confirmed",
-);
+pub const PENDING_COUNTED: Plural = Plural {
+    stem: "rules.overlaps.pending-counted.",
+    one: "{count} overlap not confirmed",
+    other: "{count} overlaps not confirmed",
+};
 pub const SHOW_RESOLVED: Key = key("rules.overlaps.show-resolved", "Show resolved");
 pub const YES: Key = key("label.yes", "Yes");
 pub const NO: Key = key("label.no", "No");
@@ -141,6 +142,10 @@ pub const LOADING: Key = key(
     "Reading your rules from the service...",
 );
 pub const FAILED: Key = key("tui.overlaps.failed", "Could not read your rules: {error}");
+pub const PASS_FAILED: Key = key(
+    "rules.overlaps.load-failed",
+    "Could not check the rules for overlaps. Try again in a moment.",
+);
 pub const NO_ITEM: Key = key(
     "tui.overlaps.no-item",
     "There is no item {n} in the list. Use the number shown before an item.",
@@ -208,7 +213,6 @@ pub fn all() -> Vec<Key> {
         TITLE,
         INTRO,
         PAIRS_TITLE,
-        PENDING_COUNT,
         SHOW_RESOLVED,
         YES,
         NO,
@@ -255,6 +259,7 @@ pub fn all() -> Vec<Key> {
         APPLY_ON_RULES,
         LOADING,
         FAILED,
+        PASS_FAILED,
         NO_ITEM,
         CANNOT_SEND,
         GONE,

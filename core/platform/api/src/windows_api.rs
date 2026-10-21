@@ -185,8 +185,8 @@ impl MockWindowsApi {
             Some(sids.iter().map(|s| s.to_string()).collect());
     }
 
-    /// Set the SID returned by `interactive_user_sid` — the service-driven
-    /// routing gate's fallback when no tray is connected.
+    /// Set the one signed-in user `interactive_user_sids` reports while no
+    /// list is set.
     pub fn set_console_user_sid(&self, sid: Option<&str>) {
         *self.console_user_sid.lock().unwrap() = sid.map(|s| s.to_string());
     }
@@ -318,14 +318,16 @@ impl RouteTablePort for MockWindowsApi {
         Ok(self.route_table.lock().unwrap().clone())
     }
 
-    fn interactive_user_sid(&self) -> Option<String> {
-        self.console_user_sid.lock().unwrap().clone()
-    }
-
     fn interactive_user_sids(&self) -> Vec<String> {
         match self.interactive_user_sids.lock().unwrap().clone() {
             Some(sids) => sids,
-            None => self.interactive_user_sid().into_iter().collect(),
+            None => self
+                .console_user_sid
+                .lock()
+                .unwrap()
+                .clone()
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -455,6 +457,7 @@ impl WfpEnginePort for MockWindowsApi {
             remote_subnet: spec.remote_subnet,
             remote_subnet_v6: spec.remote_subnet_v6,
             ip_protocol: spec.ip_protocol,
+            remote_subnet_set: spec.remote_subnet_set.clone(),
         });
         self.note_wfp_state();
         Ok(id)
@@ -515,6 +518,7 @@ mod tests {
             remote_subnet: None,
             remote_subnet_v6: None,
             ip_protocol: None,
+            remote_subnet_set: Vec::new(),
         }
     }
 

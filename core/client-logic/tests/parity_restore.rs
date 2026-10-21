@@ -10,7 +10,7 @@ mod js_harness;
 use js_harness::{arg, check, check_cases, load_vectors, Case, JsLib};
 use nrr_client_logic::restore::{
     mutes_to_restore, protection_restore, protection_to_restore, record_route_policy, restore_plan,
-    route_policy_divergence, RestorePlan,
+    route_policy_divergence, upgrade_record, RestorePlan,
 };
 use serde_json::{json, Map, Value};
 
@@ -52,6 +52,16 @@ fn route_policy_intent_after_write_matches_js() {
             );
             Value::Object(next)
         },
+    );
+}
+
+#[test]
+fn route_policy_intent_upgrade_matches_js() {
+    check(
+        "route_policy_intent_upgrade",
+        &mut JsLib::pure(),
+        |input| format!("routePolicyIntentUpgrade({})", arg(input, "intent")),
+        |input| Value::Object(upgrade_record(&object(input, "intent"))),
     );
 }
 

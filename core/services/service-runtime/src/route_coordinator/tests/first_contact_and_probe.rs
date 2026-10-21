@@ -1,4 +1,5 @@
 use super::*;
+use crate::boot_clock::BootInstant;
 
 /// A first contact routes only what the planner would, from the last
 /// recompute's resolution, and the next recompute finds it in place.
@@ -200,6 +201,7 @@ fn a_first_contact_over_its_own_addresses_routes_what_the_full_plan_would() {
         .planned_routes(
             "S-IVANOV",
             &res(Some(target())),
+            coord.route_source.load_for_sid("S-IVANOV").as_ref(),
             &target(),
             &rule_book,
             lookup.as_ref(),
@@ -296,9 +298,9 @@ fn fail_closed_exemptions_carry_probe_target_even_when_liveness_dead() {
     // `is_dead` true, the gated resolution loses the secondary, and the
     // exemptions must still carry the raw next-hop.
     let tracker = Arc::new(SecondaryLivenessTracker::new(1));
-    let dead_since = Instant::now()
+    let dead_since = BootInstant::now()
         .checked_sub(std::time::Duration::from_secs(10))
-        .expect("test host has been up for at least ten seconds");
+        .expect("the clock reads past its start");
     // Baseline first: a DEAD verdict requires the peer to have answered
     // at least once (silent-from-birth gateways are unprobeable, not
     // dead) — and the evidence must be FRESH (records within the
@@ -306,8 +308,11 @@ fn fail_closed_exemptions_carry_probe_target_even_when_liveness_dead() {
     // present rather than left in the past.
     tracker.record(78, true, dead_since);
     tracker.record(78, false, dead_since);
-    tracker.record(78, false, Instant::now());
-    assert!(tracker.is_dead(78, Instant::now()), "fixture must be DEAD");
+    tracker.record(78, false, BootInstant::now());
+    assert!(
+        tracker.is_dead(78, BootInstant::now()),
+        "fixture must be DEAD"
+    );
     let coord_dead = coordinator_with_policy(Arc::clone(&api), Arc::new(FakeRules::new()), policy)
         .with_liveness_probe(
             tracker,
@@ -384,7 +389,7 @@ fn probe_tick_forgets_the_failing_run_when_the_adapter_comes_back_under_a_new_if
 
     // Same adapter name, new ifindex — and the new index already carries a
     // failing run from whoever held it before.
-    tracker.record(61, false, Instant::now());
+    tracker.record(61, false, BootInstant::now());
     assert!(tracker.in_failing_run(61));
     api.set_adapter_infos(vec![adapter(
         "examplevpnvpn",

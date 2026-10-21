@@ -98,9 +98,52 @@ impl AutoRulesEngine {
             .remove(sid);
     }
 
+    /// A full reset of `sid`: everything the engine holds for them, memory and
+    /// the durable mirrors alike, so the next tick has nothing to write back.
+    fn forget_everything_of(&self, sid: &str) {
+        self.forget(sid);
+        self.dismissed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+        self.authored
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+        self.publish_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+        self.unreachable_told
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(owner, _), _| owner != sid);
+        self.quiet_note
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+        self.settings_memo
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+        self.twin_cleanup
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+        self.forget_verify_state(sid);
+    }
+
     /// The number every badge reports: offers the inbox shows by default.
     pub(super) fn pending_count(&self, sid: &str) -> usize {
         shown_by_default_count(&self.candidates(sid))
+    }
+
+    /// [`Self::pending_count`] after an answer, told to every surface: the one
+    /// that answered reads the reply, the others the push.
+    pub(super) fn pending_count_after_answer(&self, sid: &str) -> usize {
+        let pending = self.pending_count(sid);
+        self.publish_count(sid, pending as u64);
+        pending
     }
 
     /// [`Self::pending_count`] against a rules snapshot the caller already holds.
@@ -413,6 +456,7 @@ impl AutoRulesEngine {
             .announced
             .extend(offered.iter().map(|c| c.dto.id.clone()));
         state.announced_at = Some(now);
+        state.told_count = Some(pending);
         drop(states);
         bus.publish_for(
             sid,
@@ -420,8 +464,80 @@ impl AutoRulesEngine {
                 sid: sid.to_string(),
                 pending_count: pending,
                 top_anchor: top_anchor(&anchor_source),
+                announces: !force,
             },
         );
         true
+    }
+
+    /// Tells `sid`'s clients the inbox count when it differs from the last one
+    /// they heard. No notice rides on it, so no debounce: at most one push per
+    /// change, and none while nobody listens (a client reads the list when it
+    /// connects).
+    pub(super) fn publish_count(&self, sid: &str, pending: u64) {
+        let Some(bus) = self.events.as_ref() else {
+            return;
+        };
+        if !bus.has_subscriber_for(sid) {
+            return;
+        }
+        {
+            let mut states = self.publish_state.lock().unwrap_or_else(|p| p.into_inner());
+            let state = states.entry(sid.to_string()).or_default();
+            if state.told_count == Some(pending) {
+                return;
+            }
+            state.told_count = Some(pending);
+        }
+        bus.publish_for(
+            sid,
+            StatusUpdateEvent::AutoRuleCandidatesChanged {
+                sid: sid.to_string(),
+                pending_count: pending,
+                top_anchor: String::new(),
+                announces: false,
+            },
+        );
+    }
+}
+
+impl crate::principal_reset::PrincipalStateHolder for AutoRulesEngine {
+    fn forget_principal(&self, sid: &str) {
+        self.forget_everything_of(sid);
+    }
+
+    fn forget_everyone(&self) {
+        let mut sids: HashSet<String> = HashSet::new();
+        sids.extend(
+            self.ledgers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .keys()
+                .cloned(),
+        );
+        sids.extend(
+            self.pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .keys()
+                .cloned(),
+        );
+        sids.extend(
+            self.dismissed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .keys()
+                .cloned(),
+        );
+        sids.extend(
+            self.verify
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .keys()
+                .cloned(),
+        );
+        for sid in sids {
+            self.forget_everything_of(&sid);
+        }
     }
 }

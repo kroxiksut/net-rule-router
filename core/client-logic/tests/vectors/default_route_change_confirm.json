@@ -1,0 +1,97 @@
+{
+  "description": "pure.js defaultRouteChangeConfirmSlug: what moving the default route must be confirmed for while a level is in force. `secondary` patches the adapters base row; null means nothing is bound",
+  "cases": [
+    {
+      "name": "routed sites raised to everything while the additional connection is down",
+      "input": {
+        "level": "sites",
+        "route": "prefer-secondary-when-available",
+        "secondary": {
+          "availability": "unavailable"
+        }
+      },
+      "expected": "holds-now"
+    },
+    {
+      "name": "routed sites raised to everything with nothing bound",
+      "input": {
+        "level": "sites",
+        "route": "prefer-secondary-when-available",
+        "secondary": null
+      },
+      "expected": "holds-now"
+    },
+    {
+      "name": "routed sites raised to everything while it is up asks nothing",
+      "input": {
+        "level": "sites",
+        "route": "prefer-secondary-when-available",
+        "secondary": {}
+      },
+      "expected": ""
+    },
+    {
+      "name": "routed sites kept under the main connection asks nothing",
+      "input": {
+        "level": "sites",
+        "route": "prefer-primary",
+        "secondary": {
+          "availability": "unavailable"
+        }
+      },
+      "expected": ""
+    },
+    {
+      "name": "protection off is not raised by the route",
+      "input": {
+        "level": "off",
+        "route": "prefer-secondary-when-available",
+        "secondary": {
+          "availability": "unavailable"
+        }
+      },
+      "expected": ""
+    },
+    {
+      "name": "everything already in force asks nothing again",
+      "input": {
+        "level": "everything",
+        "route": "prefer-secondary-when-available",
+        "secondary": {
+          "availability": "unavailable"
+        }
+      },
+      "expected": ""
+    },
+    {
+      "name": "back to the main connection keeps everything without asking",
+      "input": {
+        "level": "everything",
+        "route": "prefer-primary",
+        "secondary": null
+      },
+      "expected": ""
+    },
+    {
+      "name": "an unset route reads as the main connection",
+      "input": {
+        "level": "sites",
+        "route": "",
+        "secondary": null
+      },
+      "expected": ""
+    },
+    {
+      "name": "raised over a dead-end adapter that is up asks nothing more",
+      "input": {
+        "level": "sites",
+        "route": "prefer-secondary-when-available",
+        "secondary": {
+          "gateway": "",
+          "has-forwarding-path": false
+        }
+      },
+      "expected": ""
+    }
+  ]
+}

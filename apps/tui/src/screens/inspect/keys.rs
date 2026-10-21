@@ -3,7 +3,7 @@
 //! `tui.*`. Keys built from a service slug (`diag.conn-trace.egress.<slug>`)
 //! are looked up with `Texts::dynamic` and are the GUI's own.
 
-use crate::i18n::{key, Key};
+use crate::i18n::{key, Key, Plural};
 
 // ── Lists, typing, questions ─────────────────────────────────────────────────
 
@@ -148,6 +148,14 @@ pub const TRACE_PLAIN_GROUPING: Key = key(
     "tui.trace.plain-grouping",
     "g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3",
 );
+pub const TRACE_HELP_RULE: Key = key(
+    "tui.trace.help-rule",
+    "i: a rule for the address of the chosen connection   a: a rule for its program (both open Rules)",
+);
+pub const TRACE_PLAIN_RULE: Key = key(
+    "tui.trace.plain-rule",
+    "i and a row number: a rule for that connection's address, for example i 3; a and a row number: a rule for its program",
+);
 
 // ── Grouping ─────────────────────────────────────────────────────────────────
 
@@ -155,11 +163,16 @@ pub const TRACE_GROUP_BY: Key = key("diag.conn-trace.group-by", "Group");
 pub const TRACE_GROUP_NONE: Key = key("diag.conn-trace.group-none", "No grouping");
 pub const TRACE_GROUP_PROGRAM: Key = key("diag.conn-trace.group-program", "By program");
 pub const TRACE_GROUP_FOLDER: Key = key("diag.conn-trace.group-folder", "By folder");
-pub const TRACE_GROUP_COUNT: Key = key("diag.conn-trace.group-count", "connection(s)");
-pub const TRACE_GROUP_FOLDER_COUNTS: Key = key(
-    "diag.conn-trace.group-folder-counts",
-    "%1 program(s)  ·  %2 connection(s)",
-);
+pub const TRACE_GROUP_CONNECTIONS: Plural = Plural {
+    stem: "diag.conn-trace.group-connections.",
+    one: "{count} connection",
+    other: "{count} connections",
+};
+pub const TRACE_GROUP_PROGRAMS: Plural = Plural {
+    stem: "diag.conn-trace.group-programs.",
+    one: "{count} program",
+    other: "{count} programs",
+};
 pub const TRACE_GROUP_NO_PATH: Key = key(
     "diag.conn-trace.group-no-path",
     "Programs without a known path",
@@ -333,6 +346,10 @@ pub const DNS_NOT_RESTORED: Key = key(
     "tui.service.dns-not-restored",
     "System DNS could not be restored. Run nrr-cli reset-network as administrator.",
 );
+pub const RULES_BOOK_UNREADABLE: Key = key(
+    "diag.service.rules-book-unreadable",
+    "The service could not read saved rules. The rules applied last stay in force until it can.",
+);
 pub const STARTED_AFTER: Key = key(
     "diag.service.started-after-sign-in",
     "The service started %1 s after this boot reached the sign-in screen.",
@@ -366,6 +383,7 @@ pub const AUDIT_BROKEN: Key = key(
     "Audit chain mismatch detected",
 );
 pub const AUDIT_OK: Key = key("diag.status.audit-chain-ok", "Audit chain intact");
+pub const AUDIT_EMPTY: Key = key("diag.audit.empty", "No audit entries");
 pub const ALERTS_UNREAD: Key = key(
     "diag.alert.unread-prefix",
     "Security alerts requiring attention:",
@@ -476,6 +494,16 @@ pub const TRACE_PLAIN_CHECK: Key = key(
     "c and a row number: check that connection's site, for example c 3",
 );
 
+pub const MISSING_HEADING: Key = key("platform.missing.heading", "Not available on this computer");
+pub const DNS_TAMPER_HEADING: Key = key(
+    "diag.dns-tamper.heading",
+    "Your provider changes some DNS answers",
+);
+pub const DNS_TAMPER_BODY: Key = key(
+    "diag.dns-tamper.body",
+    "For {count} sites the provider's name lookup gave an unusable answer. NetRuleRouter asked another resolver and routes those sites correctly anyway.",
+);
+pub const DNS_TAMPER_EXAMPLES: Key = key("diag.dns-tamper.examples", "For example: {names}");
 pub const ARCHIVE: Key = key("diag.archive.title", "Diagnostic archive export");
 pub const ARCHIVE_NOTE: Key = key(
     "diag.archive.service-owned-note",
@@ -506,7 +534,7 @@ pub const LOGS_ALL: Key = key("diag.logs.range-all", "All history");
 
 pub const DIAG_HELP_SWITCH: Key = key(
     "tui.diagnostics.help-switch",
-    "l: switch between diagnostics and the log",
+    "l: switch between diagnostics, the log and the audit trail",
 );
 pub const DIAG_HELP_ACK: Key = key(
     "tui.diagnostics.help-ack",
@@ -598,12 +626,12 @@ pub const ALL: &[Key] = &[
     TRACE_PLAIN_HISTORY,
     TRACE_HELP_GROUPING,
     TRACE_PLAIN_GROUPING,
+    TRACE_HELP_RULE,
+    TRACE_PLAIN_RULE,
     TRACE_GROUP_BY,
     TRACE_GROUP_NONE,
     TRACE_GROUP_PROGRAM,
     TRACE_GROUP_FOLDER,
-    TRACE_GROUP_COUNT,
-    TRACE_GROUP_FOLDER_COUNTS,
     TRACE_GROUP_NO_PATH,
     TRACE_RULE_FOR_FOLDER,
     TRACE_GROUPING_NOT_SAVED,
@@ -673,6 +701,7 @@ pub const ALL: &[Key] = &[
     REVISION,
     PENDING,
     DNS_NOT_RESTORED,
+    RULES_BOOK_UNREADABLE,
     STARTED_AFTER,
     STARTED_BEFORE,
     STALE,
@@ -687,6 +716,7 @@ pub const ALL: &[Key] = &[
     AUDIT,
     AUDIT_BROKEN,
     AUDIT_OK,
+    AUDIT_EMPTY,
     ALERTS_UNREAD,
     ALERTS_UNREADABLE,
     ALERTS_NONE,
@@ -717,6 +747,10 @@ pub const ALL: &[Key] = &[
     ROUTE_SECONDARY,
     VERDICT_BLOCK,
     VERDICT_PERMIT,
+    MISSING_HEADING,
+    DNS_TAMPER_HEADING,
+    DNS_TAMPER_BODY,
+    DNS_TAMPER_EXAMPLES,
     ARCHIVE,
     ARCHIVE_NOTE,
     ARCHIVE_READY,
@@ -778,6 +812,23 @@ mod tests {
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         serde_json::from_str(raw.trim_start_matches('\u{feff}'))
             .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn plural_families_are_in_both_locale_files() {
+        for language in ["en", "ru"] {
+            let root = locale(language);
+            for plural in [super::TRACE_GROUP_CONNECTIONS, super::TRACE_GROUP_PROGRAMS] {
+                for id in plural.required_ids() {
+                    let found = id
+                        .split('.')
+                        .try_fold(&root, |node, part| node.get(part))
+                        .and_then(Value::as_str)
+                        .is_some();
+                    assert!(found, "{language}.json lacks {id}");
+                }
+            }
+        }
     }
 
     #[test]

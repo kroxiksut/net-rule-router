@@ -67,7 +67,6 @@ whatsapp.*  # Foreign messengers and communication tools
 *.line-apps.com  # Foreign messengers and communication tools
 *.wechat.com  # Foreign messengers and communication tools
 *.qq.com  # Foreign messengers and communication tools
-*.skype.com  # Foreign messengers and communication tools
 *.zoom.us  # Foreign messengers and communication tools
 *.slack.com  # Foreign messengers and communication tools
 
@@ -84,9 +83,6 @@ whatsapp.*  # Foreign messengers and communication tools
 *.poe.com  # Foreign AI and developer AI ecosystems
 *.character.ai  # Foreign AI and developer AI ecosystems
 *.mistral.ai  # Foreign AI and developer AI ecosystems
-chat.mistral.ai  # Foreign AI and developer AI ecosystems
-lechat.mistral.ai  # Foreign AI and developer AI ecosystems
-api.mistral.ai  # Foreign AI and developer AI ecosystems
 *.huggingface.co  # Foreign AI and developer AI ecosystems
 *.replicate.com  # Foreign AI and developer AI ecosystems
 *.stability.ai  # Foreign AI and developer AI ecosystems
@@ -109,13 +105,6 @@ copilot.microsoft.com  # Google and Microsoft AI entry points
 *.jetbrains.com  # JetBrains ecosystem
 *.jb.gg  # JetBrains ecosystem
 *.intellij.net  # JetBrains ecosystem
-account.jetbrains.com  # JetBrains ecosystem
-plugins.jetbrains.com  # JetBrains ecosystem
-downloads.marketplace.jetbrains.com  # JetBrains ecosystem
-download.jetbrains.com  # JetBrains ecosystem
-download-cdn.jetbrains.com  # JetBrains ecosystem
-resources.jetbrains.com  # JetBrains ecosystem
-data.services.jetbrains.com  # JetBrains ecosystem
 api.jetbrains.ai  # JetBrains ecosystem
 *.youtrack.cloud  # JetBrains ecosystem
 *.teamcity.com  # JetBrains ecosystem
@@ -132,7 +121,6 @@ discord.exe  # Messaging and social apps
 signal.exe  # Messaging and social apps
 viber.exe  # Messaging and social apps
 # line.exe  # LINE: the process name is too generic, check it on your machine
-skype.exe  # Messaging and social apps
 zoom.exe  # Messaging and social apps
 slack.exe  # Messaging and social apps
 teams.exe  # Messaging and social apps

@@ -821,13 +821,15 @@ GroupBox {
                     theme: root.uiTheme
                     Layout.preferredWidth: 140
                     Layout.minimumWidth: 140
-                    from: 1
+                    // The service refuses less than 30 days; a lower bound here
+                    // would let the whole retention save be rejected.
+                    from: 30
                     to: 3650
                     value: group.defaultAuditMaxAgeDays
                     editable: true
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
-                    ToolTip.text: "1–3650"
+                    ToolTip.text: "30–3650"
                 }
                 Label {
                     text: root.uiRevision >= 0 ? root.tr("diag.retention.audit-max-age-unit", "days") : ""
@@ -844,7 +846,8 @@ GroupBox {
                     theme: root.uiTheme
                     Layout.preferredWidth: 140
                     Layout.minimumWidth: 140
-                    from: 1
+                    // Floor is the service's 10 MiB, in the chosen unit.
+                    from: auditSizeUnitCombo.currentIndex === 0 ? 10240 : 10
                     // Cap depends on the unit, exactly as the log budget above:
                     // one cap for a number whose unit varies bounds nothing.
                     to: auditSizeUnitCombo.currentIndex === 0 ? 1048576 : 1024
@@ -852,7 +855,8 @@ GroupBox {
                     editable: true
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
-                    ToolTip.text: "1–" + (auditSizeUnitCombo.currentIndex === 0 ? "1048576" : "1024")
+                    ToolTip.text: (auditSizeUnitCombo.currentIndex === 0 ? "10240" : "10")
+                        + "–" + (auditSizeUnitCombo.currentIndex === 0 ? "1048576" : "1024")
                 }
                 ThemedComboBox {
                     id: auditSizeUnitCombo

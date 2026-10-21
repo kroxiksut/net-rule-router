@@ -505,7 +505,7 @@ mod match_sample_tests {
             None,
             None,
             ZonePriorityPolicy::default(),
-            crate::RouteBehaviorMode::StrictSecondaryFailClosed,
+            crate::RouteBehaviorMode::PreferSecondaryWhenAvailable,
         );
         // The passed behavior_mode must be carried into the DefaultRoute so
         // the explain probe reflects the caller's real per-SID mode (not a
@@ -514,7 +514,7 @@ mod match_sample_tests {
             RequestedRouteDecision::DefaultRoute { behavior_mode, .. } => {
                 assert_eq!(
                     behavior_mode,
-                    crate::RouteBehaviorMode::StrictSecondaryFailClosed
+                    crate::RouteBehaviorMode::PreferSecondaryWhenAvailable
                 );
             }
             other => panic!("expected DefaultRoute, got {other:?}"),

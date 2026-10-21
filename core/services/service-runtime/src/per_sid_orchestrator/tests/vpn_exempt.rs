@@ -158,22 +158,22 @@ fn a_learned_client_outside_the_program_folders_is_not_exempt() {
         .contains(&PLANTED.to_string()));
 }
 
-/// Strict means nothing a rule did not name leaves. The default block used to
-/// be IPv4 only, so every IPv6 flow to an unnamed host left over the main
-/// link; now the family has its own block, with the link's own upkeep spared.
+/// "Everything" means nothing leaves but the floor while the tunnel is down,
+/// and that holds for IPv6 too: the family has its own block, with the link's
+/// own upkeep spared.
 #[test]
-fn the_strict_default_block_closes_ipv6_too_and_spares_loopback() {
+fn a_blanket_closes_ipv6_too_and_spares_loopback() {
     let (api, orch, src, rules) = fixture_with_ipv6(
-        Some(KS_LUID),
+        None,
         "example.test",
         vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))],
     );
     rules.set(rules_with_secondary_host("example.test"));
-    src.set("S-1-5-21-A", snap_strict_guard_off("Wi-Fi", "TAP"));
+    src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
     let filters = api.wfp_filters.lock().unwrap();
-    let default_v6 = filters
+    let blanket_v6 = filters
         .iter()
         .find(|f| {
             f.layer == WfpLayerKey::AleAuthConnectV6
@@ -181,8 +181,8 @@ fn the_strict_default_block_closes_ipv6_too_and_spares_loopback() {
                 && f.remote_ip_set_v6.is_empty()
                 && f.remote_subnet_v6.is_none()
         })
-        .expect("the v6 twin of the Strict default block");
-    assert_eq!(default_v6.user_sid.as_deref(), Some("S-1-5-21-A"));
+        .expect("the v6 half of the blanket");
+    assert_eq!(blanket_v6.user_sid.as_deref(), Some("S-1-5-21-A"));
     let v6_loopback = filters
         .iter()
         .find(|f| {
@@ -190,8 +190,8 @@ fn the_strict_default_block_closes_ipv6_too_and_spares_loopback() {
                 && f.action == WfpAction::Permit
                 && f.remote_subnet_v6 == Some((std::net::Ipv6Addr::LOCALHOST, 128))
         })
-        .expect("loopback survives the v6 default block");
-    assert!(v6_loopback.weight > default_v6.weight);
+        .expect("loopback survives the v6 blanket");
+    assert!(v6_loopback.weight > blanket_v6.weight);
 }
 
 /// Find the app-exempt permit for [`VPN_CLIENT_PATH`], if any installed.
@@ -245,10 +245,8 @@ fn verified_vpn_client_exempt_installed_when_mode_b_catch_all_arms() {
 
 #[test]
 fn verified_vpn_client_exempt_installed_when_pair_cannot_arm_fail_closed() {
-    // Resolution exists (LUID known) but carries no bootstrap server IPs,
-    // so the mode-B catch-all cannot arm and the posture falls back to
-    // fail-closed blocking — the client app must be permitted through that
-    // block too (this branch historically emitted no app exemptions).
+    // No bootstrap server IPs: whichever way the posture falls, the client
+    // app must be permitted through the block.
     let resolution = KillSwitchResolution {
         secondary_luid: KS_LUID,
         bootstrap_server_ips: Vec::new(),
@@ -256,6 +254,7 @@ fn verified_vpn_client_exempt_installed_when_pair_cannot_arm_fail_closed() {
         local_subnets: Vec::new(),
         local_subnets_v6: Vec::new(),
         foreign_tunnel_luids: Vec::new(),
+        foreign_tunnel_networks: Vec::new(),
     };
     let (api, orch, src, rules) = fixture_with_resolution_and_vpn_clients(
         Some(resolution),
@@ -269,6 +268,42 @@ fn verified_vpn_client_exempt_installed_when_pair_cannot_arm_fail_closed() {
     let exempt = find_client_exempt(&filters)
         .expect("verified VPN client must be permitted through the fail-closed block");
     assert!(exempt.weight >= 0x0060_0000);
+}
+
+/// A tunnel that installs no host route to its server leaves nothing to
+/// exempt by address; the client's own permit carries the reconnect, so the
+/// catch-all arms instead of blocking every rule host while the tunnel is up.
+#[test]
+fn a_tunnel_without_a_server_route_still_arms_when_its_client_is_recognised() {
+    let resolution = KillSwitchResolution {
+        bootstrap_server_ips: Vec::new(),
+        bootstrap_server_ips_v6: Vec::new(),
+        ..full_ks_resolution()
+    };
+    let (api, orch, src, rules) = fixture_with_resolution_and_vpn_clients(
+        Some(resolution),
+        vec![VPN_CLIENT_PATH.to_string()],
+    );
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
+    src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
+
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    let filters = api.wfp_filters.lock().unwrap();
+    assert!(
+        filters
+            .iter()
+            .any(|f| f.action == WfpAction::Permit && f.local_interface_luid == Some(KS_LUID)),
+        "traffic leaving through the tunnel is permitted"
+    );
+    assert!(
+        filters.iter().any(|f| f.action == WfpAction::Block
+            && f.layer == WfpLayerKey::AleAuthConnectV4
+            && f.remote_ip.is_none()
+            && f.remote_subnet.is_none()
+            && f.app_pattern.is_none()),
+        "the catch-all is armed"
+    );
+    assert!(find_client_exempt(&filters).is_some());
 }
 
 #[test]
@@ -293,14 +328,13 @@ fn verified_vpn_client_exempt_not_emitted_for_mode_a_pinning() {
 
 #[test]
 fn fail_closed_block_all_permits_what_the_main_link_names_and_nothing_else() {
-    // Under a Mode-A FailClosedUnknown block-all (secondary unresolved) a
+    // Under the block-all of "everything" (secondary unresolved) a
     // host matched by a primary rule earns a packet-layer permit, so ping
     // survives — INCLUDING one the secondary rules also name. Two of the
     // user's rules pointing one address in opposite directions is not a
     // reason to block it: blocking is a third outcome neither rule asked
     // for, and the main link is the one the user can still see and correct.
     // A host only the SECONDARY names is the leak case, and stays blocked.
-    use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
     let primary_only = Ipv4Addr::new(203, 0, 113, 20);
     let shared = Ipv4Addr::new(203, 0, 113, 21);
     let secondary_only = Ipv4Addr::new(203, 0, 113, 22);
@@ -318,7 +352,7 @@ fn fail_closed_block_all_permits_what_the_main_link_names_and_nothing_else() {
         },
     });
     let mut snap = snap_block("Wi-Fi", "TAP");
-    snap.mode_a_coverage_strategy = ModeACoverageStrategy::FailClosedUnknown;
+    snap.leak_protection = nrr_domain::LeakProtection::Everything;
     src.set("S-1-5-21-A", snap);
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
@@ -429,7 +463,6 @@ fn fixture_with_census(
 /// block, because a block is not one of the two things the user asked for.
 #[test]
 fn a_main_route_named_ip_is_spared_by_the_block_all_in_both_modes() {
-    use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
     use std::sync::atomic::AtomicBool;
     let shared = Ipv4Addr::new(203, 0, 113, 163);
     for (strict, expect_permit) in [(false, true), (true, true)] {
@@ -454,7 +487,7 @@ fn a_main_route_named_ip_is_spared_by_the_block_all_in_both_modes() {
             },
         });
         let mut snap = snap_block("Wi-Fi", "TAP");
-        snap.mode_a_coverage_strategy = ModeACoverageStrategy::FailClosedUnknown;
+        snap.leak_protection = nrr_domain::LeakProtection::Everything;
         snap.kill_switch_strict_shared_ips = strict;
         src.set("S-1-5-21-A", snap);
 
@@ -555,7 +588,6 @@ fn smart_exemption_requires_fake_ip_datapath() {
     // destination earns NO known-primary permit under the block-all (in
     // the  run, 39 assistant.example connections egressed the primary
     // through this exemption while the rule host was fail-closed).
-    use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
     use std::sync::atomic::AtomicBool;
     let shared = Ipv4Addr::new(203, 0, 113, 163);
     let (api, orch, src, rules) = fixture_with_census(
@@ -566,7 +598,7 @@ fn smart_exemption_requires_fake_ip_datapath() {
     );
     rules.set(shared_ip_rule_book(shared));
     let mut snap = snap_block("Wi-Fi", "TAP");
-    snap.mode_a_coverage_strategy = ModeACoverageStrategy::FailClosedUnknown;
+    snap.leak_protection = nrr_domain::LeakProtection::Everything;
     snap.kill_switch_strict_shared_ips = false; // smart mode requested
     src.set("S-1-5-21-A", snap);
 
@@ -685,30 +717,27 @@ fn fake_ip_datapath_flip_retightens_shared_ip_exemption_on_recompute() {
 }
 
 #[test]
-fn kill_switch_disabled_disarms_leak_guard_even_when_secondary_unresolved() {
-    // the MASTER kill-switch toggle is OFF (full opt-in).
-    // Even with a secondary bound, the fail-CLOSED posture, and the secondary
-    // adapter unresolvable (LUID None) — the exact conditions that block in
-    // `kill_switch_fail_closed_blocks_secondary_dest_when_luid_unresolved` —
-    // NO fail-closed block may be installed. Any leak is then the user's
-    // deliberate choice; only the rule's own permit survives.
+fn protection_off_disarms_the_guard_even_when_secondary_unresolved() {
+    // Leak protection off: even with a secondary bound and unresolvable,
+    // the exact conditions that block in
+    // `kill_switch_fail_closed_blocks_secondary_dest_when_luid_unresolved`,
+    // NO block may be installed; only the rule's own permit survives.
     let ip = Ipv4Addr::new(203, 0, 113, 9);
     let (api, orch, src, rules) = fixture_with_luid(None);
     rules.set(rules_with_secondary_ip(ip));
     let mut snap = snap_block("Wi-Fi", "TAP");
-    snap.kill_switch_enabled = false; // master OFF
+    snap.leak_protection = nrr_domain::LeakProtection::Off;
     src.set("S-1-5-21-A", snap);
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
     let filters = api.wfp_filters.lock().unwrap();
     assert!(
         filters.iter().all(|f| f.action != WfpAction::Block),
-        "kill-switch OFF must install ZERO block filters even with the secondary \
-         unresolved (full opt-in — leak-guard fully disarmed)"
+        "protection off must install ZERO block filters even with the secondary unresolved"
     );
 }
 
-/// Mode A, secondary gone, per-IP blocking: the rule host's v6 addresses are
+/// Routed sites, secondary gone, per-IP blocking: the rule host's v6 addresses are
 /// blocked BY NAME. This used to be a blanket `::/0` cut, which also took
 /// every v6 destination the user's rules say nothing about.
 #[test]
@@ -724,7 +753,11 @@ fn the_per_ip_fail_closed_path_blocks_the_rule_hosts_v6_addresses() {
     );
     rules.set(rules_with_secondary_host("example.test"));
     let snap = snap_block("Wi-Fi", "TAP");
-    assert!(!snap.kill_switch_block_all, "per-IP path, not block-all");
+    assert_eq!(
+        snap.leak_protection,
+        nrr_domain::LeakProtection::Sites,
+        "per-IP path, not block-all"
+    );
     src.set("S-1-5-21-A", snap);
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
@@ -770,8 +803,7 @@ fn kill_switch_arms_with_no_secondary_bound_at_all() {
     rules.set(rules_with_secondary_ip(ip));
     let mut snap = snap_full("Wi-Fi", "TAP");
     snap.secondary = None;
-    snap.block_secondary_when_unavailable = false;
-    assert!(snap.kill_switch_enabled);
+    assert!(snap.leak_protection.is_on());
     src.set("S-1-5-21-A", snap);
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
@@ -785,9 +817,9 @@ fn kill_switch_arms_with_no_secondary_bound_at_all() {
 }
 
 #[test]
-fn kill_switch_fail_closed_mode_b_blocks_all_when_unresolved() {
+fn everything_under_the_additional_route_blocks_all_when_unresolved() {
     let ip = Ipv4Addr::new(203, 0, 113, 9);
-    // Mode B (everything-via-secondary), fail-closed, secondary gone →
+    // The additional default route, protecting everything, secondary gone →
     // a catch-all block (plus the safe exemptions) must be installed.
     let (api, orch, src, rules) = fixture_with_luid(None);
     rules.set(rules_with_secondary_ip(ip));
@@ -859,17 +891,109 @@ fn a_machine_wide_cut_is_announced_to_the_principal_who_did_not_ask_for_it() {
                 if reason == "machine-wide-cut-by-another-user"
         )
     };
-    assert!(
+    // Where the OS scopes every protocol per user, nobody else is cut.
+    let machine_wide = !nrr_platform_api::enforcement::EnforcementCapabilities::current()
+        .per_user_all_protocol_scoping;
+    assert_eq!(
         bus.peek_pending_for(&bystander.subscription_id, 8)
             .iter()
             .any(is_notice),
-        "the bystander must be told why their IPv6 and ICMP stopped",
+        machine_wide,
+        "the bystander is told why their IPv6 and ICMP stopped exactly when the cut is machine-wide",
     );
     assert!(
         !bus.peek_pending_for(&asked.subscription_id, 8)
             .iter()
             .any(is_notice),
         "the principal who armed the cut needs no notice",
+    );
+}
+
+/// The machine-wide IPv6 packet cut is held only while one user alone blocks
+/// everything. Its holder's own inputs do not move when a second user arms or
+/// leaves, so that edge has to ask for the pass that re-plans the holder.
+#[test]
+fn a_second_blocker_arriving_or_leaving_re_plans_the_first_one() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let src = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let cache = Arc::new(MockFqdnCacheLookup::new());
+    cache.set_addresses(
+        "example.test",
+        vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))],
+    );
+    let requests = Arc::new(AtomicUsize::new(0));
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&src) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        cache as Arc<dyn FqdnCacheLookup>,
+        Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_kill_switch_resolver(Arc::new(|_, _| None))
+    .with_ipv6_guard_resolver(Arc::new(|_, _| {
+        crate::enforcement_planner::Ipv6Guard::FiltersAndRoutes
+    }))
+    .with_peer_replan({
+        let requests = Arc::clone(&requests);
+        Arc::new(move || {
+            requests.fetch_add(1, Ordering::SeqCst);
+        })
+    });
+    rules.set(rules_with_secondary_host("example.test"));
+    let packet_cut_of = |sid: &str| {
+        let ids: std::collections::HashSet<u64> = orch
+            .installed_filter_ids(sid)
+            .iter()
+            .map(|id| id.raw)
+            .collect();
+        api.wfp_filters.lock().unwrap().iter().any(|f| {
+            ids.contains(&f.id.raw)
+                && f.layer == WfpLayerKey::OutboundIpPacketV6
+                && f.action == WfpAction::Block
+        })
+    };
+    // What the requested pass does: every user's plan again.
+    let pass = || {
+        for sid in ["S-1-5-21-A", "S-1-5-21-B"] {
+            orch.reconcile_secondary_coverage(sid).unwrap();
+        }
+    };
+
+    src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    assert!(packet_cut_of("S-1-5-21-A"), "alone, A holds the packet cut");
+    assert_eq!(requests.load(Ordering::SeqCst), 0, "nobody else to re-plan");
+
+    src.set("S-1-5-21-B", snap_block_mode_b("Wi-Fi", "TAP"));
+    orch.install_for_sid("S-1-5-21-B").unwrap();
+    assert!(!packet_cut_of("S-1-5-21-B"));
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "B arming must ask for a pass, or A keeps cutting B's IPv6"
+    );
+    pass();
+    assert!(
+        !packet_cut_of("S-1-5-21-A"),
+        "with two blockers nobody holds the machine-wide cut"
+    );
+
+    src.set("S-1-5-21-B", snap_primary_only("Wi-Fi"));
+    orch.recompile_for_sid("S-1-5-21-B").unwrap();
+    assert_eq!(requests.load(Ordering::SeqCst), 2, "B leaving asks too");
+    pass();
+    assert!(
+        packet_cut_of("S-1-5-21-A"),
+        "alone again, A gets its packet cut back"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        2,
+        "a re-plan that changes nobody's posture asks for nothing more"
     );
 }
 
@@ -928,11 +1052,10 @@ fn two_triggers_for_one_sid_do_not_interleave() {
 }
 
 #[test]
-fn turning_the_guard_off_in_strict_does_not_cut_the_machine_off() {
-    // The Strict default block belongs to the MODE, so it is emitted with
-    // the guard off too. Its exemptions used to live inside the guard's
-    // branch, so switching the kill-switch off left a bare block-all with
-    // no loopback, no LAN, no DHCP and no route to the VPN server.
+fn the_catch_all_does_not_cut_the_machine_off() {
+    // Everything through the tunnel still leaves loopback, the LAN and the
+    // way to the VPN server open: without them the machine is cut off and
+    // the tunnel cannot come back.
     let resolution = KillSwitchResolution {
         secondary_luid: KS_LUID,
         bootstrap_server_ips: vec![Ipv4Addr::new(198, 51, 100, 9)],
@@ -940,10 +1063,11 @@ fn turning_the_guard_off_in_strict_does_not_cut_the_machine_off() {
         local_subnets: vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
         local_subnets_v6: Vec::new(),
         foreign_tunnel_luids: Vec::new(),
+        foreign_tunnel_networks: Vec::new(),
     };
     let (api, orch, src, rules) = fixture_with_resolution(Some(resolution));
     rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 9)));
-    src.set("S-1-5-21-A", snap_strict_guard_off("Wi-Fi", "TAP"));
+    src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
     let filters = api.wfp_filters.lock().unwrap();
@@ -951,12 +1075,12 @@ fn turning_the_guard_off_in_strict_does_not_cut_the_machine_off() {
         filters.iter().any(|f| f.action == WfpAction::Block
             && (f.remote_ip.is_none() && f.remote_ip_set.is_empty())
             && f.layer == WfpLayerKey::AleAuthConnectV4),
-        "fixture guard: Strict must still emit its default block",
+        "fixture guard: the catch-all must be armed",
     );
     assert!(
         filters.iter().any(|f| f.action == WfpAction::Permit
             && f.remote_subnet == Some((Ipv4Addr::new(127, 0, 0, 0), 8))),
-        "loopback must survive the default block",
+        "loopback must survive the catch-all",
     );
     assert!(
         filters.iter().any(|f| f.action == WfpAction::Permit
@@ -986,6 +1110,7 @@ fn a_device_on_the_machines_own_lan_is_never_pinned_to_the_tunnel() {
         local_subnets: vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
         local_subnets_v6: Vec::new(),
         foreign_tunnel_luids: Vec::new(),
+        foreign_tunnel_networks: Vec::new(),
     };
     let (api, orch, src, rules) = fixture_with_resolution(Some(resolution));
     rules.set(rules_with_secondary_ips(&[NAS, REMOTE]));
@@ -1009,13 +1134,10 @@ fn a_device_on_the_machines_own_lan_is_never_pinned_to_the_tunnel() {
 
 #[test]
 fn a_healthy_tunnel_is_never_cut_by_the_guard_in_the_tunnel_default_modes() {
-    // The tunnel is UP (LUID resolved) but the leak-proof pair cannot arm —
-    // no bootstrap server IP to exempt, the everyday cold-cache case for
-    // zone/suffix rules. The caller states it must NOT escalate here, and
-    // passes `block_all: false`; the guard used to ignore that in the
-    // tunnel-default modes and install a catch-all anyway, cutting every
-    // egress on a healthy tunnel and deadlocking the cache warm-up that
-    // would have lifted it.
+    // The tunnel is UP (LUID resolved) but the catch-all cannot arm: no
+    // bootstrap server IP to exempt and no trusted client. A catch-all here
+    // would seal the tunnel's reconnect; the rule destinations are pinned to
+    // the tunnel instead.
     let resolution = KillSwitchResolution {
         secondary_luid: KS_LUID,
         bootstrap_server_ips: Vec::new(),
@@ -1023,6 +1145,7 @@ fn a_healthy_tunnel_is_never_cut_by_the_guard_in_the_tunnel_default_modes() {
         local_subnets: Vec::new(),
         local_subnets_v6: Vec::new(),
         foreign_tunnel_luids: Vec::new(),
+        foreign_tunnel_networks: Vec::new(),
     };
     let (api, orch, src, rules) = fixture_with_resolution(Some(resolution));
     rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 9)));
@@ -1038,15 +1161,21 @@ fn a_healthy_tunnel_is_never_cut_by_the_guard_in_the_tunnel_default_modes() {
     });
     assert!(
         !catch_all_v4,
-        "a live tunnel must not be cut by a catch-all the caller explicitly declined",
+        "a live tunnel must not be cut by a catch-all that cannot arm",
     );
-    // The per-IP guard is still there: declining to escalate is not
-    // declining to guard.
+    // The pins are still there: declining the blanket is not declining to
+    // guard, and the pin's own egress permit keeps the tunnel's path open.
     assert!(
         filters
             .iter()
             .any(|f| f.action == WfpAction::Block && f.covers_v4(Ipv4Addr::new(203, 0, 113, 9))),
-        "the enumerated destination must still be blocked",
+        "the enumerated destination is held to the tunnel",
+    );
+    assert!(
+        filters.iter().any(|f| f.action == WfpAction::Permit
+            && f.local_interface_luid == Some(KS_LUID)
+            && f.covers_v4(Ipv4Addr::new(203, 0, 113, 9))),
+        "and still leaves through it",
     );
 }
 
@@ -1138,7 +1267,6 @@ fn block_all_arming_edge_flushes_os_dns_cache_once_per_transition() {
     // once on the disarmed→armed edge and once on armed→disarmed; the
     // steady-state reconcile (same compute, every few seconds on HW) must
     // never flush, or the OS cache would be permanently defeated.
-    use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
     let api = Arc::new(MockWindowsApi::new());
     let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
     let source = Arc::new(ScriptedSource::default());
@@ -1157,7 +1285,7 @@ fn block_all_arming_edge_flushes_os_dns_cache_once_per_transition() {
     rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 9)));
     let armed_snap = || {
         let mut s = snap_block("Wi-Fi", "TAP");
-        s.mode_a_coverage_strategy = ModeACoverageStrategy::FailClosedUnknown;
+        s.leak_protection = nrr_domain::LeakProtection::Everything;
         s
     };
     source.set("S-1-5-21-A", armed_snap());
@@ -1172,7 +1300,7 @@ fn block_all_arming_edge_flushes_os_dns_cache_once_per_transition() {
     );
 
     let mut disarmed = armed_snap();
-    disarmed.kill_switch_enabled = false; // master OFF → block-all gone
+    disarmed.leak_protection = nrr_domain::LeakProtection::Off; // block-all gone
     source.set("S-1-5-21-A", disarmed);
     orch.install_for_sid("S-1-5-21-A").unwrap();
     assert_eq!(flusher.flush_count(), 2, "disarming edge must flush once");

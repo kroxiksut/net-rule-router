@@ -28,7 +28,7 @@
 use core::fmt;
 use std::net::IpAddr;
 
-use nrr_shared::{RouteBehaviorMode, RouteRole};
+use nrr_shared::RouteRole;
 
 use crate::{
     address_class::AddressClass,
@@ -338,11 +338,6 @@ impl fmt::Display for ValidationError {
 /// configurations that the user or GUI should be made aware of.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidationWarning {
-    /// No secondary binding is present and the behavior mode is
-    /// `StrictSecondaryFailClosed`. The fail-closed contract cannot be fulfilled
-    /// without a secondary adapter.
-    MissingSecondaryWithFailClosed,
-
     /// The secondary binding references an adapter that is not in the current
     /// adapter snapshot. The adapter may be temporarily disconnected.
     UnknownAdapterReference { role: RouteRole, stable_id: String },
@@ -446,20 +441,15 @@ pub enum ValidationWarning {
     AppPatternRefusedDropped { rule_id: RuleId, value: String },
 
     /// A "check where it works" rule (`?value`) on a rule kind it means
-    /// nothing for — only domain and exact-IP rules are checked. It was kept as
-    /// a plain route rule of its own set.
+    /// nothing for — only domain and exact IPv4 rules are checked (the check
+    /// reaches a destination over IPv4 only). It was kept as a plain route
+    /// rule of its own set.
     VerifyIgnored { rule_id: RuleId, role: RouteRole },
 }
 
 impl fmt::Display for ValidationWarning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingSecondaryWithFailClosed => {
-                write!(
-                    f,
-                    "behavior mode is StrictSecondaryFailClosed but no secondary binding is present"
-                )
-            }
             Self::UnknownAdapterReference { role, stable_id } => {
                 write!(
                     f,
@@ -582,7 +572,7 @@ impl fmt::Display for ValidationWarning {
             Self::VerifyIgnored { rule_id, role } => {
                 write!(
                     f,
-                    "rule {rule_id}: '?' applies to a domain or exact-IP rule only; kept as a plain {role:?} rule"
+                    "rule {rule_id}: '?' applies to a domain or exact IPv4 address rule only; kept as a plain {role:?} rule"
                 )
             }
         }
@@ -755,15 +745,7 @@ pub fn validate_and_canonicalize(
 
     detect_cross_set_duplicates(&primary_rules, &secondary_rules, &mut warnings);
 
-    // ── 4. Behavior-mode / binding compatibility (warnings) ───────────────────
-
-    if config.secondary.is_none()
-        && config.behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed
-    {
-        warnings.push(ValidationWarning::MissingSecondaryWithFailClosed);
-    }
-
-    // ── 5. Build outcome ──────────────────────────────────────────────────────
+    // ── 4. Build outcome ──────────────────────────────────────────────────────
 
     if !errors.is_empty() {
         return ValidationOutcome::Rejected { errors, warnings };
@@ -855,14 +837,16 @@ pub(crate) fn settle_verify(rule: &mut CanonicalRule) -> bool {
 }
 
 /// "Does it open on this link" is asked of one destination a connection can
-/// name: a host name or one address, in either set.
+/// name: a host name or one IPv4 address, in either set. The probe leaves from
+/// an IPv4 source only, so an IPv6 literal could never be checked: it is a
+/// plain route, with the warning, rather than a `?` that silently does nothing.
 fn verify_applies(rule: &CanonicalRule) -> bool {
     matches!(
         rule.address_match,
         Some(
             CanonicalAddressMatch::ExactFqdn(_)
                 | CanonicalAddressMatch::SuffixDomain(_)
-                | CanonicalAddressMatch::ExactIp(_)
+                | CanonicalAddressMatch::ExactIp(std::net::IpAddr::V4(_))
         )
     )
 }
@@ -910,6 +894,11 @@ fn normalize_rule(
         }
         Some(AddressMatch::SuffixDomain(value)) => {
             match canonical_host_name(HostNameKind::Domain, value, &rule.id, warnings) {
+                // A whole top-level domain is a zone however it was written,
+                // so a literal address inside it beats it, as with `.ru`.
+                Ok(normalized) if !normalized.contains('.') => {
+                    Some(CanonicalAddressMatch::Zone(normalized))
+                }
                 Ok(normalized) => Some(CanonicalAddressMatch::SuffixDomain(normalized)),
                 Err(e) => {
                     errors.push(e);
@@ -1678,18 +1667,38 @@ pub fn networks_on_both_routes(book: &CanonicalRuleBook) -> Vec<String> {
                 .as_ref()
                 .is_some_and(|m| m.ip_blocks().is_some())
     };
-    let primary: std::collections::HashSet<MatchKey> = book
+    // By piece: a range names its decomposition, so one piece equal to the
+    // other route's subnet is the same tie as two equal subnets.
+    let pieces =
+        |rule: &CanonicalRule| -> Vec<(Option<CanonicalAppPattern>, Option<bool>, IpBlock)> {
+            let blocks = rule
+                .address_match
+                .as_ref()
+                .and_then(CanonicalAddressMatch::ip_blocks)
+                .unwrap_or_default();
+            blocks
+                .iter()
+                .map(|b| {
+                    (
+                        rule.app_match.as_ref().map(|a| a.pattern.clone()),
+                        rule.app_match.as_ref().map(|a| a.include_child_processes),
+                        *b,
+                    )
+                })
+                .collect()
+        };
+    let primary: std::collections::HashSet<_> = book
         .primary
         .rules()
         .iter()
         .filter(routed_network)
-        .map(MatchKey::across_sets)
+        .flat_map(&pieces)
         .collect();
     book.secondary
         .rules()
         .iter()
         .filter(routed_network)
-        .filter(|rule| primary.contains(&MatchKey::across_sets(rule)))
+        .filter(|rule| pieces(rule).iter().any(|p| primary.contains(p)))
         .filter_map(|rule| rule.address_match.as_ref())
         .map(CanonicalAddressMatch::to_display_string)
         .collect()

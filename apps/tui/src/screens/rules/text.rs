@@ -1,7 +1,7 @@
 //! The Rules screen's words. The GUI's own keys where the GUI says the same
 //! thing; `tui.rules.*` only for what exists in the terminal alone.
 
-use crate::i18n::{key, Key};
+use crate::i18n::{key, Key, Plural};
 
 // ── Shared with the GUI ──────────────────────────────────────────────────────
 
@@ -20,6 +20,20 @@ pub const ROUTE_FILTER: Key = key("rules.filter.route.label", "Route");
 pub const SEARCH: Key = key("action.search", "Search");
 pub const DISABLED: Key = key("label.disabled", "disabled");
 pub const AUTO_ORIGIN: Key = key("rules.auto-origin.badge", "Added for you");
+pub const APP_PINS: Key = key("rules.app-pins.badge", "holds {count} addresses");
+pub const HOSTS_BLOCKED: Key = key("rules.hosts-override.blocked", "Blocked in hosts");
+pub const HOSTS_REDIRECTED: Key = key(
+    "rules.hosts-override.redirected",
+    "Redirected by system → {ip}",
+);
+pub const HOSTS_NOTE: Key = key(
+    "rules.hosts-override.tooltip",
+    "The operating system's hosts file resolves this hostname before NetRuleRouter sees any traffic, so NetRuleRouter cannot override it. Edit the OS hosts file to change this.",
+);
+pub const APP_PINS_NOTE: Key = key(
+    "rules.app-pins.tooltip",
+    "These are the addresses this application has been seen using, and they now travel the additional link for EVERY program on this computer — a route cannot be told which process it is for. An address another program starts using is given back to the main connection automatically.",
+);
 pub const VALIDATION_ERROR: Key = key("rules.validation.error", "Error — rule is inactive");
 pub const VALIDATION_WARNING: Key = key("rules.validation.warning", "Valid with warnings");
 pub const EMPTY_TITLE: Key = key("rules.empty.title", "No rules yet");
@@ -51,6 +65,10 @@ pub const VERIFY_HINT: Key = key(
 pub const VERIFY_ANY_ZONE: Key = key(
     "dialog.rule.verify-any-zone",
     "A site in every zone is not checked: the check needs one host.",
+);
+pub const VERIFY_IPV6: Key = key(
+    "dialog.rule.verify-ipv6",
+    "An IPv6 address is not checked: the check goes out over IPv4 only, so this stays an ordinary route rule.",
 );
 pub const VERIFY_DENY: Key = key(
     "dialog.rule.verify-deny",
@@ -280,6 +298,115 @@ pub const KEEP_LIST: Key = key("tui.rules.changed-elsewhere.keep", "Keep my list
 pub const REBASED: Key = key(
     "tui.rules.changed-elsewhere.rebased",
     "Your edits are on top of the rules now in force. Review them before they apply.",
+);
+pub const MERGE_TITLE: Key = key(
+    "dialog.merge.edits-title",
+    "Your edits and the rules now in force",
+);
+pub const MERGE_BODY: Key = key(
+    "dialog.merge.edits-body",
+    "Your rules were changed elsewhere while you were editing them. Your edits go on top of the rules now in force: a rule you added, changed or deleted is added, changed or deleted there too, and rules changed elsewhere stay. Where both sides changed the same rule you pick the version that stays.",
+);
+pub const MERGE_BUCKET_ADDED: Key = key("dialog.merge.bucket-edits-only", "Only in your edits");
+pub const MERGE_BUCKET_CHANGED: Key = key("dialog.merge.bucket-edits-changed", "Changed by you");
+pub const MERGE_BUCKET_DELETED: Key = key("dialog.merge.bucket-edits-deleted", "Deleted by you");
+pub const MERGE_BUCKET_CONFLICTS: Key = key("dialog.merge.bucket-conflicts", "Conflicts");
+pub const MERGE_PICK_MINE: Key = key("dialog.merge.pick-edits", "Your edit");
+pub const MERGE_PICK_THEIRS: Key = key("dialog.merge.pick-in-force", "In force");
+pub const MERGE_SIDE_DELETED: Key = key("dialog.merge.side-deleted", "deleted");
+pub const MERGE_STAYS: Key = key("tui.rules.merge.stays", "stays: {side}");
+pub const MERGE_KEYS: Key = key(
+    "tui.rules.merge.keys",
+    "Up and Down choose a conflict; Space or a number switches the version that stays; Enter merges and shows the changes for review; Esc leaves your list as it is.",
+);
+pub const MERGE_PLAIN_PROMPT: Key = key(
+    "tui.rules.merge.plain-prompt",
+    "Type a conflict's number to switch the version that stays, y to merge and review, n to leave your list as it is.",
+);
+pub const MERGE_CANCELLED: Key = key(
+    "tui.rules.merge.cancelled",
+    "Nothing was merged. Your list is as it was.",
+);
+pub const FILES_MERGE_TITLE: Key = key("dialog.merge.title", "Merge file and app rules");
+pub const FILES_MERGE_BODY: Key = key(
+    "dialog.merge.body",
+    "Combine your linked rules file with the rules the service is currently enforcing. Rules on only one side are always kept; rules that exist on both but differ are shown as conflicts.",
+);
+pub const FILES_MERGE_BUCKET_FILE: Key = key("dialog.merge.bucket-file-only", "Only in the file");
+pub const FILES_MERGE_BUCKET_SERVICE: Key =
+    key("dialog.merge.bucket-service-only", "Only in the app");
+pub const FILES_MERGE_PICK_FILE: Key = key("dialog.merge.pick-file", "File");
+pub const FILES_MERGE_PICK_SERVICE: Key = key("dialog.merge.pick-service", "App");
+pub const FILES_MATCH: Key = key(
+    "dialog.merge.no-op",
+    "The file and the app rules already match \u{2014} nothing to merge.",
+);
+pub const FILES_CONVERGED: Key = key(
+    "notifications.rules-file-converged.title",
+    "Your rules file was brought up to date",
+);
+pub const FILES_DRIFT: Key = key(
+    "status.merge-banner",
+    "The rules in your files are not the ones being applied \u{2014} you can compare and merge them.",
+);
+pub const FILES_DRIFT_KEY: Key = key(
+    "tui.rules.files.drift-key",
+    "Press F to compare the files with the rules in force.",
+);
+pub const FILES_NONE: Key = key(
+    "tui.rules.files.none",
+    "No rules files are linked, so there is nothing to compare. Export the rules with x to link them.",
+);
+pub const FILES_DIRTY: Key = key(
+    "tui.rules.files.dirty",
+    "Apply the changes on screen, or drop them with r, before comparing the files with the rules in force.",
+);
+pub const FILES_FAILED: Key = key(
+    "tui.rules.files.failed",
+    "The files could not be compared with the rules in force: {error}",
+);
+pub const HELP_FILES_MERGE: Key = key(
+    "tui.rules.help.files-merge",
+    "F: compare your linked rules files with the rules in force and merge them",
+);
+pub const PLAIN_FILES_MERGE: Key = key(
+    "tui.rules.plain.files-merge",
+    "F: compare your linked rules files with the rules in force and merge them",
+);
+pub const SPARE_TITLE: Key = key("dialog.rules-overlap.title", "Remove rules already covered");
+pub const SPARE_BODY: Key = key(
+    "dialog.rules-overlap.body",
+    "These rules name a host that one of your wildcard rules already covers. Removing them changes nothing about where your traffic goes \u{2014} it only shortens the list.",
+);
+pub const SPARE_ITEM: Key = key(
+    "dialog.rules-overlap.covered-by",
+    "{host} \u{2014} already covered by *.{apex}",
+);
+pub const SPARE_ACTION: Key = key("rules.action.clean-overlaps", "Remove covered rules ({n})");
+pub const SPARE_NONE: Key = key(
+    "dialog.rules-overlap.empty",
+    "Nothing is covered twice right now.",
+);
+pub const SPARE_REMOVED: Plural = Plural {
+    stem: "status.rules-overlap-removed.",
+    one: "{count} rule removed as already covered. Apply to put the change into effect.",
+    other: "{count} rules removed as already covered. Apply to put the change into effect.",
+};
+pub const HELP_SPARE: Key = key(
+    "tui.rules.help.spare",
+    "Shift+C: remove the rules a wildcard rule of the same route already covers; where traffic goes does not change",
+);
+pub const PLAIN_SPARE: Key = key(
+    "tui.rules.plain.spare",
+    "C: remove the rules a wildcard rule of the same route already covers",
+);
+pub const HELP_APP_GROUPS: Key = key(
+    "tui.rules.help.app-groups",
+    "g: send a group of programs or a hypervisor's machines over a route",
+);
+pub const PLAIN_APP_GROUPS: Key = key(
+    "tui.rules.plain.app-groups",
+    "g: application and device routes",
 );
 pub const HAND_EDITED_TITLE: Key = key(
     "dialog.rules-file-edited.title",
@@ -1074,6 +1201,11 @@ pub const ALL: &[Key] = &[
     SEARCH,
     DISABLED,
     AUTO_ORIGIN,
+    APP_PINS,
+    APP_PINS_NOTE,
+    HOSTS_BLOCKED,
+    HOSTS_REDIRECTED,
+    HOSTS_NOTE,
     VALIDATION_ERROR,
     VALIDATION_WARNING,
     EMPTY_TITLE,
@@ -1090,6 +1222,7 @@ pub const ALL: &[Key] = &[
     VERIFY,
     VERIFY_HINT,
     VERIFY_ANY_ZONE,
+    VERIFY_IPV6,
     VERIFY_DENY,
     APP_NOT_LEAKPROOF,
     APP_FOLDER_SCRIPTS,
@@ -1172,6 +1305,43 @@ pub const ALL: &[Key] = &[
     REBASE,
     KEEP_LIST,
     REBASED,
+    MERGE_TITLE,
+    MERGE_BODY,
+    MERGE_BUCKET_ADDED,
+    MERGE_BUCKET_CHANGED,
+    MERGE_BUCKET_DELETED,
+    MERGE_BUCKET_CONFLICTS,
+    MERGE_PICK_MINE,
+    MERGE_PICK_THEIRS,
+    MERGE_SIDE_DELETED,
+    MERGE_STAYS,
+    MERGE_KEYS,
+    MERGE_PLAIN_PROMPT,
+    MERGE_CANCELLED,
+    FILES_MERGE_TITLE,
+    FILES_MERGE_BODY,
+    FILES_MERGE_BUCKET_FILE,
+    FILES_MERGE_BUCKET_SERVICE,
+    FILES_MERGE_PICK_FILE,
+    FILES_MERGE_PICK_SERVICE,
+    FILES_MATCH,
+    FILES_CONVERGED,
+    FILES_DRIFT,
+    FILES_DRIFT_KEY,
+    FILES_NONE,
+    FILES_DIRTY,
+    FILES_FAILED,
+    HELP_FILES_MERGE,
+    PLAIN_FILES_MERGE,
+    SPARE_TITLE,
+    SPARE_BODY,
+    SPARE_ITEM,
+    SPARE_ACTION,
+    SPARE_NONE,
+    HELP_SPARE,
+    PLAIN_SPARE,
+    HELP_APP_GROUPS,
+    PLAIN_APP_GROUPS,
     HAND_EDITED_TITLE,
     HAND_EDITED_BODY,
     HAND_EDITED_TAKE,

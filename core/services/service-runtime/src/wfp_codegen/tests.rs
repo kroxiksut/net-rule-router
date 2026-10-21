@@ -119,7 +119,6 @@ fn a_shared_address_gets_no_secondary_filter() {
     let out = generate_filters(CodegenInput {
         sid: "S-1-5-21-A",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -165,7 +164,6 @@ fn exact_ip_rule_emits_single_filter_with_remote_ip() {
     let out = generate_filters(CodegenInput {
         sid: "S-1-5-21-A",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -202,7 +200,6 @@ fn exact_fqdn_rule_fans_out_over_cached_ips() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -257,7 +254,6 @@ fn codegen_output_is_deterministic_and_behaviorally_self_equivalent() {
     let input = || CodegenInput {
         sid: "S-1-5-21-A",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &app_obs,
         app_resolver: &NoopAppPathResolver,
@@ -290,7 +286,6 @@ fn codegen_output_is_deterministic_and_behaviorally_self_equivalent() {
     let other = generate_filters(CodegenInput {
         sid: "S-1-5-21-A",
         rule_book: &other_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -313,7 +308,6 @@ fn exact_fqdn_rule_with_cold_cache_emits_diagnostic_no_filter() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -350,7 +344,6 @@ fn suffix_domain_fans_out_over_cached_subdomains_and_their_ips() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -381,7 +374,6 @@ fn suffix_domain_fan_out_includes_the_apex() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -410,7 +402,6 @@ fn zone_fan_out_still_excludes_the_bare_zone_label() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -432,7 +423,6 @@ fn suffix_domain_with_only_a_cached_apex_still_emits_a_filter() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -453,7 +443,6 @@ fn suffix_domain_with_no_cached_subdomains_emits_diagnostic() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -490,7 +479,6 @@ fn suffix_domain_over_many_hosts_keeps_every_address_inside_one_band() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -553,7 +541,6 @@ fn a_wide_rule_costs_filters_by_slot_not_by_address() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -579,7 +566,6 @@ fn a_wide_rule_costs_filters_by_slot_not_by_address() {
     let again = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -615,7 +601,6 @@ fn suffix_domain_at_backstop_emits_truncated_diagnostic() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -648,7 +633,6 @@ fn zone_fans_out_over_cached_hosts_under_tld() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -668,7 +652,6 @@ fn zone_with_no_cached_hosts_emits_zone_empty_diagnostic() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -699,7 +682,6 @@ fn application_rule_emits_filter_with_app_pattern_and_no_remote_ip() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &resolver,
@@ -733,7 +715,6 @@ fn app_observed_ips_are_marked_only_for_a_resolved_secondary_route_rule() {
         generate_filters(CodegenInput {
             sid: "S",
             rule_book,
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
             fqdn_cache: &cache,
             app_observations: &app_obs,
             app_resolver: resolver,
@@ -779,7 +760,6 @@ fn builtin_vpn_globs_resolve_to_concrete_paths_never_leaving_a_glob() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &resolver,
@@ -813,7 +793,6 @@ fn builtin_vpn_globs_unresolved_yield_empty_exempt_set() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -849,7 +828,6 @@ fn builtin_vpn_exempt_paths_are_deduped_and_sorted() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &resolver,
@@ -878,7 +856,6 @@ fn app_rule_with_unresolved_exe_emits_diagnostic_and_no_app_id_filter() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &app_obs,
         app_resolver: &resolver,
@@ -927,7 +904,6 @@ fn glob_app_rule_fans_out_one_app_id_filter_per_resolved_path() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &resolver,
@@ -966,7 +942,6 @@ fn resolved_app_id_weight_sits_below_shifted_observation_mirrors() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &app_obs,
         app_resolver: &resolver,
@@ -993,119 +968,33 @@ fn resolved_app_id_weight_sits_below_shifted_observation_mirrors() {
     assert_eq!(mirror.weight - app_id.weight, APP_PATH_FANOUT_CAP + 1);
 }
 
-// ── Default behaviour modes ─────────────────────────────────────────────
+// ── Default route ───────────────────────────────────────────────────────
 
+/// No rules, no filters: unmatched traffic follows the OS route table, and
+/// leak protection is the kill-switch's business, not the rule codegen's.
 #[test]
-fn strict_secondary_fail_closed_emits_block_catch_all() {
+fn an_empty_book_emits_nothing_in_either_family() {
     let cache = MockFqdnCacheLookup::new();
     let rule_book = book(vec![], vec![]);
-    let out = generate_filters(CodegenInput {
-        sid: "S",
-        rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::StrictSecondaryFailClosed,
-        fqdn_cache: &cache,
-        app_observations: &MockAppObservationLookup::new(),
-        app_resolver: &NoopAppPathResolver,
-        secondary_ip_denylist: &std::collections::HashSet::new(),
-        zone_priority_over_ip: false,
-        app_rules_take_all_addresses: false,
-        families: crate::enforcement_planner::FamilyScope::V4Only,
-        packet_blocks: true,
-    });
-    assert_eq!(out.filters.len(), 1);
-    let f = &out.filters[0];
-    assert_eq!(f.action, WfpAction::Block);
-    assert!(f.remote_ip.is_none() && f.remote_ip_set.is_empty());
-    assert_eq!(f.weight, DEFAULT_BLOCK_WEIGHT);
-    assert_eq!(
-        out.diagnostics,
-        vec![CodegenDiagnostic::FailClosedDefaultEmitted]
-    );
-}
-
-/// With IPv6 in play the default block has a twin on the v6 layer: Strict
-/// closes the family too, or every v6 flow to an unnamed host leaves.
-#[test]
-fn strict_default_block_has_a_v6_twin_when_the_family_is_in_scope() {
-    let cache = MockFqdnCacheLookup::new();
-    let rule_book = book(vec![], vec![]);
-    let out = generate_filters(CodegenInput {
-        sid: "S",
-        rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::StrictSecondaryFailClosed,
-        fqdn_cache: &cache,
-        app_observations: &MockAppObservationLookup::new(),
-        app_resolver: &NoopAppPathResolver,
-        secondary_ip_denylist: &std::collections::HashSet::new(),
-        zone_priority_over_ip: false,
-        app_rules_take_all_addresses: false,
-        families: crate::enforcement_planner::FamilyScope::Both,
-        packet_blocks: true,
-    });
-    assert_eq!(out.filters.len(), 2, "one default block per family");
-    let v6 = out
-        .filters
-        .iter()
-        .find(|f| f.layer == WfpLayerKey::AleAuthConnectV6)
-        .expect("the v6 twin");
-    assert_eq!(v6.action, WfpAction::Block);
-    assert_eq!(v6.weight, DEFAULT_BLOCK_WEIGHT);
-    assert!(v6.remote_ip_set_v6.is_empty() && v6.remote_subnet_v6.is_none());
-    assert_eq!(v6.user_sid.as_deref(), Some("S"));
-    assert_ne!(
-        out.filters[0].id, out.filters[1].id,
-        "a twin needs its own id"
-    );
-    assert_eq!(
-        out.diagnostics,
-        vec![CodegenDiagnostic::FailClosedDefaultEmitted],
-        "one default, two layers"
-    );
-    assert_eq!(
-        default_block_ids("S"),
-        [out.filters[0].id.raw, out.filters[1].id.raw],
-        "the drop classifier must recognise both halves"
-    );
-}
-
-#[test]
-fn prefer_primary_does_not_emit_default_block() {
-    let cache = MockFqdnCacheLookup::new();
-    let rule_book = book(vec![], vec![]);
-    let out = generate_filters(CodegenInput {
-        sid: "S",
-        rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
-        fqdn_cache: &cache,
-        app_observations: &MockAppObservationLookup::new(),
-        app_resolver: &NoopAppPathResolver,
-        secondary_ip_denylist: &std::collections::HashSet::new(),
-        zone_priority_over_ip: false,
-        app_rules_take_all_addresses: false,
-        families: crate::enforcement_planner::FamilyScope::V4Only,
-        packet_blocks: true,
-    });
-    assert!(out.filters.is_empty());
-}
-
-#[test]
-fn prefer_secondary_when_available_does_not_emit_default_block() {
-    let cache = MockFqdnCacheLookup::new();
-    let rule_book = book(vec![], vec![]);
-    let out = generate_filters(CodegenInput {
-        sid: "S",
-        rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferSecondaryWhenAvailable,
-        fqdn_cache: &cache,
-        app_observations: &MockAppObservationLookup::new(),
-        app_resolver: &NoopAppPathResolver,
-        secondary_ip_denylist: &std::collections::HashSet::new(),
-        zone_priority_over_ip: false,
-        app_rules_take_all_addresses: false,
-        families: crate::enforcement_planner::FamilyScope::V4Only,
-        packet_blocks: true,
-    });
-    assert!(out.filters.is_empty());
+    for families in [
+        crate::enforcement_planner::FamilyScope::V4Only,
+        crate::enforcement_planner::FamilyScope::Both,
+    ] {
+        let out = generate_filters(CodegenInput {
+            sid: "S",
+            rule_book: &rule_book,
+            fqdn_cache: &cache,
+            app_observations: &MockAppObservationLookup::new(),
+            app_resolver: &NoopAppPathResolver,
+            secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
+            families,
+            packet_blocks: true,
+        });
+        assert!(out.filters.is_empty(), "{families:?}");
+        assert!(out.diagnostics.is_empty(), "{families:?}");
+    }
 }
 
 // ── Disabled rules ──────────────────────────────────────────────────────
@@ -1120,7 +1009,6 @@ fn disabled_rule_is_skipped_with_diagnostic() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1156,7 +1044,6 @@ fn repeated_generation_produces_identical_filter_ids() {
     let a = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1169,7 +1056,6 @@ fn repeated_generation_produces_identical_filter_ids() {
     let b = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1212,7 +1098,6 @@ fn primary_filters_outrank_secondary_filters_by_weight() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1250,7 +1135,6 @@ fn per_sid_user_sid_stamped_on_every_filter() {
     let out = generate_filters(CodegenInput {
         sid: "S-1-5-21-XYZ",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::StrictSecondaryFailClosed,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1275,7 +1159,6 @@ fn different_sids_produce_different_filter_ids() {
     let a = generate_filters(CodegenInput {
         sid: "S-1-5-21-A",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1288,7 +1171,6 @@ fn different_sids_produce_different_filter_ids() {
     let b = generate_filters(CodegenInput {
         sid: "S-1-5-21-B",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1313,7 +1195,6 @@ fn primary_and_secondary_rule_with_same_id_produce_different_filter_ids() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1343,7 +1224,6 @@ fn fanout_idx_keeps_filter_ids_unique_for_multi_ip_hostname() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1364,7 +1244,6 @@ fn no_rule_no_strict_mode_yields_empty_output() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1390,7 +1269,6 @@ fn secondary_dest_ips_collects_only_secondary_rule_ips() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1423,7 +1301,6 @@ fn secondary_dest_ips_dedupes_across_rules_and_fanout() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1463,7 +1340,6 @@ fn an_app_rule_does_not_take_over_an_address_a_main_route_rule_names() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &observations,
         app_resolver: &resolver,
@@ -1516,7 +1392,6 @@ fn an_app_whose_every_address_was_claimed_is_not_reported_as_unobserved() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &observations,
         app_resolver: &resolver,
@@ -1555,7 +1430,6 @@ fn an_app_rule_still_claims_addresses_nobody_else_named() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &observations,
         app_resolver: &resolver,
@@ -1578,7 +1452,6 @@ fn secondary_dest_ips_skips_app_match_rules() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &resolver,
@@ -1614,7 +1487,6 @@ fn app_rule_routes_observed_ips_as_secondary_dest() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &app_obs,
         app_resolver: &resolver,
@@ -1654,7 +1526,6 @@ fn secondary_app_patterns_collects_secondary_route_apps() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &resolver,
@@ -1698,7 +1569,6 @@ fn secondary_app_patterns_excludes_primary_and_block_apps() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &resolver,
@@ -1734,7 +1604,6 @@ fn block_rule_emits_ale_and_packet_block_at_block_band() {
     let out = generate_filters(CodegenInput {
         sid: "S-1-5-21-A",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1787,7 +1656,6 @@ fn block_rule_ip_is_excluded_from_secondary_dest_ips() {
     let out = generate_filters(CodegenInput {
         sid: "S",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -1814,7 +1682,6 @@ fn block_filter_ids_are_deterministic_across_reapply() {
         generate_filters(CodegenInput {
             sid: "S",
             rule_book: &rule_book,
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
             fqdn_cache: &cache,
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
@@ -1901,7 +1768,6 @@ fn an_app_and_address_rule_is_skipped_whole_for_either_action() {
         let out = generate_filters(CodegenInput {
             sid: "S",
             rule_book: &rule_book,
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
             fqdn_cache: &cache,
             app_observations: &app_obs,
             app_resolver: &resolver,
@@ -2032,7 +1898,6 @@ fn path_codegen(
     generate_filters(CodegenInput {
         sid,
         rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &app_obs,
         app_resolver: resolver,
@@ -2249,7 +2114,6 @@ fn an_address_a_folders_script_taught_is_not_left_to_the_program_pair() {
     let out = generate_filters(CodegenInput {
         sid: "S-1-5-21-A",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &store,
         app_resolver: &resolver,
@@ -2261,4 +2125,86 @@ fn an_address_a_folders_script_taught_is_not_left_to_the_program_pair() {
     });
     assert_eq!(out.app_observed_secondary_ips, vec![by_program]);
     assert!(out.secondary_dest_ips.contains(&IpAddr::V4(by_script)));
+}
+
+#[test]
+fn a_program_deny_closes_both_families_and_leaves_loopback_open() {
+    let resolver = MockAppPathResolver::from_seed([(
+        "evil.exe".to_string(),
+        vec![PathBuf::from(r"C:\Apps\evil.exe")],
+    )]);
+    let mut denied = app_rule("r-deny", "evil.exe", false);
+    denied.action = nrr_domain::RuleAction::Block;
+    let rule_book = book(vec![], vec![denied]);
+    let out = generate_filters(CodegenInput {
+        sid: "S",
+        rule_book: &rule_book,
+        fqdn_cache: &MockFqdnCacheLookup::new(),
+        app_observations: &MockAppObservationLookup::new(),
+        app_resolver: &resolver,
+        secondary_ip_denylist: &std::collections::HashSet::new(),
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
+    });
+    let app: Vec<_> = out
+        .filters
+        .iter()
+        .filter(|f| f.app_pattern.as_deref() == Some(r"C:\Apps\evil.exe"))
+        .collect();
+    let block = |layer| {
+        app.iter()
+            .find(|f| f.action == WfpAction::Block && f.layer == layer)
+            .map(|f| f.weight)
+    };
+    let permit = |layer| {
+        app.iter()
+            .find(|f| f.action == WfpAction::Permit && f.layer == layer)
+            .copied()
+    };
+    let v4_block = block(WfpLayerKey::AleAuthConnectV4).expect("v4 block");
+    assert_eq!(block(WfpLayerKey::AleAuthConnectV6), Some(v4_block));
+    let lo4 = permit(WfpLayerKey::AleAuthConnectV4).expect("v4 loopback permit");
+    let lo6 = permit(WfpLayerKey::AleAuthConnectV6).expect("v6 loopback permit");
+    assert_eq!(lo4.remote_subnet, Some((Ipv4Addr::new(127, 0, 0, 0), 8)));
+    assert_eq!(
+        lo6.remote_subnet_v6,
+        Some((std::net::Ipv6Addr::LOCALHOST, 128))
+    );
+    assert!(lo4.weight > v4_block && lo6.weight > v4_block);
+    assert!(
+        lo4.weight < BASE_BLOCK + SLOTS_PER_RULE,
+        "stays inside the rule's own slots"
+    );
+    let ids: std::collections::HashSet<_> = app.iter().map(|f| f.id.raw).collect();
+    assert_eq!(ids.len(), app.len(), "ids are distinct");
+    assert!(
+        out.secondary_dest_networks.is_empty() && out.primary_dest_networks.is_empty(),
+        "a loopback permit is not a routed network"
+    );
+}
+
+#[test]
+fn a_program_route_rule_gets_no_loopback_companions() {
+    let resolver = MockAppPathResolver::from_seed([(
+        "chrome.exe".to_string(),
+        vec![PathBuf::from(r"C:\Apps\chrome.exe")],
+    )]);
+    let rule_book = book(vec![], vec![app_rule("r-app", "chrome.exe", false)]);
+    let out = generate_filters(CodegenInput {
+        sid: "S",
+        rule_book: &rule_book,
+        fqdn_cache: &MockFqdnCacheLookup::new(),
+        app_observations: &MockAppObservationLookup::new(),
+        app_resolver: &resolver,
+        secondary_ip_denylist: &std::collections::HashSet::new(),
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
+    });
+    assert!(out.filters.iter().all(|f| f.remote_subnet.is_none()
+        && f.remote_subnet_v6.is_none()
+        && f.layer == WfpLayerKey::AleAuthConnectV4));
 }

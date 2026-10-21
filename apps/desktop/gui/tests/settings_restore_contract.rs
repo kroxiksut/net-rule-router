@@ -144,7 +144,7 @@ fn the_tray_records_its_writes_and_asks_only_when_the_window_is_closed() {
     let tray = repo_file("apps/desktop/qml/Tray.qml");
     for record in [
         "\"merge\": { \"auto-rules-mode\": String(mode) } })",
-        "\"merge\": { \"kill-switch-enabled\": want === true } })",
+        "\"merge\": { \"leak-protection\": req[\"leak-protection\"] } })",
         "tray._recordIntent({ \"namespace\": \"notice-mutes\", \"value\": tray._noticeMutes })",
     ] {
         assert!(tray.contains(record), "the tray does not record: {record}");

@@ -178,6 +178,13 @@ impl PerSidApplyOrchestrator {
         if let Some(status) = self.block_all_posture_status.as_ref() {
             status.set(self.any_block_all_armed());
         }
+        // Another armed user's plan decides its machine-wide IPv6 packet cut by
+        // who else blocks, so this edge changes their plan too.
+        if self.other_principals_hold_block_all(sid) {
+            if let Some(request) = self.peer_replan.as_ref() {
+                request();
+            }
+        }
         match self.dns_cache_control.flush_resolver_cache() {
             Ok(()) => {
                 tracing::info!(
@@ -305,7 +312,10 @@ impl PerSidApplyOrchestrator {
                 .unwrap_or_else(|p| p.into_inner());
             let prior = g.insert(sid.to_string(), wants);
             let changed = prior != Some(wants);
-            let anybody_cuts = g.values().any(|v| *v);
+            // Where a cut is limited to one account nobody else is affected.
+            let anybody_cuts = !nrr_platform_api::enforcement::EnforcementCapabilities::current()
+                .per_user_all_protocol_scoping
+                && g.values().any(|v| *v);
             let bystanders: Vec<String> = if anybody_cuts {
                 g.iter()
                     .filter(|(_, cuts)| !**cuts)
@@ -424,97 +434,48 @@ impl PerSidApplyOrchestrator {
         }
     }
 
-    /// Build the fail-closed filter set for the failure posture. Mode A
-    /// (selective) blocks only the protected secondary destinations and the
-    /// held networks; modes B (everything-via-secondary) block all egress
-    /// except the safe exemptions. Pure projection over the codegen primitives.
-    #[allow(clippy::too_many_arguments)]
+    /// The tunnel-down filter set: with `block_all`, everything except the safe
+    /// exemptions plus the tunnel's own destinations by name; otherwise only
+    /// the protected destinations and the held networks. Pure projection over
+    /// the codegen primitives.
     pub(super) fn fail_closed_filters(
         &self,
         sid: &str,
-        mode: RouteBehaviorMode,
         protected_secondary_ips: &[std::net::IpAddr],
         holds: &crate::enforcement_planner::NetworkHolds,
         exemptions: &FailClosedExemptions,
         protocols: crate::killswitch_codegen::KillSwitchProtocols,
         posture: FailClosedPosture,
     ) -> Vec<WfpFilterSpec> {
-        let FailClosedPosture { block_all } = posture;
-        match mode {
-            RouteBehaviorMode::PreferPrimary => {
-                // with `kill_switch_block_all` the split-mode
-                // emergency block covers ALL egress (catch-all) so ICMP/ping and
-                // rotating/un-cached secondary-rule IPs can't leak to the primary
-                // while the secondary adapter is down; otherwise it blocks only the enumerated
-                // secondary destinations (the historic per-IP behaviour).
-                if block_all {
-                    let mut out = crate::killswitch_codegen::fail_closed_block_all_filters(
-                        sid, exemptions, protocols,
-                    );
-                    out.extend(named_destination_blocks_under_block_all(
-                        sid,
-                        protected_secondary_ips,
-                        holds,
-                        exemptions,
-                        protocols,
-                    ));
-                    out
-                } else {
-                    // honour the VPN-server (bootstrap) exemption on
-                    // the mode-A per-IP path too: subtract the exempted server IPs
-                    // from the per-destination block set so, if a secondary rule
-                    // ever resolved to the tunnel's own server IP, the handshake to
-                    // it is never blocked. Mirrors the block-all path's
-                    // bootstrap_server_ips exemption, closing the IP-overlap corner
-                    // case as defence-in-depth alongside the per-app primary
-                    // exemption above.
-                    // The protected set carries both families, so a rule host's
-                    // v6 addresses are blocked here by name instead of cutting the
-                    // whole v6 family.
-                    let protected: Vec<std::net::IpAddr> =
-                        exempt_tunnel_servers(protected_secondary_ips, exemptions);
-                    let mut out = crate::killswitch_codegen::fail_closed_block_destinations(
-                        sid, &protected, protocols,
-                    );
-                    out.extend(crate::killswitch_codegen::fail_closed_network_filters(
-                        sid, holds, protocols,
-                    ));
-                    out
-                }
-            }
-            RouteBehaviorMode::PreferSecondaryWhenAvailable
-            | RouteBehaviorMode::StrictSecondaryFailClosed => {
-                // `block_all` must be honoured here: the caller that arms the
-                // guard while the tunnel is HEALTHY (empty pin set on a cold
-                // FQDN cache) states in its own comment that it must not
-                // escalate. Ignoring `block_all` would force a catch-all
-                // anyway, cutting every egress on a live tunnel and
-                // deadlocking the very cache warm-up that would lift it.
-                if block_all {
-                    let mut out = crate::killswitch_codegen::fail_closed_block_all_filters(
-                        sid, exemptions, protocols,
-                    );
-                    out.extend(named_destination_blocks_under_block_all(
-                        sid,
-                        protected_secondary_ips,
-                        holds,
-                        exemptions,
-                        protocols,
-                    ));
-                    out
-                } else {
-                    let protected: Vec<std::net::IpAddr> =
-                        exempt_tunnel_servers(protected_secondary_ips, exemptions);
-                    let mut out = crate::killswitch_codegen::fail_closed_block_destinations(
-                        sid, &protected, protocols,
-                    );
-                    out.extend(crate::killswitch_codegen::fail_closed_network_filters(
-                        sid, holds, protocols,
-                    ));
-                    out
-                }
-            }
+        let FailClosedPosture {
+            block_all,
+            machine_has_other_principals,
+        } = posture;
+        if block_all {
+            let mut out = crate::killswitch_codegen::fail_closed_block_all_filters_for(
+                sid,
+                exemptions,
+                protocols,
+                machine_has_other_principals,
+            );
+            out.extend(named_destination_blocks_under_block_all(
+                sid,
+                protected_secondary_ips,
+                holds,
+                exemptions,
+                protocols,
+            ));
+            return out;
         }
+        // The tunnel's own server is never blocked by name, even if a rule
+        // resolved to it: the handshake to it is how the tunnel comes back.
+        let protected = exempt_tunnel_servers(protected_secondary_ips, exemptions);
+        let mut out =
+            crate::killswitch_codegen::fail_closed_block_destinations(sid, &protected, protocols);
+        out.extend(crate::killswitch_codegen::fail_closed_network_filters(
+            sid, holds, protocols,
+        ));
+        out
     }
 
     /// Reset `sid`'s unresolved-app set and rule conflicts so the

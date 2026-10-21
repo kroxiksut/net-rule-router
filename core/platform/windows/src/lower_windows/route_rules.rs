@@ -25,7 +25,7 @@ pub fn lower_route_rules(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
     // behavioural oracle still compares like with like.
     let mut out = Vec::new();
     let mut rules: Vec<(RuleChunkKey, Vec<IpAddr>)> = Vec::new();
-    for flow in &plan.flows {
+    for flow in plan.flows.iter().filter(|f| !is_foreign_restatement(f)) {
         match rule_chunk_key(flow) {
             Some((key, ip)) => match rules.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, ips)) => ips.push(ip),
@@ -111,13 +111,12 @@ pub(super) fn rule_chunk_key(flow: &FlowRule) -> Option<(RuleChunkKey, IpAddr)> 
         Verdict::Block => WfpAction::Block,
     };
     let ordinal = u64::from(flow.precedence.ordinal);
-    let slot = ordinal % nrr_platform_api::enforcement::SLOTS_PER_RULE;
     let observed_app_range = nrr_platform_api::enforcement::APP_PATH_FANOUT_CAP + 1;
     Some((
         RuleChunkKey {
             base,
             rule_position: ordinal / nrr_platform_api::enforcement::SLOTS_PER_RULE,
-            slot_base: if slot >= observed_app_range {
+            slot_base: if flow.observed_by_program {
                 observed_app_range
             } else {
                 0

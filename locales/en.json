@@ -57,6 +57,7 @@
     "settings": "Settings"
   },
   "action": {
+    "save": "Save",
     "open-folder": "Open folder",
     "ok": "OK",
     "move": "Move",
@@ -82,6 +83,7 @@
     "add": "Add",
     "edit": "Edit",
     "delete": "Delete",
+    "remove": "Remove",
     "refresh": "Refresh",
     "clear": "Clear",
     "export": "Export",
@@ -119,6 +121,7 @@
     "expand-submenu": "Expand submenu",
     "open-rules": "Open rules",
     "open-settings": "Open settings",
+    "open-diagnostics": "Open diagnostics",
     "details": "Details",
     "show-details": "Show details",
     "hide-details": "Hide details",
@@ -197,7 +200,7 @@
         "uninstall": "Uninstall service",
         "start": "Start service",
         "stop": "Stop service",
-        "stop-tooltip": "Stops the background service. By default all routes are removed and every connection returns to your main connection; leak-protection blocks are always removed. (Turn on \"Keep matched routes on the additional adapter\" in Settings to keep your routed sites on the additional adapter — e.g. a work/corporate adapter.) Note: simply closing the app keeps routing active, because the service keeps running.",
+        "stop-tooltip": "Stops the background service. By default all routes are removed and every connection returns to your main connection; leak-protection blocks are removed. (Turn on \"Keep matched routes on the additional adapter\" in Settings to keep your routed sites on the additional adapter — e.g. a work/corporate adapter.) Note: simply closing the app keeps routing active, because the service keeps running.",
         "restart": "Restart service",
         "open-logs": "Open service logs folder",
         "gc-orphan-comments": "Clear orphan comments"
@@ -359,6 +362,8 @@
       "auto-confirm-adapter-id-tooltip": "When an additional adapter is reinstalled and gets a new ID, re-bind it automatically if the saved name uniquely matches a live adapter. Turn off to confirm each change manually via the banner.",
       "tooltips": "Enable tooltips",
       "ui-scale": "UI scale",
+      "ui-scale-decrease": "Decrease UI scale",
+      "ui-scale-increase": "Increase UI scale",
       "theme": "Theme",
       "system-font": "System font",
       "route-primary-label": "Primary route name",
@@ -379,6 +384,13 @@
       "option-arial": "Arial",
       "option-tahoma": "Tahoma",
       "option-verdana": "Verdana"
+    },
+    "vpn-gateways": {
+      "title": "Other VPNs you allowed",
+      "note": "Their servers can be reached over the main connection while leak protection is on, for the VPN's own connection only.",
+      "system": "built into the system",
+      "removed-status": "The VPN server {address} is no longer let through.",
+      "remove": "Remove the allowed VPN server {address}"
     },
     "routing": {
       "zone-ip-priority": {
@@ -417,8 +429,19 @@
         "no-tray-warning": "Tray is not running. Rules apply only while the tray is active."
       },
       "default-route": {
-        "title": "Default route for unmatched traffic",
-        "description": "Where traffic that matches no rule is sent. Rules always take priority. Default: primary route."
+        "title": "Default route",
+        "description": "Where traffic that matches no rule goes. Rules always take priority."
+      },
+      "leak-protection": {
+        "option-off": "Off",
+        "option-sites": "Routed sites",
+        "option-everything": "Everything",
+        "note-off": "If the additional connection drops, traffic continues over your main connection.",
+        "note-sites": "What your rules send through the additional connection never goes out the main one. Everything else keeps working.",
+        "note-everything": "Nothing leaves except through the additional connection, your local network and what your rules send over the main connection. If the additional connection drops, the internet waits until it returns."
+      },
+      "routing-method": {
+        "title": "Routing method"
       },
       "enforcement-mode": {
         "label": "How routed traffic is enforced",
@@ -446,12 +469,6 @@
       "fake-ip-instant-rst": {
         "label": "Instant reset when the additional route is unavailable",
         "note": "On (default): apps get an immediate connection reset when the additional route can't be resolved, so they can retry or fail over right away. Off: connections are held for up to 10 seconds while the route comes back, instead of resetting immediately."
-      },
-      "mode-a-coverage": {
-        "label": "When the additional route is unavailable (watching system DNS)",
-        "option-fail-closed-unknown": "Block all unresolved traffic (default, safest)",
-        "option-per-ip": "Block only the learned addresses of routed sites (may briefly leak)",
-        "note": "Applies while leak protection is armed and the additional adapter is down or unresolved. “Block all unresolved traffic” closes the gap where a routed site rotates to a fresh, not-yet-learned IP that would otherwise leak over the primary link. VPN clients and apps routed to the primary adapter stay exempt so the tunnel can always reconnect."
       },
       "hosts-bypass": {
         "label": "Resolve routed domains bypassing the hosts file",
@@ -516,7 +533,7 @@
         "option-custom": "Custom…",
         "seconds-unit": "seconds",
         "custom-range": "Seconds — from 5 to 3600.",
-        "note": "Optional. When set, NetRuleRouter actively pings the additional adapter's next hop; if it stays unreachable for this many seconds, leak protection fail-closes even if no traffic has failed yet. Off by default. It may false-positive if the tunnel peer silently drops ICMP (many VPNs do), so leave it off unless you know the peer answers pings."
+        "note": "Optional. When set, NetRuleRouter actively pings the additional adapter's next hop; if it stays unreachable for this many seconds, the additional connection counts as down even though the adapter is still up and no traffic has failed yet: with leak protection on, what it carries is blocked; with it off, that traffic goes over the main connection. Off by default. It may false-positive if the tunnel peer silently drops ICMP (many VPNs do), so leave it off unless you know the peer answers pings."
       },
       "rule-lock": {
         "heading": "Who can change the rules",
@@ -535,7 +552,17 @@
         "current": "Current: {name}",
         "none": "Not set",
         "set-up": "Set up my VPN",
-        "change": "Change"
+        "change": "Change",
+        "external-address-auto": "Check the external address each time the additional route connects",
+        "external-address-auto-note": "Once per connection, asks a public address server through the additional route which address the internet sees, and shows it in a notice. Off by default: the request leaves through your VPN. The “Check external address” button works either way."
+      },
+      "providers": {
+        "note": "Programs that keep working over your main link while leak protection is on, such as your VPN client. Type a program's full path to add one.",
+        "empty": "No programs are confirmed yet.",
+        "remove": "Remove {name} ({path})",
+        "new": "Program to add (full path)",
+        "need-path": "Type the program's full path first.",
+        "removed": "{name} was removed. Leak protection no longer keeps it working over your main link."
       },
       "vpn-gateway": {
         "title": "Other VPNs (corporate)",
@@ -566,34 +593,19 @@
       "kill-switch": {
         "title": "Leak protection",
         "set-up-vpn": "Set up my VPN",
-        "enable-label": "Enable leak protection (block traffic when the additional adapter is down)",
-        "enable-note": "Off by default. While off, nothing is blocked — if the additional adapter drops, traffic falls back to your main link (this can expose your real address, which is fine if you don't need blocking). Turn it on to reveal the blocking options below.",
-        "always-on": "While leak protection is ON and the additional adapter can't be reached — it is down, not started, or was reinstalled under a new name — traffic matched by your rules is blocked instead of leaking over your primary route. Choose what happens below.",
-        "label": "Leak protection: if a site routed to the additional adapter is unavailable, block it instead of leaking over the primary route",
-        "summary": "If the additional adapter drops, traffic matched by your rules is blocked instead of leaking over your primary route.",
-        "description": "Closes the leak window with no race. Protection is armed automatically as soon as an additional adapter is assigned, and it stays armed whenever that adapter can't be found — it is down, was never started, or was reinstalled under a new name/ID (common with VPNs). In every one of those cases traffic that should use the adapter is blocked rather than sent over the primary route under your real address. What gets blocked depends on the routing behavior above: 'only selected' protects the matched destinations — the sites, IPs and applications you routed to the additional adapter; 'everything via the additional adapter' blocks all traffic except your local network, DHCP and the route exceptions. Traffic you did NOT route to the additional adapter keeps using your normal connection by design, so a ping to a random site you never routed is not blocked.",
+        "description": "Leak protection decides what happens to your traffic while the additional connection is unavailable: the VPN is disconnected, not started yet, or was reinstalled under a new name. \"Routed sites\" holds what your rules send through the additional connection — sites, IPs and applications; everything else keeps working as usual. \"Everything\" holds all traffic except your local network and what your rules send over the main connection.",
         "coverage-note": "How coverage works: protection tracks the IP addresses a routed site resolves to, learned by watching your system's DNS. It extends automatically as new addresses appear (e.g. when a site behind a CDN rotates IPs), but a brand-new address has a brief unprotected moment until it is seen. Apps that resolve names themselves over DNS-over-HTTPS (DoH) bypass this — turn off DoH in the browser/app for full protection. A diagnostic ping is the hardest case: it fires a single packet the instant a name resolves — before protection can catch up — and pinging a bare IP address skips name-based routing entirely; neither reflects how apps normally connect.",
-        "block-all-label": "When the additional adapter is unavailable, block ALL traffic, not just its routed sites",
-        "block-all-note": "Most aggressive: while the additional adapter is down, only your local network and already-known primary sites keep working — everything else, including ping and new name (DNS) lookups, is blocked. This is what stops routed sites (and ICMP) from leaking to the primary link. Requires leak protection to be on. While armed, the FIRST connection to a newly-seen allowed site can fail — its permit installs right after the name is first observed, so a refresh a second later goes through. On Windows, IPv6, ping and VPN protocols such as IPsec are then held back for every user of this computer.",
-        "block-all-alert": "Heads up: with this on, if the additional adapter (VPN) goes down your normal internet stops too — only your local network keeps working — until it comes back. Leave it off if you want your main connection to keep working when the VPN drops.",
-        "allow-dns-label": "Allow name resolution over the main link while blocked (keep zones resolving)",
-        "allow-dns-note": "On by default: a narrow exception keeps name resolution working while blocked — only to the DNS servers your main link is configured with, and only on the DNS port, so zones keep resolving. Turn this off only for strict blocking: with DNS cut too, you have no working internet at all until the block clears.",
+        "allow-dns-label": "Allow name resolution over the main connection while blocked",
+        "allow-dns-note": "On by default: a narrow exception keeps name resolution working while blocked — only to the DNS servers of your main connection, and only on the DNS port. Turn this off only for strict blocking: with DNS cut too, you have no working internet at all until the additional connection returns.",
         "shared-strict-label": "Strict: also block addresses shared with regular sites (may break them)",
         "shared-strict-note": "Off (recommended): more convenient. Ordinary sites keep opening while the additional adapter is down, but some traffic of routed sites may go out through the main connection. On (strict): safer. No traffic of routed sites goes out through the main connection, but some ordinary sites may stop opening until the additional adapter is back.",
         "shared-smart-warning": "Leak protection strictness is reduced: shared addresses excluded from blocking — ",
         "shared-smart-list-title": "Excluded addresses",
         "shared-smart-list-unavailable": "The running service reports how many addresses were excluded, but not which ones.",
         "copy-addresses": "Copy addresses",
-        "block-all-active-banner": "Leak protection is blocking unknown traffic: the additional adapter can't be found (down, not started, or reinstalled under a new ID). Sites open as they become known; reconnect the VPN or re-bind the adapter to lift the block.",
-        "block-all-warn-label": "Warn when leak protection blocks all unknown traffic",
-        "block-all-warn-note": "On by default: a banner appears while the full block is active. Turn it off if you deliberately keep the service running with the VPN disconnected (e.g. from OS startup) and don't want the reminder.",
-        "failure-mode": {
-          "label": "If the additional adapter can't be found or is unavailable (offline)",
-          "option-fail-closed": "Block traffic (recommended)",
-          "option-fail-open": "Allow traffic and warn me",
-          "desc-fail-closed": "Safest: if NetRuleRouter can't find the additional adapter (it's down, or the binding is stale), matched traffic is blocked instead of leaking over the primary route. Leak protection always works.",
-          "desc-fail-open": "Convenience: if the additional adapter can't be found, matched traffic keeps flowing over the primary route and a warning is shown. Your real address may be exposed."
-        },
+        "block-all-active-banner": "Leak protection is holding all traffic: the additional connection can't be found (down, not started, or reinstalled under a new ID). The internet waits until it returns; reconnect the VPN or assign the adapter again.",
+        "block-all-warn-label": "Warn while leak protection is holding all traffic",
+        "block-all-warn-note": "On by default: a banner appears while the additional connection is down and everything waits for it. Turn it off if you deliberately keep the service running with the VPN disconnected (e.g. from OS startup) and don't want the reminder.",
         "protocols": {
           "label": "Protocols leak protection cuts",
           "tcp": "TCP",
@@ -602,19 +614,19 @@
           "igmp": "IGMP",
           "gre": "GRE",
           "esp": "ESP",
-          "desc": "Which IP protocols leak protection drops. ICMP covers ping/traceroute. TCP/UDP are enforced at the connection layer; ICMP/IGMP/GRE/ESP at the packet layer. All on by default — uncheck to let a protocol through even while the block is active.",
+          "desc": "Which IP protocols leak protection drops. ICMP covers ping/traceroute. TCP/UDP are enforced at the connection layer; ICMP/IGMP/GRE/ESP at the packet layer. All on by default — uncheck to let a protocol through even while the block is active. ICMP, IGMP, GRE and ESP are cut for the whole computer, not only for your account.",
           "tcp-tooltip": "Most web, email and app traffic (HTTP/HTTPS and similar).",
           "udp-tooltip": "DNS, video calls, games and other real-time traffic.",
           "icmp-tooltip": "Ping and traceroute. These live only at the packet layer, so ICMP must be checked for the block to stop a ping.",
           "igmp-tooltip": "Multicast group membership on the local network.",
           "gre-tooltip": "A tunnelling protocol used by some VPNs (e.g. PPTP).",
           "esp-tooltip": "Encrypted IPsec VPN payloads.",
-          "last-one-hint": "To turn leak protection off, use the switch above."
+          "last-one-hint": "To turn leak protection off, choose Off above."
         }
       },
       "local-networks": {
         "title": "Local networks",
-        "description": "While leak protection is on, only these local networks stay reachable. Traffic to them never leaves this computer.",
+        "description": "These networks stay reachable whatever your rules and leak protection do: a router, a printer or a virtual machine on them keeps working, and traffic to them goes straight there, never through the additional connection.",
         "empty": "No local networks found yet. Add one below if you reach a virtual machine at an address this list does not show.",
         "undecided": "no answer yet",
         "reason": {
@@ -726,21 +738,15 @@
       },
       "mode": {
         "prefer-primary": {
-          "label": "Selected sites only (via the additional adapter)",
-          "description": "Only the sites, IPs and apps in your rules use the additional adapter; all other traffic stays on your main connection. It routes by resolved IP address, so sites on shared CDNs or apps using DNS-over-HTTPS can occasionally slip onto your main connection. For a guarantee that nothing leaks, choose “Everything via the additional adapter — no leaks”."
+          "label": "Main connection — selected sites through the additional one",
+          "description": "Only the sites, IPs and apps in your rules use the additional connection; all other traffic stays on your main connection. It routes by IP address, so sites on shared CDNs or apps using DNS-over-HTTPS can occasionally slip onto your main connection. What happens while the additional connection is down is up to leak protection."
         },
         "prefer-secondary-when-available": {
-          "label": "Everything via the additional adapter",
-          "description": "All traffic goes through the additional adapter while it is available. If it drops, traffic falls back to your main connection — your real address may be exposed until it reconnects."
-        },
-        "strict-secondary-fail-closed": {
-          "label": "Everything via the additional adapter — no leaks",
-          "description": "All traffic goes through the additional adapter. If it drops, everything is blocked — nothing ever leaks over your main connection. This is the strongest no-leak guarantee (recommended when you use a VPN). Requires an additional adapter to be assigned.",
-          "warning": "If the additional adapter becomes unavailable, ALL traffic is blocked until it reconnects or you change this setting."
+          "label": "Additional connection — exceptions through the main one",
+          "description": "All traffic goes through the additional connection; only the exceptions in your rules use the main one. What happens while the additional connection is down is up to leak protection."
         }
       },
-      "default-mode-note": "When no additional adapter is configured, your main connection is used by default.",
-      "recommended-for-secondary-note": "For a full guarantee that nothing leaks, choose “Everything via the additional adapter — no leaks”: all traffic goes through it and is blocked if it ever drops."
+      "default-mode-note": "When no additional adapter is configured, your main connection is used by default."
     },
     "revisions": {
       "retention": {
@@ -753,6 +759,11 @@
         "rolledback-count": "Maximum rolled-back revisions",
         "pin-lkg": "Always keep last known-good revision",
         "pin-lkg-hint": "The most recent superseded revision is pinned and excluded from age and count limits.",
+        "superseded-days-tooltip": "Earlier versions of your rules that you can roll back to. Keep them longer for a longer history, or shorter to save disk space.",
+        "superseded-count-tooltip": "The most earlier versions kept, whatever their age. Once there are more, the oldest go first.",
+        "rejected-days-tooltip": "Rule sets the service refused to apply are kept this long, so the history still shows why they were refused.",
+        "rolledback-days-tooltip": "Rule sets that were undone, by you or after a failed apply, are kept this long so you can return to them.",
+        "rolledback-count-tooltip": "The most undone rule sets kept, whatever their age. Once there are more, the oldest go first.",
         "last-cleanup": "Last cleanup: {timestamp}",
         "last-cleanup-never": "Last cleanup: never",
         "save": "Save",
@@ -946,7 +957,7 @@
         "heading": "When routing is paused or the service stops",
         "persist": {
           "label": "Keep rule routes on the additional adapter after pause/stop (route persistence, not leak protection)",
-          "tooltip": "Default (off): full teardown — every route is removed and ALL traffic returns to your main connection; matched sites stop using the additional adapter. Turn ON to keep the matched routes on the additional adapter — useful for a work/corporate additional adapter, so you keep reaching corporate resources while general routing is paused; for a general-purpose additional adapter leave it off so everything returns to your main connection. NetRuleRouter's overlays are still removed either way. Leak-protection blocks are always removed on pause/stop, so a paused or stopped service can never lock you out."
+          "tooltip": "Default (off): full teardown — every route is removed and ALL traffic returns to your main connection; matched sites stop using the additional adapter. Turn ON to keep the matched routes on the additional adapter — useful for a work/corporate additional adapter, so you keep reaching corporate resources while general routing is paused; for a general-purpose additional adapter leave it off so everything returns to your main connection. NetRuleRouter's own extra routes are still removed either way. Leak-protection blocks are removed on pause and on a normal stop, so a paused or stopped service does not keep you locked out."
         },
         "help": "Applies to both “safe disable”/pause and stopping the service. Affects the whole machine and needs administrator approval. Note: simply closing the app keeps routing active because the background service keeps running — use Stop service (or Disable) to turn routing off."
       },
@@ -1023,6 +1034,8 @@
     }
   },
   "vpn-onboarding": {
+    "gateway-allowed-status": "The VPN server {address} can now be reached while leak protection is on.",
+    "gateway-save-failed": "Could not save the change to the allowed VPN servers, so nothing changed. Try again.",
     "title": "Your VPN client",
     "heading": "Do you use a VPN?",
     "intro": "Point NetRuleRouter at it so it keeps working when leak protection is on. We look at your running programs and installed apps — nothing is sent anywhere.",
@@ -1037,6 +1050,9 @@
     "not-found": "not found — pick manually",
     "source-running-process": "detected as a running program",
     "source-installed-program": "found among installed programs",
+    "source-confirmed": "confirmed by you earlier",
+    "source-manual-pick": "chosen by you",
+    "pick-file": "Choose its program file",
     "manual-pick": "My VPN isn't listed / pick it manually",
     "select-all": "Select all",
     "clear-selection": "Clear selection",
@@ -1046,8 +1062,7 @@
     "confirm": "This is my VPN",
     "skip": "I don't use a VPN",
     "confirmed-status": "NetRuleRouter will keep {name} working over your main link while leak protection is on.",
-    "confirmed-status-no-path": "Noted {name} as your VPN. Pick its program file to finish setup.",
-    "confirmed-status-multi": "NetRuleRouter will keep your {count} VPN programs working over your main link while leak protection is on.",
+    "cleared-status": "No program is kept working over your main link any more.",
     "skipped-status": "No VPN set up. You can set one up later from Settings -> Routing.",
     "service-write-failed": "Could not save to the routing service — will retry on next apply.",
     "manual-pick-status": "Choose your VPN program file…",
@@ -1078,14 +1093,17 @@
     },
     "group-assignable-hint": "route can be assigned",
     "group-display-only-hint": "for information only",
-    "kernel-nat-note": "Traffic of WSL, Hyper-V, Docker, libvirt and virtual machines on a bridge is handled by the kernel and does not belong to any process, so it cannot be assigned a route — it always uses the main route. Flexible routing for these environments is planned for the future.",
+    "kernel-nat-note": "Traffic of WSL, Hyper-V, Docker, libvirt and other virtual machines does not belong to any program on this computer, so it cannot be given a route of its own. When it goes out through this computer, it follows the routes your rules set, as this computer's own traffic does; a machine bridged straight onto your network goes past them. Flexible routing for these environments is planned for the future.",
     "route-locked": "Main",
     "badge-running": "running",
     "badge-installed": "installed",
     "badge-feature": "system component",
     "footer-note": "Can't find your program? Add it as an ordinary application rule, or tell us through any channel — the dictionary keeps growing.",
     "apply": "Apply",
-    "confirmed-status": "Routes updated for {count} program(s).",
+    "confirmed-status": {
+      "one": "Routes updated for {count} program.",
+      "other": "Routes updated for {count} programs."
+    },
     "legend-running": "running — the process is active right now",
     "legend-installed": "installed — found in the program list",
     "legend-feature": "system component — detected via an OS service"
@@ -1259,6 +1277,7 @@
       "verify-hint": "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule.",
       "verify-any-zone": "A site in every zone is not checked: the check needs one host.",
       "verify-deny": "A denied rule is not checked: its traffic goes through no connection.",
+      "verify-ipv6": "An IPv6 address is not checked: the check goes out over IPv4 only, so this stays an ordinary route rule.",
       "mode": {
         "one": "One rule",
         "several": "Several rules"
@@ -1338,7 +1357,10 @@
       "title": "Review changes",
       "title-readonly": "Preview parked changes",
       "summary-empty": "No structural changes detected.",
-      "reset-summary": "Discard {count} custom rule(s) and restore the baseline rules.",
+      "reset-summary": {
+        "one": "Discard {count} custom rule and restore the baseline rules.",
+        "other": "Discard {count} custom rules and restore the baseline rules."
+      },
       "column-added": "Added",
       "column-removed": "Removed",
       "column-modified": "Modified or retargeted",
@@ -1392,6 +1414,11 @@
       "confirm-kill-switch": "Turn it on anyway",
       "cancel-description": "Leave everything as it is"
     },
+    "leak-holds-now": {
+      "title": "The additional connection is not available",
+      "body": "With leak protection set to Everything, traffic is held right away: the internet stops until the additional connection returns.",
+      "effect": "Your local network and what your rules send over the main connection keep working."
+    },
     "factory-preset-save": {
       "title": "This file belongs to the app's own rule sets",
       "body": "The rules file you are saving to is one of the sets that come with the app, and the next update replaces that folder — anything saved there would be lost. Save into a folder of your own instead, or save here anyway if that is what you want.",
@@ -1403,7 +1430,10 @@
     },
     "empty-service-rules": {
       "title": "The service has no active rules",
-      "body": "The background service is currently enforcing 0 rules. Loading its state will remove all {count} rule(s) shown here. Your rules files on disk are not touched. Continue?",
+      "body": {
+        "one": "The background service is currently enforcing 0 rules. Loading its state will remove the {count} rule shown here. Your rules files on disk are not touched. Continue?",
+        "other": "The background service is currently enforcing 0 rules. Loading its state will remove all {count} rules shown here. Your rules files on disk are not touched. Continue?"
+      },
       "confirm": "Clear the rules"
     },
     "safe-rollback": {
@@ -1690,7 +1720,6 @@
       "option-start-empty-description": "No rules. Add or import them whenever you want.",
       "protection-title": "Protection",
       "protection-description": "Recommended for everyone. Each of these can be changed later in Settings.",
-      "protection-kill-switch": "Block routed traffic when the additional route is down",
       "protection-doh-lockdown": "Keep browsers from resolving routed sites past NetRuleRouter",
       "protection-fake-ip": "Route sites by name, so an address shared with another site is not dragged along",
       "protection-diagnostic-logs": "Write detailed diagnostic logs (only needed to report a problem)",
@@ -1884,7 +1913,10 @@
     "auto-open-completed": "Rules loaded from disk.",
     "file-binding-forgotten": "File binding cleared. Rules will not be auto-loaded on next launch.",
     "rules-refresh-failed": "Could not load the active rules from the service.",
-    "rules-refreshed-from-service": "Loaded {count} active rule(s) from the service.",
+    "rules-refreshed-from-service": {
+      "one": "Loaded {count} active rule from the service.",
+      "other": "Loaded {count} active rules from the service."
+    },
     "rollback-discard-completed": "Changes discarded.",
     "rollback-discard-failed": "Failed to roll back changes: ",
     "demo-rules-loaded": "Demo rules loaded. Review and confirm to activate.",
@@ -1958,7 +1990,10 @@
     "drift-recheck-offline": "The service is not running, so the rules it applies cannot be compared right now.",
     "sidecar-comments-gc-unavailable": "Comment storage is not available in this build.",
     "sidecar-comments-gc-failed": "Failed to clear orphan comments; see logs.",
-    "sidecar-comments-gc-done": "Cleared {n} orphan comment(s).",
+    "sidecar-comments-gc-done": {
+      "one": "Cleared {count} orphan comment.",
+      "other": "Cleared {count} orphan comments."
+    },
     "drift-banner": "Rules in the file, the app, and the service do not all agree.",
     "drift-banner-empty-service": "The service has none of your rules — nothing is being routed yet.",
     "drift-banner-apply": "Apply rules",
@@ -1983,7 +2018,10 @@
     "save-as-cancelled": "Save As cancelled — nothing more was saved.",
     "bound-file-none-linked": "No rules file is linked yet — you will be asked where to save.",
     "bound-file-already-current": "Your rules file already holds these rules.",
-    "vpn-split-conflict": "Your additional adapter \"{name}\" is up and carrying exactly what you asked it to: your {n} rule(s) go through it, everything else stays on your main connection. That is selective routing doing its job — nothing here needs fixing. If you would rather send everything through it, switch the mode in Settings → Routing behavior.",
+    "vpn-split-conflict": {
+      "one": "Your additional adapter \"{name}\" is up and carrying exactly what you asked it to: your {count} rule goes through it, everything else stays on your main connection. That is selective routing doing its job — nothing here needs fixing. If you would rather send everything through it, switch the mode in Settings → Routing behavior.",
+      "other": "Your additional adapter \"{name}\" is up and carrying exactly what you asked it to: your {count} rules go through it, everything else stays on your main connection. That is selective routing doing its job — nothing here needs fixing. If you would rather send everything through it, switch the mode in Settings → Routing behavior."
+    },
     "preview-data-banner": "Sample data: this window shows an example, not your service's data, and nothing changed here reaches the service.",
     "vpn-split-conflict-dismiss": "Got it — don't show this for this adapter again",
     "vpn-split-conflict-fulltunnel": "Route everything through the additional adapter",
@@ -2014,7 +2052,10 @@
     "local-network-offer-accepted": "These local networks stay reachable while routed traffic is blocked.",
     "local-network-offer-failed": "Could not save the answer; it will be asked again.",
     "platform-unsupported": "This is not available on your operating system yet, so the controls here stay off. Nothing here is sent to the background service.",
-    "drift-loaded-from-file": "Loaded {count} rule(s) from file into the app. Review and apply when ready.",
+    "drift-loaded-from-file": {
+      "one": "Loaded {count} rule from file into the app. Review and apply when ready.",
+      "other": "Loaded {count} rules from file into the app. Review and apply when ready."
+    },
     "drift-clear-all-running": "Clearing all rules…",
     "drift-cleared-all": "All rules cleared from the app and the service.",
     "drift-clear-all-failed": "Local rules cleared, but the service was not updated (administrator approval or a connection is required).",
@@ -2031,21 +2072,14 @@
     "app-rules-take-all-failed": "Could not change how programs in rules are routed: ",
     "shared-ip-policy-set": "Shared-IP handling updated.",
     "shared-ip-policy-failed": "Could not update shared-IP handling: ",
-    "kill-switch-on": "Leak protection enabled: matched traffic is blocked if the additional adapter drops.",
-    "kill-switch-off": "Leak protection disabled.",
     "kill-switch-uac-declined": "Administrator approval was declined; leak protection was not changed.",
-    "kill-switch-failed": "Could not update leak protection: ",
     "kill-switch-protocols-applied": "Leak protection protocols updated.",
-    "kill-switch-fail-closed-on": "Leak protection set to fail-closed: traffic is blocked if the additional adapter can't be found.",
-    "kill-switch-fail-closed-off": "Leak protection set to fail-open: traffic is allowed (with a warning) if the additional adapter can't be found.",
-    "kill-switch-block-all-on": "Block-all on: while the additional adapter is down, all traffic is blocked except your local network and already-known primary sites.",
-    "kill-switch-block-all-off": "Block-all off: while the additional adapter is down, only its routed sites are blocked now.",
-    "kill-switch-block-all-failed": "Could not update the block-all setting: ",
-    "kill-switch-enabled-on": "Leak protection enabled. Choose how it blocks in the options below.",
-    "kill-switch-enabled-off": "Leak protection disabled. Nothing is blocked — while the additional adapter is down, traffic is allowed to leak (your choice).",
     "kill-switch-enabled-failed": "Could not update leak protection: ",
-    "allow-dns-over-primary-on": "While blocked, name resolution now works over your main link, so zones keep resolving.",
-    "allow-dns-over-primary-off": "Strict: while blocked, DNS is blocked over the main link too.",
+    "leak-protection-off": "Leak protection is off. If the additional connection drops, traffic continues over your main connection.",
+    "leak-protection-sites": "Leak protection: routed sites. What your rules send through the additional connection never goes out the main one.",
+    "leak-protection-everything": "Leak protection: everything. If the additional connection drops, the internet waits until it returns.",
+    "allow-dns-over-primary-on": "While blocked, name resolution now works over your main connection.",
+    "allow-dns-over-primary-off": "Strict: while blocked, DNS is blocked over the main connection too.",
     "allow-dns-over-primary-failed": "Could not update the DNS setting: ",
     "enforcement-mode-reactive": "Routing method: watching system DNS. Applied — the local DNS resolver is off.",
     "enforcement-mode-resolver": "Routing method: local DNS resolver. Applied — the resolver is now active.",
@@ -2070,8 +2104,6 @@
     "fake-ip-instant-rst-on": "Instant reset for the additional route is on.",
     "fake-ip-instant-rst-off": "Instant reset is off — connections are held briefly instead of resetting.",
     "fake-ip-instant-rst-failed": "Could not change the instant-reset setting: ",
-    "mode-a-coverage-set": "Leak protection behavior updated.",
-    "mode-a-coverage-failed": "Could not update the leak protection behavior: ",
     "hosts-bypass-set": "Rule-domain resolution updated.",
     "hosts-bypass-failed": "Could not update rule-domain resolution: ",
     "auto-rules-added": "Addresses a routed site needs were added to your rules.",
@@ -2124,6 +2156,9 @@
     "primary-probe-auto-off": "The main route will only be checked when you ask.",
     "primary-probe-limits-saved": "Check limits saved.",
     "primary-probe-failed": "Could not change the main-route check: ",
+    "external-address-auto-on": "The external address will be checked each time the additional route connects.",
+    "external-address-auto-off": "The external address will only be checked when you ask.",
+    "external-address-auto-failed": "Could not change the external-address check: ",
     "refusing-anchor-on": "{name} is marked as refusing addresses on the main connection.",
     "refusing-anchor-off": "The mark on {name} was removed.",
     "binding-parked-offline": "Saved. The connection assignment will be applied as soon as the background service is running.",
@@ -2134,11 +2169,14 @@
     "local-network-auto-accept-on": "New local networks stay reachable without asking. You can still refuse any of them in Settings.",
     "local-network-auto-accept-off": "You will be asked about each new local network again.",
     "protection": {
-      "blanket-block-not-armed": "Full blocking is not switched on: the address of the additional link is unknown, and blocking everything without it would cut the link itself. Traffic outside your rules is not blocked.",
+      "blanket-block-not-armed": "Leak protection \"Everything\" is not in force yet: the address of the additional connection is unknown, and blocking everything without it would cut that connection too. Traffic outside your rules is not blocked.",
       "machine-wide-cut-by-another-user": "Another user of this computer switched on leak protection. Part of it cannot be limited to one account, so IPv6 and ping are off for everyone until they switch it off."
     },
     "clear-failed": "Could not clear: ",
-    "rules-overlap-removed": "{n} rule(s) removed as already covered. Apply to put the change into effect.",
+    "rules-overlap-removed": {
+      "one": "{count} rule removed as already covered. Apply to put the change into effect.",
+      "other": "{count} rules removed as already covered. Apply to put the change into effect."
+    },
     "service-install-offer-stopped": "The service install offer is off. Turn it back on in Settings.",
     "duplicate-rule-resolved": "The other copy of the rule was switched off. Review the changes again to apply them.",
     "route-binding-divergence": "The connections shown here are not the ones the background service is applying. ",
@@ -2164,7 +2202,11 @@
     "forwarded-traffic-as-computer": "WSL, containers and virtual machines are now protected like this computer.",
     "forwarded-traffic-unprotected": "WSL, containers and virtual machines are no longer protected while the additional route is down.",
     "forwarded-traffic-failed": "Could not change protection of WSL and containers: ",
-    "rules-bulk-denied": "{n} rule(s) now deny their traffic."
+    "rules-bulk-denied": "{n} rule(s) now deny their traffic.",
+    "contract-skew": {
+      "service-older": "The background service is older than this window. Changes are off until both match: update or restart the service.",
+      "client-older": "This window is from a different build than the background service. Changes are off until both match: restart the window or update the app."
+    }
   },
   "interfaces": {
     "type": {
@@ -2264,9 +2306,8 @@
       "readiness": "Readiness: %1"
     },
     "mode": {
-      "prefer-primary": "Selected sites only (via the additional adapter)",
-      "prefer-secondary-when-available": "Everything via the additional adapter",
-      "strict-secondary-fail-closed": "Everything via the additional adapter — no leaks"
+      "prefer-primary": "Main connection — selected sites through the additional one",
+      "prefer-secondary-when-available": "Additional connection — exceptions through the main one"
     },
     "availability": {
       "available": "Available",
@@ -2277,8 +2318,7 @@
       "selected": "Selected",
       "not-selected": "Not selected",
       "unavailable": "Unavailable",
-      "requires-verification": "Requires verification",
-      "fail-closed-conflict": "Strict mode — traffic is blocked"
+      "requires-verification": "Requires verification"
     },
     "role": {
       "primary": "Main connection",
@@ -2326,7 +2366,10 @@
     "nav": {
       "list": "Rules list",
       "check-sync": "Check rules match",
-      "pending-badge": "{n} item(s) in Rules waiting for an answer"
+      "pending-badge": {
+        "one": "{count} item in Rules waiting for an answer",
+        "other": "{count} items in Rules waiting for an answer"
+      }
     },
     "auto-origin": {
       "site-companion": "Needed for {site} to work",
@@ -2556,12 +2599,16 @@
       "count": "{n} rule(s) are not in their section: {rules}",
       "move-all": "Move all",
       "move-all-tooltip": "Give each of these rules the type its value is. Nothing else changes.",
-      "done-many": "{n} rule(s) moved to the type their value is."
+      "done-many": {
+        "one": "{count} rule moved to the type its value is.",
+        "other": "{count} rules moved to the type their value is."
+      }
     },
     "validation": {
       "valid": "Valid",
       "warning": "Valid with warnings",
       "error": "Error — rule is inactive",
+      "verdict-unavailable": "Could not check this value. Try editing it again, or check that the app is running normally.",
       "match-value-empty": "Rule value is empty.",
       "unknown-rule-type": "Unknown rule type.",
       "match-value-invalid": {
@@ -2665,6 +2712,7 @@
         "intro": "These addresses were pulled in by sites you route. Adding one sends it through the additional route together with the site that needs it. Anything you leave alone keeps going through the main route.",
         "empty-all-inert": "The service saw {count} addresses beside your sites, but each already travels the route it would be sent to — a rule would change nothing. For example: {sample}.",
         "empty": "Nothing is waiting for an answer right now.",
+        "load-failed": "Could not read the suggestions from the service. Try again in a moment.",
         "needed-by": "Needed by:",
         "reach": "The rule covers every name under {domain}.",
         "reach-seen": "Seen so far: {hosts}.",
@@ -2801,7 +2849,10 @@
     },
     "overlaps": {
       "nav-label": "Overlaps",
-      "pending-badge": "{n} overlap(s) not confirmed",
+      "pending-counted": {
+        "one": "{count} overlap not confirmed",
+        "other": "{count} overlaps not confirmed"
+      },
       "intro": "When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.",
       "rule": "{value} ({type})",
       "nested": "{winner} goes over {winner-route}: it is narrower than {loser} on {loser-route}.",
@@ -2831,6 +2882,7 @@
       "send-over": "Send over {route} instead",
       "show-resolved": "Show resolved",
       "all-resolved": "Every overlap is resolved.",
+      "load-failed": "Could not check the rules for overlaps. Try again in a moment.",
       "conflicts": {
         "title": "Conflicts in the applied rules",
         "hint": "Rules the service enforces differently from how they read, as it enforces them now. They update after you apply changes.",
@@ -2964,6 +3016,7 @@
       "connecting": "Connecting to service…",
       "disconnected": "Service offline — showing locally-cached data",
       "service-stopped": "NetRuleRouter service is stopped",
+      "service-lost": "The NetRuleRouter service stopped unexpectedly, so your rules are not applied",
       "service-not-installed": "NetRuleRouter service is not installed",
       "protocol-mismatch": "Service version mismatch — please update NetRuleRouter",
       "refused": "The background service refused this connection"
@@ -2989,8 +3042,6 @@
       "add-rule": "Add rule…",
       "suggestions": "Suggested addresses",
       "suggestions-count": "Suggested addresses ({count})",
-      "kill-switch-on": "Turn leak protection on",
-      "kill-switch-off": "Turn leak protection off",
       "safe-disable": "Disable temporarily…",
       "start-service": "Start service",
       "stop-service": "Stop service"
@@ -3068,7 +3119,8 @@
       "service-unknown": "Cannot read service status",
       "no-updates": "The service is running, but this app is not receiving updates from it",
       "rules-applied": "NetRuleRouter — your rules are being applied",
-      "no-rules-applied": "NetRuleRouter — no rules are being applied yet"
+      "no-rules-applied": "NetRuleRouter — no rules are being applied yet",
+      "contract-skew": "App and service builds differ — changes are off"
     },
     "auto-rules": {
       "title": "Addresses a site needs",
@@ -3094,6 +3146,7 @@
         "co-activity": "keeps appearing together with the site",
         "placeholder-answer": "your provider answered with an address nothing can be reached at",
         "app-main-link-blocked": "most of the addresses it reached for on the main route kept failing, and none of its traffic goes over the additional route yet",
+        "app-own-resolver": "it looks up site names on its own, so rules by site name do not reach it",
         "main-link-blocked": "connections to it kept failing on the main route and none went through"
       },
       "action": {
@@ -3105,6 +3158,10 @@
       "body-blocked": "Connections to {name} keep failing on the main route.",
       "title-app-blocked": "Programs the main route will not carry",
       "body-app-blocked": "Most connections of {name} fail on the main route.",
+      "title-app-own-resolver": "Programs your site rules do not reach",
+      "body-app-own-resolver": "{name} looks up site names on its own, so rules by site name do not apply to it. A rule for the program sends all of its connections over the additional route.",
+      "title-assorted": "Suggested rules",
+      "body-assorted": "Each item below says why it is offered.",
       "body-blocked-multi": "Connections to {count} sites keep failing on the main route.",
       "title-mixed-blocked": "Not getting through on the main route",
       "body-mixed-blocked": "The programs and sites below keep failing on the main route.",
@@ -3142,7 +3199,6 @@
       "attempts": "{count} attempts",
       "reason": {
         "route-unavailable": "The route these addresses are bound to is down right now, so none of them open. This is one notice for the whole route.",
-        "not-covered-by-rules": "This app is confined to a route, and no rule covers this address there.",
         "blocked-by-rule": "A rule denies this address directly.",
         "ipv6-blocked": "IPv6 is switched off while leak protection is on, and this address is IPv6. No rule blocked it — the switch is in Settings.",
         "dns-lockdown": "This app tried to reach a public DNS resolver of its own instead of the one NetRuleRouter provides, and encrypted-DNS blocking closed it. No rule blocked it — the switch is in Settings, under Routing.",
@@ -3151,7 +3207,6 @@
       },
       "reason-short": {
         "route-unavailable": "Route is down",
-        "not-covered-by-rules": "No rule for this address",
         "blocked-by-rule": "Denied by a rule",
         "ipv6-blocked": "IPv6 is switched off",
         "dns-lockdown": "Own encrypted DNS",
@@ -3214,6 +3269,11 @@
     "settings-restore-failed": "Your settings could not be restored. Open the app to try again."
   },
   "diag": {
+    "dns-tamper": {
+      "heading": "Your provider changes some DNS answers",
+      "body": "For {count} sites the provider's name lookup gave an unusable answer. NetRuleRouter asked another resolver and routes those sites correctly anyway.",
+      "examples": "For example: {names}"
+    },
     "copy-all-shown": "Copy all shown",
     "copy-selected": "Copy selected",
     "table": {
@@ -3313,7 +3373,10 @@
         "help": "The audit journal is a tamper-evident record of every privileged change. If a record was altered or lost, the check keeps reporting it until an administrator acknowledges it. Restarting records that acknowledgement in the journal itself and continues checking from that point: the old break stays visible in the history, and any new break is reported again.",
         "title": "Restart audit chain",
         "loading": "Checking the audit trail…",
-        "summary": "The audit trail fails verification in {count} place(s):",
+        "summary": {
+          "one": "The audit trail fails verification in {count} place:",
+          "other": "The audit trail fails verification in {count} places:"
+        },
         "list-name": "Audit chain breaks",
         "row-line": "{file}, line {line}: {kind}",
         "row-file": "{file}: {kind}",
@@ -3362,6 +3425,7 @@
       "revision-label": "Active revision",
       "pending-changes-label": "Pending changes",
       "dns-not-restored": "System DNS could not be restored. Use Settings -> Service management -> Restore network.",
+      "rules-book-unreadable": "The service could not read saved rules. The rules applied last stay in force until it can.",
       "started-after-sign-in": "The service started %1 s after this boot reached the sign-in screen.",
       "started-before-sign-in": "The service started %1 s before this boot reached the sign-in screen."
     },
@@ -3475,8 +3539,14 @@
       "group-none": "No grouping",
       "group-program": "By program",
       "group-folder": "By folder",
-      "group-count": "connection(s)",
-      "group-folder-counts": "%1 program(s)  ·  %2 connection(s)",
+      "group-connections": {
+        "one": "{count} connection",
+        "other": "{count} connections"
+      },
+      "group-programs": {
+        "one": "{count} program",
+        "other": "{count} programs"
+      },
       "group-no-path": "Programs without a known path",
       "rule-for-folder": "Rule for this folder…",
       "leak-mismatch-tip": "Mismatch: this address belongs to a rule routed to the additional adapter, but the connection was allowed out over the PRIMARY link — a leak indicator.",
@@ -3619,11 +3689,13 @@
         "blocked": "blocked"
       },
       "enforcement": {
-        "blocked-unknown-under-block-all": "Note: “block all unresolved” is on and this name is not in the cache — while the additional adapter is unavailable this connection will be BLOCKED until the name is cached.",
+        "everything-waits-when-secondary-down": "Leak protection is set to “Everything”: while the additional connection is unavailable, this connection waits until it returns and is not sent over the main connection.",
         "fail-closed-when-secondary-down": "Routed via the additional adapter: while it is unavailable this traffic is BLOCKED (leak protection), not sent over the main link.",
         "collateral-blocked-strict": "Some of this site's addresses are SHARED with sites routed via the additional adapter. Strict leak protection is on: while the additional adapter is unavailable those shared addresses are blocked, so this site may not open.",
         "collateral-smart-exempt": "Some of this site's addresses are shared with sites routed via the additional adapter. Smart leak protection keeps them unblocked, so this site works — but routed traffic to those shared addresses is not leak-protected.",
-        "collateral-risk-subdomain-rules": "This name is not cached, but sites under the same domain are routed via the additional adapter. Large services often serve both from the same addresses, so strict leak protection may block this site while the additional adapter is unavailable."
+        "collateral-risk-subdomain-rules": "This name is not cached, but sites under the same domain are routed via the additional adapter. Large services often serve both from the same addresses, so strict leak protection may block this site while the additional adapter is unavailable.",
+        "kept-direct-local-network": "Some of this name's addresses sit on a network your computer is directly attached to (for example your home network). They are not sent over the additional adapter, so the device stays reachable; a rule naming the address itself overrides this.",
+        "kept-direct-foreign-tunnel": "Some of this name's addresses are carried by another VPN on this computer (for example a work connection). They stay on that connection and are not taken over by the additional adapter; a rule naming the address itself overrides this."
       }
     },
     "archive": {
@@ -3675,7 +3747,7 @@
       "svc-boot-leak-guard-reconciled": "Leak protection reconciled: {added} route(s) added",
       "svc-boot-leak-guard-reconcile-failed": "Leak protection reconcile failed ({error})",
       "svc-boot-teardown-connections-live": "Active connections at shutdown will be interrupted by route removal: {processes}",
-      "svc-boot-teardown-persist-routes": "Service stopping: kept VPN rule-routes, removed {removed_overlays} routing overlay(s)",
+      "svc-boot-teardown-persist-routes": "Service stopping: kept the rule routes on the VPN; removed {removed_overlays} route(s) that steered the rest of the traffic, which now follows the system default.",
       "svc-boot-teardown-keep-secondary-failed": "Keeping additional routes during shutdown teardown failed ({error})",
       "svc-boot-teardown-full-restore": "Service stopping: all routes removed, routing restored to its original state",
       "svc-boot-teardown-full-failed": "Full route teardown at shutdown failed ({error})",
@@ -3730,6 +3802,7 @@
       "svc-boot-ndjson-verbosity": "Operational log verbosity set to verbose: {verbose}",
       "svc-boot-crash-recovery-complete": "Crash recovery check complete: {outcome}",
       "svc-boot-crash-recovery-marker-stale": "The last rules activation was applied, but its marker could not be removed ({detail}); the service started anyway.",
+      "svc-boot-crash-recovery-deferred": "The previous run left an unfinished record and writing its recovery to the audit trail failed ({reason}); recovery is postponed to the next start and the service started anyway.",
       "tamper-mutation-gate-query-failed": "Could not check for active security alerts ({error}); new rule changes are allowed by default until the check succeeds.",
       "tamper-signing-key-too-short": "The stored signing key ({bytes} bytes) is too short to be usable; treating it as missing and generating a new one.",
       "tamper-fresh-install-key-generated": "Fresh install: generated a new database integrity key; no existing revisions to verify.",
@@ -3825,6 +3898,7 @@
       "wfpledger-open-failed": "Could not open the WFP filter ledger for appending ({error}).",
       "secext-probe-no-address": "The additional route ({adapter}) connected, but its external address could not be observed on attempt {attempt} (retrying: {retry}).",
       "secext-observed": "Observed the external address of the additional route ({adapter}) after it connected.",
+      "secext-withdrawn": "The additional route went down or changed, so its external address is no longer shown.",
       "routingpause-route-teardown": "Routing paused — tore down the additional route table ({removed} route(s) removed, keep host routes: {persist}).",
       "routingpause-route-teardown-failed": "Tearing down the additional route table for a pause did not fully succeed ({error}).",
       "routingpause-flag-restore-failed": "The pause flag could not be put back after the platform refused the change ({error}).",
@@ -3905,7 +3979,7 @@
       "persid-apply-orphans-adopted": "First pass done: {removed} filter(s) of a previous instance nobody claimed were removed.",
       "persid-apply-orphans-deferred": "A previous instance's {inherited} filter(s) stay in force until the first pass adopts them.",
       "persid-apply-orphans-enumerate-failed": "Adoption could not list the installed filters ({error}); only the recorded ids were settled.",
-      "principal-stop-kept-rule-routes": "Service stopping: the rule routes on the additional link were kept; {removed_overlays} overlay routes were removed.",
+      "principal-stop-kept-rule-routes": "Service stopping: the rule routes on the additional link were kept; {removed_overlays} route(s) that steered the rest of the traffic were removed.",
       "prod-rules-book-readable-again": "The rule book of {principal} reads again.",
       "prod-rules-book-unreadable": "The rule book of {principal} could not be read ({reason}); the last applied set stays in force.",
       "supervised-start-blocked": "Start blocked, recovery required: {reason}. Reads are answered; nothing is applied or removed.",
@@ -3951,7 +4025,10 @@
       "linux-rtnetlink-overflowed": "The network change feed overflowed; some change messages were lost, so current state is being re-read.",
       "linux-rtnetlink-reader-stopped": "The network change reader stopped ({error}); only the periodic check remains.",
       "linux-flow-reset-dump-failed": "Could not read the kernel's connection table ({error}); no connection was reset.",
+      "linux-rp-filter-strict": "Strict reverse-path filtering is on: a second signed-in user may get no replies from hosts routed through the additional connection.",
+      "linux-capability-changed": "Kernel capability {capability}: available = {available}.",
       "linux-flow-reset-unsupported": "The kernel cannot close connections on request (built without CONFIG_INET_DIAG_DESTROY): {refused} connection(s) stay on their previous route until they close.",
+      "linux-flow-reset-udp-refused": "The kernel did not close {refused} UDP (QUIC) socket(s); they stay on their previous route until they close.",
       "linux-flow-reset-refused": "The kernel refused to close {refused} connection(s) ({error}); they stay on their previous route until they close.",
       "windows-flow-reset-v6-left-to-ale": "{left} IPv6 connection(s) were found on their previous route but Windows offers no way to close them; the updated filters cut the ones that are no longer allowed.",
       "dns-config-watch-stopped": "The DNS settings watch stopped ({error}); changes are noticed only by the periodic check.",
@@ -3961,7 +4038,7 @@
       "linux-polkit-unavailable": "polkit is not available on this machine; privileged operations stay refused ({error}).",
       "linux-polkit-check-timed-out": "The authorization check did not finish within {timeout_secs} seconds; treating it as unanswered.",
       "linux-dns-monitor-unavailable": "systemd-resolved's query monitor is not available ({error}); DNS resolutions are not observed on this machine.",
-      "linux-dns-monitor-stream-ended": "The DNS query monitor stream ended; resolutions are no longer observed.",
+      "linux-dns-monitor-stream-ended": "The DNS query monitor stream ended; resolutions are not observed until it is started again.",
       "wfp-sublayer-registration-failed": "Sub-layer registration failed ({error}) for filter {filter_id}; the batch was aborted because nothing in it can install.",
       "wfp-filter-skip-unmaterializable": "Skipping a filter that could not be created (best-effort apply policy): {filter_id}, error: {error}. First occurrence this session; further repeats will not be logged at this level.",
       "wfp-filter-abort-unmaterializable-strict": "A filter that could not be created ({filter_id}, error: {error}) aborted the apply (strict, all-or-nothing policy).",
@@ -3981,6 +4058,7 @@
       "win-conn-observe-started": "Connection observer (WFP net events) started.",
       "win-conn-observe-stopped": "Connection observer (WFP net events) stopped.",
       "win-conn-observe-restore-failed": "Could not restore a machine-wide WFP net-event setting to its previous value (code {code}).",
+      "win-dns-redirect-foreign-catch-all": "Another program has its own rule sending every DNS name elsewhere; it competes with ours, so some names may bypass the local resolver.",
       "win-dns-redirect-orphans-swept": "Removed {swept} leftover DNS redirect rule(s) that would have made the DNS client reject the whole policy table.",
       "win-dns-redirect-verify-unconfirmed": "The DNS redirect rule was installed but could not be confirmed against the effective policy table ({error}); treating it as active.",
       "win-dns-redirect-exemption-sweep-failed": "Could not remove the DNS namespace exemptions left from a previous run ({error}).",
@@ -4131,24 +4209,22 @@
       "persid-plan-unresolved-hosts-dns-query": "{hosts} rule host(s) have no confirmed address yet; asking DNS to resolve them now instead of waiting ({dropped} additional host(s) skipped this round).",
       "persid-plan-app-rules-unresolved": "{count} application rule(s) are not enforced: no installed or running program matched ({apps}).",
       "persid-plan-vpn-client-awaiting-confirmation": "{count} program(s) named like a VPN client sit outside the protected program folders ({apps}); they stay under leak protection until confirmed as the link provider.",
+      "vpn-gateway-awaiting-confirmation": "Leak protection stopped what looks like another VPN reaching its server {address}; the user is asked whether to let it through.",
       "persid-plan-app-claimed-by-main": "{count} application rule address(es) overlap with main-link rules and stay on the main link ({conflicts}); the app keeps the additional link for everything else.",
       "persid-plan-app-rules-overcapped": "{count} application rule(s) are only partially enforced: more matching programs were found than the per-app limit allows ({apps}).",
       "persid-plan-rule-shape-unsupported": "{count} rule(s) are not enforced: they limit an address to one application, which cannot be carried out yet, so they were skipped rather than applied to every application ({rules}).",
       "persid-plan-suffix-truncated": "Rule {rule_id} for suffix {suffix} matched more hosts than the limit of {cap}; only the most recently seen hosts were enforced.",
-      "persid-plan-zone-widening-unimplemented": "The \"zone widening\" coverage strategy is selected but not yet supported; falling back to per-IP pinning.",
       "persid-plan-pin-set-trimmed": "Leak protection address set trimmed: {kept} address(es) kept, {dropped} dropped (already routed elsewhere or covered by {app_covered} app-observed destination(s)).",
       "persid-plan-shared-ip-excluded": "Smart leak protection excluded {excluded} shared address(es) from blocking (each is also used by a directly-visited host); {pinned} address(es) remain pinned.",
       "persid-plan-service-dns-spared": "Additional-link rules name {count} DNS server(s) of the main link ({servers}). System services keep reaching them over the main link: cutting them would break name resolution for the whole machine. Mode B moves name resolution to the service.",
       "persid-service-accounts-owner-changed": "Users the route table serves changed ({previous} → {owner}): system services now follow their leak protection addresses.",
       "persid-plan-network-too-wide": "{count} network(s) routed through the additional adapter are wider than /{widest_prefix}, so leak protection does not block them while that adapter is down: their traffic may leave through the main adapter (for example: {sample}).",
+      "foreign-tunnel-networks-over-cap": "{count} network(s) of other VPN tunnels are past the limit of {cap} per tunnel and address family and stay under leak protection while the additional adapter is down.",
       "persid-plan-network-over-cap": "{count} network(s) routed through the additional adapter are past the leak protection limit and are not blocked while that adapter is down (for example: {sample}).",
       "persid-plan-network-spared": "Leak protection never blocks {count} network(s) routed through the additional adapter: they cover the local network, a reserved range or the tunnel server, or the main adapter's rules name them too (for example: {sample}).",
-      "persid-plan-pair-empty-fail-closed": "Leak protection could not arm the leak-proof pair in mode {mode}; blocking traffic instead ({fail_closed_filters} filter(s)).",
-      "persid-plan-pair-empty-fail-open": "Leak protection was requested but could not arm this cycle in mode {mode}; traffic is allowed through (fail-open).",
-      "persid-plan-kill-switch-active": "Leak protection active in mode {mode}: {kill_switch_filters} filter(s) pinning {pinned_addresses} address(es).",
-      "persid-plan-secondary-unresolved-fail-closed": "Additional adapter could not be resolved; leak protection is blocking traffic in mode {mode} (block-all: {block_all}, {fail_closed_filters} filter(s)).",
-      "persid-plan-secondary-unresolved-heartbeat": "Additional adapter still unresolved after {elapsed_minutes} minute(s); leak protection continues blocking in mode {mode} ({fail_closed_filters} filter(s)).",
-      "persid-plan-secondary-unresolved-fail-open": "Leak protection was requested, but the additional adapter could not be resolved; leaving it disarmed (fail-open).",
+      "persid-plan-kill-switch-active": "Leak protection active: {kill_switch_filters} filter(s) pinning {pinned_addresses} address(es).",
+      "persid-plan-secondary-unresolved-fail-closed": "The additional connection could not be found; leak protection holds traffic until it returns ({fail_closed_filters} filter(s)).",
+      "persid-plan-secondary-unresolved-heartbeat": "The additional connection is still not found after {elapsed_minutes} minute(s); leak protection keeps holding traffic ({fail_closed_filters} filter(s)).",
       "persid-plan-standing-filter-alarm": "Standing filter count reached {filters}, above the alarm threshold of {threshold} (previous peak {previous_peak}): {by_band}.",
       "persid-plan-standing-filter-recovered": "Standing filter count dropped back to {filters}, below the alarm threshold.",
       "persid-apply-phantom-filters": "After applying, {phantom} of {expected} filter(s) recorded as installed are not actually active — real enforcement is weaker than reported.",
@@ -4212,6 +4288,7 @@
       "fakeip-poll-step-panicked": "An internal error interrupted one fake-IP processing step ({reason}) — it was contained and the relay keeps running.",
       "mutation-tokens-capped": "Too many unconfirmed rule previews ({held} for one user, {total} in all) — the oldest are dropped; confirming one of those asks for a fresh preview.",
       "app-observations-app-cap": "Application observation limit reached ({cap} programs) — the program seen least recently is forgotten first.",
+      "app-observations-foreign-shed": "Learnt application destinations inside a network another VPN now carries were dropped ({destinations}).",
       "fakeip-flow-refused": "Connection to {hostname} ({destination}) was refused: {verdict}.",
       "fakeip-dial-connected": "Connected to {hostname} at {upstream} via {route} in {elapsed_ms} ms.",
       "fakeip-dial-failed": "Could not connect to {hostname} at {upstream} via {route} after {elapsed_ms} ms: {error}.",
@@ -4244,6 +4321,7 @@
       "route-table-owner-none": "Nobody is signed in: the system's own traffic follows no user's routes.",
       "per-user-routing-unsupported": "This kernel cannot route each user separately ({reason}): the system route table carries the routes of one signed-in user for everyone.",
       "linux-foreign-rule-moved": "A routing rule added after the service's (a VPN connected later) stood in front of them; moved from priority {from} to {to}, where it would have been without the service.",
+      "linux-foreign-rule-ahead": "A routing rule far in front of the service's sends all traffic to another table (priority {priority}, table {table}): it is looked up before any user's own routes.",
       "linux-foreign-rule-move-failed": "A routing rule in front of the service's could not be moved ({error}): until it is, it takes the traffic before the rules do.",
       "own-traffic-mark-failed": "The service could not mark its own connections ({error}): system-wide filters may hold its checks and lookups.",
       "source-link-pin-failed": "The service could not hold an external address check to its adapter ({error}): the answer may describe another connection.",
@@ -4257,7 +4335,7 @@
       "route-users-conflict": "Another signed-in user already routes {count} of this user's destinations ({addresses}) through a different link. They keep those routes; with leak protection on, this user's traffic to them is blocked rather than sent the other way.",
       "route-users-conflict-cleared": "The route conflict with another signed-in user is over — this user's routes are in the table again.",
       "route-paused-teardown": "Routing is paused for this user (remove-on-pause) — removing additional routes.",
-      "route-paused-persist": "Routing is paused for this user (keep-on-pause) — keeping the rule-specific routes and removing only the overlay routes.",
+      "route-paused-persist": "Routing is paused for this user (keep-on-pause) — keeping the rule-specific routes and removing only the routes that steered the rest of the traffic.",
       "route-policy-recomputed": "Routes recomputed after a policy change: {added} added, {removed} removed.",
       "route-policy-recompute-failed": "Recomputing routes after a policy change failed ({error}).",
       "prod-settings-enforcement-mode-written": "DNS enforcement mode set to {written} (previous: {prior}, changed: {changed}, live resolver available: {resolver_live}).",
@@ -4332,6 +4410,8 @@
       "dns-listener-query-shed": "Mode B: a DNS query from {source} was failed at once instead of queued ({reason}; {shed} so far) — the resolver is saturated or one program is past its share.",
       "dns-resolver-withheld-name-leak-guard": "Leak protection is blocking: the name of rule host {host} was not sent over the main link ({reason}) — the answer is withheld.",
       "dns-resolver-redirect-lifted-no-upstream": "Local DNS resolver: no upstream DNS server answers — system DNS is handed back to the OS until one does.",
+      "dns-resolver-redirect-lifted-only-foreign": "Local DNS resolver: only another VPN's DNS server answers — system DNS is handed back to the OS and name-based routing is off until a resolver of ours answers.",
+      "dns-upstream-dropped-foreign": "The upstream DNS server was dropped: its network now belongs to another VPN.",
       "dns-resolver-redirect-back-upstream-answers": "Local DNS resolver: an upstream DNS server answers again — system DNS is redirected to the resolver.",
       "dns-resolver-tcp-bind-failed": "Local DNS resolver: could not listen for DNS over TCP on {addr} ({error}) — answers too large for a datagram will not resolve.",
       "dns-stack-modeb-no-signed-in-user": "Mode B: no signed-in user yet — staying in reactive mode until sign-in.",
@@ -4341,7 +4421,7 @@
       "dns-stack-changes-unwatched": "Network or DNS settings changes cannot be watched ({error}); the local resolver re-reads the connections' DNS domains on every check.",
       "dns-stack-short-name-suffixes-unread": "The short-name domains could not be read ({error}); the ones read before stay in use.",
       "dns-stack-local-suffixes-unread": "The home-network suffix list could not be read ({error}); the one read before stays in use.",
-      "dns-stack-modeb-no-upstream-answered": "Mode B was requested, but no upstream IPv4 DNS server answered a probe — staying in reactive mode.",
+      "dns-stack-modeb-no-upstream-answered": "Mode B was requested, but no upstream DNS server answered a probe — staying in reactive mode.",
       "power-resume-rebind-requested": "Re-resolving the adapter binding on request ({reason}).",
       "power-resume-from-sleep": "The machine resumed from sleep — re-resolving the adapter binding and re-applying routes.",
       "prodmisc-failclosed-state": "Leak protection blocking traffic for the additional route: {fail_closed_active}.",
@@ -4357,6 +4437,7 @@
       "autorules-intake-evidence-restored": "Restored companion evidence from before the last restart: {candidates} candidate(s), {anchors} anchor(s).",
       "autorules-intake-not-offered-companion-burst": "Not offering {host}: every measured sighting came inside another page's burst ({companions} companion(s)).",
       "autorules-intake-app-offer-stalled": "Offering to move {program} onto the additional route: {stalled} of its connection(s) did not complete on the main link.",
+      "autorules-intake-app-offer-own-resolver": "Offering a rule for {program}: it looks up site names on its own, so rules by site name do not reach {unnamed} of the addresses it used.",
       "autorules-intake-domain-offer": "A second name under {domain} ({host}) fails on the main link — offering the whole domain instead of each name.",
       "autorules-ledger-auto-added": "Automatically added {added} address(es) a routed site needs (e.g. {anchor}) to the user's own rules.",
       "autorules-ledger-serialize-failed": "Could not serialize a pending suggestion ({error}) — it will not survive a restart.",
@@ -4384,6 +4465,7 @@
       "storage-kill-switch-protocols-reset": "A stored leak protection protocol selection blocked nothing; every protocol is blocked instead.",
       "persid-plan-network-carving-over-cap": "{count} network rule(s) hold more narrower rules than can be carved out, so each applies to its whole network and the narrower rules inside it do not take effect ({rules}).",
       "linux-flow-reset-dump-capped": "The connection table holds more {family} sockets than one listing reads ({cap}); connections past that are not reset.",
+      "svc-boot-restarted-after-unasked-stop": "The service started again after a stop nobody asked for; protection was off in between.",
       "svc-scm-stop-unasked": "Stopped by something other than NetRuleRouter's own commands; the service will be started again. To keep it stopped, use \"nrr-cli stop\".",
       "svc-scm-stop-with-filtering-engine": "Stopping because the Windows Base Filtering Engine is going down; the service will be started again once the engine is back."
     },
@@ -4441,6 +4523,16 @@
     }
   },
   "audit": {
+    "cause": {
+      "revoked": "taken back by its owner or an administrator",
+      "expired": "its term ran out",
+      "full-reset": "full reset of the user's data",
+      "emergency-reset": "emergency network reset",
+      "crash-loop": "the service crashed several times in a row",
+      "services-changed": "the set of services changed",
+      "unsigned": "the stored record carried no signature",
+      "tampered": "the stored record was altered"
+    },
     "column": {
       "seq": "Seq",
       "kind": "Kind",
@@ -4469,7 +4561,6 @@
       "rule-set-emptied": "All {prev-total} previous rules are being removed",
       "high-removal-ratio": "{removed-pct}% of previous rules are being removed",
       "overlapping-rules": "*.{apex} already covers {apex} itself and every subdomain — a separate exact-name rule is redundant and can be removed, unless it deliberately routes elsewhere",
-      "fail-closed-activation": "Switching to “Everything via the additional adapter — no leaks”: if that adapter drops, all traffic is blocked",
       "app-rule-unenforceable": "No installed program matches these application rules, so they do nothing: {executables}",
       "additional-adapter-unresolved": "The additional route's adapter is not found right now: the rules apply, and its traffic stays blocked until the adapter returns",
       "apply-will-be-refused": "The service's consistency check rejects this change, so it will not be applied. The reason is in the service log",
@@ -4502,12 +4593,15 @@
     "rules-changed-elsewhere": "Your rules were changed somewhere else after they were loaded here, so nothing was applied. Load them again and merge your changes in.",
     "storage-failure": "The service could not read or write its rules storage.",
     "not-implemented": "This is not available on this system yet.",
+    "route-policy-sites-needs-main-route": "Routed sites protection works only when the main connection is the default route.",
     "unsupported-platform": "This is not available on this system, so nothing was changed.",
     "precondition-failed": "Operation precondition not met",
     "confirmation-expired": "Confirmation token expired — re-run review",
     "confirmation-unknown": "Confirmation token unknown — re-run review",
     "service-degraded": "Service is degraded — try again later",
     "recovery-required": "Service requires user recovery action",
+    "unsupported-operation": "The running service is older than this app and does not know this action. Restart the service, or update it, and try again.",
+    "response-too-large": "The service's answer was too large to send; the change itself may have been applied — refresh before trying again.",
     "internal": "Internal service error",
     "gui-internal": "Internal error in the application — the change was not sent",
     "transport-disconnected": "Service is offline",
@@ -4577,7 +4671,8 @@
     "malformed-input": "The request could not be read, so nothing was changed.",
     "canonicalisation-failed": "The rules could not be prepared for comparison, so the check was skipped.",
     "user-settings-read-only": "Your settings file cannot be written from this window, so the change was not saved. Restart NetRuleRouter and try again.",
-    "user-settings-unavailable": "Your settings file could not be read or saved. Try again."
+    "user-settings-unavailable": "Your settings file could not be read or saved. Try again.",
+    "service-contract-mismatch": "The background service is from a different build than this app, so changes are off until both match. Restart the service or update the app."
   },
   "unsaved-changes": {
     "title": "Unsaved changes",
@@ -4613,6 +4708,8 @@
         "security-alert-ack": "Acknowledge alert",
         "security-alert-resolve": "Resolve alert",
         "safe-disable": "Safe disable",
+        "rules-reset-to-baseline": "Reset to baseline",
+        "audit-chain-restart": "Restart audit trail",
         "unknown": "Operation"
       },
       "phase": {
@@ -4671,7 +4768,6 @@
       "title": "Connection blocked",
       "reason": {
         "route-unavailable": "The route this connection needed was unavailable.",
-        "not-covered-by-rules": "No rule covers this connection, so the default action blocked it.",
         "blocked-by-rule": "A rule denies this connection.",
         "ipv6-blocked": "IPv6 is switched off while leak protection is on, so this connection did not go out.",
         "dns-lockdown": "This app went to its own DNS resolver instead of the one NetRuleRouter provides, and encrypted-DNS blocking closed it.",
@@ -4683,7 +4779,10 @@
       "app-unknown": "unknown application",
       "backlog": {
         "title": "Blocked while the app was closed",
-        "body": "The service blocked {count} connection(s) while NetRuleRouter was not open.",
+        "counted": {
+          "one": "The service blocked {count} connection while NetRuleRouter was not open.",
+          "other": "The service blocked {count} connections while NetRuleRouter was not open."
+        },
         "destinations": "Destinations: {list}.",
         "more": "and {count} more"
       },
@@ -4783,16 +4882,40 @@
       "title": "New application rule is settling in",
       "body": "{apps}: the service is still learning which addresses this program uses, so its first connection attempts may fail. Restart the program if it is already open."
     },
+    "settings-unreadable": {
+      "title": "Your settings could not be read",
+      "body": "This session uses default settings and will not save changes, so your saved settings stay as they are. Close the app and open it again; if the file is locked by another program, free it first."
+    },
+    "delivery-incomplete": {
+      "title": "The installation is incomplete",
+      "body": "This copy of the program lacks {parts}. Everything else keeps working. Reinstall the program to restore what is missing.",
+      "part": {
+        "presets": "the ready-made rule sets",
+        "locales": "the interface languages, so the program is shown in English",
+        "service-binary": "the background service, so it cannot be installed or started from this window",
+        "component": "{name} (needed for: {feature})"
+      }
+    },
     "vpn-client-trust": {
       "title": "Is this your VPN?",
       "body": "{name} looks like a VPN client, but it is not installed in a protected program folder, so leak protection does not trust it on its own. Confirm it and it will keep working while leak protection is on.",
-      "body-bundle": "{name} looks like a VPN client, but it is not installed in a protected program folder, so leak protection does not trust it on its own. It ships with {count} more program(s) that can be trusted with it.",
+      "body-bundle": {
+        "one": "{name} looks like a VPN client, but it is not installed in a protected program folder, so leak protection does not trust it on its own. It ships with {count} more program that can be trusted with it.",
+        "other": "{name} looks like a VPN client, but it is not installed in a protected program folder, so leak protection does not trust it on its own. It ships with {count} more programs that can be trusted with it."
+      },
       "action-bundle": "This is my VPN, with the programs it ships with",
       "tray-body": "{apps} looks like a VPN client, but it is not installed in a protected program folder. Open NetRuleRouter to confirm it, or leak protection keeps blocking it while the additional route is down.",
       "tui-body": "{apps}: named like a VPN client, but not installed in a protected program folder, so leak protection does not trust it on its own.",
       "tui-hint": "t: confirm these as your VPN (with the programs each ships with in its protected folder).",
       "tui-done": "{count} program(s) confirmed as your VPN; leak protection keeps them working over the main link.",
       "tui-failed": "Could not save the confirmation to the routing service ({error})."
+    },
+    "vpn-gateway-trust": {
+      "title": "Let this VPN connect?",
+      "body": "Leak protection stopped a VPN from reaching its server {address} over your main connection. Allow it and that VPN connects while leak protection is on; nothing else is let through to that address.",
+      "body-program": "Leak protection stopped {name} from reaching the VPN server {address} over your main connection. Allow it and that VPN connects while leak protection is on; nothing else is let through to that address.",
+      "action": "Allow this VPN",
+      "tray-body": "A VPN is waiting for your answer in the NetRuleRouter window: leak protection stopped it from reaching its server {addresses}."
     },
     "protection-coverage": {
       "title": "Leak protection coverage changed"
@@ -4801,9 +4924,23 @@
       "title": "Protection restored after a service failure",
       "body": "The service had lost these settings and they were switched back on: {settings}."
     },
+    "service-lost": {
+      "title": "The service stopped",
+      "body": "The NetRuleRouter service stopped unexpectedly, so your rules are not applied. Start it again, or restore network access if the connection is cut.",
+      "body-start-only": "The NetRuleRouter service stopped unexpectedly, so your rules are not applied."
+    },
+    "rules-book-unreadable": {
+      "title": "Your saved rules cannot be read",
+      "body": "Your saved rules cannot be read; the last applied rules stay in force. Changes will not apply until this is fixed.",
+      "cleared": "Your saved rules can be read again; changes apply again."
+    },
     "system-dns-not-restored": {
       "title": "Sites may not open by name",
       "body": "NetRuleRouter could not hand the system DNS settings back. Restore network removes what the service left behind."
+    },
+    "dns-foreign-only": {
+      "title": "Name handling is paused by your VPN",
+      "body": "Your work VPN only lets its own DNS answer, so NetRuleRouter's name handling is paused until another DNS answers. Rules by site name may not apply meanwhile. Disconnect the VPN, or ask its administrator to allow other DNS servers."
     },
     "host-unreachable": {
       "title": "A site does not answer on either link",
@@ -4833,13 +4970,41 @@
       "body": "Choose what WSL, containers and virtual machines get when the additional route goes down. Until you choose, they are protected like this computer."
     }
   },
+  "platform": {
+    "missing": {
+      "heading": "Not available on this computer",
+      "connection-reset": {
+        "title": "Closing connections after a rule change",
+        "effect": "Connections opened before a rule change stay on their previous route until they close."
+      },
+      "user-routes": {
+        "title": "Separate routes per user",
+        "effect": "All users share one route; per-user routing needs Linux 4.10 or newer."
+      },
+      "block-reports": {
+        "title": "Reports of blocked connections",
+        "effect": "Blocks are enforced, but blocked-site notices and the outage list stay empty."
+      },
+      "ipsec-networks": {
+        "title": "Corporate IPsec networks under full leak protection",
+        "effect": "With leak protection set to Everything, a strongSwan or libreswan connection without a network interface of its own cannot reach its company's networks. This needs Linux 4.20 and nftables 0.9.1 or newer."
+      },
+      "foreign-rule-ahead": {
+        "title": "A routing rule of another program comes first",
+        "effect": "A catch-all rule of another program (often a VPN) is looked up before ours, so some traffic may bypass the routes you set."
+      },
+      "dns-foreign-catch-all": {
+        "title": "Another program takes over name lookups",
+        "effect": "Another program (often a VPN or a security tool) sends every site name to its own DNS server, so site rules may miss some sites. Close that program or turn off its DNS setting."
+      }
+    }
+  },
   "route": {
     "primary": "Main",
     "secondary": "Additional"
   },
   "block-reason": {
     "route-unavailable": "Route outages",
-    "not-covered-by-rules": "Addresses no rule covers",
     "blocked-by-rule": "Denied by rules",
     "ipv6-blocked": "IPv6 blocks",
     "dns-lockdown": "Blocks of apps using their own DNS",
@@ -4847,6 +5012,36 @@
     "any": "Blocks of this kind"
   },
   "tui": {
+    "app-groups": {
+      "intro": "A whole group of programs, or the machines of a hypervisor, can be sent over the main or the additional route at once. Changes go to your rules list, where you review and apply them.",
+      "list-title": "Groups and machines",
+      "no-rules": "Your rules have not been read yet, so a route cannot be assigned. Connect to the service first.",
+      "route-mixed": "Different routes",
+      "machines": "Machines",
+      "unchanged": "The rules already send it that way. Nothing changed.",
+      "not-assignable": "Item {n} cannot be given a route: no program rule reaches its traffic.",
+      "no-item": "There is no item {n}.",
+      "locked": "The rules list is being applied and cannot change meanwhile.",
+      "not-hypervisor": "Item {n} is not a hypervisor, so it has no machines to show.",
+      "no-target": "There is no adapter {n} that can be tied to a route.",
+      "pin-busy": "The previous change to a machine is still being made.",
+      "pin-unchanged": "The adapter is already set that way. Nothing changed.",
+      "pinning": "Changing the machine in VirtualBox…",
+      "machines-title": "Machines of {hypervisor}",
+      "help": {
+        "move": "Up and Down choose an item; Home and End jump to the first and the last",
+        "route": "P sends the item over the main route, S over the additional one; Space switches between them",
+        "scan": "R scans again",
+        "machines": "M shows the machines of the chosen hypervisor and their network adapters; M or Esc goes back to the list",
+        "pin": "In the machines, A sends all traffic of the chosen VirtualBox NAT adapter over the additional route, F lets it follow the rules again"
+      },
+      "plain": {
+        "route": "p and an item number, for example p 2: send that item over the main route; s and a number: over the additional route",
+        "scan": "r: scan again",
+        "machines": "m and an item number, for example m 1: show that hypervisor's machines; m alone: back to the list",
+        "pin": "with the machines shown, a and an adapter number: send all of its traffic over the additional route; f and a number: let it follow the rules again; p or s alone: the hypervisor's route"
+      }
+    },
     "service": {
       "dns-not-restored": "System DNS could not be restored. Run nrr-cli reset-network as administrator."
     },
@@ -4946,7 +5141,9 @@
       "help-history": "h: the latest connections or your kept history   t: the history's period — last hour, today, last 7 days",
       "plain-history": "h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period",
       "help-grouping": "g: group the list — no grouping, by program, by folder   f: a rule for the folder of the chosen group (opens Rules)",
-      "plain-grouping": "g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3"
+      "plain-grouping": "g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3",
+      "help-rule": "i: a rule for the address of the chosen connection   a: a rule for its program (both open Rules)",
+      "plain-rule": "i and a row number: a rule for that connection's address, for example i 3; a and a row number: a rule for its program"
     },
     "outage-blocks": {
       "where": "The list of what was blocked: {screen}"
@@ -4967,7 +5164,7 @@
       "acknowledging": "Acknowledging…",
       "archive-unreadable": "The service wrote the archive, but this account cannot open it.",
       "kind-any": "any",
-      "help-switch": "l: switch between diagnostics and the log",
+      "help-switch": "l: switch between diagnostics, the log and the audit trail",
       "help-ack": "Up and Down: choose an alert; a: acknowledge it",
       "help-explain": "e: type a host name or address and see which rule decides it",
       "help-export": "x: export a diagnostic archive; the service writes it and the path is shown here",
@@ -5006,7 +5203,14 @@
       "adapter-missing": "Not found",
       "rules-applied": "Rules applied",
       "rules-not-applied": "Rules not applied",
-      "rules-unknown": "Not known without the service"
+      "rules-unknown": "Not known without the service",
+      "vpn-gateway-hint": "a: allow these VPNs to reach their servers while leak protection is on.",
+      "vpn-gateway-allowed-many": "The VPN servers {addresses} can now be reached while leak protection is on.",
+      "block-route-offer": "{name} was blocked. v: send it over the additional route.",
+      "block-route-more": "Blocked sites waiting after it: {count}.",
+      "block-route-done": "{name} now goes over the additional route. You can undo it in Rules.",
+      "block-route-already": "{name} already goes over the additional route; nothing was added.",
+      "block-route-failed": "Could not send {name} over the additional route: {error}"
     },
     "help": {
       "screens": "1 to 9 and 0: open a screen",
@@ -5018,6 +5222,8 @@
       "quit": "q: quit",
       "status-feed": "On this screen, Up and Down scroll the notifications when that panel has the focus.",
       "status-vpn-trust": "t: confirm the listed programs as your VPN, so leak protection keeps them working",
+      "status-vpn-gateway": "a: allow the listed VPNs to reach their servers, so leak protection lets them connect",
+      "status-block-route": "v: send the blocked site named under the state over the additional route; you are asked first",
       "status-confirm-primary": "p: confirm the suggested main connection; another one is chosen under Interfaces and routes",
       "settings-focus": "Tab: give this screen the focus; then Up and Down move through the sections and the settings.",
       "settings-enter": "Enter: open a section, change the chosen setting, or run the chosen action.",
@@ -5025,6 +5231,7 @@
       "status-restore": "r: restore your settings to a service that lost them"
     },
     "footer": "F1: help   q: quit",
+    "clipped": "+{count} more rows",
     "plain": {
       "screen": "Screen: {name}",
       "prompt": "Type a screen number, h for help or q to quit, then press Enter.",
@@ -5032,6 +5239,7 @@
       "help-enter": "Enter on its own: show this screen again",
       "help-help": "h or ?: this help",
       "unknown": "Not understood: {input}",
+      "input-ended-unapplied": "Input ended while rule changes were not applied. They were dropped; nothing was sent to the service.",
       "commands": "Commands on this screen",
       "status-restore": "r: restore your settings to a service that lost them"
     },
@@ -5095,6 +5303,18 @@
         "rebase": "Put my edits on top of the rules now in force",
         "keep": "Keep my list as it is",
         "rebased": "Your edits are on top of the rules now in force. Review them before they apply."
+      },
+      "files": {
+        "drift-key": "Press F to compare the files with the rules in force.",
+        "none": "No rules files are linked, so there is nothing to compare. Export the rules with x to link them.",
+        "dirty": "Apply the changes on screen, or drop them with r, before comparing the files with the rules in force.",
+        "failed": "The files could not be compared with the rules in force: {error}"
+      },
+      "merge": {
+        "stays": "stays: {side}",
+        "keys": "Up and Down choose a conflict; Space or a number switches the version that stays; Enter merges and shows the changes for review; Esc leaves your list as it is.",
+        "plain-prompt": "Type a conflict's number to switch the version that stays, y to merge and review, n to leave your list as it is.",
+        "cancelled": "Nothing was merged. Your list is as it was."
       },
       "apply-offline": "The service is not connected, so the rules cannot be applied now. Export them to files with x to keep them.",
       "expired": "The review is out of date — the rules in force changed meanwhile. Press s to compare again.",
@@ -5166,6 +5386,9 @@
         "book": "b: switch between your own rules and the baseline every user without rules of their own follows; the title says which is on screen",
         "main-route": "c: check whether the main route reaches the sites of your additional-route rules; the answer shows beside each rule. Shift+O: list what the main route does not reach first, or back",
         "gateway": "v: add a rule for a VPN's gateway, so that VPN connects through the channel you choose",
+        "app-groups": "g: send a group of programs or a hypervisor's machines over a route",
+        "files-merge": "F: compare your linked rules files with the rules in force and merge them",
+        "spare": "Shift+C: remove the rules a wildcard rule of the same route already covers; where traffic goes does not change",
         "verdicts": "m: move the rules that work only on the other route there for good. n: not now",
         "move-to-type": "Shift+T: give the chosen rule the type its value is, when the value belongs to another type. Shift+M: do it for every such rule",
         "form": "In the rule form: Up and Down move between fields, Left and Right change a choice, Space switches the rule on or off, Enter saves, Esc cancels",
@@ -5188,6 +5411,9 @@
         "book": "b: switch between your own rules and the baseline",
         "main-route": "c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back",
         "gateway": "v: add a rule for a VPN's gateway",
+        "app-groups": "g: application and device routes",
+        "files-merge": "F: compare your linked rules files with the rules in force and merge them",
+        "spare": "C: remove the rules a wildcard rule of the same route already covers",
         "verdicts": "m: move the rules that work only on the other route. n: not now",
         "bulk": "A: add several rules at once",
         "move-to-type": "T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule",
@@ -5243,6 +5469,8 @@
       "saving": "Saving…",
       "saved": "Saved.",
       "not-saved": "Not saved: {error}",
+      "rollback-lookup": "Look up the previous version of my rules",
+      "rollback-failed": "Safe rollback failed: {error}",
       "load-failed": "Could not read this from the service: {error}",
       "offline": "The service is not connected, so nothing was changed. The values shown are the last ones known.",
       "number-range": "Type a whole number from {min} to {max}.",
@@ -5275,6 +5503,9 @@
         "start-mode": "Starts: {mode}",
         "note": "Starting and stopping the service needs administrator rights, and nrr-tui never asks for them. To use these actions, start nrr-tui as administrator or with sudo.",
         "done": "Done. State: {state}",
+        "fix-uninstall": "To remove the service, run: {command}",
+        "fix-reinstall": "To re-register it from this folder and start it, run: {command}",
+        "fix-mode": "To change when it starts, remove it with {uninstall}, then install it again with {install}",
         "query-failed": "Could not ask the system about the service: {error}",
         "no-manager": "This system has no service manager this program can ask."
       },
@@ -5286,6 +5517,12 @@
         "written": "Full settings exported to {path}.",
         "write-failed": "Could not write {path}: {error}",
         "rules-note": "Rules files are imported and exported on the Rules screen."
+      },
+      "reset": {
+        "scope": "Whose data to clear",
+        "scope-everyone": "Every user on this computer (needs nrr-tui started as administrator)",
+        "done": "Full reset is done and the service is stopped. Close this terminal and any NetRuleRouter window, then start again.",
+        "needs-elevation": "Full reset stopped before the rules were cleared and the service was stopped: {error}"
       },
       "logs": {
         "window-until": "On until {timestamp}"
@@ -5301,9 +5538,15 @@
       }
     },
     "wizard": {
+      "stability-failed-title": "A setup answer was not saved",
       "step": "Step {number} of {total}: {name}",
       "answers-title": "Your answer",
       "language-note": "The language of this terminal session. To start in it every time, run the program with --lang.",
+      "licence-page": "Part {number} of {total}",
+      "licence-next": "Read on",
+      "licence-previous": "Previous part",
+      "licence-not-saved": "The acceptance could not be saved, so you will be asked again next time.",
+      "sheet-note": "Answers supplied before the first start are already chosen below; change any of them.",
       "current": "{name} (current)",
       "setting": "{name}: {value}",
       "protection-saved": "Protection settings saved.",
@@ -5329,6 +5572,7 @@
       "line": "The service does not have your settings. r: restore them.",
       "failed": "Your settings could not be restored: {error}"
     },
-    "answer-in-routing-settings": "Answer in Settings, Routing section (c2)."
+    "answer-in-routing-settings": "Answer in Settings, Routing section (c2).",
+    "see-diagnostics": "Details are on the Diagnostics and logs screen (9)."
   }
 }

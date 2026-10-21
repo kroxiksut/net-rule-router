@@ -376,15 +376,11 @@ impl crate::per_sid_orchestrator::RoutePolicySource for OneSecondaryPolicy {
                 known_stable_ids: Vec::new(),
             }),
             mode: crate::per_sid_orchestrator::PerSidBehaviorMode::PreferPrimary,
-            block_secondary_when_unavailable: false,
-            kill_switch_fail_closed: true,
+            leak_protection: nrr_domain::LeakProtection::Sites,
             kill_switch_protocols: 0x7F,
-            kill_switch_block_all: false,
-            kill_switch_enabled: true,
             allow_dns_over_primary: false,
             shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
             kill_switch_strict_shared_ips: true,
-            mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy::default(),
             link_provider_exe_paths: Vec::new(),
             doh_lockdown_enabled: false,
             doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
@@ -518,12 +514,12 @@ fn established(
 #[test]
 fn destination_scoped_drop_with_live_secondary_tears_the_stale_flow_down() {
     let reset = Arc::new(nrr_platform_api::fake_ip::stale_flows::MockStaleFlowReset::new());
-    // The dropped socket itself, unattributed; and another user's connection
-    // to the same address, which the pin is not about.
+    // The dropped socket itself; and another user's connection to the same
+    // address, which the pin is not about.
     let dropped = established(
         SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 51000),
         1194,
-        None,
+        Some("S-1-5-21-1-2-3-1001"),
     );
     reset.set_flows(vec![
         dropped.clone(),
@@ -538,10 +534,9 @@ fn destination_scoped_drop_with_live_secondary_tears_the_stale_flow_down() {
         .with_stale_flow_reset(Arc::clone(&reset) as Arc<dyn StaleFlowReset>);
 
     // The same stalled flow observed twice in one batch reads the table once.
-    consumer.consume(
-        &[vpn_drop_obs(Some(80122)), vpn_drop_obs(Some(80122))],
-        SystemTime::now(),
-    );
+    let mut obs = vpn_drop_obs(Some(80122));
+    obs.user_sid = Some("S-1-5-21-1-2-3-1001".to_owned());
+    consumer.consume(&[obs.clone(), obs], SystemTime::now());
 
     assert_eq!(
         reset.queried(),
@@ -811,36 +806,25 @@ fn p2p_processes_suppress_fcrdns_learning_others_do_not() {
 // ── block-notice reporting ─────────────────────────────
 
 #[test]
-fn block_reason_prefers_killswitch_then_default_block_then_falls_back_to_rule() {
+fn block_reason_prefers_killswitch_then_falls_back_to_rule() {
     // Role-verified kill-switch/fail-closed drop → the route is down.
     assert_eq!(
-        block_reason_for(Some(1), true, Some(99), false, false, false),
+        block_reason_for(Some(1), true, false, false, false),
         BlockReason::RouteUnavailable
     );
-    // Not kill-switch, but matches the deterministic default-block-all id
-    // → nothing routed this destination.
+    // Otherwise the only remaining production source is an explicit rule.
     assert_eq!(
-        block_reason_for(Some(99), false, Some(99), false, false, false),
-        BlockReason::NotCoveredByRules
-    );
-    // Neither → the only remaining production source is an explicit rule.
-    assert_eq!(
-        block_reason_for(Some(5), false, Some(99), false, false, false),
-        BlockReason::BlockedByRule
-    );
-    // No active SID this batch (default id unknown) → same cautious default.
-    assert_eq!(
-        block_reason_for(Some(5), false, None, false, false, false),
+        block_reason_for(Some(5), false, false, false, false),
         BlockReason::BlockedByRule
     );
     // Unidentified filter: ours, but which one is unknown — say only that.
     assert_eq!(
-        block_reason_for(None, false, Some(99), false, false, false),
+        block_reason_for(None, false, false, false, false),
         BlockReason::Unattributed
     );
     // The fail-closed window still outranks it: there the cause is known.
     assert_eq!(
-        block_reason_for(None, false, Some(99), true, false, false),
+        block_reason_for(None, false, true, false, false),
         BlockReason::RouteUnavailable
     );
 }
@@ -849,13 +833,13 @@ fn block_reason_prefers_killswitch_then_default_block_then_falls_back_to_rule() 
 fn a_drop_of_the_closed_ipv6_family_names_the_family_not_a_rule() {
     // The v6 cut is an identified filter of ours that no rule can explain.
     assert_eq!(
-        block_reason_for(Some(5), false, Some(99), false, true, false),
+        block_reason_for(Some(5), false, false, true, false),
         BlockReason::Ipv6Blocked
     );
     // Even while the block-all is armed: the outage has its own notice,
     // and the switch that closed v6 is what the user can act on here.
     assert_eq!(
-        block_reason_for(Some(5), false, Some(99), true, true, false),
+        block_reason_for(Some(5), false, true, true, false),
         BlockReason::Ipv6Blocked
     );
 }
@@ -865,19 +849,19 @@ fn a_resolver_drop_names_the_dns_lockdown_not_a_rule() {
     // An app reaching for its own public resolver: identified filter,
     // no rule behind it, and the switch is in Settings.
     assert_eq!(
-        block_reason_for(Some(5), false, Some(99), false, false, true),
+        block_reason_for(Some(5), false, false, false, true),
         BlockReason::DnsLockdown
     );
     // Also while the block-all is armed — the outage has its own notice,
     // and this drop would have happened without it.
     assert_eq!(
-        block_reason_for(Some(5), false, Some(99), true, false, true),
+        block_reason_for(Some(5), false, true, false, true),
         BlockReason::DnsLockdown
     );
     // A role-verified kill-switch drop still wins: the bands are disjoint,
     // and a drop that reaches both readings is the outage.
     assert_eq!(
-        block_reason_for(Some(5), true, Some(99), false, false, true),
+        block_reason_for(Some(5), true, false, false, true),
         BlockReason::RouteUnavailable
     );
 }
@@ -906,7 +890,7 @@ fn reverse_learner_consumer(
     let sink = Arc::clone(&named);
     let consumer = ConnectionObservationConsumer::new(api, coordinator, active_sid, false)
         .with_dns_lockdown_drop_check(lockdown_check)
-        .with_reverse_dns_learner(Arc::new(move |ip, _allow_direct, _origin| {
+        .with_reverse_dns_learner(Arc::new(move |ip, _allow_direct, _origin, _owner| {
             sink.lock().unwrap_or_else(|p| p.into_inner()).push(ip);
         }));
     (consumer, named)
@@ -947,14 +931,8 @@ fn an_unrecognised_drop_during_a_fail_closed_window_reads_as_the_outage() {
     // outside the current kill-switch registry (a fake-address block).
     // Calling that "a rule blocked you" sends the user editing rules.
     assert_eq!(
-        block_reason_for(Some(5), false, Some(99), true, false, false),
+        block_reason_for(Some(5), false, true, false, false),
         BlockReason::RouteUnavailable
-    );
-    // "No rule covers this host" is still the more specific answer and keeps
-    // precedence over the posture.
-    assert_eq!(
-        block_reason_for(Some(99), false, Some(99), true, false, false),
-        BlockReason::NotCoveredByRules
     );
 }
 
@@ -1534,7 +1512,7 @@ fn with_suggestions_off_no_direct_connection_is_looked_up() {
                 Arc::new(|_: Option<&str>, _: &str| {}),
             )
             .with_reverse_dns_learner(Arc::new(
-                move |_: Ipv4Addr, _: bool, _: ReverseLearnOrigin| {
+                move |_: Ipv4Addr, _: bool, _: ReverseLearnOrigin, _: Option<&str>| {
                     counted.fetch_add(1, Ordering::SeqCst);
                 },
             ))
@@ -1835,4 +1813,170 @@ fn a_folders_script_teaches_the_folder_rule_for_its_owner_only() {
     assert!(!store.destination_used_outside(&[folder.to_string()], script_ip));
     // The editor's and the other person's command lines are never read.
     assert_eq!(launches.reads(), 2);
+}
+
+/// Victims of one dropped socket of `owner` to the test address.
+fn pin_victims(
+    local: SocketAddrV4,
+    owner: &str,
+) -> std::collections::BTreeMap<IpAddr, drop_reporter::PinDropVictims> {
+    let mut victims = drop_reporter::PinDropVictims::default();
+    victims.note(SocketAddr::V4(local), Some(owner));
+    [(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), victims)]
+        .into_iter()
+        .collect()
+}
+
+#[test]
+fn a_pin_drop_spares_a_shared_address_and_a_session_on_a_foreign_link() {
+    use nrr_platform_api::fake_ip::stale_flows::FlowLinks;
+    const OWNER: &str = "S-1-5-21-1-2-3-1001";
+    let dropped = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 51000);
+    // The same owner's session over a tunnel of their own, e.g. an RDP hop.
+    let foreign = SocketAddrV4::new(Ipv4Addr::new(172, 16, 0, 9), 52000);
+    let links = || {
+        FlowLinks::new(
+            vec![
+                (IpAddr::V4(*dropped.ip()), 1),
+                (IpAddr::V4(*foreign.ip()), 3),
+            ],
+            Some(1),
+            Some(2),
+        )
+    };
+    let flows = || {
+        vec![
+            established(dropped, 443, Some(OWNER)),
+            established(foreign, 443, Some(OWNER)),
+        ]
+    };
+    let victims = pin_victims(dropped, OWNER);
+    let shared = std::collections::HashSet::new();
+
+    let reset = drop_reporter::pin_drop_resets(flows(), &victims, &shared, |owner| {
+        assert_eq!(owner, OWNER, "the owner is asked as the OS spelled it");
+        links()
+    });
+    assert_eq!(reset, vec![established(dropped, 443, Some(OWNER))]);
+
+    // The foreign-link flow shares the owner, yet rides a link of neither
+    // role and stays; a shared address spares the dropped socket too.
+    let census: std::collections::HashSet<Ipv4Addr> =
+        [Ipv4Addr::new(203, 0, 113, 50)].into_iter().collect();
+    let none = drop_reporter::pin_drop_resets(flows(), &victims, &census, |_| links());
+    assert!(none.is_empty(), "an address a direct host shares is spared");
+}
+
+/// A program on the additional route reaching the corporate network teaches
+/// nothing: neither an address a foreign tunnel carries nor private space is
+/// pinned for it, while a public address still is.
+#[test]
+fn an_app_reaching_a_foreign_tunnels_network_is_not_learnt() {
+    use crate::app_observation_lookup::AppObservationLookup;
+    let cell = Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new());
+    cell.publish_networks(vec![nrr_domain::ipv4_network::Ipv4Network::parse(
+        "100.64.8.0/24",
+    )
+    .expect("net")]);
+    let store = Arc::new(AppObservationStore::new().with_foreign_tunnels(cell));
+    let consumer = ConnectionObservationConsumer::with_egress(
+        Arc::new(nrr_platform_api::windows_api::MockWindowsApi::new()),
+        Arc::new(|_: &str| (None, None)),
+        Arc::new(|| Some(SCRIPT_OWNER.to_string())),
+        false,
+    )
+    .with_app_observations(Arc::clone(&store));
+    let image = r"C:\Apps\assistant.exe";
+    let carried = Ipv4Addr::new(100, 64, 8, 20);
+    let private = Ipv4Addr::new(192, 168, 78, 20);
+    let public = Ipv4Addr::new(203, 0, 113, 20);
+    let summary = consumer.consume(
+        &[
+            script_observation(7, image, SCRIPT_OWNER, carried),
+            script_observation(7, image, SCRIPT_OWNER, private),
+            script_observation(7, image, SCRIPT_OWNER, public),
+        ],
+        SystemTime::now(),
+    );
+    assert_eq!(store.ips_for_app("assistant.exe"), vec![public]);
+    assert_eq!(summary.app_ips_added, 1);
+}
+
+/// "Other" is not only a foreign link: a main link the binding has not
+/// resolved yet, or a second uplink with the lower metric, carries the
+/// program too, and its destinations are still learnt. A flow over the
+/// corporate tunnel teaches nothing of what that tunnel carries.
+#[test]
+fn an_app_is_learnt_on_any_link_but_not_what_a_foreign_tunnel_carries() {
+    use crate::app_observation_lookup::AppObservationLookup;
+    const WIFI: u32 = 17;
+    const CORP: u32 = 30;
+    let adapter = |index, ip: Ipv4Addr| AdapterInfo {
+        index,
+        adapter_name: format!("{{if-{index}}}"),
+        description: String::new(),
+        friendly_name: String::new(),
+        mac: None,
+        interface_type: nrr_platform_api::adapters::InterfaceType::Ethernet,
+        oper_status: nrr_platform_api::adapters::IfOperStatus::Up,
+        ipv4_addresses: vec![ip],
+        ipv6_addresses: Vec::new(),
+        gateways: Vec::new(),
+    };
+    let ethernet_ip = Ipv4Addr::new(192, 168, 0, 50);
+    let corp_ip = Ipv4Addr::new(10, 200, 0, 5);
+    let cell = Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new());
+    cell.publish_networks(vec![nrr_domain::ipv4_network::Ipv4Network::parse(
+        "198.51.100.0/24",
+    )
+    .expect("net")]);
+    let consumer_on = |links: (Option<u32>, Option<u32>)| {
+        let mock = nrr_platform_api::windows_api::MockWindowsApi::new();
+        mock.set_adapter_infos(vec![
+            adapter(ETHERNET, ethernet_ip),
+            adapter(WIFI, Ipv4Addr::new(192, 168, 1, 50)),
+            adapter(CORP, corp_ip),
+            adapter(VPN, Ipv4Addr::new(10, 88, 1, 41)),
+        ]);
+        let store = Arc::new(AppObservationStore::new().with_foreign_tunnels(Arc::clone(&cell)));
+        let consumer = ConnectionObservationConsumer::with_egress(
+            Arc::new(mock),
+            Arc::new(move |_: &str| links),
+            Arc::new(|| Some(SCRIPT_OWNER.to_string())),
+            false,
+        )
+        .with_app_observations(Arc::clone(&store));
+        (consumer, store)
+    };
+    let image = r"C:\Apps\assistant.exe";
+    let public = Ipv4Addr::new(203, 0, 113, 20);
+
+    for (case, links) in [
+        ("main link unresolved", (None, Some(VPN))),
+        ("second uplink", (Some(WIFI), Some(VPN))),
+    ] {
+        let (consumer, store) = consumer_on(links);
+        let summary = consumer.consume(
+            &[script_observation(7, image, SCRIPT_OWNER, public)],
+            SystemTime::now(),
+        );
+        assert_eq!(store.ips_for_app("assistant.exe"), vec![public], "{case}");
+        assert_eq!(summary.app_ips_added, 1, "{case}");
+    }
+
+    let (consumer, store) = consumer_on((Some(ETHERNET), Some(VPN)));
+    let over_corp = |remote| {
+        let mut o = script_observation(7, image, SCRIPT_OWNER, remote);
+        o.local = SocketAddr::V4(SocketAddrV4::new(corp_ip, 50000));
+        o
+    };
+    let summary = consumer.consume(
+        &[
+            over_corp(Ipv4Addr::new(198, 51, 100, 9)),
+            over_corp(Ipv4Addr::new(10, 200, 4, 4)),
+        ],
+        SystemTime::now(),
+    );
+    assert!(store.ips_for_app("assistant.exe").is_empty());
+    assert_eq!(summary.app_ips_added, 0);
 }

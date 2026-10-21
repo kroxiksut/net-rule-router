@@ -182,8 +182,9 @@ pub struct ServiceStabilityConfigRecord {
     /// virtual addresses and relayed through the TUN adapter. Lives next to
     /// `enforcement_mode` because the feature is meaningful only on top of the
     /// Mode-B resolver and drives a machine-wide adapter/stack. Persisted as
-    /// INTEGER 0/1 (schema v34, CHECK 0/1); default `false` (opt-in). Global
-    /// service setting (NOT per-SID).
+    /// INTEGER 0/1 (schema v34, CHECK 0/1). A never-written row answers
+    /// `true`; a stored row keeps what it holds. Global service setting (NOT
+    /// per-SID).
     pub fake_ip_enabled: bool,
     /// DNS-over-secondary — when `true` AND the secondary adapter
     /// is up, the service's own upstream DNS queries egress source-bound
@@ -274,7 +275,10 @@ impl ServiceStabilityConfigRecord {
             // reviewed as a product decision, not inherited silently.
             enforcement_mode: EnforcementMode::Resolver,
             secondary_liveness_window_secs: 0,
-            fake_ip_enabled: false,
+            // On for a fresh install only: the column default stays `0`, and
+            // nothing writes a row without naming this field, so an install
+            // that already saved its settings keeps its choice.
+            fake_ip_enabled: true,
             dns_via_secondary: false,
             dns_fast_answers: true,
             fake_ip_udp_relay: false,

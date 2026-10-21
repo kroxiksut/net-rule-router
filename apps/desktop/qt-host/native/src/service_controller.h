@@ -2,6 +2,13 @@
 
 #include "native_bridge.h"
 
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QSaveFile>
+#include <QStandardPaths>
+
 // ── NrrServiceController ─────────────────────────────────────────────────
 //
 // Q_OBJECT bridge for the Windows Service Control Manager. Wraps the
@@ -230,6 +237,13 @@ public:
     /// (one UAC per session) instead of a per-action `ShellExecute runas`.
     /// Set once at startup in `main()`. Null ⇒ fall back to direct elevation.
     void setBridge(NrrNativeBridge *bridge) { bridge_ = bridge; }
+
+    /// True when any NetRuleRouter window or tray on this account asked for a stop in the last
+    /// few minutes. A stop nobody here asked for is the one worth telling the user about.
+    Q_INVOKABLE bool stopWasExpected() const {
+        const QFileInfo info(expectedStopMarkerPath());
+        return info.exists() && !info.isSymLink() && info.lastModified().secsTo(QDateTime::currentDateTime()) <= 180;
+    }
 
     Q_INVOKABLE void installService()   { dispatch(QStringLiteral("install"),   QStringLiteral("install")); }
     Q_INVOKABLE void uninstallService() { dispatch(QStringLiteral("uninstall"), QStringLiteral("uninstall")); }
@@ -530,7 +544,23 @@ private:
     }
 #endif
 
+    // In the vetted runtime directory, the one `nrr_shared::user_paths::runtime_dir` names.
+    static QString expectedStopMarkerPath() {
+        const QString dir = appRuntimeDirectoryPath();
+        return dir.isEmpty() ? QString()
+                             : QDir(dir).filePath(QStringLiteral("service-stop-expected.flag"));
+    }
+
+    static void noteExpectedStop(const QString &operation) {
+        static const QStringList stopping{QStringLiteral("stop"), QStringLiteral("restart"),
+            QStringLiteral("uninstall"), QStringLiteral("reinstall"),
+            QStringLiteral("stop-and-cleanup")};
+        if (!stopping.contains(operation)) { return; }
+        writeRuntimeMarker(expectedStopMarkerPath());
+    }
+
     void dispatch(const QString &operation, const QString &command) {
+        noteExpectedStop(operation);
 #ifndef Q_OS_WIN
         // The launcher runs the action against the installed service and
         // locates it itself; no path from here is used.

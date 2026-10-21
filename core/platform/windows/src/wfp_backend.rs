@@ -76,7 +76,7 @@ impl EnforcementBackend for WfpEnforcement {
     type Error = PlatformError;
 
     fn reconcile(&self, plan: &EnforcementPlan) -> Result<ApplyReport, Self::Error> {
-        let filters = lower_plan(plan, self.egress);
+        let filters = lower_plan(plan, &self.egress);
         let requested = filters.len();
         let desired: std::collections::HashSet<u64> = filters.iter().map(|f| f.id.raw).collect();
 
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn an_empty_plan_lowers_to_no_filters() {
-        assert!(lower_plan(&empty_plan(), EgressLuids::default()).is_empty());
+        assert!(lower_plan(&empty_plan(), &EgressLuids::default()).is_empty());
     }
 
     /// A filter whose id changed (an update re-derives ids) is replaced
@@ -236,8 +236,9 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
+            observed_by_program: false,
         });
-        let new = lower_plan(&plan, EgressLuids::default());
+        let new = lower_plan(&plan, &EgressLuids::default());
         assert!(!new.is_empty());
         let old: Vec<WfpFilterRecord> = new
             .iter()
@@ -256,6 +257,7 @@ mod tests {
                 remote_subnet: f.remote_subnet,
                 remote_subnet_v6: f.remote_subnet_v6,
                 ip_protocol: f.ip_protocol,
+                remote_subnet_set: f.remote_subnet_set.clone(),
             })
             .collect();
         let old_ids: Vec<u64> = old.iter().map(|r| r.id.raw).collect();
@@ -317,6 +319,7 @@ mod tests {
             remote_subnet: None,
             remote_subnet_v6: None,
             ip_protocol: None,
+            remote_subnet_set: Vec::new(),
         };
         let api = Arc::new(MockWindowsApi::new());
         *api.wfp_filters.lock().expect("lock") = vec![record(0xAAAA, mine), record(0xBBBB, theirs)];

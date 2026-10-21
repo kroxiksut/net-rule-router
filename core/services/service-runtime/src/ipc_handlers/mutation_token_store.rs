@@ -2,8 +2,10 @@
 //! safe-disable, rollback).
 //!
 //! A `dry_run = true` request mints a confirmation token and stashes what
-//! the confirm needs here under it, with a TTL. The follow-up request
-//! carries the token back and [`MutationTokenStore::consume`]s it.
+//! the confirm needs here under it, with a TTL on the clock that counts sleep
+//! ([`BootInstant`]): a preview left open over a suspend is not confirmable
+//! after it. The follow-up request carries the token back and
+//! [`MutationTokenStore::consume`]s it.
 //!
 //! Every token is bound to the operation that issued it: the operations
 //! share this store, and a confirmation of one must never authorise another.
@@ -13,10 +15,11 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nrr_shared::ipc::IpcOperationName;
 
+use crate::boot_clock::BootInstant;
 use crate::ipc::{IpcError, IpcErrorCode};
 use crate::ipc_handlers::payloads::{MutationKind, MutationSubmitRequest};
 
@@ -145,7 +148,7 @@ pub struct MutationTokenStore {
 struct Entry {
     operation: IpcOperationName,
     payload: StoredMutation,
-    expires_at: Instant,
+    expires_at: BootInstant,
     /// Issue order; the oldest token is the one evicted.
     seq: u64,
 }
@@ -155,11 +158,9 @@ struct Entry {
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// The token IS the authority for the confirm phase, so it must not be
-/// derivable from another one. The old suffix was `Instant::now().elapsed()`,
-/// which is a handful of nanoseconds by construction — in practice the token
-/// was the counter. Same CSPRNG the coordinator's confirmation tokens use, with
-/// the same reasoning about its fallback: a mutation that cannot be confirmed
-/// at all is worse than a token that is merely hard to guess, and the token
+/// derivable from another one: 128 bits from the CSPRNG the coordinator's
+/// tokens use. Its clock fallback is deliberate: a mutation that cannot be
+/// confirmed at all is worse than a token merely hard to guess, and the token
 /// stays single-use, principal-scoped and short-lived either way.
 fn next_token() -> (u64, String) {
     let n = TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -204,7 +205,7 @@ impl MutationTokenStore {
         &self,
         operation: IpcOperationName,
         payload: StoredMutation,
-        expires_at: Instant,
+        expires_at: BootInstant,
     ) -> String {
         let (seq, token) = next_token();
         let mut g = self.inner.lock().expect("token store mutex poisoned");
@@ -251,7 +252,7 @@ impl MutationTokenStore {
         &self,
         token: &str,
         operation: IpcOperationName,
-        now: Instant,
+        now: BootInstant,
     ) -> Result<StoredMutation, ConsumeError> {
         self.take(token, operation, None, now)
     }
@@ -263,7 +264,7 @@ impl MutationTokenStore {
         token: &str,
         operation: IpcOperationName,
         caller: &str,
-        now: Instant,
+        now: BootInstant,
     ) -> Result<StoredMutation, ConsumeError> {
         self.take(token, operation, Some(caller), now)
     }
@@ -278,7 +279,7 @@ impl MutationTokenStore {
         operation: IpcOperationName,
         caller: &str,
         caller_is_elevated: bool,
-        now: Instant,
+        now: BootInstant,
     ) -> Result<StoredMutation, ConsumeError> {
         self.take(
             token,
@@ -293,7 +294,7 @@ impl MutationTokenStore {
         token: &str,
         operation: IpcOperationName,
         caller: Option<&str>,
-        now: Instant,
+        now: BootInstant,
     ) -> Result<StoredMutation, ConsumeError> {
         let mut g = self.inner.lock().expect("token store mutex poisoned");
         let entry = g.remove(token).ok_or(ConsumeError::NotFound)?;
@@ -309,7 +310,7 @@ impl MutationTokenStore {
 
     /// Sweep entries whose TTL has elapsed. Cheap; callers can run it
     /// periodically (e.g. once per minute from the runtime loop).
-    pub fn gc_expired(&self, now: Instant) -> usize {
+    pub fn gc_expired(&self, now: BootInstant) -> usize {
         let mut g = self.inner.lock().expect("token store mutex poisoned");
         let before = g.len();
         g.retain(|_, e| now < e.expires_at);
@@ -347,7 +348,7 @@ mod tests {
     #[test]
     fn issue_returns_unique_tokens() {
         let s = MutationTokenStore::new();
-        let now = Instant::now();
+        let now = BootInstant::now();
         let t1 = s.issue(OP, payload(), now + DEFAULT_MUTATION_TOKEN_TTL);
         let t2 = s.issue(OP, payload(), now + DEFAULT_MUTATION_TOKEN_TTL);
         assert_ne!(t1, t2);
@@ -360,7 +361,7 @@ mod tests {
         // across two calls made moments apart, letting one token predict the
         // next; the random half must actually vary.
         let store = MutationTokenStore::new();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = BootInstant::now() + Duration::from_secs(60);
         let first = store.issue(OP, payload(), deadline);
         let second = store.issue(OP, payload(), deadline);
         let suffix = |t: &str| t.trim_start_matches("mut-tok-")[16..].to_string();
@@ -379,7 +380,7 @@ mod tests {
     #[test]
     fn consume_returns_payload_and_removes_entry() {
         let s = MutationTokenStore::new();
-        let now = Instant::now();
+        let now = BootInstant::now();
         let t = s.issue(OP, payload(), now + DEFAULT_MUTATION_TOKEN_TTL);
         let p = s.consume(&t, OP, now).expect("happy path");
         assert_eq!(p.kind, MutationKind::RulesUpdate);
@@ -394,7 +395,7 @@ mod tests {
     #[test]
     fn consume_expired_returns_expired() {
         let s = MutationTokenStore::new();
-        let now = Instant::now();
+        let now = BootInstant::now();
         let t = s.issue(OP, payload(), now + Duration::from_millis(1));
         let later = now + Duration::from_secs(60);
         assert!(matches!(
@@ -406,10 +407,26 @@ mod tests {
     }
 
     #[test]
+    fn a_token_issued_before_a_long_sleep_is_expired_after_it() {
+        let s = MutationTokenStore::new();
+        let t = s.issue(
+            OP,
+            payload(),
+            BootInstant::now() + DEFAULT_MUTATION_TOKEN_TTL,
+        );
+        crate::boot_clock::simulate_sleep(Duration::from_secs(8 * 3600));
+        assert_eq!(
+            s.consume(&t, OP, BootInstant::now()).unwrap_err(),
+            ConsumeError::Expired
+        );
+    }
+
+    #[test]
     fn consume_unknown_returns_not_found() {
         let s = MutationTokenStore::new();
         assert!(matches!(
-            s.consume("never-issued", OP, Instant::now()).unwrap_err(),
+            s.consume("never-issued", OP, BootInstant::now())
+                .unwrap_err(),
             ConsumeError::NotFound
         ));
     }
@@ -426,7 +443,7 @@ mod tests {
     #[test]
     fn a_principal_past_its_cap_loses_its_oldest_token() {
         let s = MutationTokenStore::new();
-        let now = Instant::now();
+        let now = BootInstant::now();
         let deadline = now + DEFAULT_MUTATION_TOKEN_TTL;
         let tokens: Vec<String> = (0..MAX_TOKENS_PER_PRINCIPAL + 3)
             .map(|_| s.issue(OP, payload_of("S-1-5-21-1"), deadline))
@@ -450,7 +467,7 @@ mod tests {
     #[test]
     fn another_principals_token_survives_a_flood() {
         let s = MutationTokenStore::new();
-        let now = Instant::now();
+        let now = BootInstant::now();
         let deadline = now + DEFAULT_MUTATION_TOKEN_TTL;
         let other = s.issue(OP, payload_of("S-1-5-21-2"), deadline);
         for _ in 0..MAX_TOKENS_TOTAL * 2 {
@@ -464,7 +481,7 @@ mod tests {
     #[test]
     fn the_store_never_exceeds_its_total_cap() {
         let s = MutationTokenStore::new();
-        let deadline = Instant::now() + DEFAULT_MUTATION_TOKEN_TTL;
+        let deadline = BootInstant::now() + DEFAULT_MUTATION_TOKEN_TTL;
         for i in 0..MAX_TOKENS_TOTAL * 2 {
             s.issue(OP, payload_of(&format!("S-1-5-21-{i}")), deadline);
         }
@@ -474,7 +491,7 @@ mod tests {
     #[test]
     fn gc_drops_expired_entries_only() {
         let s = MutationTokenStore::new();
-        let now = Instant::now();
+        let now = BootInstant::now();
         let _t1 = s.issue(OP, payload(), now + Duration::from_millis(1));
         let _t2 = s.issue(OP, payload(), now + Duration::from_secs(60));
         let dropped = s.gc_expired(now + Duration::from_secs(10));
@@ -487,7 +504,7 @@ mod tests {
     #[test]
     fn a_token_confirms_only_the_operation_that_issued_it() {
         let s = MutationTokenStore::new();
-        let now = Instant::now();
+        let now = BootInstant::now();
         let deadline = now + DEFAULT_MUTATION_TOKEN_TTL;
         let t = s.issue(
             IpcOperationName::ProductImpactDisableTemporary,
@@ -514,7 +531,7 @@ mod tests {
     #[test]
     fn a_principal_bound_consume_refuses_another_principal() {
         let s = MutationTokenStore::new();
-        let now = Instant::now();
+        let now = BootInstant::now();
         let deadline = now + DEFAULT_MUTATION_TOKEN_TTL;
         let t = s.issue(OP, payload_of("S-1-5-21-1"), deadline);
         assert_eq!(
@@ -535,7 +552,7 @@ mod tests {
     #[test]
     fn an_elevated_confirmer_may_differ_from_the_issuer_and_a_plain_one_may_not() {
         let s = MutationTokenStore::new();
-        let now = Instant::now();
+        let now = BootInstant::now();
         let deadline = now + DEFAULT_MUTATION_TOKEN_TTL;
         let t = s.issue(OP, payload_of("S-1-5-21-1"), deadline);
         assert_eq!(

@@ -93,6 +93,7 @@ pub mod local_time;
 // user's behalf waits for one — event-driven, because the sign-in happens
 // inside the logon phase where an early arm costs the user a frozen screen.
 pub mod logon_session;
+pub mod net_change;
 pub mod network_change;
 pub mod service_set_change;
 // The service's own sockets, tagged so machine-scope filters let them through.
@@ -129,6 +130,9 @@ pub mod reachability;
 // The route table + adapters half of the old `WindowsApiPort` — the part
 // every OS can implement.
 pub mod route_lowering;
+// Which rows of a route table are ours, for every reader with no record of
+// what it installed: the service, the reset verb and both OS uninstalls.
+pub mod route_signature;
 pub mod route_table;
 pub mod routing;
 // Register / remove / start / stop / inspect the background service. The OS
@@ -157,6 +161,8 @@ pub mod third_party;
 // The servers kernel tunnels reach, which no route names.
 pub mod tunnel_endpoints;
 pub mod types;
+// Which link is the machine's way out, by the route table rather than a name.
+pub mod uplink;
 // A hypervisor's machines and what their network adapters mean for routing.
 pub mod vm_inventory;
 // VPN-client discovery port (processes + installed programs →

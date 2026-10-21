@@ -246,9 +246,15 @@ fn failed(error: CallError) -> Note {
 /// After the rules were read back from a move made here: each route bound to
 /// a file gets it written from the rows now on screen.
 pub fn write_bound_files(app: &mut AppState) {
-    if !std::mem::take(&mut app.rules.verdicts.rewrite_files) {
-        return;
+    if std::mem::take(&mut app.rules.verdicts.rewrite_files) {
+        write_bound_files_now(app);
     }
+}
+
+/// The same write, without waiting for a flag: after an apply, whose rows are
+/// the rules in force.
+pub fn write_bound_files_now(app: &mut AppState) {
+    app.rules.verdicts.rewrite_files = false;
     let Some(file) = app.rules.settings_file.as_deref() else {
         return;
     };

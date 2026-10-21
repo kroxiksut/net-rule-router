@@ -436,7 +436,7 @@ impl DirectUdpUpstreamResolver {
         sock.send(query)
             .map_err(|e| ResolveError::Unavailable(format!("send: {e}")))?;
         let started = std::time::Instant::now();
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; MAX_REPLY_DATAGRAM];
         loop {
             let remaining = window.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -568,6 +568,10 @@ impl DirectUdpUpstreamResolver {
 
 /// The `Unavailable` reason a truncated datagram carries.
 const TRUNCATED: &str = "truncated (TC=1)";
+
+/// The largest datagram an upstream can send. A smaller buffer fails the
+/// receive on Windows, and an oversized answer counted against the server.
+const MAX_REPLY_DATAGRAM: usize = 65_535;
 
 impl DirectUdpUpstreamResolver {
     /// one PTR send + receive window for `ip`.
@@ -789,6 +793,77 @@ pub struct PoisonFallbackUpstreamResolver {
     /// Memory of what other rule hostnames recently resolved to. `None` = the
     /// reuse trigger is not wired (tests / non-resolver callers).
     recent: Option<Arc<RecentRuleAddressIndex>>,
+    /// Hosts whose upstream answer was recently found unusable, so the next
+    /// query skips the doomed round-trip.
+    verdicts: Mutex<HostVerdicts>,
+}
+
+/// What a confirmation round last learned about a host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostVerdict {
+    /// The captured upstream's answer was unusable and a public resolver
+    /// answered clean.
+    UpstreamUnusable,
+    /// Every source agreed the name has nothing to pin.
+    NothingToPin,
+}
+
+/// Bounded, short-lived memory of [`HostVerdict`]s. A wrong entry costs at
+/// most one TTL of the old behaviour, so a provider that stops filtering is
+/// noticed within it.
+#[derive(Default)]
+struct HostVerdicts {
+    entries: std::collections::HashMap<(Box<str>, bool), (Instant, HostVerdict)>,
+}
+
+impl HostVerdicts {
+    const TTL: Duration = Duration::from_secs(120);
+    const CAPACITY: usize = 512;
+
+    fn key(hostname: &str, family: AddressFamily) -> (Box<str>, bool) {
+        (
+            hostname.to_ascii_lowercase().into_boxed_str(),
+            family == AddressFamily::Ipv6,
+        )
+    }
+
+    fn recall(
+        &mut self,
+        hostname: &str,
+        family: AddressFamily,
+        now: Instant,
+    ) -> Option<HostVerdict> {
+        let key = Self::key(hostname, family);
+        match self.entries.get(&key) {
+            Some((until, verdict)) if *until > now => Some(*verdict),
+            Some(_) => {
+                self.entries.remove(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn remember(
+        &mut self,
+        hostname: &str,
+        family: AddressFamily,
+        verdict: HostVerdict,
+        now: Instant,
+    ) {
+        if self.entries.len() >= Self::CAPACITY {
+            self.entries.retain(|_, (until, _)| *until > now);
+            if self.entries.len() >= Self::CAPACITY {
+                return;
+            }
+        }
+        self.entries
+            .insert(Self::key(hostname, family), (now + Self::TTL, verdict));
+    }
+
+    fn forget(&mut self, hostname: &str, family: AddressFamily) {
+        self.entries.remove(&Self::key(hostname, family));
+    }
 }
 
 /// Why an upstream answer is not taken at face value.
@@ -836,6 +911,7 @@ impl PoisonFallbackUpstreamResolver {
             inner,
             fallbacks: Self::public_fallbacks(None),
             recent: None,
+            verdicts: Mutex::new(HostVerdicts::default()),
         }
     }
 
@@ -937,6 +1013,56 @@ impl PoisonFallbackUpstreamResolver {
         }
     }
 
+    fn recall_verdict(&self, hostname: &str, family: AddressFamily) -> Option<HostVerdict> {
+        let mut verdicts = self.verdicts.lock().unwrap_or_else(|p| p.into_inner());
+        verdicts.recall(hostname, family, Instant::now())
+    }
+
+    fn remember_verdict(&self, hostname: &str, family: AddressFamily, verdict: HostVerdict) {
+        let mut verdicts = self.verdicts.lock().unwrap_or_else(|p| p.into_inner());
+        verdicts.remember(hostname, family, verdict, Instant::now());
+    }
+
+    fn forget_verdict(&self, hostname: &str, family: AddressFamily) {
+        let mut verdicts = self.verdicts.lock().unwrap_or_else(|p| p.into_inner());
+        verdicts.forget(hostname, family);
+    }
+
+    /// Straight to the public resolvers for a host whose upstream answer was
+    /// recently unusable. `None` sends the caller down the ordinary path.
+    fn ask_fallbacks_directly(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+        budget: Duration,
+    ) -> Option<ResolvedAddresses> {
+        let started = Instant::now();
+        let budget = budget.min(Self::CONFIRM_BUDGET);
+        for fallback in &self.fallbacks {
+            let left = budget.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            let Ok(candidate) = fallback.resolve_within(hostname, family, left) else {
+                continue;
+            };
+            if self
+                .confirmation(
+                    hostname,
+                    &Suspicion::NoUsableAddress,
+                    None,
+                    &candidate,
+                    family,
+                )
+                .is_some()
+            {
+                crate::dns_tamper_summary::record(hostname);
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     /// How `candidate` settles `suspicion`, or `None` when it does not.
     fn confirmation(
         &self,
@@ -1021,7 +1147,19 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
         budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
         let call_started = std::time::Instant::now();
+        let verdict = self.recall_verdict(hostname, family);
+        if verdict == Some(HostVerdict::UpstreamUnusable) {
+            if let Some(answer) = self.ask_fallbacks_directly(hostname, family, budget) {
+                return Ok(answer);
+            }
+            self.forget_verdict(hostname, family);
+        }
         let primary = self.inner.resolve_within(hostname, family, budget);
+        // Everyone agreed last time that there is nothing to pin: the ordinary
+        // answer goes out without another confirmation round.
+        if verdict == Some(HostVerdict::NothingToPin) {
+            return primary;
+        }
         let suspicion = match &primary {
             Ok(resolved) => self.suspicion(hostname, resolved, family),
             // A filtering provider's refusal shows on the A answer, asked
@@ -1101,6 +1239,10 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
                     return Ok(candidate);
                 }
                 Some(Confirmation::Replaced) => {
+                    crate::dns_tamper_summary::record(hostname);
+                    if matches!(suspicion, Suspicion::NoUsableAddress) {
+                        self.remember_verdict(hostname, family, HostVerdict::UpstreamUnusable);
+                    }
                     tracing::info!(
                         target: "nrr::dns-resolver",
                         msg_key = "dns-resolver-fallback-answered-clean",
@@ -1122,11 +1264,14 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
             // reporting it as a failed confirmation buried the real alarms:
             // measured at ten a minute on a live machine, every one of them a
             // CDN zone with no A record of its own.
-            Suspicion::NoUsableAddress if second_source_saw_nothing_either => tracing::debug!(
-                target: "nrr::dns-resolver",
-                host = %hostname,
-                "a second source agrees this host has no address of its own — nothing to pin",
-            ),
+            Suspicion::NoUsableAddress if second_source_saw_nothing_either => {
+                self.remember_verdict(hostname, family, HostVerdict::NothingToPin);
+                tracing::debug!(
+                    target: "nrr::dns-resolver",
+                    host = %hostname,
+                    "a second source agrees this host has no address of its own — nothing to pin",
+                );
+            }
             Suspicion::NoUsableAddress => tracing::warn!(
                 target: "nrr::dns-resolver",
                 msg_key = "dns-resolver-unconfirmed-answer",
@@ -1449,7 +1594,12 @@ pub struct HookSyncReconciler {
     /// Where the worker reports; a hook running past
     /// [`RECONCILE_WORK_DEADLINE`] is a hang every waiter pays for.
     liveness: Option<Arc<crate::task_liveness::TaskLiveness>>,
+    /// What a forced request runs instead of `hook`.
+    forced_hook: Option<RouteRecomputeHook>,
 }
+
+/// A run shorter than this was an idle pass, not a plan and an apply.
+const SKIPPED_PASS: Duration = Duration::from_millis(20);
 
 /// One reconcile run longer than this is stuck, not slow: waiters give up on
 /// it after a fraction of a second.
@@ -1545,6 +1695,8 @@ struct ReconcileWorkerState {
     /// answered at once instead of waiting out their deadline, and the worker
     /// does not re-run for it — a hook that always panics must not spin.
     failed: u64,
+    /// Highest generation requested with the forced run.
+    forced: u64,
     worker_spawned: bool,
     shutdown: bool,
 }
@@ -1562,7 +1714,16 @@ impl HookSyncReconciler {
             first_contact_v6: None,
             first_contact_timing: FirstContactTiming::default(),
             liveness: None,
+            forced_hook: None,
         }
+    }
+
+    /// The run a [`SyncReconciler::reconcile_forced`] request gets; without
+    /// it a forced request is a plain one.
+    #[must_use]
+    pub fn with_forced_hook(mut self, hook: RouteRecomputeHook) -> Self {
+        self.forced_hook = Some(hook);
+        self
     }
 
     /// Report the worker to `liveness`.
@@ -1591,6 +1752,7 @@ impl HookSyncReconciler {
     /// crediting every caller whose request preceded the run's start.
     fn worker_loop(
         hook: RouteRecomputeHook,
+        forced_hook: Option<RouteRecomputeHook>,
         state: Arc<(Mutex<ReconcileWorkerState>, std::sync::Condvar)>,
         last_run: Arc<std::sync::atomic::AtomicU64>,
         liveness: Option<Arc<crate::task_liveness::TaskLiveness>>,
@@ -1605,7 +1767,7 @@ impl HookSyncReconciler {
         });
         let (lock, cv) = &*state;
         loop {
-            let target = {
+            let (target, forced) = {
                 let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
                 loop {
                     if guard.shutdown {
@@ -1615,8 +1777,9 @@ impl HookSyncReconciler {
                         }
                         return;
                     }
-                    if guard.requested > guard.completed.max(guard.failed) {
-                        break guard.requested;
+                    let done = guard.completed.max(guard.failed);
+                    if guard.requested > done {
+                        break (guard.requested, guard.forced > done);
                     }
                     guard = cv.wait(guard).unwrap_or_else(|p| p.into_inner());
                 }
@@ -1629,7 +1792,11 @@ impl HookSyncReconciler {
             // A panic must not take the worker with it: the flag would still
             // say "spawned" and every later reconcile would wait out its
             // deadline, withholding every rule host until a restart.
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()));
+            let run_hook = match (&forced_hook, forced) {
+                (Some(forced_hook), true) => forced_hook,
+                _ => &hook,
+            };
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_hook()));
             drop(run);
             if let Err(panic) = outcome {
                 let detail = panic
@@ -1650,10 +1817,13 @@ impl HookSyncReconciler {
             let took = started.elapsed();
             // Published so the answer gate can tell a wait that can succeed
             // from one that cannot — see `SyncReconciler::typical_run`.
-            last_run.store(
-                took.as_millis().min(u128::from(u64::MAX)) as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            // A pass skipped as unchanged says nothing about what a real one costs.
+            if took >= SKIPPED_PASS {
+                last_run.store(
+                    took.as_millis().min(u128::from(u64::MAX)) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
             let credited = target.saturating_sub(guard.completed);
             let queued = guard.requested.saturating_sub(target);
@@ -1675,28 +1845,25 @@ impl HookSyncReconciler {
     }
 }
 
-impl Drop for HookSyncReconciler {
-    fn drop(&mut self) {
-        let (lock, cv) = &*self.state;
-        let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-        guard.shutdown = true;
-        cv.notify_all();
-    }
-}
-
-impl SyncReconciler for HookSyncReconciler {
-    fn reconcile_now(&self, deadline: Duration) -> ReconcileOutcome {
+impl HookSyncReconciler {
+    fn wait_for_run(&self, deadline: Duration, forced: bool) -> ReconcileOutcome {
         let (lock, cv) = &*self.state;
         let my_gen = {
             let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
             guard.requested += 1;
+            if forced {
+                guard.forced = guard.requested;
+            }
             if !guard.worker_spawned {
                 guard.worker_spawned = true;
                 let hook = Arc::clone(&self.hook);
+                let forced_hook = self.forced_hook.clone();
                 let state = Arc::clone(&self.state);
                 let last_run = Arc::clone(&self.last_run_ms);
                 let liveness = self.liveness.clone();
-                std::thread::spawn(move || Self::worker_loop(hook, state, last_run, liveness));
+                std::thread::spawn(move || {
+                    Self::worker_loop(hook, forced_hook, state, last_run, liveness)
+                });
             }
             cv.notify_all();
             guard.requested
@@ -1726,6 +1893,29 @@ impl SyncReconciler for HookSyncReconciler {
                 return ReconcileOutcome::DeadlineExceeded;
             }
         }
+    }
+}
+
+impl Drop for HookSyncReconciler {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.state;
+        let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        guard.shutdown = true;
+        cv.notify_all();
+    }
+}
+
+impl SyncReconciler for HookSyncReconciler {
+    fn reconcile_forced(&self, deadline: Duration) -> ReconcileOutcome {
+        self.wait_for_run(deadline, self.forced_hook.is_some())
+    }
+
+    fn reconcile_now(&self, deadline: Duration) -> ReconcileOutcome {
+        self.wait_for_run(deadline, false)
+    }
+
+    fn request_reconcile_forced(&self) {
+        let _ = self.reconcile_forced(Duration::ZERO);
     }
 
     fn typical_run(&self) -> Option<Duration> {
@@ -1971,7 +2161,7 @@ impl crate::dns_resolver::DirectAnswerGate for ReconcilingDirectAnswerGate {
         if added == 0 {
             return; // already exempt (or capped) — nothing new to install
         }
-        let outcome = self.reconciler.reconcile_now(self.deadline);
+        let outcome = self.reconciler.reconcile_forced(self.deadline);
         tracing::info!(
             target: "nrr::dns-resolver",
             msg_key = "dns-resolver-block-all-exemption-installed",

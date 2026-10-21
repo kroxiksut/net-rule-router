@@ -90,14 +90,14 @@ pub fn write_token_file(launcher_pid: u32, suffix: &str, nonce: &str) -> io::Res
 /// broker on a path inside a directory its unprivileged user controls, so a
 /// link swapped in while the UAC prompt is up must not turn this into an
 /// administrator's read or delete elsewhere. Deletion is best-effort.
-pub fn read_and_delete_token_file(path: &Path) -> io::Result<String> {
+pub fn read_and_delete_token_file(path: &Path, client_sid: &str) -> io::Result<String> {
     if !is_token_file_path(path) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("not a broker token file: {}", path.display()),
         ));
     }
-    let nonce = handoff::take(path)?.trim().to_string();
+    let nonce = handoff::take(path, client_sid)?.trim().to_string();
     if nonce.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -131,9 +131,10 @@ mod handoff {
         })
     }
 
-    pub fn take(path: &Path) -> io::Result<String> {
-        let root = nrr_platform_windows::pinned_file::user_temp_root()
-            .unwrap_or_else(|_| std::env::temp_dir());
+    /// The file lives in the asking user's folder, which is not the one this
+    /// process's shell names when another administrator answered the prompt.
+    pub fn take(path: &Path, client_sid: &str) -> io::Result<String> {
+        let root = nrr_platform_windows::pinned_file::temp_root_of_user(Some(client_sid))?;
         nrr_platform_windows::pinned_file::take(&root, path)
     }
 }
@@ -147,7 +148,7 @@ mod handoff {
         std::env::temp_dir().join(nrr_shared::product_identity::PRODUCT_NAME)
     }
 
-    pub fn take(path: &Path) -> io::Result<String> {
+    pub fn take(path: &Path, _client_sid: &str) -> io::Result<String> {
         for p in [path.parent().unwrap_or(path), path] {
             if std::fs::symlink_metadata(p)?.file_type().is_symlink() {
                 return Err(io::Error::new(
@@ -195,6 +196,17 @@ pub fn spawn_elevated_broker(exe: &Path, argv: &[String]) -> SpawnOutcome {
 mod tests {
     use super::*;
 
+    fn own_sid() -> String {
+        #[cfg(windows)]
+        {
+            nrr_platform_windows::elevation::current_user_sid().unwrap_or_default()
+        }
+        #[cfg(not(windows))]
+        {
+            String::new()
+        }
+    }
+
     #[test]
     fn nonce_is_64_hex_chars() {
         let n = generate_nonce().expect("nonce");
@@ -213,7 +225,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("broker-shape-test.txt");
         std::fs::write(&path, "nonce").unwrap();
-        assert!(read_and_delete_token_file(&path).is_err());
+        assert!(read_and_delete_token_file(&path, &own_sid()).is_err());
         assert!(path.exists(), "a refused path must not be deleted");
         let _ = std::fs::remove_file(&path);
     }
@@ -225,7 +237,7 @@ mod tests {
         let nonce = "abc123";
         let path = write_token_file(pid, suffix, nonce).expect("write token");
         assert!(path.exists());
-        let read = read_and_delete_token_file(&path).expect("read token");
+        let read = read_and_delete_token_file(&path, &own_sid()).expect("read token");
         assert_eq!(read, nonce);
         assert!(!path.exists(), "token file must be deleted after read");
     }
@@ -236,7 +248,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("broker-empty-test.token");
         std::fs::write(&path, "   ").unwrap();
-        let result = read_and_delete_token_file(&path);
+        let result = read_and_delete_token_file(&path, &own_sid());
         assert!(result.is_err());
         assert!(!path.exists());
     }

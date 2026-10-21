@@ -22,6 +22,55 @@ pub struct IpcContractVersionPolicy {
 /// [`IPC_VERSION_COMPATIBILITY_MATRIX`].
 pub const IPC_PROTOCOL_VERSION: u32 = 1;
 
+/// Revision of the payload shapes both ends exchange, apart from the framing
+/// [`IPC_PROTOCOL_VERSION`] covers. Bump it whenever a payload changes in a way
+/// an older peer would misread: a field removed, renamed or made required, or a
+/// meaning changed. Reads still work across a skew; changes do not, because a
+/// change the other side misreads can switch protection off while reporting
+/// success. `tests/wire_contract_revision.rs` fails on a shape change that came
+/// without a bump.
+///
+/// 2: route policy carries `leak-protection`; the kill-switch fields are gone.
+pub const IPC_CONTRACT_REVISION: u32 = 2;
+
+/// What a peer that states no revision speaks: it predates the field.
+pub const IPC_CONTRACT_REVISION_UNSTATED: u32 = 1;
+
+/// Serde default for a revision the peer left out.
+pub const fn contract_revision_unstated() -> u32 {
+    IPC_CONTRACT_REVISION_UNSTATED
+}
+
+/// Which side of a connection is behind on the payload contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ContractSkew {
+    /// The service reads older shapes than this client writes.
+    ServiceOlder,
+    /// This client reads older shapes than the service writes.
+    ClientOlder,
+}
+
+impl ContractSkew {
+    /// `None` when both speak the same revision.
+    pub const fn between(service: u32, client: u32) -> Option<Self> {
+        if service < client {
+            Some(Self::ServiceOlder)
+        } else if service > client {
+            Some(Self::ClientOlder)
+        } else {
+            None
+        }
+    }
+
+    /// The slug the window and the terminal key their texts by.
+    pub const fn as_slug(self) -> &'static str {
+        match self {
+            Self::ServiceOlder => "service-older",
+            Self::ClientOlder => "client-older",
+        }
+    }
+}
+
 pub const IPC_CONTRACT_VERSION_POLICY: IpcContractVersionPolicy = IpcContractVersionPolicy {
     contract_version_in_envelope: true,
     explicit_negotiation_required: true,

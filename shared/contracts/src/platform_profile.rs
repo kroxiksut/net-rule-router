@@ -246,7 +246,9 @@ impl PlatformProfile {
                 // The daemon applies a verbose window live and resumes it on
                 // start, whatever happens to the rest of the stored row.
                 verbose_logging: true,
-                local_network_exceptions: false,
+                // The planner honours the stored answers and the list reads
+                // the same route table the exemptions come from.
+                local_network_exceptions: true,
                 forwarded_traffic_guard: true,
                 // Fed by the drop reports our nftables rules send back.
                 block_notices: true,
@@ -396,8 +398,8 @@ mod tests {
             PlatformProfile::macos().supports,
         ] {
             assert!(!supports.service_stability_config);
-            assert!(!supports.local_network_exceptions);
         }
+        assert!(!PlatformProfile::macos().supports.local_network_exceptions);
         assert!(!PlatformProfile::macos().supports.block_notices);
         assert!(!PlatformProfile::macos().supports.audit_chain_restart);
     }

@@ -67,19 +67,6 @@ impl RouteTablePort for ProductionWindowsApi {
         production_unicast_ip_addresses()
     }
 
-    fn interactive_user_sid(&self) -> Option<String> {
-        // Real WTS/token resolution on Windows; no console-session concept
-        // elsewhere, so cross-platform check stays green.
-        #[cfg(target_os = "windows")]
-        {
-            crate::win32_ffi::console_session::interactive_user_sid()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            None
-        }
-    }
-
     fn interactive_user_sids(&self) -> Vec<String> {
         #[cfg(target_os = "windows")]
         {

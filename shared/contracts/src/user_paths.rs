@@ -68,9 +68,204 @@ pub fn user_config_root() -> Option<PathBuf> {
     user_app_roots().into_iter().next()
 }
 
+/// A stop of the service the asking user requested on purpose. Written before
+/// the stop by whoever asked (window, tray, console); read by the clients so a
+/// requested stop raises no "unexpected stop" notice.
+pub const EXPECTED_STOP_MARKER: &str = "service-stop-expected.flag";
+
+/// How long a marker vouches for a stop.
+pub const EXPECTED_STOP_WINDOW: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The per-user directory the desktop surfaces coordinate through (locks,
+/// activation hand-off, shutdown flags, the stop marker). Windows: the per-user
+/// temp folder. Elsewhere a shared `/tmp` would let another user plant a link,
+/// so it is `$XDG_RUNTIME_DIR` or the user config root, never the temp root. The
+/// Qt host spells the same two places (`host_support.h`).
+pub fn runtime_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        Some(std::env::temp_dir().join(crate::product_identity::PRODUCT_NAME))
+    }
+    #[cfg(not(windows))]
+    {
+        let temp = std::env::temp_dir();
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .map(|p| p.join(product_dir_leaf()))
+            .or_else(|| user_app_roots().into_iter().find(|r| !r.starts_with(&temp)))
+    }
+}
+
+/// The directory holding the marker: the runtime directory.
+pub fn expected_stop_marker_dir() -> Option<PathBuf> {
+    runtime_dir()
+}
+
+/// The marker inside `dir`.
+pub fn expected_stop_marker_in(dir: &std::path::Path) -> PathBuf {
+    dir.join(EXPECTED_STOP_MARKER)
+}
+
+/// Whether a marker of this age still vouches for a stop.
+pub fn expected_stop_is_fresh(age: std::time::Duration) -> bool {
+    age <= EXPECTED_STOP_WINDOW
+}
+
+/// Whether the asking user left a fresh marker. A link is never followed.
+pub fn expected_stop_was_requested() -> bool {
+    expected_stop_marker_dir().is_some_and(|dir| expected_stop_marker_fresh_in(&dir))
+}
+
+/// [`expected_stop_was_requested`] for a given directory.
+pub fn expected_stop_marker_fresh_in(dir: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(expected_stop_marker_in(dir))
+        .ok()
+        .filter(|m| m.file_type().is_file())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(expected_stop_is_fresh)
+}
+
+/// Leave the marker for this user. Best effort: a failure only means the stop
+/// reads as unexpected, which errs toward telling the user.
+pub fn note_expected_stop() {
+    if let Some(dir) = expected_stop_marker_dir() {
+        note_expected_stop_in(&dir);
+    }
+}
+
+/// [`note_expected_stop`] into a given directory. The directory must be a real
+/// one of ours; the file is written beside the marker and renamed over it, so a
+/// planted link at the marker is replaced, never written through.
+pub fn note_expected_stop_in(dir: &std::path::Path) {
+    let _ = write_marker(dir);
+}
+
+fn write_marker(dir: &std::path::Path) -> std::io::Result<()> {
+    ensure_own_dir(dir)?;
+    let marker = expected_stop_marker_in(dir);
+    let staging = dir.join(format!("{EXPECTED_STOP_MARKER}.{}", std::process::id()));
+    let _ = std::fs::remove_file(&staging);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(&staging)?;
+    std::fs::rename(&staging, &marker).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staging);
+    })
+}
+
+/// A real directory, not a link, that only its owner can change; created
+/// private when missing.
+pub fn ensure_own_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    if std::fs::symlink_metadata(dir).is_err() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(dir)?;
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a plain directory"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // The parent is the per-user root we trust; a directory of another
+        // owner, or one others can write, is not ours.
+        let parent_uid = dir
+            .parent()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.uid());
+        if parent_uid != Some(meta.uid()) || meta.mode() & 0o022 != 0 {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "directory is not ours",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stop_marker_vouches_only_while_fresh() {
+        assert!(expected_stop_is_fresh(std::time::Duration::from_secs(179)));
+        assert!(!expected_stop_is_fresh(std::time::Duration::from_secs(181)));
+    }
+
+    #[test]
+    fn noting_a_stop_creates_a_fresh_marker_and_its_folder() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("stop");
+        assert!(!expected_stop_marker_fresh_in(&dir));
+        note_expected_stop_in(&dir);
+        assert!(expected_stop_marker_fresh_in(&dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_link_at_the_marker_is_replaced_not_followed() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("stop");
+        note_expected_stop_in(&dir);
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, b"keep").expect("victim");
+        let marker = expected_stop_marker_in(&dir);
+        std::fs::remove_file(&marker).expect("rm");
+        symlink(&victim, &marker).expect("plant");
+        assert!(
+            !expected_stop_marker_fresh_in(&dir),
+            "a link is not a marker"
+        );
+        note_expected_stop_in(&dir);
+        assert_eq!(std::fs::read(&victim).expect("read"), b"keep");
+        assert!(expected_stop_marker_fresh_in(&dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_link_as_the_folder_is_not_written_through() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("tempdir");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("dir");
+        let dir = root.path().join("stop");
+        symlink(&elsewhere, &dir).expect("plant");
+        note_expected_stop_in(&dir);
+        assert_eq!(std::fs::read_dir(&elsewhere).expect("ls").count(), 0);
+    }
+
+    #[test]
+    fn the_runtime_dir_is_never_the_bare_temp_root() {
+        if let Some(dir) = runtime_dir() {
+            assert_ne!(dir, std::env::temp_dir());
+            if cfg!(not(windows)) {
+                assert!(!dir.starts_with(std::env::temp_dir()));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_folder_open_to_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("run");
+        std::fs::create_dir(&dir).expect("dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(ensure_own_dir(&dir).is_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert!(ensure_own_dir(&dir).is_ok());
+    }
 
     #[test]
     fn every_root_ends_in_the_product_leaf() {

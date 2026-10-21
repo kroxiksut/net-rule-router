@@ -63,6 +63,8 @@ GroupBox {
                 theme: root.uiTheme
                 text: "-"
                 Layout.preferredWidth: 40
+                Accessible.name: root.uiRevision >= 0
+                    ? root.tr("settings.field.ui-scale-decrease", "Decrease UI scale") : ""
                 onClicked: root.commitPrefs({
                     fontScalePercent: Pure.normalizedFontScalePercent(
                         root.prefs.fontScalePercent - fontScaleSlider.stepSize)
@@ -71,6 +73,7 @@ GroupBox {
             Slider {
                 id: fontScaleSlider
                 Layout.fillWidth: true
+                Accessible.name: root.uiRevision >= 0 ? root.tr("settings.field.ui-scale", "UI scale") : ""
                 from: 80
                 to: 300
                 stepSize: 5
@@ -114,6 +117,8 @@ GroupBox {
                 theme: root.uiTheme
                 text: "+"
                 Layout.preferredWidth: 40
+                Accessible.name: root.uiRevision >= 0
+                    ? root.tr("settings.field.ui-scale-increase", "Increase UI scale") : ""
                 onClicked: root.commitPrefs({
                     fontScalePercent: Pure.normalizedFontScalePercent(
                         root.prefs.fontScalePercent + fontScaleSlider.stepSize)

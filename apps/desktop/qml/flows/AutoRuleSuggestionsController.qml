@@ -30,6 +30,8 @@ QtObject {
     /// the sidebar badges. Never re-counted here: a second rule would drift.
     property int autoRuleCandidatesPending: 0
     property bool _autoRuleFetchInFlight: false
+    /// The last list read failed: an empty list then means "unknown", not "nothing".
+    property bool autoRuleLoadFailed: false
     /// Id of the banner currently on screen, so a newer push can replace it.
     property string _autoRuleNoticeId: ""
     /// Id of the on-screen "same rule on both routes" stripe, so a newer
@@ -53,11 +55,16 @@ QtObject {
             autoRuleSuggestionsController._autoRuleFetchInFlight = false
             if (!ok || !payload) {
                 console.log("auto-rule candidates fetch failed:", code, msg)
+                autoRuleSuggestionsController.autoRuleLoadFailed = true
                 return
             }
+            autoRuleSuggestionsController.autoRuleLoadFailed = false
             var list = payload.candidates || payload["candidates"] || []
             autoRuleSuggestionsController.autoRuleCandidates = list
             autoRuleSuggestionsController.autoRuleCandidatesPending = Number(payload["pending-count"] || 0)
+            // A notice promising addresses the list no longer holds goes too.
+            if (autoRuleSuggestionsController.autoRuleCandidatesPending <= 0)
+                root.notificationsController._dropPushNotice(autoRuleSuggestionsController._autoRuleNoticeId)
             // Why the list is empty, when it is: companions the service saw but
             // did not offer because they already travel the same route.
             autoRuleSuggestionsController.autoRuleInertDropped = Number(payload["inert-dropped"] || 0)

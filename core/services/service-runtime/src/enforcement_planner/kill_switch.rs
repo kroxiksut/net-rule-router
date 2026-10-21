@@ -111,6 +111,7 @@ fn kill_switch_flow(
         app: AppScope::Any,
         egress,
         coverage,
+        observed_by_program: false,
     }
 }
 
@@ -359,11 +360,236 @@ pub fn plan_catch_all_kill_switch(
         }
     }
 
+    // IPv6 leaving through the tunnel survives the cut below. Named per family:
+    // the Windows lowering reads `Any` as IPv4.
+    for coverage in [Coverage::ConnectOnly, Coverage::AllPackets] {
+        flows.push(catch_all_flow(
+            &principal,
+            Verdict::Permit,
+            PrecedenceClass::CatchAllExempt,
+            DstMatch::SubnetV6 {
+                net: Ipv6Addr::UNSPECIFIED,
+                prefix: 0,
+            },
+            EgressConstraint::OnlyVia(EgressRef::Secondary),
+            None,
+            coverage,
+            CATCH_ALL_V6_EGRESS_ORDINAL,
+        ));
+    }
     // ── IPv6 cut (always): loopback + link-local + link-local-multicast
     //    exemptions over an ::/0 block-all, at BOTH V6 layers (ALE + packet). ──
     push_ipv6_cut(&principal, &mut flows, v6);
 
     flows
+}
+
+/// Above the IPv6 exemption band, where `killswitch_codegen` weighs its egress
+/// permit (`CATCHALL_EXEMPT_BASE + 100`).
+const CATCH_ALL_V6_EGRESS_ORDINAL: u32 = 100;
+
+/// First ordinal of the foreign-tunnel permits: past every exemption the
+/// blanket postures number, so the two never share a slot.
+const FOREIGN_TUNNEL_ORDINAL_BASE: u32 = nrr_platform_api::enforcement::FOREIGN_TUNNEL_ORDINAL_BASE;
+
+/// Somebody else's tunnel: the link it runs on, by the name the egress pin
+/// uses, and the networks its own routes carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignTunnelLink {
+    pub name: String,
+    pub networks: Vec<nrr_shared::ip_block::IpBlock>,
+}
+
+/// Plan the permits that keep somebody else's tunnels out of every block this
+/// plan carries: egress through the tunnel to a network its own routes carry.
+/// Empty when `flows` holds no posture block or pin to spare them from.
+///
+/// Never to any destination: a tunnel that also holds a default route would
+/// then carry the protected traffic once ours is down. Past
+/// `FOREIGN_TUNNEL_MAX_NETWORKS` per link and family (or
+/// `FOREIGN_TUNNEL_MAX_TUNNELS` links) the rest stay cut. The user's own hard
+/// blocks sit above this band and stay in force.
+///
+/// One flow per network by design: the Linux lowering folds the rules of a link
+/// into a single anonymous set, so the chain pays one lookup per link.
+pub fn plan_foreign_tunnel_permits(
+    sid: &str,
+    flows: &[FlowRule],
+    links: &[ForeignTunnelLink],
+) -> Vec<FlowRule> {
+    plan_foreign_tunnel_permits_for(&principal_scope(sid), flows, links)
+}
+
+/// [`plan_foreign_tunnel_permits`] for any scope: the service accounts and the
+/// forwarded traffic keep a corporate network the same way a user does.
+pub fn plan_foreign_tunnel_permits_for(
+    principal: &PrincipalScope,
+    flows: &[FlowRule],
+    links: &[ForeignTunnelLink],
+) -> Vec<FlowRule> {
+    use crate::wfp_bands::{FOREIGN_TUNNEL_MAX_NETWORKS, FOREIGN_TUNNEL_MAX_TUNNELS};
+    let principal = principal.clone();
+    if !holds_posture_block(&principal, flows) {
+        return Vec::new();
+    }
+    // The cap is per link and family, the way the Windows lowering packs a
+    // tunnel's networks into one filter per layer.
+    let per_family = |v4: bool| {
+        links
+            .iter()
+            .take(FOREIGN_TUNNEL_MAX_TUNNELS)
+            .flat_map(move |link| {
+                link.networks
+                    .iter()
+                    .filter(move |net| net.is_ipv4() == v4)
+                    .take(FOREIGN_TUNNEL_MAX_NETWORKS)
+                    .map(move |net| (link, *net))
+            })
+    };
+    let kept: Vec<(&ForeignTunnelLink, nrr_shared::ip_block::IpBlock)> =
+        per_family(true).chain(per_family(false)).collect();
+    let vetoes = plan_foreign_pin_vetoes(&principal, flows, &kept);
+    let permits = kept
+        .iter()
+        .enumerate()
+        .map(|(n, &(link, net))| {
+            let dst = match net.network() {
+                IpAddr::V4(addr) => DstMatch::SubnetV4 {
+                    net: addr,
+                    prefix: net.prefix_len(),
+                },
+                IpAddr::V6(addr) => DstMatch::SubnetV6 {
+                    net: addr,
+                    prefix: net.prefix_len(),
+                },
+            };
+            catch_all_flow(
+                &principal,
+                Verdict::Permit,
+                PrecedenceClass::CatchAllExempt,
+                dst,
+                EgressConstraint::OnlyVia(EgressRef::Adapter(
+                    nrr_platform_api::enforcement::AdapterId(link.name.clone()),
+                )),
+                None,
+                Coverage::ConnectOnly,
+                FOREIGN_TUNNEL_ORDINAL_BASE + n as u32,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut out = permits;
+    out.extend(vetoes);
+    out
+}
+
+/// Whether `flows` hold a block the guard placed for `principal`. A pin states
+/// its guard as the drop that follows its permit, so it cuts like a block does.
+pub(crate) fn holds_posture_block(principal: &PrincipalScope, flows: &[FlowRule]) -> bool {
+    flows.iter().any(|f| {
+        f.principal == *principal
+            && f.precedence.class.rank() < PrecedenceClass::CatchAllExempt.rank()
+            && (f.verdict == Verdict::Block
+                || (matches!(f.egress, EgressConstraint::OnlyVia(_))
+                    && f.flow.dst != DstMatch::Any))
+    })
+}
+
+/// The DoH/DoT lockdown restated for each foreign link `flows` holds a permit
+/// for, and for IPsec-protected traffic when they spare it: a copy of every
+/// lockdown block that drops only what leaves that way, above the permits. The
+/// lockdown is the user's own protection, so a resolver the corporate network
+/// routes is not exempt from it. The lockdown keeps its own place for every
+/// other egress.
+#[must_use]
+pub fn plan_doh_foreign_vetoes(sid: &str, doh: &[FlowRule], flows: &[FlowRule]) -> Vec<FlowRule> {
+    use nrr_platform_api::enforcement::DOH_FOREIGN_VETO_ORDINAL_BASE;
+    let principal = principal_scope(sid);
+    let mut spared = flows.iter().filter(|f| {
+        f.principal == principal
+            && f.verdict == Verdict::Permit
+            && f.precedence.class == PrecedenceClass::CatchAllExempt
+            && f.precedence.ordinal >= FOREIGN_TUNNEL_ORDINAL_BASE
+    });
+    let mut links: Vec<&nrr_platform_api::enforcement::AdapterId> = spared
+        .clone()
+        .filter_map(|f| match &f.egress {
+            EgressConstraint::OnlyVia(EgressRef::Adapter(link)) => Some(link),
+            _ => None,
+        })
+        .collect();
+    links.sort_by(|a, b| a.0.cmp(&b.0));
+    links.dedup();
+    let mut egresses: Vec<EgressConstraint> = links
+        .into_iter()
+        .map(|link| EgressConstraint::OnlyVia(EgressRef::Adapter(link.clone())))
+        .collect();
+    if spared.any(|f| f.egress == EgressConstraint::UnderIpsecPolicy) {
+        egresses.push(EgressConstraint::UnderIpsecPolicy);
+    }
+    let mut out = Vec::new();
+    for egress in egresses {
+        for block in doh.iter().filter(|f| {
+            f.principal == principal
+                && f.verdict == Verdict::Block
+                && f.precedence.class == PrecedenceClass::DohBlock
+        }) {
+            let mut veto = block.clone();
+            veto.precedence = Precedence {
+                class: PrecedenceClass::HardBlock,
+                ordinal: DOH_FOREIGN_VETO_ORDINAL_BASE.saturating_add(out.len() as u32),
+            };
+            veto.egress = egress.clone();
+            out.push(veto);
+        }
+    }
+    out
+}
+
+/// The narrower rule wins over the network: an address the guard pins to our
+/// tunnel, or cuts while it is down, stays that way inside a corporate network
+/// a foreign permit opens. Each is the guard's own flow re-stated above the
+/// permits, so a pin still means "this address, our tunnel only".
+fn plan_foreign_pin_vetoes(
+    principal: &PrincipalScope,
+    flows: &[FlowRule],
+    permitted: &[(&ForeignTunnelLink, nrr_shared::ip_block::IpBlock)],
+) -> Vec<FlowRule> {
+    use nrr_platform_api::enforcement::FOREIGN_PIN_VETO_ORDINAL_BASE;
+    let inside = |dst: DstMatch| {
+        let addr = match dst {
+            DstMatch::HostV4(a) => IpAddr::V4(a),
+            DstMatch::HostV6(a) => IpAddr::V6(a),
+            _ => return false,
+        };
+        permitted.iter().any(|(_, net)| net.contains(addr))
+    };
+    flows
+        .iter()
+        .filter(|f| {
+            f.principal == *principal
+                && f.app == AppScope::Any
+                && f.flow.dst_port.is_none()
+                && f.coverage == Coverage::ConnectOnly
+                && inside(f.flow.dst)
+                && match f.verdict {
+                    Verdict::Permit => {
+                        f.precedence.class == PrecedenceClass::KillSwitchPermit
+                            && f.flow.protocol.is_none()
+                            && f.egress == EgressConstraint::OnlyVia(EgressRef::Secondary)
+                    }
+                    Verdict::Block => f.precedence.class == PrecedenceClass::KillSwitchBlock,
+                }
+        })
+        .enumerate()
+        .map(|(n, f)| {
+            let mut veto = f.clone();
+            veto.precedence = Precedence {
+                class: PrecedenceClass::HardBlock,
+                ordinal: FOREIGN_PIN_VETO_ORDINAL_BASE.saturating_add(n as u32),
+            };
+            veto
+        })
+        .collect()
 }
 
 /// What a blanket block must not cut on the IPv6 side, beyond the link-scope
@@ -435,7 +661,7 @@ pub(super) fn push_ipv6_cut(
 
 /// What any block over `::/0` must leave open, in order: the link-scope
 /// prefixes every posture exempts, then the tunnel's endpoints and the local
-/// prefixes. One list for the blanket postures and the strict floor.
+/// prefixes. One list for both blanket postures.
 pub(super) fn ipv6_exempt_matches(v6: Ipv6Exemptions<'_>) -> Vec<DstMatch> {
     let link_scope = [
         DstMatch::SubnetV6 {
@@ -494,8 +720,239 @@ pub(super) fn catch_all_flow(
         app: AppScope::Any,
         egress,
         coverage,
+        observed_by_program: false,
     }
 }
 
 #[cfg(test)]
 mod network_tests;
+
+#[cfg(test)]
+mod foreign_tunnel_tests {
+    use super::*;
+    use nrr_shared::ip_block::IpBlock;
+
+    const SID: &str = "1000";
+    const CORP: &str = "tap-corp";
+
+    fn corp() -> Vec<ForeignTunnelLink> {
+        vec![ForeignTunnelLink {
+            name: CORP.to_owned(),
+            networks: vec![
+                IpBlock::parse("10.77.0.0/16").expect("block"),
+                IpBlock::parse("fd00:77::/48").expect("block"),
+            ],
+        }]
+    }
+
+    fn via_corp() -> EgressConstraint {
+        EgressConstraint::OnlyVia(EgressRef::Adapter(
+            nrr_platform_api::enforcement::AdapterId(CORP.to_owned()),
+        ))
+    }
+
+    fn pins() -> Vec<FlowRule> {
+        let pinned = [IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))];
+        plan_kill_switch_destinations(SID, &pinned, KillSwitchProtocols::ALL)
+    }
+
+    /// Every posture block of the principal sits under a permit for each
+    /// network the foreign link carries, by that link, and for nothing else.
+    fn assert_spared(posture: &str, flows: Vec<FlowRule>) {
+        let permits = plan_foreign_tunnel_permits(SID, &flows, &corp());
+        let dsts: Vec<DstMatch> = permits.iter().map(|p| p.flow.dst).collect();
+        assert_eq!(
+            dsts,
+            vec![
+                DstMatch::SubnetV4 {
+                    net: Ipv4Addr::new(10, 77, 0, 0),
+                    prefix: 16
+                },
+                DstMatch::SubnetV6 {
+                    net: Ipv6Addr::new(0xfd00, 0x77, 0, 0, 0, 0, 0, 0),
+                    prefix: 48
+                },
+            ],
+            "{posture}",
+        );
+        assert!(permits
+            .iter()
+            .all(|p| p.verdict == Verdict::Permit && p.egress == via_corp()));
+        // Pins lower to an accept and a drop at their own rank, so ranking
+        // the permit above every other class the posture uses is the proof.
+        let permit_rank = PrecedenceClass::CatchAllExempt.rank();
+        assert!(flows
+            .iter()
+            .all(|f| f.precedence.class.rank() <= permit_rank));
+    }
+
+    fn v6<'a>() -> Ipv6Exemptions<'a> {
+        Ipv6Exemptions::default()
+    }
+
+    #[test]
+    fn every_blocking_posture_spares_a_foreign_tunnels_networks() {
+        let server = [Ipv4Addr::new(203, 0, 113, 7)];
+        let pinned = [IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))];
+        let all = KillSwitchProtocols::ALL;
+        assert_spared("per-destination pins", pins());
+        assert_spared(
+            "prefer-secondary catch-all",
+            plan_catch_all_kill_switch(SID, &server, &[], v6(), all),
+        );
+        assert_spared(
+            "fail-closed per destination",
+            plan_fail_closed_destinations(SID, &pinned, all),
+        );
+        assert_spared(
+            "fail-closed block-all",
+            plan_fail_closed_block_all(SID, &server, &[], &[], &[], &[], v6(), false, &[], all),
+        );
+    }
+
+    /// A tunnel whose routes are only a default or a redirect pair carries no
+    /// network of its own, so nothing is opened through it.
+    #[test]
+    fn a_tunnel_with_only_a_default_route_gets_no_permit() {
+        let full_tunnel = [ForeignTunnelLink {
+            name: CORP.to_owned(),
+            networks: Vec::new(),
+        }];
+        assert!(plan_foreign_tunnel_permits(SID, &pins(), &full_tunnel).is_empty());
+        assert!(plan_foreign_tunnel_permits(SID, &pins(), &corp())
+            .iter()
+            .all(|p| p.flow.dst != DstMatch::Any));
+    }
+
+    #[test]
+    fn nothing_is_permitted_where_nothing_blocks_or_no_tunnel_is_foreign() {
+        assert!(plan_foreign_tunnel_permits(SID, &pins(), &[]).is_empty());
+        assert!(plan_foreign_tunnel_permits(SID, &[], &corp()).is_empty());
+
+        let pinned = [IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))];
+        let blocks = plan_fail_closed_destinations(SID, &pinned, KillSwitchProtocols::ALL);
+        assert!(plan_foreign_tunnel_permits(SID, &blocks, &[]).is_empty());
+    }
+
+    /// The permit sits below the hard-block class, so a user's own Block on an
+    /// address inside the tunnel's network keeps it cut.
+    #[test]
+    fn a_users_hard_block_outranks_the_foreign_permit() {
+        let permits = plan_foreign_tunnel_permits(SID, &pins(), &corp());
+        assert!(!permits.is_empty());
+        let block = catch_all_flow(
+            &principal_scope(SID),
+            Verdict::Block,
+            PrecedenceClass::HardBlock,
+            DstMatch::HostV4(Ipv4Addr::new(10, 77, 0, 5)),
+            EgressConstraint::Any,
+            None,
+            Coverage::ConnectOnly,
+            0,
+        );
+        assert!(permits
+            .iter()
+            .all(|p| p.precedence.class.rank() < block.precedence.class.rank()));
+    }
+
+    /// A pin inside the tunnel's network is restated above the permit, so the
+    /// address still goes through our tunnel only; one outside it is left alone.
+    #[test]
+    fn a_pin_inside_a_foreign_network_outranks_the_permit() {
+        let inside = IpAddr::V4(Ipv4Addr::new(10, 77, 3, 4));
+        let outside = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+        let flows =
+            plan_kill_switch_destinations(SID, &[inside, outside], KillSwitchProtocols::ALL);
+        let out = plan_foreign_tunnel_permits(SID, &flows, &corp());
+        let vetoes: Vec<&FlowRule> = out
+            .iter()
+            .filter(|f| f.precedence.class == PrecedenceClass::HardBlock)
+            .collect();
+        assert_eq!(vetoes.len(), 1);
+        let veto = vetoes[0];
+        assert_eq!(veto.flow.dst, DstMatch::HostV4(Ipv4Addr::new(10, 77, 3, 4)));
+        assert_eq!(veto.verdict, Verdict::Permit);
+        assert_eq!(veto.egress, EgressConstraint::OnlyVia(EgressRef::Secondary));
+        let permit_rank = PrecedenceClass::CatchAllExempt.rank();
+        assert!(veto.precedence.class.rank() > permit_rank);
+        assert!(
+            veto.precedence.ordinal >= nrr_platform_api::enforcement::FOREIGN_PIN_VETO_ORDINAL_BASE
+        );
+    }
+
+    #[test]
+    fn a_fail_closed_block_inside_a_foreign_network_stays_cut() {
+        let inside = [IpAddr::V4(Ipv4Addr::new(10, 77, 3, 4))];
+        let flows = plan_fail_closed_destinations(SID, &inside, KillSwitchProtocols::ALL);
+        let out = plan_foreign_tunnel_permits(SID, &flows, &corp());
+        assert!(out.iter().any(|f| f.verdict == Verdict::Block
+            && f.precedence.class == PrecedenceClass::HardBlock
+            && f.flow.dst == DstMatch::HostV4(Ipv4Addr::new(10, 77, 3, 4))));
+    }
+
+    fn link_with(name: &str, count: usize) -> ForeignTunnelLink {
+        ForeignTunnelLink {
+            name: name.to_owned(),
+            networks: (0..count)
+                .map(|n| {
+                    IpBlock::parse(&format!("10.{}.{}.0/24", n / 200 + 1, n % 200)).expect("block")
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn past_the_cap_the_rest_of_a_links_family_stays_cut() {
+        use crate::wfp_bands::FOREIGN_TUNNEL_MAX_NETWORKS;
+        let many = [link_with(CORP, FOREIGN_TUNNEL_MAX_NETWORKS + 1)];
+        assert_eq!(
+            plan_foreign_tunnel_permits(SID, &pins(), &many).len(),
+            FOREIGN_TUNNEL_MAX_NETWORKS
+        );
+    }
+
+    /// The cap is per link: a second tunnel is not starved by the first.
+    #[test]
+    fn each_link_has_its_own_cap() {
+        use crate::wfp_bands::FOREIGN_TUNNEL_MAX_NETWORKS;
+        let two = [
+            link_with(CORP, FOREIGN_TUNNEL_MAX_NETWORKS),
+            link_with("tap-other", 3),
+        ];
+        let permits = plan_foreign_tunnel_permits(SID, &pins(), &two);
+        assert_eq!(permits.len(), FOREIGN_TUNNEL_MAX_NETWORKS + 3);
+        assert!(permits.iter().any(|p| p.egress
+            == EgressConstraint::OnlyVia(EgressRef::Adapter(
+                nrr_platform_api::enforcement::AdapterId("tap-other".to_owned())
+            ))));
+    }
+
+    /// The lockdown outranks a corporate link's permit for what leaves through
+    /// that link, and only there.
+    #[test]
+    fn the_lockdown_is_restated_above_a_foreign_permit_for_that_link_only() {
+        use nrr_platform_api::enforcement::DOH_FOREIGN_VETO_ORDINAL_BASE;
+        let resolver = [IpAddr::V4(Ipv4Addr::new(10, 77, 7, 7))];
+        let doh = plan_doh_dot_block(SID, &resolver, true);
+        let mut flows = pins();
+        flows.extend(plan_foreign_tunnel_permits(SID, &flows, &corp()));
+        let vetoes = plan_doh_foreign_vetoes(SID, &doh, &flows);
+        assert_eq!(
+            vetoes.len(),
+            doh.len(),
+            "one restatement per lockdown block"
+        );
+        let permit_rank = PrecedenceClass::CatchAllExempt.rank();
+        for v in &vetoes {
+            assert_eq!(v.verdict, Verdict::Block);
+            assert_eq!(v.egress, via_corp());
+            assert!(v.precedence.class.rank() > permit_rank);
+            assert!(v.precedence.ordinal >= DOH_FOREIGN_VETO_ORDINAL_BASE);
+        }
+        assert!(doh.iter().all(|d| d.egress == EgressConstraint::Any));
+        assert!(
+            plan_doh_foreign_vetoes(SID, &doh, &pins()).is_empty(),
+            "no permit for a foreign link, nothing to restate",
+        );
+    }
+}

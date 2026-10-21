@@ -25,7 +25,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use nrr_platform_api::adapters::names_indicate_virtual_machine_network;
-use nrr_platform_api::dns::{DnsCacheControlPort, UpstreamDnsCandidate};
+use nrr_platform_api::dns::{
+    once_per_link, once_per_server, DnsCacheControlPort, UpstreamDnsCandidate,
+};
 // The flush is a real API call on Windows; other hosts, where only the
 // fake-backed tests of this module run, get the no-op.
 #[cfg(not(target_os = "windows"))]
@@ -233,6 +235,9 @@ pub struct NrptTableScan {
     /// Rules without a `Version` — left by a writer that died mid-rule. The DNS
     /// client rejects the whole table over one of these.
     pub damaged: usize,
+    /// Another writer's complete rule sends every name (`.`) elsewhere. It
+    /// competes with ours for the same namespace.
+    pub foreign_catch_all: bool,
 }
 
 /// The rule table itself — the registry on Windows, a map in tests.
@@ -315,25 +320,32 @@ fn upstream_dns_script() -> &'static str {
 pub fn capture_upstream_dns_candidates_v4<R: CommandRunner>(
     runner: &R,
 ) -> Vec<UpstreamDnsCandidate> {
+    once_per_server(upstream_dns_lines_v4(runner), |c| c.server)
+}
+
+/// The same, each server listed once per interface that offers it: a server a
+/// foreign tunnel and our own adapter both list must survive barring the
+/// tunnel's interface.
+pub fn capture_upstream_dns_candidates_v4_per_link<R: CommandRunner>(
+    runner: &R,
+) -> Vec<UpstreamDnsCandidate> {
+    once_per_link(upstream_dns_lines_v4(runner))
+}
+
+/// Every usable `(interface, server)` line the script emits, repeats included.
+fn upstream_dns_lines_v4<R: CommandRunner>(runner: &R) -> Vec<UpstreamDnsCandidate> {
     let Ok(out) = runner.run_powershell(upstream_dns_script()) else {
         return Vec::new();
     };
     if !out.success {
         return Vec::new();
     }
-    let mut seen: Vec<UpstreamDnsCandidate> = Vec::new();
-    for line in out.stdout.lines() {
-        let Some(parsed) = parse_candidate_line(line) else {
-            continue;
-        };
-        if !is_usable_upstream(&parsed) {
-            continue;
-        }
-        if !seen.iter().any(|c| c.server == parsed.server) {
-            seen.push(UpstreamDnsCandidate::new(parsed.index, parsed.server));
-        }
-    }
-    seen
+    out.stdout
+        .lines()
+        .filter_map(parse_candidate_line)
+        .filter(is_usable_upstream)
+        .map(|parsed| UpstreamDnsCandidate::new(parsed.index, parsed.server))
+        .collect()
 }
 
 /// One emitted candidate line, split into its columns.
@@ -416,6 +428,14 @@ impl nrr_platform_api::dns::SystemDnsServersPort for WindowsSystemDnsServers {
     fn upstream_candidates_v6(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
         capture_upstream_dns_candidates_v6(&PowerShellRunner)
     }
+
+    fn upstream_candidates_v4_per_link(&self) -> Vec<UpstreamDnsCandidate> {
+        capture_upstream_dns_candidates_v4_per_link(&PowerShellRunner)
+    }
+
+    fn upstream_candidates_v6_per_link(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        capture_upstream_dns_candidates_v6_per_link(&PowerShellRunner)
+    }
 }
 
 /// The IPv6 twin of [`upstream_dns_script`]: the connected v6 interfaces by
@@ -445,6 +465,20 @@ fn upstream_dns_script_v6() -> &'static str {
 /// Link-local servers are left out: the address alone does not say which
 /// link, and a wrong guess is a probe timeout on every re-selection.
 pub fn capture_upstream_dns_candidates_v6<R: CommandRunner>(
+    runner: &R,
+) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+    once_per_server(upstream_dns_lines_v6(runner), |c| c.server)
+}
+
+/// The IPv6 twin of [`capture_upstream_dns_candidates_v4_per_link`].
+pub fn capture_upstream_dns_candidates_v6_per_link<R: CommandRunner>(
+    runner: &R,
+) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+    once_per_link(upstream_dns_lines_v6(runner))
+}
+
+/// Every usable IPv6 `(interface, server)` line, repeats included.
+fn upstream_dns_lines_v6<R: CommandRunner>(
     runner: &R,
 ) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
     let Ok(out) = runner.run_powershell(upstream_dns_script_v6()) else {
@@ -478,13 +512,10 @@ pub fn capture_upstream_dns_candidates_v6<R: CommandRunner>(
         if names_indicate_virtual_machine_network(description, friendly_name) {
             continue;
         }
-        let server = IpAddr::V6(server);
-        if !seen.iter().any(|c| c.server == server) {
-            seen.push(nrr_platform_api::dns::UpstreamDnsServer {
-                interface_index: index,
-                server,
-            });
-        }
+        seen.push(nrr_platform_api::dns::UpstreamDnsServer {
+            interface_index: index,
+            server: IpAddr::V6(server),
+        });
     }
     seen
 }
@@ -551,6 +582,26 @@ fn effective_policy_script(listener_ip: &str) -> String {
     )
 }
 
+/// Raised while another program's catch-all shares the table with ours.
+static FOREIGN_CATCH_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Slug of the status-card notice for a foreign catch-all.
+pub const FOREIGN_CATCH_ALL_SLUG: &str = "dns-foreign-catch-all";
+
+/// What the clients show under `platform.missing.<slug>.*`.
+#[must_use]
+pub fn reported_slugs() -> Vec<String> {
+    slugs_from(&FOREIGN_CATCH_ALL)
+}
+
+fn slugs_from(foreign_catch_all: &std::sync::atomic::AtomicBool) -> Vec<String> {
+    if foreign_catch_all.load(std::sync::atomic::Ordering::Acquire) {
+        vec![FOREIGN_CATCH_ALL_SLUG.to_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Windows NRPT implementation of [`SystemDnsRedirectPort`], generic over the
 /// rule store and the [`CommandRunner`] so the redirect/restore/verify flow is
 /// testable with fakes. Production wires [`TransactedNrptStore`] and
@@ -565,7 +616,19 @@ pub struct NrptDnsRedirect<R: CommandRunner, S: NrptRuleStore> {
     /// The global suffix list the catch-all needs beside it; `None` leaves
     /// short names to whatever the machine had.
     search_list: Option<Arc<dyn SearchListStore>>,
+    /// A list release left running by [`Self::restore`]; the next sync waits
+    /// for it, so the two never interleave.
+    pending_release: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The status-card flag for a foreign catch-all; its edge also keeps the
+    /// guard's periodic check from repeating the log line.
+    foreign_catch_all: &'static std::sync::atomic::AtomicBool,
+    /// What the exemption and keep sets last put in the table; `None` until
+    /// the first full rewrite, which also clears any leftovers of a prior run.
+    exemption_memo: std::sync::Mutex<Option<RuleSet>>,
+    keep_memo: std::sync::Mutex<Option<RuleSet>>,
 }
+
+type RuleSet = std::collections::BTreeMap<String, Vec<RegistryValue>>;
 
 impl<R: CommandRunner, S: NrptRuleStore> NrptDnsRedirect<R, S> {
     pub fn new(runner: R, store: S) -> Self {
@@ -580,7 +643,91 @@ impl<R: CommandRunner, S: NrptRuleStore> NrptDnsRedirect<R, S> {
             store,
             cache,
             search_list: None,
+            pending_release: std::sync::Mutex::new(None),
+            foreign_catch_all: &FOREIGN_CATCH_ALL,
+            exemption_memo: std::sync::Mutex::new(None),
+            keep_memo: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Bring one marked set of rules to `desired`.
+    ///
+    /// The first call sweeps the marker and writes everything. Later calls
+    /// touch only what differs, so a change never opens a window where rules
+    /// that stay are absent. Returns (rules in force, rules changed or removed).
+    fn apply_rule_set(
+        &self,
+        marker: &str,
+        memo: &std::sync::Mutex<Option<RuleSet>>,
+        desired: RuleSet,
+        on_write_error: &dyn Fn(&str, &PlatformError),
+    ) -> Result<(usize, usize), PlatformError> {
+        let mut memo = memo.lock().unwrap_or_else(|p| p.into_inner());
+        let mut changed = 0usize;
+        let mut now = RuleSet::new();
+        let mut prior = match memo.take() {
+            Some(prior) => prior,
+            None => {
+                changed += self.store.sweep_orphans(marker, "")?;
+                RuleSet::new()
+            }
+        };
+        for (key, values) in desired {
+            if prior.get(&key) == Some(&values) {
+                prior.remove(&key);
+                now.insert(key, values);
+                continue;
+            }
+            match self.store.write_rule(&key, &values) {
+                Ok(()) => {
+                    changed += 1;
+                    prior.remove(&key);
+                    now.insert(key, values);
+                }
+                Err(error) => on_write_error(&key, &error),
+            }
+        }
+        // What is left of `prior` is no longer wanted. A failed delete stays
+        // in the memo so the next pass retries it.
+        for (key, values) in prior {
+            match self.store.delete_rule(&key) {
+                Ok(removed) => changed += usize::from(removed),
+                Err(_) => {
+                    now.insert(key, values);
+                }
+            }
+        }
+        let in_force = now.len();
+        *memo = Some(now);
+        Ok((in_force, changed))
+    }
+
+    fn forget_rule_sets(&self) {
+        *self
+            .exemption_memo
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        *self.keep_memo.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Raise the notice (and log once) while somebody else's catch-all shares
+    /// the table; drop it when that rule goes, so a return is told again.
+    fn report_foreign_catch_all(&self, present: bool) {
+        use std::sync::atomic::Ordering;
+        if !self.foreign_catch_all.swap(present, Ordering::AcqRel) && present {
+            tracing::warn!(
+                target: "nrr::dns-redirect",
+                msg_key = "win-dns-redirect-foreign-catch-all",
+                "another program has its own rule sending every DNS name elsewhere; it competes with ours and names may bypass the local resolver",
+            );
+        }
+    }
+
+    /// Keeps a test's notice off the process-wide flag the other tests share.
+    #[cfg(test)]
+    fn with_notice_flag(mut self, flag: &'static std::sync::atomic::AtomicBool) -> Self {
+        self.foreign_catch_all = flag;
+        self
     }
 
     #[must_use]
@@ -588,11 +735,66 @@ impl<R: CommandRunner, S: NrptRuleStore> NrptDnsRedirect<R, S> {
         self.search_list = Some(search_list);
         self
     }
+
+    /// Take back our suffix list without holding up the restore that calls
+    /// this. Where a write needs a child process (Windows before 10 2004) the
+    /// release runs on a thread of its own: the catch-all is already gone, and
+    /// a process killed mid-write leaves the note for the next start's sweep.
+    fn release_search_list_promptly(&self, store: &Arc<dyn SearchListStore>) {
+        if store.writes_in_place() {
+            release_logged(store.as_ref());
+            return;
+        }
+        let mut pending = self
+            .pending_release
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(running) = pending.take() {
+            // No sync has run since it started (a sync waits for it), so it
+            // already covers everything there is to release.
+            if !running.is_finished() {
+                *pending = Some(running);
+                return;
+            }
+            let _ = running.join();
+        }
+        let list = Arc::clone(store);
+        match std::thread::Builder::new()
+            .name("nrr-dns-search-list-release".to_string())
+            .spawn(move || release_logged(list.as_ref()))
+        {
+            Ok(running) => *pending = Some(running),
+            Err(_) => release_logged(store.as_ref()),
+        }
+    }
+
+    fn settle_pending_release(&self) {
+        let running = self
+            .pending_release
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(running) = running {
+            let _ = running.join();
+        }
+    }
+}
+
+fn release_logged(store: &dyn SearchListStore) {
+    if let Err(error) = release_search_list(store) {
+        tracing::warn!(
+            target: "nrr::dns-redirect",
+            msg_key = "win-dns-search-list-release-failed",
+            error = %error,
+            "could not take back the DNS suffix search list",
+        );
+    }
 }
 
 impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedirect<R, S> {
     fn redirect_to(&self, listener: SocketAddr) -> Result<RedirectHandle, PlatformError> {
         let ip = listener.ip().to_string();
+        self.forget_rule_sets();
         // Debris first: a half-written rule, ours or anyone's, makes the DNS
         // client reject the table our rule is about to join.
         let swept = self.store.sweep_orphans(NRPT_MARKER, NRPT_RULE_KEY)?;
@@ -610,6 +812,9 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
             marker: NRPT_MARKER.to_string(),
             listener,
         };
+        if let Err(error) = self.inspect(&handle) {
+            tracing::debug!(target: "nrr::dns-redirect", error = %error, "table scan after write failed");
+        }
         // Written is not honoured. Confirm against the table in force, and take
         // a rejected rule back out: left in place it buys nothing and leaves
         // the DNS client holding a policy it refuses, while the resolver above
@@ -648,6 +853,9 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
     /// they would keep steering names at servers we no longer watch, which
     /// is a change to the machine outliving the thing that asked for it.
     fn restore(&self, _handle: &RedirectHandle) -> Result<(), PlatformError> {
+        self.forget_rule_sets();
+        // Without our catch-all there is nothing for the foreign one to compete with.
+        self.report_foreign_catch_all(false);
         let swept = self
             .store
             .sweep_orphans(NRPT_EXEMPT_MARKER, "")
@@ -663,15 +871,8 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
                 "could not remove the namespace exemptions",
             );
         }
-        if let Some(search_list) = self.search_list.as_deref() {
-            if let Err(error) = release_search_list(search_list) {
-                tracing::warn!(
-                    target: "nrr::dns-redirect",
-                    msg_key = "win-dns-search-list-release-failed",
-                    error = %error,
-                    "could not take back the DNS suffix search list",
-                );
-            }
+        if let Some(search_list) = self.search_list.as_ref() {
+            self.release_search_list_promptly(search_list);
         }
         deleted.map(drop)
     }
@@ -681,6 +882,7 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
         let scan = self
             .store
             .scan(NRPT_RULE_KEY, &nrpt_rule_values(&ip, &handle.marker))?;
+        self.report_foreign_catch_all(scan.foreign_catch_all);
         Ok(if scan.ours_intact && scan.damaged == 0 {
             RedirectState::Active
         } else {
@@ -709,17 +911,15 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
 
     /// Replace the whole exemption set with `exemptions`.
     ///
-    /// Written as a set rather than incrementally: a connection that went
-    /// away stops claiming its namespace, and a rule pointing at a resolver
-    /// that is no longer reachable is worse than no rule — every name under
-    /// it would resolve nowhere. Sweeping first and writing after means the
-    /// table always describes the machine as it is now.
+    /// A connection that went away stops claiming its namespace, and a rule
+    /// pointing at a resolver that is no longer reachable is worse than no
+    /// rule: every name under it would resolve nowhere. Only the difference
+    /// is written, so rules that stay are never absent in between.
     fn exempt_namespaces(
         &self,
         exemptions: &[DnsNamespaceExemption],
     ) -> Result<usize, PlatformError> {
-        let removed = self.store.sweep_orphans(NRPT_EXEMPT_MARKER, "")?;
-        let mut written = 0usize;
+        let mut desired = RuleSet::new();
         for exemption in exemptions {
             let servers = exemption
                 .servers
@@ -730,27 +930,33 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
             if servers.is_empty() {
                 continue;
             }
-            let key = nrpt_exemption_key(&exemption.suffix);
-            let values = nrpt_namespace_rule_values(&exemption.suffix, &servers);
-            match self.store.write_rule(&key, &values) {
-                Ok(()) => written += 1,
-                // One unwritable rule must not cost the others: the point of
-                // the feature is to stop being in the way, and being half out
-                // of the way is still better than being fully in it.
-                Err(error) => tracing::warn!(
+            desired.insert(
+                nrpt_exemption_key(&exemption.suffix),
+                nrpt_namespace_rule_values(&exemption.suffix, &servers),
+            );
+        }
+        // One unwritable rule must not cost the others: the point of the
+        // feature is to stop being in the way, and being half out of the way
+        // is still better than being fully in it.
+        let (written, changed) = self.apply_rule_set(
+            NRPT_EXEMPT_MARKER,
+            &self.exemption_memo,
+            desired,
+            &|key, error| {
+                tracing::warn!(
                     target: "nrr::dns-redirect",
                     msg_key = "win-dns-redirect-exemption-write-failed",
-                    suffix = %exemption.suffix,
+                    suffix = %key,
                     error = %error,
                     "could not leave this namespace to its own resolver",
-                ),
-            }
-        }
-        if removed > 0 || written > 0 {
+                );
+            },
+        )?;
+        if changed > 0 {
             tracing::info!(
                 target: "nrr::dns-redirect",
                 msg_key = "win-dns-redirect-exemptions-applied",
-                removed,
+                removed = changed,
                 written,
                 "namespaces left to the connections that claim them",
             );
@@ -758,31 +964,28 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
         Ok(written)
     }
 
-    /// Same shape as the exemptions: sweep first, then write what holds now.
+    /// Same shape as the exemptions: only the difference is written.
     fn keep_names(&self, names: &[String], listener: SocketAddr) -> Result<usize, PlatformError> {
-        let removed = self.store.sweep_orphans(NRPT_KEEP_MARKER, "")?;
         let ip = listener.ip().to_string();
-        let mut written = 0usize;
-        for name in names {
-            match self
-                .store
-                .write_rule(&nrpt_keep_key(name), &nrpt_keep_rule_values(name, &ip))
-            {
-                Ok(()) => written += 1,
-                Err(error) => tracing::warn!(
+        let desired: RuleSet = names
+            .iter()
+            .map(|name| (nrpt_keep_key(name), nrpt_keep_rule_values(name, &ip)))
+            .collect();
+        let (written, changed) =
+            self.apply_rule_set(NRPT_KEEP_MARKER, &self.keep_memo, desired, &|key, error| {
+                tracing::warn!(
                     target: "nrr::dns-redirect",
                     msg_key = "win-dns-redirect-keep-write-failed",
-                    host = %name,
+                    host = %key,
                     error = %error,
                     "could not keep this rule host with the resolver",
-                ),
-            }
-        }
-        if removed > 0 || written > 0 {
+                );
+            })?;
+        if changed > 0 {
             tracing::info!(
                 target: "nrr::dns-redirect",
                 msg_key = "win-dns-redirect-keeps-applied",
-                removed,
+                removed = changed,
                 written,
                 "rule hosts inside left namespaces kept with the resolver",
             );
@@ -798,6 +1001,7 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
         let Some(search_list) = self.search_list.as_deref() else {
             return Ok(());
         };
+        self.settle_pending_release();
         let connections: Vec<String> = claimed.iter().map(|c| c.suffix.clone()).collect();
         match sync_search_list(search_list, &connections, &extra())? {
             SearchListOutcome::Written(suffixes) => tracing::info!(
@@ -1153,6 +1357,11 @@ mod transacted {
                     scan.ours_intact = intact;
                 } else if read_value(&rule, "Version")?.is_none() {
                     scan.damaged += 1;
+                } else if let (Some(name), Some(comment)) = (
+                    expected.iter().find(|v| v.name == "Name"),
+                    expected.iter().find(|v| v.name == "Comment"),
+                ) {
+                    scan.foreign_catch_all |= holds(&rule, name)? && !holds(&rule, comment)?;
                 }
             }
             Ok(scan)

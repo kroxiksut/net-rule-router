@@ -37,6 +37,8 @@ pub(crate) struct DropObservationParts {
     /// The trace's "write to the log" switch, shared with the settings writer.
     pub log_ndjson: Arc<AtomicBool>,
     pub stale_flow_reset: Option<Arc<dyn StaleFlowReset>>,
+    /// The shared-address census a pin-drop teardown spares by.
+    pub flow_reset_census: Option<Arc<dyn nrr_service_runtime::fqdn_cache_lookup::FqdnCacheLookup>>,
 }
 
 /// A principal's links as the consumer reads them: the secondary only while
@@ -111,8 +113,13 @@ pub(crate) fn drop_consumer(
     .with_ipv6_cut_drop_check(tag_check(|tag| tag.kind == DropKind::Ipv6Cut))
     .with_dns_lockdown_drop_check(tag_check(|tag| tag.kind == DropKind::DnsLockdown))
     .with_service_account_drop_check(tag_check(|tag| tag.system))
-    .with_not_covered_drop_check(tag_check(|tag| tag.kind == DropKind::Default))
+    .with_rule_block_drop_check(tag_check(|tag| tag.kind == DropKind::Rule))
+    .with_vpn_gateway_drops(nrr_service_runtime::vpn_gateway_confirm::production_drop_sink())
     .with_block_notice(Arc::new(move |ip| recent.lookup(ip)), parts.notice_sink);
+    let consumer = match parts.flow_reset_census {
+        Some(census) => consumer.with_flow_reset_census(census),
+        None => consumer,
+    };
     match parts.stale_flow_reset {
         Some(reset) => consumer.with_stale_flow_reset(reset),
         None => consumer,
@@ -178,8 +185,12 @@ pub(crate) fn app_observation_wiring(
 
 /// The NFLOG listener as the tick's second source.
 pub(crate) fn start_nflog() -> Result<Arc<dyn ConnectionObservationSource>, PlatformError> {
-    nrr_platform_linux::nflog::NflogDropObserver::start()
-        .map(|observer| Arc::new(observer) as Arc<dyn ConnectionObservationSource>)
+    let started = nrr_platform_linux::nflog::NflogDropObserver::start();
+    nrr_platform_linux::kernel_capabilities::record(
+        nrr_platform_linux::kernel_capabilities::KernelCapability::BlockReports,
+        started.is_ok(),
+    );
+    started.map(|observer| Arc::new(observer) as Arc<dyn ConnectionObservationSource>)
 }
 
 #[cfg(test)]

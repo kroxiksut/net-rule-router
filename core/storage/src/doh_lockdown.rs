@@ -4,7 +4,7 @@
 //! plaintext queries again (the plaintext-DNS blind-spot class). Two pieces of state:
 //!
 //! - a **per-SID** enable toggle + application scope (in `secondary_block_policy`,
-//!   alongside the other kill-switch fields) — each user decides whether to apply
+//!   alongside the leak-protection fields) — each user decides whether to apply
 //!   the lockdown to their own traffic and when;
 //! - a **shared baseline** list of resolver entries (the `doh_resolver_entries`
 //!   table) — the resolver set is a machine-wide fact, edited once (with
@@ -24,13 +24,13 @@ use crate::schema::BASELINE_PRINCIPAL;
 /// (like [`crate::resolution_source`]'s policies), carried on the wire as a slug.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DohLockdownScope {
-    /// Apply the lockdown ONLY while leak protection (kill switch / block-all) is
-    /// armed — DoH hurts observation exactly there. The default: the aggressive
+    /// Apply the lockdown ONLY while leak protection is on — DoH hurts
+    /// observation exactly there. The default: the aggressive
     /// measure acts only when it is needed, so normal browsing keeps DoH/HTTP-3.
     #[default]
     LeakProtectionOnly,
-    /// Apply the lockdown ALWAYS while the toggle is on, regardless of the
-    /// kill-switch — maximum observability, at the cost of breaking DoH in the
+    /// Apply the lockdown ALWAYS while the toggle is on, regardless of leak
+    /// protection — maximum observability, at the cost of breaking DoH in the
     /// calm state too.
     Always,
 }

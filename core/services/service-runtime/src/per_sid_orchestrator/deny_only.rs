@@ -30,10 +30,10 @@ impl PerSidApplyOrchestrator {
             return Ok(ComputedFilterSet::NoPolicy);
         }
         let cache_snapshot = self.fqdn_cache.snapshot_for_compute();
-        let fqdn_cache: &dyn FqdnCacheLookup = match &cache_snapshot {
-            Some(snapshot) => snapshot,
-            None => self.fqdn_cache.as_ref(),
-        };
+        let fqdn_cache = crate::fqdn_cache_lookup::snapshot_or_live(
+            cache_snapshot.as_ref(),
+            self.fqdn_cache.as_ref(),
+        );
         let denylist = crate::secondary_ip_policy::secondary_ip_denylist(
             &rules.rule_book.secondary,
             fqdn_cache,
@@ -44,7 +44,6 @@ impl PerSidApplyOrchestrator {
         let out = generate_filters(CodegenInput {
             sid,
             rule_book: &rules.rule_book,
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
             fqdn_cache,
             app_observations: self.app_observations.as_ref(),
             app_resolver: self.app_resolver.as_ref(),
@@ -99,6 +98,15 @@ impl PerSidApplyOrchestrator {
             .collect();
         if filters.is_empty() {
             return Ok(ComputedFilterSet::NoPolicy);
+        }
+        if intent.publishes() {
+            self.update_killswitch_registry(
+                sid,
+                KillswitchBlockIds {
+                    rule_blocks: rule_block_ids(&filters),
+                    ..KillswitchBlockIds::default()
+                },
+            );
         }
         Ok(ComputedFilterSet::Install(ComputedPlan {
             filters,

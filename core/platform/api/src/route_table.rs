@@ -54,21 +54,13 @@ pub trait RouteTablePort: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Identity of the user owning the active interactive session, in the
-    /// platform's own spelling (a string SID on Windows). The service-driven
-    /// routing scope uses it to pick the routing user when no GUI/tray is
-    /// connected, so a managed policy is enforced from boot. `None` when there
-    /// is no interactive user or the identity cannot be resolved.
-    fn interactive_user_sid(&self) -> Option<String> {
-        None
-    }
-
     /// Every user signed in interactively (console and remote, attached or
-    /// disconnected), console user first, each once. The default answers with
-    /// [`Self::interactive_user_sid`], which is right for a platform with one
-    /// seat.
+    /// disconnected), console user first, each once, in the platform's own
+    /// spelling (a string SID on Windows). The service-driven routing scope
+    /// enforces these users' policy with no GUI or tray connected, from boot.
+    /// The default is nobody.
     fn interactive_user_sids(&self) -> Vec<String> {
-        self.interactive_user_sid().into_iter().collect()
+        Vec::new()
     }
 
     /// [`Self::interactive_user_sids`], each with when the user signed in

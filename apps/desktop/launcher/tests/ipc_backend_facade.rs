@@ -158,6 +158,8 @@ fn diagnostics_status_response(stale: bool) -> SnapshotDiagnosticsResponse {
             },
             stale,
             origin: DiagnosticsDataOrigin::Service,
+            missing_capabilities: Vec::new(),
+            dns_tamper: Default::default(),
         },
         explain_sample: None,
     }

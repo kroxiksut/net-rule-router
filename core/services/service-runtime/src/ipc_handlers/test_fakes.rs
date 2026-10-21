@@ -176,6 +176,8 @@ impl FakeDiagnostics {
             },
             stale: false,
             origin: DiagnosticsDataOrigin::Service,
+            missing_capabilities: Vec::new(),
+            dns_tamper: Default::default(),
         }
     }
 
@@ -472,7 +474,6 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
         routing_pause: Arc::new(FakeRoutingPause),
         routing_pause_writer: Arc::new(FakeRoutingPauseWriter),
         autostart: Arc::new(FakeAutostart),
-        autostart_writer: Arc::new(FakeAutostartWriter),
         // Alerts repo defaults to `None`; tests that
         // exercise the security alerts list/ack/resolve path build their
         // own deps and pass an `InMemorySecurityAlertsRepository`.
@@ -565,11 +566,16 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
 #[derive(Default)]
 pub struct FakeRoutePolicy {
     pub stored: Mutex<Option<RoutePolicyDto>>,
+    pub first: Option<crate::ipc_handlers::payloads::FirstPolicyDto>,
 }
 
 impl RoutePolicyProvider for FakeRoutePolicy {
     fn get_for_sid(&self, _sid: &str) -> Option<RoutePolicyDto> {
         self.stored.lock().unwrap().clone()
+    }
+
+    fn first_policy(&self) -> Option<crate::ipc_handlers::payloads::FirstPolicyDto> {
+        self.first
     }
 }
 
@@ -590,15 +596,11 @@ impl RoutePolicyWriter for FakeRoutePolicyWriter {
             primary: request.primary.clone(),
             secondary: request.secondary.clone(),
             mode: request.mode,
-            block_secondary_when_unavailable: request.block_secondary_when_unavailable,
-            kill_switch_fail_closed: request.kill_switch_fail_closed,
+            leak_protection: request.leak_protection,
             kill_switch_protocols: request.kill_switch_protocols,
-            kill_switch_block_all: request.kill_switch_block_all,
-            kill_switch_enabled: request.kill_switch_enabled,
             allow_dns_over_primary: request.allow_dns_over_primary,
             include_subdomains: request.include_subdomains,
             shared_ip_policy: request.shared_ip_policy.clone(),
-            mode_a_coverage_strategy: request.mode_a_coverage_strategy.clone(),
             resolve_hosts_bypass: request.resolve_hosts_bypass,
             secondary_link_provider_apps: Vec::new(),
             doh_lockdown_enabled: request.doh_lockdown_enabled,
@@ -619,6 +621,7 @@ impl RoutePolicyWriter for FakeRoutePolicyWriter {
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
             forwarded_outage: String::new(),
+            external_address_auto_check: false,
             binding_source: request.binding_source,
         };
         *self.stored.lock().unwrap() = Some(dto.clone());
@@ -669,7 +672,7 @@ use crate::ipc_handlers::payloads::{
     RetentionSettingsDto, RetentionSettingsSetRequest, RoutingPauseDto, StorageUsageDto,
 };
 use crate::ipc_handlers::providers::{
-    ApplyFailurePolicyProvider, ApplyFailurePolicyWriter, AutostartProvider, AutostartWriter,
+    ApplyFailurePolicyProvider, ApplyFailurePolicyWriter, AutostartProvider,
     LogRetentionConfigProvider, LogRetentionConfigWriter, RetentionSettingsProvider,
     RetentionSettingsWriter, RoutingPauseProvider, RoutingPauseWriter, SettingsWriteError,
     StorageUsageProvider,
@@ -817,18 +820,6 @@ impl AutostartProvider for FakeAutostart {
             overridden_value: None,
             updated_at: 0,
         }
-    }
-}
-
-pub struct FakeAutostartWriter;
-impl AutostartWriter for FakeAutostartWriter {
-    fn toggle(&self, _sid: &str, enabled: bool) -> Result<AutostartDto, SettingsWriteError> {
-        Ok(AutostartDto {
-            enabled,
-            last_known_state: if enabled { "enabled" } else { "disabled" }.into(),
-            overridden_value: None,
-            updated_at: 0,
-        })
     }
 }
 

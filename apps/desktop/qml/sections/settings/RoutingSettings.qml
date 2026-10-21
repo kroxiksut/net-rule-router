@@ -19,15 +19,8 @@ ColumnLayout {
     // local-networks ops reads one of them instead of asking the profile itself.
     readonly property bool stabilitySupported: root.serviceStabilitySupported
     readonly property bool localNetworksSupported: root.localNetworksSupported
-    // Fake-IP rides the stability row and needs a TUN adapter of its own.
-    readonly property bool fakeIpOffered: stabilitySupported && root.supports("fakeIp")
 
-    // Kill-switch failure posture. `true` = fail-closed
-    // (block when the additional adapter can't be resolved); `false` =
-    // fail-open (allow + warn). Read from the live per-SID policy on mount;
-    // written via the same route-policy channel as the kill-switch toggle.
-    property bool ksFailClosed: true
-    // Protocol bitmask the emergency block cuts (TCP=1, UDP=2,
+    // Protocol bitmask leak protection cuts (TCP=1, UDP=2,
     // ICMP=4, IGMP=8, GRE=16, ESP=32, Other=64). All = 127 (the default).
     property int ksProtocols: 0x7F
     // "Treat a domain as `domain` + `*.domain`". Default ON.
@@ -39,25 +32,26 @@ ColumnLayout {
     // shares with other sites) is handled. Slug: majority-of-ip (default) |
     // majority-of-rules | any-rule-domain. Read from the live per-SID policy.
     property string sharedIpPolicy: "majority-of-ip"
-    // Aggressive kill-switch scope. When ON, split-mode
-    // fail-closed blocks ALL egress (except explicitly-allowed) while the
-    // additional adapter is down, not just its cached destination IPs — this is
-    // what closes the ICMP/ping and rotating-IP leaks of routed hosts. Only
-    // meaningful with fail-closed ON. Read from the live per-SID policy. Off.
-    property bool ksBlockAll: false
-    // MASTER kill-switch toggle (explicit opt-in). When false
-    // (the default) the kill-switch is OFF: no fail-closed blocking arms at all,
-    // and every sub-setting below is hidden. The sub-settings become visible only
-    // when this is true. Read from the live per-SID policy on mount.
-    property bool killSwitchEnabled: false
+    // Leak protection as the service holds it: "off" | "sites" | "everything".
+    property string leakProtection: "off"
     // Default route for unmatched traffic, as the service holds it.
     property string routeMode: ""
-    // OPT-IN "allow name resolution over the primary link while
-    // The kill-switch block-all is engaged". (P1b): Default flipped to
-    // true — with DNS cut too, an armed block-all is a total blackout. Only
-    // meaningful when block-all is on. Read from the per-SID policy.
+    // The level in force under the current default route ("sites" under the
+    // additional connection means "everything").
+    readonly property string leakEffective: Pure.coerceLeakProtection(routeMode, leakProtection)
+    readonly property bool leakOn: leakEffective !== "off"
+    // The bound additional connection, as the service holds it: the terminal
+    // UI reads the same snapshot binding.
+    readonly property bool secondaryBound: root._servicePolicySecondaryBound === true
+    // The routing settings offered right now; the terminal UI asks the same.
+    readonly property var offered: Pure.offeredRoutingSettings(
+        root.platformProfile ? root.platformProfile.supports : null,
+        panel.enforcementMode, panel.leakEffective, panel.secondaryBound, panel.fakeIpEnabled)
+    // "Allow name resolution over the main connection while blocked". Acts
+    // only when everything is blocked. Default true: with DNS cut too, the
+    // outage is a total blackout. Read from the per-SID policy.
     property bool allowDnsOverPrimary: true
-    // Kill-switch shared-IP strictness. false (default) =
+    // Shared-IP strictness of leak protection. false (default) =
     // "smart": addresses the census has seen on ordinary (non-rule) sites are
     // NOT pinned/blocked, so a shared CDN front-end never cuts an innocent
     // co-tenant (the 0719 search.example collateral). true = "strict": pin every
@@ -89,6 +83,9 @@ ColumnLayout {
     property bool appRulesTakeAllAddresses: false
     /// What forwarded traffic gets while the tunnel is down; "" until answered.
     property string forwardedOutage: ""
+    // Ask for the additional route's external address on every connect. Off by
+    // default: the request leaves through the tunnel.
+    property bool externalAddressAutoCheck: false
     // A clicked radio no longer follows its `checked:` binding.
     onForwardedOutageChanged: {
         forwardedAsComputerRadio.checked = forwardedOutage === "as-computer"
@@ -102,54 +99,32 @@ ColumnLayout {
     function _shortNamesRefused() {
         shortNameCheck.checked = panel.shortNameCompletion
     }
-    // Enforcement mechanism: "reactive" (Mode A,
-    // default — the existing reactive kill-switch) vs "resolver" (Mode B — a
-    // local DNS resolver that enforces BEFORE the app connects). Global service
-    // setting (service_stability_config), read/written via the service-stability
-    // config RPC. Redirecting system DNS is invasive → default off (reactive).
+    // Enforcement mechanism (machine-wide): "resolver" (the default, a local
+    // DNS resolver that routes before the app connects) or the legacy
+    // "reactive" mode that watches system DNS. Read from the service.
     property string enforcementMode: "reactive"
-    // Virtual-address routing toggle. GLOBAL service
-    // setting (`fake-ip-enabled` on the service-stability config), read/written
-    // via the same clobber-safe stability RPC as the enforcement mode. Only
-    // meaningful in Mode B (the resolver controls the DNS answer), so the
-    // checkbox greys out in Mode A. Snapshot is the SSOT (no prefs mirror).
+    // Virtual-address routing (`fake-ip-enabled`, machine-wide). Acts only in
+    // resolver mode, which hands out the addresses. Snapshot is the SSOT.
     property bool fakeIpEnabled: false
-    // Fake-IP UDP relay toggle. GLOBAL service setting
-    // (`fake-ip-udp-relay` on the service-stability config), read/written via
-    // the same clobber-safe stability RPC as the fake-IP toggle. Only
-    // meaningful while fake-IP itself is on, so the checkbox rides the same
-    // visibility as the fake-IP row. Snapshot is the SSOT (no prefs mirror).
-    // Defaults OFF, so every read must test `=== true`, never `!== false`.
+    // Fake-IP UDP relay (`fake-ip-udp-relay`, machine-wide), acting only while
+    // fake-IP is on. Defaults OFF: every read tests `=== true`.
     property bool fakeIpUdpRelay: false
-    // Fake-IP instant-reset toggle. GLOBAL service setting
-    // (`fake-ip-instant-rst` on the service-stability config), read/written via
-    // the same clobber-safe stability RPC as the fake-IP toggle. Only
-    // meaningful while fake-IP itself is on, so the checkbox rides the same
-    // visibility as the UDP-relay row. ON (default) keeps today's behaviour: a
-    // relay dial refused because the additional route can't be resolved resets
-    // the client immediately. Snapshot is the SSOT (no prefs mirror). Defaults
-    // ON, so every read must test `!== false`, never `=== true`.
+    // Fake-IP instant reset (`fake-ip-instant-rst`, machine-wide): a relay dial
+    // refused while the additional route is unresolved resets the client at
+    // once. Acts only while fake-IP is on. Defaults ON: every read tests
+    // `!== false`.
     property bool fakeIpInstantRst: true
-    // DNS-over-secondary toggle. GLOBAL service setting
-    // (`dns-via-secondary` on the service-stability config), read/written
-    // through the same clobber-safe stability RPC as the fake-IP toggle. It
-    // decides where the SERVICE's own name lookups leave from, so — unlike
-    // fake-IP — it is meaningful in either enforcement mode; it only needs a
-    // secondary link to be bound. Snapshot is the SSOT (no prefs mirror).
+    // DNS through the tunnel (`dns-via-secondary`, machine-wide): where the
+    // service's own lookups leave from, in either enforcement mode, once an
+    // additional connection is bound. Snapshot is the SSOT.
     property bool dnsViaSecondary: false
-    // Fast-DNS-answers toggle. GLOBAL service setting
-    // (`dns-fast-answers` on the service-stability config), read/written through
-    // the same clobber-safe stability RPC as the DNS-over-secondary toggle. It
-    // trades a small protection-install race for answer latency, so — like
-    // `dns-via-secondary` — it is meaningful in either enforcement mode.
-    // Snapshot is the SSOT (no prefs mirror). Defaults ON: a MISSING field in a
-    // reply means "on", so every read must test `!== false`, never `=== true`.
+    // Fast DNS answers (`dns-fast-answers`, machine-wide): the local resolver
+    // trades a small route-install race for answer latency, so resolver mode
+    // only. Defaults ON: every read tests `!== false`.
     property bool dnsFastAnswers: true
-    // Gates the five manual-tuning toggles above (DNS through the tunnel,
-    // fast DNS answers, fake-IP, its UDP relay and instant-reset) behind the
-    // "Detailed mode" switch in Experimental settings. Off by default: the
-    // toggles stay hidden and their saved values are untouched — only
-    // visibility changes. Device-local UI preference.
+    // "Detailed mode" (Experimental settings, device-local, off by default)
+    // shows the tuning knobs: the fake-IP UDP relay and instant reset, and the
+    // protocols leak protection cuts. Only visibility changes.
     readonly property bool detailedModeOn: root.uiRevision >= 0
         ? (root.prefs.routingDetailedMode === true) : false
     // Live integrity verdict of the bundled virtual-adapter
@@ -157,14 +132,6 @@ ColumnLayout {
     // "genuine" | "untrusted" | "missing", or "none" when this build ships no
     // driver binary at all (Linux/macOS — kernel TUN is native; line hides).
     property string fakeIpDriverVerdict: ""
-    // Mode-A coverage strategy: how Mode A treats traffic whose
-    // destination is not yet in the seeded pin set while the additional route
-    // Is unavailable. "per-ip" (default) blocks only the learned
-    // addresses so default/primary and zone→primary traffic is not blocked;
-    // "fail-closed-unknown" is the paranoid opt-in that also blocks unmatched
-    // browsing while armed. Per-SID service setting, mirrored in prefs (this
-    // pre-read default is overwritten by the live per-SID policy on mount).
-    property string modeACoverage: "per-ip"
     // Resolve rule domains bypassing the OS hosts/adblock file.
     // Default true. Per-SID service setting, mirrored in prefs.
     property bool resolveHostsBypass: true
@@ -174,7 +141,7 @@ ColumnLayout {
     // per-SID policy on mount (no prefs mirror — the service snapshot is the SSOT).
     property bool dohLockdownEnabled: false
     // When the lockdown applies: "leak-protection-only" (default,
-    // recommended — only while a block-all leak-guard is armed) | "always".
+    // recommended — only while leak protection is on) | "always".
     property string dohLockdownScope: "leak-protection-only"
     // The lockdown decides itself (on while the user has rules for the
     // additional route); the service reports what it decided.
@@ -185,12 +152,9 @@ ColumnLayout {
     // Details and the resolver list follow whether the lockdown applies.
     readonly property bool dohLockdownShown: panel.dohLockdownAuto
         ? panel.dohLockdownEffective : panel.dohLockdownEnabled
-    // Track 1 Chunk 4 — secondary tunnel liveness window (SECONDS). An
-    // active ICMP-probe window: how long the tunnel next-hop must be
-    // continuously unreachable before the kill-switch fail-closes. `0` =
-    // disabled (never fail-closes; safe default); any non-zero value is clamped
-    // to [5, 3600]. GLOBAL service setting (service_stability_config), read via
-    // the service-stability config RPC. Opt-in.
+    // Additional-tunnel liveness window (seconds): how long the tunnel's next
+    // hop must stay unreachable before the tunnel counts as down. `0` disables
+    // it (the default); anything else is clamped to [5, 3600]. Machine-wide.
     property int livenessWindowSecs: 0
     // When the user picks "Custom…" in the liveness dropdown, reveal the spin
     // box even before a value is committed. Also implied by a non-preset value.
@@ -202,8 +166,8 @@ ColumnLayout {
     // "persist" (keep matched routes on the additional adapter).
     property bool ruleScopeServiceDriven: true
     property string routingStopPolicy: "teardown"
-    // The "Show details" disclosures below (kill-switch, default-route,
-    // fake-IP, DNS-over-secondary, block-all, strict-shared-IP, exempt
+    // The "Show details" disclosures below (leak protection, default-route,
+    // fake-IP, DNS-over-secondary, strict-shared-IP, exempt
     // addresses, DoH lockdown) live on `root` — see Main.qml — so switching
     // away from Settings and back never re-collapses them.
 
@@ -396,7 +360,7 @@ ColumnLayout {
     // Offline seed. When the per-SID service snapshot is
     // unreachable (service stopped), show the user's saved toggle intent from the
     // UiPrefs mirror instead of falling back to QML property defaults (the bug:
-    // "kill-switch/subdomain checkboxes reset after the service is stopped"). The
+    // "protection/subdomain checkboxes reset after the service is stopped"). The
     // write side (Main.qml apply*, emitPrefs) already persists the mirror on every
     // change; this is the missing read side. Read-only — never pushes to the service.
     // P2c — derive the containing-folder `file://` URL for
@@ -416,9 +380,8 @@ ColumnLayout {
     /// service-stopped launch shows the user's real values instead of the QML
     /// literal defaults.
     readonly property var _mirroredRoutePolicyKeys: [
-        "kill-switch-fail-closed", "kill-switch-protocols", "include-subdomains",
-        "shared-ip-policy", "kill-switch-block-all", "kill-switch-enabled",
-        "allow-dns-over-primary", "mode-a-coverage-strategy", "resolve-hosts-bypass",
+        "leak-protection", "kill-switch-protocols", "include-subdomains",
+        "shared-ip-policy", "allow-dns-over-primary", "resolve-hosts-bypass",
         "doh-lockdown-enabled", "doh-lockdown-scope", "kill-switch-strict-shared-ips",
         "auto-rules-mode", "auto-rules-eager-delivery-names",
         "primary-probe-auto", "primary-probe-timeout-ms", "primary-probe-max-targets",
@@ -426,7 +389,8 @@ ColumnLayout {
         "local-networks-auto-accept",
         "short-name-completion", "short-name-suffix",
         "app-rules-take-all-addresses",
-        "forwarded-outage"
+        "forwarded-outage",
+        "external-address-auto-check"
     ]
 
     /// Copy the subset of `cur` this panel mirrors into the display mirror.
@@ -519,29 +483,22 @@ ColumnLayout {
         // from the one the request builder sends is how the DNS-over-primary
         // toggle came to display ON while every unrelated policy write pushed
         // `false`.
-        panel.ksFailClosed = _offlineRoutePolicyPick(parked, mirror, "kill-switch-fail-closed",
-            _mirroredBool("kill-switch-fail-closed", root.prefs.routeKillSwitchFailClosed))
+        panel.leakProtection = _offlineRoutePolicyPick(parked, mirror, "leak-protection",
+            root.routePolicyDefault("leak-protection"))
         panel.ksProtocols = _offlineRoutePolicyPick(parked, mirror, "kill-switch-protocols",
             Pure.routePolicyCoerce("kill-switch-protocols", root.prefs.routeKillSwitchProtocols))
         panel.includeSubdomains = _offlineRoutePolicyPick(parked, mirror, "include-subdomains",
             _mirroredBool("include-subdomains", root.prefs.routeIncludeSubdomains))
         panel.sharedIpPolicy = _offlineRoutePolicyPick(parked, mirror, "shared-ip-policy",
             _mirroredString("shared-ip-policy", root.prefs.routeSharedIpPolicy))
-        panel.ksBlockAll = _offlineRoutePolicyPick(parked, mirror, "kill-switch-block-all",
-            _mirroredBool("kill-switch-block-all", root.prefs.routeKillSwitchBlockAll))
-        panel.killSwitchEnabled = _offlineRoutePolicyPick(parked, mirror, "kill-switch-enabled",
-            _mirroredBool("kill-switch-enabled", root.prefs.routeKillSwitchEnabled))
         panel.routeMode = _offlineRoutePolicyPick(parked, mirror, "mode",
             _mirroredString("mode", root.prefs.routeBehaviorMode))
         panel.allowDnsOverPrimary = _offlineRoutePolicyPick(parked, mirror,
             "allow-dns-over-primary",
             _mirroredBool("allow-dns-over-primary", root.prefs.routeAllowDnsOverPrimary))
-        // Mode-A coverage strategy + hosts-bypass mirrors.
-        panel.modeACoverage = _offlineRoutePolicyPick(parked, mirror, "mode-a-coverage-strategy",
-            _mirroredString("mode-a-coverage-strategy", root.prefs.routeModeACoverageStrategy))
         panel.resolveHostsBypass = _offlineRoutePolicyPick(parked, mirror, "resolve-hosts-bypass",
             _mirroredBool("resolve-hosts-bypass", root.prefs.routeResolveHostsBypass))
-        // These four have no per-key UiPrefs mirror (the service snapshot is
+        // These have no per-key UiPrefs mirror (the service snapshot is
         // their SSOT), so before the display mirror existed they showed the QML
         // literal default on every service-stopped launch.
         panel.dohLockdownEnabled = _offlineRoutePolicyPick(parked, mirror,
@@ -590,6 +547,8 @@ ColumnLayout {
             root.routePolicyDefault("app-rules-take-all-addresses"))
         panel.forwardedOutage = _offlineRoutePolicyPick(parked, mirror,
             "forwarded-outage", root.routePolicyDefault("forwarded-outage"))
+        panel.externalAddressAutoCheck = _offlineRoutePolicyPick(parked, mirror,
+            "external-address-auto-check", root.routePolicyDefault("external-address-auto-check"))
     }
 
     function _loadKillSwitchPosture() {
@@ -612,18 +571,17 @@ ColumnLayout {
         if (!corr) return
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
             if (!ok) return
+            if (p && typeof root._noteServicePolicy === "function")
+                root._noteServicePolicy(p["route-policy"] || p.routePolicy, p["first-policy"])
             var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
             // Every control reads through the SAME defaults the request builder
             // applies, so a key the reply omits can never render one way here
             // and be sent another way on the next write.
-            panel.ksFailClosed = root._routePolicyEffective(cur, "kill-switch-fail-closed")
+            panel.leakProtection = root._routePolicyEffective(cur, "leak-protection")
             panel.ksProtocols = root._routePolicyEffective(cur, "kill-switch-protocols")
             panel.includeSubdomains = root._routePolicyEffective(cur, "include-subdomains")
             panel.sharedIpPolicy = root._routePolicyEffective(cur, "shared-ip-policy")
-            panel.ksBlockAll = root._routePolicyEffective(cur, "kill-switch-block-all")
-            panel.killSwitchEnabled = root._routePolicyEffective(cur, "kill-switch-enabled")
             panel.allowDnsOverPrimary = root._routePolicyEffective(cur, "allow-dns-over-primary")
-            panel.modeACoverage = root._routePolicyEffective(cur, "mode-a-coverage-strategy")
             panel.resolveHostsBypass = root._routePolicyEffective(cur, "resolve-hosts-bypass")
             panel.dohLockdownEnabled = root._routePolicyEffective(cur, "doh-lockdown-enabled")
             panel.dohLockdownScope = root._routePolicyEffective(cur, "doh-lockdown-scope")
@@ -648,6 +606,8 @@ ColumnLayout {
             panel.appRulesTakeAllAddresses =
                 root._routePolicyEffective(cur, "app-rules-take-all-addresses")
             panel.forwardedOutage = root._routePolicyEffective(cur, "forwarded-outage")
+            panel.externalAddressAutoCheck =
+                root._routePolicyEffective(cur, "external-address-auto-check")
             panel.routeMode = root._routePolicyEffective(cur, "mode")
             // A live read always wins — and refreshes the display mirror the
             // service-stopped seed reads back. Nothing is sent back: a service
@@ -674,14 +634,11 @@ ColumnLayout {
     function _showConfirmedPolicy(confirmed) {
         var fields = {
             "mode": ["routeMode", null],
-            "kill-switch-enabled": ["killSwitchEnabled", killSwitchEnableCheck],
-            "kill-switch-fail-closed": ["ksFailClosed", null],
+            "leak-protection": ["leakProtection", null],
             "kill-switch-protocols": ["ksProtocols", null],
-            "kill-switch-block-all": ["ksBlockAll", ksBlockAllCheck],
             "allow-dns-over-primary": ["allowDnsOverPrimary", allowDnsOverPrimaryCheck],
             "include-subdomains": ["includeSubdomains", includeSubdomainsCheck],
             "shared-ip-policy": ["sharedIpPolicy", null],
-            "mode-a-coverage-strategy": ["modeACoverage", null],
             "resolve-hosts-bypass": ["resolveHostsBypass", hostsBypassCheck],
             "doh-lockdown-enabled": ["dohLockdownEnabled", dohEnableCheck],
             "doh-lockdown-scope": ["dohLockdownScope", null],
@@ -696,7 +653,8 @@ ColumnLayout {
             "short-name-completion": ["shortNameCompletion", shortNameCheck],
             "short-name-suffix": ["shortNameSuffix", null],
             "app-rules-take-all-addresses": ["appRulesTakeAllAddresses", appRulesTakeAllCheck],
-            "forwarded-outage": ["forwardedOutage", null]
+            "forwarded-outage": ["forwardedOutage", null],
+            "external-address-auto-check": ["externalAddressAutoCheck", externalAddressAutoBox]
         }
         for (var key in (confirmed || {})) {
             var field = fields[key]
@@ -1383,7 +1341,7 @@ ColumnLayout {
 
     function _focusTarget(id) {
         if (id === "doh-lockdown") return dohEnableCheck
-        if (id === "leak-protection") return killSwitchEnableCheck
+        if (id === "leak-protection") return leakProtectionChoice
         if (id === "forwarded-traffic") return forwardedAsComputerRadio
         return null
     }
@@ -1611,16 +1569,13 @@ ColumnLayout {
         }
     }
 
-    // Default route for traffic that
-    // matches NO rule. Reuses RouteBehaviorMode (`behaviorModeModel`), and
-    // writes to the SERVICE per-SID policy via `root.applyRouteBehaviorMode`
-    // (Phase B1) so the choice actually drives WFP — not just the deprecated
-    // UiPreferences mirror. Mirrors the selector on the Interfaces & Routes
-    // screen; both stay in sync through `prefs.routeBehaviorMode`.
+    // Default route for traffic that matches NO rule, written to the service
+    // per-SID policy. Mirrors the selector on the Interfaces & Routes screen;
+    // both stay in sync through `prefs.routeBehaviorMode`.
     GroupBox {
         id: defaultRouteGroup
         title: root.tr("settings.routing.default-route.title",
-            "Default route for unmatched traffic")
+            "Default route")
         Layout.fillWidth: true
         visible: root.behaviorModeModel && root.behaviorModeModel.count > 0
         ColumnLayout {
@@ -1633,7 +1588,7 @@ ColumnLayout {
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.default-route.description",
-                    "Where traffic that matches no rule is sent. Rules always take priority. Default: primary route.")
+                    "Where traffic that matches no rule goes. Rules always take priority.")
             }
             ThemedComboBox {
                 id: defaultRouteCombo
@@ -1662,14 +1617,8 @@ ColumnLayout {
                     target: panel
                     function onRouteModeChanged() { defaultRouteCombo._syncFromState() }
                 }
-                onActivated: {
-                    var id = root.behaviorModeModel.get(currentIndex).id
-                    panel.routeMode = String(id)
-                    if (typeof root.routePolicyController.applyRouteBehaviorMode === "function") {
-                        root.routePolicyController.applyRouteBehaviorMode(id)
-                    }
-                    defaultRouteCombo.displayText = root.behaviorModeLabel(id)
-                }
+                onActivated: panel._chooseDefaultRoute(
+                    String(root.behaviorModeModel.get(currentIndex).id))
                 Connections {
                     target: root
                     function onUiRevisionChanged() {
@@ -1681,7 +1630,7 @@ ColumnLayout {
                 }
             }
             // "Show details" / "Hide details" disclosure for the
-            // default-route explainer prose (mirrors the leak-protection group's
+            // default-route explainer prose (like the leak-protection group's
             // `routingKsDetailsExpanded` collapse). Keeps the selector + its
             // one-line label above always visible; everything below folds away.
             ThemedButton {
@@ -1694,11 +1643,8 @@ ColumnLayout {
                 onClicked: root.routingDefaultRouteDetailsExpanded = !root.routingDefaultRouteDetailsExpanded
             }
 
-            // Explain the SELECTED mode inline
-            // (answers "what does Strict secondary mean?"). Reuses the
-            // existing `settings.routing-behavior.mode.<slug>.description`
-            // locale keys (flat catalog → the `settings.` prefix is required);
-            // updates as the user changes the dropdown.
+            // Explains the SELECTED default route inline; updates as the user
+            // changes the dropdown.
             Label {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
@@ -1836,30 +1782,27 @@ ColumnLayout {
         }
     }
 
-    // Friendly display of the configured VPN executable (basename, no ".exe").
-    // Empty when none is set. Read through `uiRevision` at the call site so it
-    // re-evaluates when the onboarding writes `confirmedVpnExePath`.
+    // Every confirmed VPN program, as the service holds them (the prefs copy
+    // only until it has answered). Empty when none is set.
     function _vpnDisplayName() {
-        var p = String((root.prefs && root.prefs.confirmedVpnExePath) || "")
-        if (p === "") return ""
-        var i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"))
-        var b = i >= 0 ? p.substring(i + 1) : p
-        return Pure.displayText(b.replace(/\.exe$/i, ""))
+        var names = Pure.displayTextList(Pure.vpnProviderNames(
+            typeof root.currentLinkProviders === "function" ? root.currentLinkProviders() : []))
+        return names.length === 0 ? ""
+            : Pure.listSummary(names, root.tr("status.app-unresolved-more", "+{n} more"))
     }
 
     // Dedicated "Your VPN client" group. Moved out of the leak-
     // protection group (per the placement decision) so it stays visible
-    // regardless of the kill-switch state. Captures WHICH program is the user's
+    // regardless of leak protection. Captures WHICH program is the user's
     // VPN so its traffic keeps flowing over the primary link while leak
     // protection is on (an "Application -> primary route" rule is already a
-    // kill-switch exemption; this only records the executable).
+    // leak-protection exemption; this only records the executable).
     GroupBox {
         id: vpnClientGroup
         title: root.tr("settings.routing.vpn-client.title", "Your VPN client")
         Layout.fillWidth: true
 
-        // Re-evaluated on every `uiRevision` bump (the onboarding writes the
-        // pref via updatePrefs, which bumps it). Empty ⇒ nothing configured.
+        // Follows the service set and the language. Empty: nothing confirmed.
         property string vpnName: root.uiRevision >= 0 ? panel._vpnDisplayName() : ""
 
         ColumnLayout {
@@ -1899,6 +1842,10 @@ ColumnLayout {
                         root.openVpnOnboarding()
                 }
             }
+            LinkProvidersPanel {
+                root: panel.root
+                Layout.fillWidth: true
+            }
             // A VPN that has to connect through one channel: a rule on its
             // gateway, not an entry above (that one keeps its program on the
             // main link).
@@ -1906,15 +1853,116 @@ ColumnLayout {
                 root: panel.root
                 Layout.fillWidth: true
             }
+            CheckBox {
+                id: externalAddressAutoBox
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                checked: panel.externalAddressAutoCheck
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.routing.vpn-client.external-address-auto",
+                        "Check the external address each time the additional route connects")
+                    : ""
+                Accessible.role: Accessible.CheckBox
+                Accessible.name: text
+                Accessible.description: externalAddressAutoNote.text
+                contentItem: Label {
+                    text: externalAddressAutoBox.text
+                    leftPadding: externalAddressAutoBox.indicator.width
+                        + externalAddressAutoBox.spacing
+                    color: root.textColor
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onToggled: {
+                    var wanted = checked
+                    panel.externalAddressAutoCheck = wanted
+                    if (typeof root.routePolicyController.applyExternalAddressAutoCheck
+                            === "function") {
+                        // A refused write leaves the service as it was.
+                        root.routePolicyController.applyExternalAddressAutoCheck(wanted,
+                            function() {
+                                panel.externalAddressAutoCheck = !wanted
+                                externalAddressAutoBox.checked = !wanted
+                            })
+                    }
+                }
+            }
+            Label {
+                id: externalAddressAutoNote
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.leftMargin: root.uiTheme.spacingMd
+                wrapMode: Text.WordWrap
+                color: root.mutedTextColor
+                font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.routing.vpn-client.external-address-auto-note",
+                        "Once per connection, asks a public address server through the additional route which address the internet sees, and shows it in a notice. Off by default: the request leaves through your VPN. The “Check external address” button works either way.")
+                    : ""
+            }
         }
     }
 
-    // Leak protection is now its own GroupBox (previously it was
-    // mixed into the default-route box). The bold master toggle is the first child;
-    // the "Show details" disclosure, the enforcement-mode (A/B) selector and the
-    // shared-IP selector live directly under it per the user's reorg. Resolved
-    // : every sub-setting is gated on the master toggle, so the whole
-    // subtree hides when the kill-switch is off.
+    // A clicked radio no longer follows a `checked:` binding, so all three are
+    // set from the panel's value whenever it changes.
+    onLeakEffectiveChanged: _syncLeakRadios()
+    function _syncLeakRadios() {
+        leakOffRadio.checked = panel.leakEffective === "off"
+        leakSitesRadio.checked = panel.leakEffective === "sites"
+        leakEverythingRadio.checked = panel.leakEffective === "everything"
+    }
+    function _chooseLeakProtection(slug) {
+        if (slug === panel.leakEffective) return
+        // "Everything" while the additional connection is down stops the
+        // internet at once, and protection over an adapter with no way out
+        // blocks what the rules hand to it: confirm first, and keep the old
+        // choice until the answer.
+        var controller = root.interfacesRolesController
+        var row = controller && typeof controller.boundSecondaryRow === "function"
+            ? controller.boundSecondaryRow() : null
+        var why = Pure.leakProtectionConfirmSlug(panel.leakEffective, slug, row)
+        var proceed = function() { panel._commitLeakProtection(slug) }
+        if (why === "holds-now" && typeof root.confirmLeakHoldsNow === "function") {
+            panel._syncLeakRadios()
+            root.confirmLeakHoldsNow(proceed)
+            return
+        }
+        if (why === "unroutable" && typeof root.confirmUnroutableSecondary === "function") {
+            panel._syncLeakRadios()
+            root.confirmUnroutableSecondary(row, "leak-protection", proceed)
+            return
+        }
+        panel._commitLeakProtection(slug)
+    }
+    // The write raises "Routed sites" to "Everything" under the additional
+    // connection, which stops the internet while that connection is down:
+    // the same yes as picking "Everything", the old route shown until then.
+    function _chooseDefaultRoute(id) {
+        var proceed = function() { panel._commitDefaultRoute(id) }
+        if (typeof root.confirmDefaultRoute === "function") {
+            defaultRouteCombo._syncFromState()
+            root.confirmDefaultRoute(panel.leakEffective, id, proceed)
+            return
+        }
+        proceed()
+    }
+    function _commitDefaultRoute(id) {
+        panel.routeMode = id
+        // The panel shows the raised level at once.
+        panel.leakProtection = Pure.coerceLeakProtection(id, panel.leakProtection)
+        if (typeof root.routePolicyController.applyRouteBehaviorMode === "function")
+            root.routePolicyController.applyRouteBehaviorMode(id)
+        defaultRouteCombo._syncFromState()
+    }
+    function _commitLeakProtection(slug) {
+        panel.leakProtection = slug
+        panel._syncLeakRadios()
+        if (typeof root.routePolicyController.applyLeakProtection === "function")
+            root.routePolicyController.applyLeakProtection(slug)
+    }
+
+    // Leak protection: one three-way choice. Every refinement below shows
+    // only where it acts.
     GroupBox {
         id: leakProtectionGroup
         title: root.tr("settings.routing.kill-switch.title", "Leak protection")
@@ -1924,11 +1972,6 @@ ColumnLayout {
             anchors.right: parent.right
             spacing: root.uiTheme.spacingSm
 
-            // MASTER kill-switch toggle (explicit opt-in). The
-            // kill-switch is OFF by default: nothing is blocked, and every option
-            // below stays hidden until the user turns it on here. Replaces the old
-            // auto-arm-on-secondary-bound behaviour per an explicit UX
-            // decision — enforcement is now the user's explicit choice.
             SettingFocusBanner {
                 id: leakFocusBanner
                 root: panel.root
@@ -1947,72 +1990,110 @@ ColumnLayout {
                 onDismissed: panel._focusId = ""
             }
 
-            CheckBox {
-                id: killSwitchEnableCheck
-                SettingFocusHighlight {
-                    theme: root.uiTheme
-                    shown: panel._focusHighlightId === "leak-protection"
-                }
+            // The three levels share this parent, which makes them exclusive.
+            ColumnLayout {
+                id: leakProtectionChoice
                 Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                checked: panel.killSwitchEnabled
-                text: root.tr("settings.routing.kill-switch.enable-label",
-                    "Enable leak protection (block traffic when the additional adapter is down)")
-                contentItem: Label {
-                    text: killSwitchEnableCheck.text
-                    leftPadding: killSwitchEnableCheck.indicator.width + killSwitchEnableCheck.spacing
-                    color: root.textColor
-                    wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignVCenter
-                    font.bold: true
-                }
-                onToggled: {
-                    // Arming leak protection over an additional adapter that
-                    // has no way out to the network turns "not routed" into
-                    // "blocked" for every destination the rules hand to it.
-                    // Confirm first; the checkbox stays off until the user says
-                    // yes, and nothing about the kill-switch is weakened.
-                    if (checked
-                            && root.interfacesRolesController
-                            && typeof root.interfacesRolesController.unroutableBoundSecondaryRow === "function"
-                            && typeof root.confirmUnroutableSecondary === "function") {
-                        var badRow = root.interfacesRolesController.unroutableBoundSecondaryRow()
-                        if (badRow) {
-                            killSwitchEnableCheck.checked = false
-                            root.confirmUnroutableSecondary(badRow, "kill-switch", function() {
-                                killSwitchEnableCheck.checked = true
-                                panel.killSwitchEnabled = true
-                                if (typeof root.routePolicyController.applyKillSwitchEnabled === "function")
-                                    root.routePolicyController.applyKillSwitchEnabled(true)
-                            })
-                            return
-                        }
-                    }
-                    panel.killSwitchEnabled = checked
-                    if (typeof root.routePolicyController.applyKillSwitchEnabled === "function")
-                        root.routePolicyController.applyKillSwitchEnabled(checked)
-                }
-            }
-            Label {
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                Layout.leftMargin: root.uiTheme.spacingSm
-                color: root.mutedTextColor
-                wrapMode: Text.WordWrap
-                font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                text: root.tr("settings.routing.kill-switch.enable-note",
-                    "Off by default. While off, nothing is blocked — if the additional adapter drops, traffic falls back to your main link (this can expose your real address, which is fine if you don't need blocking). Turn it on to reveal the blocking options below.")
-            }
+                spacing: root.uiTheme.spacingXs
+                // The outline marks the chosen level; a layout child cannot
+                // carry anchors of its own.
+                Accessible.role: Accessible.Grouping
+                Accessible.name: root.uiRevision >= 0
+                    ? root.tr("settings.routing.kill-switch.title", "Leak protection") : ""
 
-            // VPN-client onboarding moved to its own "Your VPN client" group
-            // above so it is visible regardless of the kill-switch
-            // state — see `vpnClientGroup`.
+                ThemedRadioButton {
+                    id: leakOffRadio
+                    theme: root.uiTheme
+                    Layout.fillWidth: true
+                    text: root.uiRevision >= 0
+                        ? root.tr("settings.routing.leak-protection.option-off", "Off") : ""
+                    Accessible.description: leakOffHelp.text
+                    SettingFocusHighlight {
+                        theme: root.uiTheme
+                        shown: leakOffRadio.checked && panel._focusHighlightId === "leak-protection"
+                    }
+                    Component.onCompleted: checked = panel.leakEffective === "off"
+                    onToggled: if (checked) panel._chooseLeakProtection("off")
+                }
+                Label {
+                    id: leakOffHelp
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    Layout.leftMargin: root.uiTheme.spacingXl
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                    text: root.uiRevision >= 0
+                        ? root.tr("settings.routing.leak-protection.note-off",
+                            "If the additional connection drops, traffic continues over your main connection.")
+                        : ""
+                }
+                // Not offered while unmatched traffic already goes through the
+                // additional connection: there it would mean "Everything".
+                ThemedRadioButton {
+                    id: leakSitesRadio
+                    theme: root.uiTheme
+                    Layout.fillWidth: true
+                    visible: root.uiRevision >= 0
+                        && Pure.leakProtectionChoices(panel.routeMode).indexOf("sites") >= 0
+                    text: root.uiRevision >= 0
+                        ? root.tr("settings.routing.leak-protection.option-sites", "Routed sites") : ""
+                    Accessible.description: leakSitesHelp.text
+                    SettingFocusHighlight {
+                        theme: root.uiTheme
+                        shown: leakSitesRadio.checked && panel._focusHighlightId === "leak-protection"
+                    }
+                    Component.onCompleted: checked = panel.leakEffective === "sites"
+                    onToggled: if (checked) panel._chooseLeakProtection("sites")
+                }
+                Label {
+                    id: leakSitesHelp
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    Layout.leftMargin: root.uiTheme.spacingXl
+                    visible: leakSitesRadio.visible
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                    text: root.uiRevision >= 0
+                        ? root.tr("settings.routing.leak-protection.note-sites",
+                            "What your rules send through the additional connection never goes out the main one. Everything else keeps working.")
+                        : ""
+                }
+                ThemedRadioButton {
+                    id: leakEverythingRadio
+                    theme: root.uiTheme
+                    Layout.fillWidth: true
+                    text: root.uiRevision >= 0
+                        ? root.tr("settings.routing.leak-protection.option-everything", "Everything") : ""
+                    Accessible.description: leakEverythingHelp.text
+                    SettingFocusHighlight {
+                        theme: root.uiTheme
+                        shown: leakEverythingRadio.checked && panel._focusHighlightId === "leak-protection"
+                    }
+                    Component.onCompleted: checked = panel.leakEffective === "everything"
+                    onToggled: if (checked) panel._chooseLeakProtection("everything")
+                }
+                Label {
+                    id: leakEverythingHelp
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    Layout.leftMargin: root.uiTheme.spacingXl
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                    text: root.uiRevision >= 0
+                        ? root.tr("settings.routing.leak-protection.note-everything",
+                            "Nothing leaves except through the additional connection, your local network and what your rules send over the main connection. If the additional connection drops, the internet waits until it returns.")
+                        : ""
+                }
+            }
 
             // "Show details" / "Hide details" disclosure for the full explainer.
             ThemedButton {
                 theme: root.uiTheme
                 flat: true
-                visible: panel.killSwitchEnabled
+                visible: panel.leakOn
                 Layout.leftMargin: root.uiTheme.spacingSm
                 text: root.routingKsDetailsExpanded
                     ? root.tr("action.hide-details", "Hide details")
@@ -2023,12 +2104,12 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled && root.routingKsDetailsExpanded
+                visible: panel.leakOn && root.routingKsDetailsExpanded
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.kill-switch.description",
-                    "Closes the leak window with no race: if the additional adapter goes down, matched traffic is dropped rather than sent over the primary route under your real address. Requires the additional adapter to be assigned. Traffic that matches no rule is unaffected.")
+                    "Leak protection decides what happens to your traffic while the additional connection is unavailable: the VPN is disconnected, not started yet, or was reinstalled under a new name.")
             }
 
             // Coverage caveat. Protection is IP-based
@@ -2039,7 +2120,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled && root.routingKsDetailsExpanded
+                visible: panel.leakOn && root.routingKsDetailsExpanded
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -2047,31 +2128,214 @@ ColumnLayout {
                     "How coverage works: protection tracks the IP addresses a routed site resolves to, learned by watching your system's DNS. It extends automatically as new addresses appear (e.g. when a site behind a CDN rotates IPs), but a brand-new address has a brief unprotected moment until it is seen. Apps that resolve names themselves over DNS-over-HTTPS (DoH) bypass this — turn off DoH in the browser/app for full protection. A diagnostic ping is the hardest case: it fires a single packet the instant a name resolves — before protection can catch up — and pinging a bare IP address skips name-based routing entirely; neither reflects how apps normally connect.")
             }
 
-            // Enforcement mechanism selector.
-            // Mode A (reactive kill-switch, default) vs Mode B (local DNS
-            // resolver, enforce-before-connect). Global service setting; takes
-            // effect after the service restarts. Redirecting DNS is invasive.
-            // The whole cluster writes the shared service-stability config;
-            // where that has no handler the controls are hidden and this note
-            // stands in their place.
+            // Acts only while everything is blocked: keeps name resolution
+            // working over the main connection (port-scoped). Off cuts DNS too,
+            // a total blackout.
+            Item {
+                visible: panel.offered.indexOf("allow-dns-over-primary") >= 0
+                Layout.fillWidth: true
+                Layout.preferredHeight: root.uiTheme.spacingSm
+            }
+            CheckBox {
+                id: allowDnsOverPrimaryCheck
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                visible: panel.offered.indexOf("allow-dns-over-primary") >= 0
+                checked: panel.allowDnsOverPrimary
+                text: root.tr("settings.routing.kill-switch.allow-dns-label",
+                    "Allow name resolution over the main connection while blocked")
+                contentItem: Label {
+                    text: allowDnsOverPrimaryCheck.text
+                    leftPadding: allowDnsOverPrimaryCheck.indicator.width + allowDnsOverPrimaryCheck.spacing
+                    color: root.textColor
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onToggled: {
+                    panel.allowDnsOverPrimary = checked
+                    if (typeof root.routePolicyController.applyAllowDnsOverPrimary === "function")
+                        root.routePolicyController.applyAllowDnsOverPrimary(checked)
+                }
+            }
             Label {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.killSwitchEnabled && !panel.stabilitySupported
+                Layout.leftMargin: root.uiTheme.spacingSm
+                visible: panel.offered.indexOf("allow-dns-over-primary") >= 0
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                text: root.tr("settings.routing.kill-switch.allow-dns-note",
+                    "On by default: a narrow exception keeps name resolution working while blocked — only to the DNS servers your main connection is configured with, and only on the DNS port. Turn this off only for strict blocking: with DNS cut too, you have no working internet at all until the additional connection returns.")
+            }
+
+            // What the user sees, not what is enforced: the banner Main.qml
+            // shows while everything is blocked. Prefs-only, no service write.
+            CheckBox {
+                id: leakHoldWarnCheck
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                visible: panel.leakEffective === "everything"
+                checked: root.uiRevision >= 0
+                    ? root.prefs.warnKillSwitchBlockAll !== false : true
+                text: root.tr("settings.routing.kill-switch.block-all-warn-label",
+                    "Warn while leak protection is holding all traffic")
+                contentItem: Label {
+                    text: leakHoldWarnCheck.text
+                    leftPadding: leakHoldWarnCheck.indicator.width + leakHoldWarnCheck.spacing
+                    color: root.textColor
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onToggled: { root.updatePrefs({ warnKillSwitchBlockAll: checked }); root.emitPrefs() }
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.leftMargin: root.uiTheme.spacingSm
+                visible: panel.leakEffective === "everything"
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                text: root.tr("settings.routing.kill-switch.block-all-warn-note",
+                    "On by default: a banner appears while the additional connection is down and everything waits for it. Turn it off if you deliberately keep the service running with the VPN disconnected (e.g. from OS startup) and don't want the reminder.")
+            }
+
+            // Refinements of the levels that block.
+            ColumnLayout {
+                Layout.fillWidth: true
+                Layout.leftMargin: root.uiTheme.spacingSm
+                Layout.topMargin: root.uiTheme.spacingSm
+                spacing: root.uiTheme.spacingSm
+                visible: panel.offered.indexOf("kill-switch-protocols") >= 0
+                // Which IP protocols leak protection cuts. ICMP (ping) is only
+                // blockable at the packet layer. A tuning knob: Detailed mode.
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    Layout.topMargin: root.uiTheme.spacingSm
+                    visible: panel.offered.indexOf("kill-switch-protocols") >= 0 && panel.detailedModeOn
+                    color: root.textColor
+                    wrapMode: Text.WordWrap
+                    text: root.tr("settings.routing.kill-switch.protocols.label",
+                        "Protocols leak protection cuts")
+                }
+                Item {
+                    Layout.fillWidth: true
+                    visible: panel.offered.indexOf("kill-switch-protocols") >= 0 && panel.detailedModeOn
+                    Layout.preferredHeight: ksProtocolsFlow.height
+                    Flow {
+                        id: ksProtocolsFlow
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        spacing: root.uiTheme.spacingMd
+                        Repeater {
+                            model: [
+                                { slug: "tcp", bit: 1, tip: "Most web, email and app traffic (HTTP/HTTPS and similar)." },
+                                { slug: "udp", bit: 2, tip: "DNS, video calls, games and other real-time traffic." },
+                                { slug: "icmp", bit: 4, tip: "Ping and traceroute. These live only at the packet layer, so ICMP must be checked for the block to stop a ping." },
+                                { slug: "igmp", bit: 8, tip: "Multicast group membership on the local network." },
+                                { slug: "gre", bit: 16, tip: "A tunnelling protocol used by some VPNs (e.g. PPTP)." },
+                                { slug: "esp", bit: 32, tip: "Encrypted IPsec VPN payloads." }
+                            ]
+                            delegate: CheckBox {
+                                // The last ticked box stays ticked: the service
+                                // refuses a selection that blocks nothing. The
+                                // stored "other" bit has no box and is kept as is.
+                                readonly property bool lastOne:
+                                    Pure.killSwitchProtocolLocked(panel.ksProtocols, modelData.bit)
+                                text: root.tr("settings.routing.kill-switch.protocols." + modelData.slug,
+                                    modelData.slug === "icmp"
+                                        ? "ICMP (ping)"
+                                        : modelData.slug.toUpperCase())
+                                id: protocolBox
+                                checked: (panel.ksProtocols & modelData.bit) !== 0
+                                enabled: !lastOne
+                                // A click drops the `checked:` binding; a refused
+                                // write still has to show the mask the service kept.
+                                Connections {
+                                    target: panel
+                                    function onKsProtocolsChanged() {
+                                        protocolBox.checked = (panel.ksProtocols & modelData.bit) !== 0
+                                    }
+                                }
+                                onToggled: {
+                                    var m = checked
+                                        ? (panel.ksProtocols | modelData.bit)
+                                        : (panel.ksProtocols & ~modelData.bit)
+                                    panel.ksProtocols = m & 0x7F
+                                    if (typeof root.routePolicyController.applyKillSwitchProtocols === "function")
+                                        root.routePolicyController.applyKillSwitchProtocols(panel.ksProtocols)
+                                }
+                                // Per-protocol hover tooltip + Accessible
+                                // (a tooltip must never be the sole source of meaning,
+                                // so the same text is also the accessible description).
+                                ToolTip.visible: hovered
+                                ToolTip.delay: 400
+                                ToolTip.text: root.tr(
+                                    "settings.routing.kill-switch.protocols." + modelData.slug + "-tooltip",
+                                    modelData.tip)
+                                Accessible.name: text
+                                Accessible.description: lastOne
+                                    ? ToolTip.text + " " + ksLastProtocolHint.text
+                                    : ToolTip.text
+                            }
+                        }
+                    }
+                }
+                Label {
+                    id: ksLastProtocolHint
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    visible: panel.offered.indexOf("kill-switch-protocols") >= 0 && panel.detailedModeOn
+                        && Pure.killSwitchProtocolsAtLastOne(panel.ksProtocols)
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                    text: root.tr("settings.routing.kill-switch.protocols.last-one-hint",
+                        "To turn leak protection off, choose Off above.")
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    visible: panel.offered.indexOf("kill-switch-protocols") >= 0 && panel.detailedModeOn
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                    text: root.tr("settings.routing.kill-switch.protocols.desc",
+                        "Which IP protocols leak protection drops. ICMP covers ping/traceroute. TCP/UDP are enforced at the connection layer; ICMP/IGMP/GRE/ESP at the packet layer. All on by default — uncheck to let a protocol through even while the block is active.")
+                }
+            }
+        }
+    }
+
+    // Routing refinements, offered wherever the service acts on them whatever
+    // the leak-protection level: `Pure.offeredRoutingSettings` decides, for
+    // the terminal UI too.
+    GroupBox {
+        id: routingMethodGroup
+        title: root.tr("settings.routing.routing-method.title", "Routing method")
+        Layout.fillWidth: true
+        ColumnLayout {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: root.uiTheme.spacingSm
+
+            // The cluster writes the shared service-stability config; where
+            // that has no handler this note stands in for its controls.
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                visible: panel.offered.indexOf("service-stability-unavailable") >= 0
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 text: root.platformUnsupportedText
             }
 
-            Item {
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
-                Layout.fillWidth: true
-                Layout.preferredHeight: root.uiTheme.spacingSm
-            }
             Label {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.offered.indexOf("enforcement-mode") >= 0
                 color: root.textColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.enforcement-mode.label",
@@ -2080,7 +2344,7 @@ ColumnLayout {
             ThemedComboBox {
                 id: enforcementModeCombo
                 theme: root.uiTheme
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.offered.indexOf("enforcement-mode") >= 0
                 Layout.fillWidth: true
                 Layout.maximumWidth: 460
                 // Mode A (reactive) is a non-maintained legacy fallback, offered
@@ -2151,7 +2415,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.offered.indexOf("enforcement-mode") >= 0
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -2159,22 +2423,16 @@ ColumnLayout {
                     "The resolver answers site-name lookups itself and sets up the route before the answer reaches the program, so even the first connection takes the right route. It takes over system DNS while the service runs. Changes apply immediately — no service restart needed.")
             }
 
-            // Virtual-address routing. Only
-            // meaningful in Mode B (the resolver controls the DNS answer), so
-            // the checkbox and its rows are hidden in Mode A and appear only
-            // when Mode B is selected; the long hint folds behind "Show details".
             Item {
-                visible: panel.stabilitySupported && panel.killSwitchEnabled && panel.enforcementMode === "resolver"
+                visible: panel.offered.indexOf("dns-via-secondary") >= 0
                 Layout.fillWidth: true
                 Layout.preferredHeight: root.uiTheme.spacingSm
             }
+            // Where the service's own lookups leave from: either enforcement
+            // mode, once an additional connection is bound.
             RowLayout {
                 Layout.fillWidth: true
-                // Unlike fake-IP this is not Mode-B-only: it changes where the
-                // service's own lookups leave from, which matters in either
-                // enforcement mode. It still needs leak protection on, because
-                // that is what binds an additional connection at all.
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.offered.indexOf("dns-via-secondary") >= 0
                 CheckBox {
                     id: dnsViaSecondaryCheck
                     Layout.fillWidth: true
@@ -2211,7 +2469,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.offered.indexOf("dns-via-secondary") >= 0
                     && root.routingDnsViaSecondaryDetailsExpanded
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
@@ -2223,20 +2481,17 @@ ColumnLayout {
                     + "connection is not available, lookups fall back to the main one. Off by default.")
             }
             Item {
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.offered.indexOf("dns-fast-answers") >= 0
                 Layout.fillWidth: true
                 Layout.preferredHeight: root.uiTheme.spacingSm
             }
-            // Answer-latency vs protection-install ordering. Rides the same
-            // stability config as the row above and, like it, matters in either
-            // enforcement mode, so it shares that row's visibility condition.
-            // The trade-off fits one line, so it gets a plain description
-            // instead of a "Show details" disclosure.
+            // Answer latency against route-install ordering: the local
+            // resolver's own trade-off, so resolver mode only.
             CheckBox {
                 id: dnsFastAnswersCheck
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.offered.indexOf("dns-fast-answers") >= 0
                 checked: panel.dnsFastAnswers
                 text: root.tr("settings.routing.dns-fast-answers.label",
                     "Fast DNS answers")
@@ -2259,7 +2514,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.offered.indexOf("dns-fast-answers") >= 0
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -2271,12 +2526,11 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredHeight: root.uiTheme.spacingSm
             }
-            // Where the rest of the row applies but no TUN adapter opens, the
-            // setting is named and explained instead of offered.
+            // Virtual addresses come from the local resolver. Where no TUN
+            // adapter opens, the setting is named and explained instead.
             ColumnLayout {
                 Layout.fillWidth: true
-                visible: panel.stabilitySupported && !panel.fakeIpOffered
-                    && panel.killSwitchEnabled && panel.enforcementMode === "resolver"
+                visible: panel.offered.indexOf("fake-ip-unavailable") >= 0
                 spacing: root.uiTheme.spacingXs
                 Label {
                     Layout.fillWidth: true
@@ -2297,7 +2551,7 @@ ColumnLayout {
             }
             RowLayout {
                 Layout.fillWidth: true
-                visible: panel.fakeIpOffered && panel.killSwitchEnabled && panel.enforcementMode === "resolver"
+                visible: panel.offered.indexOf("fake-ip-enabled") >= 0
                 CheckBox {
                     id: fakeIpCheck
                     Layout.fillWidth: true
@@ -2332,8 +2586,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.fakeIpOffered && panel.killSwitchEnabled
-                    && panel.enforcementMode === "resolver"
+                visible: panel.offered.indexOf("fake-ip-enabled") >= 0
                     && root.routingFakeIpDetailsExpanded
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
@@ -2347,8 +2600,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.fakeIpOffered && panel.killSwitchEnabled
-                    && panel.enforcementMode === "resolver"
+                visible: panel.offered.indexOf("fake-ip-enabled") >= 0
                     && panel.fakeIpDriverVerdict !== ""
                     && panel.fakeIpDriverVerdict !== "none"
                 color: panel.fakeIpDriverVerdict === "genuine"
@@ -2359,20 +2611,14 @@ ColumnLayout {
                         "Virtual-adapter driver (Wintun): ")
                     + panel._fakeIpDriverVerdictLabel()
             }
-            // UDP relay for the fake-IP pool. Only meaningful while fake-IP
-            // itself is on (it changes what the pool permit does with UDP), so
-            // it shares the fake-IP row's visibility plus a check on the
-            // fake-IP toggle. The trade-off fits one line, so — like the
-            // fast-DNS-answers toggle — it gets a plain description instead of
-            // a "Show details" disclosure.
+            // The two fake-IP refinements act only while fake-IP is on; as
+            // tuning knobs they also wait for Detailed mode.
             CheckBox {
                 id: fakeIpUdpRelayCheck
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.fakeIpOffered && panel.killSwitchEnabled
-                    && panel.enforcementMode === "resolver"
+                visible: panel.offered.indexOf("fake-ip-udp-relay") >= 0
                     && panel.detailedModeOn
-                    && panel.fakeIpEnabled
                 checked: panel.fakeIpUdpRelay
                 text: root.tr("settings.routing.fake-ip-udp-relay.label",
                     "Fake-IP UDP relay (experimental)")
@@ -2395,28 +2641,20 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.fakeIpOffered && panel.killSwitchEnabled
-                    && panel.enforcementMode === "resolver"
+                visible: panel.offered.indexOf("fake-ip-udp-relay") >= 0
                     && panel.detailedModeOn
-                    && panel.fakeIpEnabled
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.fake-ip-udp-relay.note",
                     "Carry QUIC/HTTP-3 through the relay instead of forcing browsers to fall back to TCP.")
             }
-            // Instant-reset toggle for a fake-IP relay dial refused because the
-            // additional route can't be resolved (most commonly mid-VPN-
-            // reconnect). Same visibility as the UDP-relay row: only meaningful
-            // while fake-IP itself is on. Defaults ON (today's behaviour).
             CheckBox {
                 id: fakeIpInstantRstCheck
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.fakeIpOffered && panel.killSwitchEnabled
-                    && panel.enforcementMode === "resolver"
+                visible: panel.offered.indexOf("fake-ip-instant-rst") >= 0
                     && panel.detailedModeOn
-                    && panel.fakeIpEnabled
                 checked: panel.fakeIpInstantRst
                 text: root.tr("settings.routing.fake-ip-instant-rst.label",
                     "Instant reset when the additional route is unavailable")
@@ -2439,10 +2677,8 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.fakeIpOffered && panel.killSwitchEnabled
-                    && panel.enforcementMode === "resolver"
+                visible: panel.offered.indexOf("fake-ip-instant-rst") >= 0
                     && panel.detailedModeOn
-                    && panel.fakeIpEnabled
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -2450,106 +2686,18 @@ ColumnLayout {
                     "On (default): apps get an immediate connection reset when the additional route can't be resolved, so they can retry or fail over right away. Off: connections are held for up to 10 seconds while the route comes back, instead of resetting immediately.")
             }
 
-            // Mode-A coverage strategy: what happens to traffic whose
-            // destination is not yet in the learned pin set while the additional
-            // route is unavailable. Only meaningful in Mode A (reactive), so it
-            // hides in Mode B, where the resolver enforces before the first
-            // packet. Per-SID `mode-a-coverage-strategy`; the default flipped to
-            // Fail-closed-unknown (leak protection must hold even
-            // while the pin set is incomplete — the "ping still passes with the
-            // VPN closed" report). `zone-widening` exists in the enum but is not
-            // yet enforced, so it is deliberately NOT offered here.
+            // Shared addresses — one frame for the two settings that answer "a
+            // single IP serves several sites", on two axes: the combo box
+            // decides ROUTING while the additional adapter is up (any level),
+            // the check box BLOCKING while it is down (leak protection on).
             Item {
-                visible: panel.killSwitchEnabled && panel.enforcementMode !== "resolver"
-                Layout.fillWidth: true
-                Layout.preferredHeight: root.uiTheme.spacingSm
-            }
-            Label {
-                visible: panel.killSwitchEnabled && panel.enforcementMode !== "resolver"
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                color: root.textColor
-                wrapMode: Text.WordWrap
-                text: root.tr("settings.routing.mode-a-coverage.label",
-                    "When the additional route is unavailable (watching system DNS)")
-            }
-            ThemedComboBox {
-                id: modeACoverageCombo
-                visible: panel.killSwitchEnabled && panel.enforcementMode !== "resolver"
-                theme: root.uiTheme
-                Layout.fillWidth: true
-                Layout.maximumWidth: 460
-                model: ListModel {
-                    ListElement { slug: "fail-closed-unknown"; label: "" }
-                    ListElement { slug: "per-ip"; label: "" }
-                }
-                textRole: "label"
-                function _slugLabel(slug) {
-                    return root.tr("settings.routing.mode-a-coverage.option-" + slug,
-                        slug === "per-ip"
-                            ? "Block only the learned addresses of routed sites (may briefly leak)"
-                            : "Block all unresolved traffic (default, safest)")
-                }
-                function _indexOfSlug(slug) {
-                    for (var i = 0; i < modeACoverageCombo.model.count; i += 1)
-                        if (String(modeACoverageCombo.model.get(i).slug) === slug)
-                            return i
-                    return 0
-                }
-                function _refreshLabels() {
-                    var m = modeACoverageCombo.model
-                    for (var i = 0; i < m.count; i += 1)
-                        m.setProperty(i, "label", _slugLabel(String(m.get(i).slug)))
-                    _syncFromState()
-                }
-                function _syncFromState() {
-                    currentIndex = _indexOfSlug(String(panel.modeACoverage))
-                    displayText = _slugLabel(String(panel.modeACoverage))
-                }
-                Component.onCompleted: _refreshLabels()
-                onActivated: {
-                    var slug = String(model.get(currentIndex).slug)
-                    panel.modeACoverage = slug
-                    displayText = _slugLabel(slug)
-                    if (typeof root.routePolicyController.applyModeACoverageStrategy === "function")
-                        root.routePolicyController.applyModeACoverageStrategy(slug)
-                }
-                Connections {
-                    target: panel
-                    function onModeACoverageChanged() { modeACoverageCombo._syncFromState() }
-                }
-                Connections {
-                    target: root
-                    function onUiRevisionChanged() { modeACoverageCombo._refreshLabels() }
-                }
-            }
-            Label {
-                visible: panel.killSwitchEnabled && panel.enforcementMode !== "resolver"
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                Layout.leftMargin: root.uiTheme.spacingSm
-                color: root.mutedTextColor
-                wrapMode: Text.WordWrap
-                font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                text: root.tr("settings.routing.mode-a-coverage.note",
-                    "Applies while leak protection is armed and the additional adapter is down or unresolved. “Block all unresolved traffic” closes the gap where a routed site rotates to a fresh, not-yet-learned IP that would otherwise leak over the primary link. VPN clients and apps routed to the primary adapter stay exempt so the tunnel can always reconnect.")
-            }
-
-            // Shared addresses — one titled frame for the two settings that both
-            // answer "a single IP serves several sites". They stay two separate
-            // controls on two different axes: the combo box decides ROUTING
-            // while the additional adapter is up, the check box decides
-            // BLOCKING while it is down. They used to sit far apart, which made
-            // users read one as the other; the axis lines below say which is
-            // which. Wire keys and appliers are unchanged.
-            Item {
-                visible: panel.killSwitchEnabled
+                visible: panel.offered.indexOf("shared-ip-policy") >= 0
                 Layout.fillWidth: true
                 Layout.preferredHeight: root.uiTheme.spacingSm
             }
             GroupBox {
                 id: sharedAddressesGroup
-                visible: panel.killSwitchEnabled
+                visible: panel.offered.indexOf("shared-ip-policy") >= 0
                 Layout.fillWidth: true
                 title: root.tr("settings.routing.shared-addresses.title",
                     "Shared addresses (one IP serving several sites)")
@@ -2567,7 +2715,7 @@ ColumnLayout {
                     Label {
                         Layout.fillWidth: true
                         Layout.preferredWidth: 0
-                        visible: panel.killSwitchEnabled
+                        visible: panel.offered.indexOf("shared-ip-policy") >= 0
                         color: root.mutedTextColor
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -2577,7 +2725,7 @@ ColumnLayout {
                     Label {
                         Layout.fillWidth: true
                         Layout.preferredWidth: 0
-                        visible: panel.killSwitchEnabled
+                        visible: panel.offered.indexOf("shared-ip-policy") >= 0
                         color: root.textColor
                         wrapMode: Text.WordWrap
                         text: root.tr("settings.routing-behavior.shared-ip.label",
@@ -2586,7 +2734,7 @@ ColumnLayout {
                     ThemedComboBox {
                         id: sharedIpCombo
                         theme: root.uiTheme
-                        visible: panel.killSwitchEnabled
+                        visible: panel.offered.indexOf("shared-ip-policy") >= 0
                         Layout.fillWidth: true
                         Layout.maximumWidth: 460
                         model: ListModel {
@@ -2640,7 +2788,7 @@ ColumnLayout {
                         Layout.fillWidth: true
                         Layout.preferredWidth: 0
                         Layout.leftMargin: root.uiTheme.spacingSm
-                        visible: panel.killSwitchEnabled
+                        visible: panel.offered.indexOf("shared-ip-policy") >= 0
                         color: root.mutedTextColor
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -2656,14 +2804,14 @@ ColumnLayout {
                     // is the SSOT (no prefs mirror), mirroring the DoH-lockdown
                     // toggle.
                     Item {
-                        visible: panel.killSwitchEnabled && panel.ksFailClosed
+                        visible: panel.offered.indexOf("kill-switch-strict-shared-ips") >= 0
                         Layout.fillWidth: true
                         Layout.preferredHeight: root.uiTheme.spacingSm
                     }
                     Label {
                         Layout.fillWidth: true
                         Layout.preferredWidth: 0
-                        visible: panel.killSwitchEnabled && panel.ksFailClosed
+                        visible: panel.offered.indexOf("kill-switch-strict-shared-ips") >= 0
                         color: root.mutedTextColor
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -2674,7 +2822,7 @@ ColumnLayout {
                         id: ksStrictSharedCheck
                         Layout.fillWidth: true
                         Layout.preferredWidth: 0
-                        visible: panel.killSwitchEnabled && panel.ksFailClosed
+                        visible: panel.offered.indexOf("kill-switch-strict-shared-ips") >= 0
                         checked: panel.ksStrictSharedIps
                         text: root.tr("settings.routing.kill-switch.shared-strict-label",
                             "Strict: also block addresses shared with regular sites (may break them)")
@@ -2695,7 +2843,7 @@ ColumnLayout {
                         theme: root.uiTheme
                         flat: true
                         Layout.leftMargin: root.uiTheme.spacingSm
-                        visible: panel.killSwitchEnabled && panel.ksFailClosed
+                        visible: panel.offered.indexOf("kill-switch-strict-shared-ips") >= 0
                         text: root.routingSharedStrictDetailsExpanded
                             ? root.tr("action.hide-details", "Hide details")
                             : root.tr("action.show-details", "Show details")
@@ -2705,7 +2853,7 @@ ColumnLayout {
                         Layout.fillWidth: true
                         Layout.preferredWidth: 0
                         Layout.leftMargin: root.uiTheme.spacingSm
-                        visible: panel.killSwitchEnabled && panel.ksFailClosed
+                        visible: panel.offered.indexOf("kill-switch-strict-shared-ips") >= 0
                             && root.routingSharedStrictDetailsExpanded
                         color: root.mutedTextColor
                         wrapMode: Text.WordWrap
@@ -2717,7 +2865,7 @@ ColumnLayout {
                         Layout.fillWidth: true
                         Layout.preferredWidth: 0
                         Layout.leftMargin: root.uiTheme.spacingSm
-                        visible: panel.killSwitchEnabled && panel.ksFailClosed
+                        visible: panel.offered.indexOf("kill-switch-strict-shared-ips") >= 0
                             && !panel.ksStrictSharedIps
                             && (root.uiRevision >= 0
                                 ? Number(root.routingState.killSwitchSharedIpExemptions || 0) > 0
@@ -2740,7 +2888,7 @@ ColumnLayout {
                         theme: root.uiTheme
                         flat: true
                         Layout.leftMargin: root.uiTheme.spacingSm
-                        visible: panel.killSwitchEnabled && panel.ksFailClosed
+                        visible: panel.offered.indexOf("kill-switch-strict-shared-ips") >= 0
                             && !panel.ksStrictSharedIps
                             && (root.uiRevision >= 0
                                 ? Number(root.routingState.killSwitchSharedIpExemptions || 0) > 0
@@ -2756,7 +2904,7 @@ ColumnLayout {
                         Layout.preferredWidth: 0
                         Layout.leftMargin: root.uiTheme.spacingSm
                         visible: root.routingSharedExemptAddressesExpanded
-                            && panel.killSwitchEnabled && panel.ksFailClosed
+                            && panel.offered.indexOf("kill-switch-strict-shared-ips") >= 0
                             && !panel.ksStrictSharedIps
                             && panel.sharedExemptAddresses.length === 0
                         color: root.mutedTextColor
@@ -2770,7 +2918,7 @@ ColumnLayout {
                         Layout.leftMargin: root.uiTheme.spacingSm
                         spacing: root.uiTheme.spacingSm
                         visible: root.routingSharedExemptAddressesExpanded
-                            && panel.killSwitchEnabled && panel.ksFailClosed
+                            && panel.offered.indexOf("kill-switch-strict-shared-ips") >= 0
                             && !panel.ksStrictSharedIps
                             && panel.sharedExemptAddresses.length > 0
                         Label {
@@ -2806,7 +2954,7 @@ ColumnLayout {
                                 * (root.uiTheme.baseFontSizePx + 6) + 12))
                         clip: true
                         visible: root.routingSharedExemptAddressesExpanded
-                            && panel.killSwitchEnabled && panel.ksFailClosed
+                            && panel.offered.indexOf("kill-switch-strict-shared-ips") >= 0
                             && !panel.ksStrictSharedIps
                             && panel.sharedExemptAddresses.length > 0
                         // Read-only but selectable so a support hand-off can
@@ -2825,532 +2973,145 @@ ColumnLayout {
                 }
             }
 
-            // Leak protection is no longer an
-            // opt-in toggle that could be silently left OFF. Binding a
-            // secondary (additional) adapter is itself the request to protect
-            // its traffic, so the guard arms AUTOMATICALLY whenever a secondary
-            // is assigned and stays armed while that adapter is unreachable
-            // (down / not started / reinstalled under a new name). The only
-            // user choice is the posture below (block vs allow). This closes
-            // a leak where an un-ticked toggle silently disabled
-            // protection so the secondary adapter drop leaked to the primary.
-            Item { Layout.fillWidth: true; Layout.preferredHeight: root.uiTheme.spacingSm }
-
-            // The redundant bold "Защита от утечки" section header
-            // was removed: the bold master toggle above ("Включить защиту от
-            // утечки") is the single anchor for the feature now that the term is
-            // unified, so a second heading mid-section only duplicated it. The
-            // always-on explainer below now introduces the posture sub-settings.
-            // Always-on explainer — replaces the old opt-in summary and covers
-            // the "adapter not found / not started" case the user raged about.
+            // Secondary tunnel liveness window: an ICMP probe that treats
+            // the tunnel as down when its next hop stays unreachable for N
+            // seconds, at any leak-protection level. Opt-in.
             Label {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                Layout.leftMargin: root.uiTheme.spacingSm
-                color: root.mutedTextColor
-                wrapMode: Text.WordWrap
-                font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                visible: panel.killSwitchEnabled
-                text: root.tr("settings.routing.kill-switch.always-on",
-                    "While the kill-switch is ON and the additional adapter can't be reached — it is down, not started, or was reinstalled under a new name — traffic matched by your rules is blocked instead of leaking over your primary route. Choose what happens below.")
-            }
-
-            // Aggressive kill-switch scope. When the
-            // additional adapter is unavailable, block ALL egress (kill-switch)
-            // instead of only its cached routed IPs — closes ICMP/ping and
-            // rotating-IP leaks. Writes the per-SID `kill-switch-block-all`; only
-            // meaningful with the kill-switch ON and fail-closed.
-            Item { Layout.fillWidth: true; Layout.preferredHeight: root.uiTheme.spacingSm }
-            CheckBox {
-                id: ksBlockAllCheck
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                // Track 1 Chunk 5 — hidden entirely when the posture is
-                // fail-open (leak protection not blocking); shown fail-closed.
-                visible: panel.killSwitchEnabled && panel.ksFailClosed
-                checked: panel.ksBlockAll
-                text: root.tr("settings.routing.kill-switch.block-all-label",
-                    "When the additional adapter is unavailable, block ALL traffic, not just its routed sites")
-                contentItem: Label {
-                    text: ksBlockAllCheck.text
-                    leftPadding: ksBlockAllCheck.indicator.width + ksBlockAllCheck.spacing
-                    color: ksBlockAllCheck.enabled ? root.textColor : root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignVCenter
-                }
-                onToggled: {
-                    panel.ksBlockAll = checked
-                    if (typeof root.routePolicyController.applyKillSwitchBlockAll === "function")
-                        root.routePolicyController.applyKillSwitchBlockAll(checked)
-                }
-            }
-            ThemedButton {
-                theme: root.uiTheme
-                flat: true
-                Layout.leftMargin: root.uiTheme.spacingSm
-                // Track 1 Chunk 5 — travels with its checkbox: hidden fail-open.
-                visible: panel.killSwitchEnabled && panel.ksFailClosed
-                text: root.routingBlockAllDetailsExpanded
-                    ? root.tr("action.hide-details", "Hide details")
-                    : root.tr("action.show-details", "Show details")
-                onClicked: root.routingBlockAllDetailsExpanded = !root.routingBlockAllDetailsExpanded
-            }
-            Label {
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                Layout.leftMargin: root.uiTheme.spacingSm
-                // Track 1 Chunk 5 — travels with its checkbox: hidden fail-open.
-                visible: panel.killSwitchEnabled && panel.ksFailClosed
-                    && root.routingBlockAllDetailsExpanded
-                color: root.mutedTextColor
-                wrapMode: Text.WordWrap
-                font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                text: root.tr("settings.routing.kill-switch.block-all-note",
-                    "Most aggressive: while the additional adapter is down, only your explicitly primary-routed sites keep working — everything else, including ping, is blocked. This is what stops routed sites (and ICMP) from leaking to the primary link. Requires leak protection to be on. On Windows, IPv6, ping and VPN protocols such as IPsec are then held back for every user of this computer.")
-            }
-            // Prominent alert when the strict
-            // catch-all is CHOSEN: it cuts the user's real internet when the
-            // additional adapter is down. Shown only while the option is ON (and
-            // meaningful, i.e. fail-closed). QtQuick.Layouts excludes it from the
-            // column when invisible, so no height juggling is needed.
-            Rectangle {
-                id: ksBlockAllAlert
-                Layout.fillWidth: true
-                Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled && panel.ksFailClosed && panel.ksBlockAll
-                implicitHeight: ksBlockAllAlertRow.implicitHeight + root.uiTheme.spacingSm * 2
-                radius: root.uiTheme.radiusSm
-                color: Qt.rgba(root.uiTheme.colorWarning.r, root.uiTheme.colorWarning.g,
-                    root.uiTheme.colorWarning.b, 0.16)
-                border.width: root.uiTheme.borderWidth
-                border.color: Qt.rgba(root.uiTheme.colorWarning.r, root.uiTheme.colorWarning.g,
-                    root.uiTheme.colorWarning.b, 0.55)
-                RowLayout {
-                    id: ksBlockAllAlertRow
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.top: parent.top
-                    anchors.margins: root.uiTheme.spacingSm
-                    spacing: root.uiTheme.spacingSm
-                    Rectangle {
-                        Layout.preferredWidth: 8; Layout.preferredHeight: 8; radius: 4
-                        Layout.alignment: Qt.AlignTop
-                        Layout.topMargin: 4
-                        color: root.uiTheme.colorWarning
-                    }
-                    Label {
-                        Layout.fillWidth: true
-                        Layout.preferredWidth: 0
-                        color: root.textColor
-                        wrapMode: Text.WordWrap
-                        font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                        text: root.tr("settings.routing.kill-switch.block-all-alert",
-                            "Heads up: with this on, if the additional adapter (VPN) goes down your normal internet stops too — only your local network keeps working — until it comes back. Leave it off if you want your main connection to keep working when the VPN drops.")
-                    }
-                }
-            }
-
-            // Opt-in: keep name resolution working over the
-            // primary link while the aggressive block-all is engaged (port-scoped
-            // UDP/TCP 53). Only meaningful when block-all is on. (P1b):
-            // ON is now the default — with DNS cut too, an armed block-all is a
-            // total blackout. OFF = strict, blocks DNS too. Lets the user pick
-            // either behaviour.
-            CheckBox {
-                id: allowDnsOverPrimaryCheck
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled && panel.ksFailClosed && panel.ksBlockAll
-                checked: panel.allowDnsOverPrimary
-                text: root.tr("settings.routing.kill-switch.allow-dns-label",
-                    "Allow name resolution over the main link while blocked (keep zones resolving)")
-                contentItem: Label {
-                    text: allowDnsOverPrimaryCheck.text
-                    leftPadding: allowDnsOverPrimaryCheck.indicator.width + allowDnsOverPrimaryCheck.spacing
-                    color: root.textColor
-                    wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignVCenter
-                }
-                onToggled: {
-                    panel.allowDnsOverPrimary = checked
-                    if (typeof root.routePolicyController.applyAllowDnsOverPrimary === "function")
-                        root.routePolicyController.applyAllowDnsOverPrimary(checked)
-                }
-            }
-            Label {
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled && panel.ksFailClosed && panel.ksBlockAll
-                color: root.mutedTextColor
-                wrapMode: Text.WordWrap
-                font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                text: root.tr("settings.routing.kill-switch.allow-dns-note",
-                    "On by default: a narrow exception (port 53 only) keeps name resolution working over your main link while blocked, so zones keep resolving — a deliberate, narrow DNS leak. Turn this off only for strict blocking: with DNS cut too, you have no working internet at all until the block clears. Useful with the local DNS resolver so zone rules keep working.")
-            }
-
-            // Pure UI-notification preference (NOT an
-            // enforcement setting): toggles the "leak protection is blocking all
-            // unknown traffic" banner shown by Main.qml. Prefs-only round-trip,
-            // no IPC / UAC / service write. Placed at the end of the group since
-            // it changes only what the user sees, not what is enforced.
-            CheckBox {
-                id: ksBlockAllWarnCheck
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                visible: panel.killSwitchEnabled && panel.ksFailClosed
-                checked: root.uiRevision >= 0
-                    ? root.prefs.warnKillSwitchBlockAll !== false : true
-                text: root.tr("settings.routing.kill-switch.block-all-warn-label",
-                    "Warn when leak protection blocks all unknown traffic")
-                contentItem: Label {
-                    text: ksBlockAllWarnCheck.text
-                    leftPadding: ksBlockAllWarnCheck.indicator.width + ksBlockAllWarnCheck.spacing
-                    color: root.textColor
-                    wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignVCenter
-                }
-                onToggled: { root.updatePrefs({ warnKillSwitchBlockAll: checked }); root.emitPrefs() }
-            }
-            Label {
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled && panel.ksFailClosed
-                color: root.mutedTextColor
-                wrapMode: Text.WordWrap
-                font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                text: root.tr("settings.routing.kill-switch.block-all-warn-note",
-                    "On by default: a banner appears while the full block is active. Turn it off if you deliberately keep the service running with the VPN disconnected (e.g. from OS startup) and don't want the reminder.")
-            }
-
-            // Failure posture. fail-closed (default) makes
-            // the emergency block actually block when the additional adapter
-            // can't be found; fail-open keeps traffic flowing and warns. Block
-            // The posture (block vs allow) is a kill-switch
-            // sub-setting: shown only when the master toggle above is ON.
-            ColumnLayout {
-                Layout.fillWidth: true
-                Layout.leftMargin: root.uiTheme.spacingSm
                 Layout.topMargin: root.uiTheme.spacingSm
-                spacing: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled
-                Label {
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 0
-                    color: root.textColor
-                    wrapMode: Text.WordWrap
-                    text: root.tr("settings.routing.kill-switch.failure-mode.label",
-                        "If the additional adapter can't be found")
+                visible: panel.offered.indexOf("secondary-liveness-window-secs") >= 0
+                color: root.textColor
+                wrapMode: Text.WordWrap
+                text: root.tr("settings.routing.liveness-window.label",
+                    "Additional tunnel liveness window")
+            }
+            ThemedComboBox {
+                id: livenessWindowCombo
+                theme: root.uiTheme
+                visible: panel.offered.indexOf("secondary-liveness-window-secs") >= 0
+                Layout.fillWidth: true
+                Layout.maximumWidth: 460
+                model: ListModel {
+                    ListElement { secs: 0; kind: "disabled" }
+                    ListElement { secs: 10; kind: "preset" }
+                    ListElement { secs: 30; kind: "preset" }
+                    ListElement { secs: 60; kind: "preset" }
+                    ListElement { secs: 90; kind: "preset" }
+                    ListElement { secs: 120; kind: "preset" }
+                    ListElement { secs: 240; kind: "preset" }
+                    ListElement { secs: -1; kind: "custom" }
                 }
-                ThemedComboBox {
-                    id: ksFailModeCombo
-                    theme: root.uiTheme
-                    Layout.fillWidth: true
-                    Layout.maximumWidth: 380
-                    model: ListModel {
-                        ListElement { slug: "fail-closed"; label: "" }
-                        ListElement { slug: "fail-open"; label: "" }
-                    }
-                    // The popup delegate showed the English
-                    // fallback while the closed displayText was localised. A tr()
-                    // call inside the delegate label is NOT reactive to locale load
-                    // (see LESSONS — binding must track uiRevision), so the delegate
-                    // froze on the fallback resolved before the locale loaded. Fix:
-                    // resolve each option label into the model (textRole = "label")
-                    // and re-resolve on every locale change, so the popup list and
-                    // the closed field always agree.
-                    textRole: "label"
-                    function _slugLabel(slug) {
-                        return root.tr("settings.routing.kill-switch.failure-mode.option-" + slug,
-                            slug === "fail-closed" ? "Block traffic (recommended)"
-                                                   : "Allow traffic and warn me")
-                    }
-                    function _refreshLabels() {
-                        var m = ksFailModeCombo.model
-                        for (var i = 0; i < m.count; i += 1)
-                            m.setProperty(i, "label", _slugLabel(String(m.get(i).slug)))
-                        _syncFromState()
-                    }
-                    function _syncFromState() {
-                        var idx = panel.ksFailClosed ? 0 : 1
-                        currentIndex = idx
-                        displayText = _slugLabel(panel.ksFailClosed ? "fail-closed" : "fail-open")
-                    }
-                    Component.onCompleted: _refreshLabels()
-                    onActivated: {
-                        var slug = String(model.get(currentIndex).slug)
-                        var failClosed = slug === "fail-closed"
-                        panel.ksFailClosed = failClosed
-                        displayText = _slugLabel(slug)
-                        if (typeof root.routePolicyController.applyKillSwitchFailClosed === "function")
-                            root.routePolicyController.applyKillSwitchFailClosed(failClosed)
-                    }
-                    Connections {
-                        target: panel
-                        function onKsFailClosedChanged() { ksFailModeCombo._syncFromState() }
-                    }
-                    Connections {
-                        target: root
-                        function onUiRevisionChanged() { ksFailModeCombo._refreshLabels() }
-                    }
+                textRole: "label"
+                // The dropdown delegate reads its text via
+                // labelResolver FIRST (ThemedComboBox._labelFor); the `label`
+                // role is bolted on at runtime via setProperty and is invisible
+                // to the delegate's bound context, so without this resolver the
+                // popup rendered raw "QQmlDMAbstractItemModelData" objects.
+                // secs/kind are statically declared in every ListElement, so
+                // they are always readable in the delegate.
+                labelResolver: function(item) {
+                    return item
+                        ? livenessWindowCombo._optLabel(item.secs | 0, String(item.kind))
+                        : ""
                 }
-                Label {
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 0
-                    // Fail-open is the risky choice — colour it as a warning so
-                    // the trade-off (possible real-address exposure) is obvious.
-                    color: panel.ksFailClosed
-                        ? root.mutedTextColor
-                        : root.uiTheme.colorWarning
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                    text: panel.ksFailClosed
-                        ? root.tr("settings.routing.kill-switch.failure-mode.desc-fail-closed",
-                            "Safest: if NetRuleRouter can't find the additional adapter (it's down, or the binding is stale), matched traffic is blocked instead of leaking over the primary route. Leak protection always works.")
-                        : root.tr("settings.routing.kill-switch.failure-mode.desc-fail-open",
-                            "Convenience: if the additional adapter can't be found, matched traffic keeps flowing over the primary route and a warning is shown. Your real address may be exposed.")
+                function _optLabel(secs, kind) {
+                    // Mark the default choice in the list itself
+                    // (the user asked "which one is the default?").
+                    if (kind === "disabled")
+                        return root.tr("settings.routing.liveness-window.option-disabled",
+                            "Disabled (default)")
+                    if (kind === "custom")
+                        return root.tr("settings.routing.liveness-window.option-custom",
+                            "Custom…")
+                    return secs + " " + root.tr("settings.routing.liveness-window.seconds-unit",
+                        "seconds")
                 }
-                // Which IP protocols the emergency block cuts. ICMP (ping) is
-                // only blockable at the packet layer. Hidden while fail-open:
-                // nothing is blocked there.
-                Label {
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 0
-                    Layout.topMargin: root.uiTheme.spacingSm
-                    visible: panel.killSwitchEnabled && panel.ksFailClosed
-                    color: root.textColor
-                    wrapMode: Text.WordWrap
-                    text: root.tr("settings.routing.kill-switch.protocols.label",
-                        "Protocols leak protection cuts")
+                function _indexOfSecs(secs) {
+                    if (secs === 0) return 0
+                    for (var i = 1; i < livenessWindowCombo.model.count - 1; i += 1)
+                        if ((livenessWindowCombo.model.get(i).secs | 0) === secs)
+                            return i
+                    // Non-preset, non-zero → the "Custom…" entry (last row).
+                    return livenessWindowCombo.model.count - 1
                 }
-                Item {
-                    Layout.fillWidth: true
-                    visible: panel.killSwitchEnabled && panel.ksFailClosed
-                    Layout.preferredHeight: ksProtocolsFlow.height
-                    Flow {
-                        id: ksProtocolsFlow
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        spacing: root.uiTheme.spacingMd
-                        Repeater {
-                            model: [
-                                { slug: "tcp", bit: 1, tip: "Most web, email and app traffic (HTTP/HTTPS and similar)." },
-                                { slug: "udp", bit: 2, tip: "DNS, video calls, games and other real-time traffic." },
-                                { slug: "icmp", bit: 4, tip: "Ping and traceroute. These live only at the packet layer, so ICMP must be checked for the block to stop a ping." },
-                                { slug: "igmp", bit: 8, tip: "Multicast group membership on the local network." },
-                                { slug: "gre", bit: 16, tip: "A tunnelling protocol used by some VPNs (e.g. PPTP)." },
-                                { slug: "esp", bit: 32, tip: "Encrypted IPsec VPN payloads." }
-                            ]
-                            delegate: CheckBox {
-                                // The last ticked box stays ticked: the service
-                                // refuses a selection that blocks nothing. The
-                                // stored "other" bit has no box and is kept as is.
-                                readonly property bool lastOne:
-                                    Pure.killSwitchProtocolLocked(panel.ksProtocols, modelData.bit)
-                                text: root.tr("settings.routing.kill-switch.protocols." + modelData.slug,
-                                    modelData.slug === "icmp"
-                                        ? "ICMP (ping)"
-                                        : modelData.slug.toUpperCase())
-                                id: protocolBox
-                                checked: (panel.ksProtocols & modelData.bit) !== 0
-                                enabled: !lastOne
-                                // A click drops the `checked:` binding; a refused
-                                // write still has to show the mask the service kept.
-                                Connections {
-                                    target: panel
-                                    function onKsProtocolsChanged() {
-                                        protocolBox.checked = (panel.ksProtocols & modelData.bit) !== 0
-                                    }
-                                }
-                                onToggled: {
-                                    var m = checked
-                                        ? (panel.ksProtocols | modelData.bit)
-                                        : (panel.ksProtocols & ~modelData.bit)
-                                    panel.ksProtocols = m & 0x7F
-                                    if (typeof root.routePolicyController.applyKillSwitchProtocols === "function")
-                                        root.routePolicyController.applyKillSwitchProtocols(panel.ksProtocols)
-                                }
-                                // Per-protocol hover tooltip + Accessible
-                                // (a tooltip must never be the sole source of meaning,
-                                // so the same text is also the accessible description).
-                                ToolTip.visible: hovered
-                                ToolTip.delay: 400
-                                ToolTip.text: root.tr(
-                                    "settings.routing.kill-switch.protocols." + modelData.slug + "-tooltip",
-                                    modelData.tip)
-                                Accessible.name: text
-                                Accessible.description: lastOne
-                                    ? ToolTip.text + " " + ksLastProtocolHint.text
-                                    : ToolTip.text
-                            }
-                        }
+                function _refreshLabels() {
+                    var m = livenessWindowCombo.model
+                    for (var i = 0; i < m.count; i += 1)
+                        m.setProperty(i, "label",
+                            _optLabel(m.get(i).secs | 0, String(m.get(i).kind)))
+                    _syncFromState()
+                }
+                function _syncFromState() {
+                    var idx = _indexOfSecs(panel.livenessWindowSecs | 0)
+                    currentIndex = idx
+                    var it = livenessWindowCombo.model.get(idx)
+                    displayText = _optLabel(it.secs | 0, String(it.kind))
+                }
+                Component.onCompleted: _refreshLabels()
+                onActivated: {
+                    var it = model.get(currentIndex)
+                    var kind = String(it.kind)
+                    displayText = _optLabel(it.secs | 0, kind)
+                    if (kind === "custom") {
+                        // Reveal the spin box; apply its current value so the
+                        // choice takes effect immediately (clamped to >= 5).
+                        panel.livenessCustomSelected = true
+                        panel._applyLivenessWindow(livenessCustomSpin.value)
+                    } else {
+                        panel.livenessCustomSelected = false
+                        panel._applyLivenessWindow(it.secs | 0)
                     }
                 }
-                Label {
-                    id: ksLastProtocolHint
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 0
-                    visible: panel.killSwitchEnabled && panel.ksFailClosed
-                        && Pure.killSwitchProtocolsAtLastOne(panel.ksProtocols)
-                    color: root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                    text: root.tr("settings.routing.kill-switch.protocols.last-one-hint",
-                        "To turn leak protection off, use the switch above.")
+                Connections {
+                    target: panel
+                    function onLivenessWindowSecsChanged() { livenessWindowCombo._syncFromState() }
                 }
-                Label {
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 0
-                    visible: panel.killSwitchEnabled && panel.ksFailClosed
-                    color: root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                    text: root.tr("settings.routing.kill-switch.protocols.desc",
-                        "Which IP protocols leak protection drops. ICMP covers ping/traceroute. TCP/UDP are enforced at the connection layer; ICMP/IGMP/GRE/ESP at the packet layer. All on by default — uncheck to let a protocol through even while the block is active.")
+                Connections {
+                    target: root
+                    function onUiRevisionChanged() { livenessWindowCombo._refreshLabels() }
                 }
-
-                // Secondary tunnel liveness window: an ICMP probe that
-                // fail-closes the kill-switch when the tunnel next-hop stays
-                // unreachable for N seconds. Opt-in; hidden while fail-open.
-                Label {
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 0
-                    Layout.topMargin: root.uiTheme.spacingSm
-                    visible: panel.stabilitySupported && panel.killSwitchEnabled && panel.ksFailClosed
-                    color: root.textColor
-                    wrapMode: Text.WordWrap
-                    text: root.tr("settings.routing.liveness-window.label",
-                        "Additional tunnel liveness window")
-                }
-                ThemedComboBox {
-                    id: livenessWindowCombo
-                    theme: root.uiTheme
-                    visible: panel.stabilitySupported && panel.killSwitchEnabled && panel.ksFailClosed
-                    Layout.fillWidth: true
-                    Layout.maximumWidth: 460
-                    model: ListModel {
-                        ListElement { secs: 0; kind: "disabled" }
-                        ListElement { secs: 10; kind: "preset" }
-                        ListElement { secs: 30; kind: "preset" }
-                        ListElement { secs: 60; kind: "preset" }
-                        ListElement { secs: 90; kind: "preset" }
-                        ListElement { secs: 120; kind: "preset" }
-                        ListElement { secs: 240; kind: "preset" }
-                        ListElement { secs: -1; kind: "custom" }
-                    }
-                    textRole: "label"
-                    // The dropdown delegate reads its text via
-                    // labelResolver FIRST (ThemedComboBox._labelFor); the `label`
-                    // role is bolted on at runtime via setProperty and is invisible
-                    // to the delegate's bound context, so without this resolver the
-                    // popup rendered raw "QQmlDMAbstractItemModelData" objects.
-                    // secs/kind are statically declared in every ListElement, so
-                    // they are always readable in the delegate.
-                    labelResolver: function(item) {
-                        return item
-                            ? livenessWindowCombo._optLabel(item.secs | 0, String(item.kind))
-                            : ""
-                    }
-                    function _optLabel(secs, kind) {
-                        // Mark the default choice in the list itself
-                        // (the user asked "which one is the default?").
-                        if (kind === "disabled")
-                            return root.tr("settings.routing.liveness-window.option-disabled",
-                                "Disabled (default)")
-                        if (kind === "custom")
-                            return root.tr("settings.routing.liveness-window.option-custom",
-                                "Custom…")
-                        return secs + " " + root.tr("settings.routing.liveness-window.seconds-unit",
-                            "seconds")
-                    }
-                    function _indexOfSecs(secs) {
-                        if (secs === 0) return 0
-                        for (var i = 1; i < livenessWindowCombo.model.count - 1; i += 1)
-                            if ((livenessWindowCombo.model.get(i).secs | 0) === secs)
-                                return i
-                        // Non-preset, non-zero → the "Custom…" entry (last row).
-                        return livenessWindowCombo.model.count - 1
-                    }
-                    function _refreshLabels() {
-                        var m = livenessWindowCombo.model
-                        for (var i = 0; i < m.count; i += 1)
-                            m.setProperty(i, "label",
-                                _optLabel(m.get(i).secs | 0, String(m.get(i).kind)))
-                        _syncFromState()
-                    }
-                    function _syncFromState() {
-                        var idx = _indexOfSecs(panel.livenessWindowSecs | 0)
-                        currentIndex = idx
-                        var it = livenessWindowCombo.model.get(idx)
-                        displayText = _optLabel(it.secs | 0, String(it.kind))
-                    }
-                    Component.onCompleted: _refreshLabels()
-                    onActivated: {
-                        var it = model.get(currentIndex)
-                        var kind = String(it.kind)
-                        displayText = _optLabel(it.secs | 0, kind)
-                        if (kind === "custom") {
-                            // Reveal the spin box; apply its current value so the
-                            // choice takes effect immediately (clamped to >= 5).
-                            panel.livenessCustomSelected = true
-                            panel._applyLivenessWindow(livenessCustomSpin.value)
-                        } else {
-                            panel.livenessCustomSelected = false
-                            panel._applyLivenessWindow(it.secs | 0)
-                        }
-                    }
-                    Connections {
-                        target: panel
-                        function onLivenessWindowSecsChanged() { livenessWindowCombo._syncFromState() }
-                    }
-                    Connections {
-                        target: root
-                        function onUiRevisionChanged() { livenessWindowCombo._refreshLabels() }
-                    }
-                }
-                ThemedSpinBox {
-                    id: livenessCustomSpin
-                    theme: root.uiTheme
-                    Layout.leftMargin: root.uiTheme.spacingSm
-                    from: 5
-                    to: 3600
-                    stepSize: 5
-                    // Shown only while the "Custom…" option is active (explicit
-                    // selection, or a persisted non-preset non-zero value).
-                    visible: panel.stabilitySupported && panel.killSwitchEnabled && panel.ksFailClosed
-                        && (panel.livenessCustomSelected
-                            || (panel.livenessWindowSecs !== 0
-                                && !panel._isLivenessPreset(panel.livenessWindowSecs)))
-                    value: (panel.livenessWindowSecs !== 0)
-                        ? Math.max(5, Math.min(3600, panel.livenessWindowSecs))
-                        : 5
-                    onValueModified: panel._applyLivenessWindow(value)
-                }
-                // The bare spin box gave no clue what it counts or its
-                // limits (user report). State the unit + range explicitly.
-                Label {
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 0
-                    Layout.leftMargin: root.uiTheme.spacingSm
-                    visible: livenessCustomSpin.visible
-                    color: root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                    text: root.tr("settings.routing.liveness-window.custom-range",
-                        "Seconds — from 5 to 3600.")
-                }
-                Label {
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 0
-                    visible: panel.stabilitySupported && panel.killSwitchEnabled && panel.ksFailClosed
-                    color: root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                    text: root.tr("settings.routing.liveness-window.note",
-                        "Optional. When set, NetRuleRouter actively pings the additional adapter's next hop; if it stays unreachable for this many seconds, leak protection fail-closes even if no traffic has failed yet. Off by default. It may false-positive if the tunnel peer silently drops ICMP (many VPNs do), so leave it off unless you know the peer answers pings.")
-                }
+            }
+            ThemedSpinBox {
+                id: livenessCustomSpin
+                theme: root.uiTheme
+                Layout.leftMargin: root.uiTheme.spacingSm
+                from: 5
+                to: 3600
+                stepSize: 5
+                // Shown only while the "Custom…" option is active (explicit
+                // selection, or a persisted non-preset non-zero value).
+                visible: panel.offered.indexOf("secondary-liveness-window-secs") >= 0
+                    && (panel.livenessCustomSelected
+                        || (panel.livenessWindowSecs !== 0
+                            && !panel._isLivenessPreset(panel.livenessWindowSecs)))
+                value: (panel.livenessWindowSecs !== 0)
+                    ? Math.max(5, Math.min(3600, panel.livenessWindowSecs))
+                    : 5
+                onValueModified: panel._applyLivenessWindow(value)
+            }
+            // The bare spin box gave no clue what it counts or its
+            // limits (user report). State the unit + range explicitly.
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.leftMargin: root.uiTheme.spacingSm
+                visible: livenessCustomSpin.visible
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                text: root.tr("settings.routing.liveness-window.custom-range",
+                    "Seconds — from 5 to 3600.")
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                visible: panel.offered.indexOf("secondary-liveness-window-secs") >= 0
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                text: root.tr("settings.routing.liveness-window.note",
+                    "Optional. When set, NetRuleRouter actively pings the additional adapter's next hop; if it stays unreachable for this many seconds, the additional connection counts as down even though the adapter is still up and no traffic has failed yet: with leak protection on, what it carries is blocked; with it off, that traffic goes over the main connection. Off by default. It may false-positive if the tunnel peer silently drops ICMP (many VPNs do), so leave it off unless you know the peer answers pings.")
             }
         }
     }
@@ -3457,17 +3218,16 @@ ColumnLayout {
         }
     }
 
-    // Local networks. Leak protection blocks everything that is not the tunnel,
-    // and a virtual machine's own segment is caught in that net even though its
-    // traffic never leaves this computer. The service exempts what it can
-    // recognise; this is where the user corrects it — refuse a discovered
-    // segment, or name one nothing on the machine reveals (a hypervisor in NAT
-    // mode creates no host interface). Per-SID, no elevation.
+    // Local networks, at any leak-protection level: rules never route them and
+    // leak protection leaves them open. The service lists what it recognises;
+    // here the user refuses a discovered segment or names one nothing on the
+    // machine reveals (a hypervisor in NAT mode creates no host interface).
+    // Per-SID, no elevation.
     GroupBox {
         id: localNetworksGroup
         title: root.tr("settings.routing.local-networks.title", "Local networks")
         Layout.fillWidth: true
-        visible: panel.killSwitchEnabled
+        visible: panel.offered.indexOf("local-networks") >= 0
 
         ColumnLayout {
             anchors.left: parent.left
@@ -3480,16 +3240,7 @@ ColumnLayout {
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.local-networks.description",
-                    "While leak protection is on, only these local networks stay reachable. Traffic to them never leaves this computer.")
-            }
-
-            Label {
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                visible: !panel.localNetworksSupported
-                color: root.mutedTextColor
-                wrapMode: Text.WordWrap
-                text: root.platformUnsupportedText
+                    "These networks stay reachable whatever your rules and leak protection do: a router, a printer or a virtual machine on them keeps working, and traffic to them goes straight there, never through the additional connection.")
             }
 
             // The banner's "Stop asking" lives here too, so it can be undone
@@ -3894,7 +3645,7 @@ ColumnLayout {
     // images, video and API calls from CDN hosts the user's rules never mention,
     // so the page opens but its media does not. The service can spot those
     // companion domains; this per-SID setting decides what it may then do with
-    // the finding. Rides the same route.policy.update channel as the kill-switch
+    // the finding. Rides the same route.policy.update channel as leak protection
     // fields (GUI + tray, no elevation).
     GroupBox {
         id: autoRulesGroup
@@ -4186,7 +3937,7 @@ ColumnLayout {
 
     // DoH/DoT lockdown. Browsers/apps that resolve names over
     // DNS-over-HTTPS/TLS hide their queries from the DNS observer, so routed
-    // sites resolved that way slip past the kill-switch. Blocking known DoH/DoT
+    // sites resolved that way slip past leak protection. Blocking known DoH/DoT
     // resolver endpoints forces a plaintext fallback the observer can see. Part A
     // is the per-SID master toggle + scope (rides route.policy.update); Part B is
     // the shared machine-wide resolver baseline editor (privileged doh.resolvers.*).
@@ -4880,7 +4631,7 @@ ColumnLayout {
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
                     ToolTip.text: root.tr("settings.diagnostics.routing-stop.persist.tooltip",
-                        "Default (off): full teardown — every route is removed and ALL traffic returns to your main connection; matched sites stop using the additional adapter. Turn ON to keep the matched routes on the additional adapter — useful for a work/corporate additional adapter, so you keep reaching corporate resources while general routing is paused; for a general-purpose additional adapter leave it off so everything returns to your main connection. NetRuleRouter's overlays are still removed either way. Leak-protection and kill-switch blocks are always removed on pause/stop, so a paused or stopped service can never lock you out.")
+                        "Default (off): full teardown — every route is removed and ALL traffic returns to your main connection; matched sites stop using the additional adapter. Turn ON to keep the matched routes on the additional adapter — useful for a work/corporate additional adapter, so you keep reaching corporate resources while general routing is paused; for a general-purpose additional adapter leave it off so everything returns to your main connection. NetRuleRouter's own extra routes are still removed either way. Leak-protection blocks are removed on pause and on a normal stop, so a paused or stopped service does not keep you locked out.")
                 }
                 Label {
                     Layout.fillWidth: true
@@ -4918,7 +4669,7 @@ ColumnLayout {
             // starve a routed site of its public IP (an adblock entry pinning
             // it to `127.0.0.1`). Per-SID `resolve-hosts-bypass`,
             // default ON. Affects rule-host resolution in both modes. General
-            // resolution setting — NOT gated on the kill-switch.
+            // resolution setting — NOT gated on leak protection.
             CheckBox {
                 id: hostsBypassCheck
                 Layout.fillWidth: true

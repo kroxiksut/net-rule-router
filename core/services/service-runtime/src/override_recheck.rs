@@ -19,6 +19,8 @@ use nrr_platform_api::network_change::NetworkChangeSubscription;
 use nrr_platform_api::service_set_change::ServiceSetChangeObserver;
 
 use crate::ipc_handlers::{service_accounts_reader, RuleOverrideDeps};
+use crate::service_tasks::ServiceTaskKind;
+use crate::task_liveness::{TaskLiveness, ThreadExit, ThreadLease, Watch};
 use crate::timed_window::now_ms;
 
 /// How the thread paces itself.
@@ -54,6 +56,18 @@ pub struct OverrideRecheck {
 }
 
 static RUNNING: OnceLock<OverrideRecheck> = OnceLock::new();
+
+/// The service's health board, handed over once it exists: on Linux the
+/// thread starts before it.
+static LIVENESS: OnceLock<Arc<TaskLiveness>> = OnceLock::new();
+
+/// The loop wakes every `tell_every`; this much silence is a stuck thread.
+const SILENCE: Duration = Duration::from_secs(60);
+
+/// Report the thread's life to `liveness`. The first call wins.
+pub fn report_to(liveness: Arc<TaskLiveness>) {
+    let _ = LIVENESS.set(liveness);
+}
 
 /// Start the service's re-check for the life of the process. Only the first
 /// call counts.
@@ -154,17 +168,36 @@ impl Signal {
 fn run(deps: &RuleOverrideDeps, signal: &Signal, timing: Timing) {
     let mut last = Instant::now();
     let mut first = true;
+    let mut lease: Option<ThreadLease> = None;
     loop {
         let poked =
             std::mem::take(&mut first) || signal.wait(timing.tell_every.min(timing.interval));
         if signal.stop.load(Ordering::Acquire) {
+            if let Some(lease) = lease.take() {
+                lease.finish(ThreadExit::Stopped);
+            }
             return;
+        }
+        if lease.is_none() {
+            lease = LIVENESS.get().map(|board| {
+                board.lease(
+                    ServiceTaskKind::OverrideRecheck,
+                    None,
+                    Watch::Beats(SILENCE),
+                )
+            });
+        }
+        if let Some(lease) = lease.as_ref() {
+            lease.beat();
         }
         deps.grants.deliver_unheard();
         if !poked && last.elapsed() < timing.interval {
             continue;
         }
         if poked && !signal.settle(timing.settle) {
+            if let Some(lease) = lease.take() {
+                lease.finish(ThreadExit::Stopped);
+            }
             return;
         }
         recheck_once(deps);

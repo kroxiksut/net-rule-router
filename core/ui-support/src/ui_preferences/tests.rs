@@ -371,16 +371,10 @@ fn save_then_load_roundtrip_is_stable() {
         // round-trip must prove persists.
         route_include_subdomains: false,
         route_shared_ip_policy: "any-rule-domain".to_string(),
-        route_kill_switch_block_all: true,
-        route_kill_switch_fail_closed: false,
         route_kill_switch_protocols: 123,
-        route_kill_switch_enabled: true,
         // Default is true; false is the non-default value the
         // round-trip must prove persists.
         route_allow_dns_over_primary: false,
-        // Non-default values (defaults: fail-closed-unknown / true) so
-        // the round-trip proves these mirrors persist.
-        route_mode_a_coverage_strategy: "per-ip".to_string(),
         route_resolve_hosts_bypass: false,
         route_enforcement_mode: "resolver".to_string(),
         // Non-default value inside the clamp range so the round-trip
@@ -388,8 +382,8 @@ fn save_then_load_roundtrip_is_stable() {
         route_liveness_window_secs: 90,
         // Non-empty compact JSON so the round-trip proves the
         // pending-offline intents blob persists.
-        route_pending_offline_json: r#"{"killSwitchEnabled":true,"enforcementMode":"resolver"}"#
-            .to_string(),
+        route_pending_offline_json:
+            r#"{"leakProtection":"everything","enforcementMode":"resolver"}"#.to_string(),
         // Cache-viewer column widths — non-empty compact JSON so the
         // round-trip proves the persisted column widths survive save/load.
         cache_table_column_widths: r#"{"ip":140,"freshness":90,"source":160}"#.to_string(),
@@ -595,7 +589,43 @@ fn schema_version_constant_is_current() {
     // Each schema bump is additive: older files load with the new
     // fields defaulted via the "missing key → default" path in
     // `parse_preferences`.
-    assert_eq!(CURRENT_UI_PREFS_SCHEMA_VERSION, 12);
+    assert_eq!(CURRENT_UI_PREFS_SCHEMA_VERSION, 13);
+}
+
+/// The four leak-protection mirrors left with schema 13: the service owns that
+/// choice. A file written before still loads, keeps every other value, and the
+/// next save drops the retired keys instead of carrying them.
+#[test]
+fn a_file_with_the_retired_leak_protection_mirrors_loads_and_sheds_them() {
+    let content = "schema_version=12\n\
+                   theme_mode=dark\n\
+                   route_kill_switch_enabled=true\n\
+                   route_kill_switch_fail_closed=false\n\
+                   route_kill_switch_block_all=true\n\
+                   route_mode_a_coverage_strategy=fail-closed-unknown\n\
+                   route_kill_switch_protocols=3\n\
+                   route_allow_dns_over_primary=false\n\
+                   route_behavior_mode=strict-secondary-fail-closed\n";
+    let parsed = parse_preferences(content);
+    assert_eq!(parsed.theme_mode, ThemeMode::Dark);
+    assert_eq!(parsed.route_kill_switch_protocols, 3);
+    assert!(!parsed.route_allow_dns_over_primary);
+    assert_eq!(
+        parsed.route_behavior_mode,
+        RouteBehaviorMode::PreferSecondaryWhenAvailable,
+        "the removed strict mode keeps its traffic on the additional connection"
+    );
+    assert_eq!(parsed.forward_compat, ForwardCompat::default());
+    let saved = format_preferences(&parsed);
+    for retired in [
+        "route_kill_switch_enabled",
+        "route_kill_switch_fail_closed",
+        "route_kill_switch_block_all",
+        "route_mode_a_coverage_strategy",
+    ] {
+        assert!(!saved.contains(retired), "{retired} was carried: {saved}");
+    }
+    assert!(saved.contains("route_kill_switch_protocols=3\n"));
 }
 
 #[test]

@@ -64,6 +64,7 @@ pub mod product_impact_disable;
 pub mod rollback;
 pub mod route_link_provider_set;
 pub mod route_policy_update;
+pub mod route_vpn_gateways_set;
 pub mod rule_override;
 pub mod rules_list;
 pub mod rules_recent_changes;
@@ -107,7 +108,7 @@ pub use diagnostics_handlers::{
 };
 pub use doh_resolvers::{DohResolverListStore, DohResolversGetHandler, DohResolversSetHandler};
 pub use event_bus::{
-    EventBus, EventEntry, SubscribeOutcome, SubscriberState, EVENT_BUFFER_CAPACITY,
+    EventBus, EventEntry, PushWaker, SubscribeOutcome, SubscriberState, EVENT_BUFFER_CAPACITY,
 };
 pub use interfaces_refresh::InterfacesRefreshHandler;
 pub use local_dns_suffixes::{
@@ -131,7 +132,7 @@ pub use principal_data_handlers::{PrincipalDataCountHandler, PrincipalDataPurgeH
 pub use product_impact_disable::ProductImpactDisableTemporaryHandler;
 pub use providers::{
     review_risk_level, AdaptersSnapshotProvider, ApplyFailurePolicyProvider,
-    ApplyFailurePolicyWriter, AutostartProvider, AutostartWriter, LogRetentionConfigProvider,
+    ApplyFailurePolicyWriter, AutostartProvider, LogRetentionConfigProvider,
     LogRetentionConfigWriter, MigrationCompletionRecord, MigrationCompletionWriter,
     MigrationStatusProvider, MutationExecutor, MutationOutcome, PrincipalDataPurger,
     RetentionSettingsProvider, RetentionSettingsWriter, RoutePolicyProvider, RoutePolicyWriteError,
@@ -142,6 +143,7 @@ pub use providers::{
 pub use rollback::RollbackHandler;
 pub use route_link_provider_set::RouteLinkProviderSetHandler;
 pub use route_policy_update::RoutePolicyUpdateHandler;
+pub use route_vpn_gateways_set::RouteVpnGatewaysSetHandler;
 pub use rule_override::{
     service_accounts_reader, RuleOverrideDeps, RuleOverrideGrantHandler,
     RuleOverridePreviewHandler, RuleOverrideRevokeHandler,
@@ -159,7 +161,7 @@ pub use service_stability_handlers::{
 };
 pub use settings_handlers::{
     ApplyFailurePolicyGetHandler, ApplyFailurePolicySetHandler, AutoRuleCandidatesProbeHandler,
-    AutostartGetHandler, AutostartToggleHandler, LocalNetworksGetHandler, LocalNetworksSetHandler,
+    AutostartGetHandler, LocalNetworksGetHandler, LocalNetworksSetHandler,
     LogRetentionConfigGetHandler, LogRetentionConfigSetHandler, RefusingAnchorSetHandler,
     RetentionSettingsGetHandler, RetentionSettingsSetHandler, RoutingPauseGetHandler,
     RoutingPauseToggleHandler, StorageUsageGetHandler, TrafficHistoryMergeSetHandler,

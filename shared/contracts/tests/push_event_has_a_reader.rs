@@ -42,14 +42,6 @@ const NO_SETTINGS_IN_TRAY: Duty =
 /// own `push-gap` marker (see `CLIENT_MARKERS`).
 const TABLE: &[Row] = &[
     Row {
-        slug: "health-changed",
-        gui: Ignored(
-            "the window re-reads service health on its own timer (DiagnosticsSection) and through its connection probe",
-        ),
-        tray: Read,
-        tui: Read,
-    },
-    Row {
         slug: "protection-coverage-changed",
         gui: Read,
         tray: Read,
@@ -146,7 +138,21 @@ const TABLE: &[Row] = &[
         tui: Read,
     },
     Row {
+        slug: "vpn-gateway-awaiting-confirmation",
+        gui: Read,
+        // As for the VPN-client question: answered in the window, announced by
+        // the tray while the window is not on screen.
+        tray: Read,
+        tui: Read,
+    },
+    Row {
         slug: "secondary-external-address-observed",
+        gui: Read,
+        tray: Read,
+        tui: Read,
+    },
+    Row {
+        slug: "secondary-external-address-cleared",
         gui: Read,
         tray: Read,
         tui: Read,
@@ -207,10 +213,17 @@ const TABLE: &[Row] = &[
         tray: Read,
         tui: Read,
     },
+    Row {
+        slug: "rules-book-unreadable",
+        gui: Read,
+        tray: Read,
+        tui: Read,
+    },
 ];
 
-/// Events the IPC client makes up itself, not the service: they have no
-/// variant, but a surface ignores them at the same cost.
+/// Markers with no variant: `push-gap` comes from the IPC client and from the
+/// service's resync after a fall behind its ring. A surface ignores them at the
+/// same cost.
 const CLIENT_MARKERS: &[Row] = &[Row {
     slug: "push-gap",
     gui: Read,

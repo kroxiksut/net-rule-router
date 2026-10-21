@@ -84,16 +84,10 @@ impl UiPreferences {
             // route the rule already names.
             route_include_subdomains: true,
             route_shared_ip_policy: SHARED_IP_POLICY_DEFAULT.to_string(),
-            route_kill_switch_block_all: false,
-            route_kill_switch_fail_closed: true,
             route_kill_switch_protocols: u32::from(
                 nrr_shared::ipc_payloads::KILL_SWITCH_PROTOCOLS_ALL,
             ),
-            route_kill_switch_enabled: false,
             route_allow_dns_over_primary: true,
-            // Matches the service default (leak protection holds even while
-            // the pin set is incomplete) and the hosts-bypass default.
-            route_mode_a_coverage_strategy: route_mode_a_coverage_strategy_default(),
             route_resolve_hosts_bypass: true,
             // Kept in sync with `EnforcementMode::default().as_slug()`.
             route_enforcement_mode: nrr_shared::ipc_payloads::enforcement_mode_default(),
@@ -143,13 +137,6 @@ impl UiPreferences {
             forward_compat: ForwardCompat::default(),
         }
     }
-}
-
-/// Default slug for the `route_mode_a_coverage_strategy` mirror. This is a
-/// MIRROR of a service-owned policy field, so it never spells the slug itself —
-/// it defers to the wire default in `nrr-shared`, which is normative.
-fn route_mode_a_coverage_strategy_default() -> String {
-    nrr_shared::ipc_payloads::mode_a_coverage_strategy_default()
 }
 
 /// Clamp the secondary tunnel liveness window (seconds) to the backend

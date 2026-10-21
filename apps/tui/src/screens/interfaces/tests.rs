@@ -106,6 +106,33 @@ fn choose(app: &mut AppState, name: &str) {
         .position(|row| row.name == name)
         .expect("the adapter is listed");
     app.interfaces.cursor = index;
+    app.interfaces.cursor_key = None;
+}
+
+/// The list re-sorts under the cursor; the chosen adapter stays chosen, so
+/// `p` never lands on a neighbour.
+#[test]
+fn the_cursor_follows_its_adapter_when_the_list_reorders() {
+    let mut app = app_with(machine());
+    // Navigation records the adapter, as a keypress does.
+    let list = rows(&app);
+    set_cursor(&mut app, &list, 2);
+    let chosen = selected(&app).expect("a row is chosen");
+
+    let mut snapshot = machine();
+    snapshot["adapters"]["rows"]
+        .as_array_mut()
+        .expect("rows")
+        .reverse();
+    let parsed = serde_json::from_value(snapshot).expect("snapshot parses");
+    app.apply(
+        BackendEvent::Snapshot(Box::new(parsed)),
+        &texts_en(),
+        Instant::now(),
+    );
+    app.outbox.take();
+    let after = selected(&app).expect("a row is chosen");
+    assert_eq!(row_key(&after), row_key(&chosen));
 }
 
 fn render(app: &AppState, width: u16, height: u16) -> String {
@@ -238,12 +265,24 @@ fn an_adapter_with_no_way_out_is_bound_only_after_the_warning() {
     );
     assert!(picture.contains("Assign anyway"), "{picture}");
 
-    // The question takes the keys, even with the menu focused.
+    // The safe answer is highlighted: Enter alone binds nothing.
     handle_key(
         &mut app,
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         &texts_en(),
     );
+    assert_eq!(app.interfaces.outcome, Some(Outcome::Cancelled));
+    assert!(app.outbox.take().is_empty(), "nothing was sent");
+
+    // The question takes the keys, even with the menu focused.
+    press(&mut app, 'p');
+    for code in [KeyCode::Up, KeyCode::Enter] {
+        handle_key(
+            &mut app,
+            KeyEvent::new(code, KeyModifiers::NONE),
+            &texts_en(),
+        );
+    }
     assert_eq!(run_jobs(&mut app, &fake), 1);
     let request = &fake.sent(IpcOperationName::RoutePolicyUpdate)[0];
     assert_eq!(request["primary"]["stable-id"], json!(HOST_ONLY));
@@ -287,6 +326,21 @@ fn the_external_address_check_runs_only_when_asked() {
     assert!(fake
         .operations()
         .contains(&IpcOperationName::InterfacesRefreshRequest));
+}
+
+#[test]
+fn a_panel_cut_by_a_small_terminal_says_so_and_a_roomy_one_does_not() {
+    let mut app = app_with(machine());
+    choose(&mut app, "Wi-Fi");
+    let small = render(&app, 80, 24);
+    assert!(small.contains("more rows"), "{small}");
+    assert!(
+        small.contains("> 3. Wi-Fi"),
+        "the chosen row stays in view:
+{small}"
+    );
+    let roomy = render(&app, 140, 50);
+    assert!(!roomy.contains("more rows"), "{roomy}");
 }
 
 #[test]

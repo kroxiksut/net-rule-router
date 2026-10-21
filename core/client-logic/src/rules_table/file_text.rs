@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use nrr_shared::preset_parser::SYNTAX_HINT_PREFIX;
+use nrr_shared::preset_parser::{program_value_on_line, SYNTAX_HINT_PREFIX};
 
 use super::{RuleRow, RuleType, TargetRoute};
 use crate::{js, Route};
@@ -187,7 +187,8 @@ fn syntax_hint_block(texts: &[String]) -> Vec<String> {
 /// a `?` there in its own file; a disabled row is written commented out. An
 /// app-authored domain rule moves to `--- Auto` with the provenance tokens the
 /// parser reads it back from; an app-authored program rule carries them in its
-/// own section.
+/// own section. A program the parser would read as something else bare goes
+/// in quotes.
 pub fn build_rules_file_text(
     rows: &[RuleRow],
     route: Route,
@@ -226,7 +227,11 @@ pub fn build_rules_file_text(
         } else if row.is_verify() {
             line.push('?');
         }
-        line.push_str(value);
+        if section == Section::Apps {
+            line.push_str(&program_value_on_line(value, row.enabled));
+        } else {
+            line.push_str(value);
+        }
 
         let comment = if options.include_comments {
             one_line(&row.comment)
@@ -444,6 +449,84 @@ mod tests {
             format!("#: {}", "\u{1F600}".repeat(HINT_MAX_LINE / 2))
         );
         assert_eq!(block[2], "#: line 0");
+    }
+
+    fn program_row(value: &str, enabled: bool, route: TargetRoute, comment: &str) -> RuleRow {
+        RuleRow {
+            id: String::new(),
+            enabled,
+            rule_type: RuleType::Application,
+            match_value: value.to_owned(),
+            target_route: route,
+            verify: false,
+            comment: comment.to_owned(),
+            origin: None,
+        }
+    }
+
+    fn program_rows() -> Vec<RuleRow> {
+        vec![
+            program_row(
+                "Web Content +children",
+                false,
+                TargetRoute::Secondary,
+                "note",
+            ),
+            program_row("/opt/My Apps/tool", false, TargetRoute::Secondary, ""),
+            program_row("Enabled App", true, TargetRoute::Secondary, ""),
+            program_row("Denied App", false, TargetRoute::Block, ""),
+            program_row("firefox", false, TargetRoute::Secondary, ""),
+            program_row("Adobe Reader.exe", false, TargetRoute::Secondary, ""),
+            program_row("\"Quoted\"", true, TargetRoute::Secondary, ""),
+        ]
+    }
+
+    fn program_text(os: &str) -> String {
+        let options = RulesFileOptions {
+            include_comments: true,
+            exported_at: "2026-01-01T00:00:00Z",
+            passthrough: &BTreeMap::new(),
+            os,
+            syntax_hint: &[],
+        };
+        build_rules_file_text(&program_rows(), Route::Secondary, &options)
+    }
+
+    /// A disabled program the parser would take for a note goes in quotes; a
+    /// value that reads back bare keeps its spelling.
+    #[test]
+    fn a_program_that_would_not_read_back_bare_is_written_in_quotes() {
+        for os in ["linux", "macos", "windows"] {
+            let text = program_text(os);
+            for line in [
+                "\n# \"Web Content\" +children          # note\n",
+                "\n# \"/opt/My Apps/tool\"\n",
+                "\nEnabled App\n",
+                "\n# !\"Denied App\"\n",
+                "\n# firefox\n",
+                "\n# Adobe Reader.exe\n",
+                "\n\"\"Quoted\"\"\n",
+            ] {
+                assert!(text.contains(line), "{os}: {line:?} in\n{text}");
+            }
+        }
+    }
+
+    /// Written on this host, read by the clients' parser: every row comes back.
+    #[test]
+    fn program_rows_read_back_whole() {
+        let os = nrr_shared::platform_profile::PlatformProfile::current().os;
+        let text = program_text(os);
+        let parsed = nrr_shared::preset_parser::parse_canonical_rules(&text);
+        let back: Vec<RuleRow> = parsed
+            .rules
+            .iter()
+            .map(|rule| RuleRow {
+                comment: rule.comment.clone(),
+                ..crate::rules_table::drift_row_from_parsed_rule(rule, Route::Secondary)
+            })
+            .collect();
+        assert_eq!(back, program_rows(), "{text}");
     }
 
     #[test]

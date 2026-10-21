@@ -15,15 +15,19 @@
 
 use serde_json::Value;
 
-use nrr_shared::ipc::IpcOperationName;
+use nrr_shared::ipc::{ContractSkew, IpcOperationName, IPC_CONTRACT_REVISION_UNSTATED};
 use nrr_shared::ipc_payloads::{ContractNegotiateClientKind, ContractNegotiateRequest};
+use nrr_shared::ipc_transport::IpcOperationClass;
 
-use crate::connection::NegotiateInfo;
+use crate::connection::{IpcClientError, NegotiateInfo};
 
 /// Protocol version this client speaks. Read from the SSOT in `nrr-shared`,
 /// which both ends already depend on — a local copy meant a bump on the
 /// service side compiled green here and then failed every call.
 pub(crate) use nrr_shared::ipc::IPC_PROTOCOL_VERSION as CLIENT_PROTOCOL_VERSION;
+
+/// Payload revision this client writes, from the same SSOT.
+pub(crate) use nrr_shared::ipc::IPC_CONTRACT_REVISION as CLIENT_CONTRACT_REVISION;
 
 /// Outcome of one request/response exchange, delivered back to the caller
 /// thread. Neutral: carries only wire types (`Value`, `IpcOperationName`,
@@ -139,6 +143,7 @@ fn build_contract_negotiate_as(client_version: u32, kind: ContractNegotiateClien
         client_version,
         client_kind: kind,
         supported_features: Vec::new(),
+        contract_revision: CLIENT_CONTRACT_REVISION,
     };
     serde_json::json!({
         "protocol-version": client_version,
@@ -174,6 +179,13 @@ pub(crate) fn interpret_negotiate_response(response: &Value) -> NegotiateParse {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // A service that predates the field states none, and that is the
+        // revision it speaks.
+        let contract_revision = payload
+            .get("contract-revision")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(IPC_CONTRACT_REVISION_UNSTATED);
         // An `ok` handshake still has to agree on a protocol. The field that
         // says so is `negotiated-protocol` — the server may run a newer
         // version and still agree to speak ours, which is the whole point of
@@ -193,6 +205,7 @@ pub(crate) fn interpret_negotiate_response(response: &Value) -> NegotiateParse {
             server_protocol,
             service_version,
             session_id,
+            contract_revision,
         });
     }
     // Server may have responded with an InvalidVersion error; surface that.
@@ -228,6 +241,30 @@ pub(crate) fn interpret_negotiate_response(response: &Value) -> NegotiateParse {
         return NegotiateParse::Refused { message };
     }
     NegotiateParse::Unexpected(format!("unexpected handshake response: {response}"))
+}
+
+/// The refusal of a call this client must not send: a change while the service
+/// reads another payload revision. Either side would misread the other's
+/// shapes, and a misread change can report success while doing something
+/// else; reads still go, so the user sees where things stand. Exporting a
+/// diagnostics archive is allowed: it is how the skew gets reported.
+pub(crate) fn contract_write_refusal(
+    op: IpcOperationName,
+    payload: &Value,
+    info: Option<&NegotiateInfo>,
+) -> Option<IpcClientError> {
+    let info = info?;
+    let skew = ContractSkew::between(info.contract_revision, CLIENT_CONTRACT_REVISION)?;
+    let class = nrr_shared::ipc_transport::canonical_operation_class(op, payload);
+    if !class.is_mutating() || class == IpcOperationClass::DiagnosticAction {
+        return None;
+    }
+    Some(IpcClientError::ContractMismatch {
+        op,
+        skew,
+        service_revision: info.contract_revision,
+        client_revision: CLIENT_CONTRACT_REVISION,
+    })
 }
 
 pub(crate) fn parse_server_version_from_message(msg: &str) -> Option<u32> {
@@ -415,6 +452,7 @@ mod tests {
                 serde_json::from_value(env.payload).expect("service decodes the payload");
             assert_eq!(body.client_kind, kind);
             assert_eq!(body.client_version, CLIENT_PROTOCOL_VERSION);
+            assert_eq!(body.contract_revision, CLIENT_CONTRACT_REVISION);
         }
     }
 
@@ -494,6 +532,99 @@ mod tests {
             NegotiateParse::ProtocolMismatch { server_version } => assert_eq!(server_version, 4),
             _ => panic!("expected ProtocolMismatch"),
         }
+    }
+
+    /// The service the window met after an update of the window alone: it
+    /// answers the handshake and states no payload revision.
+    #[test]
+    fn a_service_that_states_no_revision_speaks_the_one_before_it() {
+        let r = serde_json::json!({
+            "ok": true,
+            "payload": {
+                "server-version": 1,
+                "negotiated-protocol": CLIENT_PROTOCOL_VERSION,
+                "service-version": "0.1.0",
+                "session-id": "sess-3",
+            }
+        });
+        let NegotiateParse::Ok(info) = interpret_negotiate_response(&r) else {
+            panic!("expected Ok");
+        };
+        assert_eq!(info.contract_revision, IPC_CONTRACT_REVISION_UNSTATED);
+        assert_eq!(info.contract_skew(), Some(ContractSkew::ServiceOlder));
+    }
+
+    fn info_at(contract_revision: u32) -> NegotiateInfo {
+        NegotiateInfo {
+            server_protocol: CLIENT_PROTOCOL_VERSION,
+            service_version: "0.1.0".into(),
+            session_id: "sess-1".into(),
+            contract_revision,
+        }
+    }
+
+    /// Across a skew a change is not sent, whichever side is behind; a read
+    /// is, and so is the archive that reports the skew.
+    #[test]
+    fn across_a_revision_skew_changes_are_refused_and_reads_still_go() {
+        let leak_protection = serde_json::json!({
+            "leak-protection": "sites",
+            "apply-only": ["leak-protection"],
+        });
+        for (revision, skew) in [
+            (CLIENT_CONTRACT_REVISION - 1, ContractSkew::ServiceOlder),
+            (CLIENT_CONTRACT_REVISION + 1, ContractSkew::ClientOlder),
+        ] {
+            let info = info_at(revision);
+            match contract_write_refusal(
+                IpcOperationName::RoutePolicyUpdate,
+                &leak_protection,
+                Some(&info),
+            ) {
+                Some(IpcClientError::ContractMismatch {
+                    skew: refused,
+                    service_revision,
+                    ..
+                }) => {
+                    assert_eq!(refused, skew);
+                    assert_eq!(service_revision, revision);
+                }
+                other => panic!("revision {revision}: expected a refusal, got {other:?}"),
+            }
+            let rules_commit = serde_json::json!({
+                "mutation-kind": "rules-update",
+                "payload": {},
+                "dry-run": false,
+            });
+            assert!(contract_write_refusal(
+                IpcOperationName::MutationSubmit,
+                &rules_commit,
+                Some(&info)
+            )
+            .is_some());
+            for read in [
+                IpcOperationName::SnapshotInitialGet,
+                IpcOperationName::ServiceHealthGet,
+                IpcOperationName::DiagnosticsExportArchive,
+            ] {
+                assert!(
+                    contract_write_refusal(read, &serde_json::json!({}), Some(&info)).is_none(),
+                    "{}",
+                    read.slug()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn at_the_same_revision_or_before_a_handshake_nothing_is_refused() {
+        let payload = serde_json::json!({ "leak-protection": "sites" });
+        let op = IpcOperationName::RoutePolicyUpdate;
+        assert!(
+            contract_write_refusal(op, &payload, Some(&info_at(CLIENT_CONTRACT_REVISION)))
+                .is_none()
+        );
+        assert!(contract_write_refusal(op, &payload, None).is_none());
     }
 
     #[test]
@@ -619,6 +750,23 @@ mod tests {
             RequestResponse::ServerError { code, message, .. } => {
                 assert_eq!(message, "no admin");
                 assert_eq!(code, nrr_shared::ipc_transport::IpcErrorCode::Forbidden);
+            }
+            other => panic!("expected ServerError, got {:?}", debug_response(&other)),
+        }
+    }
+
+    #[test]
+    fn parse_response_reads_the_unsupported_operation_code() {
+        let r = serde_json::json!({
+            "ok": false,
+            "error": { "code": "unsupported_operation", "message": "not supported" }
+        });
+        match parse_response(&r, IpcOperationName::RulesList) {
+            RequestResponse::ServerError { code, .. } => {
+                assert_eq!(
+                    code,
+                    nrr_shared::ipc_transport::IpcErrorCode::UnsupportedOperation
+                );
             }
             other => panic!("expected ServerError, got {:?}", debug_response(&other)),
         }

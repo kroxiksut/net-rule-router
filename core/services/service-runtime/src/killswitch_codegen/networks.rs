@@ -280,5 +280,6 @@ fn net_spec(
         remote_subnet,
         remote_subnet_v6,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }

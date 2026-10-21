@@ -6,7 +6,7 @@
       "input": {
         "intent": {},
         "service": {
-          "kill-switch-enabled": true
+          "leak-protection": "everything"
         }
       },
       "expected": []
@@ -15,22 +15,22 @@
       "name": "a wiped service answers with its defaults",
       "input": {
         "intent": {
-          "kill-switch-enabled": true
+          "leak-protection": "everything"
         },
         "service": {}
       },
       "expected": [
-        "kill-switch-enabled"
+        "leak-protection"
       ]
     },
     {
       "name": "the same value",
       "input": {
         "intent": {
-          "kill-switch-enabled": true
+          "leak-protection": "everything"
         },
         "service": {
-          "kill-switch-enabled": true
+          "leak-protection": "everything"
         }
       },
       "expected": []
@@ -186,10 +186,66 @@
       "expected": []
     },
     {
-      "name": "several keys come back sorted",
+      "name": "a damaged level reads as off",
+      "input": {
+        "intent": {
+          "leak-protection": "block-all"
+        },
+        "service": {
+          "leak-protection": "off"
+        }
+      },
+      "expected": []
+    },
+    {
+      "name": "routed sites under the additional route the service holds read as everything",
+      "input": {
+        "intent": {
+          "leak-protection": "sites"
+        },
+        "service": {
+          "mode": "prefer-secondary-when-available",
+          "leak-protection": "everything"
+        }
+      },
+      "expected": []
+    },
+    {
+      "name": "a weaker level at the service diverges",
+      "input": {
+        "intent": {
+          "leak-protection": "everything"
+        },
+        "service": {
+          "leak-protection": "sites"
+        }
+      },
+      "expected": [
+        "leak-protection"
+      ]
+    },
+    {
+      "name": "a retired default route and retired protection keys read as what they meant",
       "input": {
         "intent": {
           "mode": "strict-secondary-fail-closed",
+          "kill-switch-enabled": true,
+          "kill-switch-fail-closed": true,
+          "kill-switch-block-all": true,
+          "mode-a-coverage-strategy": "fail-closed-unknown"
+        },
+        "service": {
+          "mode": "prefer-secondary-when-available",
+          "leak-protection": "everything"
+        }
+      },
+      "expected": []
+    },
+    {
+      "name": "several keys come back sorted",
+      "input": {
+        "intent": {
+          "mode": "prefer-secondary-when-available",
           "doh-lockdown-enabled": true,
           "auto-rules-mode": "off"
         },
@@ -198,6 +254,22 @@
       "expected": [
         "auto-rules-mode",
         "doh-lockdown-enabled",
+        "mode"
+      ]
+    },
+    {
+      "name": "the strict mode of an earlier build diverges from the main default route",
+      "input": {
+        "intent": {
+          "mode": "strict-secondary-fail-closed"
+        },
+        "service": {
+          "mode": "prefer-primary",
+          "leak-protection": "off"
+        }
+      },
+      "expected": [
+        "leak-protection",
         "mode"
       ]
     }

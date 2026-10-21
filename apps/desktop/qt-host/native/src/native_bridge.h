@@ -146,6 +146,11 @@ public:
     // consume race with the tray's own Exit path.
     Q_INVOKABLE bool requestTrayShutdown();
 
+    /// Whether the tray process this host spawned still exists. False once it
+    /// is gone, and when this host never tracked one. An undecidable probe
+    /// counts as alive: the caller waits a bounded time and then goes on.
+    Q_INVOKABLE bool isTrayProcessAlive();
+
     // Tray polls this (Tray.qml) and quits when it returns true. Consumed
     // exactly once (the flag is deleted on read).
     Q_INVOKABLE bool consumeTrayShutdownRequest();
@@ -212,8 +217,8 @@ public:
 
     /// Write the caller's per-SID route policy (default route / behavior
     /// mode for traffic not matched by a rule). `payload` is a full
-    /// RoutePolicyUpdateRequest (primary?/secondary?/mode/
-    /// block-secondary-when-unavailable/binding-source). This is a PRIVILEGED
+    /// RoutePolicyUpdateRequest (primary?/secondary?/mode/binding-source).
+    /// This is a PRIVILEGED
     /// mutation: a non-elevated GUI's request returns Forbidden, which the
     /// launcher transparently relays through the session elevation broker (one
     /// UAC, reused for the session) — same path as MutationSubmit.
@@ -226,6 +231,10 @@ public:
     /// per-app kill-switch exemptions and triggers an immediate server-side
     /// recompile. Same privileged relay path as `rpcRoutePolicyUpdate`.
     Q_INVOKABLE QString rpcRouteLinkProviderSet(const QVariantMap &payload);
+
+    /// Replaces the caller's confirmed VPN gateways whole
+    /// ({gateways:[{address, program}, ...]}); an empty list clears them.
+    Q_INVOKABLE QString rpcRouteVpnGatewaysSet(const QVariantMap &payload);
 
     /// The local networks that stay reachable while the kill-switch blocks
     /// everything else: what the service discovered (the main link's subnets,

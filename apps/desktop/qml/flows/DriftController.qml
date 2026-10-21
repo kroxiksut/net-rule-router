@@ -1,6 +1,7 @@
 import QtQuick 2.15
 import "../lib/pure.js" as Pure
 import "../lib/rules.js" as Rules
+import "../lib/plurals.js" as Plurals
 
 // Non-visual controller owning the file <-> GUI <-> service drift-detection
 // logic and the file<->service merge flow. Extracted from Main.qml (thin-shell
@@ -350,9 +351,10 @@ QtObject {
                 // app-vs-service stays until the user applies.
                 _driftUpdateGuiHash("primary", function() {})
                 _driftUpdateGuiHash("secondary", _driftCompare)
-                root.statusLine = root.tr("status.drift-loaded-from-file",
-                    "Loaded {count} rule(s) from file into the app. Review and apply when ready.")
-                    .replace("{count}", String(summary.rulesCount))
+                root.statusLine = Plurals.counted(root.tr, "status.drift-loaded-from-file.",
+                        summary.rulesCount,
+                        "Loaded {count} rule from file into the app. Review and apply when ready.",
+                        "Loaded {count} rules from file into the app. Review and apply when ready.")
                 if (typeof onLoaded === "function") onLoaded()
             }
         })
@@ -1020,8 +1022,11 @@ QtObject {
     /// Periodic poll entry. Re-fetches file legs (mtime-cached) and
     /// GUI legs, then compares. Bounded by `_driftRecheckInFlight`
     /// so overlapping triggers don't interleave their async chains.
-    function _driftRecheck() {
-        if (root._driftRecheckInFlight) return
+    function _driftRecheck(includeService) {
+        if (root._driftRecheckInFlight) {
+            if (includeService === true) _driftRecheckQueued = true
+            return
+        }
         if (((root.backendStatus || {}).kind) !== "connected") { _drainRecheckDone(); return }
         if (!root.bridgeAvailable
                 || typeof nrrNativeBridge === "undefined"
@@ -1039,11 +1044,14 @@ QtObject {
         // the amber "rules differ" banner stuck on after a mid-session apply the
         // user did not make. Re-reading the live revision each
         // poll makes a stale pin correct itself within one tick.
-        var pending = 5
+        var withService = includeService !== false
+        var pending = withService ? 5 : 4
         var maybeFinish = function() {
             pending -= 1
             if (pending <= 0) {
-                _driftCompare()
+                // An exception in the compare must not leave the flag set: every
+                // later poll would then be skipped for the rest of the session.
+                try { _driftCompare() } catch (e) { console.log("drift compare failed:", e) }
                 root._driftRecheckInFlight = false
                 var waiting = _driftRecheckDone
                 _driftRecheckDone = []
@@ -1058,7 +1066,7 @@ QtObject {
         _driftRefreshFileHash("secondary", maybeFinish)
         _driftUpdateGuiHash("primary",     maybeFinish)
         _driftUpdateGuiHash("secondary",   maybeFinish)
-        _driftRefreshServiceHashInto(maybeFinish)
+        if (withService) _driftRefreshServiceHashInto(maybeFinish)
     }
 
     /// Decide whether to surface the drift banner. For each route,

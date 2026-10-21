@@ -2,9 +2,9 @@ import QtQuick 2.15
 import "../lib/pure.js" as Pure
 
 // Non-visual controller for the per-SID route-policy apply handlers driven by
-// the Routing settings panel (kill-switch family, DoH lockdown, shared-IP,
-// include-subdomains, mode-A coverage, hosts-bypass, browser-history auto-seed,
-// default-route mode) plus the adapter-binding push/resync. Extracted from
+// the Routing settings panel (leak protection and its refinements, DoH lockdown,
+// shared-IP, include-subdomains, hosts-bypass, browser-history auto-seed,
+// default route) plus the adapter-binding push/resync. Extracted from
 // Main.qml (thin-shell rule). Shared infrastructure the shell keeps on the
 // window: `_routingBackendConnected`, `_recordOfflineRoutingIntent`,
 // `_buildFullRoutePolicyReq`, `_routePolicyEffective`, `applyServiceStabilityPatch`
@@ -70,12 +70,14 @@ QtObject {
             var req = root._buildFullRoutePolicyReq(cur)
             for (var m = 0; m < keys.length; m += 1)
                 req[keys[m]] = changes[keys[m]]
-            return req
+            // A default-route change can leave a level that route does not
+            // offer; the service would refuse the pair.
+            return Pure.settleLeakProtection(req)
         }, function(ok, code, stage) {
-            // A failed read used to leave `cur` empty and build the request from
-            // the field defaults, which turn the kill switch, block-all and the
-            // DoH lockdown OFF. The decision is parked instead, like one made
-            // while the service is down: it is still what the user asked for.
+            // A failed read would build the request from the field defaults,
+            // which switch leak protection and the DoH lockdown off. The
+            // decision is parked instead, like one made while the service is
+            // down: it is still what the user asked for.
             if (stage === "read") {
                 for (var k = 0; k < keys.length; k += 1)
                     root._recordOfflineRoutingIntent("route-policy", keys[k], changes[keys[k]])
@@ -117,7 +119,7 @@ QtObject {
     ///
     /// `route.policy.update` replaces the whole row, so every write is built on
     /// a fresh read. Two in flight read the same row and each carries the
-    /// other's field back to its old value: first-run sent the kill switch, the
+    /// other's field back to its old value: first-run sent leak protection, the
     /// DoH lockdown and both adapter bindings at once, and the service kept
     /// neither protection. Writes therefore run one at a time, each reading
     /// after the previous one landed.
@@ -188,6 +190,9 @@ QtObject {
             root.rpc.registerRpcCallback(wCorr, function(ok2, p2, code2, msg2) {
                 if (ok2) _mirrorConfirmedPolicy(req, changed)
                 else policyWriteRefused(confirmed)
+                // The answer is the row as stored, the install-time start included.
+                if (ok2 && p2 && typeof p2 === "object" && p2.mode !== undefined)
+                    root._noteServicePolicy(p2, null)
                 if (ok2 && Pure.isUserWriteOrigin(job.origin) && root.settingsRestoreController)
                     root.settingsRestoreController.recordRoutePolicy(req, changed)
                 finish(ok2, code2, "write")
@@ -198,6 +203,12 @@ QtObject {
     /// The local preference mirrors follow a write the service confirmed,
     /// whoever sent it: the user, the parked delivery, a restore.
     function _mirrorConfirmedPolicy(req, changed) {
+        // The level in force is what the next default-route change is asked against.
+        if (changed.indexOf("mode") >= 0 || changed.indexOf("leak-protection") >= 0) {
+            root.updateRoutingState({ leakProtection: Pure.coerceLeakProtection(
+                Pure.routePolicyCoerce("mode", req["mode"]),
+                Pure.routePolicyCoerce("leak-protection", req["leak-protection"])) })
+        }
         var patch = Pure.routePolicyPrefMirrorPatch(req, changed)
         if (Object.keys(patch).length === 0) return
         root.commitPrefs(patch)
@@ -219,21 +230,29 @@ QtObject {
                 "Could not update the default route: ")
         })
     }
-    /// Kill-switch FAILURE POSTURE. fail-closed (default) blocks when the
-    /// additional adapter can't be resolved; fail-open allows + warns.
-    function applyKillSwitchFailClosed(failClosed) {
-        var want = failClosed === true
-        _applyRoutePolicyKey("kill-switch-fail-closed", want, {
-            ok: want
-                ? root.tr("status.kill-switch-fail-closed-on",
-                    "Leak protection set to fail-closed: traffic is blocked if the additional adapter can't be found.")
-                : root.tr("status.kill-switch-fail-closed-off",
-                    "Leak protection set to fail-open: traffic is allowed (with a warning) if the additional adapter can't be found."),
+    /// Leak protection: `off` | `sites` | `everything`. A level the current
+    /// default route does not offer is settled by the write itself.
+    function applyLeakProtection(slug, onFailed) {
+        var want = Pure.routePolicyCoerce("leak-protection", slug)
+        var o = _leakProtectionMessages(want)
+        o.onFailed = onFailed
+        _applyRoutePolicyKey("leak-protection", want, o)
+    }
+    function _leakProtectionMessages(level) {
+        return {
+            ok: level === "everything"
+                ? root.tr("status.leak-protection-everything",
+                    "Leak protection: everything. If the additional connection drops, the internet waits until it returns.")
+                : level === "sites"
+                    ? root.tr("status.leak-protection-sites",
+                        "Leak protection: routed sites. What your rules send through the additional connection never goes out the main one.")
+                    : root.tr("status.leak-protection-off",
+                        "Leak protection is off. If the additional connection drops, traffic continues over your main connection."),
             uac: root.tr("status.kill-switch-uac-declined",
                 "Administrator approval was declined; leak protection was not changed."),
-            failPrefix: root.tr("status.kill-switch-failed",
+            failPrefix: root.tr("status.kill-switch-enabled-failed",
                 "Could not update leak protection: ")
-        })
+        }
     }
     /// "Treat a domain as `domain` + `*.domain`" — ON by default. When on,
     /// the service expands every bare-domain rule to also
@@ -307,22 +326,6 @@ QtObject {
                 "Could not update shared-IP handling: ")
         })
     }
-    /// Mode-A coverage strategy: how Mode A treats traffic whose destination is
-    /// not yet in the seeded pin set while the additional route is unavailable.
-    /// "per-ip" (default) blocks only the learned addresses; "fail-closed-unknown"
-    /// blocks everything unresolved (paranoid opt-in — it can briefly block
-    /// unmatched browsing while armed).
-    function applyModeACoverageStrategy(slug) {
-        var want = String(slug || root.routePolicyDefault("mode-a-coverage-strategy"))
-        _applyRoutePolicyKey("mode-a-coverage-strategy", want, {
-            ok: root.tr("status.mode-a-coverage-set",
-                "Leak protection behavior updated."),
-            uac: root.tr("status.route-policy-uac-declined",
-                "Administrator approval was declined; the setting was not changed."),
-            failPrefix: root.tr("status.mode-a-coverage-failed",
-                "Could not update the leak protection behavior: ")
-        })
-    }
     /// "Resolve rule domains bypassing the hosts file". ON (default) resolves
     /// rule hosts straight against upstream DNS so a local hosts/adblock loopback
     /// pin cannot starve a rule of its routable public IP; OFF honours the hosts
@@ -341,7 +344,7 @@ QtObject {
     /// DoH/DoT lockdown MASTER switch. When ON, the service blocks known DoH/DoT
     /// resolver endpoints so browser DNS-over-HTTPS falls back to plaintext the
     /// DNS observer can see (otherwise routed sites resolved over DoH are
-    /// invisible to the kill-switch).
+    /// invisible to leak protection).
     function applyDohLockdownEnabled(enabled) {
         var want = enabled === true
         _applyRoutePolicyKey("doh-lockdown-enabled", want, {
@@ -369,9 +372,9 @@ QtObject {
                 "Could not update DoH/DoT blocking: ")
         })
     }
-    /// Kill-switch shared-IP strictness. "strict" pins census-shared IPs too
-    /// (historic behaviour, can cut co-tenant sites); "smart" (default) excludes
-    /// them from the pin/block set.
+    /// Shared-IP strictness of leak protection. "strict" also holds addresses
+    /// shared with regular sites (can cut co-tenant sites); "smart" (default)
+    /// leaves them out.
     function applyKillSwitchStrictSharedIps(strict) {
         var want = strict === true
         _applyRoutePolicyKey("kill-switch-strict-shared-ips", want, {
@@ -456,6 +459,27 @@ QtObject {
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.primary-probe-failed",
                 "Could not change the main-route check: ")
+        })
+    }
+
+    /// Ask for the additional route's external address each time it connects.
+    /// Off by default: the request leaves through the tunnel.
+    function applyExternalAddressAutoCheck(enabled, onFailed) {
+        var want = enabled === true
+        _applyRoutePolicyKey("external-address-auto-check", want, {
+            onApplied: function(v) {
+                root.updateRoutingState({ externalAddressAutoCheck: v })
+            },
+            onFailed: onFailed,
+            ok: want
+                ? root.tr("status.external-address-auto-on",
+                    "The external address will be checked each time the additional route connects.")
+                : root.tr("status.external-address-auto-off",
+                    "The external address will only be checked when you ask."),
+            uac: root.tr("status.route-policy-uac-declined",
+                "Administrator approval was declined; the setting was not changed."),
+            failPrefix: root.tr("status.external-address-auto-failed",
+                "Could not change the external-address check: ")
         })
     }
 
@@ -565,7 +589,7 @@ QtObject {
                 "Could not update automatic browser-history seeding: ")
         })
     }
-    /// Kill-switch PROTOCOL bitmask (which IP protocols the emergency block cuts:
+    /// Leak-protection PROTOCOL bitmask (which IP protocols it cuts:
     /// TCP=1, UDP=2, ICMP=4, IGMP=8, GRE=16, ESP=32; bit 64 has no box, the
     /// caller keeps it as stored). A mask that selects nothing is not sent: the
     /// service refuses it.
@@ -577,40 +601,22 @@ QtObject {
                 "Leak protection protocols updated."),
             uac: root.tr("status.kill-switch-uac-declined",
                 "Administrator approval was declined; leak protection was not changed."),
-            failPrefix: root.tr("status.kill-switch-failed",
+            failPrefix: root.tr("status.kill-switch-enabled-failed",
                 "Could not update leak protection: ")
         })
     }
-    /// Aggressive kill-switch SCOPE. When ON, the split-mode fail-closed block
-    /// cuts ALL egress (except explicitly primary-routed + exemptions) while the
-    /// additional adapter is unavailable, instead of only the cached secondary
-    /// destination IPs.
-    function applyKillSwitchBlockAll(enabled) {
-        var want = enabled === true
-        _applyRoutePolicyKey("kill-switch-block-all", want, {
-            ok: want
-                ? root.tr("status.kill-switch-block-all-on",
-                    "Block-all on: while the additional adapter is down, all traffic is blocked except your local network and already-known primary sites.")
-                : root.tr("status.kill-switch-block-all-off",
-                    "Block-all off: while the additional adapter is down, only its routed sites are blocked now."),
-            uac: root.tr("status.route-policy-uac-declined",
-                "Administrator approval was declined; the setting was not changed."),
-            failPrefix: root.tr("status.kill-switch-block-all-failed",
-                "Could not update the block-all setting: ")
-        })
-    }
-    /// The first-run protections (wizard or answer file) as ONE write, so the
-    /// kill switch and the DoH lockdown cannot be sent as two snapshots of the
-    /// same row.
+    /// The first-run protections (wizard or answer file) as ONE write, so leak
+    /// protection and the DoH lockdown cannot be sent as two snapshots of the
+    /// same row. `leakProtection` is a level slug.
     /// `origin` names who answered: the wizard is the user's own choice, an
     /// answer sheet is the administrator's and is not recorded as theirs.
-    function applyFirstRunProtections(killSwitch, dohLockdown, origin) {
-        var ks = killSwitch === true
-        var o = _killSwitchMessages(ks)
+    function applyFirstRunProtections(leakProtection, dohLockdown, origin) {
+        var level = Pure.routePolicyCoerce("leak-protection", leakProtection)
+        var o = _leakProtectionMessages(level)
         o.origin = origin || "user:first-run"
         // "Yes" is the automatic posture; "no" is a choice that holds.
         _applyRoutePolicyKeys({
-            "kill-switch-enabled": ks,
+            "leak-protection": level,
             "doh-lockdown-enabled": dohLockdown === true,
             "doh-lockdown-auto": dohLockdown === true
         }, o)
@@ -639,39 +645,18 @@ QtObject {
                 "Could not update DoH/DoT blocking: ")
         })
     }
-    /// MASTER kill-switch toggle (the explicit opt-in). When OFF (default) the
-    /// whole leak-guard is disarmed regardless of sub-settings; when ON the gated
-    /// sub-settings take effect.
-    function applyKillSwitchEnabled(enabled) {
-        var want = enabled === true
-        _applyRoutePolicyKey("kill-switch-enabled", want, _killSwitchMessages(want))
-    }
-    function _killSwitchMessages(want) {
-        return {
-            ok: want
-                ? root.tr("status.kill-switch-enabled-on",
-                    "Kill-switch enabled. Choose how it blocks in the options below.")
-                : root.tr("status.kill-switch-enabled-off",
-                    "Kill-switch disabled. Nothing is blocked — while the additional adapter is down, traffic is allowed to leak (your choice)."),
-            uac: root.tr("status.kill-switch-uac-declined",
-                "Administrator approval was declined; leak protection was not changed."),
-            failPrefix: root.tr("status.kill-switch-enabled-failed",
-                "Could not update the kill-switch: ")
-        }
-    }
-    /// "Allow name resolution over the primary link while the block-all is
-    /// engaged". ON (default) adds a port-scoped UDP/TCP-53 permit so zones keep
-    /// resolving over the main link while everything else is blocked; OFF is the
-    /// strict opt-out where the block-all cuts DNS too (a total blackout in
-    /// which the FQDN cache can never fill).
+    /// "Allow name resolution over the main connection while blocked" (leak
+    /// protection = everything, additional connection down). ON (default) keeps
+    /// DNS working over the main link; OFF cuts it too, a total blackout in
+    /// which the FQDN cache can never fill.
     function applyAllowDnsOverPrimary(enabled) {
         var want = enabled === true
         _applyRoutePolicyKey("allow-dns-over-primary", want, {
             ok: want
                 ? root.tr("status.allow-dns-over-primary-on",
-                    "While blocked, name resolution now works over your main link, so zones keep resolving.")
+                    "While blocked, name resolution now works over your main connection.")
                 : root.tr("status.allow-dns-over-primary-off",
-                    "Strict: while blocked, DNS is blocked over the main link too."),
+                    "Strict: while blocked, DNS is blocked over the main connection too."),
             uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.allow-dns-over-primary-failed",

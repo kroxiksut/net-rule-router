@@ -1,7 +1,7 @@
 //! The Windows live enumeration behind [`InterfaceRowsPort`]: the stable
 //! identity snapshot (`crate::interface_manager::adapters_snapshot`) merged
-//! with per-adapter runtime IP/gateway/DNS data from the `ipconfig` crate. The
-//! row type and every judgement about a row are the neutral ones re-exported
+//! with per-adapter runtime IP/gateway/DNS data from the same `GetAdaptersAddresses`
+//! walker (`crate::win32_ffi::adapters`). The row type and every judgement about a row are the neutral ones re-exported
 //! below.
 
 pub use nrr_platform_api::interface_rows::*;
@@ -201,37 +201,49 @@ fn forwarding_capable_adapter_names() -> Option<std::collections::HashSet<String
 
 #[cfg(windows)]
 fn collect_windows_runtime_data() -> Result<Vec<WindowsRuntimeInterfaceData>, String> {
+    Ok(crate::win32_ffi::adapters::enumerate_adapter_details()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(runtime_data)
+        .collect())
+}
+
+#[cfg(windows)]
+fn runtime_data(
+    adapter: &crate::win32_ffi::adapters::AdapterDetails,
+) -> WindowsRuntimeInterfaceData {
     use nrr_platform_api::interface_rows::preferred_display_address;
+    use std::net::IpAddr;
 
-    let adapters = ipconfig::get_adapters().map_err(|error| error.to_string())?;
-    Ok(adapters
-        .into_iter()
-        .map(|adapter| {
-            let local_ip = preferred_display_address(adapter.ip_addresses())
-                .unwrap_or_else(|| "-".to_string());
-            let gateway =
-                preferred_display_address(adapter.gateways()).unwrap_or_else(|| "-".to_string());
+    // The pick ranks the addresses itself, so the family split costs nothing.
+    let unicast = adapter
+        .info
+        .ipv4_addresses
+        .iter()
+        .copied()
+        .map(IpAddr::V4)
+        .chain(adapter.info.ipv6_addresses.iter().copied().map(IpAddr::V6))
+        .collect::<Vec<_>>();
+    let local_ip = preferred_display_address(&unicast).unwrap_or_else(|| "-".to_string());
+    let gateway = preferred_display_address(&adapter.gateways).unwrap_or_else(|| "-".to_string());
+    let dns_servers = if adapter.dns_servers.is_empty() {
+        "-".to_string()
+    } else {
+        adapter
+            .dns_servers
+            .iter()
+            .map(IpAddr::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
 
-            let dns_values = adapter
-                .dns_servers()
-                .iter()
-                .map(|ip| ip.to_string())
-                .collect::<Vec<_>>();
-            let dns_servers = if dns_values.is_empty() {
-                "-".to_string()
-            } else {
-                dns_values.join(", ")
-            };
-
-            WindowsRuntimeInterfaceData {
-                adapter_name: adapter.adapter_name().trim().to_string(),
-                local_ip,
-                gateway: gateway.clone(),
-                dns_servers,
-                has_default_route: gateway != "-",
-            }
-        })
-        .collect::<Vec<_>>())
+    WindowsRuntimeInterfaceData {
+        adapter_name: adapter.info.adapter_name.trim().to_string(),
+        has_default_route: gateway != "-",
+        local_ip,
+        gateway,
+        dns_servers,
+    }
 }
 
 #[cfg(windows)]
@@ -251,5 +263,83 @@ mod tests {
     fn collected_rows_are_never_empty() {
         let (_source, rows) = WindowsInterfaceRows.collect_rows(false);
         assert!(!rows.is_empty());
+    }
+
+    #[cfg(windows)]
+    mod runtime_mapping {
+        use super::super::runtime_data;
+        use crate::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
+        use crate::win32_ffi::adapters::AdapterDetails;
+        use std::net::IpAddr;
+
+        fn ip(text: &str) -> IpAddr {
+            text.parse().expect("ip literal")
+        }
+
+        fn details(unicast: &[&str], gateways: &[&str], dns: &[&str]) -> AdapterDetails {
+            let unicast: Vec<IpAddr> = unicast.iter().map(|text| ip(text)).collect();
+            AdapterDetails {
+                info: AdapterInfo {
+                    index: 7,
+                    adapter_name: " {0000-AAAA} ".to_string(),
+                    description: String::new(),
+                    friendly_name: String::new(),
+                    mac: None,
+                    interface_type: InterfaceType::Ethernet,
+                    oper_status: IfOperStatus::Up,
+                    ipv4_addresses: unicast
+                        .iter()
+                        .filter_map(|ip| match ip {
+                            IpAddr::V4(v4) => Some(*v4),
+                            IpAddr::V6(_) => None,
+                        })
+                        .collect(),
+                    ipv6_addresses: unicast
+                        .iter()
+                        .filter_map(|ip| match ip {
+                            IpAddr::V6(v6) => Some(*v6),
+                            IpAddr::V4(_) => None,
+                        })
+                        .collect(),
+                    gateways: Vec::new(),
+                },
+                ipv6_if_index: 12,
+                physical_address: Vec::new(),
+                if_type: 6,
+                gateways: gateways.iter().map(|text| ip(text)).collect(),
+                dns_servers: dns.iter().map(|text| ip(text)).collect(),
+            }
+        }
+
+        #[test]
+        fn the_row_shows_the_routable_address_and_every_dns_server_in_order() {
+            let data = runtime_data(&details(
+                &["fe80::1", "169.254.3.4", "2001:db8::20", "192.168.1.20"],
+                &["fe80::fe", "192.168.1.1"],
+                &["2001:db8::53", "192.168.1.1"],
+            ));
+            assert_eq!(data.adapter_name, "{0000-AAAA}");
+            assert_eq!(data.local_ip, "192.168.1.20");
+            assert_eq!(data.gateway, "192.168.1.1");
+            assert_eq!(data.dns_servers, "2001:db8::53, 192.168.1.1");
+            assert!(data.has_default_route);
+        }
+
+        #[test]
+        fn an_ipv6_only_gateway_still_counts_as_a_default_route() {
+            let data = runtime_data(&details(&["2001:db8::20"], &["fe80::fe"], &[]));
+            assert_eq!(data.local_ip, "2001:db8::20");
+            assert_eq!(data.gateway, "fe80::fe");
+            assert!(data.has_default_route);
+        }
+
+        #[test]
+        fn an_adapter_without_addresses_reads_as_dashes() {
+            let data = runtime_data(&details(&[], &[], &[]));
+            assert_eq!(data.local_ip, "-");
+            assert_eq!(data.gateway, "-");
+            assert_eq!(data.dns_servers, "-");
+            assert!(!data.has_default_route);
+        }
     }
 }

@@ -1,5 +1,7 @@
 #include "native_bridge.h"
 #include <QSaveFile>
+#include <QDateTime>
+#include <QFileInfo>
 
 NrrNativeBridge::NrrNativeBridge(const QString &applicationDir,
                                  const QString &logsDirectory, QObject *parent)
@@ -84,10 +86,20 @@ bool NrrNativeBridge::savePreferences(const QString &serializedPayload) {
 }
 
 QVariantMap NrrNativeBridge::takePendingGuiRequest() {
-    QFile requestFile(guiActivationRequestPath_);
-    if (!requestFile.exists()) {
+    constexpr qint64 kMaxActivationBytes = 64 * 1024;
+    const QFileInfo requestInfo(guiActivationRequestPath_);
+    if (requestInfo.isSymLink()) {
+        QFile::remove(guiActivationRequestPath_);
         return {};
     }
+    if (!requestInfo.exists()) {
+        return {};
+    }
+    if (!requestInfo.isFile() || requestInfo.size() > kMaxActivationBytes) {
+        QFile::remove(guiActivationRequestPath_);
+        return {};
+    }
+    QFile requestFile(guiActivationRequestPath_);
     if (!requestFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         qWarning().noquote() << "Failed to open GUI activation request:"
                              << guiActivationRequestPath_ << requestFile.errorString();
@@ -96,15 +108,22 @@ QVariantMap NrrNativeBridge::takePendingGuiRequest() {
 
     QJsonParseError parseError;
     const QJsonDocument document =
-        QJsonDocument::fromJson(requestFile.readAll(), &parseError);
+        QJsonDocument::fromJson(requestFile.read(kMaxActivationBytes), &parseError);
     requestFile.close();
-    QFile::remove(guiActivationRequestPath_);
 
     if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        // A writer may still be mid-file: keep a fresh unreadable file for the
+        // next poll, drop one that has sat unreadable.
+        const qint64 ageMs =
+            QFileInfo(guiActivationRequestPath_).lastModified().msecsTo(QDateTime::currentDateTime());
+        if (ageMs > 5000) {
+            QFile::remove(guiActivationRequestPath_);
+        }
         qWarning().noquote() << "Failed to parse GUI activation request:"
                              << parseError.errorString();
         return {};
     }
+    QFile::remove(guiActivationRequestPath_);
 
     // Records that the request was read. Only a count: the file is writable by
     // any process of this user, and its text on a protocol stream could forge
@@ -200,11 +219,14 @@ void NrrNativeBridge::openContainingFolder(const QString &path) {
 }
 
 // SystemTrayIcon (Qt.labs.platform) takes its icon only as a URL, so a derived
-// icon has to exist as a file. It goes to the per-user runtime directory, and
-// through QSaveFile: a fresh exclusive temp file renamed over the name, so a
-// link planted at that name is replaced, never written through.
+// icon has to exist as a file. It goes to the per-user runtime directory. A
+// QSaveFile resolves a link and writes to its target, so a link at the name is
+// removed first (the link itself, not what it points at).
 static QString saveTrayIconPng(const QImage &image, const QString &fileName) {
     const QString outPath = QDir(appRuntimeDirectoryPath()).filePath(fileName);
+    if (QFileInfo(outPath).isSymLink()) {
+        QFile::remove(outPath);
+    }
     QSaveFile file(outPath);
     if (!file.open(QIODevice::WriteOnly) || !image.save(&file, "PNG") || !file.commit()) {
         qWarning().noquote() << "Failed to save tray icon to" << outPath;
@@ -343,9 +365,7 @@ bool NrrNativeBridge::ensureTrayRunning() {
 }
 
 bool NrrNativeBridge::consumeApplicationShutdownRequest() {
-    const QString path = applicationShutdownFlagPath();
-    if (QFile::exists(path)) {
-        QFile::remove(path);
+    if (consumeRuntimeMarker(applicationShutdownFlagPath())) {
         // Consuming the flag deletes it, so the tray-liveness watch would
         // no longer see it when the tray process finally goes away. Latch
         // the fact here instead of re-reading a file that is already gone.
@@ -363,13 +383,15 @@ bool NrrNativeBridge::requestTrayShutdown() {
     return true;
 }
 
-bool NrrNativeBridge::consumeTrayShutdownRequest() {
-    const QString path = trayShutdownFlagPath();
-    if (QFile::exists(path)) {
-        QFile::remove(path);
-        return true;
+bool NrrNativeBridge::isTrayProcessAlive() {
+    if (trayProcessId_ <= 0) {
+        return false;
     }
-    return false;
+    return probeProcessLiveness(trayProcessId_) != ProcessLiveness::Gone;
+}
+
+bool NrrNativeBridge::consumeTrayShutdownRequest() {
+    return consumeRuntimeMarker(trayShutdownFlagPath());
 }
 
 int NrrNativeBridge::clearGuiLogs() {

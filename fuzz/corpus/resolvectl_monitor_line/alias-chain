@@ -1,0 +1,1 @@
+{"state":"success","answer":[{"rr":{"key":{"class":1,"type":5,"name":"www.example.com"},"name":"edge.cdn.example"}},{"rr":{"key":{"class":1,"type":1,"name":"edge.cdn.example"},"address":[192,0,2,10]}}]}

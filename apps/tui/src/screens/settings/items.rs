@@ -3,6 +3,7 @@
 //! that the state does not hold; words stay keys until the view resolves them.
 
 use nrr_client_logic::notice_mutes::MUTABLE_NOTICE_KINDS;
+use nrr_client_logic::routing_settings::{self, RoutingContext};
 use nrr_client_logic::units::format_storage_bytes;
 use nrr_client_logic::{route_policy, stability};
 use nrr_platform_api::service_control::{ServiceRunState, ServiceStartMode};
@@ -11,7 +12,7 @@ use nrr_shared::ipc_payloads::{BlockNoticeMuteDto, BlockNoticeMuteScopeDto, Traf
 use serde_json::{Map, Value};
 
 use super::text as t;
-use super::{failure_text, Category, Failure, Loadable, MuteScope, ServiceInfo};
+use super::{failure_text, Category, Failure, Loadable, MuteScope, RollbackOffer, ServiceInfo};
 use crate::i18n::{Key, Texts};
 use crate::link::admin_command;
 use crate::state::AppState;
@@ -165,6 +166,8 @@ pub enum ItemId {
     Stability(&'static str),
     RuleLock,
     StopPersist,
+    /// Applying the rules at all (the GUI's "Apply rules").
+    RulesPause,
     /// A one-shot log-window request (`verbose-logging-change`, …).
     LogWindow(&'static str),
     FailurePolicy,
@@ -173,10 +176,15 @@ pub enum ItemId {
     ServiceRestart,
     ExportPath,
     ExportRun,
+    SafeDisableReason,
+    SafeDisableRun,
+    RollbackLookup,
+    RollbackRun,
     LogRetention(LogField),
     ClearLogs,
     Revisions(RevisionField),
     PinLkg,
+    RevisionsReset,
     Traffic(TrafficField),
     TrafficRetention,
     TrafficReset,
@@ -185,6 +193,8 @@ pub enum ItemId {
     HistoryRetention,
     HistoryClear,
     Pref(PrefField),
+    Reset(super::reset::ResetRow),
+    Provider(super::providers::ProviderRow),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -636,6 +646,38 @@ pub const PROTOCOLS: [(i32, Key); 6] = [
     (32, t::PROTOCOL_ESP),
 ];
 
+/// The leak-protection level as the policy's default route offers it.
+pub fn leak_protection(policy: &Map<String, Value>) -> &'static str {
+    route_policy::coerce_leak_protection(
+        &policy_text(policy, "mode"),
+        &policy_text(policy, route_policy::LEAK_PROTECTION_KEY),
+    )
+}
+
+/// The levels `mode` offers, as choice options.
+pub fn leak_protection_options(mode: &str) -> Vec<Opt> {
+    route_policy::leak_protection_choices(mode)
+        .into_iter()
+        .map(|level| opt(level, leak_protection_label(level)))
+        .collect()
+}
+
+pub fn leak_protection_label(level: &str) -> Key {
+    match level {
+        "sites" => t::LEAK_SITES,
+        "everything" => t::LEAK_EVERYTHING,
+        _ => t::LEAK_OFF,
+    }
+}
+
+fn leak_protection_note(level: &str) -> Key {
+    match level {
+        "sites" => t::LEAK_SITES_NOTE,
+        "everything" => t::LEAK_EVERYTHING_NOTE,
+        _ => t::LEAK_OFF_NOTE,
+    }
+}
+
 pub fn policy_bool(policy: &Map<String, Value>, key: &str) -> bool {
     route_policy::effective(policy, key) == Some(Value::Bool(true))
 }
@@ -673,6 +715,30 @@ fn stability_toggle(config: &Map<String, Value>, key: &'static str, label: Key) 
     toggle(ItemId::Stability(key), label, stability_bool(config, key))
 }
 
+/// The GUI's "Safe rollback": ask what would be restored, and only then offer it.
+fn rollback_rows(app: &AppState) -> Vec<Item> {
+    let mut rows = vec![
+        heading(t::ROLLBACK_TITLE),
+        action(ItemId::RollbackLookup, t::ROLLBACK_LOOKUP, false),
+    ];
+    match &app.settings.rollback {
+        RollbackOffer::Unasked => {}
+        RollbackOffer::Nothing => rows.push(info(Words::Key(t::ROLLBACK_NONE))),
+        RollbackOffer::Ready { target, .. } => {
+            let at = target.activated_at.unwrap_or(0).saturating_mul(1000);
+            rows.push(info(Words::Fill(
+                t::ROLLBACK_READY,
+                vec![
+                    ("time", app.settings.clock.format(at)),
+                    ("count", target.rule_count.to_string()),
+                ],
+            )));
+            rows.push(action(ItemId::RollbackRun, t::ROLLBACK_RUN, true));
+        }
+    }
+    rows
+}
+
 fn routing(app: &AppState) -> Vec<Item> {
     let s = &app.settings;
     let policy = match &s.data.policy {
@@ -683,7 +749,15 @@ fn routing(app: &AppState) -> Vec<Item> {
         Loadable::Ready(config) => Ok(config),
         other => Err(other),
     };
+    let paused = app.routing_state() == crate::state::RoutingState::Paused;
     let mut v = vec![
+        heading(t::RULES_PAUSE_TITLE),
+        toggle(ItemId::RulesPause, t::RULES_PAUSE_TITLE, !paused),
+        info(Words::Key(t::RULES_PAUSE_HINT)),
+    ];
+    v.extend(rollback_rows(app));
+    let mode = policy_text(policy, "mode");
+    v.extend([
         heading(t::DEFAULT_ROUTE),
         choice(
             ItemId::Policy("mode"),
@@ -691,141 +765,30 @@ fn routing(app: &AppState) -> Vec<Item> {
             vec![
                 opt("prefer-primary", t::MODE_PREFER_PRIMARY),
                 opt("prefer-secondary-when-available", t::MODE_PREFER_SECONDARY),
-                opt("strict-secondary-fail-closed", t::MODE_STRICT_SECONDARY),
             ],
-            &policy_text(policy, "mode"),
+            &mode,
         )
         .note(t::DEFAULT_ROUTE_NOTE),
         policy_toggle(policy, "include-subdomains", t::SUBDOMAINS).note(t::SUBDOMAINS_NOTE),
         policy_toggle(policy, "app-rules-take-all-addresses", t::APP_TAKEOVER)
             .note(t::APP_TAKEOVER_NOTE),
         heading(t::LEAK_TITLE),
-    ];
-    if !s.supports.kill_switch {
-        v.push(info(Words::Key(t::UNSUPPORTED)));
-    } else {
+    ]);
+    let level = leak_protection(policy);
+    if s.supports.kill_switch {
         v.push(
-            policy_toggle(policy, "kill-switch-enabled", t::LEAK_ENABLE).note(t::LEAK_ENABLE_NOTE),
+            choice(
+                ItemId::Policy(route_policy::LEAK_PROTECTION_KEY),
+                t::LEAK_TITLE,
+                leak_protection_options(&mode),
+                level,
+            )
+            .note(leak_protection_note(level)),
         );
-        let enabled = policy_bool(policy, "kill-switch-enabled");
-        let fail_closed = policy_bool(policy, "kill-switch-fail-closed");
-        if enabled {
-            v.push(
-                choice(
-                    ItemId::Policy("kill-switch-fail-closed"),
-                    t::FAILURE_MODE,
-                    vec![
-                        opt("fail-closed", t::FAIL_CLOSED),
-                        opt("fail-open", t::FAIL_OPEN),
-                    ],
-                    if fail_closed {
-                        "fail-closed"
-                    } else {
-                        "fail-open"
-                    },
-                )
-                .note(if fail_closed {
-                    t::FAIL_CLOSED_NOTE
-                } else {
-                    t::FAIL_OPEN_NOTE
-                }),
-            );
-            if fail_closed {
-                v.push(heading(t::PROTOCOLS));
-                let mask = policy_int(policy, route_policy::KILL_SWITCH_PROTOCOLS_KEY).unwrap_or(0);
-                for (bit, label) in PROTOCOLS {
-                    v.push(toggle(
-                        ItemId::Protocol(bit),
-                        label,
-                        mask & i64::from(bit) != 0,
-                    ));
-                }
-                v.push(
-                    policy_toggle(policy, "kill-switch-block-all", t::BLOCK_ALL)
-                        .note(t::BLOCK_ALL_NOTE),
-                );
-                if policy_bool(policy, "kill-switch-block-all") {
-                    v.push(
-                        policy_toggle(policy, "allow-dns-over-primary", t::ALLOW_DNS)
-                            .note(t::ALLOW_DNS_NOTE),
-                    );
-                }
-                v.push(
-                    policy_toggle(policy, "kill-switch-strict-shared-ips", t::SHARED_STRICT)
-                        .note(t::SHARED_STRICT_NOTE),
-                );
-            }
-            v.push(
-                choice(
-                    ItemId::Policy("shared-ip-policy"),
-                    t::SHARED_IP,
-                    vec![
-                        opt("majority-of-ip", t::SHARED_MAJORITY_IP),
-                        opt("majority-of-rules", t::SHARED_MAJORITY_RULES),
-                        opt("any-rule-domain", t::SHARED_ANY),
-                    ],
-                    &policy_text(policy, "shared-ip-policy"),
-                )
-                .note(t::SHARED_IP_NOTE),
-            );
-            if s.supports.service_stability_config {
-                match stability_row {
-                    Ok(config) => {
-                        let resolver = stability_text(config, "enforcement-mode") == "resolver";
-                        if resolver {
-                            v.push(
-                                stability_toggle(config, "dns-via-secondary", t::DNS_VIA_SECONDARY)
-                                    .note(t::DNS_VIA_SECONDARY_NOTE),
-                            );
-                        }
-                        v.push(stability_toggle(config, "dns-fast-answers", t::DNS_FAST));
-                        if s.supports.fake_ip {
-                            if resolver {
-                                v.push(stability_toggle(config, "fake-ip-enabled", t::FAKE_IP));
-                            }
-                            v.push(stability_toggle(
-                                config,
-                                "fake-ip-udp-relay",
-                                t::FAKE_IP_UDP,
-                            ));
-                            v.push(stability_toggle(
-                                config,
-                                "fake-ip-instant-rst",
-                                t::FAKE_IP_RST,
-                            ));
-                        } else if resolver {
-                            // Named and explained, as the GUI does, rather than offered.
-                            v.push(info(Words::Join(vec![
-                                Words::Key(t::FAKE_IP),
-                                raw(": "),
-                                Words::Key(t::UNSUPPORTED),
-                            ])));
-                        }
-                        if fail_closed {
-                            let key = "secondary-liveness-window-secs";
-                            let secs = stability::effective(config, key).and_then(|v| v.as_i64());
-                            let mut item = number(
-                                ItemId::Stability(key),
-                                Words::Key(t::LIVENESS),
-                                secs,
-                                0,
-                                3600,
-                            )
-                            .note(t::LIVENESS_RANGE);
-                            item.shown = Some(match secs {
-                                Some(0) | None => Words::Key(t::LIVENESS_DISABLED),
-                                Some(n) => {
-                                    Words::Join(vec![raw(format!("{n} ")), Words::Key(t::SECONDS)])
-                                }
-                            });
-                            v.push(item);
-                        }
-                    }
-                    Err(other) => v.push(pending(app, other)),
-                }
-            }
-        }
+    } else {
+        v.push(info(Words::Key(t::UNSUPPORTED)));
     }
+    v.extend(routing_refinements(app, policy, stability_row, level));
 
     v.push(heading(t::DOH_TITLE));
     v.push(policy_toggle(policy, "doh-lockdown-auto", t::DOH_AUTO).note(t::DOH_AUTO_NOTE));
@@ -859,7 +822,8 @@ fn routing(app: &AppState) -> Vec<Item> {
         "resolve-hosts-bypass",
         t::HOSTS_BYPASS,
     ));
-    if s.supports.local_network_exceptions {
+    let offered = offered_routing_settings(app, stability_row.ok(), level);
+    if offered.contains(&routing_settings::LOCAL_NETWORKS) {
         v.push(heading(t::LOCAL_TITLE));
         v.push(policy_toggle(
             policy,
@@ -887,6 +851,12 @@ fn routing(app: &AppState) -> Vec<Item> {
             row
         });
     }
+    v.extend(provider_rows(policy, &s.providers));
+    v.extend(gateway_rows(app));
+    v.push(
+        policy_toggle(policy, "external-address-auto-check", t::EXTERNAL_CHECK)
+            .note(t::EXTERNAL_CHECK_NOTE),
+    );
     v.push(heading(t::SHORT_TITLE));
     v.push(
         toggle(
@@ -955,6 +925,162 @@ fn routing(app: &AppState) -> Vec<Item> {
         }
     }
     v
+}
+
+/// Whether an additional connection is bound, as the snapshot names it.
+fn secondary_bound(app: &AppState) -> bool {
+    app.snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.route_policy.as_ref())
+        .is_some_and(|policy| policy.secondary.is_some())
+}
+
+/// The routing settings the window offers for these readings, in its order.
+pub fn offered_routing_settings(
+    app: &AppState,
+    stability_row: Option<&Map<String, Value>>,
+    level: &str,
+) -> Vec<&'static str> {
+    let supports = app.settings.supports_map();
+    let mode = stability_row.map(|c| stability_text(c, "enforcement-mode"));
+    routing_settings::offered(&RoutingContext {
+        supports: Some(&supports),
+        enforcement_mode: mode.as_deref().unwrap_or(""),
+        leak_protection: level,
+        secondary_bound: secondary_bound(app),
+        fake_ip_enabled: stability_row.is_some_and(|c| stability_bool(c, "fake-ip-enabled")),
+    })
+}
+
+/// The leak-protection refinements under the level, then the routing ones,
+/// exactly the rows `routing_settings::offered` names.
+fn routing_refinements(
+    app: &AppState,
+    policy: &Map<String, Value>,
+    stability_row: Result<&Map<String, Value>, &Loadable<Map<String, Value>>>,
+    level: &str,
+) -> Vec<Item> {
+    let config = stability_row.ok();
+    let mut v = Vec::new();
+    let mut titled = false;
+    let mut waiting = false;
+    for row in offered_routing_settings(app, config, level) {
+        // Listed further down, with the networks themselves.
+        if row == routing_settings::LOCAL_NETWORKS {
+            continue;
+        }
+        let leak_row = matches!(
+            row,
+            route_policy::KILL_SWITCH_PROTOCOLS_KEY | routing_settings::ALLOW_DNS_OVER_PRIMARY
+        );
+        if !leak_row && !titled {
+            titled = true;
+            v.push(heading(t::ROUTING_METHOD));
+        }
+        let item = match row {
+            route_policy::KILL_SWITCH_PROTOCOLS_KEY => {
+                v.push(heading(t::PROTOCOLS));
+                let mask = policy_int(policy, row).unwrap_or(0);
+                v.extend(PROTOCOLS.into_iter().map(|(bit, label)| {
+                    toggle(ItemId::Protocol(bit), label, mask & i64::from(bit) != 0)
+                }));
+                continue;
+            }
+            routing_settings::ALLOW_DNS_OVER_PRIMARY => {
+                policy_toggle(policy, row, t::ALLOW_DNS).note(t::ALLOW_DNS_NOTE)
+            }
+            routing_settings::SHARED_IP_POLICY => choice(
+                ItemId::Policy(row),
+                t::SHARED_IP,
+                vec![
+                    opt("majority-of-ip", t::SHARED_MAJORITY_IP),
+                    opt("majority-of-rules", t::SHARED_MAJORITY_RULES),
+                    opt("any-rule-domain", t::SHARED_ANY),
+                ],
+                &policy_text(policy, row),
+            )
+            .note(t::SHARED_IP_NOTE),
+            routing_settings::STRICT_SHARED_IPS => {
+                policy_toggle(policy, row, t::SHARED_STRICT).note(t::SHARED_STRICT_NOTE)
+            }
+            routing_settings::STABILITY_UNAVAILABLE => info(Words::Key(t::UNSUPPORTED)),
+            _ => {
+                // Every other row is a field of the stability row.
+                let Some(config) = config else {
+                    if !waiting {
+                        waiting = true;
+                        if let Err(other) = stability_row {
+                            v.push(pending(app, other));
+                        }
+                    }
+                    continue;
+                };
+                match stability_item(config, row) {
+                    Some(item) => item,
+                    None => continue,
+                }
+            }
+        };
+        v.push(item);
+    }
+    v
+}
+
+fn stability_item(config: &Map<String, Value>, row: &'static str) -> Option<Item> {
+    Some(match row {
+        routing_settings::ENFORCEMENT_MODE => {
+            let mode = stability_text(config, row);
+            // The legacy mode is a GUI opt-in; held, it is named, not offered.
+            let item = choice(
+                ItemId::Stability(row),
+                t::ENFORCEMENT,
+                vec![opt("resolver", t::ENFORCEMENT_RESOLVER)],
+                &mode,
+            )
+            .note(t::ENFORCEMENT_NOTE);
+            if mode == "reactive" {
+                item.shown(Words::Key(t::ENFORCEMENT_REACTIVE))
+            } else {
+                item
+            }
+        }
+        routing_settings::DNS_VIA_SECONDARY => {
+            stability_toggle(config, row, t::DNS_VIA_SECONDARY).note(t::DNS_VIA_SECONDARY_NOTE)
+        }
+        routing_settings::DNS_FAST_ANSWERS => {
+            stability_toggle(config, row, t::DNS_FAST).note(t::DNS_FAST_NOTE)
+        }
+        routing_settings::FAKE_IP_ENABLED => stability_toggle(config, row, t::FAKE_IP),
+        // Named and explained, as the GUI does, rather than offered.
+        routing_settings::FAKE_IP_UNAVAILABLE => info(Words::Join(vec![
+            Words::Key(t::FAKE_IP),
+            raw(": "),
+            Words::Key(t::UNSUPPORTED),
+        ])),
+        routing_settings::FAKE_IP_UDP_RELAY => stability_toggle(config, row, t::FAKE_IP_UDP),
+        routing_settings::FAKE_IP_INSTANT_RST => stability_toggle(config, row, t::FAKE_IP_RST),
+        routing_settings::LIVENESS_WINDOW => {
+            let secs = stability::effective(config, row).and_then(|v| v.as_i64());
+            let mut item = number(
+                ItemId::Stability(row),
+                Words::Key(t::LIVENESS),
+                secs,
+                0,
+                3600,
+            );
+            item.note = Some(Words::Join(vec![
+                Words::Key(t::LIVENESS_NOTE),
+                raw(" "),
+                Words::Key(t::LIVENESS_RANGE),
+            ]));
+            item.shown = Some(match secs {
+                Some(0) | None => Words::Key(t::LIVENESS_DISABLED),
+                Some(n) => Words::Join(vec![raw(format!("{n} ")), Words::Key(t::SECONDS)]),
+            });
+            item
+        }
+        _ => return None,
+    })
 }
 
 /// The main-route check limits: key, label and the GUI's bounds.
@@ -1053,6 +1179,36 @@ fn service(app: &AppState) -> Vec<Item> {
                 }
                 _ => {}
             }
+            v.push(info(Words::Fill(
+                t::SERVICE_FIX_UNINSTALL,
+                vec![("command", admin_command("uninstall"))],
+            )));
+            v.push(info(Words::Fill(
+                t::SERVICE_FIX_REINSTALL,
+                vec![("command", admin_command("reinstall"))],
+            )));
+            if let Some(mode) = report.start_mode {
+                let other = match mode {
+                    ServiceStartMode::WithWindows => "--start-mode=on-demand",
+                    ServiceStartMode::OnAppLaunch => "--start-mode=auto",
+                };
+                v.push(info(Words::Fill(
+                    t::SERVICE_FIX_MODE,
+                    vec![
+                        ("uninstall", admin_command("uninstall")),
+                        ("install", admin_command(&format!("install {other}"))),
+                    ],
+                )));
+            }
+            if report.run_state == ServiceRunState::Running {
+                v.push(info(Words::Key(t::SAFE_DISABLE_NOTE)));
+                v.push(Item::new(
+                    ItemId::SafeDisableReason,
+                    Words::Key(t::SAFE_DISABLE_REASON),
+                    Kind::Text(app.settings.safe_disable_reason.clone()),
+                ));
+                v.push(action(ItemId::SafeDisableRun, t::SAFE_DISABLE_RUN, true));
+            }
             // The GUI's "restore network": a live service would put the state
             // straight back, so it is stopped first, and ended if it hangs.
             let (hint, verb) = if report.run_state == ServiceRunState::Stopped {
@@ -1080,7 +1236,7 @@ fn service(app: &AppState) -> Vec<Item> {
 // ── Presets and settings ─────────────────────────────────────────────────────
 
 fn presets(app: &AppState) -> Vec<Item> {
-    vec![
+    let mut v = vec![
         info(Words::Key(t::EXPORT_DESCRIPTION)),
         Item::new(
             ItemId::ExportPath,
@@ -1089,7 +1245,126 @@ fn presets(app: &AppState) -> Vec<Item> {
         ),
         action(ItemId::ExportRun, t::EXPORT_RUN, false),
         info(Words::Key(t::RULES_NOTE)),
-    ]
+    ];
+    v.extend(reset_rows(app));
+    v
+}
+
+/// The programs kept working over the main link, the scan's finds each
+/// ticked when confirmed, and the form to add one by path.
+fn provider_rows(
+    policy: &Map<String, Value>,
+    state: &super::providers::ProvidersState,
+) -> Vec<Item> {
+    use super::providers as p;
+    let typed = state.new.as_str();
+    let apps = p::apps_of(policy);
+    let mut v = vec![heading(p::TITLE), info(Words::Key(p::NOTE))];
+    if apps.is_empty() {
+        v.push(info(Words::Key(p::EMPTY)));
+    }
+    for (index, app) in apps.iter().enumerate() {
+        v.push(Item::new(
+            ItemId::Provider(p::ProviderRow::Remove(index)),
+            Words::Fill(
+                p::REMOVE,
+                vec![
+                    ("name", p::name_of(app)),
+                    ("path", display_text(&app.exe_path).into_owned()),
+                ],
+            ),
+            Kind::Action { confirm: true },
+        ));
+    }
+    v.push(action(
+        ItemId::Provider(p::ProviderRow::Scan),
+        match (state.scanning, state.found.is_some()) {
+            (true, _) => p::SCANNING,
+            (false, true) => p::SCAN_AGAIN,
+            (false, false) => p::SCAN,
+        },
+        false,
+    ));
+    if let Some(found) = &state.found {
+        if found.is_empty() {
+            v.push(info(Words::Key(p::FOUND_NONE)));
+        } else {
+            v.push(info(Words::Key(p::FOUND_HINT)));
+        }
+        for (index, row) in found.iter().enumerate() {
+            v.push(
+                if nrr_client_logic::vpn_client_trust::picker_tickable(row) {
+                    Item::new(
+                        ItemId::Provider(p::ProviderRow::Found(index)),
+                        p::found_label(row),
+                        Kind::Toggle(p::is_confirmed(policy, row)),
+                    )
+                } else {
+                    info(p::found_label(row))
+                },
+            );
+        }
+    }
+    v.push(Item::new(
+        ItemId::Provider(p::ProviderRow::New),
+        Words::Key(p::NEW),
+        Kind::Text(typed.to_owned()),
+    ));
+    v.push(action(ItemId::Provider(p::ProviderRow::Add), t::ADD, false));
+    v
+}
+
+/// The other VPNs' servers the user let through, each with its remove row.
+/// Added only by answering the question, so nothing shows until one is.
+fn gateway_rows(app: &AppState) -> Vec<Item> {
+    use super::providers as p;
+    let confirmed = &app.vpn_gateway_trust.confirmed;
+    if confirmed.is_empty() {
+        return Vec::new();
+    }
+    let mut v = vec![
+        heading(p::GATEWAYS_TITLE),
+        info(Words::Key(p::GATEWAYS_NOTE)),
+    ];
+    for (index, gateway) in confirmed.iter().enumerate() {
+        v.push(Item::new(
+            ItemId::Provider(p::ProviderRow::RemoveGateway(index)),
+            Words::Join(vec![
+                Words::Fill(
+                    p::GATEWAY_REMOVE,
+                    vec![("address", display_text(&gateway.address).into_owned())],
+                ),
+                raw(" ("),
+                p::gateway_program(gateway),
+                raw(")"),
+            ]),
+            Kind::Action { confirm: true },
+        ));
+    }
+    v
+}
+
+/// The full reset, with the choice of whose data when others have rules too.
+fn reset_rows(app: &AppState) -> Vec<Item> {
+    use super::reset as r;
+    let state = &app.settings.reset;
+    let mut v = vec![heading(r::TITLE), info(Words::Key(r::BODY))];
+    if let Loadable::Ready(count) = &state.others {
+        if *count > 0 {
+            v.push(info(Words::Fill(
+                r::OTHERS,
+                vec![("count", count.to_string())],
+            )));
+            v.push(choice(
+                ItemId::Reset(r::ResetRow::Scope),
+                r::SCOPE,
+                vec![opt("mine", r::MINE), opt("everyone", r::EVERYONE)],
+                if state.everyone { "everyone" } else { "mine" },
+            ));
+        }
+    }
+    v.push(action(ItemId::Reset(r::ResetRow::Run), r::RUN, true));
+    v
 }
 
 // ── Logs and storage ─────────────────────────────────────────────────────────
@@ -1278,10 +1553,11 @@ fn logs(app: &AppState) -> Vec<Item> {
     v.push(info(Words::Key(t::REVISIONS_NOTE)));
     match &s.data.retention {
         Loadable::Ready(r) => {
-            for (field, label, value, min, max) in [
+            for (field, label, note, value, min, max) in [
                 (
                     RevisionField::SupersededDays,
                     t::SUPERSEDED_DAYS,
+                    t::SUPERSEDED_DAYS_NOTE,
                     r.superseded_days,
                     7,
                     365,
@@ -1289,6 +1565,7 @@ fn logs(app: &AppState) -> Vec<Item> {
                 (
                     RevisionField::SupersededCount,
                     t::SUPERSEDED_COUNT,
+                    t::SUPERSEDED_COUNT_NOTE,
                     r.superseded_count_cap,
                     20,
                     1000,
@@ -1296,6 +1573,7 @@ fn logs(app: &AppState) -> Vec<Item> {
                 (
                     RevisionField::RejectedDays,
                     t::REJECTED_DAYS,
+                    t::REJECTED_DAYS_NOTE,
                     r.rejected_days,
                     1,
                     90,
@@ -1303,6 +1581,7 @@ fn logs(app: &AppState) -> Vec<Item> {
                 (
                     RevisionField::RolledbackDays,
                     t::ROLLEDBACK_DAYS,
+                    t::ROLLEDBACK_DAYS_NOTE,
                     r.rolledback_days,
                     1,
                     90,
@@ -1310,20 +1589,34 @@ fn logs(app: &AppState) -> Vec<Item> {
                 (
                     RevisionField::RolledbackCount,
                     t::ROLLEDBACK_COUNT,
+                    t::ROLLEDBACK_COUNT_NOTE,
                     r.rolledback_count_cap,
                     5,
                     100,
                 ),
             ] {
-                v.push(number(
-                    ItemId::Revisions(field),
-                    Words::Key(label),
-                    Some(i64::from(value)),
-                    min,
-                    max,
-                ));
+                v.push(
+                    number(
+                        ItemId::Revisions(field),
+                        Words::Key(label),
+                        Some(i64::from(value)),
+                        min,
+                        max,
+                    )
+                    .note(note),
+                );
             }
             v.push(toggle(ItemId::PinLkg, t::PIN_LKG, r.pin_lkg).note(t::PIN_LKG_NOTE));
+            v.push(action(ItemId::RevisionsReset, t::REVISIONS_RESET, false));
+            v.push(info(
+                match r.last_cleanup_at.and_then(|at| i64::try_from(at).ok()) {
+                    Some(secs) => Words::Fill(
+                        t::LAST_CLEANUP,
+                        vec![("timestamp", s.clock.format(secs.saturating_mul(1000)))],
+                    ),
+                    None => Words::Key(t::LAST_CLEANUP_NEVER),
+                },
+            ));
         }
         other => v.push(pending(app, other)),
     }

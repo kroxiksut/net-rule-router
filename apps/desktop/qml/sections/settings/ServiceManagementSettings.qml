@@ -438,6 +438,25 @@ GroupBox {
             }
         }
 
+        // "Restore network" from the tray or the banner lands here with the
+        // confirmation open, so the user does not click the button again.
+        property int _focusSerialHandled: 0
+        function _takeRecoveryRequest() {
+            var request = group.root ? (group.root.settingsFocusRequest || {}) : {}
+            var serial = Number(request.serial || 0)
+            if (serial === 0 || serial === _focusSerialHandled) return
+            _focusSerialHandled = serial
+            if (String(request.id || "") !== "restore-network") return
+            if (!group._serviceAvailable() || !group.root.supports("killSwitch")
+                    || group._busy()) return
+            recoveryConfirm.open()
+        }
+        Component.onCompleted: Qt.callLater(_takeRecoveryRequest)
+        Connections {
+            target: group.root
+            function onSettingsFocusRequestChanged() { group._takeRecoveryRequest() }
+        }
+
         NetworkRecoveryConfirmDialog {
             id: recoveryConfirm
             ownerRoot: root

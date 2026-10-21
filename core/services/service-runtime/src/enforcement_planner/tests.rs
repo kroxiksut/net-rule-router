@@ -127,19 +127,14 @@ fn a_declined_shared_address_is_kept_off_the_tunnel() {
             secondary_ip_denylist: denylist,
             packet_blocks: true,
         };
-        plan_route_rules(
-            &rule_book,
-            "S-1-5-21-DENY",
-            RouteBehaviorMode::PreferPrimary,
-            &input,
-        )
-        .0
-        .into_iter()
-        .filter_map(|f| match (f.precedence.class, f.flow.dst) {
-            (PrecedenceClass::RouteRule(role), DstMatch::HostV4(ip)) => Some((role, ip)),
-            _ => None,
-        })
-        .collect()
+        plan_route_rules(&rule_book, "S-1-5-21-DENY", &input)
+            .0
+            .into_iter()
+            .filter_map(|f| match (f.precedence.class, f.flow.dst) {
+                (PrecedenceClass::RouteRule(role), DstMatch::HostV4(ip)) => Some((role, ip)),
+                _ => None,
+            })
+            .collect()
     };
 
     let with_policy = planned(&declined);
@@ -189,7 +184,6 @@ fn a_unix_principal_scopes_the_flows_it_plans() {
     let flows = plan_route_rules(
         &rb,
         "unix:uid:1000",
-        RouteBehaviorMode::PreferPrimary,
         &planner_input(&cache, &resolver, &obs),
     )
     .0;
@@ -221,7 +215,6 @@ fn the_baseline_plans_without_a_principal() {
     let flows = plan_route_rules(
         &rb,
         nrr_domain::user_principal::BASELINE_PRINCIPAL,
-        RouteBehaviorMode::PreferPrimary,
         &planner_input(&cache, &resolver, &obs),
     )
     .0;
@@ -242,7 +235,6 @@ fn plans_exact_ip_permits_primary_then_secondary_with_slot_ordinals() {
     let flows = plan_route_rules(
         &rb,
         "S-1-5-21-A",
-        RouteBehaviorMode::PreferPrimary,
         &planner_input(
             &MapCache::default(),
             &MapResolver::default(),
@@ -291,7 +283,6 @@ fn plans_fqdn_fanout_and_block() {
     let flows = plan_route_rules(
         &rb,
         "S-1-5-21-A",
-        RouteBehaviorMode::PreferPrimary,
         &planner_input(&cache, &MapResolver::default(), &MapObs::default()),
     )
     .0;
@@ -325,7 +316,6 @@ fn the_same_addresses_in_another_recency_order_plan_the_same() {
         plan_route_rules(
             &rb,
             "S-1-5-21-A",
-            RouteBehaviorMode::PreferPrimary,
             &planner_input(&cache, &MapResolver::default(), &MapObs::default()),
         )
         .0
@@ -357,19 +347,14 @@ fn an_ipv6_exact_address_rule_is_planned_only_when_a_link_carries_ipv6() {
     let obs = MapObs::default();
 
     let off = planner_input(&cache, &resolver, &obs);
-    let (flows, _) = plan_route_rules(&rb, "S-1-5-21-A", RouteBehaviorMode::PreferPrimary, &off);
+    let (flows, _) = plan_route_rules(&rb, "S-1-5-21-A", &off);
     assert!(flows.is_empty(), "{flows:?}");
 
     let carried = PlannerInput {
         ipv6: Ipv6Guard::FiltersAndRoutes,
         ..planner_input(&cache, &resolver, &obs)
     };
-    let (flows, _) = plan_route_rules(
-        &rb,
-        "S-1-5-21-A",
-        RouteBehaviorMode::PreferPrimary,
-        &carried,
-    );
+    let (flows, _) = plan_route_rules(&rb, "S-1-5-21-A", &carried);
     assert!(
         flows.iter().any(|f| f.flow.dst == DstMatch::HostV6(v6)),
         "{flows:?}"
@@ -393,7 +378,6 @@ fn skips_disabled_and_unresolved_rules() {
     assert!(plan_route_rules(
         &rb,
         "S-1-5-21-A",
-        RouteBehaviorMode::PreferPrimary,
         &planner_input(
             &MapCache::default(),
             &MapResolver::default(),
@@ -476,7 +460,6 @@ fn slices123_neutral_pipeline_matches_current_codegen() {
     let current = generate_filters(CodegenInput {
         sid,
         rule_book: &rb,
-        behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &obs,
         app_resolver: &resolver,
@@ -490,13 +473,7 @@ fn slices123_neutral_pipeline_matches_current_codegen() {
     let plan = EnforcementPlan {
         principal: nrr_platform_api::enforcement::UserPrincipal::from_windows_sid(sid)
             .expect("valid sid"),
-        flows: plan_route_rules(
-            &rb,
-            sid,
-            nrr_domain::RouteBehaviorMode::PreferPrimary,
-            &planner_input(&cache, &resolver, &obs),
-        )
-        .0,
+        flows: plan_route_rules(&rb, sid, &planner_input(&cache, &resolver, &obs)).0,
         routes: Vec::new(),
         policy_rules: Vec::new(),
     };
@@ -513,6 +490,72 @@ fn slices123_neutral_pipeline_matches_current_codegen() {
         arbitration_order_preserved(&current.filters, &lowered),
         "neutral pipeline must preserve the arbitration order"
     );
+}
+
+// A rule that names no program can still carry more than sixteen addresses; they
+// are the rule's own, and pack exactly as the codegen packs them.
+#[cfg(windows)]
+#[test]
+fn a_suffix_rule_with_many_addresses_packs_like_the_codegen() {
+    use crate::wfp_codegen::{generate_filters, CodegenInput};
+    use nrr_platform_api::enforcement::EnforcementPlan;
+    use nrr_platform_api::wfp_behavioral::{arbitration_order_preserved, behaviorally_equivalent};
+
+    let mut cache = MapCache::default();
+    let names: Vec<String> = (0..20).map(|i| format!("h{i}.big.example")).collect();
+    for (i, name) in names.iter().enumerate() {
+        cache
+            .hosts
+            .insert(name.clone(), vec![v4(198, 51, 100, i as u8 + 1)]);
+    }
+    cache.suffixes.insert("big.example".into(), names);
+    let resolver = MapResolver::default();
+    let obs = MapObs::default();
+
+    let sid = "S-1-5-21-1-2-3-1001";
+    let rb = book(
+        Vec::new(),
+        vec![rule(
+            "s-suffix",
+            CanonicalAddressMatch::SuffixDomain("big.example".into()),
+            RuleAction::Route,
+        )],
+    );
+    let denylist = std::collections::HashSet::new();
+    let current = generate_filters(CodegenInput {
+        sid,
+        rule_book: &rb,
+        fqdn_cache: &cache,
+        app_observations: &obs,
+        app_resolver: &resolver,
+        secondary_ip_denylist: &denylist,
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
+    });
+    let flows = plan_route_rules(&rb, sid, &planner_input(&cache, &resolver, &obs)).0;
+    assert!(
+        flows.len() > APP_PATH_FANOUT_CAP as usize + 1,
+        "sanity: the rule runs past the program slots"
+    );
+    assert!(
+        flows.iter().all(|f| !f.observed_by_program),
+        "no program observed any of them"
+    );
+    let plan = EnforcementPlan {
+        principal: nrr_platform_api::enforcement::UserPrincipal::from_windows_sid(sid)
+            .expect("valid sid"),
+        flows,
+        routes: Vec::new(),
+        policy_rules: Vec::new(),
+    };
+    let lowered = nrr_platform_windows::lower_windows::lower_route_rules(&plan);
+    assert!(
+        behaviorally_equivalent(&current.filters, &lowered),
+        "the neutral lowering packs the same addresses into the same filters"
+    );
+    assert!(arbitration_order_preserved(&current.filters, &lowered));
 }
 
 // ── EQUIVALENCE — per-destination kill-switch (Windows only) ────────────────
@@ -608,94 +651,6 @@ lowered={lowered:#?}"
     }
 }
 
-/// The floor under the strict default block. Lowered with NO tunnel LUID
-/// on purpose: the floor exists whether or not a tunnel is up, and the
-/// posture that needs a LUID (the blanket block and its egress permit) is
-/// exactly what must NOT appear in that case.
-#[cfg(windows)]
-#[test]
-fn slice7_default_block_exemptions_match_current_codegen() {
-    use crate::killswitch_codegen::{default_block_exemptions, FailClosedExemptions};
-    use nrr_platform_api::enforcement::EnforcementPlan;
-    use nrr_platform_api::wfp_behavioral::{arbitration_order_preserved, behaviorally_equivalent};
-
-    let sid = "S-1-5-21-1-2-3-1001";
-    let server_ips = vec![Ipv4Addr::new(203, 0, 113, 5)];
-    let local_subnets = vec![(Ipv4Addr::new(192, 168, 1, 0), 24)];
-
-    let current = default_block_exemptions(
-        sid,
-        &FailClosedExemptions {
-            bootstrap_server_ips: server_ips.clone(),
-            bootstrap_server_ips_v6: Vec::new(),
-            local_subnets: local_subnets.clone(),
-            local_subnets_v6: Vec::new(),
-            foreign_tunnel_luids: Vec::new(),
-            ..Default::default()
-        },
-    );
-    assert!(!current.is_empty(), "the floor is never empty");
-
-    // The shipped floor is IPv4: its block sits at the v4 connect layer only.
-    let mut flows =
-        plan_default_block_exemptions(sid, &server_ips, &local_subnets, Ipv6Exemptions::default());
-    flows.retain(|f| !matches!(f.flow.dst, DstMatch::SubnetV6 { .. } | DstMatch::HostV6(_)));
-    let plan = EnforcementPlan {
-        principal: nrr_platform_api::enforcement::UserPrincipal::from_windows_sid(sid)
-            .expect("valid sid"),
-        flows,
-        routes: Vec::new(),
-        policy_rules: Vec::new(),
-    };
-    let lowered = nrr_platform_windows::lower_windows::lower_catch_all_kill_switch(&plan, 0);
-
-    assert!(
-        behaviorally_equivalent(&current, &lowered),
-        "the floor must match:
-current={current:#?}
-lowered={lowered:#?}"
-    );
-    assert!(
-        arbitration_order_preserved(&current, &lowered),
-        "the floor's own order is what the codegen's running weight encodes"
-    );
-}
-
-/// The strict floor's IPv6 side is one list on both backends: what the neutral
-/// planner exempts is exactly what the Windows codegen's v6 floor exempts, in
-/// the same order.
-#[test]
-fn the_v6_floor_is_the_same_list_on_both_backends() {
-    use crate::killswitch_codegen::default_block_exemptions_v6;
-    use std::net::Ipv6Addr;
-
-    let sid = "S-1-5-21-1-2-3-1001";
-    let server = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x7);
-    let local = (Ipv6Addr::new(0x2001, 0xdb8, 0x10, 0, 0, 0, 0, 0), 64u8);
-
-    let v6 = Ipv6Exemptions {
-        server_ips: &[server],
-        local_subnets: &[local],
-    };
-    let neutral: Vec<(Ipv6Addr, u8)> = super::kill_switch::ipv6_exempt_matches(v6)
-        .into_iter()
-        .map(|dst| match dst {
-            DstMatch::SubnetV6 { net, prefix } => (net, prefix),
-            other => panic!("the v6 floor names only v6 prefixes: {other:?}"),
-        })
-        .collect();
-    let shipped: Vec<(Ipv6Addr, u8)> = default_block_exemptions_v6(sid, &[server], &[local])
-        .into_iter()
-        .map(|f| {
-            f.remote_subnet_v6
-                .expect("every v6 floor filter names a prefix")
-        })
-        .collect();
-
-    assert_eq!(neutral, shipped);
-    assert!(neutral.contains(&(server, 128)) && neutral.contains(&local));
-}
-
 /// The kill switch and the GUI do not consume the plan — they consume sets
 /// READ BACK off it. Until those sets come from the plan, the live codegen
 /// cannot be switched off no matter how equal the filters are.
@@ -766,7 +721,6 @@ fn slice8_derived_sets_match_current_codegen() {
     let current = generate_filters(CodegenInput {
         sid,
         rule_book: &rb,
-        behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &obs,
         app_resolver: &resolver,
@@ -776,13 +730,7 @@ fn slice8_derived_sets_match_current_codegen() {
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
-    let flows = plan_route_rules(
-        &rb,
-        sid,
-        nrr_domain::RouteBehaviorMode::PreferPrimary,
-        &planner_input(&cache, &resolver, &obs),
-    )
-    .0;
+    let flows = plan_route_rules(&rb, sid, &planner_input(&cache, &resolver, &obs)).0;
 
     // Compared as SETS. The shipped order is an artefact of WFP slot
     // packing — the codegen reads its addresses back out of packed chunks,
@@ -895,7 +843,6 @@ fn slice9_plan_report_matches_current_codegen_diagnostics() {
     let current = generate_filters(CodegenInput {
         sid,
         rule_book: &rb,
-        behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &obs,
         app_resolver: &resolver,
@@ -905,12 +852,7 @@ fn slice9_plan_report_matches_current_codegen_diagnostics() {
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
-    let (_, report) = plan_route_rules(
-        &rb,
-        sid,
-        nrr_domain::RouteBehaviorMode::PreferPrimary,
-        &planner_input(&cache, &resolver, &obs),
-    );
+    let (_, report) = plan_route_rules(&rb, sid, &planner_input(&cache, &resolver, &obs));
 
     let mut codegen_apps: Vec<String> = Vec::new();
     let mut codegen_hosts: Vec<String> = Vec::new();
@@ -1011,7 +953,6 @@ fn slice9_plan_report_names_both_caps() {
     let current = generate_filters(CodegenInput {
         sid,
         rule_book: &rb,
-        behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &obs,
         app_resolver: &resolver,
@@ -1021,12 +962,7 @@ fn slice9_plan_report_names_both_caps() {
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
-    let (_, report) = plan_route_rules(
-        &rb,
-        sid,
-        nrr_domain::RouteBehaviorMode::PreferPrimary,
-        &planner_input(&cache, &resolver, &obs),
-    );
+    let (_, report) = plan_route_rules(&rb, sid, &planner_input(&cache, &resolver, &obs));
 
     let codegen_truncated: Vec<(String, String, usize)> = current
         .diagnostics
@@ -1435,6 +1371,7 @@ fn slice4c_catch_all_kill_switch_matches_current_codegen() {
         local_subnets: local_subnets.to_vec(),
         local_subnets_v6: Vec::new(),
         foreign_tunnel_luids: Vec::new(),
+        foreign_tunnel_networks: Vec::new(),
     };
 
     let check = |protos: KillSwitchProtocols, expected_len: usize| {
@@ -1476,20 +1413,21 @@ fn slice4c_catch_all_kill_switch_matches_current_codegen() {
 
     // ALL: ALE 8 (egress+loopback+link-local+broadcast+local-network-
     // control+server+subnet+block) + packet 11 (7 mirror exempts + 4 named
-    // blocks — no agnostic block-all) + IPv6 8 (4 ALE + 4 packet) = 27.
-    check(KillSwitchProtocols::ALL, 27);
+    // blocks — no agnostic block-all) + IPv6 10 (egress through the tunnel and
+    // 4 more, at each layer) = 29.
+    check(KillSwitchProtocols::ALL, 29);
 
-    // TCP/UDP only: no V4 packet layer at all → ALE 8 + IPv6 8 = 16.
-    check(KillSwitchProtocols::from_bits(0x03), 16);
+    // TCP/UDP only: no V4 packet layer at all → ALE 8 + IPv6 10 = 18.
+    check(KillSwitchProtocols::from_bits(0x03), 18);
 
     // All-except-ICMP: ALE 8 + packet 10 (7 mirror exempts + IGMP/GRE/ESP
-    // named blocks; unchecked ICMP simply gets no filter) + IPv6 8 = 26.
+    // named blocks; unchecked ICMP simply gets no filter) + IPv6 10 = 28.
     check(
         KillSwitchProtocols {
             icmp: false,
             ..KillSwitchProtocols::ALL
         },
-        26,
+        28,
     );
 }
 
@@ -1608,12 +1546,14 @@ fn slice4d_fail_closed_and_app_kill_switch_match_current_codegen() {
                 local_subnets: subnets.to_vec(),
                 local_subnets_v6: Vec::new(),
                 foreign_tunnel_luids: Vec::new(),
+                foreign_tunnel_networks: Vec::new(),
                 primary_dest_ips: primaries.to_vec(),
                 allow_dns_over_primary: allow_dns,
-                dns_servers: dns.to_vec(),
+                dns_servers: dns.iter().copied().map(IpAddr::V4).collect(),
                 known_direct_ips: directs.to_vec(),
                 probe_target_ips: probes.to_vec(),
                 secondary_luid: 0,
+                guest_network_luids: Vec::new(),
             };
             let cur = fail_closed_block_all_filters(sid, &ex, protos);
             let low = lower_catch_all_kill_switch(
@@ -1636,162 +1576,249 @@ fn slice4d_fail_closed_and_app_kill_switch_match_current_codegen() {
     }
 }
 
-// ── EQUIVALENCE — fail-closed default block (Windows only) ──────────────────
-// With `StrictSecondaryFailClosed`, `plan_route_rules` → `lower_route_rules`
-// must reproduce the whole `generate_filters` output INCLUDING the trailing
-// `default_block_spec` catch-all block (`wfp_codegen`).
+// ── EQUIVALENCE — foreign tunnels and another VPN's handshake (Windows only) ─
+// The neutral permits through somebody else's tunnel (`EgressRef::Adapter`)
+// must lower to what `killswitch_codegen::foreign_tunnel_permits` installs on
+// every layer each posture blocks, with the pin vetoes, the lockdown restated
+// over the tunnel and the handshake permits beside them.
 #[cfg(windows)]
 #[test]
-fn slice5_fail_closed_default_block_matches_current_codegen() {
-    use crate::wfp_codegen::{generate_filters, CodegenInput};
+fn foreign_tunnels_and_vpn_handshakes_match_current_codegen() {
+    use crate::killswitch_codegen::{
+        catch_all_kill_switch_filters, doh_dot_block_filters, doh_foreign_vetoes,
+        fail_closed_block_all_filters, foreign_tunnel_permits, ike_service_filters,
+        kill_switch_filters, service_account_filters, vpn_handshake_filters, FailClosedExemptions,
+        ForeignTunnelNetwork, KillSwitchProtocols, KillSwitchResolution,
+    };
     use nrr_platform_api::enforcement::EnforcementPlan;
-    use nrr_platform_api::types::WfpAction;
-    use nrr_platform_api::wfp_behavioral::{arbitration_order_preserved, behaviorally_equivalent};
+    use nrr_platform_api::types::{WfpFilterSpec, WfpLayerKey};
+    use nrr_platform_api::wfp_behavioral::{
+        arbitration_order_preserved, behavioral_difference, behaviorally_equivalent,
+    };
+    use nrr_platform_windows::lower_windows::{lower_plan, lower_vpn_handshake, EgressLuids};
+    use nrr_shared::ip_block::IpBlock;
 
     let sid = "S-1-5-21-1-2-3-1001";
-    let rb = book(
-        vec![exact_ip_rule("p-ip", Ipv4Addr::new(192, 0, 2, 5))],
-        vec![rule(
-            "s-block",
-            CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))),
-            RuleAction::Block,
-        )],
-    );
-    let cache = MapCache::default();
-    let resolver = MapResolver::default();
-    let obs = MapObs::default();
-    let denylist = std::collections::HashSet::new();
-    let current = generate_filters(CodegenInput {
-        sid,
-        rule_book: &rb,
-        behavior_mode: RouteBehaviorMode::StrictSecondaryFailClosed,
-        fqdn_cache: &cache,
-        app_observations: &obs,
-        app_resolver: &resolver,
-        secondary_ip_denylist: &denylist,
-        zone_priority_over_ip: false,
-        app_rules_take_all_addresses: false,
-        families: crate::enforcement_planner::FamilyScope::V4Only,
-        packet_blocks: true,
-    });
-
-    let plan = EnforcementPlan {
+    let own = 0x0001_0000_0000_0007_u64;
+    let corp = 0x0001_0000_0000_0009_u64;
+    let lab = 0x0001_0000_0000_000b_u64;
+    let block = |s: &str| IpBlock::parse(s).expect("block");
+    let links = vec![
+        ForeignTunnelLink {
+            name: "corp0".into(),
+            networks: vec![
+                block("10.20.0.0/16"),
+                block("10.30.0.0/16"),
+                block("fd00:20::/48"),
+            ],
+        },
+        ForeignTunnelLink {
+            name: "lab0".into(),
+            networks: vec![block("172.20.0.0/16")],
+        },
+    ];
+    let networks: Vec<ForeignTunnelNetwork> = [(corp, &links[0]), (lab, &links[1])]
+        .into_iter()
+        .flat_map(|(luid, link)| {
+            link.networks
+                .iter()
+                .map(move |network| ForeignTunnelNetwork {
+                    luid,
+                    network: *network,
+                })
+        })
+        .collect();
+    let egress = EgressLuids {
+        secondary: own,
+        adapters: vec![("corp0".into(), corp), ("lab0".into(), lab)],
+    };
+    let servers = [Ipv4Addr::new(203, 0, 113, 7)];
+    let subnets = [(Ipv4Addr::new(192, 168, 1, 0), 24)];
+    let plan = |flows: Vec<FlowRule>| EnforcementPlan {
         principal: nrr_platform_api::enforcement::UserPrincipal::from_windows_sid(sid)
             .expect("valid sid"),
-        flows: plan_route_rules(
-            &rb,
-            sid,
-            RouteBehaviorMode::StrictSecondaryFailClosed,
-            &planner_input(&cache, &resolver, &obs),
-        )
-        .0,
+        flows,
         routes: Vec::new(),
         policy_rules: Vec::new(),
     };
-    let lowered = nrr_platform_windows::lower_windows::lower_route_rules(&plan);
-
-    // 1 ExactIp permit + Block (ALE + packet mirror) + default block = 4.
-    assert_eq!(current.filters.len(), 4, "sanity: incl the default block");
-    assert_eq!(
-        current
-            .filters
-            .iter()
-            // Unconditional means NO destination at all — a packed
-            // filter carries its addresses in `remote_ip_set`, so checking
-            // the single field alone would count one as unconditional.
-            .filter(|f| f.action == WfpAction::Block
-                && f.remote_ip.is_none()
-                && f.remote_ip_set.is_empty()
-                && f.remote_subnet.is_none())
-            .count(),
-        1,
-        "exactly one unconditional default block in the codegen output"
-    );
-    assert!(
-        behaviorally_equivalent(&current.filters, &lowered),
-        "neutral pipeline must install the default block too"
-    );
-    assert!(arbitration_order_preserved(&current.filters, &lowered));
-}
-
-/// The v6 twin of the Strict default block: planned as a `::/0` catch-all,
-/// lowered to the v6 ALE layer, and only when the family is in scope.
-#[cfg(windows)]
-#[test]
-fn slice5_strict_default_block_covers_ipv6_when_the_family_is_in_scope() {
-    use crate::wfp_codegen::{generate_filters, CodegenInput};
-    use nrr_platform_api::enforcement::EnforcementPlan;
-    use nrr_platform_api::types::{WfpAction, WfpLayerKey};
-    use nrr_platform_api::wfp_behavioral::{arbitration_order_preserved, behaviorally_equivalent};
-
-    let sid = "S-1-5-21-1-2-3-1001";
-    let rb = book(
-        vec![exact_ip_rule("p-ip", Ipv4Addr::new(192, 0, 2, 5))],
-        vec![],
-    );
-    let cache = MapCache::default();
-    let resolver = MapResolver::default();
-    let obs = MapObs::default();
-    let denylist = std::collections::HashSet::new();
-    for (ipv6, families) in [
-        (Ipv6Guard::Off, FamilyScope::V4Only),
-        (Ipv6Guard::FiltersAndRoutes, FamilyScope::Both),
-    ] {
-        let current = generate_filters(CodegenInput {
-            sid,
-            rule_book: &rb,
-            behavior_mode: RouteBehaviorMode::StrictSecondaryFailClosed,
-            fqdn_cache: &cache,
-            app_observations: &obs,
-            app_resolver: &resolver,
-            secondary_ip_denylist: &denylist,
-            zone_priority_over_ip: false,
-            app_rules_take_all_addresses: false,
-            families,
-            packet_blocks: true,
-        });
-        let input = PlannerInput {
-            ipv6,
-            ..planner_input(&cache, &resolver, &obs)
-        };
-        let (flows, _) = plan_route_rules(
-            &rb,
-            sid,
-            RouteBehaviorMode::StrictSecondaryFailClosed,
-            &input,
-        );
-        let plan = EnforcementPlan {
-            principal: nrr_platform_api::enforcement::UserPrincipal::from_windows_sid(sid)
-                .expect("valid sid"),
-            flows,
-            routes: Vec::new(),
-            policy_rules: Vec::new(),
-        };
-        let lowered = nrr_platform_windows::lower_windows::lower_route_rules(&plan);
-
-        let v6_defaults = |set: &[nrr_platform_api::types::WfpFilterSpec]| {
-            set.iter()
-                .filter(|f| {
-                    f.layer == WfpLayerKey::AleAuthConnectV6
-                        && f.action == WfpAction::Block
-                        && f.remote_ip_set_v6.is_empty()
-                        && f.remote_subnet_v6.is_none()
-                })
-                .count()
-        };
-        let expected = usize::from(families == FamilyScope::Both);
-        assert_eq!(
-            v6_defaults(&current.filters),
-            expected,
-            "{families:?}: codegen"
-        );
-        assert_eq!(v6_defaults(&lowered), expected, "{families:?}: lowering");
+    let assert_equiv = |current: &[WfpFilterSpec], lowered: &[WfpFilterSpec], label: &str| {
         assert!(
-            behaviorally_equivalent(&current.filters, &lowered),
-            "{families:?}: neutral pipeline must install the same default blocks"
+            behaviorally_equivalent(current, lowered),
+            "{label}: {:?}",
+            behavioral_difference(current, lowered)
         );
-        assert!(arbitration_order_preserved(&current.filters, &lowered));
+        assert!(
+            arbitration_order_preserved(current, lowered),
+            "{label}: arbitration order must be preserved"
+        );
+    };
+    // The codegen's composition: the posture, then the tunnels' permits read
+    // off it.
+    let spared = |mut current: Vec<WfpFilterSpec>| {
+        let permits = foreign_tunnel_permits(sid, &current, &networks, own);
+        assert!(!permits.is_empty(), "nothing to compare without permits");
+        current.extend(permits);
+        current
+    };
+    let with_permits = |mut flows: Vec<FlowRule>| {
+        let permits = plan_foreign_tunnel_permits(sid, &flows, &links);
+        flows.extend(permits);
+        flows
+    };
+
+    // (A) "Everything" with the tunnel up, a confirmed gateway of each family
+    // and the DoH lockdown: every layer the blanket blocks spares both tunnels.
+    let gateways = [
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x20)),
+    ];
+    let resolvers = [
+        IpAddr::V4(Ipv4Addr::new(10, 20, 0, 53)),
+        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    ];
+    let resolution = KillSwitchResolution {
+        secondary_luid: own,
+        bootstrap_server_ips: servers.to_vec(),
+        bootstrap_server_ips_v6: Vec::new(),
+        local_subnets: subnets.to_vec(),
+        local_subnets_v6: Vec::new(),
+        foreign_tunnel_luids: vec![corp, lab],
+        foreign_tunnel_networks: networks.clone(),
+    };
+    let mut current = spared(catch_all_kill_switch_filters(
+        sid,
+        &resolution,
+        &FailClosedExemptions::default(),
+        KillSwitchProtocols::ALL,
+    ));
+    for layer in [
+        WfpLayerKey::AleAuthConnectV4,
+        WfpLayerKey::OutboundTransportV4,
+        WfpLayerKey::AleAuthConnectV6,
+        WfpLayerKey::OutboundIpPacketV6,
+    ] {
+        assert!(
+            current
+                .iter()
+                .any(|f| f.layer == layer && f.local_interface_luid == Some(corp)),
+            "the codegen spares the tunnel on {layer:?}"
+        );
     }
+    current.extend(vpn_handshake_filters(sid, &gateways));
+    let doh = doh_dot_block_filters(sid, &resolvers, true);
+    let vetoes = doh_foreign_vetoes(sid, &doh, &current, &[corp, lab], own);
+    assert!(!vetoes.is_empty());
+    current.extend(doh);
+    current.extend(vetoes);
+    let mut flows = with_permits(plan_catch_all_kill_switch(
+        sid,
+        &servers,
+        &subnets,
+        Ipv6Exemptions::default(),
+        KillSwitchProtocols::ALL,
+    ));
+    let handshake = plan_vpn_handshake_permits(sid, &flows, &gateways);
+    flows.extend(handshake);
+    let lockdown = plan_doh_dot_block(sid, &resolvers, true);
+    let restated = plan_doh_foreign_vetoes(sid, &lockdown, &flows);
+    flows.extend(lockdown);
+    flows.extend(restated);
+    assert_equiv(&current, &lower_plan(&plan(flows), &egress), "catch-all");
+
+    // (B) "Routed sites": a pinned address inside the corporate network stays
+    // the tunnel's own, on ALE and on the transport layer alike.
+    let pinned = [
+        IpAddr::V4(Ipv4Addr::new(10, 20, 1, 5)),
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+    ];
+    let current = spared(kill_switch_filters(
+        sid,
+        &pinned,
+        own,
+        KillSwitchProtocols::ALL,
+    ));
+    assert!(
+        current
+            .iter()
+            .any(|f| f.layer == WfpLayerKey::OutboundTransportV4
+                && f.action == nrr_platform_api::types::WfpAction::Block
+                && f.local_interface_luid == Some(corp)),
+        "the codegen vetoes the pin on the transport layer"
+    );
+    let flows = with_permits(plan_kill_switch_destinations(
+        sid,
+        &pinned,
+        KillSwitchProtocols::ALL,
+    ));
+    assert_equiv(&current, &lower_plan(&plan(flows), &egress), "pins");
+
+    // (C) The block-all with the tunnel gone.
+    let exemptions = FailClosedExemptions {
+        bootstrap_server_ips: servers.to_vec(),
+        local_subnets: subnets.to_vec(),
+        ..FailClosedExemptions::default()
+    };
+    let current = spared(fail_closed_block_all_filters(
+        sid,
+        &exemptions,
+        KillSwitchProtocols::ALL,
+    ));
+    let flows = with_permits(plan_fail_closed_block_all(
+        sid,
+        &servers,
+        &[],
+        &subnets,
+        &[],
+        &[],
+        Ipv6Exemptions::default(),
+        false,
+        &[],
+        KillSwitchProtocols::ALL,
+    ));
+    assert_equiv(&current, &lower_plan(&plan(flows), &egress), "block-all");
+
+    // (D) A link the caller cannot name a LUID for is opened on no link, and
+    // its restatements do not read as user rules: the posture alone is left.
+    let unnamed = with_permits(plan_kill_switch_destinations(
+        sid,
+        &pinned,
+        KillSwitchProtocols::ALL,
+    ));
+    let lowered = lower_plan(
+        &plan(unnamed),
+        &EgressLuids {
+            secondary: own,
+            adapters: Vec::new(),
+        },
+    );
+    assert_equiv(
+        &kill_switch_filters(sid, &pinned, own, KillSwitchProtocols::ALL),
+        &lowered,
+        "unnamed link",
+    );
+
+    // (E) The OS IKE service's share, by image, for the service accounts.
+    let holds = NetworkHolds::default();
+    let guard = service_account_guard(&ServiceAccountInput {
+        is_route_table_owner: true,
+        posture: Some(ServiceAccountPosture::Block),
+        destinations: &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 80))],
+        holds: &holds,
+        tunnel_servers: &[],
+        local_subnets: &[],
+        primary_dns: &[],
+    })
+    .expect("owner with a guard");
+    let images = [
+        r"C:\Windows\System32\svchost.exe".to_string(),
+        r"C:\Windows\SysWOW64\svchost.exe".to_string(),
+    ];
+    let service = service_account_filters(sid, &guard, own, KillSwitchProtocols::ALL, &[], &[]);
+    let current = ike_service_filters(sid, &service, &images);
+    assert_eq!(current.len(), 8, "two images, two ports, two families");
+    let service_flows = plan_service_account_flows(sid, &guard, KillSwitchProtocols::ALL, &[]);
+    let ike = plan_ike_service_permits(&service_flows, IkeServiceMatch::Images(&images));
+    assert_equiv(&current, &lower_vpn_handshake(&plan(ike)), "ike");
 }
 
 // ── EQUIVALENCE — system route table (Windows only) ──────────────────────────
@@ -1909,7 +1936,6 @@ fn slice5_routes_match_current_codegen() {
         for mode in [
             RouteBehaviorMode::PreferPrimary,
             RouteBehaviorMode::PreferSecondaryWhenAvailable,
-            RouteBehaviorMode::StrictSecondaryFailClosed,
         ] {
             for has_primary in [false, true] {
                 let primary_opt = has_primary.then_some(&pri);
@@ -2011,6 +2037,58 @@ fn a_lan_address_behind_a_name_is_not_planned_into_the_tunnel() {
     assert!(!tunnelled.contains(&v4(192, 168, 1, 5)), "{tunnelled:?}");
 }
 
+/// A zone or name rule covering a corporate host must not pin its address, which
+/// a foreign tunnel's narrower route carries, into our tunnel.
+#[test]
+fn an_address_a_foreign_tunnel_carries_is_not_planned_into_our_tunnel() {
+    let mut cache = MapCache::default();
+    cache.hosts.insert(
+        "gate.corp.example".into(),
+        vec![v4(10, 20, 0, 7), v4(203, 0, 113, 5)],
+    );
+    let rb = book(
+        Vec::new(),
+        vec![
+            rule(
+                "R-corp",
+                CanonicalAddressMatch::ExactFqdn("gate.corp.example".into()),
+                RuleAction::Route,
+            ),
+            exact_ip_rule("R-literal", Ipv4Addr::new(10, 20, 0, 8)),
+        ],
+    );
+    let networks = crate::route_codegen::network_routes::NetworkRouteFacts {
+        foreign_tunnel_routes: vec![
+            nrr_shared::ip_block::IpBlock::parse("10.20.0.0/16").expect("block")
+        ],
+        ..Default::default()
+    };
+    let routes = plan_routes_with(
+        RouteBehaviorMode::PreferPrimary,
+        &rb,
+        false,
+        &cache,
+        &MapObs::default(),
+        &std::collections::HashSet::new(),
+        FamilyScope::V4Only,
+        crate::address_ownership::ZoneVsIpOrder::default(),
+        &[],
+        &networks,
+        crate::wfp_codegen::current_rule_shape_support(),
+    );
+    let tunnelled: Vec<IpAddr> = routes
+        .iter()
+        .filter(|r| r.egress == EgressRef::Secondary)
+        .filter_map(|r| match r.dst {
+            DstMatch::HostV4(ip) => Some(IpAddr::V4(ip)),
+            _ => None,
+        })
+        .collect();
+    assert!(tunnelled.contains(&v4(203, 0, 113, 5)), "{tunnelled:?}");
+    assert!(tunnelled.contains(&v4(10, 20, 0, 8)), "{tunnelled:?}");
+    assert!(!tunnelled.contains(&v4(10, 20, 0, 7)), "{tunnelled:?}");
+}
+
 #[test]
 fn the_planned_counter_overlay_answers_the_tunnel_it_is_given() {
     let rb = book(Vec::new(), Vec::new());
@@ -2101,7 +2179,6 @@ fn an_app_and_address_rule_plans_nothing_and_is_reported() {
         let (flows, report) = plan_route_rules(
             &rule_book,
             "S-1-5-21-1",
-            RouteBehaviorMode::PreferPrimary,
             &planner_input(&cache, &resolver, &obs),
         );
         assert!(
@@ -2145,7 +2222,6 @@ fn a_network_carved_past_the_cap_is_a_conflict_in_both_planners() {
     let current = generate_filters(CodegenInput {
         sid,
         rule_book: &rb,
-        behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &obs,
         app_resolver: &resolver,
@@ -2155,12 +2231,7 @@ fn a_network_carved_past_the_cap_is_a_conflict_in_both_planners() {
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
-    let (_, report) = plan_route_rules(
-        &rb,
-        sid,
-        nrr_domain::RouteBehaviorMode::PreferPrimary,
-        &planner_input(&cache, &resolver, &obs),
-    );
+    let (_, report) = plan_route_rules(&rb, sid, &planner_input(&cache, &resolver, &obs));
 
     let codegen = crate::rule_conflicts::over_cap_networks(
         &current
@@ -2239,15 +2310,7 @@ fn a_folder_rule_plans_one_flow_and_routes_what_its_programs_used() {
             origin: None,
         }],
     );
-    let plan = || {
-        plan_route_rules(
-            &rule_book,
-            "unix:uid:1000",
-            RouteBehaviorMode::PreferPrimary,
-            &input,
-        )
-        .0
-    };
+    let plan = || plan_route_rules(&rule_book, "unix:uid:1000", &input).0;
     let flows = plan();
     let programs: Vec<&FlowRule> = flows
         .iter()
@@ -2321,12 +2384,7 @@ fn a_folder_in_another_users_profile_plans_nothing_and_says_so() {
             origin: None,
         }],
     );
-    let (flows, report) = plan_route_rules(
-        &rule_book,
-        "unix:uid:1000",
-        RouteBehaviorMode::PreferPrimary,
-        &input,
-    );
+    let (flows, report) = plan_route_rules(&rule_book, "unix:uid:1000", &input);
     assert!(
         flows
             .iter()
@@ -2338,4 +2396,48 @@ fn a_folder_in_another_users_profile_plans_nothing_and_says_so() {
             rule_id: "r-other".into(),
         }
     ));
+}
+
+/// Resolvers of either family earn the port-53 permit, UDP then TCP each, and
+/// the strict default names none.
+#[test]
+fn the_block_all_names_resolvers_of_both_families() {
+    use nrr_platform_api::enforcement::{L4Proto, Verdict};
+    let v4_dns = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53));
+    let v6_dns: IpAddr = "2001:db8:53::1".parse().unwrap();
+    let all = KillSwitchProtocols::ALL;
+    let dns_permits = |allow: bool| -> Vec<(DstMatch, L4Proto)> {
+        plan_fail_closed_block_all_with_dns(
+            "S",
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            Ipv6Exemptions::default(),
+            allow,
+            &[v4_dns, v6_dns, "fe80::1".parse().unwrap()],
+            all,
+        )
+        .into_iter()
+        .filter(|f| f.verdict == Verdict::Permit && f.flow.dst_port == Some(53))
+        .map(|f| (f.flow.dst, f.flow.protocol.expect("a protocol")))
+        .collect()
+    };
+    assert_eq!(
+        dns_permits(true),
+        vec![
+            (DstMatch::HostV4(Ipv4Addr::new(192, 0, 2, 53)), L4Proto::Udp),
+            (DstMatch::HostV4(Ipv4Addr::new(192, 0, 2, 53)), L4Proto::Tcp),
+            (
+                DstMatch::HostV6("2001:db8:53::1".parse().unwrap()),
+                L4Proto::Udp
+            ),
+            (
+                DstMatch::HostV6("2001:db8:53::1".parse().unwrap()),
+                L4Proto::Tcp
+            ),
+        ]
+    );
+    assert!(dns_permits(false).is_empty());
 }

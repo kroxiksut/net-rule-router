@@ -24,7 +24,39 @@ pub enum BindingSourceDto {
 pub enum BehaviorModeDto {
     PreferPrimary,
     PreferSecondaryWhenAvailable,
-    StrictSecondaryFailClosed,
+}
+
+/// Leak protection. Slugs match `nrr_domain::LeakProtection::as_slug`; an
+/// unknown slug is a malformed message, never a fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LeakProtectionDto {
+    Off,
+    /// Offered only with the main-connection default route; the service
+    /// refuses it together with `PreferSecondaryWhenAvailable`.
+    Sites,
+    Everything,
+}
+
+impl LeakProtectionDto {
+    /// The wire slug, as the clients compare it.
+    pub const fn as_slug(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Sites => "sites",
+            Self::Everything => "everything",
+        }
+    }
+}
+
+/// What a caller with no saved policy starts from: the default route the
+/// administrator chose at install time, and the leak protection its first save
+/// is raised to at least.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct FirstPolicyDto {
+    pub mode: BehaviorModeDto,
+    pub leak_protection_at_least: LeakProtectionDto,
 }
 
 /// One binding row — either primary or secondary slot.
@@ -58,35 +90,19 @@ pub struct RoutePolicyDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secondary: Option<RouteBindingDto>,
     pub mode: BehaviorModeDto,
-    pub block_secondary_when_unavailable: bool,
-    /// Kill-switch failure posture. `true` (default) =
-    /// fail-closed (block when the secondary can't be resolved); `false` =
-    /// fail-open (allow + GUI warning banner). `#[serde(default)]` keeps it
-    /// additive — an older service that omits it reads as fail-closed.
-    #[serde(default = "kill_switch_fail_closed_default")]
-    pub kill_switch_fail_closed: bool,
-    /// Which IP protocols the emergency block cuts, as a
+    /// Required: a snapshot without it says nothing about protection, and
+    /// reading that as `off` would show a protected user as unprotected.
+    pub leak_protection: LeakProtectionDto,
+    /// Which IP protocols leak protection cuts while it is on, as a
     /// bitmask (TCP=1, UDP=2, ICMP=4, IGMP=8, GRE=16, ESP=32, Other=64; all
     /// = 127). `#[serde(default)]` (= all) keeps it additive — an older peer
     /// that omits it reads as "block every protocol".
     #[serde(default = "kill_switch_protocols_default")]
     pub kill_switch_protocols: u16,
-    /// When `true`, split-mode fail-closed blocks ALL egress
-    /// (catch-all) instead of only cached secondary IPs (see backend). Default
-    /// `false` (per-IP). `#[serde(default)]` keeps it additive.
-    #[serde(default)]
-    pub kill_switch_block_all: bool,
-    /// MASTER kill-switch toggle. `false` (default) = OFF,
-    /// so NO fail-closed blocking arms at all (full opt-in); the sibling
-    /// kill-switch fields are only consulted when this is `true`.
-    /// `#[serde(default)]` = `false` keeps it additive.
-    #[serde(default)]
-    pub kill_switch_enabled: bool,
-    /// "Allow name resolution over the primary link while
-    /// the kill-switch block-all is engaged". Default `true` — with DNS cut,
-    /// an armed block-all is a total blackout and the FQDN cache never
+    /// "Allow name resolution over the primary link while everything is
+    /// blocked" (`leak_protection = everything`, tunnel down). Default `true`:
+    /// with DNS cut the block is a total blackout and the FQDN cache never
     /// fills; strict users opt out.
-    /// `#[serde(default = "default_true")]` keeps it additive.
     #[serde(default = "default_true")]
     pub allow_dns_over_primary: bool,
     /// "Treat a domain as `domain` + `*.domain`". When
@@ -103,12 +119,6 @@ pub struct RoutePolicyDto {
     /// `#[serde(default)]` = balanced default keeps it additive.
     #[serde(default = "shared_ip_policy_default")]
     pub shared_ip_policy: String,
-    /// Mode-A un-seeded-IP coverage strategy slug: `per-ip` |
-    /// `fail-closed-unknown` (default) | `zone-widening` (matches
-    /// `nrr_domain::mode_a_coverage::ModeACoverageStrategy::as_slug`).
-    /// `#[serde(default)]` = fail-closed-unknown keeps it additive.
-    #[serde(default = "mode_a_coverage_strategy_default")]
-    pub mode_a_coverage_strategy: String,
     /// Resolve rule hosts bypassing the OS hosts/adblock file. `true`
     /// (DEFAULT) forces a routable public IP; `false` honours the hosts file.
     /// Defaults to `true` when an older peer omits it (the intended posture).
@@ -146,9 +156,9 @@ pub struct RoutePolicyDto {
     /// explicit opt-in). `#[serde(default)]` keeps it additive.
     #[serde(default)]
     pub browser_history_auto_seed: bool,
-    /// Kill-switch shared-IP strictness. `false` (default,
+    /// Shared-IP strictness while leak protection is on. `false` (default,
     /// "smart"): IPs the shared-IP census has seen on direct (non-rule) hosts
-    /// are excluded from the kill-switch per-IP pin/block set (an innocent
+    /// are excluded from the per-IP pin/block set (an innocent
     /// co-tenant site is never cut). `true` ("strict"): pin/block every
     /// secondary-destined IP regardless of sharing. `#[serde(default)]`
     /// keeps it additive.
@@ -212,6 +222,11 @@ pub struct RoutePolicyDto {
     /// treated as `as-computer`), `as-computer` or `unprotected`.
     #[serde(default)]
     pub forwarded_outage: String,
+    /// Ask a public server for the additional route's external address each
+    /// time that route connects. Off by default, and an older peer that omits
+    /// it reads as off: the request leaves through the tunnel.
+    #[serde(default)]
+    pub external_address_auto_check: bool,
 }
 
 /// Additive default for [`RoutePolicyDto::auto_rules_mode`] /
@@ -335,13 +350,6 @@ pub struct SeedFromBrowserHistoryResponse {
     pub already_running: bool,
 }
 
-/// Wire default for `kill_switch_fail_closed`: fail-closed (`true`). An
-/// older peer that omits the field must never silently downgrade an
-/// installed fail-closed posture to fail-open on a round-trip.
-fn kill_switch_fail_closed_default() -> bool {
-    true
-}
-
 /// Every protocol bit the emergency block knows (TCP=1 … Other=64), and the
 /// wire default: an omitting peer must never silently narrow what it cuts.
 pub const KILL_SWITCH_PROTOCOLS_ALL: u16 = 0x7F;
@@ -357,26 +365,13 @@ pub const KILL_SWITCH_PROTOCOLS_ENFORCED: u16 = 0x3F;
 
 /// Whether `bits` is a protocol selection the service stores and every mirror
 /// keeps. The one answer for all sides. A mask that blocks nothing (`0`, or
-/// "Other" alone) is not one: switching leak protection off is the master
-/// toggle's job, and such a mask is protection that reads as on while
+/// "Other" alone) is not one: switching leak protection off is
+/// `leak_protection = off`'s job, and such a mask is protection that reads as on while
 /// blocking nothing. A bit outside the mask is damage, and masking it away
 /// would invent a selection.
 #[must_use]
 pub const fn is_valid_kill_switch_protocols(bits: u16) -> bool {
     bits & KILL_SWITCH_PROTOCOLS_ENFORCED != 0 && bits & !KILL_SWITCH_PROTOCOLS_ALL == 0
-}
-
-/// Wire default for `mode_a_coverage_strategy`: `per-ip` — the permissive
-/// default installs no catch-all, so default/primary-destined and
-/// zone→primary traffic is not blocked; fail-closed-unknown is a paranoid opt-in.
-/// Kept in sync with `nrr_domain::mode_a_coverage::ModeACoverageStrategy::default().as_slug()`.
-///
-/// Public because it is the NORMATIVE spelling of this default: the
-/// `UiPreferences` mirror in `nrr-ui-support` and the legacy-preferences
-/// migration in the launcher both read it instead of retyping the slug — the
-/// three spellings had already drifted apart once.
-pub fn mode_a_coverage_strategy_default() -> String {
-    "per-ip".to_string()
 }
 
 /// Wire default for `resolve_hosts_bypass`: `true` (bypass the hosts file). An
@@ -389,47 +384,29 @@ fn resolve_hosts_bypass_default() -> bool {
 /// caller's per-SID policy: send `Some(...)` to bind a slot,
 /// `None` to clear it. `binding_source = MigratedFromPreferences` is
 /// only valid during the GUI migration flow.
+///
+/// A key this build does not know is a malformed request: a peer from another
+/// build means something by it, and dropping it while applying the rest would
+/// write a policy nobody asked for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RoutePolicyUpdateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary: Option<RouteBindingDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary: Option<RouteBindingDto>,
     pub mode: BehaviorModeDto,
-    pub block_secondary_when_unavailable: bool,
-    /// Kill-switch failure posture (see [`RoutePolicyDto`]).
-    /// Defaults to fail-closed when an older GUI omits it.
-    #[serde(default = "kill_switch_fail_closed_default")]
-    pub kill_switch_fail_closed: bool,
-    /// Protocol bitmask the emergency block cuts (see
+    /// Required: this request replaces the whole policy, so leaving the field
+    /// out must be a malformed request, never a quiet switch to `off`.
+    /// `sites` with `prefer-secondary-when-available` is refused.
+    pub leak_protection: LeakProtectionDto,
+    /// Protocol bitmask leak protection cuts (see
     /// [`RoutePolicyDto`]). Defaults to all protocols when an older GUI omits it.
     #[serde(default = "kill_switch_protocols_default")]
     pub kill_switch_protocols: u16,
-    /// When `true`, split-mode fail-closed blocks ALL egress
-    /// (catch-all) instead of only cached secondary IPs (see backend).
-    ///
-    /// REQUIRED — no wire default. See [`kill_switch_enabled`].
-    ///
-    /// [`kill_switch_enabled`]: RoutePolicyUpdateRequest::kill_switch_enabled
-    pub kill_switch_block_all: bool,
-    /// MASTER kill-switch toggle (see [`RoutePolicyDto`]).
-    ///
-    /// REQUIRED — no wire default, deliberately. This request replaces the
-    /// caller's whole per-SID policy, and a field that TURNS PROTECTION OFF
-    /// must not be expressible by leaving it out: `#[serde(default)]` on a
-    /// `bool` made a message that forgot this field disarm the kill switch
-    /// silently. A peer that omits it now gets a malformed-request error, which
-    /// is the correct answer for an incomplete full replace — and a loud
-    /// failure is strictly better than a quiet disarm.
-    ///
-    /// Its own subordinate `kill_switch_fail_closed` already had the safe
-    /// direction (an explicit `true` default); the master toggle did not.
-    pub kill_switch_enabled: bool,
     /// "Allow DNS over the primary link while blocked"
-    /// (see [`RoutePolicyDto`]). Defaults to ON when
-    /// an older GUI omits it (an armed block-all with DNS cut is a total
-    /// blackout).
+    /// (see [`RoutePolicyDto`]). Defaults to ON when an older GUI omits it
+    /// (a block with DNS cut is a total blackout).
     #[serde(default = "default_true")]
     pub allow_dns_over_primary: bool,
     /// "Treat a domain as `domain` + `*.domain`" (see
@@ -440,19 +417,15 @@ pub struct RoutePolicyUpdateRequest {
     /// Defaults to `majority-of-ip` when an older GUI omits it.
     #[serde(default = "shared_ip_policy_default")]
     pub shared_ip_policy: String,
-    /// Mode-A un-seeded-IP coverage strategy slug (see [`RoutePolicyDto`]).
-    /// Defaults to `fail-closed-unknown` when an older GUI omits it.
-    #[serde(default = "mode_a_coverage_strategy_default")]
-    pub mode_a_coverage_strategy: String,
     /// Resolve rule hosts bypassing the hosts file (see [`RoutePolicyDto`]).
     /// Defaults to `true` when an older GUI omits it.
     #[serde(default = "resolve_hosts_bypass_default")]
     pub resolve_hosts_bypass: bool,
     /// DoH/DoT lockdown toggle (see [`RoutePolicyDto`]).
     ///
-    /// REQUIRED — no wire default. See [`kill_switch_enabled`].
+    /// REQUIRED — no wire default. See [`leak_protection`].
     ///
-    /// [`kill_switch_enabled`]: RoutePolicyUpdateRequest::kill_switch_enabled
+    /// [`leak_protection`]: RoutePolicyUpdateRequest::leak_protection
     pub doh_lockdown_enabled: bool,
     /// DoH/DoT lockdown scope slug (see [`RoutePolicyDto`]).
     /// Defaults to `leak-protection-only` when an older GUI omits it.
@@ -466,11 +439,11 @@ pub struct RoutePolicyUpdateRequest {
     /// [`RoutePolicyDto`]). Defaults to `false` (off) when an older GUI omits it.
     #[serde(default)]
     pub browser_history_auto_seed: bool,
-    /// Kill-switch shared-IP strictness (see [`RoutePolicyDto`]).
+    /// Shared-IP strictness (see [`RoutePolicyDto`]).
     ///
-    /// REQUIRED — no wire default. See [`kill_switch_enabled`].
+    /// REQUIRED — no wire default. See [`leak_protection`].
     ///
-    /// [`kill_switch_enabled`]: RoutePolicyUpdateRequest::kill_switch_enabled
+    /// [`leak_protection`]: RoutePolicyUpdateRequest::leak_protection
     pub kill_switch_strict_shared_ips: bool,
     /// Auto-rules mode slug (see [`RoutePolicyDto`]). Defaults to
     /// `suggest` when an older GUI omits it.
@@ -516,6 +489,9 @@ pub struct RoutePolicyUpdateRequest {
     /// WSL while the tunnel is down (see [`RoutePolicyDto`]).
     #[serde(default)]
     pub forwarded_outage: String,
+    /// Automatic external-address check (see [`RoutePolicyDto`]).
+    #[serde(default)]
+    pub external_address_auto_check: bool,
     /// When not empty, only these fields (wire names) are taken from this
     /// request; the rest stay as stored. Two clients each writing the row they
     /// read lose each other's change; naming what changed keeps both.
@@ -550,15 +526,11 @@ impl RoutePolicyUpdateRequest {
             primary,
             secondary,
             mode,
-            block_secondary_when_unavailable,
-            kill_switch_fail_closed,
+            leak_protection,
             kill_switch_protocols,
-            kill_switch_block_all,
-            kill_switch_enabled,
             allow_dns_over_primary,
             include_subdomains,
             shared_ip_policy,
-            mode_a_coverage_strategy,
             resolve_hosts_bypass,
             doh_lockdown_enabled,
             doh_lockdown_scope,
@@ -577,6 +549,7 @@ impl RoutePolicyUpdateRequest {
             short_name_suffix,
             app_rules_take_all_addresses,
             forwarded_outage,
+            external_address_auto_check,
             binding_source: _,
             apply_only: _,
         } = self;
@@ -584,15 +557,11 @@ impl RoutePolicyUpdateRequest {
             primary: stored_primary,
             secondary: stored_secondary,
             mode: stored_mode,
-            block_secondary_when_unavailable: stored_block_secondary,
-            kill_switch_fail_closed: stored_fail_closed,
+            leak_protection: stored_leak_protection,
             kill_switch_protocols: stored_protocols,
-            kill_switch_block_all: stored_block_all,
-            kill_switch_enabled: stored_kill_switch,
             allow_dns_over_primary: stored_dns_over_primary,
             include_subdomains: stored_include_subdomains,
             shared_ip_policy: stored_shared_ip_policy,
-            mode_a_coverage_strategy: stored_mode_a_strategy,
             resolve_hosts_bypass: stored_hosts_bypass,
             secondary_link_provider_apps: _,
             doh_lockdown_enabled: stored_doh_enabled,
@@ -614,21 +583,18 @@ impl RoutePolicyUpdateRequest {
             short_name_suffix: stored_short_name_suffix,
             app_rules_take_all_addresses: stored_app_takeover,
             forwarded_outage: stored_wsl_outage,
+            external_address_auto_check: stored_external_check,
             binding_source: _,
         } = current;
 
         bound_adapter_id(primary) != bound_adapter_id(stored_primary)
             || bound_adapter_id(secondary) != bound_adapter_id(stored_secondary)
             || mode != stored_mode
-            || block_secondary_when_unavailable != stored_block_secondary
-            || kill_switch_fail_closed != stored_fail_closed
+            || leak_protection != stored_leak_protection
             || kill_switch_protocols != stored_protocols
-            || kill_switch_block_all != stored_block_all
-            || kill_switch_enabled != stored_kill_switch
             || allow_dns_over_primary != stored_dns_over_primary
             || include_subdomains != stored_include_subdomains
             || shared_ip_policy != stored_shared_ip_policy
-            || mode_a_coverage_strategy != stored_mode_a_strategy
             || resolve_hosts_bypass != stored_hosts_bypass
             || doh_lockdown_enabled != stored_doh_enabled
             || doh_lockdown_scope != stored_doh_scope
@@ -650,6 +616,8 @@ impl RoutePolicyUpdateRequest {
             || short_name_suffix != stored_short_name_suffix
             || app_rules_take_all_addresses != stored_app_takeover
             || forwarded_outage != stored_wsl_outage
+            // Sends traffic through the tunnel unasked: a frozen policy holds it.
+            || external_address_auto_check != stored_external_check
     }
 }
 
@@ -662,3 +630,8 @@ fn bound_adapter_id(binding: &Option<RouteBindingDto>) -> Option<&str> {
 /// GUI uses this to update its in-memory cache without re-calling
 /// `SnapshotInitial`.
 pub type RoutePolicyUpdateResponse = RoutePolicyDto;
+
+/// Keys [`RoutePolicyDto`] reports that [`RoutePolicyUpdateRequest`] does not
+/// accept: written through their own operations, or decided by the service.
+pub const ROUTE_POLICY_SNAPSHOT_ONLY_KEYS: [&str; 2] =
+    ["secondary-link-provider-apps", "doh-lockdown-effective"];

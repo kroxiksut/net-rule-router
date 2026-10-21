@@ -5,10 +5,10 @@
       "name": "nothing to restore",
       "input": {
         "intent": {
-          "kill-switch-enabled": true
+          "leak-protection": "everything"
         },
         "service": {
-          "kill-switch-enabled": true
+          "leak-protection": "everything"
         },
         "present": []
       },
@@ -298,7 +298,7 @@
       "name": "protection the record holds on is not offered: it went back on its own",
       "input": {
         "intent": {
-          "kill-switch-enabled": true,
+          "leak-protection": "everything",
           "mode": "prefer-secondary-when-available"
         },
         "service": {},
@@ -318,24 +318,122 @@
       }
     },
     {
-      "name": "protection the record holds off is offered, never sent on its own",
+      "name": "protection the record holds weaker is offered, never sent on its own",
       "input": {
         "intent": {
-          "kill-switch-fail-closed": false
+          "leak-protection": "off"
+        },
+        "service": {
+          "leak-protection": "sites"
+        },
+        "present": []
+      },
+      "expected": {
+        "keys": [
+          "leak-protection"
+        ],
+        "missing": [],
+        "values": {
+          "leak-protection": "off"
+        },
+        "applyOnly": [
+          "leak-protection"
+        ]
+      }
+    },
+    {
+      "name": "a restored additional default route takes routed sites to everything",
+      "input": {
+        "intent": {
+          "mode": "prefer-secondary-when-available"
+        },
+        "service": {
+          "mode": "prefer-primary",
+          "leak-protection": "sites"
+        },
+        "present": []
+      },
+      "expected": {
+        "keys": [
+          "leak-protection",
+          "mode"
+        ],
+        "missing": [],
+        "values": {
+          "leak-protection": "everything",
+          "mode": "prefer-secondary-when-available"
+        },
+        "applyOnly": [
+          "leak-protection",
+          "mode"
+        ]
+      }
+    },
+    {
+      "name": "routed sites recorded under the additional route the service holds is what it holds",
+      "input": {
+        "intent": {
+          "leak-protection": "sites"
+        },
+        "service": {
+          "mode": "prefer-secondary-when-available",
+          "leak-protection": "everything"
+        },
+        "present": []
+      },
+      "expected": {
+        "keys": [],
+        "missing": [],
+        "values": null,
+        "applyOnly": null
+      }
+    },
+    {
+      "name": "a restored main default route keeps the level the service holds",
+      "input": {
+        "intent": {
+          "mode": "prefer-primary",
+          "leak-protection": "sites"
+        },
+        "service": {
+          "mode": "prefer-secondary-when-available",
+          "leak-protection": "everything"
+        },
+        "present": []
+      },
+      "expected": {
+        "keys": [
+          "mode"
+        ],
+        "missing": [],
+        "values": {
+          "mode": "prefer-primary"
+        },
+        "applyOnly": [
+          "mode"
+        ]
+      }
+    },
+    {
+      "name": "the strict mode of an earlier build offers the additional route, its protection having gone back by itself",
+      "input": {
+        "intent": {
+          "mode": "strict-secondary-fail-closed",
+          "kill-switch-enabled": true
         },
         "service": {},
         "present": []
       },
       "expected": {
         "keys": [
-          "kill-switch-fail-closed"
+          "mode"
         ],
         "missing": [],
         "values": {
-          "kill-switch-fail-closed": false
+          "mode": "prefer-secondary-when-available"
         },
         "applyOnly": [
-          "kill-switch-fail-closed"
+          "mode"
         ]
       }
     }

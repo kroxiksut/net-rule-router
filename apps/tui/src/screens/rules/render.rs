@@ -17,8 +17,8 @@ pub const REVIEW_PAGE: usize = 12;
 /// Overlaps the form spells out before it counts the rest.
 const FORM_OVERLAPS: usize = 3;
 use super::{
-    bulk, gateway, main_route, overrides, recent, text, verdicts, Busy, Choice, ChoicePurpose,
-    Input, InputPurpose, Mode, Phase, SetList,
+    bulk, gateway, main_route, merge, overrides, recent, spare, text, verdicts, Busy, Choice,
+    ChoicePurpose, Input, InputPurpose, Mode, Phase, SetList,
 };
 use crate::i18n::Texts;
 use crate::keys;
@@ -76,6 +76,11 @@ pub fn view(app: &AppState, texts: &Texts) -> ScreenView {
         Mode::Override(confirm) => Panel {
             title: texts.get(text::OVERRIDE_TITLE),
             lines: overrides::lines(confirm, texts),
+            feed: false,
+        },
+        Mode::Merge(merge) => Panel {
+            title: texts.get(merge::title(merge)),
+            lines: merge::lines(app, merge, texts),
             feed: false,
         },
     };
@@ -148,6 +153,15 @@ fn state_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             texts.fill(text::LOAD_FAILED, &[("error", failure.text(texts))]),
         ));
     }
+    if matches!(rules.mode, Mode::List) && rules.busy.is_none() {
+        let count = spare::spare_rules(app).len();
+        if count > 0 {
+            lines.push(ViewLine::new(vec![Segment::state(
+                spare::offer(count, texts),
+                StateTone::Caution,
+            )]));
+        }
+    }
     let mut filter = vec![
         Segment::strong(format!("{}: ", texts.get(text::ROUTE_FILTER))),
         Segment::plain(texts.get(table.filter.label())),
@@ -202,12 +216,12 @@ fn verdict_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     lines
 }
 
-fn type_label(rule_type: &RuleType, texts: &Texts) -> String {
+pub(super) fn type_label(rule_type: &RuleType, texts: &Texts) -> String {
     let slug = rule_type.canonical_slug();
     texts.dynamic(&format!("rules.type.{slug}"), &slug)
 }
 
-fn route_text(route: &TargetRoute, texts: &Texts) -> String {
+pub(super) fn route_text(route: &TargetRoute, texts: &Texts) -> String {
     route_label(route).map_or_else(|| route.as_str().to_owned(), |k| texts.get(k))
 }
 
@@ -318,6 +332,9 @@ fn row_lines(
         first.push(Segment::plain(" · "));
         first.push(mark);
     }
+    if let Some(mark) = hosts_mark(row, texts) {
+        first.push(Segment::plain(format!(" · {mark}")));
+    }
     let mut lines = vec![ViewLine::new(first)];
     // The chosen row says the rest: what the validator found, what the main
     // route answered, who wrote it, and its note.
@@ -339,6 +356,10 @@ fn row_lines(
         if rule.auto_origin().is_some() {
             details.push(texts.get(text::AUTO_ORIGIN));
         }
+        details.extend(pinned_lines(row, texts));
+        if row.hosts_override.is_some() {
+            details.push(texts.get(text::HOSTS_NOTE));
+        }
         details.extend(recent::previous_lines(app, rule, texts));
         if !rule.comment.is_empty() {
             details.push(format!("# {}", display_text(&rule.comment)));
@@ -348,6 +369,32 @@ fn row_lines(
         }
     }
     lines
+}
+
+/// What the OS hosts file does to this hostname, as the GUI's row badge says.
+fn hosts_mark(row: &Row, texts: &Texts) -> Option<String> {
+    let hosts = row.hosts_override.as_ref()?;
+    Some(if hosts.blocking {
+        texts.get(text::HOSTS_BLOCKED)
+    } else {
+        texts.fill(text::HOSTS_REDIRECTED, &[("ip", display_text(&hosts.ip))])
+    })
+}
+
+/// The addresses an application rule holds, and why that reaches every
+/// program: the GUI's badge and its hover text.
+fn pinned_lines(row: &Row, texts: &Texts) -> Vec<String> {
+    if row.pinned_total == 0 {
+        return Vec::new();
+    }
+    let badge = texts.fill(text::APP_PINS, &[("count", row.pinned_total.to_string())]);
+    let sample: Vec<&str> = row.pinned.iter().take(20).map(String::as_str).collect();
+    let first = if sample.is_empty() {
+        badge
+    } else {
+        format!("{badge}: {}", display_text(&sample.join(", ")))
+    };
+    vec![first, texts.get(text::APP_PINS_NOTE)]
 }
 
 fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
@@ -531,7 +578,12 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
                     Segment::plain(marker(current)),
                     Segment::plain(format!("{tick} {}", texts.get(text::VERIFY))),
                 ]));
-                if form.verify {
+                if form.verify_dropped_for_ipv6() {
+                    lines.push(ViewLine::text(format!(
+                        "     {}",
+                        texts.get(text::VERIFY_IPV6)
+                    )));
+                } else if form.verify {
                     lines.push(ViewLine::text(format!(
                         "     {}",
                         texts.get(text::VERIFY_HINT)
@@ -714,7 +766,10 @@ pub fn choice_len(purpose: &ChoicePurpose) -> usize {
         ChoicePurpose::Preset(list) => list.sets.len(),
         ChoicePurpose::Recent => 4,
         ChoicePurpose::Restore(count) => *count,
-        ChoicePurpose::Delete(_) | ChoicePurpose::Reload | ChoicePurpose::Overwrite(_) => 2,
+        ChoicePurpose::Delete(_)
+        | ChoicePurpose::Reload
+        | ChoicePurpose::Overwrite(_)
+        | ChoicePurpose::RemoveSpare(_) => 2,
         ChoicePurpose::HandEdited(_) => 3,
         ChoicePurpose::ChangedElsewhere => 2,
     }
@@ -742,6 +797,14 @@ fn choice_lines(app: &AppState, choice: &Choice, texts: &Texts) -> Vec<ViewLine>
                 vec![get(text::DELETE_CONFIRM), get(text::CANCEL)],
             )
         }
+        ChoicePurpose::RemoveSpare(spare_rules) => (
+            get(text::SPARE_TITLE),
+            spare::details(spare_rules, texts),
+            vec![
+                texts.fill(text::SPARE_ACTION, &[("n", spare_rules.len().to_string())]),
+                get(text::CANCEL),
+            ],
+        ),
         ChoicePurpose::Reload => (
             get(text::RELOAD_QUESTION),
             vec![get(text::RELOAD_HINT)],

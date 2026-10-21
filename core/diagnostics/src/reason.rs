@@ -80,7 +80,8 @@ pub mod decision {
     pub const ROUTE_SELECTED: ReasonCode = ReasonCode("decision.route_selected");
     /// No rule matched; the configured default route was used.
     pub const DEFAULT_ROUTE: ReasonCode = ReasonCode("decision.default_route");
-    /// Secondary was unavailable but Fail-Open allowed default-route fallback.
+    /// Secondary was unavailable and, with leak protection off, traffic fell
+    /// back to the default route.
     pub const FAIL_OPEN: ReasonCode = ReasonCode("decision.fail_open");
     /// Secondary was unavailable; traffic was blocked (Fail-Closed).
     pub const FAIL_CLOSED: ReasonCode = ReasonCode("decision.fail_closed");

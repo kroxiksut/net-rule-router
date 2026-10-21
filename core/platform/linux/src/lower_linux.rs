@@ -399,12 +399,58 @@ fn lower_flow(flow: &FlowRule, egress: &EgressNames, service_uids: &[(u32, u32)]
 
     let comment = rule_comment(flow);
 
+    // The lockdown restated for one foreign link: a plain drop on that
+    // interface, not the pin pair an `OnlyVia` permit means. A link that is
+    // gone carries nothing, so there is nothing to drop.
+    if flow.verdict == Verdict::Block
+        && flow.precedence.class == nrr_platform_api::enforcement::PrecedenceClass::HardBlock
+        && flow.precedence.ordinal >= nrr_platform_api::enforcement::DOH_FOREIGN_VETO_ORDINAL_BASE
+    {
+        if let EgressConstraint::OnlyVia(reference) = &flow.egress {
+            let rules = egress
+                .resolve(reference)
+                .map(|device| {
+                    let mut matches = base.clone();
+                    matches.push(NftMatch::OutInterface(device));
+                    NftRule {
+                        matches,
+                        verdict: verdict_of(flow),
+                        comment: comment.clone(),
+                    }
+                })
+                .into_iter()
+                .collect();
+            return LoweredFlow::rules(rules);
+        }
+    }
+
+    // A pin on ANY destination is the blanket "everything through the tunnel"
+    // permit; any exemption only spares. Either way the cut it spares from is
+    // the posture's own block, stated lower down. A guard here would sit in the
+    // exemption band and cut what a later exemption spares: the machine's own
+    // escapes, or a home LAN in the range a corporate tunnel carries.
+    let spares_only = flow.flow.dst == DstMatch::Any
+        || (flow.verdict == Verdict::Permit
+            && flow.precedence.class
+                == nrr_platform_api::enforcement::PrecedenceClass::CatchAllExempt);
+
     match &flow.egress {
         EgressConstraint::Any => LoweredFlow::rules(vec![NftRule {
             matches: base,
             verdict: verdict_of(flow),
             comment,
         }]),
+        // Whichever link carries it: the route says the kernel will encrypt
+        // it. A lockdown veto restated for it drops just as plainly.
+        EgressConstraint::UnderIpsecPolicy => {
+            let mut matches = base;
+            matches.push(NftMatch::RouteIpsec);
+            LoweredFlow::rules(vec![NftRule {
+                matches,
+                verdict: verdict_of(flow),
+                comment,
+            }])
+        }
         EgressConstraint::OnlyVia(reference) => {
             let Some(device) = egress.resolve(reference) else {
                 // The pinned link is gone. The `accept` cannot be built without
@@ -412,10 +458,8 @@ fn lower_flow(flow: &FlowRule, egress: &EgressNames, service_uids: &[(u32, u32)]
                 // interface, dropped. Emitting nothing here would let the
                 // traffic follow the default route — the leak the pin exists to
                 // prevent, appearing at exactly the moment the pinned link
-                // failed. The blanket pin (`dst == Any`) keeps its own rule:
-                // its guard is the plan's separate block-all, stated lower down
-                // so the machine's own escapes are matched first.
-                if flow.flow.dst == DstMatch::Any {
+                // failed.
+                if spares_only {
                     return LoweredFlow::unsupported(UnsupportedReason::UnresolvedEgress);
                 }
                 return LoweredFlow {
@@ -434,13 +478,7 @@ fn lower_flow(flow: &FlowRule, egress: &EgressNames, service_uids: &[(u32, u32)]
                 verdict: NftVerdict::Accept,
                 comment: format!("{comment} via"),
             };
-            // A pin on ANY destination is the blanket "everything goes through
-            // the tunnel" permit, and its guard would be a block on everything —
-            // which the plan states separately, and lower down, so the machine's
-            // own escapes (loopback, the LAN, the tunnel's server) are matched
-            // first. Emitting it here would put that block in the exemption
-            // band, above the very rules it must not cut.
-            if flow.flow.dst == DstMatch::Any {
+            if spares_only {
                 return LoweredFlow::rules(vec![accept]);
             }
             LoweredFlow::rules(vec![
@@ -521,8 +559,21 @@ fn drop_tag(flow: &FlowRule, leak_guard: bool) -> DropTag {
             }
             P::CatchAllBlock => DropKind::BlockAll,
             P::DohBlock => DropKind::DnsLockdown,
+            // The lockdown restated for a corporate link is still the lockdown.
+            P::HardBlock
+                if flow.precedence.ordinal
+                    >= nrr_platform_api::enforcement::DOH_FOREIGN_VETO_ORDINAL_BASE =>
+            {
+                DropKind::DnsLockdown
+            }
+            // A veto the guard states for itself is not the user's rule.
+            P::HardBlock
+                if flow.precedence.ordinal
+                    >= nrr_platform_api::enforcement::FOREIGN_PIN_VETO_ORDINAL_BASE =>
+            {
+                DropKind::FailClosed
+            }
             P::HardBlock => DropKind::Rule,
-            P::DefaultCatchAll => DropKind::Default,
             P::FakeIpPool => DropKind::RelayPool,
             P::RouteRule(_) | P::CatchAllExempt | P::KillSwitchPermit => DropKind::Other,
         }
@@ -547,7 +598,6 @@ fn band_slug(class: nrr_platform_api::enforcement::PrecedenceClass) -> &'static 
     use nrr_platform_api::enforcement::PrecedenceClass as P;
     use nrr_shared::RouteRole;
     match class {
-        P::DefaultCatchAll => "default",
         P::RouteRule(RouteRole::Primary) => "route-primary",
         P::RouteRule(RouteRole::Secondary) => "route-secondary",
         P::DohBlock => "doh-block",
@@ -584,6 +634,7 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
+            observed_by_program: false,
         }
     }
 
@@ -618,6 +669,68 @@ mod tests {
                 rest
             }
         }
+    }
+
+    /// "Everything" over the tunnel: IPv6 leaving through it survives the
+    /// family cut, IPv6 leaving any other way does not. The blanket permit
+    /// names no family, so one `oifname` accept covers both.
+    #[test]
+    fn the_catch_all_lets_ipv6_out_through_the_tunnel_only() {
+        let v6_all = DstMatch::SubnetV6 {
+            net: std::net::Ipv6Addr::UNSPECIFIED,
+            prefix: 0,
+        };
+        let mut through_tunnel = rule(
+            PrecedenceClass::CatchAllExempt,
+            0,
+            DstMatch::Any,
+            Verdict::Permit,
+        );
+        through_tunnel.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
+        let mut flows = vec![through_tunnel];
+        for coverage in [Coverage::ConnectOnly, Coverage::AllPackets] {
+            let mut cut = rule(PrecedenceClass::CatchAllBlock, 0, v6_all, Verdict::Block);
+            cut.coverage = coverage;
+            flows.push(cut);
+        }
+
+        let lowered = lower_plan(&plan_of(flows), &names());
+        let rules = policy_rules(&lowered);
+        let accept = rules
+            .iter()
+            .position(|r| {
+                r.verdict == NftVerdict::Accept
+                    && r.matches.contains(&NftMatch::OutInterface("tun0".into()))
+            })
+            .expect("the tunnel accept");
+        assert!(
+            !rules[accept].matches.iter().any(|m| matches!(
+                m,
+                NftMatch::DstV4 { .. }
+                    | NftMatch::DstV6 { .. }
+                    | NftMatch::DstSetV4(_)
+                    | NftMatch::DstSetV6(_)
+            )),
+            "family-agnostic: {:?}",
+            rules[accept]
+        );
+        let cut = rules
+            .iter()
+            .position(|r| {
+                r.verdict != NftVerdict::Accept
+                    && r.matches.iter().any(|m| {
+                        matches!(m, NftMatch::DstV6 { prefix: 0, .. } | NftMatch::DstSetV6(_))
+                    })
+            })
+            .expect("the IPv6 cut");
+        assert!(accept < cut, "the tunnel accept is matched first");
+        assert!(
+            rules[cut]
+                .matches
+                .iter()
+                .all(|m| !matches!(m, NftMatch::OutInterface(_))),
+            "the cut holds on every other link"
+        );
     }
 
     /// The core of the port: Windows arbitrates by weight, Linux by position.
@@ -727,6 +840,345 @@ mod tests {
             net: v4(203, 0, 113, 138),
             prefix: 32,
         }));
+    }
+
+    /// A pinned address inside a foreign tunnel's permitted network is accepted
+    /// by our tunnel and dropped on any other link, ahead of the tunnel's permit.
+    #[test]
+    fn a_pin_veto_is_matched_before_the_foreign_permit() {
+        use nrr_platform_api::enforcement::{AdapterId, FOREIGN_PIN_VETO_ORDINAL_BASE};
+        let mut permit = rule(
+            PrecedenceClass::CatchAllExempt,
+            0x0010_0000,
+            DstMatch::SubnetV4 {
+                net: v4(10, 77, 0, 0),
+                prefix: 16,
+            },
+            Verdict::Permit,
+        );
+        permit.egress = EgressConstraint::OnlyVia(EgressRef::Adapter(AdapterId("corp0".into())));
+        let mut veto = rule(
+            PrecedenceClass::HardBlock,
+            FOREIGN_PIN_VETO_ORDINAL_BASE,
+            DstMatch::HostV4(v4(10, 77, 3, 4)),
+            Verdict::Permit,
+        );
+        veto.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
+
+        let lowered = lower_plan(&plan_of(vec![permit, veto]), &names());
+        let rules = policy_rules(&lowered);
+        let first_corp = rules
+            .iter()
+            .position(|r| r.comment.starts_with("catch-all-exempt"))
+            .expect("the foreign permit is lowered");
+        let pin_accept = rules
+            .iter()
+            .position(|r| r.comment.starts_with("hard-block") && r.verdict == NftVerdict::Accept)
+            .expect("the veto accepts on our tunnel");
+        let pin_drop_at = rules
+            .iter()
+            .position(|r| matches!(r.verdict, NftVerdict::DropReported(_)))
+            .expect("the veto drops on any other link");
+        assert!(pin_accept < first_corp && pin_drop_at < first_corp);
+    }
+
+    /// First-match walk of the output chain for one TCP/443 packet of `uid`.
+    fn first_verdict(rules: &[NftRule], uid: u32, dst: Ipv4Addr, oif: &str) -> Option<NftVerdict> {
+        first_verdict_of(rules, uid, dst, oif, false)
+    }
+
+    /// [`first_verdict`], for a packet whose route the kernel will encrypt
+    /// under an IPsec policy when `ipsec` holds.
+    fn first_verdict_of(
+        rules: &[NftRule],
+        uid: u32,
+        dst: Ipv4Addr,
+        oif: &str,
+        ipsec: bool,
+    ) -> Option<NftVerdict> {
+        let hit = |m: &NftMatch| match m {
+            NftMatch::SkUid(u) => *u == uid,
+            NftMatch::SkUidSet(ranges) => ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&uid)),
+            NftMatch::DstV4 { net, prefix } => {
+                let mask = u32::MAX.checked_shl(32 - u32::from(*prefix)).unwrap_or(0);
+                u32::from(*net) & mask == u32::from(dst) & mask
+            }
+            NftMatch::DstSetV4(blocks) => {
+                blocks.iter().any(|b| b.contains(std::net::IpAddr::V4(dst)))
+            }
+            NftMatch::OutInterface(dev) => dev == oif,
+            NftMatch::Protocol(p) => *p == 6,
+            NftMatch::DstPort(p) => *p == 443,
+            NftMatch::RouteIpsec => ipsec,
+            NftMatch::DstV6 { .. }
+            | NftMatch::DstSetV6(_)
+            | NftMatch::Mark(_)
+            | NftMatch::CtReply => false,
+        };
+        rules
+            .iter()
+            .find(|r| r.matches.iter().all(&hit))
+            .map(|r| r.verdict)
+    }
+
+    /// A corporate tunnel that carries the same private range as the home LAN
+    /// opens that range through itself and cuts nothing: the home LAN stays
+    /// reachable through the uplink, while a pin keeps its own guard.
+    #[test]
+    fn a_foreign_permit_does_not_cut_a_home_lan_in_the_same_range() {
+        use nrr_platform_api::enforcement::AdapterId;
+        let user = PrincipalScope::User(UserPrincipal::from_linux_uid(1000));
+        let mut corp = rule(
+            PrecedenceClass::CatchAllExempt,
+            0x0010_0000,
+            DstMatch::SubnetV4 {
+                net: v4(192, 168, 1, 0),
+                prefix: 24,
+            },
+            Verdict::Permit,
+        );
+        corp.principal = user.clone();
+        corp.egress = EgressConstraint::OnlyVia(EgressRef::Adapter(AdapterId("wg0".into())));
+        let mut pin = rule(
+            PrecedenceClass::RouteRule(RouteRole::Secondary),
+            0,
+            DstMatch::HostV4(v4(203, 0, 113, 9)),
+            Verdict::Permit,
+        );
+        pin.principal = user;
+        pin.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
+
+        let lowered = lower_plan(&plan_of(vec![corp, pin]), &names());
+        let rules = policy_rules(&lowered);
+
+        let lan = v4(192, 168, 1, 20);
+        assert!(
+            !matches!(
+                first_verdict(rules, 1000, lan, "eth0"),
+                Some(NftVerdict::Drop | NftVerdict::DropReported(_))
+            ),
+            "the home LAN is cut: {rules:?}"
+        );
+        assert_eq!(
+            first_verdict(rules, 1000, lan, "wg0"),
+            Some(NftVerdict::Accept)
+        );
+        assert!(
+            rules
+                .iter()
+                .filter(|r| r.comment.starts_with("catch-all-exempt"))
+                .all(|r| r.verdict == NftVerdict::Accept),
+            "an exemption only spares: {rules:?}"
+        );
+        let pinned = v4(203, 0, 113, 9);
+        assert_eq!(first_verdict(rules, 1000, pinned, "eth0"), Some(pin_drop()));
+        assert_eq!(
+            first_verdict(rules, 1000, pinned, "tun0"),
+            Some(NftVerdict::Accept)
+        );
+    }
+
+    /// The lockdown restated for a corporate link drops only what leaves
+    /// through that interface, ahead of the link's permit, and is reported as
+    /// the lockdown.
+    #[test]
+    fn the_lockdown_restated_for_a_foreign_link_drops_on_that_interface_only() {
+        use nrr_platform_api::enforcement::{AdapterId, DOH_FOREIGN_VETO_ORDINAL_BASE};
+        let corp = || EgressConstraint::OnlyVia(EgressRef::Adapter(AdapterId("corp0".into())));
+        let mut permit = rule(
+            PrecedenceClass::CatchAllExempt,
+            0x0010_0000,
+            DstMatch::SubnetV4 {
+                net: v4(10, 77, 0, 0),
+                prefix: 16,
+            },
+            Verdict::Permit,
+        );
+        permit.egress = corp();
+        let mut veto = rule(
+            PrecedenceClass::HardBlock,
+            DOH_FOREIGN_VETO_ORDINAL_BASE,
+            DstMatch::HostV4(v4(10, 77, 7, 7)),
+            Verdict::Block,
+        );
+        veto.egress = corp();
+        veto.flow.dst_port = Some(443);
+
+        let lowered = lower_plan(&plan_of(vec![permit, veto]), &names());
+        let rules = policy_rules(&lowered);
+        let drops: Vec<_> = rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                matches!(r.verdict, NftVerdict::DropReported(_))
+                    && r.matches
+                        .iter()
+                        .any(|m| matches!(m, NftMatch::OutInterface(_)))
+            })
+            .collect();
+        assert_eq!(
+            drops.len(),
+            1,
+            "one drop on the interface, no pin pair: {rules:?}"
+        );
+        let (at, drop) = drops[0];
+        assert!(matches!(
+            drop.verdict,
+            NftVerdict::DropReported(DropTag {
+                kind: DropKind::DnsLockdown,
+                ..
+            })
+        ));
+        assert!(
+            rules
+                .iter()
+                .all(|r| r.verdict != NftVerdict::Accept || !r.comment.starts_with("hard-block")),
+            "the restatement never accepts",
+        );
+        let permit_at = rules
+            .iter()
+            .position(|r| r.comment.starts_with("catch-all-exempt"))
+            .expect("the foreign permit is lowered");
+        assert!(at < permit_at, "matched before the link's permit");
+    }
+
+    /// What a policy-based IPsec VPN encrypts reaches a private network past
+    /// the catch-all on the main link; the same packet without the policy, or
+    /// to a public address, is still cut.
+    #[test]
+    fn ipsec_protected_traffic_is_spared_ahead_of_the_catch_all_block() {
+        let user = PrincipalScope::User(UserPrincipal::from_linux_uid(1000));
+        let private = [
+            (v4(10, 0, 0, 0), 8),
+            (v4(172, 16, 0, 0), 12),
+            (v4(192, 168, 0, 0), 16),
+        ];
+        let mut flows: Vec<FlowRule> = private
+            .iter()
+            .enumerate()
+            .map(|(n, &(net, prefix))| {
+                let mut permit = rule(
+                    PrecedenceClass::CatchAllExempt,
+                    0x0019_0000 + n as u32,
+                    DstMatch::SubnetV4 { net, prefix },
+                    Verdict::Permit,
+                );
+                permit.principal = user.clone();
+                permit.egress = EgressConstraint::UnderIpsecPolicy;
+                permit
+            })
+            .collect();
+        let mut block = rule(
+            PrecedenceClass::CatchAllBlock,
+            0,
+            DstMatch::Any,
+            Verdict::Block,
+        );
+        block.principal = user;
+        flows.push(block);
+
+        let lowered = lower_plan(&plan_of(flows), &names());
+        assert!(lowered.unsupported.is_empty(), "{:?}", lowered.unsupported);
+        let script = lowered.ruleset.to_nft_script();
+        let spared = script
+            .find(
+                "meta skuid 1000 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } rt ipsec exists accept",
+            )
+            .expect("one set rule for the private networks");
+        let cut = script.find("catch-all-block").expect("the catch-all");
+        assert!(spared < cut, "{script}");
+
+        let rules = policy_rules(&lowered);
+        let corp = v4(10, 20, 30, 40);
+        assert_eq!(
+            first_verdict_of(rules, 1000, corp, "eth0", true),
+            Some(NftVerdict::Accept)
+        );
+        let cut = Some(NftVerdict::DropReported(DropTag::user(DropKind::BlockAll)));
+        assert_eq!(first_verdict_of(rules, 1000, corp, "eth0", false), cut);
+        assert_eq!(
+            first_verdict_of(rules, 1000, v4(203, 0, 113, 9), "eth0", true),
+            cut,
+            "a policy over the whole internet keeps only the private networks"
+        );
+    }
+
+    /// The lockdown restated for IPsec-protected traffic drops only what the
+    /// kernel would encrypt, and before the permit that spares it.
+    #[test]
+    fn the_lockdown_restated_for_ipsec_traffic_drops_ahead_of_its_permit() {
+        use nrr_platform_api::enforcement::DOH_FOREIGN_VETO_ORDINAL_BASE;
+        let mut permit = rule(
+            PrecedenceClass::CatchAllExempt,
+            0x0019_0000,
+            DstMatch::SubnetV4 {
+                net: v4(10, 0, 0, 0),
+                prefix: 8,
+            },
+            Verdict::Permit,
+        );
+        permit.egress = EgressConstraint::UnderIpsecPolicy;
+        let mut veto = rule(
+            PrecedenceClass::HardBlock,
+            DOH_FOREIGN_VETO_ORDINAL_BASE,
+            DstMatch::HostV4(v4(10, 77, 7, 7)),
+            Verdict::Block,
+        );
+        veto.egress = EgressConstraint::UnderIpsecPolicy;
+        veto.flow.dst_port = Some(443);
+
+        let lowered = lower_plan(&plan_of(vec![permit, veto]), &names());
+        let rules = policy_rules(&lowered);
+        let drop_at = rules
+            .iter()
+            .position(|r| {
+                r.verdict == NftVerdict::DropReported(DropTag::user(DropKind::DnsLockdown))
+                    && r.matches.contains(&NftMatch::RouteIpsec)
+            })
+            .expect("the restated lockdown");
+        let permit_at = rules
+            .iter()
+            .position(|r| {
+                r.verdict == NftVerdict::Accept && r.matches.contains(&NftMatch::RouteIpsec)
+            })
+            .expect("the permit");
+        assert!(drop_at < permit_at, "{rules:?}");
+    }
+
+    /// The chain is walked by every packet: a corporate link that pushes many
+    /// networks folds into ONE rule over an anonymous set.
+    #[test]
+    fn a_foreign_links_networks_fold_into_one_set_rule() {
+        use nrr_platform_api::enforcement::AdapterId;
+        let flows: Vec<FlowRule> = (0..40u8)
+            .map(|n| {
+                let mut permit = rule(
+                    PrecedenceClass::CatchAllExempt,
+                    0x0010_0000 + u32::from(n),
+                    DstMatch::SubnetV4 {
+                        net: v4(10, n + 1, 0, 0),
+                        prefix: 16,
+                    },
+                    Verdict::Permit,
+                );
+                permit.egress =
+                    EgressConstraint::OnlyVia(EgressRef::Adapter(AdapterId("corp0".into())));
+                permit
+            })
+            .collect();
+        let lowered = lower_plan(&plan_of(flows), &names());
+        let rules = policy_rules(&lowered);
+        let corp: Vec<_> = rules
+            .iter()
+            .filter(|r| {
+                r.comment.starts_with("catch-all-exempt") && r.verdict == NftVerdict::Accept
+            })
+            .collect();
+        assert_eq!(corp.len(), 1, "{corp:?}");
+        assert!(corp[0]
+            .matches
+            .iter()
+            .any(|m| matches!(m, NftMatch::DstSetV4(set) if set.len() == 40)));
     }
 
     /// A backend that silently ignores part of a plan looks exactly like one
@@ -1006,6 +1458,7 @@ mod tests {
                 app: AppScope::Any,
                 egress: EgressConstraint::OnlyVia(EgressRef::Secondary),
                 coverage: Coverage::ConnectOnly,
+                observed_by_program: false,
             }],
             routes: Vec::new(),
             policy_rules: Vec::new(),
@@ -1045,6 +1498,7 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage,
+            observed_by_program: false,
         };
         let plan = EnforcementPlan {
             principal: UserPrincipal::from_linux_uid(1000),
@@ -1079,6 +1533,7 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
+            observed_by_program: false,
         };
         let plan = EnforcementPlan {
             principal: UserPrincipal::from_linux_uid(uid),
@@ -1121,6 +1576,7 @@ mod tests {
                 app: AppScope::Any,
                 egress: EgressConstraint::Any,
                 coverage: Coverage::ConnectOnly,
+                observed_by_program: false,
             }],
             routes: Vec::new(),
             policy_rules: Vec::new(),
@@ -1162,6 +1618,7 @@ mod tests {
                 app: AppScope::Any,
                 egress: EgressConstraint::Any,
                 coverage: Coverage::ConnectOnly,
+                observed_by_program: false,
             }],
             routes: Vec::new(),
             policy_rules: Vec::new(),
@@ -1370,7 +1827,6 @@ mod tests {
             (PrecedenceClass::CatchAllBlock, DropKind::BlockAll),
             (PrecedenceClass::DohBlock, DropKind::DnsLockdown),
             (PrecedenceClass::HardBlock, DropKind::Rule),
-            (PrecedenceClass::DefaultCatchAll, DropKind::Default),
             (PrecedenceClass::FakeIpPool, DropKind::RelayPool),
         ];
         for (class, kind) in cases {
@@ -1472,44 +1928,6 @@ mod tests {
             policy_rules(&lowered).len(),
             1,
             "the other user's guard still lowers"
-        );
-    }
-
-    /// The strict default block is stated twice by the planner — family-less
-    /// and as `::/0` for a backend whose `Any` is one family. One chain judges
-    /// both families, so the v6 twin decides nothing and is dropped.
-    #[test]
-    fn the_v6_twin_of_the_default_block_folds_into_the_family_less_one() {
-        let uid = 1000;
-        let block = |ordinal, dst| {
-            let mut flow = rule(
-                PrecedenceClass::DefaultCatchAll,
-                ordinal,
-                dst,
-                Verdict::Block,
-            );
-            flow.principal = PrincipalScope::User(UserPrincipal::from_linux_uid(uid));
-            flow
-        };
-        let v6_all = DstMatch::SubnetV6 {
-            net: std::net::Ipv6Addr::UNSPECIFIED,
-            prefix: 0,
-        };
-        let plan = EnforcementPlan {
-            principal: UserPrincipal::from_linux_uid(uid),
-            flows: vec![block(0, DstMatch::Any), block(1, v6_all)],
-            routes: Vec::new(),
-            policy_rules: Vec::new(),
-        };
-
-        let lowered = lower_plan(&plan, &EgressNames::default());
-
-        let rules = policy_rules(&lowered);
-        assert_eq!(rules.len(), 1, "{rules:?}");
-        assert_eq!(rules[0].matches, vec![NftMatch::SkUid(uid)]);
-        assert_eq!(
-            rules[0].verdict,
-            NftVerdict::DropReported(DropTag::user(DropKind::Default))
         );
     }
 

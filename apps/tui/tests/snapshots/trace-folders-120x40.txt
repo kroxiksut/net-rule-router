@@ -4,17 +4,17 @@ Screens                    Connection trace
   2 First run              Show blocked: No · Show local connections: No · IPv6 only: No
   3 Interfaces and routes  Group: By folder
   4 Rules                  Connections
-  5 Overlaps               > 1. C:\Program Files\AVP  ·  2 program(s)  ·  2 connection(s):
+  5 Overlaps               > 1. C:\Program Files\AVP  ·  2 programs  ·  2 connections:
   6 Suggested addresses      2. avp.exe → 203.0.113.50:443 — Primary · Allowed
 > 7 Connection trace         3. avp2.exe → 203.0.113.50:443 — Primary · Allowed
-  8 Cache                    4. C:\Tools  ·  1 program(s)  ·  1 connection(s):
+  8 Cache                    4. C:\Tools  ·  1 program  ·  1 connection:
   9 Diagnostics and logs     5. tool.exe → 203.0.113.50:443 — Primary · Allowed
-  0 Settings                 6. Programs without a known path  ·  1 program(s)  ·  1 connection(s):
+  0 Settings                 6. Programs without a known path  ·  1 program  ·  1 connection:
                              7. svc → 203.0.113.50:443 — Primary · Allowed
                            Rows 1–7 of 7.
                            Selected connection
                            Path: C:\Program Files\AVP
-                           2 program(s)  ·  2 connection(s)
+                           2 programs  ·  2 connections
                            f: Rule for this folder…
 
 

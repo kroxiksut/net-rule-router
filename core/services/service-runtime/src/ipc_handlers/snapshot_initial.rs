@@ -140,6 +140,12 @@ impl IpcHandler for SnapshotInitialHandler {
         } else {
             self.route_policy.get_for_sid(ctx.caller_stored())
         };
+        // A caller with no policy settles its first choice against this.
+        let first_policy = if route_policy.is_none() && !ctx.caller_stored().is_empty() {
+            self.route_policy.first_policy()
+        } else {
+            None
+        };
 
         // Settings snapshot.
         let pending_revisions: Vec<RevisionSummaryDto> = self
@@ -160,10 +166,13 @@ impl IpcHandler for SnapshotInitialHandler {
             .collect();
         let last_known_good = self.policy.last_known_good_id();
         let apply_failure_policy = Some(self.apply_failure_policy.get());
-        let routing_paused = if ctx.caller_stored().is_empty() {
-            false
+        let (routing_paused, pause_term) = if ctx.caller_stored().is_empty() {
+            (false, Default::default())
         } else {
-            self.routing_pause.get(ctx.caller_stored()).paused
+            (
+                self.routing_pause.get(ctx.caller_stored()).paused,
+                self.routing_pause.term(ctx.caller_stored()),
+            )
         };
         let autostart = Some(self.autostart.get());
         let retention_settings = Some(self.retention.get());
@@ -196,11 +205,24 @@ impl IpcHandler for SnapshotInitialHandler {
         } else {
             self.route_enforcement.traffic_carried(ctx.caller_stored())
         };
+        // The caller's own book only: another user's failing read is theirs.
+        let rules_book_unreadable = !ctx.caller_stored().is_empty()
+            && crate::rules_book_notice::service().unreadable_for(ctx.caller_stored());
         // The caller's own: a client waits for the user who can confirm it.
         let pending_vpn_clients = if ctx.caller_stored().is_empty() {
             Vec::new()
         } else {
             crate::vpn_client_trust::global_pending_vpn_clients().dtos_for(ctx.caller_stored())
+        };
+        // The caller's own gateways, asked and answered.
+        let (pending_vpn_gateways, confirmed_vpn_gateways) = if ctx.caller_stored().is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let book = crate::vpn_gateway_confirm::global_vpn_gateways();
+            (
+                book.pending_for(ctx.caller_stored()),
+                book.confirmed_for(ctx.caller_stored()),
+            )
         };
         // The caller's own confirmations of protected rules, with their terms.
         let rule_overrides = match crate::override_grants::installed() {
@@ -219,10 +241,13 @@ impl IpcHandler for SnapshotInitialHandler {
             active_alerts_count,
             active_revision_id,
             route_policy,
+            first_policy,
             pending_revisions,
             last_known_good,
             apply_failure_policy,
             routing_paused,
+            routing_pause_resumes_at_ms: pause_term.resumes_at_ms,
+            routing_pause_until_restart: pause_term.until_restart,
             autostart,
             retention_settings,
             unenforced_app_rules,
@@ -234,7 +259,10 @@ impl IpcHandler for SnapshotInitialHandler {
             enforcement_status,
             routes_held_by_another_user,
             traffic_carried_by_another_user,
+            rules_book_unreadable,
             pending_vpn_clients,
+            pending_vpn_gateways,
+            confirmed_vpn_gateways,
             rule_overrides,
         };
         serde_json::to_value(resp).map_err(|e| IpcError {
@@ -644,5 +672,118 @@ mod tests {
         assert!(resp.get("traffic-carried-by-another-user").is_none());
         let anonymous = h.handle(&req(), &ctx()).unwrap();
         assert!(anonymous.get("traffic-carried-by-another-user").is_none());
+    }
+
+    /// A client that connects while its own rule book does not read learns it
+    /// here; another user and an anonymous caller see nothing.
+    #[test]
+    fn surfaces_only_the_callers_unreadable_rule_book() {
+        use nrr_domain::user_principal::UserPrincipal;
+        // Uids no other test uses: the registry is the service's own.
+        let caller = UserPrincipal::from_linux_uid(47_011);
+        let other = UserPrincipal::from_linux_uid(47_012);
+        crate::rules_book_notice::service().raise(caller.as_stored());
+        let h = SnapshotInitialHandler::new(
+            Arc::new(FakeHealth {
+                state: ServiceRuntimeState::Running,
+                severity: ServiceHealthSeverity::Ok,
+            }),
+            Arc::new(FakePolicy { revision: None }),
+            Arc::new(FakeAdapters::empty()),
+            Arc::new(FakeDiagnostics::healthy()),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRoutePolicy::default()),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeApplyFailurePolicy),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRoutingPause),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeAutostart),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRetention),
+            AppEnforcementStatus::new(),
+            crate::app_enforcement_status::SharedIpExemptionStatus::new(),
+            crate::app_enforcement_status::BlockAllPostureStatus::new(),
+        );
+
+        let own = IpcRequestContext {
+            caller_principal: Some(caller.clone()),
+            ..ctx()
+        };
+        let resp = h.handle(&req(), &own).unwrap();
+        assert_eq!(resp["rules-book-unreadable"], true);
+
+        let theirs = IpcRequestContext {
+            caller_principal: Some(other),
+            ..ctx()
+        };
+        let resp = h.handle(&req(), &theirs).unwrap();
+        assert!(resp.get("rules-book-unreadable").is_none());
+        let anonymous = h.handle(&req(), &ctx()).unwrap();
+        assert!(anonymous.get("rules-book-unreadable").is_none());
+
+        crate::rules_book_notice::service().clear(caller.as_stored());
+        let resp = h.handle(&req(), &own).unwrap();
+        assert!(
+            resp.get("rules-book-unreadable").is_none(),
+            "cleared once it reads"
+        );
+    }
+
+    /// The install-time start reaches only a caller with no policy of its own.
+    #[test]
+    fn the_first_policy_is_reported_only_while_the_caller_has_none() {
+        use crate::ipc_handlers::payloads::{BehaviorModeDto, FirstPolicyDto, LeakProtectionDto};
+        use crate::ipc_handlers::test_fakes::FakeRoutePolicy;
+        let first = FirstPolicyDto {
+            mode: BehaviorModeDto::PreferSecondaryWhenAvailable,
+            leak_protection_at_least: LeakProtectionDto::Everything,
+        };
+        let handler = |stored: Option<RoutePolicyDto>| {
+            SnapshotInitialHandler::new(
+                Arc::new(FakeHealth {
+                    state: ServiceRuntimeState::Running,
+                    severity: ServiceHealthSeverity::Ok,
+                }),
+                Arc::new(FakePolicy { revision: None }),
+                Arc::new(FakeAdapters::empty()),
+                Arc::new(FakeDiagnostics::healthy()),
+                Arc::new(FakeRoutePolicy {
+                    stored: std::sync::Mutex::new(stored),
+                    first: Some(first),
+                }),
+                Arc::new(crate::ipc_handlers::test_fakes::FakeApplyFailurePolicy),
+                Arc::new(crate::ipc_handlers::test_fakes::FakeRoutingPause),
+                Arc::new(crate::ipc_handlers::test_fakes::FakeAutostart),
+                Arc::new(crate::ipc_handlers::test_fakes::FakeRetention),
+                AppEnforcementStatus::new(),
+                crate::app_enforcement_status::SharedIpExemptionStatus::new(),
+                crate::app_enforcement_status::BlockAllPostureStatus::new(),
+            )
+        };
+        let own = IpcRequestContext {
+            caller_principal: Some(nrr_domain::user_principal::UserPrincipal::from_linux_uid(
+                1000,
+            )),
+            ..ctx()
+        };
+
+        let resp = handler(None).handle(&req(), &own).unwrap();
+        assert_eq!(
+            resp["first-policy"]["mode"],
+            "prefer-secondary-when-available"
+        );
+        assert_eq!(
+            resp["first-policy"]["leak-protection-at-least"],
+            "everything"
+        );
+        let parsed: SnapshotInitialResponse = serde_json::from_value(resp).unwrap();
+        assert_eq!(parsed.first_policy, Some(first));
+
+        let stored: RoutePolicyDto = serde_json::from_value(serde_json::json!({
+            "mode": "prefer-primary",
+            "leak-protection": "off",
+            "doh-lockdown-enabled": false,
+            "kill-switch-strict-shared-ips": false,
+            "binding-source": "user-assigned"
+        }))
+        .unwrap();
+        let resp = handler(Some(stored)).handle(&req(), &own).unwrap();
+        assert!(resp.get("first-policy").is_none());
     }
 }

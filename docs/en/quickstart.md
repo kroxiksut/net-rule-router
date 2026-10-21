@@ -7,10 +7,10 @@ IP address, or application. It works with connections you already have
 (main internet + VPN, two providers, Wi-Fi + Ethernet), and is not a VPN
 client, proxy, or anonymity tool.
 
-> **This is pre-alpha.** Leak protection and its block-all mode have not
-> yet passed full testing and may work
-> incorrectly — up to a complete loss of network access until the mode is
-> disabled. They are available in settings, but enabling them is at your
+> **This is pre-alpha.** Leak protection, its **Everything** setting above
+> all, has not yet passed full testing and may work
+> incorrectly — up to a complete loss of network access until it is set
+> back to **Off**. It is available in settings, but turning it on is at your
 > own risk.
 
 ## Requirements
@@ -65,8 +65,26 @@ routing does not apply.
 
    ![Interfaces & routes: the main and the additional adapter](images/interfaces-routes.png)
 
-3. **Choose default behavior** — where does traffic that doesn't match any
-   rule go: the main or additional route.
+3. **Choose the default route and leak protection.** The *default route*
+   decides where traffic that no rule covers goes:
+
+   - **Main connection — selected sites through the additional one**;
+   - **Additional connection — exceptions through the main one**.
+
+   *Leak protection* decides what may still leave over the main connection
+   instead of the additional one:
+
+   - **Off** (the default) — if the additional connection drops, traffic
+     continues over your main connection.
+   - **Routed sites** — what your rules send through the additional
+     connection never goes out the main one. Everything else keeps working.
+     Offered with the main-connection default route.
+   - **Everything** — nothing leaves except through the additional
+     connection, your local network and what your rules send over the main
+     connection. If the additional connection drops, the internet waits
+     until it returns.
+
+   A corporate VPN beside yours keeps its own networks in every mode.
 
    ![Routing behavior: where traffic that no rule covers goes](images/routing-behavior.png)
 
@@ -129,6 +147,53 @@ receive — every rule added, changed or removed — and waits for your
 confirmation.
 
 ![Review before applying: the full list of changes, waiting for your confirmation](images/review-changes.png)
+
+### Deny, many rules at once, and recent changes
+
+- **Deny.** Choose *Deny* as the route when you add a rule, or put `!` before
+  the value in a rules file (`!telemetry.example.net`): that site, address,
+  network or program is not let through any connection. The *Denied* filter
+  of the rules list shows them all.
+- **Several rules at once.** Switch the add window to *Several rules* and
+  type or paste one rule per line, as in a rules file. Each line is checked
+  and shown with its type before anything is added; the lines that are not
+  taken stay in the box for you to fix.
+- **Recent.** The *Recent* filter of the rules list shows what you added or
+  changed in the last hour, today or the last 7 days, newest first, with the
+  time and what it was before. Rules you deleted are listed below them, and
+  *Restore* puts one back as it was; apply to bring it into
+  force again.
+
+The terminal interface has all three too; see [its Rules
+screen](tui.md#more-on-the-rules-screen).
+
+### Programs by name, file or folder
+
+An application rule names a program by its name (`chrome.exe`), by its file
+(`C:\Apps\Tool\tool.exe`) or by the folder it lives in: *Choose folder...* in
+the add window, with *Include subfolders* for a program that keeps helpers
+and new versions in subfolders; under the field the window says how many
+programs the rule takes. A folder rule also covers a program that
+appears there after an update, and the scripts kept in the folder when they
+are started by Python, PowerShell, Java and the like. Rules by file and
+folder work on Windows and Linux. The full list of forms is in the [rules
+format](rules-file-format.md#windows--linux--macos-application-sections).
+
+To find the folder, open **Connection trace** and group it by folder: a
+folder group offers a rule for the whole folder.
+
+### Programs the system needs are protected
+
+A deny, or a rule for the additional route, cannot take a program or a folder
+the computer needs to stay on the network: the system folder, `svchost.exe`,
+the network services, a folder many programs share such as `Program Files`.
+The add window says so before the rule is saved, and such a rule already in a
+rules file is shown as not applied, with the reason. When you do mean it,
+write `+override` after the value in the rules file: the rule is applied once
+you confirm it in the rules list (*Confirm…*), for a time you choose, and
+confirming a rule that reaches past your own programs asks for administrator
+rights. See [Applying a rule despite the
+protection](rules-file-format.md#116-applying-a-rule-despite-the-protection-override).
 
 ### Application rules need a restart of the program
 
@@ -208,9 +273,9 @@ rules stay in place and will work as soon as you assign an additional
 route (for example, install a VPN).
 
 If you want traffic from such rules to be **blocked instead of using the
-main channel**, turn on leak protection — but read the
-warning at the beginning of this document: in pre-alpha that mode is
-enabled at your own risk.
+main channel**, set leak protection to **Routed sites** — but read the
+warning at the beginning of this document: in pre-alpha leak protection is
+turned on at your own risk.
 
 If you do use a VPN, tell the app which program it is — its client keeps
 working over your main link while leak protection is on, instead of being cut
@@ -246,7 +311,8 @@ may tell you and which kinds of notifications stay hidden, and for how long.
 ![Settings → Application](images/settings.png)
 
 The theme follows the system or can be set to light or dark; for low vision
-there is a dedicated high-contrast theme.
+there is a dedicated high-contrast theme. Text size, the font and working
+from the keyboard alone are covered in [Accessibility](accessibility.md).
 
 ![Dark theme](images/theme-dark.png)
 
@@ -304,10 +370,10 @@ most — including turning the rules off for a moment.
 
 The app makes no permanent changes to your system: all routes and blocking
 filters it creates are **temporary** — they do not survive a reboot. If
-after experimenting with rules (especially with leak protection or block-all)
-you lost network access, proceed step by step:
+after experimenting with rules (especially with leak protection set to
+**Everything**) you lost network access, proceed step by step:
 
-1. **Turn off leak protection** in the app settings
+1. **Set leak protection to Off** in the app settings
    and apply the changes.
 2. **Stop the service** — Settings → Service management → Stop service.
    When the service stops, it removes its routes and protection, every
@@ -333,6 +399,32 @@ you lost network access, proceed step by step:
 
 To see the current routing table for diagnostics, use
 `route print -4` (or `Get-NetRoute -AddressFamily IPv4`).
+
+## Updating
+
+Once the first release is out, the app tells you when a newer version is
+available, but it never downloads or installs anything: you take the new
+version from the [releases page](https://github.com/kroxiksut/net-rule-router/releases)
+yourself. An update keeps your rules, settings, connection history and the
+audit trail. Rule sets kept in the program folder are replaced by the new
+version's, which is why your own set belongs in a folder of your own.
+
+- **Installed with the EXE or the MSI.** Run the installer of the new version
+  of the same kind: EXE over EXE, MSI over MSI. It stops the service, replaces
+  the program and starts the service again. To move from one kind to the
+  other, remove the first in the default mode, which keeps your data, then
+  install the other.
+- **Portable copy.** Close the window and choose **Exit** in the tray menu,
+  unpack the new version into a folder of its own (or over the old one) and
+  start `NetRuleRouter.exe` from it. The app sees that the service is an
+  older build or runs from another folder and offers **Update service from
+  this folder** in Settings → Service management; it asks for administrator
+  approval, and routing pauses for a moment. From a terminal opened as
+  administrator in the new folder, `nrr-cli reinstall` does the same.
+
+If an update stops with an error, check that NetRuleRouter is still listed in
+Settings → Apps and that the service is running (`nrr-cli status`). If either
+is missing, run the installer of the new version again.
 
 ## Removal
 

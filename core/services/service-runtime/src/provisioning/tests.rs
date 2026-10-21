@@ -186,6 +186,7 @@ fn the_settings_reader_takes_the_exporters_own_output_and_ignores_its_adapters()
         .yaml_bytes_utf8;
     let facts = read_settings_export(yaml.as_bytes()).expect("read");
     assert_eq!(facts.route_mode, Some(BehaviorMode::PreferPrimary));
+    assert_eq!(facts.leak_protection, Some(nrr_domain::LeakProtection::Off));
 }
 
 #[test]
@@ -196,6 +197,18 @@ fn the_settings_reader_refuses_what_it_does_not_understand() {
             .expect("read")
             .route_mode,
         Some(BehaviorMode::PreferSecondaryWhenAvailable)
+    );
+    // An export from before the strict mode was retired still installs, and
+    // keeps its promise of no leaks.
+    let old = "nrr_settings_export:\n  version: 1\n  behavior:\n    route_mode: \"strict-secondary-fail-closed\"\n";
+    let facts = read_settings_export(old.as_bytes()).expect("read");
+    assert_eq!(
+        facts.route_mode,
+        Some(BehaviorMode::PreferSecondaryWhenAvailable)
+    );
+    assert_eq!(
+        facts.leak_protection,
+        Some(nrr_domain::LeakProtection::Everything)
     );
     for (text, code) in [
         ("version: 1\n", "not-a-settings-export"),
@@ -210,6 +223,10 @@ fn the_settings_reader_refuses_what_it_does_not_understand() {
         (
             "nrr_settings_export:\n  version: 1\n  behavior:\n    route_mode: \"sideways\"\n",
             "unknown-route-mode",
+        ),
+        (
+            "nrr_settings_export:\n  version: 1\n  behavior:\n    leak_protection: \"on\"\n",
+            "unknown-leak-protection",
         ),
         ("nrr_settings_export:\n\tversion: 1\n", "tab-indentation"),
         (
@@ -329,6 +346,36 @@ fn a_broken_file_leaves_the_baseline_and_the_policy_and_raises_the_notice() {
         fx.apply(),
         ProvisionApplyOutcome::NothingStaged,
         "not retried"
+    );
+}
+
+/// An old export's strict mode reaches the install policy as the additional
+/// route with a floor of everything.
+#[test]
+fn a_strict_export_stores_the_additional_route_and_a_floor_of_everything() {
+    let fx = Fixture::new();
+    fx.stage(&BundleBytes {
+        settings: Some(
+            b"nrr_settings_export:\n  version: 1\n  behavior:\n    route_mode: \"strict-secondary-fail-closed\"\n"
+                .to_vec(),
+        ),
+        ..BundleBytes::default()
+    });
+    assert_eq!(
+        fx.apply(),
+        ProvisionApplyOutcome::Applied {
+            rules: false,
+            policy: true
+        }
+    );
+    let policy = fx.policy();
+    assert_eq!(
+        policy.default_route_mode,
+        Some(BehaviorMode::PreferSecondaryWhenAvailable)
+    );
+    assert_eq!(
+        policy.default_leak_protection,
+        nrr_domain::LeakProtection::Everything
     );
 }
 

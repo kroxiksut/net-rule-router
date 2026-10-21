@@ -100,14 +100,6 @@ pub(super) fn resolve_user_locales_dir() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    // Backward compatibility with the pre-3.6 external-locale override variable.
-    if let Ok(legacy_dir) = env::var("NRR_LOCALES_DIR") {
-        let path = PathBuf::from(legacy_dir);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
     resolve_managed_locales_dir()
 }
 

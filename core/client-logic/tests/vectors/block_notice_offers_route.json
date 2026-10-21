@@ -1,0 +1,15 @@
+{
+  "description": "pure.js blockNoticeOffersRoute: whether a block notice of this reason offers \"To additional route\"",
+  "cases": [
+    { "name": "blocked by a rule", "input": { "reason": "blocked-by-rule" }, "expected": true },
+    { "name": "filter unknown", "input": { "reason": "unattributed" }, "expected": true },
+    { "name": "no reason given", "input": { "reason": "" }, "expected": true },
+    { "name": "reason absent", "input": { "reason": null }, "expected": true },
+    { "name": "a reason this build does not know", "input": { "reason": "something-new" }, "expected": true },
+    { "name": "route is down", "input": { "reason": "route-unavailable" }, "expected": false },
+    { "name": "IPv6 switched off", "input": { "reason": "ipv6-blocked" }, "expected": false },
+    { "name": "own encrypted DNS", "input": { "reason": "dns-lockdown" }, "expected": false },
+    { "name": "case is part of the slug", "input": { "reason": "Route-Unavailable" }, "expected": true },
+    { "name": "padding is not trimmed", "input": { "reason": " dns-lockdown" }, "expected": true }
+  ]
+}

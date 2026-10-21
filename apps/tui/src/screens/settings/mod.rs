@@ -10,6 +10,8 @@ mod clock;
 mod items;
 mod jobs;
 pub mod prefs;
+mod providers;
+mod reset;
 #[cfg(test)]
 mod tests;
 mod text;
@@ -25,7 +27,7 @@ use nrr_shared::ipc_payloads::{
     BlockNoticeMuteDto, BlockNoticeMuteScopeDto, ConnHistoryListResponse,
     LocalDnsSuffixesGetResponse, LocalNetworksGetResponse, LogRetentionConfigDto,
     LogRetentionConfigSetRequest, RetentionSettingsDto, RetentionSettingsSetRequest,
-    StorageUsageDto, TrafficStatsGetResponse, TrafficStatsSettingsDto,
+    RollbackTargetDto, StorageUsageDto, TrafficStatsGetResponse, TrafficStatsSettingsDto,
 };
 use nrr_shared::ipc_transport::IpcErrorCode;
 use nrr_shared::platform_profile::{PlatformProfile, PlatformSupports};
@@ -131,15 +133,20 @@ impl Failure {
     }
 }
 
+/// How to start the terminal with the rights a machine-wide action needs.
+pub fn elevation_text(texts: &Texts) -> String {
+    texts.get(if cfg!(windows) {
+        text::NEEDS_ELEVATION_WINDOWS
+    } else {
+        text::NEEDS_ELEVATION_UNIX
+    })
+}
+
 /// The words for a failure: the remedy for missing rights, the GUI's wording
 /// for a known service code, else what the source said.
 pub fn failure_text(failure: &Failure, texts: &Texts) -> String {
     if failure.elevation {
-        return texts.get(if cfg!(windows) {
-            text::NEEDS_ELEVATION_WINDOWS
-        } else {
-            text::NEEDS_ELEVATION_UNIX
-        });
+        return elevation_text(texts);
     }
     if failure.slug.is_empty() {
         return failure.detail.clone();
@@ -281,12 +288,30 @@ pub enum Mode {
     Editing { buffer: String },
     /// An action that cannot be undone waits for a second yes.
     Confirming,
+    /// A pick that would hold traffic (a leak-protection level, or a default
+    /// route that raises it) waits for a yes.
+    ConfirmingPick {
+        slug: &'static str,
+        why: route_policy::LeakProtectionConfirm,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub words: Words,
     pub tone: Option<StateTone>,
+}
+
+/// What the safe-rollback lookup found; the token is spent by one rollback.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RollbackOffer {
+    #[default]
+    Unasked,
+    Nothing,
+    Ready {
+        token: String,
+        target: RollbackTargetDto,
+    },
 }
 
 #[derive(Debug)]
@@ -304,12 +329,17 @@ pub struct SettingsState {
     pub local_suffix_new: String,
     pub local_network_new: String,
     pub export_path: String,
+    /// Why protection is being switched off, kept in the audit trail.
+    pub safe_disable_reason: String,
+    pub rollback: RollbackOffer,
     pub prefs: TuiPrefs,
     /// Where the terminal's settings are saved; `None` cannot save.
     pub prefs_path: Option<PathBuf>,
     pub clock: Clock,
     pub service_probe: RegistrationProbe,
     pub supports: PlatformSupports,
+    pub reset: reset::ResetState,
+    pub providers: providers::ProvidersState,
 }
 
 impl Default for SettingsState {
@@ -324,11 +354,15 @@ impl Default for SettingsState {
             local_suffix_new: String::new(),
             local_network_new: String::new(),
             export_path: String::new(),
+            safe_disable_reason: String::new(),
+            rollback: RollbackOffer::default(),
             prefs: TuiPrefs::default(),
             prefs_path: None,
             clock: Clock::default(),
             service_probe: crate::platform::service_control,
             supports: PlatformProfile::current().supports,
+            reset: reset::ResetState::default(),
+            providers: providers::ProvidersState::default(),
         }
     }
 }
@@ -414,6 +448,13 @@ impl Screen for SettingsScreen {
         app.settings.mode != Mode::Browse
     }
 
+    fn text_target(&self, app: &AppState) -> crate::paste::TextTarget {
+        match app.settings.mode {
+            Mode::Editing { .. } => crate::paste::TextTarget::Line,
+            _ => crate::paste::TextTarget::None,
+        }
+    }
+
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
         on_key(app, key)
     }
@@ -427,7 +468,7 @@ impl Screen for SettingsScreen {
             Mode::Browse => None,
             Mode::Picking { .. } => Some(text::PLAIN_PICK),
             Mode::Editing { .. } => Some(text::PLAIN_EDIT),
-            Mode::Confirming => Some(text::PLAIN_CONFIRM),
+            Mode::Confirming | Mode::ConfirmingPick { .. } => Some(text::PLAIN_CONFIRM),
         }
     }
 }
@@ -547,6 +588,11 @@ fn detail_lines(app: &AppState, item: &Item, focused: bool, texts: &Texts) -> Ve
             lines
         }
         (Mode::Confirming, _) if focused => vec![indent(texts.get(text::CONFIRM))],
+        (Mode::ConfirmingPick { why, .. }, _) if focused => {
+            let mut lines = leak_confirm_lines(app, *why, texts);
+            lines.push(indent(texts.get(text::CONFIRM)));
+            lines
+        }
         (Mode::Browse, _) => item
             .note
             .iter()
@@ -700,14 +746,83 @@ fn pick(app: &mut AppState, option: usize) {
     };
     if let Kind::Choice { options, .. } = &item.kind {
         if let Some(slug) = options.get(option).map(|o| o.slug) {
+            if let Some(why) = leak_confirm(app, &item, slug) {
+                app.settings.mode = Mode::ConfirmingPick { slug, why };
+                return;
+            }
             activate(app, &item, Input::Pick(slug));
         }
     }
 }
 
+/// What a pick must be confirmed for, as the window and the tray decide it:
+/// a leak-protection level, or a default route whose write raises the level.
+fn leak_confirm(
+    app: &AppState,
+    item: &Item,
+    next: &str,
+) -> Option<route_policy::LeakProtectionConfirm> {
+    let Loadable::Ready(policy) = &app.settings.data.policy else {
+        return None;
+    };
+    let level = items::leak_protection(policy);
+    let secondary = bound_secondary_row(app);
+    match item.id {
+        ItemId::Policy(route_policy::LEAK_PROTECTION_KEY) => {
+            route_policy::leak_protection_confirm(level, next, secondary)
+        }
+        ItemId::Policy("mode") => {
+            route_policy::default_route_change_confirm(level, next, secondary)
+        }
+        _ => None,
+    }
+}
+
+fn bound_secondary_row(app: &AppState) -> Option<&nrr_shared::ipc_payloads::InterfaceRowDto> {
+    let snapshot = app.snapshot.as_ref()?;
+    let binding = snapshot.route_policy.as_ref()?.secondary.as_ref()?;
+    crate::screens::status::bound_row(&snapshot.adapters.rows, binding)
+}
+
+fn leak_confirm_lines(
+    app: &AppState,
+    why: route_policy::LeakProtectionConfirm,
+    texts: &Texts,
+) -> Vec<ViewLine> {
+    use crate::screens::interfaces::keys as ik;
+    let words = match why {
+        route_policy::LeakProtectionConfirm::HoldsNow => vec![
+            texts.get(text::LEAK_HOLDS_TITLE),
+            texts.get(text::LEAK_HOLDS_BODY),
+            texts.get(text::LEAK_HOLDS_EFFECT),
+        ],
+        route_policy::LeakProtectionConfirm::Unroutable => {
+            let name = bound_secondary_row(app)
+                .map(nrr_client_logic::adapters::display_name)
+                .unwrap_or_default();
+            vec![
+                texts.get(ik::UNROUTABLE_TITLE),
+                texts.fill(ik::UNROUTABLE_ADAPTER, &[("name", &name)]),
+                texts.get(text::LEAK_UNROUTABLE_BODY),
+                texts.get(text::LEAK_UNROUTABLE_EFFECT),
+            ]
+        }
+    };
+    words
+        .into_iter()
+        .map(|text| ViewLine::text(format!("      {text}")))
+        .collect()
+}
+
 fn run_confirmed(app: &mut AppState) {
     if let Some(item) = focused_item(app) {
         activate(app, &item, Input::Run);
+    }
+}
+
+fn run_confirmed_pick(app: &mut AppState, slug: &'static str) {
+    if let Some(item) = focused_item(app) {
+        activate(app, &item, Input::Pick(slug));
     }
 }
 
@@ -755,6 +870,12 @@ fn on_key(app: &mut AppState, key: KeyEvent) -> bool {
         Mode::Confirming => {
             if key.code == KeyCode::Enter {
                 run_confirmed(app);
+            }
+            true
+        }
+        Mode::ConfirmingPick { slug, .. } => {
+            if key.code == KeyCode::Enter {
+                run_confirmed_pick(app, slug);
             }
             true
         }
@@ -809,6 +930,12 @@ fn on_line(app: &mut AppState, line: &str) -> bool {
         Mode::Confirming => {
             if is_yes(line) {
                 run_confirmed(app);
+            }
+            return true;
+        }
+        Mode::ConfirmingPick { slug, .. } => {
+            if is_yes(line) {
+                run_confirmed_pick(app, slug);
             }
             return true;
         }
@@ -925,7 +1052,11 @@ fn load(app: &mut AppState) {
             s.data.traffic.start();
             queue.push(jobs::load_traffic(day));
         }
-        Category::Service | Category::Presets | Category::Updates | Category::Terminal => {}
+        Category::Presets => {
+            s.reset.others.start();
+            queue.push(reset::load_others());
+        }
+        Category::Service | Category::Updates | Category::Terminal => {}
     }
     for job in queue {
         app.outbox.push(job);
@@ -954,7 +1085,11 @@ fn needs_service(id: ItemId) -> bool {
             | ItemId::MuteUnit
             | ItemId::LocalSuffixNew
             | ItemId::LocalNetworkNew
+            | ItemId::Provider(providers::ProviderRow::New)
+            | ItemId::Provider(providers::ProviderRow::Scan)
+            | ItemId::Reset(reset::ResetRow::Scope)
             | ItemId::ExportPath
+            | ItemId::SafeDisableReason
             | ItemId::Pref(_)
             | ItemId::ServiceStart
             | ItemId::ServiceStop
@@ -973,6 +1108,8 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
         _ => false,
     };
     let job = match (item.id, input) {
+        (ItemId::Reset(row), input) => reset::activate(app, row, input),
+        (ItemId::Provider(row), input) => providers::activate(app, row, input),
         (ItemId::HideKind(kind), Input::Pick(choice)) => hide_kind(app, kind, choice),
         (ItemId::RemoveMute(index), Input::Run) => {
             let scope = app
@@ -1037,8 +1174,6 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
         (ItemId::Policy(key), input) => {
             let value = match input {
                 Input::Toggle => Value::Bool(toggled),
-                Input::Pick("fail-closed") if key == "kill-switch-fail-closed" => Value::Bool(true),
-                Input::Pick("fail-open") if key == "kill-switch-fail-closed" => Value::Bool(false),
                 Input::Pick(slug) => Value::from(slug),
                 Input::Number(n) => Value::from(n),
                 Input::Text(text) => Value::from(text),
@@ -1077,6 +1212,9 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
             Some(policy_change(app, defaults))
         }
         (ItemId::Stability(key), Input::Toggle) => stability_change(app, key, Value::Bool(toggled)),
+        (ItemId::Stability(key), Input::Pick(slug)) => {
+            stability_change(app, key, Value::from(slug))
+        }
         (ItemId::Stability(key), Input::Number(n)) => {
             if key == "secondary-liveness-window-secs" && (1..5).contains(&n) {
                 app.settings.refuse(Words::Key(text::LIVENESS_RANGE));
@@ -1108,6 +1246,31 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
             jobs::ServiceOp::Restart,
             app.settings.service_probe,
         )),
+        (ItemId::RulesPause, Input::Toggle) => Some(jobs::set_rules_paused(!toggled)),
+        (ItemId::SafeDisableReason, Input::Text(reason)) => {
+            app.settings.safe_disable_reason = reason;
+            None
+        }
+        (ItemId::SafeDisableRun, Input::Run) => {
+            let reason = app.settings.safe_disable_reason.trim().to_owned();
+            if reason.is_empty() {
+                app.settings
+                    .refuse(Words::Key(text::SAFE_DISABLE_NEED_REASON));
+                return;
+            }
+            Some(jobs::safe_disable(reason))
+        }
+        (ItemId::RollbackLookup, Input::Run) => {
+            app.settings.rollback = RollbackOffer::Unasked;
+            Some(jobs::rollback_lookup())
+        }
+        (ItemId::RollbackRun, Input::Run) => {
+            // The token is single-use: a second Enter finds nothing to spend.
+            match std::mem::take(&mut app.settings.rollback) {
+                RollbackOffer::Ready { token, target } => Some(jobs::rollback_run(token, target)),
+                _ => None,
+            }
+        }
         (ItemId::ExportRun, Input::Run) => {
             let path = app.settings.export_path.trim().to_owned();
             if path.is_empty() {
@@ -1120,6 +1283,9 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
         (ItemId::ClearLogs, Input::Run) => Some(jobs::clear_logs()),
         (ItemId::Revisions(field), Input::Number(n)) => revisions(app, Some((field, n)), None),
         (ItemId::PinLkg, Input::Toggle) => revisions(app, None, Some(toggled)),
+        (ItemId::RevisionsReset, Input::Run) => {
+            Some(jobs::set_retention(RetentionSettingsSetRequest::DEFAULT))
+        }
         (ItemId::Traffic(field), Input::Toggle) => traffic(app, |s| match field {
             TrafficField::Enabled => s.enabled = toggled,
             TrafficField::Loopback => s.count_loopback = toggled,

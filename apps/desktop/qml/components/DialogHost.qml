@@ -293,77 +293,21 @@ Item {
         onKernelTunnelAdapterRequested: function(interfaceName) {
             ownerRoot.focusAdapter(interfaceName)
         }
-        onVpnConfirmed: function(displayName, exePath) {
-            // Single add (the manual file picker). We store the confirmed
-            // executable as a device-local preference (the offline display
-            // fallback) AND write it to the service-side SSOT via
-            // route.link-provider.set below — that write registers the per-app
-            // kill-switch exemption and triggers a server-side recompile, which
-            // supersedes the old "make it an Application->primary rule" intent.
-            var path = String(exePath || "")
-            ownerRoot.updatePrefs({
-                confirmedVpnExePath: path,
-                confirmedVpnExePaths: path
-            })
-            ownerRoot.emitPrefs()
-            var shownName = String(displayName || "")
-            var statusName = Pure.displayText(shownName)
-            ownerRoot.statusLine = (path !== "")
-                ? ownerRoot.tr("vpn-onboarding.confirmed-status",
+        onPickConfirmed: function(rows, selected) {
+            // Worked out over a fresh read: a program confirmed from another
+            // client since the picker opened was not on screen, so it stays.
+            ownerRoot._replaceLinkProviders(function(existing) {
+                return Pure.vpnPickerResultApps(rows, selected, existing)
+            }, function(stored) {
+                if (stored.length === 0)
+                    return ownerRoot.tr("vpn-onboarding.cleared-status",
+                        "No program is kept working over your main link any more.")
+                return ownerRoot.tr("vpn-onboarding.confirmed-status",
                     "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
-                    .replace("{name}", statusName)
-                : ownerRoot.tr("vpn-onboarding.confirmed-status-no-path",
-                    "Noted {name} as your VPN. Pick its program file to finish setup.")
-                    .replace("{name}", statusName)
-            if (path !== "") {
-                var lpName = (shownName !== "")
-                    ? shownName
-                    : String(path.split(/[\\/]/).pop() || "")
-                ownerRoot._writeLinkProviderSet([{ "exe-path": path, "display-name": lpName }])
-            }
-        }
-        onVpnConfirmedMulti: function(displayNames, exePaths) {
-            // Multi-select confirm: persist the FULL set of confirmed VPN
-            // executables (semicolon-joined) and mirror the first non-empty path
-            // into the single-path preference for back-compat with readers like
-            // Settings -> Routing's VPN-client display (the offline fallback).
-            // The same set is written to the service-side SSOT via
-            // route.link-provider.set below (per-app kill-switch exemptions +
-            // server-side recompile), superseding the old "Application->primary
-            // rules" intent.
-            var names = displayNames || []
-            var raw = exePaths || []
-            var paths = []
-            var lpApps = []
-            for (var i = 0; i < raw.length; i += 1) {
-                var p = String(raw[i] || "")
-                if (p !== "") {
-                    paths.push(p)
-                    var nm = String((i < names.length ? names[i] : "") || "")
-                    if (nm === "") nm = String(p.split(/[\\/]/).pop() || "")
-                    lpApps.push({ "exe-path": p, "display-name": nm })
-                }
-            }
-            ownerRoot.updatePrefs({
-                confirmedVpnExePaths: paths.join(";"),
-                confirmedVpnExePath: paths.length > 0 ? paths[0] : ""
+                    .replace("{name}", Pure.listSummary(
+                        Pure.displayTextList(Pure.vpnProviderNames(stored)),
+                        ownerRoot.tr("status.app-unresolved-more", "+{n} more")))
             })
-            ownerRoot.emitPrefs()
-            ownerRoot._writeLinkProviderSet(lpApps)
-            if (paths.length > 1) {
-                ownerRoot.statusLine = ownerRoot.tr("vpn-onboarding.confirmed-status-multi",
-                    "NetRuleRouter will keep your {count} VPN programs working over your main link while leak protection is on.")
-                    .replace("{count}", String(paths.length))
-            } else if (paths.length === 1) {
-                ownerRoot.statusLine = ownerRoot.tr("vpn-onboarding.confirmed-status",
-                    "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
-                    .replace("{name}", String(names.length > 0 ? names[0] : ""))
-            } else {
-                // Everything selected was name-only (no resolved path).
-                ownerRoot.statusLine = ownerRoot.tr("vpn-onboarding.confirmed-status-no-path",
-                    "Noted {name} as your VPN. Pick its program file to finish setup.")
-                    .replace("{name}", String(names.length > 0 ? names[0] : ""))
-            }
         }
         onSkipped: {
             ownerRoot.statusLine = ownerRoot.tr("vpn-onboarding.skipped-status",

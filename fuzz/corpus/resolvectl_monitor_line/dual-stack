@@ -1,0 +1,1 @@
+{"state":"success","question":[{"class":1,"type":1,"name":"example.com"}],"answer":[{"rr":{"key":{"class":1,"type":1,"name":"example.com"},"address":[203,0,113,160]},"ifindex":2},{"rr":{"key":{"class":1,"type":28,"name":"example.com"},"address":[32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1]},"ifindex":2}]}

@@ -18,8 +18,8 @@
 use std::net::Ipv4Addr;
 
 use nrr_platform_api::dns_scope::{
-    classify_claims, is_actionable_scope, normalize_suffix, ClaimedNamespace, InterfaceDnsScope,
-    InterfaceDnsScopePort,
+    classify_typed_tunnel_claims, is_actionable_scope, normalize_suffix, ClaimedNamespace,
+    InterfaceDnsScope, InterfaceDnsScopePort,
 };
 use nrr_platform_api::{AdapterInfo, IfOperStatus, InterfaceType};
 use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
@@ -59,15 +59,21 @@ pub fn live_actionable_dns_scopes() -> Vec<InterfaceDnsScope> {
     claims_of_live_adapters(WindowsInterfaceDnsScopes.dns_scopes(), &live)
 }
 
-/// Every claim of a connection the OS is using right now, told apart by the
-/// kind of link behind it. Not narrowed to actionable claims: a single-label
-/// lease on the main link is still worth offering.
-pub fn live_claims() -> Vec<ClaimedNamespace> {
+/// Every claim of a connection the OS is using right now. Not narrowed to
+/// actionable claims: a single-label lease on the main link is still worth
+/// offering.
+///
+/// Only a link the OS types as a tunnel is marked foreign here; the route
+/// coordinator, whose foreign set is the one definition, upgrades the rest.
+/// An unreadable route table marks nothing: which link is the uplink is then
+/// unknown, and doubt is "not foreign". `ours` are the served users'
+/// additional-route links (see [`classify_typed_tunnel_claims`]).
+pub fn live_claims(ours: &[u32]) -> Vec<ClaimedNamespace> {
     use nrr_platform_api::route_table::RouteTablePort;
 
     let api = crate::windows_api::ProductionWindowsApi;
     let live = api.get_adapter_infos().unwrap_or_default();
-    let routes = api.get_ip_forward_table().unwrap_or_default();
+    let routes = api.get_ip_forward_table().ok();
     let scopes = WindowsInterfaceDnsScopes
         .dns_scopes()
         .into_iter()
@@ -80,7 +86,10 @@ pub fn live_claims() -> Vec<ClaimedNamespace> {
             Some(scope)
         })
         .collect();
-    classify_claims(scopes, &live, &routes)
+    match routes {
+        Some(routes) => classify_typed_tunnel_claims(scopes, &live, &routes, ours),
+        None => classify_typed_tunnel_claims(scopes, &[], &[], ours),
+    }
 }
 
 fn claims_of_live_adapters(

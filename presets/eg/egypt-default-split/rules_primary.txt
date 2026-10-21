@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 7
 # name: EG Egypt Default Split - Primary Route
 # description: Egypt/local services routed to primary
 # author: NetRuleRouter contributors

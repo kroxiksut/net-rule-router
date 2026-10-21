@@ -30,12 +30,6 @@ pub(super) fn process_basename_lower(process_path: &str) -> String {
 /// Block band via [`crate::killswitch_drop_registry`] — that band means the
 /// route the destination is pinned to is down, i.e. [`BlockReason::RouteUnavailable`].
 ///
-/// `default_block_id` is the deterministic id of the "no rule covers this
-/// host" catch-all ([`crate::wfp_codegen::filter_id_for`] with role
-/// `"default"`, computed fresh per batch from the active SID) — matching it
-/// needs no new registry, only the same hash the codegen used to mint it, so
-/// it maps cleanly to [`BlockReason::NotCoveredByRules`].
-///
 /// `fail_closed_armed` is the live block-all posture. The registry above only
 /// recognizes the filters of the CURRENT compute, so a drop caught by a
 /// neighbouring filter of the same outage (a fake-address block, a filter from
@@ -62,16 +56,12 @@ pub(super) fn process_basename_lower(process_path: &str) -> String {
 pub(super) fn block_reason_for(
     spec_id: Option<u64>,
     killswitch_verified: bool,
-    default_block_id: Option<u64>,
     fail_closed_armed: bool,
     ipv6_cut: bool,
     dns_lockdown: bool,
 ) -> BlockReason {
     if killswitch_verified {
         return BlockReason::RouteUnavailable;
-    }
-    if spec_id.is_some() && spec_id == default_block_id {
-        return BlockReason::NotCoveredByRules;
     }
     if dns_lockdown {
         return BlockReason::DnsLockdown;
@@ -138,7 +128,7 @@ pub(super) fn process_is_peer_to_peer(process_path: Option<&str>) -> bool {
 /// Can this program ever be offered for the tunnel? The operating system's
 /// own programs, tunnel clients and peer-to-peer programs never are, so both
 /// halves of the application measure leave them out alike.
-pub(super) fn offerable_program(path: &str) -> bool {
+pub(crate) fn offerable_program(path: &str) -> bool {
     !(nrr_domain::app_offer::is_os_program(path)
         || process_name_matches_vpn(Some(path))
         || process_is_peer_to_peer(Some(path)))

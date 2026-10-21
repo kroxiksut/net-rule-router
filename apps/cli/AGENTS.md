@@ -6,5 +6,5 @@ Short-lived, not a long-running process. Free surface is deliberately narrow: se
 - The verb table in `apps/cli/src/verbs.rs` is the single declaration from which help is rendered; a test there pins the complete set of verbs and flags, so widening the surface is a deliberate edit to that list.
 - **Output is English only** (an admin interface, never localized).
 - **`status` describes the service** — installed / running / version / start mode — and never the policy, because "N rules applied" immediately raises "whose", which is per-SID and therefore not Free console territory.
-- The **service binary's own verbs** (`console`, `run`, `set-start-auto`, `query-start-mode`, `update`, SCM mode) stay internal — the broker, GUI and systemd invoke them, they are not publicly documented and may change freely.
+- The **service binary's own verbs** (`console`, `run`, `set-start-auto`, `query-start-mode`, SCM mode) stay internal — the broker, GUI and systemd invoke them, they are not publicly documented and may change freely.
 - Holds no OS-specific logic — `platform.rs` is the single cfg, and it only picks an implementation of the service-control port. The IPC client is what lets `diag export` ask the SERVICE for the archive instead of assembling a second one.

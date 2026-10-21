@@ -8,6 +8,7 @@
 //! | Marker                        | Used for                              |
 //! |-------------------------------|---------------------------------------|
 //! | `<redacted>`                  | Generic — field exists but is hidden  |
+//! | `<masked-host>`               | Hostname that cannot be shortened     |
 //! | `<masked-ipv4>`               | IPv4 address hidden in default mode   |
 //! | `<masked-path>`               | Full process path hidden              |
 //! | `<private-ipv4>`              | RFC-1918 / loopback address           |
@@ -24,6 +25,7 @@ use crate::privacy::mode::RedactionMode;
 // ── Redaction markers ─────────────────────────────────────────────────────────
 
 pub const MARKER_REDACTED: &str = "<redacted>";
+pub const MARKER_MASKED_HOST: &str = "<masked-host>";
 pub const MARKER_MASKED_IPV4: &str = "<masked-ipv4>";
 pub const MARKER_MASKED_PATH: &str = "<masked-path>";
 pub const MARKER_PRIVATE_IPV4: &str = "<private-ipv4>";
@@ -89,7 +91,7 @@ impl<T: std::fmt::Display> Redacted<T> {
 /// | `Diagnostics` | Full hostname                  |
 /// | `DeveloperLocal` | Full hostname               |
 ///
-/// If the hostname cannot be parsed, returns `<redacted>` in Default mode.
+/// If the hostname cannot be parsed, returns `<masked-host>` in Default mode.
 #[must_use]
 pub fn redact_hostname(hostname: &str, mode: RedactionMode) -> Redacted<String> {
     if mode.shows_full_hostname() {
@@ -99,7 +101,7 @@ pub fn redact_hostname(hostname: &str, mode: RedactionMode) -> Redacted<String> 
     let etld1 = extract_etld1(hostname);
     match etld1 {
         Some(s) => Redacted::Value(s),
-        None => Redacted::Hidden(MARKER_REDACTED.to_string()),
+        None => Redacted::Hidden(MARKER_MASKED_HOST.to_string()),
     }
 }
 
@@ -155,12 +157,12 @@ pub fn redact_ipv4(ip: Ipv4Addr, mode: RedactionMode) -> Redacted<String> {
 }
 
 /// Redacts an IPv4 address given as a dotted-decimal string.
-/// Returns `Redacted::Hidden(<redacted>)` if the string is not a valid IPv4.
+/// Returns `Redacted::Hidden(<masked-ipv4>)` if the string is not a valid IPv4.
 #[must_use]
 pub fn redact_ipv4_str(ip_str: &str, mode: RedactionMode) -> Redacted<String> {
     match ip_str.parse::<Ipv4Addr>() {
         Ok(ip) => redact_ipv4(ip, mode),
-        Err(_) => Redacted::Hidden(MARKER_REDACTED.to_string()),
+        Err(_) => Redacted::Hidden(MARKER_MASKED_IPV4.to_string()),
     }
 }
 

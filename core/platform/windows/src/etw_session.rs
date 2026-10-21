@@ -424,6 +424,16 @@ impl RealtimeSession {
         unsafe { (self.release_context)(self.context) };
     }
 
+    /// Whether the `ProcessTrace` pump thread still runs; once it returns on its
+    /// own the session delivers nothing.
+    pub(crate) fn pump_alive(&self) -> bool {
+        self.worker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|w| !w.is_finished())
+    }
+
     /// What the session lost since the last report, when a report is due:
     /// the caller logs it, and the ledger keeps that to one line per period.
     pub(crate) fn losses_to_report(&self) -> Option<LostSinceReport> {

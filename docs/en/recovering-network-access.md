@@ -1,7 +1,10 @@
 # Recovering network access
 
-NetRuleRouter's protections — leak protection, per-site routing, and (in Mode B)
-directing name resolution through the app — are enforced by Windows itself, not
+**English** · [Русский](../ru/recovering-network-access.md)
+
+NetRuleRouter's protections — leak protection, per-site routing, and (with the
+local DNS resolver, the default) directing name resolution through the app —
+are enforced by Windows itself, not
 by the app process. That is what makes them reliable: they keep working even if
 the app's window is closed. It also means that if the background service stops
 **abnormally** (a crash, or a forced kill) while a protection is active, that
@@ -11,6 +14,16 @@ network or resolve names, with no running service left to lift it.
 This only happens after an abnormal stop. A normal **Stop**, **Exit**, or
 **Uninstall** restores networking. If the service could not hand the system DNS
 settings back, the app says so and offers **Restore network** (Option 2 below).
+
+If the service stops on its own while the tray, the window or the terminal
+interface is running, they say so and offer **Start service** and **Restore
+network**. A stop you asked for yourself stays silent.
+
+A different case is leak protection doing its job. With leak protection set
+to **Everything**, the internet waits while the additional connection is down,
+and a reboot does not change that: the protection comes back with the
+service. Bring the additional connection back, or set leak protection to
+**Off**; if you cannot reach the settings, use Option 2.
 
 If it does happen, there are two ways to recover.
 

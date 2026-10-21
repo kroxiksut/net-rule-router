@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use nrr_platform_api::dns::SystemDnsServersPort;
 use nrr_platform_api::dns_redirect::{DnsNamespaceExemption, SystemDnsRedirectPort};
-use nrr_platform_api::dns_scope::{plan_namespaces, ClaimedNamespace, NamespacePlan};
+use nrr_platform_api::dns_scope::{plan_namespaces, ClaimedNamespace, ClaimingLink, NamespacePlan};
 use rusqlite::Connection;
 
+use crate::foreign_tunnels::ForeignTunnelCell;
 use crate::local_dns_suffixes::MachineLocalDnsSuffixes;
 use crate::per_sid_orchestrator::RulesProvider;
 
@@ -36,6 +37,7 @@ pub struct NamespacePolicy {
     rules: Arc<dyn RulesProvider>,
     settings_conn: Arc<Mutex<Connection>>,
     kept: Mutex<Kept>,
+    foreign_tunnels: Arc<ForeignTunnelCell>,
 }
 
 #[derive(Default)]
@@ -63,13 +65,42 @@ impl NamespacePolicy {
             rules,
             settings_conn,
             kept: Mutex::new(Kept::default()),
+            foreign_tunnels: crate::foreign_tunnels::global_foreign_tunnels(),
         }
+    }
+
+    /// Publish the claims into `cell` instead of the process-wide one.
+    #[must_use]
+    pub fn with_foreign_tunnels(mut self, cell: Arc<ForeignTunnelCell>) -> Self {
+        self.foreign_tunnels = cell;
+        self
     }
 
     /// The namespaces to step out of now. Also publishes what the main link
     /// offers and keeps the covered rule names with the listener.
     pub fn exemptions(&self) -> Vec<DnsNamespaceExemption> {
-        let claims = (self.claims)();
+        // The coordinator's set upgrades a claim to a foreign tunnel. An OS-typed
+        // tunnel is foreign unless it is one of the served users' own links
+        // (`ours`), which the classifier excludes.
+        let claims: Vec<ClaimedNamespace> = (self.claims)()
+            .into_iter()
+            .map(|mut claim| {
+                if self.foreign_tunnels.names_adapter(&claim.scope.adapter_id) {
+                    claim.link = ClaimingLink::ForeignTunnel;
+                }
+                claim
+            })
+            .collect();
+        self.foreign_tunnels.publish_claims(
+            claims
+                .iter()
+                .filter(|c| nrr_platform_api::dns_scope::is_actionable_scope(&c.scope))
+                .filter_map(|c| {
+                    nrr_platform_api::dns_scope::normalize_suffix(&c.scope.suffix)
+                        .map(|suffix| (c.scope.adapter_id.clone(), suffix))
+                })
+                .collect(),
+        );
         let list = self.suffixes.current();
         let local_servers: Vec<Ipv4Addr> = self
             .system_dns
@@ -139,7 +170,7 @@ mod tests {
     use nrr_domain::{RuleAction, RuleId};
     use nrr_platform_api::dns::StaticDnsServers;
     use nrr_platform_api::dns_redirect::{RedirectHandle, RedirectState};
-    use nrr_platform_api::dns_scope::{ClaimingLink, InterfaceDnsScope};
+    use nrr_platform_api::dns_scope::InterfaceDnsScope;
     use nrr_platform_api::error::PlatformError;
     use nrr_storage::route_bindings::{BindingSource, RouteBindingsRepository, RoutePolicyRecord};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -258,7 +289,8 @@ mod tests {
             "127.0.0.1:53".parse().expect("listener"),
             rules,
             state_with_a_principal(),
-        );
+        )
+        .with_foreign_tunnels(Arc::new(ForeignTunnelCell::new()));
         (policy, suffixes)
     }
 
@@ -314,5 +346,98 @@ mod tests {
         policy.exemptions();
         policy.exemptions();
         assert_eq!(redirect.writes().len(), 3);
+    }
+
+    /// The user's own VPN pushing a search suffix reads as a tunnel to the
+    /// claim classifier, yet its namespace is no corporate one: only a link
+    /// the route coordinator names foreign reaches the fake-IP readers, and
+    /// none does before the coordinator has named any.
+    #[test]
+    fn only_a_link_the_coordinator_names_foreign_claims_a_namespace() {
+        let cell = Arc::new(ForeignTunnelCell::new());
+        let (policy, _) = policy(
+            vec![
+                claim("corp0", "corp.example", ClaimingLink::ForeignTunnel),
+                claim("mine0", "vpn.example", ClaimingLink::ForeignTunnel),
+                claim("wlan0", "home.example", ClaimingLink::Uplink),
+            ],
+            Vec::new(),
+            Arc::new(Book(book_naming("git.other.example"))),
+            Arc::new(FakeRedirect::default()),
+        );
+        let policy = policy.with_foreign_tunnels(Arc::clone(&cell));
+        policy.exemptions();
+        assert!(!cell.claims_name("rdg.corp.example"), "nothing named yet");
+
+        let corp = nrr_platform_api::adapters::AdapterInfo {
+            index: 9,
+            adapter_name: "corp0".into(),
+            description: "corp".into(),
+            friendly_name: "corp".into(),
+            mac: None,
+            interface_type: nrr_platform_api::adapters::InterfaceType::Tunnel,
+            oper_status: nrr_platform_api::adapters::IfOperStatus::Up,
+            ipv4_addresses: Vec::new(),
+            ipv6_addresses: Vec::new(),
+            gateways: Vec::new(),
+        };
+        cell.publish_tunnels(&[], &[corp], &[9]);
+        policy.exemptions();
+        assert!(cell.claims_name("rdg.corp.example"));
+        assert!(!cell.claims_name("portal.vpn.example"));
+        assert!(!cell.claims_name("nas.home.example"));
+    }
+
+    fn adapter_named(index: u32, name: &str) -> nrr_platform_api::adapters::AdapterInfo {
+        nrr_platform_api::adapters::AdapterInfo {
+            index,
+            adapter_name: name.into(),
+            description: name.into(),
+            friendly_name: name.into(),
+            mac: None,
+            interface_type: nrr_platform_api::adapters::InterfaceType::Ethernet,
+            oper_status: nrr_platform_api::adapters::IfOperStatus::Up,
+            ipv4_addresses: Vec::new(),
+            ipv6_addresses: Vec::new(),
+            gateways: Vec::new(),
+        }
+    }
+
+    fn exempt_suffixes(policy: &NamespacePolicy) -> Vec<String> {
+        policy.exemptions().into_iter().map(|e| e.suffix).collect()
+    }
+
+    /// The coordinator's foreign set is the one definition: a claim the
+    /// platform read as an uplink's is exempt once the coordinator names its
+    /// link, and the user's own VPN suffix (never named) is not.
+    #[test]
+    fn the_coordinators_set_decides_which_claim_is_exempted() {
+        let cell = Arc::new(ForeignTunnelCell::new());
+        let (policy, _) = policy(
+            vec![
+                claim("corp0", "corp.example", ClaimingLink::Uplink),
+                claim("mine0", "vpn.example", ClaimingLink::Uplink),
+            ],
+            Vec::new(),
+            Arc::new(Book(book_naming("git.other.example"))),
+            Arc::new(FakeRedirect::default()),
+        );
+        let policy = policy.with_foreign_tunnels(Arc::clone(&cell));
+        assert!(exempt_suffixes(&policy).is_empty(), "nothing named yet");
+        cell.publish_tunnels(&[], &[adapter_named(9, "corp0")], &[9]);
+        assert_eq!(exempt_suffixes(&policy), ["corp.example"]);
+    }
+
+    /// A tunnel only the OS can type (the coordinator names none) keeps its
+    /// namespace exempt, so a corporate session over it keeps resolving.
+    #[test]
+    fn an_os_typed_tunnel_the_coordinator_cannot_name_stays_exempt() {
+        let (policy, _) = policy(
+            vec![claim("da0", "corp.example", ClaimingLink::ForeignTunnel)],
+            Vec::new(),
+            Arc::new(Book(book_naming("git.other.example"))),
+            Arc::new(FakeRedirect::default()),
+        );
+        assert_eq!(exempt_suffixes(&policy), ["corp.example"]);
     }
 }

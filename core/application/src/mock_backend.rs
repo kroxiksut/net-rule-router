@@ -9,7 +9,3 @@ pub mod logs {
 pub mod network_interfaces {
     pub use nrr_mock_backend::network_interfaces::*;
 }
-
-pub mod rules {
-    pub use nrr_mock_backend::rules::*;
-}

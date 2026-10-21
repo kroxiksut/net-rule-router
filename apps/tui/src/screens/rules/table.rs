@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use nrr_client_logic::rebase::rebase_edits;
+use nrr_client_logic::rebase::{merge_view, rebase_edits, MergeView};
 use nrr_client_logic::rules_table::{
     file_row_from_service_wire, main_route_check_hosts, main_route_rank, row_matches_search,
     RowOrigin, RuleRow, RuleType, TargetRoute,
@@ -90,6 +90,12 @@ pub struct Row {
     /// What the last main-route check found (`answered`, `silent`,
     /// `no-address`, `unclear`); `None` when it never asked about this rule.
     pub main_route: Option<String>,
+    /// What an application rule holds on the additional link, machine-wide:
+    /// a sample as `rules.list` carries it and the service's true count.
+    pub pinned: Vec<String>,
+    pub pinned_total: usize,
+    /// The OS hosts file answers this hostname before the service sees it.
+    pub hosts_override: Option<nrr_shared::ipc_payloads::HostsOverrideDto>,
 }
 
 impl Row {
@@ -106,6 +112,9 @@ impl Row {
             ace_lower,
             verdict,
             main_route: None,
+            pinned: Vec::new(),
+            pinned_total: 0,
+            hosts_override: None,
         }
     }
 
@@ -239,6 +248,23 @@ pub struct Edits {
     base: Vec<RuleRow>,
     /// The rows on screen.
     edited: Vec<RuleRow>,
+}
+
+impl Edits {
+    /// What these edits would add, change and delete over `entries`, the rules
+    /// the service lists now, and where they would clash.
+    pub fn preview(&self, entries: &[RuleRowEntry]) -> MergeView {
+        let fresh: Vec<RuleRow> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let mut rule = file_row_from_service_wire(entry, ace::decode);
+                rule.id = rule_id(i + 1);
+                rule
+            })
+            .collect();
+        merge_view(&rebase_edits(&self.base, &self.edited, &fresh, &[]))
+    }
 }
 
 /// The routing part of a row, and its note: what "unchanged" compares.
@@ -408,6 +434,9 @@ impl Table {
                 let mut row = Row::new(rule);
                 row.service_id = Some(entry.id.clone());
                 row.main_route = entry.main_route.clone();
+                row.pinned = entry.pinned_destinations.clone().unwrap_or_default();
+                row.pinned_total = entry.pinned_destinations_total.unwrap_or(row.pinned.len());
+                row.hosts_override = entry.hosts_override.clone();
                 row
             })
             .collect();
@@ -418,12 +447,21 @@ impl Table {
     /// Takes in the main-route verdicts of a fresh read and nothing else, so
     /// edits on screen survive.
     pub fn merge_main_route(&mut self, entries: &[RuleRowEntry]) {
-        let marks: HashMap<(String, String), Option<String>> = entries
-            .iter()
-            .map(|entry| (entry_mark_key(entry), entry.main_route.clone()))
-            .collect();
+        // The service may hold an IDN value in either spelling: key each
+        // entry by both, and look a row up by its ACE form, then as typed.
+        let mut marks: HashMap<(String, String), Option<String>> = HashMap::new();
+        for entry in entries {
+            let key = entry_mark_key(entry);
+            let ace_key = (key.0.clone(), ace::encode(&key.1).to_lowercase());
+            marks.insert(ace_key, entry.main_route.clone());
+            marks.insert(key, entry.main_route.clone());
+        }
         for row in &mut self.rows {
-            if let Some(mark) = marks.get(&row.mark_key()) {
+            let typed = (
+                row.rule.rule_type.canonical_slug().into_owned(),
+                row.rule.match_value.trim().to_lowercase(),
+            );
+            if let Some(mark) = marks.get(&row.mark_key()).or_else(|| marks.get(&typed)) {
                 row.main_route.clone_from(mark);
             }
         }
@@ -448,9 +486,11 @@ impl Table {
 
     /// `edits` laid over the rows just read: a rule removed goes, a row of
     /// the same rule is replaced, a new one is added.
-    pub fn apply_edits(&mut self, edits: Edits) {
+    /// A rule in `keep_theirs` (by `merge_key`) stays as the rules in force
+    /// have it.
+    pub fn apply_edits(&mut self, edits: Edits, keep_theirs: &[String]) {
         let fresh: Vec<RuleRow> = self.rows.iter().map(|r| r.rule.clone()).collect();
-        let rebased = rebase_edits(&edits.base, &edits.edited, &fresh, &[]);
+        let rebased = rebase_edits(&edits.base, &edits.edited, &fresh, keep_theirs);
         let mut old: HashMap<String, Row> = HashMap::new();
         for row in std::mem::take(&mut self.rows) {
             old.entry(row.rule.merge_key()).or_insert(row);

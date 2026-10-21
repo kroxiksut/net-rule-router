@@ -29,6 +29,9 @@ use crate::state::ServiceHealthSeverity;
 /// The aggregator voice every liveness verdict is recorded under.
 pub const LIVENESS_SOURCE: &str = "liveness";
 
+/// The aggregator voice for the resolver's upstream trouble.
+const DNS_UPSTREAM_SOURCE: &str = "dns-upstream";
+
 /// A supervised tick longer than this is a hang. Generous: the longest honest
 /// tick (a cold DNS refresh batch) stays well under it.
 pub const DEFAULT_TICK_DEADLINE: Duration = Duration::from_secs(120);
@@ -354,6 +357,23 @@ impl TaskLiveness {
         self.publish(&inner);
     }
 
+    /// The resolver's standing trouble with its upstream, or `None` once over.
+    /// Its own voice: neither a task verdict nor another writer's `adapters`
+    /// state is touched.
+    pub fn say_dns_upstream(&self, trouble: Option<&str>) {
+        match trouble {
+            Some(message) => self.health.record_as(
+                DNS_UPSTREAM_SOURCE,
+                HealthComponent::Adapters,
+                ServiceHealthSeverity::Degraded,
+                message,
+            ),
+            None => self
+                .health
+                .clear_as(DNS_UPSTREAM_SOURCE, HealthComponent::Adapters),
+        }
+    }
+
     /// Names reported gone or hung right now; for tests and the status log.
     pub fn troubled(&self) -> Vec<String> {
         let inner = self.lock();
@@ -455,6 +475,19 @@ mod tests {
         let health = Arc::new(HealthAggregator::new());
         health.clear_lifecycle_override();
         (Arc::new(TaskLiveness::new(Arc::clone(&health))), health)
+    }
+
+    #[test]
+    fn the_resolvers_upstream_trouble_degrades_adapters_and_clears_with_it() {
+        let (liveness, health) = board();
+        liveness.say_dns_upstream(Some("only another VPN's DNS server answers"));
+        let (severity, message) = component(&health, HealthComponent::Adapters).expect("said");
+        assert_eq!(severity, ServiceHealthSeverity::Degraded);
+        assert!(message.starts_with(nrr_shared::ipc_payloads::DNS_ONLY_FOREIGN_RESOLVER));
+        assert_eq!(health.snapshot().state, ServiceRuntimeState::Degraded);
+        liveness.say_dns_upstream(None);
+        assert!(component(&health, HealthComponent::Adapters)
+            .is_none_or(|(severity, _)| severity < ServiceHealthSeverity::Degraded));
     }
 
     fn component(

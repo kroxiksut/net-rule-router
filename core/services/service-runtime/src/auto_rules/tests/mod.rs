@@ -467,3 +467,13 @@ mod main_link_works;
 mod offer_signals;
 mod proposal;
 mod verify_primary;
+
+/// The id outlives restarts (persisted refusals, the tray's offered set), so a
+/// crypto-crate upgrade must not change a single digit.
+#[test]
+fn a_candidate_id_of_another_principal_is_pinned() {
+    assert_eq!(
+        candidate_id("S-1-5-21-1", "suffix", "example.test"),
+        "arc-0ec95135c702"
+    );
+}

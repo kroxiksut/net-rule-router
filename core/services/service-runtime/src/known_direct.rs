@@ -1,7 +1,7 @@
 //! Session registry of destinations POSITIVELY established
 //! as DIRECT (non-rule) hosts, for kill-switch block-all exemptions.
 //!
-//! The catch-all block-all (`FailClosedUnknown` / `kill_switch_block_all`) cuts
+//! The block-all of leak protection `everything` cuts
 //! every destination it cannot classify. Rule hosts escape via their compiled
 //! permits, but a DIRECT host — one no rule matches — has no permit at all, so
 //! it is cut too (the field case: the secondary adapter vanished after an

@@ -27,10 +27,10 @@ no certificates are installed.
 
 ## What it needs
 
-Fake-IP builds on the **local DNS resolver (Mode B)** — it is the resolver that
-hands each site its private address — so it is available only when Mode B is
-selected. Mode B is the default; in the reactive mode the checkbox is greyed
-out.
+Fake-IP builds on the **local DNS resolver** — it is the resolver that hands
+each site its private address — so it is offered only while the local DNS
+resolver is the routing method. That is the default; with the legacy method
+(watching system DNS) the checkbox is not shown.
 
 Delivering traffic addressed to those private addresses needs a virtual network
 adapter:
@@ -87,9 +87,10 @@ Two ways to close this gap:
   have rules for the additional connection), which makes name resolution fall
   back to plaintext DNS the resolver can serve.
 
-## Turning it on
+## Turning it on or off
 
-Fake-IP is **off by default**. To enable it: Settings → Routing → make sure the
-local DNS resolver (Mode B, the default) is selected, then tick **Route sites
-over virtual addresses (fake-IP)**. The change applies immediately; no restart of the background
-service is needed.
+On Windows, fake-IP is **on by default** for a new installation; an
+installation that already had it off keeps it off. To change it: Settings →
+Routing behavior → Routing method, make sure **How routed traffic is enforced** shows the local DNS resolver (the default),
+then tick or clear **Route sites over virtual addresses (fake-IP)**. The change
+applies immediately; no restart of the background service is needed.

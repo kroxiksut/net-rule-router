@@ -1,5 +1,5 @@
 Service: OK
-╭> Screens─────────────────╮╭Connections───────────────────────────────────────╮
+╭> Screens─────────────────╮╭Connections — +4 more rows────────────────────────╮
 │  1 Status                ││The primary route uses the default interface; the │
 │  2 First run             ││additional route carries the traffic your rules   │
 │> 3 Interfaces and routes ││send to it.                                       │
@@ -7,12 +7,12 @@ Service: OK
 │  5 Overlaps              ││Adapter — Available                               │
 │  6 Suggested addresses   ││Additional connection: Example Tunnel — Example   │
 │  7 Connection trace      │╰──────────────────────────────────────────────────╯
-│  8 Cache                 │╭Adapters──────────────────────────────────────────╮
-│  9 Diagnostics and logs  ││  1. Ethernet — Example Network Adapter — Wired   │
-│  0 Settings              ││(Ethernet) — Available — Main connection          │
-│                          ││  2. Example Tunnel — Example Network Adapter —   │
-│                          ││Wired (Ethernet) — Available — Additional         │
+│  8 Cache                 │╭Adapters — +5 more rows───────────────────────────╮
+│  9 Diagnostics and logs  ││  2. Example Tunnel — Example Network Adapter —   │
+│  0 Settings              ││Wired (Ethernet) — Available — Additional         │
 │                          ││connection                                        │
+│                          ││> 3. Wi-Fi — Wi-Fi — Available                    │
+│                          ││  4. Host-only Network — Virtual (VM, container) —│
 │                          │╰──────────────────────────────────────────────────╯
 │                          │╭Chosen adapter: Wi-Fi─────────────────────────────╮
 │                          ││Wi-Fi · looks like the main connection            │

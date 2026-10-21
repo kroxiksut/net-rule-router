@@ -12,9 +12,10 @@
 /// listener, and a clash would silence one of the two programs (`0x4E52`, "NR").
 pub const NRR_NFLOG_GROUP: u16 = 0x4E52;
 
-/// Reports per second, per kind of drop. A blocked program retries a few
+/// Reports per second, per kind of drop and per owning uid, so one user's
+/// flood cannot use up another's reports. A blocked program retries a few
 /// times a second, so this keeps every destination of a real outage while a
-/// flood costs the kernel at most this many copies.
+/// flood costs the kernel at most this many copies per user.
 pub const DROP_LOG_RATE_PER_SECOND: u32 = 20;
 /// Lets the burst of a page opening dozens of connections through whole.
 pub const DROP_LOG_BURST: u32 = 50;
@@ -49,8 +50,6 @@ pub enum DropKind {
     DnsLockdown,
     /// A block rule the user wrote.
     Rule,
-    /// Strict mode's "no rule covers this host".
-    Default,
     /// The relay pool's UDP veto.
     RelayPool,
     /// A drop in a band that does not normally carry one.
@@ -58,14 +57,13 @@ pub enum DropKind {
 }
 
 impl DropKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 8] = [
         Self::Pin,
         Self::FailClosed,
         Self::BlockAll,
         Self::Ipv6Cut,
         Self::DnsLockdown,
         Self::Rule,
-        Self::Default,
         Self::RelayPool,
         Self::Other,
     ];
@@ -79,7 +77,6 @@ impl DropKind {
             Self::Ipv6Cut => "v6",
             Self::DnsLockdown => "doh",
             Self::Rule => "rule",
-            Self::Default => "dflt",
             Self::RelayPool => "pool",
             Self::Other => "other",
         }
@@ -93,9 +90,8 @@ impl DropKind {
             Self::Ipv6Cut => 4,
             Self::DnsLockdown => 5,
             Self::Rule => 6,
-            Self::Default => 7,
-            Self::RelayPool => 8,
-            Self::Other => 9,
+            Self::RelayPool => 7,
+            Self::Other => 8,
         }
     }
 

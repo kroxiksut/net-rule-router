@@ -343,10 +343,9 @@ mod windows_impl {
             *slot = Some(hint);
         }
 
-        /// True once [`WintunControl::shutdown`] has run — the reader turns any
-        /// error after that point into a clean end-of-stream. Wintun's own
-        /// error for "session cancelled" is not a distinct `io::ErrorKind`, so
-        /// this flag, not the error kind, is what makes the exit unambiguous.
+        /// True once [`WintunControl::shutdown`] or `Drop` has run: reads then
+        /// return `Ok(0)` without touching the queue. The reader itself knows
+        /// a cancelled session by its error, see [`is_session_shutdown`].
         pub(super) fn is_shutting_down(&self) -> bool {
             self.shutdown.load(Ordering::SeqCst)
         }
@@ -370,6 +369,14 @@ mod windows_impl {
                 let _ = handle.join();
             }
         }
+    }
+
+    /// Whether a receive error is the session being cancelled. The crate wraps
+    /// its own `Error::ShuttingDown` into the `io::Error` it returns.
+    pub(super) fn is_session_shutdown(err: &std::io::Error) -> bool {
+        err.get_ref()
+            .and_then(|inner| inner.downcast_ref::<wintun_bindings::Error>())
+            .is_some_and(|inner| matches!(inner, wintun_bindings::Error::ShuttingDown))
     }
 
     /// Reader-thread body: block on the driver until a packet arrives, queue
@@ -404,12 +411,14 @@ mod windows_impl {
                         wake();
                     }
                 }
-                Err(_) if shutdown.load(Ordering::SeqCst) => return,
+                Err(err) if is_session_shutdown(&err) => return,
+                // A failure that races a stop is still a failure.
                 Err(err) => {
                     tracing::warn!(
                         target: "nrr::fake-ip",
                         msg_key = "win-fakeip-receive-failed",
                         error = %err,
+                        stopping = shutdown.load(Ordering::SeqCst),
                         "wintun receive failed — reader thread exiting",
                     );
                     return;
@@ -426,7 +435,7 @@ mod windows_impl {
 
 /// Identity of our TUN adapter for the driver; fixed for the product's lifetime.
 #[cfg(target_os = "windows")]
-const NRR_TUN_ADAPTER_GUID: u128 = 0x7A3E_1C55_0B6D_4F82_9E14_2D6C_8B0A_5F31;
+const NRR_TUN_ADAPTER_GUID: u128 = nrr_platform_api::fake_ip::OWN_TUN_ADAPTER_GUID;
 
 #[cfg(target_os = "windows")]
 impl TunAdapterPort for WintunTunAdapter {
@@ -576,8 +585,8 @@ impl TunDevice for windows_impl::WintunDevice {
 #[cfg(target_os = "windows")]
 impl TunControl for windows_impl::WintunControl {
     fn shutdown(&self) -> Result<(), PlatformError> {
-        // Raise the flag BEFORE cancelling, so a reader that wakes up from the
-        // cancellation always observes it and exits with `Ok(0)`.
+        // Raise the flag BEFORE cancelling, so the reader's exit reaches the
+        // poll loop as end-of-stream rather than as a failed reader.
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.session
@@ -831,6 +840,23 @@ mod tests {
             windows_impl::signature_status(&path),
         );
         assert_eq!(status.verdict, IntegrityVerdict::Genuine);
+    }
+
+    /// Only the session's own cancellation ends the reader quietly; any other
+    /// receive error is a failure, whether or not a stop was under way.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn only_a_cancelled_session_reads_as_shutdown() {
+        let cancelled = std::io::Error::from(wintun_bindings::Error::ShuttingDown);
+        assert!(windows_impl::is_session_shutdown(&cancelled));
+
+        let driver_failure = std::io::Error::from_raw_os_error(1450);
+        assert!(!windows_impl::is_session_shutdown(&driver_failure));
+        let other_crate_error =
+            std::io::Error::from(wintun_bindings::Error::String("ring broken".to_string()));
+        assert!(!windows_impl::is_session_shutdown(&other_crate_error));
+        let wait_failed = std::io::Error::other("session shutting down");
+        assert!(!windows_impl::is_session_shutdown(&wait_failed));
     }
 
     /// A file that is not a pinned build is turned away before it is loaded:

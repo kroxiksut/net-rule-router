@@ -10,6 +10,7 @@ import "sections"
 import "flows"
 import "lib/pure.js" as Pure
 import "lib/rules.js" as Rules
+import "lib/plurals.js" as Plurals
 
 ApplicationWindow {
     id: window
@@ -65,7 +66,7 @@ ApplicationWindow {
             "This is not available on your operating system yet, so the controls here stay off. "
             + "Nothing here is sent to the background service.")
         : ""
-    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, appGroupsOfferDismissed: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", connTraceGroupBy: "program", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, updateCheckEnabled: true, updateCheckIntervalDays: 14, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
+    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, appGroupsOfferDismissed: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", connTraceGroupBy: "program", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, updateCheckEnabled: true, updateCheckIntervalDays: 14, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
     property string section: "interfaces-routes"
     // The section open at launch loads synchronously: an asynchronous first
     // load could stall with an empty pane until the user clicked something.
@@ -176,8 +177,8 @@ ApplicationWindow {
     readonly property int backendBannerHeight: backendBannerVisible ? 36 : 0
     // The red banner offers a one-click Start/Install
     // action. Show it for the actionable backend states (service stopped /
-    // not installed, or a runtime disconnect where the launcher collapsed the
-    // reason to "disconnected"). Hide it for "connecting" (the spinner already
+    // not installed, or a disconnect the service manager cannot explain).
+    // Hide it for "connecting" (the spinner already
     // signals progress) and "protocol-mismatch" (the compat banner owns that
     // action). Requires the C++ NrrServiceController bridge.
     readonly property bool backendBannerActionable:
@@ -256,6 +257,22 @@ ApplicationWindow {
     // read so a cold start never accuses a service we have not asked yet.
     property bool _servicePolicyRead: false
     property bool _servicePolicySecondaryBound: false
+    // The default route the service holds ("" until read) and the weakest
+    // leak protection a first save may hold; for a user with no policy yet,
+    // what the install-time choices make of that first save.
+    property string _serviceDefaultRoute: ""
+    property string _serviceLeakFloor: "off"
+    /// Follow the service's answer: `rpRaw` is its route policy (absent for a
+    /// user with none), `first` its `first-policy`.
+    function _noteServicePolicy(rpRaw, first) {
+        var rp = rpRaw || {}
+        var start = (!rpRaw && first && typeof first === "object") ? first : null
+        _servicePolicySecondaryBound = !!(rpRaw && rp.secondary)
+        _serviceDefaultRoute = rpRaw ? _routePolicyEffective(rp, "mode")
+            : (start ? Pure.routePolicyCoerce("mode", start.mode) : "")
+        _serviceLeakFloor = start
+            ? Pure.routePolicyCoerce("leak-protection", start["leak-protection-at-least"]) : "off"
+    }
     // Does the APP hold an additional-adapter choice the service never got?
     // That is the one variant with a real one-click fix (re-send the binding);
     // with no choice on either side there is nothing to send, so the notice
@@ -304,7 +321,7 @@ ApplicationWindow {
     // not merely unrouted. Saying "not applied" there would be false comfort.
     readonly property bool policyInactiveKillSwitchBlocking:
         policyInactiveBannerVisible && !_policyIdlePrefsHaveSecondary
-        && uiRevision >= 0 && !!prefs && prefs.routeKillSwitchEnabled === true
+        && uiRevision >= 0 && routingState.leakProtection !== "off"
     // The app and the service each store which adapters carry which role, and
     // a disagreement between them is not ours to settle: only the user knows
     // whether the choice in front of them or the one being enforced is the
@@ -351,9 +368,9 @@ ApplicationWindow {
         _adaptersChangedSnapshotRefreshTimer.restart()
     }
 
-    // Top-of-window warning that the service is in the block-all
-    // fail-closed posture (kill-switch armed AND the additional adapter can't
-    // be resolved), so unknown traffic is being blocked. `killSwitchBlockAllArmed`
+    // Top-of-window warning that leak protection is holding all traffic
+    // (protection "everything" and the additional adapter can't be
+    // resolved). `killSwitchBlockAllArmed`
     // mirrors the connect-time snapshot posture (see `refreshUnenforcedAppRules`);
     // the `warnKillSwitchBlockAll` pref (default on) is the opt-out, toggled from
     // Settings -> Routing behavior. The `uiRevision >= 0` guard makes the binding
@@ -473,11 +490,6 @@ ApplicationWindow {
                 "actionText": tr("action.open-rules", "Open rules")
             })
         }
-        // Standing warning while the STRICT
-        // kill-switch (block-all) is on: when the additional adapter (VPN) drops,
-        // ALL internet is cut, not just routed sites. Non-dismissible — it mirrors
-        // a live, deliberately-chosen dangerous setting and clears the moment the
-        // user turns it off (or picks the best-effort variant).
         // The service is up and turned this window away. Nothing here retries
         // itself, so the notice explains what actually restores the link.
         if (((backendStatus || {}).kind) === "refused") {
@@ -555,6 +567,9 @@ ApplicationWindow {
     property int    _compatServiceProtocol:  0
     property string _compatGuiVersion:       ""
     property string _compatServiceVersion:   ""
+    /// Which side is behind on the wire contract (`Pure.contractSkew`). Writes
+    /// are refused across it, so the banner shows whatever the mode pref says.
+    property string contractSkew: ""
     // `compatBannerMode` pref gates visibility:
     //   "never"  → suppressed even on a real protocol mismatch.
     //   "auto"   → (default) protocol-mismatch only.
@@ -568,7 +583,8 @@ ApplicationWindow {
     readonly property string _compatBannerMode:
         String((prefs && prefs.compatBannerMode) || "auto")
     readonly property bool compatBannerVisible:
-        _compatBannerMode === "never"
+        contractSkew !== "" ? true
+        : _compatBannerMode === "never"
             ? false
             : (_compatBannerMode === "always"
                 ? (_compatInfoLoaded
@@ -1059,7 +1075,7 @@ ApplicationWindow {
             _rulesOverlapInFlight = false
             rulesOverlapPairs = (ok && payload && payload.pairs) ? payload.pairs : []
             ruleOverlapsController.update((ok && payload && payload["route-overlaps"]) || [],
-                ok && !_rulesOverlapStale)
+                ok && !_rulesOverlapStale, !!ok)
             if (_rulesOverlapStale) Qt.callLater(refreshRulesOverlaps)
         })
     }
@@ -1097,9 +1113,9 @@ ApplicationWindow {
         if (removed > 0) {
             selectedRule = -1
             _recomputeRulesDirty()
-            statusLine = tr("status.rules-overlap-removed",
-                "{n} rule(s) removed as already covered. Apply to put the change into effect.")
-                .replace("{n}", String(removed))
+            statusLine = Plurals.counted(tr, "status.rules-overlap-removed.", removed,
+                "{count} rule removed as already covered. Apply to put the change into effect.",
+                "{count} rules removed as already covered. Apply to put the change into effect.")
         }
         refreshRulesOverlaps()
     }
@@ -1454,6 +1470,59 @@ ApplicationWindow {
         })
     }
 
+    /// This user's saved rules do not read, so the last applied ones hold:
+    /// said when it appears, with the way to the details. A dismissed notice
+    /// stays down while it lasts; once the rules read again it goes.
+    property bool _rulesBookNoticeRaised: false
+    property string _rulesBookNoticeId: ""
+    function _onRulesBookReading(unreadable) {
+        var step = Pure.rulesBookNoticeStep(_rulesBookNoticeRaised, unreadable)
+        _rulesBookNoticeRaised = step.raised
+        if (!step.raised && _rulesBookNoticeId !== "") {
+            notificationsController._dropPushNotice(_rulesBookNoticeId)
+            _rulesBookNoticeId = ""
+        }
+        if (!step.raise) return
+        _rulesBookNoticeId = "rules-book-unreadable:" + String(Date.now())
+        notificationsController._addPushNotice({
+            "id": _rulesBookNoticeId,
+            "severity": "warning",
+            "dismissible": true,
+            "kind": "rules-book-unreadable",
+            "title": tr("notifications.rules-book-unreadable.title",
+                "Your saved rules cannot be read"),
+            "body": tr("notifications.rules-book-unreadable.body",
+                "Your saved rules cannot be read; the last applied rules stay in force. Changes will not apply until this is fixed."),
+            "actionKey": "open-diagnostics",
+            "actionText": tr("action.open-diagnostics", "Open diagnostics")
+        })
+    }
+
+    /// A work VPN that lets only its own DNS answer pauses our name handling:
+    /// said when it appears, dropped when it goes.
+    property bool _dnsForeignNoticeRaised: false
+    property string _dnsForeignNoticeId: ""
+    function _onDnsForeignReading(foreignOnly) {
+        var step = Pure.dnsUpstreamForeignNoticeStep(_dnsForeignNoticeRaised, foreignOnly)
+        _dnsForeignNoticeRaised = step.raised
+        if (!step.raised && _dnsForeignNoticeId !== "") {
+            notificationsController._dropPushNotice(_dnsForeignNoticeId)
+            _dnsForeignNoticeId = ""
+        }
+        if (!step.raise) return
+        _dnsForeignNoticeId = "dns-foreign-only:" + String(Date.now())
+        notificationsController._addPushNotice({
+            "id": _dnsForeignNoticeId,
+            "severity": "warning",
+            "dismissible": true,
+            "kind": "dns-foreign-only",
+            "title": tr("notifications.dns-foreign-only.title",
+                "Name handling is paused by your VPN"),
+            "body": tr("notifications.dns-foreign-only.body",
+                "Your work VPN only lets its own DNS answer, so NetRuleRouter's name handling is paused until another DNS answers. Rules by site name may not apply meanwhile. Disconnect the VPN, or ask its administrator to allow other DNS servers.")
+        })
+    }
+
     /// A forwarded network up with no answer for the tunnel's outage: asked once per
     /// appearance. Read only after the service answered for this user, so a
     /// policy not read yet is never taken for "not answered".
@@ -1529,7 +1598,6 @@ ApplicationWindow {
     property bool routingDefaultRouteDetailsExpanded: false
     property bool routingFakeIpDetailsExpanded: false
     property bool routingDnsViaSecondaryDetailsExpanded: false
-    property bool routingBlockAllDetailsExpanded: false
     property bool routingSharedStrictDetailsExpanded: false
     property bool routingSharedExemptAddressesExpanded: false
     property bool routingDohEditorExpanded: false
@@ -1718,18 +1786,13 @@ ApplicationWindow {
             (normalized.routeIncludeSubdomains === undefined)
                 ? true : !!normalized.routeIncludeSubdomains
         normalized.routeSharedIpPolicy = String(normalized.routeSharedIpPolicy || "majority-of-ip")
-        normalized.routeKillSwitchBlockAll = !!normalized.routeKillSwitchBlockAll
-        // Remaining routing/blocking mirrors. Coerce with
-        // the SERVICE defaults so the emitted payload is always valid: fail-closed
-        // defaults ON (undefined → true), protocols default to all (127), and the
-        // enforcement mode is one of the two known slugs (default reactive).
+        // Remaining routing/blocking mirrors. Coerce with the SERVICE defaults
+        // so the emitted payload is always valid: protocols default to all
+        // (127), and the enforcement mode is one of the two known slugs.
         // Each of these prefs is a MIRROR of a service-owned route-policy field,
         // so its default is taken from the one wire-field table rather than
         // restated here — a mirror that normalises to a different default than
         // the request builder sends is the same divergence in another disguise.
-        normalized.routeKillSwitchFailClosed =
-            Pure.routePolicyCoerce("kill-switch-fail-closed",
-                normalized.routeKillSwitchFailClosed)
         normalized.routeKillSwitchProtocols =
             Pure.routePolicyCoerce("kill-switch-protocols",
                 normalized.routeKillSwitchProtocols)
@@ -1739,19 +1802,9 @@ ApplicationWindow {
         // any `emitPrefs()` on the literal below then SAVED that answer.
         normalized.routeEnforcementMode =
             Pure.stabilityCoerce("enforcement-mode", normalized.routeEnforcementMode)
-        normalized.routeKillSwitchEnabled =
-            Pure.routePolicyCoerce("kill-switch-enabled", normalized.routeKillSwitchEnabled)
         normalized.routeAllowDnsOverPrimary =
             Pure.routePolicyCoerce("allow-dns-over-primary",
                 normalized.routeAllowDnsOverPrimary)
-        // Slug-valued: an unrecognised value is not "keep it", it is "use the
-        // declared default" — the service would reject anything else.
-        normalized.routeModeACoverageStrategy =
-            (normalized.routeModeACoverageStrategy === "per-ip"
-                || normalized.routeModeACoverageStrategy === "fail-closed-unknown"
-                || normalized.routeModeACoverageStrategy === "zone-widening")
-            ? normalized.routeModeACoverageStrategy
-            : Pure.ROUTE_POLICY_FIELD_DEFAULTS["mode-a-coverage-strategy"]
         normalized.routeResolveHostsBypass =
             Pure.routePolicyCoerce("resolve-hosts-bypass", normalized.routeResolveHostsBypass)
         // Secondary tunnel liveness window (seconds).
@@ -1781,7 +1834,7 @@ ApplicationWindow {
         normalized.acceptedEulaVersion = Math.max(0, normalized.acceptedEulaVersion | 0)
         return normalized
     }
-    // Apply/Cancel buffer-rollback (13.R2-GUI.3.c):
+    // Apply/Cancel buffer-rollback:
     // First mutating `updatePrefs` since the last Apply/Cancel takes a deep
     // snapshot of the prefs object. While `prefsSnapshot !== null`, the
     // footer Apply / Cancel buttons are enabled. Apply discards the snapshot
@@ -2000,7 +2053,7 @@ ApplicationWindow {
     }
 
     // Local segments the service found and nobody has answered for yet. The
-    // service exempts them from the kill-switch on its own, which is nearly
+    // service exempts them from leak protection on its own, which is nearly
     // always right — a hypervisor network or the main link's own subnet never
     // leaves the machine — but "nearly" is why the user gets asked rather than
     // told. `decided-by-user` is the service's own record of having an answer,
@@ -2357,20 +2410,23 @@ ApplicationWindow {
         // Mirror of the per-SID "seed from browser history
         // automatically" opt-in, refreshed from the connect snapshot.
         browserHistoryAutoSeed: false,
-        // Mirror of the per-SID kill-switch shared-IP
-        // strictness (false = "smart": census-shared IPs are not pinned).
+        // Leak protection in force ("off" / "sites" / "everything"), read under
+        // the service's default route; refreshed from the connect snapshot.
+        leakProtection: "off",
+        // Mirror of the per-SID shared-IP strictness of leak protection
+        // (false = "smart": census-shared IPs are not pinned).
         killSwitchStrictSharedIps: false,
-        // How many secondary IPs the smart kill-switch
-        // excluded from its pin/block set this compute (0 = no warning).
+        // How many secondary IPs smart leak protection excluded from its
+        // pin/block set this compute (0 = no warning).
         killSwitchSharedIpExemptions: 0,
         // The excluded addresses themselves, when the
         // service reports them. Older services send only the count above, so
         // this stays empty and the settings panel says so rather than
         // inventing a list.
         killSwitchSharedIpExemptionAddresses: [],
-        // Mirror of the service block-all posture (kill-switch
-        // fail-closed + secondary adapter unresolved). Drives the warning
-        // banner; refreshed from the connect snapshot.
+        // The service is holding all traffic (leak protection on, additional
+        // adapter unresolved). Drives the warning banner; refreshed from the
+        // connect snapshot.
         killSwitchBlockAllArmed: false,
         // What forwarded traffic gets while the tunnel is down ("" until answered).
         forwardedOutage: "",
@@ -2394,7 +2450,8 @@ ApplicationWindow {
     /// clients. Called on reconnect and after every rules refresh, since an
     /// app's resolvability changes once it is installed or launched (the
     /// resolver also inspects running processes).
-    function refreshUnenforcedAppRules() {
+    /// `onSnapshot(p)`, if given, also sees the snapshot once it is applied.
+    function refreshUnenforcedAppRules(onSnapshot) {
         if (!bridgeAvailable
                 || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
                 || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") {
@@ -2410,11 +2467,13 @@ ApplicationWindow {
             // An absent `route-policy` is the service's own "no route policy
             // for this user" state; a policy without a secondary slot resolves
             // to the same "no secondary routes will be applied" outcome.
-            window._servicePolicySecondaryBound = !!(rpRaw && rp.secondary)
+            window._noteServicePolicy(rpRaw, p["first-policy"])
             window._servicePolicyRead = true
             // The standing twin of the push: a client that connected after
             // the service asked still gets the question.
             _offerPendingVpnClients(p["pending-vpn-clients"] || [])
+            confirmedVpnGateways = p["confirmed-vpn-gateways"] || []
+            _offerPendingVpnGateways(p["pending-vpn-gateways"] || [])
             var patch = {
                 unenforcedAppRules: list,
                 unenforcedAppReasons: p["unenforced-app-reasons"] || {},
@@ -2425,8 +2484,11 @@ ApplicationWindow {
                 // An absent or unknown value reads as the declared default,
                 // never as "apply automatically".
                 autoRulesMode: window._routePolicyEffective(rp, "auto-rules-mode"),
-                // Strictness mirror + the smart kill-switch
-                // shared-IP exclusion count for the settings warning.
+                leakProtection: Pure.coerceLeakProtection(
+                    window._routePolicyEffective(rp, "mode"),
+                    window._routePolicyEffective(rp, "leak-protection")),
+                // Strictness mirror + the smart shared-IP exclusion count for
+                // the settings warning.
                 killSwitchStrictSharedIps: rp["kill-switch-strict-shared-ips"] === true,
                 killSwitchSharedIpExemptions:
                     Number(p["kill-switch-shared-ip-exemptions"] || 0),
@@ -2436,9 +2498,8 @@ ApplicationWindow {
                 killSwitchSharedIpExemptionAddresses:
                     (p["kill-switch-shared-ip-exemption-addresses"] instanceof Array)
                         ? p["kill-switch-shared-ip-exemption-addresses"] : [],
-                // Mirror the service block-all posture so the
-                // top-of-window warning banner reflects the live fail-closed
-                // state (kill-switch armed + secondary adapter unresolved).
+                // The top-of-window warning follows the live "holding all
+                // traffic" state.
                 killSwitchBlockAllArmed:
                     p["kill-switch-block-all-armed"] === true,
                 ruleConflicts: (p["rule-conflicts"] instanceof Array)
@@ -2462,6 +2523,7 @@ ApplicationWindow {
             }
             updateRoutingState(patch)
             _onForwardedReading()
+            _recordLinkProvidersFrom(p)
             _resyncLinkProvidersFromPrefs(p)
             // The push fires on change only; a window that connected later
             // learns the standing state here. Nothing may record these
@@ -2470,13 +2532,15 @@ ApplicationWindow {
             _applyStandingEnforcementStatus(p["enforcement-status"])
             _applyStandingRoutesHeld(p["routes-held-by-another-user"])
             _applyStandingTrafficCarried(p["traffic-carried-by-another-user"])
+            _onRulesBookReading(p["rules-book-unreadable"] === true)
+            if (typeof onSnapshot === "function") onSnapshot(p)
         })
     }
     // Heal the service-side link-provider SSOT after a
     // service-DB wipe. The confirmed-VPN prefs mirror survives (registry),
     // but the per-SID `route_link_provider_apps` table does not; without it
     // the VPN client earns no APP_EXEMPT permit and its own handshake is
-    // caught by the kill-switch catch-all. When the connect
+    // caught by leak protection. When the connect
     // snapshot reports an EMPTY service set while the prefs mirror holds
     // confirmed paths, push the mirror back through route.link-provider.set.
     // Once per GUI session: the write triggers a server-side recompile, so
@@ -2926,7 +2990,7 @@ ApplicationWindow {
         id: offlinePendingController
         root: window
     }
-    // Per-SID route-policy apply handlers (kill-switch family, DoH lockdown,
+    // Per-SID route-policy apply handlers (leak protection, DoH lockdown,
     // shared-IP, include-subdomains, mode-A coverage, hosts-bypass, browser-history
     // auto-seed, default-route mode) + adapter-binding push/resync. The shell keeps
     // the shared policy helpers (`_buildFullRoutePolicyReq` / `_routePolicyEffective`
@@ -3009,9 +3073,10 @@ ApplicationWindow {
                 "title": tr("notifications.vpn-client-trust.title",
                     "Is this your VPN?"),
                 "body": (bundled
-                    ? tr("notifications.vpn-client-trust.body-bundle",
-                        "{name} looks like a VPN client, but it is not installed in a protected program folder, so leak protection does not trust it on its own. It ships with {count} more program(s) that can be trusted with it.")
-                        .replace("{count}", String(offer.bundledExePaths.length))
+                    ? Plurals.counted(tr, "notifications.vpn-client-trust.body-bundle.",
+                        offer.bundledExePaths.length,
+                        "{name} looks like a VPN client, but it is not installed in a protected program folder, so leak protection does not trust it on its own. It ships with {count} more program that can be trusted with it.",
+                        "{name} looks like a VPN client, but it is not installed in a protected program folder, so leak protection does not trust it on its own. It ships with {count} more programs that can be trusted with it.")
                     : tr("notifications.vpn-client-trust.body",
                         "{name} looks like a VPN client, but it is not installed in a protected program folder, so leak protection does not trust it on its own. Confirm it and it will keep working while leak protection is on."))
                     .replace("{name}", Pure.displayText(offer.name)),
@@ -3035,43 +3100,199 @@ ApplicationWindow {
     function _trustVpnClient(noticeId, withBundle) {
         var offer = _pendingVpnOffers[String(noticeId || "")]
         if (!offer) return
-        var joined = (prefs && prefs.confirmedVpnExePaths)
-            ? String(prefs.confirmedVpnExePaths) : ""
-        var existing = []
+        var started = _replaceLinkProviders(function(existing) {
+            return Pure.vpnClientTrustConfirmedApps(existing, offer, withBundle)
+        }, function() {
+            return tr("vpn-onboarding.confirmed-status",
+                "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
+                .replace("{name}", Pure.displayText(offer.name))
+        })
+        if (!started) return
+        notificationsController._dropPushNotice(String(noticeId || ""))
+        delete _pendingVpnOffers[String(noticeId || "")]
+    }
+
+    // The confirmed link providers as the service last reported them: what
+    // Settings shows and the picker opens with. The prefs copy only stands in
+    // until the service has answered.
+    property var linkProviderApps: []
+    property bool linkProviderAppsKnown: false
+    property bool _linkProvidersWriting: false
+    function _recordLinkProvidersFrom(snapshot) {
+        var rp = (snapshot && (snapshot["route-policy"] || snapshot.routePolicy)) || null
+        if (!rp) return
+        linkProviderApps = rp["secondary-link-provider-apps"] || []
+        linkProviderAppsKnown = true
+    }
+    function _linkProvidersMirror() {
+        var joined = (prefs && prefs.confirmedVpnExePaths) ? String(prefs.confirmedVpnExePaths) : ""
         var known = joined === "" ? [] : joined.split(";")
+        var out = []
         for (var i = 0; i < known.length; i += 1) {
             var path = String(known[i] || "").trim()
-            if (path !== "") existing.push({ "exe-path": path, "display-name": "" })
+            if (path !== "") out.push({ "exe-path": path, "display-name": "" })
         }
-        var apps = Pure.vpnClientTrustConfirmedApps(existing, offer, withBundle)
+        return out
+    }
+    function currentLinkProviders() {
+        return linkProviderAppsKnown ? linkProviderApps : _linkProvidersMirror()
+    }
+    function _mirrorLinkProviders(apps) {
         var paths = []
-        for (var a = 0; a < apps.length; a += 1) paths.push(apps[a]["exe-path"])
+        for (var i = 0; i < (apps || []).length; i += 1) paths.push(String(apps[i]["exe-path"] || ""))
         updatePrefs({
             confirmedVpnExePaths: paths.join(";"),
             confirmedVpnExePath: paths.length > 0 ? paths[0] : ""
         })
         emitPrefs()
-        _writeLinkProviderSet(apps)
-        notificationsController._dropPushNotice(String(noticeId || ""))
-        delete _pendingVpnOffers[String(noticeId || "")]
-        statusLine = tr("vpn-onboarding.confirmed-status",
-            "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
-            .replace("{name}", Pure.displayText(offer.name))
     }
-    function _writeLinkProviderSet(apps) {
+    function _linkProvidersRead() {
+        return (bridgeAvailable && typeof nrrNativeBridge !== "undefined" && nrrNativeBridge !== null
+                && typeof nrrNativeBridge.rpcSnapshotInitialGet === "function")
+            ? (nrrNativeBridge.rpcSnapshotInitialGet() || "") : ""
+    }
+    // The service replaces the set whole, so every change is worked out over
+    // a fresh read: `build(existing)` gives the new set, `say(stored)` the
+    // status line once the service holds it. Without the service only the
+    // prefs copy changes, and the next start that finds the service set empty
+    // sends it. False while another change is in flight.
+    function _replaceLinkProviders(build, say, onDone) {
+        if (_linkProvidersWriting) return false
+        var read = _linkProvidersRead()
+        if (!read) {
+            _mirrorLinkProviders(build(_linkProvidersMirror()))
+            statusLine = tr("vpn-onboarding.service-write-failed",
+                "Could not save to the routing service — will retry on next apply.")
+            if (onDone) onDone(false)
+            return true
+        }
+        _linkProvidersWriting = true
+        rpcTransport.registerRpcCallback(read, function(ok, p, code) {
+            if (!ok) {
+                _linkProvidersWriting = false
+                var label = (typeof ipcErrorLabel === "function")
+                    ? ipcErrorLabel(String(code || "unknown")) : String(code || "")
+                statusLine = tr("status.route-policy-read-failed",
+                    "Could not read the current routing policy, so nothing was changed. The setting is saved and will be sent again: ")
+                    + label
+                if (onDone) onDone(false)
+                return
+            }
+            _recordLinkProvidersFrom(p)
+            _writeLinkProviderSet(build(linkProviderApps), function(stored) {
+                _linkProvidersWriting = false
+                statusLine = say(stored)
+                if (onDone) onDone(true)
+            }, function() {
+                _linkProvidersWriting = false
+                if (onDone) onDone(false)
+            })
+        })
+        return true
+    }
+    function _writeLinkProviderSet(apps, onStored, onFailed) {
         var req = {
             "role": "secondary",
             "link-provider-apps": apps || []
         }
         var corr = rpcTransport.rpcRouteLinkProviderSet(req)
+        if (!corr) {
+            if (onFailed) onFailed()
+            return
+        }
         rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
-            if (ok) return
+            if (ok) {
+                // What the service stored (deduplicated), not what was sent.
+                var stored = (p && p["link-provider-apps"]) || apps || []
+                linkProviderApps = stored
+                linkProviderAppsKnown = true
+                _mirrorLinkProviders(stored)
+                if (onStored) onStored(stored)
+                return
+            }
+            // Kept on the device so the next start can send it again.
+            _mirrorLinkProviders(apps || [])
             var label = (typeof ipcErrorLabel === "function")
                 ? ipcErrorLabel(String(code || "unknown")) : String(code || "")
             statusLine = statusLine + " "
                 + tr("vpn-onboarding.service-write-failed",
                     "Could not save to the routing service — will retry on next apply.")
                 + (label ? (" (" + label + ")") : "")
+            if (onFailed) onFailed()
+        })
+    }
+
+    // Another VPN's server that leak protection stopped on the main link: the
+    // service lists it, the notice asks, and a yes writes the confirmed list
+    // whole (old list plus the answer). One write at a time, or two answers
+    // built from the same old list would drop one of them.
+    property var confirmedVpnGateways: []
+    property var _pendingVpnGatewayOffers: ({})
+    property bool _vpnGatewaysWriting: false
+    function _offerPendingVpnGateways(pending) {
+        var offers = Pure.vpnGatewayOffers(pending || [])
+        var keep = {}
+        for (var i = 0; i < offers.length; i += 1) {
+            var offer = offers[i]
+            var id = "vpn-gateway-trust:" + offer.address.toLowerCase()
+            keep[id] = true
+            _pendingVpnGatewayOffers[id] = offer
+            notificationsController._addPushNotice({
+                "id": id,
+                "severity": "warning",
+                "dismissible": true,
+                "kind": "vpn-gateway-trust",
+                "title": tr("notifications.vpn-gateway-trust.title", "Let this VPN connect?"),
+                "body": (offer.program !== ""
+                    ? tr("notifications.vpn-gateway-trust.body-program",
+                        "Leak protection stopped {name} from reaching the VPN server {address} over your main connection. Allow it and that VPN connects while leak protection is on; nothing else is let through to that address.")
+                        .replace("{name}", Pure.displayText(offer.name))
+                    : tr("notifications.vpn-gateway-trust.body",
+                        "Leak protection stopped a VPN from reaching its server {address} over your main connection. Allow it and that VPN connects while leak protection is on; nothing else is let through to that address."))
+                    .replace("{address}", Pure.displayText(offer.address)),
+                "actionKey": "trust-vpn-gateway",
+                "actionText": tr("notifications.vpn-gateway-trust.action", "Allow this VPN"),
+                "actionArg": id
+            })
+        }
+        for (var old in _pendingVpnGatewayOffers) {
+            if (keep[old]) continue
+            notificationsController._dropPushNotice(old)
+            delete _pendingVpnGatewayOffers[old]
+        }
+    }
+    // Writes `list` as the caller's whole confirmed set; `onSaved` runs after
+    // `confirmedVpnGateways` follows the stored answer.
+    function _writeVpnGateways(list, onSaved) {
+        if (_vpnGatewaysWriting) return
+        var corr = rpcTransport.rpcRouteVpnGatewaysSet({ "gateways": list })
+        if (!corr) return
+        _vpnGatewaysWriting = true
+        rpcTransport.registerRpcCallback(corr, function(ok, p, code) {
+            _vpnGatewaysWriting = false
+            if (!ok) {
+                var label = (typeof ipcErrorLabel === "function")
+                    ? ipcErrorLabel(String(code || "unknown")) : String(code || "")
+                // Nothing retries this write; the list stays as it was.
+                statusLine = tr("vpn-onboarding.gateway-save-failed",
+                        "Could not save the change to the allowed VPN servers, so nothing changed. Try again.")
+                    + (label ? (" (" + label + ")") : "")
+                return
+            }
+            confirmedVpnGateways = (p && p["gateways"]) || list
+            onSaved()
+        })
+    }
+    function _trustVpnGateway(noticeId) {
+        var id = String(noticeId || "")
+        var offer = _pendingVpnGatewayOffers[id]
+        if (!offer) return
+        _writeVpnGateways(Pure.vpnGatewaysConfirmed(confirmedVpnGateways, offer), function() {
+            notificationsController._dropPushNotice(id)
+            delete _pendingVpnGatewayOffers[id]
+            statusLine = tr("vpn-onboarding.gateway-allowed-status",
+                "The VPN server {address} can now be reached while leak protection is on.")
+                .replace("{address}", Pure.displayText(offer.address))
         })
     }
 
@@ -3219,7 +3440,10 @@ ApplicationWindow {
                 // so a real service is answering regardless of which facade the
                 // launcher handed us at cold start.
                 window.backendLiveServiceConfirmed = true
+                if (!notificationsController._shippedComponentsChecked)
+                    Qt.callLater(notificationsController.checkShippedComponentsOnce)
                 window._onSystemDnsReading(Pure.systemDnsNotRestored(payload))
+                window._onDnsForeignReading(Pure.dnsUpstreamForeignOnly(payload))
                 var wasDisconnected =
                     (window.backendStatus || {}).kind !== "connected"
                 if (wasDisconnected) {
@@ -3396,6 +3620,14 @@ ApplicationWindow {
                 kind = "connecting"
             } else {
                 _healthTimeoutStreak = 0
+                // The pipe alone cannot say why nobody answers; the service
+                // manager can, and the banner then offers Start or Install.
+                // On Linux the read is asynchronous, so this tick uses the last one.
+                if (typeof nrrServiceController !== "undefined" && nrrServiceController
+                        && typeof nrrServiceController.refreshStatus === "function") {
+                    nrrServiceController.refreshStatus()
+                }
+                kind = Pure.offlineBackendKind(kind, window._serviceStatusSlug())
             }
             var prevKind = (window.backendStatus || {}).kind
             window.backendStatus = {
@@ -3404,7 +3636,7 @@ ApplicationWindow {
                     ? window.ipcErrorLabel(code) : code
             }
             // Log only on a real transition (the poll fires every 3 s).
-            if (kind !== prevKind) {
+            if (kind !== prevKind && !Pure.backendOutageContinues(prevKind, kind)) {
                 if (kind === "connecting") {
                     window.logProgress(
                         tr("progress.connecting", "Connecting to the service…"),
@@ -3484,7 +3716,13 @@ ApplicationWindow {
         repeat: true
         running: true
         triggeredOnStart: false
-        onTriggered: driftController._driftRecheck()
+        // The service leg (a whole-book pull) follows `revision-status-changed`;
+        // the tick only re-reads it as a slow safety net.
+        property int ticks: 0
+        onTriggered: {
+            ticks += 1
+            driftController._driftRecheck(ticks % 10 === 0)
+        }
     }
 
     // Debounced re-pull of the connect-time snapshot after an
@@ -3501,6 +3739,67 @@ ApplicationWindow {
         repeat: false
         running: false
         onTriggered: refreshUnenforcedAppRules()
+    }
+
+    // A dropped frame, a fall behind the ring and a re-subscribe can all land
+    // together; the state is re-read once they settle, not once each.
+    Timer {
+        id: _pushGapRereadTimer
+        interval: 500
+        repeat: false
+        running: false
+        onTriggered: _rereadAfterPushGap()
+    }
+
+    /// A hole in the push stream: what the lost pushes would have changed is
+    /// read again from the service.
+    function _rereadAfterPushGap() {
+        if (!bridgeAvailable) return
+        interfacesRolesController.refreshInterfacesFromService()
+        // Same guard as a reconnect: unsaved edits and a parked offline import
+        // must survive a gap. A clean table follows the rules in force, and so
+        // do the linked files.
+        if (!unsavedChangesRegistry["rules"] && !_offlineRulesPendingPush)
+            boundFilesController.handleRulesChangedInService()
+        else if (typeof driftController._driftRefreshServiceBaselineFromService === "function")
+            driftController._driftRefreshServiceBaselineFromService()
+        refreshUnenforcedAppRules(_applyPushedSettingsFromSnapshot)
+        refreshDiagnosticsSnapshot()
+        refreshPendingLocalNetworks()
+        autoRuleSuggestionsController.refreshAutoRuleCandidates()
+        autoRuleSuggestionsController.refreshAutoRuleDismissed()
+        verifyVerdicts.refresh()
+        notificationsController.onNoticeMutesChanged()
+        driftController._driftRecheck(true)
+    }
+
+    /// The settings this window otherwise learns only from their pushes.
+    function _applyPushedSettingsFromSnapshot(p) {
+        var patch = {}
+        var paused = p["routing-paused"] === true
+        if (paused !== (routingState.routingPaused === true)) {
+            patch.routingPaused = paused
+            patch.routingPausedAt = paused ? new Date().toISOString() : ""
+            patch.routingPauseReason = ""
+        }
+        var failurePolicy = p["apply-failure-policy"]
+        if (failurePolicy && failurePolicy.policy)
+            patch.applyFailurePolicy = String(failurePolicy.policy)
+        if (p["retention-settings"])
+            patch.retentionSettings = _retentionSettingsFromWire(p["retention-settings"])
+        updateRoutingState(patch)
+    }
+
+    function _retentionSettingsFromWire(p) {
+        return {
+            supersededDays: Number(p["superseded-days"] || 30),
+            supersededCountCap: Number(p["superseded-count-cap"] || 100),
+            rejectedDays: Number(p["rejected-days"] || 7),
+            rolledbackDays: Number(p["rolledback-days"] || 14),
+            rolledbackCountCap: Number(p["rolledback-count-cap"] || 20),
+            pinLkg: !!p["pin-lkg"],
+            lastCleanupAt: p["last-cleanup-at"] || ""
+        }
     }
 
     // Settle window + re-read for the "service applies nothing" notice. Runs
@@ -3626,19 +3925,7 @@ ApplicationWindow {
                 if (bridgeAvailable) {
                     var corr = nrrNativeBridge.rpcRetentionSettingsGet()
                     rpcTransport.registerRpcCallback(corr, function(ok, p) {
-                        if (ok && p) {
-                            updateRoutingState({
-                                retentionSettings: {
-                                    supersededDays: Number(p["superseded-days"] || 30),
-                                    supersededCountCap: Number(p["superseded-count-cap"] || 100),
-                                    rejectedDays: Number(p["rejected-days"] || 7),
-                                    rolledbackDays: Number(p["rolledback-days"] || 14),
-                                    rolledbackCountCap: Number(p["rolledback-count-cap"] || 20),
-                                    pinLkg: !!p["pin-lkg"],
-                                    lastCleanupAt: p["last-cleanup-at"] || ""
-                                }
-                            })
-                        }
+                        if (ok && p) updateRoutingState({ retentionSettings: _retentionSettingsFromWire(p) })
                     })
                 }
                 break
@@ -3648,6 +3935,7 @@ ApplicationWindow {
                 // Whoever wrote — the tray, the terminal UI, the service's own
                 // authors, a reset: a clean table follows the rules in force.
                 boundFilesController.handleRulesChangedInService()
+                driftController._driftRecheck(true)
                 break
             case "security-alerts-changed":
                 refreshDiagnosticsSnapshot()
@@ -3704,7 +3992,11 @@ ApplicationWindow {
                 // no longer holds.
                 autoRuleSuggestionsController.refreshAutoRuleCandidates()
                 autoRuleSuggestionsController.refreshAutoRuleDismissed()
-                if (autoRuleSuggestionsController.autoRuleCandidatesPending > 0) {
+                // A push that only moves the count updates the badges; a notice
+                // is for news, never for an empty inbox.
+                if (autoRuleSuggestionsController.autoRuleCandidatesPending <= 0)
+                    notificationsController._dropPushNotice(autoRuleSuggestionsController._autoRuleNoticeId)
+                if (Pure.autoRuleNoticeDue(event)) {
                     // Keyed on the push, not on a constant: dismissing writes
                     // to the ledger, and one fixed id would retire the banner
                     // for the life of the install. Only one is on screen at a
@@ -3758,6 +4050,9 @@ ApplicationWindow {
                 // time, so a confirmed client's question goes away.
                 _offerPendingVpnClients(event["clients"] || [])
                 break
+            case "vpn-gateway-awaiting-confirmation":
+                _offerPendingVpnGateways(event["gateways"] || [])
+                break
             case "rule-duplicates-detected":
                 // The rules are valid; they simply claim the same traffic for
                 // two routes, and evaluation order — not the user — settles
@@ -3802,6 +4097,9 @@ ApplicationWindow {
                 break
             case "secondary-external-address-observed":
                 _onSecondaryExternalAddress(event)
+                break
+            case "secondary-external-address-cleared":
+                _withdrawSecondaryExternalAddress()
                 break
             case "block-notice-raised":
                 _onBlockNoticeRaised(event, eventId)
@@ -3877,6 +4175,9 @@ ApplicationWindow {
             case "traffic-carried-by-another-user":
                 _onTrafficCarriedByAnotherUser(event)
                 break
+            case "rules-book-unreadable":
+                _onRulesBookReading(event.unreadable === true)
+                break
             case "adapters-changed":
                 // The service's adapter monitor detected a
                 // topology change (e.g. the secondary adapter went up or down). Re-pull the
@@ -3888,7 +4189,7 @@ ApplicationWindow {
                 // `routingState.killSwitchBlockAllArmed` (and the rest of the
                 // snapshot mirror) tracks the service's live block-all posture
                 // once the topology change resolves — otherwise the amber
-                // "kill-switch block-all active" banner can outlive the
+                // "holding all traffic" banner can outlive the
                 // condition that raised it. Debounced: a flapping adapter can
                 // fire several of these pushes back to back.
                 if (bridgeAvailable) _adaptersChangedSnapshotRefreshTimer.restart()
@@ -3901,15 +4202,10 @@ ApplicationWindow {
                     Qt.callLater(routePolicyController.resyncRouteBindingOnAdapterChange)
                 break
             case "push-gap":
-                // The client dropped at least one event because this window was
-                // not draining fast enough, so anything derived from pushes may
-                // be behind. Re-read the live state rather than carry on from a
-                // stream with a hole in it.
-                if (bridgeAvailable) {
-                    Qt.callLater(interfacesRolesController.refreshInterfacesFromService)
-                    Qt.callLater(function() { _refreshRulesFromService({ silent: true }) })
-                    _adaptersChangedSnapshotRefreshTimer.restart()
-                }
+                // Events were dropped (this window did not drain fast enough,
+                // fell behind the service's ring, or re-subscribed), so all it
+                // derived from pushes may be behind. One re-read per burst.
+                if (bridgeAvailable) _pushGapRereadTimer.restart()
                 break
             default:
                 console.log("push: unknown event type", type)
@@ -3973,7 +4269,7 @@ ApplicationWindow {
         var body = ""
         if (reason === "blanket-block-not-armed") {
             body = tr("status.protection.blanket-block-not-armed",
-                "Full blocking is not switched on: the address of the additional link is unknown, and blocking everything without it would cut the link itself. Traffic outside your rules is not blocked.")
+                "Leak protection \"Everything\" is not in force yet: the address of the additional connection is unknown, and blocking everything without it would cut that connection too. Traffic outside your rules is not blocked.")
         } else if (reason === "machine-wide-cut-by-another-user") {
             body = tr("status.protection.machine-wide-cut-by-another-user",
                 "Another user of this computer switched on leak protection. Part of it cannot be limited to one account, so IPv6 and ping are off for everyone until they switch it off.")
@@ -4023,6 +4319,9 @@ ApplicationWindow {
             return String(n.id).indexOf(prefix) === 0 && n.id !== id
         })
         for (var i = 0; i < stale.length; i += 1) notificationsController._dropPushNotice(stale[i].id)
+        // A reconnect inside the service's quiet period refreshes the value
+        // only; it is not announced again.
+        if (event.quiet === true) return
         notificationsController._addPushNoticeUnlessMuted("external-address", {
             "id": id,
             "severity": "info",
@@ -4034,6 +4333,16 @@ ApplicationWindow {
             "body": body,
             "bodyRichText": true
         })
+    }
+
+    /// The link the card named went down or changed: its exit is not the
+    /// route's exit any more.
+    function _withdrawSecondaryExternalAddress() {
+        var prefix = "secondary-external-address:"
+        var shown = notificationsController._pushNotices.filter(function(n) {
+            return String(n.id).indexOf(prefix) === 0
+        })
+        for (var i = 0; i < shown.length; i += 1) notificationsController._dropPushNotice(shown[i].id)
     }
 
     /// Roles the service last reported as not enforced. Kept apart from the
@@ -4049,6 +4358,7 @@ ApplicationWindow {
     /// comes up, celebrated.
     property var _enforcementQuietRoles: []
     function _setEnforcementStatus(role, status) {
+        if (Pure.secondaryLinkEnded(status, role)) _withdrawSecondaryExternalAddress()
         var next = Object.assign({}, enforcementStatusByRole)
         if (status === "" || status === "ok") delete next[role]
         else next[role] = status
@@ -4365,9 +4675,6 @@ ApplicationWindow {
             case "route-unavailable":
                 return tr("notifications.block-notice.reason.route-unavailable",
                     "The route this connection needed was unavailable.")
-            case "not-covered-by-rules":
-                return tr("notifications.block-notice.reason.not-covered-by-rules",
-                    "No rule covers this connection, so the default action blocked it.")
             case "blocked-by-rule":
                 return tr("notifications.block-notice.reason.blocked-by-rule",
                     "A rule denies this connection.")
@@ -4425,9 +4732,9 @@ ApplicationWindow {
             list = list + ", " + tr("notifications.block-notice.backlog.more", "and {count} more")
                 .replace("{count}", String(summary.more))
         }
-        var body = tr("notifications.block-notice.backlog.body",
-                "The service blocked {count} connection(s) while NetRuleRouter was not open.")
-            .replace("{count}", String(summary.count))
+        var body = Plurals.counted(tr, "notifications.block-notice.backlog.counted.", summary.count,
+            "The service blocked {count} connection while NetRuleRouter was not open.",
+            "The service blocked {count} connections while NetRuleRouter was not open.")
         if (list !== "") {
             body = body + " " + tr("notifications.block-notice.backlog.destinations",
                 "Destinations: {list}.").replace("{list}", list)
@@ -4746,6 +5053,25 @@ ApplicationWindow {
                     "The service was stopped, so it has been started again.")
             })
         }
+        // The file stays untouched so a later start can still read it; until
+        // then this session runs on defaults and saves nothing.
+        if (context.preferencesUnreadable === true) {
+            Qt.callLater(function() {
+                notificationsController._addPushNotice({
+                    "id": "settings-unreadable",
+                    "severity": "warning",
+                    "dismissible": true,
+                    "title": tr("notifications.settings-unreadable.title",
+                        "Your settings could not be read"),
+                    "body": tr("notifications.settings-unreadable.body",
+                        "This session uses default settings and will not save changes, so your saved settings stay as they are. Close the app and open it again; if the file is locked by another program, free it first.")
+                })
+            })
+        }
+        // Parts of the package this copy lacks, named once the window is up.
+        var deliveryGaps = context.deliveryGaps || []
+        if (deliveryGaps.length > 0)
+            Qt.callLater(function() { notificationsController.noteDeliveryGaps(deliveryGaps) })
         // Before `section`: opening Diagnostics right away must see whether
         // the launch snapshot already counts as a fresh live answer.
         diagnosticsSnapshot = context.diagnostics || ({})
@@ -4779,19 +5105,10 @@ ApplicationWindow {
             supports("appRouting"))
         for (var t = 0; t < types.length; t += 1) ruleTypesModel.append(types[t])
         Pure.clearModel(rulesModel)
-        // When the launcher intended the real service
-        // (BackendChoice::Ipc) but the service was stopped/unreachable, it
-        // falls back to the MockBackendFacade whose cold-start snapshot carries
-        // DEMO rules, while stamping a non-"connected" backendStatus (e.g.
-        // "service-stopped"). Seeding those demo rows made the Rules table
-        // masquerade demo data as the user's real (not-yet-loaded) rules —
-        // momentary "my rules are gone" panic. Only seed the snapshot rows when
-        // the backend is genuinely connected: a real service, OR an explicit
-        // mock/preview build (BackendChoice::Mock/PreviewLocal both emit
-        // kind:"connected"). In the degraded-Ipc fallback leave the model EMPTY
-        // — RulesSection paints a "service not running" empty-state, and the 3 s
-        // backendStatusPoll → refreshBackendStatus() → _refreshRulesFromService
-        // hydrates the real per-SID rules the moment the service connects.
+        // Rows are seeded only from a connected backend (a real service, or
+        // the explicit mock build: BackendChoice::Mock emits kind:"connected").
+        // A stopped service leaves the model empty until
+        // _refreshRulesFromService hydrates the real rules on connect.
         var rulesRows = (((backendStatus || {}).kind) === "connected")
             ? (((context.rules || {}).rows) || [])
             : []
@@ -4871,12 +5188,19 @@ ApplicationWindow {
         }
     }
 
-    // Open the VPN-client onboarding dialog. Entry
-    // point wired from Settings -> Routing -> Leak protection ("Set up my VPN").
+    // Open the VPN-client picker over a fresh read of the stored set, so it
+    // opens with exactly what the service holds ticked.
     function openVpnOnboarding() {
-        if (typeof vpnOnboardingDialog !== "undefined" && vpnOnboardingDialog) {
-            vpnOnboardingDialog.open()
+        if (typeof vpnOnboardingDialog === "undefined" || !vpnOnboardingDialog) return
+        var read = _linkProvidersRead()
+        if (!read) {
+            vpnOnboardingDialog.open(currentLinkProviders())
+            return
         }
+        rpcTransport.registerRpcCallback(read, function(ok, p) {
+            if (ok) _recordLinkProvidersFrom(p)
+            vpnOnboardingDialog.open(currentLinkProviders())
+        })
     }
 
     // Open the app-group routing dialog (scan installed programs,
@@ -4904,70 +5228,72 @@ ApplicationWindow {
     function _applyAppGroupRoutes(assignments) {
         var list = assignments || []
         var mutated = false
-        // Pass 1 — primary assignments remove any matching application rule.
-        for (var pi = 0; pi < list.length; pi += 1) {
-            var pa = list[pi]
-            if (String(pa.route || "") !== "primary") continue
-            var pmv = String(pa.matchValue || "")
-            if (pmv === "") continue
-            var pmvLower = pmv.toLowerCase()
-            for (var ri = rulesModel.count - 1; ri >= 0; ri -= 1) {
-                var prow = rulesModel.get(ri)
-                if (String(prow.ruleType || "") === "application"
-                        && String(prow.matchValue || "").toLowerCase() === pmvLower) {
-                    rulesModel.remove(ri)
-                    mutated = true
-                }
+        // The decision (which rules go, switch or appear) is Pure's; this
+        // function only carries it out on the model.
+        var appRows = []
+        var modelIndex = []
+        for (var mi = 0; mi < rulesModel.count; mi += 1) {
+            var mrow = rulesModel.get(mi)
+            if (String(mrow.ruleType || "") !== "application") continue
+            appRows.push({
+                value: String(mrow.matchValue || ""),
+                route: String(mrow.targetRoute || ""),
+                enabled: mrow.enabled !== false
+            })
+            modelIndex.push(mi)
+        }
+        var wanted = []
+        var kindByValue = ({})
+        var secondaryCount = 0
+        for (var wi = 0; wi < list.length; wi += 1) {
+            var wv = String(list[wi].matchValue || "")
+            var wr = String(list[wi].route || "")
+            if (wv === "") continue
+            wanted.push({ value: wv, route: wr })
+            if (wr === "secondary") {
+                secondaryCount += 1
+                kindByValue[wv] = String(list[wi].kind || "")
             }
         }
-        // Pass 2 — secondary assignments ensure an application->secondary rule.
+        var plan = Pure.planAppRouteAssignments(appRows, wanted)
+        // Highest model index first, so earlier removals do not shift later ones.
+        var doomed = plan.remove.map(function(i) { return modelIndex[i] })
+            .sort(function(x, y) { return y - x })
+        for (var di = 0; di < doomed.length; di += 1) {
+            rulesModel.remove(doomed[di])
+            mutated = true
+        }
+        var shift = function(at) {
+            var n = 0
+            for (var q = 0; q < doomed.length; q += 1) if (doomed[q] < at) n += 1
+            return at - n
+        }
+        for (var ti = 0; ti < plan.retarget.length; ti += 1) {
+            var upd = rulesModel.get(shift(modelIndex[plan.retarget[ti]]))
+            // A disabled rule routes nothing: enabling it is the change.
+            rulesModel.set(shift(modelIndex[plan.retarget[ti]]), {
+                id: upd.id,
+                enabled: true,
+                ruleType: "application",
+                ruleTypeTitle: ruleTypeLabel("application"),
+                matchValue: upd.matchValue,
+                aceMatchValue: _aceLowerForSearch(upd.matchValue),
+                targetRoute: "secondary",
+                comment: upd.comment
+            })
+            mutated = true
+        }
+        // Counted once and carried: re-walking the model per rule is quadratic.
         var limitHit = false
-        var secondaryCount = 0
-        // Counted once and carried: the check sits inside the loop, and
-        // re-walking the whole model per assignment is quadratic on a rule set
-        // this size.
         var userCount = userRuleCount()
-        for (var si = 0; si < list.length; si += 1) {
-            var sa = list[si]
-            if (String(sa.route || "") !== "secondary") continue
-            var mv = String(sa.matchValue || "")
-            if (mv === "") continue
-            var mvLower = mv.toLowerCase()
-            secondaryCount += 1
-            // Find an existing application rule with the same match value.
-            var existingIdx = -1
-            for (var ei = 0; ei < rulesModel.count; ei += 1) {
-                var erow = rulesModel.get(ei)
-                if (String(erow.ruleType || "") === "application"
-                        && String(erow.matchValue || "").toLowerCase() === mvLower) {
-                    existingIdx = ei
-                    break
-                }
-            }
-            var kind = String(sa.kind || "")
-            var groupComment = tr("app-groups.group." + kind, kind)
-            if (existingIdx >= 0) {
-                var upd = rulesModel.get(existingIdx)
-                if (String(upd.targetRoute || "") !== "secondary") {
-                    rulesModel.set(existingIdx, {
-                        id: upd.id,
-                        enabled: upd.enabled,
-                        ruleType: "application",
-                        ruleTypeTitle: ruleTypeLabel("application"),
-                        matchValue: upd.matchValue,
-                        aceMatchValue: _aceLowerForSearch(upd.matchValue),
-                        targetRoute: "secondary",
-                        comment: upd.comment
-                    })
-                    mutated = true
-                }
-                continue
-            }
+        for (var ai = 0; ai < plan.add.length; ai += 1) {
             if (userCount >= freeRulesMaxCount) {
                 limitHit = true
                 break
             }
             userCount += 1
+            var mv = String(plan.add[ai])
+            var kind = kindByValue[mv] || ""
             var item = {
                 id: nextFreeRuleId(),
                 enabled: true,
@@ -4976,7 +5302,7 @@ ApplicationWindow {
                 matchValue: mv,
                 aceMatchValue: _aceLowerForSearch(mv),
                 targetRoute: "secondary",
-                comment: groupComment
+                comment: tr("app-groups.group." + kind, kind)
             }
             rulesModel.append(item)
             _sidecarWriteCommentForRow(item)
@@ -4994,9 +5320,8 @@ ApplicationWindow {
                 "Up to {max} active rules are supported.")
                 .replace("{max}", String(freeRulesMaxCount))
         } else {
-            statusLine = tr("app-groups.confirmed-status",
-                "Routes updated for {count} program(s).")
-                .replace("{count}", String(secondaryCount))
+            statusLine = Plurals.counted(tr, "app-groups.confirmed-status.", secondaryCount,
+                "Routes updated for {count} program.", "Routes updated for {count} programs.")
         }
     }
 
@@ -5037,7 +5362,7 @@ ApplicationWindow {
 
     /// Is this window showing INVENTED data while claiming a healthy service?
     ///
-    /// `NRR_BACKEND=mock` / `preview-local` hands the window a stand-in facade
+    /// `NRR_BACKEND=mock` hands the window a stand-in facade
     /// that reports `connected`, so every surface paints "all fine" over
     /// snapshots that never touched the service and over edits that never reach
     /// it. The launcher says so in its log; the log is not what the person is
@@ -5382,7 +5707,12 @@ ApplicationWindow {
         var job = _stabilityPatchQueue.shift()
         var finish = function(ok, code, payload) {
             _stabilityPatchInFlight = false
-            if (typeof job.onDone === "function") job.onDone(ok, code, payload)
+            // A throwing caller must not stop the queue behind it.
+            try {
+                if (typeof job.onDone === "function") job.onDone(ok, code, payload)
+            } catch (e) {
+                console.log("stability patch callback failed:", e)
+            }
             _drainStabilityPatchQueue()
         }
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
@@ -5403,6 +5733,12 @@ ApplicationWindow {
             // an in-flight slot nobody releases stops every later patch from
             // every panel, and the only symptom is silence.
             try {
+                // A Set that changes nothing still raises the administrator
+                // prompt, and a decline would then report a change that never was.
+                if (Pure.stabilityPatchChangesNothing(payload || {}, job.partial || {})) {
+                    finish(true, "", payload)
+                    return
+                }
                 // The merge base is the live row and the user's parked changes.
                 // Nothing comes from the user's own file: these settings are the
                 // machine's, and only the service's backup brings them back.
@@ -5878,8 +6214,9 @@ ApplicationWindow {
         if (moved === 0) return 0
         rulesModelEdited()
         _recomputeRulesDirty()
-        statusLine = tr("rules.move-to-type.done-many", "{n} rule(s) moved to the type their value is.")
-            .replace("{n}", String(moved))
+        statusLine = Plurals.counted(tr, "rules.move-to-type.done-many.", moved,
+            "{count} rule moved to the type its value is.",
+            "{count} rules moved to the type their value is.")
         return moved
     }
     /// A row moved to another route is judged again: a deny or the additional
@@ -5979,6 +6316,9 @@ ApplicationWindow {
             }
         }
         if (editingRule >= 0) rulesModel.set(editingRule, item); else rulesModel.append(item)
+        if (editingRule >= 0)
+            _refreshRowVerdict(editingRule, String(item.id), String(item.ruleType),
+                String(item.matchValue))
         // The edit may change the rule's key; the selection and the form
         // stay on it.
         if (editingRule >= 0 && editingRule === selectedRule) selectedRuleKey = Rules.mergeKey(item)
@@ -6789,9 +7129,10 @@ ApplicationWindow {
                 if (!opts.silent) boundFilesController._persistBoundFilesAfterApply()
                 uiRevision += 1
                 if (!opts.silent) {
-                    statusLine = tr("status.rules-refreshed-from-service",
-                        "Loaded {count} active rule(s) from the service.")
-                        .replace("{count}", String(rows.length))
+                    statusLine = Plurals.counted(tr, "status.rules-refreshed-from-service.",
+                        rows.length,
+                        "Loaded {count} active rule from the service.",
+                        "Loaded {count} active rules from the service.")
                 }
                 if (typeof opts.onComplete === "function") opts.onComplete(true, true)
             })
@@ -6890,8 +7231,11 @@ ApplicationWindow {
             var changed = false
             for (var j = 0; j < rulesModel.count; j += 1) {
                 var entry = rulesModel.get(j)
-                var mark = marks[String(entry.ruleType || "") + "|"
-                    + String(entry.matchValue || "").toLowerCase()]
+                // The service may hold the ACE or the decoded spelling of an IDN.
+                var typePrefix = String(entry.ruleType || "") + "|"
+                var mark = marks[typePrefix + String(entry.matchValue || "").toLowerCase()]
+                if (mark === undefined && entry.aceMatchValue)
+                    mark = marks[typePrefix + String(entry.aceMatchValue).toLowerCase()]
                 if (mark !== undefined && mark !== String(entry.mainRoute || "")) {
                     rulesModel.setProperty(j, "mainRoute", mark)
                     changed = true
@@ -6901,7 +7245,7 @@ ApplicationWindow {
             if (typeof onDone === "function") onDone(Number(p["main-route-pending"] || 0))
         })
     }
-    // Persistent main GUI flow (13.R2-GUI.4.c): when `minimizeToTrayInsteadOfClose`
+    // Persistent main GUI flow: when `minimizeToTrayInsteadOfClose`
     // is enabled, the X button hides the window without exiting the host
     // process. The launcher and Qt host remain alive, so a subsequent tray
     // "Open NetRuleRouter" click reaches the running primary via the
@@ -6992,7 +7336,8 @@ ApplicationWindow {
         repeat: true
         onTriggered: {
             if (window.hasAnyUnsavedChanges() || window._guardRulesInFlight
-                    || rpcTransport.longCallInFlight) return
+                    || rpcTransport.longCallInFlight
+                    || window._trayAddRule) return
             console.log("Main: hidden in the tray for a while, ending the window process")
             window.windDownApplication()
         }
@@ -7086,18 +7431,36 @@ ApplicationWindow {
     /// A running tray keeps the language it started with: its menu labels are
     /// resolved once at spawn and its context file is read once. Restarting it
     /// is the only refresh that covers every surface — menu, toasts and notice
-    /// windows alike. The delay clears the launcher's preference-write debounce
-    /// (500 ms) and the tray's shutdown poll (250 ms), so the new process reads
-    /// the language the user just picked.
+    /// windows alike. The first probe waits out the launcher's preference-write
+    /// debounce (500 ms) so the new process reads the language the user just
+    /// picked; the new tray starts only once the old one is gone, or after the
+    /// wait budget, because a tray that starts while the old one still holds
+    /// the single-instance lock exits as a duplicate.
     function restartTrayForLanguageChange() {
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.requestTrayShutdown !== "function") {
             return
         }
         nrrNativeBridge.requestTrayShutdown()
-        trayRestartTimer.interval = 1500
-        trayRestartTimer.restart()
+        trayGoneProbe.waitedMs = 0
+        trayGoneProbe.restart()
         console.log("Main: restarting tray to pick up the new language")
+    }
+
+    Timer {
+        id: trayGoneProbe
+        property int waitedMs: 0
+        interval: 500
+        repeat: true
+        onTriggered: {
+            waitedMs += interval
+            var stillThere = typeof nrrNativeBridge.isTrayProcessAlive === "function"
+                && nrrNativeBridge.isTrayProcessAlive()
+            if (stillThere && waitedMs < 10000) return
+            stop()
+            trayRestartTimer.interval = 1
+            trayRestartTimer.restart()
+        }
     }
 
     // Two-column menu item delegate: splits the Action's text on the tab
@@ -8081,9 +8444,8 @@ ApplicationWindow {
                 return
             }
             var removed = (payload && payload.removed) || 0
-            statusLine = tr("status.sidecar-comments-gc-done",
-                "Cleared {n} orphan comment(s).")
-                .replace("{n}", String(removed))
+            statusLine = Plurals.counted(tr, "status.sidecar-comments-gc-done.", removed,
+                "Cleared {count} orphan comment.", "Cleared {count} orphan comments.")
         })
     }
 
@@ -8429,7 +8791,7 @@ ApplicationWindow {
     // VPN-client onboarding. Captures WHICH installed/
     // running program the user treats as their VPN so its traffic keeps flowing
     // over the primary link while leak protection is on (an
-    // "Application -> primary route" rule is already a kill-switch exemption).
+    // "Application -> primary route" rule is already a leak-protection exemption).
     // Opened from `openVpnOnboarding()` (Settings -> Routing -> Leak protection).
 
     // App-group routing dialog. Scans installed/running programs,
@@ -8621,13 +8983,9 @@ ApplicationWindow {
         }
     }
 
-    /// Decide whether the red banner's action button
-    /// should Install or Start the service. The decision MUST come from the
-    /// live SCM status (nrrServiceController), NOT backendStatus.kind:
-    /// refreshBackendStatus() collapses every runtime failure to
-    /// "disconnected"/"connecting" and never re-derives the stopped vs
-    /// not-installed slug. Fall back to backendStatus.kind only when the SCM
-    /// status is still unknown (cold-start before the first refreshStatus()).
+    /// Install or Start for the red banner's button, from the live SCM status:
+    /// backendStatus.kind lags it by a poll and stays "disconnected" when the
+    /// SCM answer is unknown, which is the only case it decides.
     function _bannerServiceAction() {
         var slug = _serviceStatusSlug()
         if (slug === "not-installed") return "install"
@@ -8675,7 +9033,7 @@ ApplicationWindow {
 
     /// Ask the user to confirm a choice that puts an adapter with no way out to
     /// the network in charge of the additional route. `row` is a mapped
-    /// interface row, `contextSlug` is "assign" or "kill-switch", and
+    /// interface row, `contextSlug` is "assign" or "leak-protection", and
     /// `onProceed` / `onCancel` are plain callbacks. The caller decides what
     /// happens; this only owns the wording and the yes/no.
     function confirmUnroutableSecondary(row, contextSlug, onProceed, onCancel) {
@@ -8685,10 +9043,34 @@ ApplicationWindow {
             Pure.unroutableInterfaceReasonSlug(r)
         unroutableSecondaryConfirmDialog.contextSlug = String(contextSlug || "assign")
         unroutableSecondaryConfirmDialog.killSwitchArmed =
-            prefs.routeKillSwitchEnabled === true
+            routingState.leakProtection !== "off"
         unroutableSecondaryConfirmDialog.pendingAction = onProceed || null
         unroutableSecondaryConfirmDialog.pendingCancelAction = onCancel || null
         unroutableSecondaryConfirmDialog.open()
+    }
+
+    /// Ask before "Everything" while the additional connection is not
+    /// available: the internet stops at once. Same dialog, no adapter named.
+    function confirmLeakHoldsNow(onProceed, onCancel) {
+        unroutableSecondaryConfirmDialog.adapterName = ""
+        unroutableSecondaryConfirmDialog.reasonSlug = ""
+        unroutableSecondaryConfirmDialog.contextSlug = "holds-now"
+        unroutableSecondaryConfirmDialog.pendingAction = onProceed || null
+        unroutableSecondaryConfirmDialog.pendingCancelAction = onCancel || null
+        unroutableSecondaryConfirmDialog.open()
+    }
+
+    /// A default route that raises `level` (in force now) to "Everything"
+    /// while the additional connection is not available asks first; any
+    /// other change runs `onProceed` at once.
+    function confirmDefaultRoute(level, nextRoute, onProceed, onCancel) {
+        var why = Pure.defaultRouteChangeConfirmSlug(level, nextRoute,
+            interfacesRolesController.boundSecondaryRow())
+        if (why === "holds-now") {
+            confirmLeakHoldsNow(onProceed, onCancel)
+            return
+        }
+        if (onProceed) onProceed()
     }
 
     /// True when a dry-run review summary
@@ -8786,6 +9168,7 @@ ApplicationWindow {
             _compatGuiVersion      = String(payload["gui-version"] || "")
             _compatServiceProtocol = parseInt(payload["service-protocol"] || 0)
             _compatServiceVersion  = String(payload["service-version"] || "")
+            contractSkew = Pure.contractSkew(payload, Pure.WIRE_CONTRACT_REVISION)
             serviceRegisteredPath      = String(payload["service-registered-path"] || "")
             serviceExpectedPath        = String(payload["service-expected-path"] || "")
             serviceRegisteredElsewhere = payload["service-registered-elsewhere"] === true

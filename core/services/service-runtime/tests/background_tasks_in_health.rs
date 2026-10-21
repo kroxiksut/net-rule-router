@@ -227,6 +227,15 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         Verdict::Bounded("one teardown step, time-boxed"),
     ),
     (
+        "service-runtime/src/auto_rules/verify_primary.rs",
+        "nrr-verify-check",
+        1,
+        Verdict::Invisible(
+            "idles on a bounded queue; a stuck probe only delays one `?` verdict, \
+             and no enforcement pass waits for it",
+        ),
+    ),
+    (
         "service-runtime/src/dns_resolver_service.rs",
         "nrr-dns-resolver",
         1,
@@ -254,7 +263,13 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         "service-runtime/src/dns_upstream.rs",
         "nrr-dns-upstream-refresh",
         1,
-        Verdict::Bounded("one upstream re-selection per network change"),
+        Verdict::Bounded("one upstream re-selection at a time, on a network or tunnel change"),
+    ),
+    (
+        "service-runtime/src/fake_ip/apply_queue.rs",
+        "nrr-fakeip-apply",
+        1,
+        Verdict::Bounded("ends once the latest queued apply is done; one at a time"),
     ),
     (
         "service-runtime/src/fake_ip/lifecycle.rs",
@@ -270,7 +285,7 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
     ),
     (
         "service-runtime/src/fake_ip/self_heal.rs",
-        UNNAMED,
+        "nrr-fakeip-self-heal",
         1,
         Verdict::Leased(ServiceTaskKind::FakeIpSelfHeal),
     ),
@@ -386,6 +401,14 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
     ),
     (
         "windows-service/src/runtime_deps/build.rs",
+        "nrr-peer-replan",
+        1,
+        Verdict::Bounded(
+            "one pass request per block-all change of another user; the coalescer serialises them",
+        ),
+    ),
+    (
+        "windows-service/src/runtime_deps/build.rs",
         UNNAMED,
         1,
         Verdict::Bounded("one fake-IP bring-up after sign-in"),
@@ -399,7 +422,7 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
     (
         "windows-service/src/runtime_deps/ipc_surface.rs",
         UNNAMED,
-        2,
+        1,
         Verdict::Bounded("one setting apply and replan off the IPC thread"),
     ),
     (
@@ -433,13 +456,16 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         Verdict::Bounded("one teardown step at stop, waited for under a deadline"),
     ),
     (
+        "service-runtime/src/recompute_window.rs",
+        "nrr-pass-window",
+        1,
+        Verdict::Bounded("one coalesced enforcement pass, ends with it"),
+    ),
+    (
         "service-runtime/src/override_recheck.rs",
         "nrr-override-recheck",
         1,
-        Verdict::Invisible(
-            "if it stops, confirmations stay as the last re-check left them and the next \
-             service start re-checks them",
-        ),
+        Verdict::Leased(ServiceTaskKind::OverrideRecheck),
     ),
     (
         "linux-service/src/run.rs",

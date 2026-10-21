@@ -1,0 +1,50 @@
+{
+  "description": "pure.js contractSkew: which side is behind on the wire contract, from local.service-info and the revision this window's code speaks. Empty until the handshake completed and when both match; a window whose code and launcher disagree is the client that must restart.",
+  "cases": [
+    {
+      "name": "handshake not done yet",
+      "input": { "info": { "service-protocol": 0, "gui-contract": 2, "service-contract": 0 }, "own": 2 },
+      "expected": ""
+    },
+    {
+      "name": "everything at one revision",
+      "input": { "info": { "service-protocol": 1, "gui-contract": 2, "service-contract": 2 }, "own": 2 },
+      "expected": ""
+    },
+    {
+      "name": "service predates the field",
+      "input": { "info": { "service-protocol": 1, "gui-contract": 2, "service-contract": 1 }, "own": 2 },
+      "expected": "service-older"
+    },
+    {
+      "name": "service newer than the window",
+      "input": { "info": { "service-protocol": 1, "gui-contract": 2, "service-contract": 3 }, "own": 2 },
+      "expected": "client-older"
+    },
+    {
+      "name": "launcher older than the window code",
+      "input": { "info": { "service-protocol": 1, "gui-contract": 1, "service-contract": 2 }, "own": 2 },
+      "expected": "client-older"
+    },
+    {
+      "name": "launcher without the field",
+      "input": { "info": { "service-protocol": 1, "service-contract": 2 }, "own": 2 },
+      "expected": "client-older"
+    },
+    {
+      "name": "launcher newer than the window code",
+      "input": { "info": { "service-protocol": 1, "gui-contract": 3, "service-contract": 3 }, "own": 2 },
+      "expected": "client-older"
+    },
+    {
+      "name": "launcher and window agree, service behind both",
+      "input": { "info": { "service-protocol": 2, "gui-contract": 3, "service-contract": 2 }, "own": 3 },
+      "expected": "service-older"
+    },
+    {
+      "name": "no info at all",
+      "input": { "info": {}, "own": 2 },
+      "expected": ""
+    }
+  ]
+}

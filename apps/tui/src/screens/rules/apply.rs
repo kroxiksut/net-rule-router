@@ -142,19 +142,29 @@ pub fn pending_from(
 ) -> Result<Pending, Failure> {
     let book = book_of(table.rules()).map_err(|refusal| Failure::code(refusal.code()))?;
     let rules_json = to_canonical_string(&book).map_err(|_| Failure::code("gui-internal"))?;
-    let content_hash = format!("{:x}", Sha256::digest(rules_json.as_bytes()));
     Ok(Pending {
+        content_hash: content_hash(&rules_json),
         rules_json,
-        content_hash,
         correlation_id: correlation_id("tui-apply"),
         admin_baseline,
         base_revision: base_revision.map(str::to_owned),
     })
 }
 
+/// The rules' content hash as the service and the GUI spell it: SHA-256 of the
+/// bytes sent, fixed-width lowercase hex. The service dedupes revisions on it.
+pub(super) fn content_hash(rules_json: &str) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(rules_json.as_bytes()) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// `rules-update-<origin>-<ms>-<n>`: the origin reaches the service log, so a
 /// stray cycle names its caller (`newCorrelationId`).
-fn correlation_id(origin: &str) -> String {
+pub(super) fn correlation_id(origin: &str) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -380,5 +390,24 @@ fn settle_by_preview(client: &dyn IpcClient, pending: &Pending) -> Finished {
             Outcome::Applied => Finished::Applied { base: None },
             Outcome::Failed(code) => Finished::Failed(Failure::code(&code)),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The same inputs and values the service pins for its own content hash: a
+    /// hash-crate upgrade that changed the spelling fails here, not as a
+    /// revision the service no longer recognises.
+    #[test]
+    fn the_content_hash_is_pinned() {
+        assert_eq!(
+            super::content_hash("not json at all"),
+            "92628a747890d02d1459c6eb45fd13cfa63bbb6d346412cff190297cf9c33d39"
+        );
+        // A leading zero nibble stays: the hex is fixed-width.
+        assert_eq!(
+            super::content_hash("not json 19"),
+            "0b4447295187b5a8357ab3aa6cb10dd0911a9bc45a613f7e40411b7626a3e0a4"
+        );
     }
 }

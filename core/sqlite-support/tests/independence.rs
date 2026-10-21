@@ -1,24 +1,28 @@
+#![allow(clippy::expect_used)]
+
 //! A leaf, enforced: both the service store and the GUI sidecar depend on this
 //! crate, so any `nrr-*` edge out of it would hand the sidecar that crate too.
 
-use std::path::Path;
+#[path = "support/reachable.rs"]
+mod reachable;
 
 #[test]
-fn the_manifest_depends_on_no_product_crate() {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-    let text = std::fs::read_to_string(manifest).expect("manifest");
-    let mut dependency_lines = 0;
-    for line in text.lines().map(str::trim) {
-        if line.starts_with('#') || !line.contains('=') {
-            continue;
-        }
-        if line.contains("version") || line.contains("path") {
-            dependency_lines += 1;
-        }
-        assert!(
-            !line.starts_with("nrr-"),
-            "nrr-sqlite-support must stay a leaf: `{line}`"
-        );
-    }
-    assert!(dependency_lines > 0, "no dependency line was checked");
+fn it_links_no_product_crate_at_any_depth() {
+    let product = reachable::reachable_product_crates("nrr-sqlite-support");
+    assert!(
+        product.is_empty(),
+        "nrr-sqlite-support must stay a leaf, yet links {product:?}; \
+         trace with `cargo tree -p nrr-sqlite-support -i <crate>`"
+    );
+}
+
+#[test]
+fn the_graph_check_sees_crates_the_manifest_never_names() {
+    // A guard that cannot fire proves nothing: SQLite's own bindings arrive
+    // only through rusqlite, so seeing them shows transitive edges are read.
+    let reachable = reachable::reachable_packages("nrr-sqlite-support");
+    assert!(
+        reachable.contains("libsqlite3-sys"),
+        "the graph check missed a transitive dependency: {reachable:?}"
+    );
 }

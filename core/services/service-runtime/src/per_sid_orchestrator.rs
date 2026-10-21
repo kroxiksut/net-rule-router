@@ -104,8 +104,8 @@ pub use types::{
 };
 
 mod compute;
-pub(crate) use compute::behavior_mode_for_codegen;
 use compute::*;
+pub(crate) use compute::{behavior_mode_for_codegen, protects_everything};
 pub use compute::{behavior_mode_of, PerSidFilterSet, SidApplyPreview};
 
 mod state;
@@ -113,8 +113,9 @@ use state::*;
 pub use state::{
     EnforcedSidsSource, FailClosedExemptionsResolver, FakeIpContextProvider,
     FilterFailureModeSource, FlowLinksResolver, Ipv6GuardResolver, KillSwitchResolver,
-    MachineReader, PerSidApplyOrchestrator, PrimaryDnsServersFn, RouteSyncHook, RoutedElsewhereFn,
-    RoutingOwnerFn, ServiceAccountWiring, UnresolvedHostsSink, VpnClientAppsProvider,
+    MachineReader, PeerReplanRequest, PerSidApplyOrchestrator, PrimaryDnsServersFn, RouteSyncHook,
+    RoutedElsewhereFn, RoutingOwnerFn, ScopedRouteSyncHook, ServiceAccountWiring,
+    UnresolvedHostsSink, VpnClientAppsProvider,
 };
 
 mod posture;

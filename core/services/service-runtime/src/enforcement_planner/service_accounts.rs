@@ -123,6 +123,19 @@ pub fn plan_service_account_flows(
     protocols: KillSwitchProtocols,
     exempt_apps: &[String],
 ) -> Vec<FlowRule> {
+    plan_service_account_flows_with_foreign(owner, guard, protocols, exempt_apps, &[])
+}
+
+/// [`plan_service_account_flows`] plus the corporate networks the service
+/// accounts keep through somebody else's tunnels.
+#[must_use]
+pub fn plan_service_account_flows_with_foreign(
+    owner: &str,
+    guard: &ServiceAccountGuard,
+    protocols: KillSwitchProtocols,
+    exempt_apps: &[String],
+    foreign: &[ForeignTunnelLink],
+) -> Vec<FlowRule> {
     let mut flows = match guard.posture {
         ServiceAccountPosture::Pin => {
             let mut flows = plan_kill_switch_destinations(owner, &guard.destinations, protocols);
@@ -140,6 +153,9 @@ pub fn plan_service_account_flows(
     for flow in &mut flows {
         flow.principal = PrincipalScope::ServiceAccounts;
     }
+    let permits =
+        plan_foreign_tunnel_permits_for(&PrincipalScope::ServiceAccounts, &flows, foreign);
+    flows.extend(permits);
     flows
 }
 
@@ -149,6 +165,16 @@ pub fn plan_service_account_flows(
 /// as the owner's does, instead of waiting for the next pass.
 #[must_use]
 pub fn plan_forwarded_flows(owner: &str, guard: &ServiceAccountGuard) -> Vec<FlowRule> {
+    plan_forwarded_flows_with_foreign(owner, guard, &[])
+}
+
+/// [`plan_forwarded_flows`] plus the corporate networks forwarded traffic keeps.
+#[must_use]
+pub fn plan_forwarded_flows_with_foreign(
+    owner: &str,
+    guard: &ServiceAccountGuard,
+    foreign: &[ForeignTunnelLink],
+) -> Vec<FlowRule> {
     let all = KillSwitchProtocols::ALL;
     let mut flows = match guard.posture {
         ServiceAccountPosture::Pin => {
@@ -163,6 +189,8 @@ pub fn plan_forwarded_flows(owner: &str, guard: &ServiceAccountGuard) -> Vec<Flo
         }
     };
     onto_forwarded(&mut flows);
+    let permits = plan_foreign_tunnel_permits_for(&PrincipalScope::Forwarded, &flows, foreign);
+    flows.extend(permits);
     flows
 }
 
@@ -171,8 +199,20 @@ pub fn plan_forwarded_flows(owner: &str, guard: &ServiceAccountGuard) -> Vec<Flo
 /// blanket keeps open, with the main link's resolvers among the direct hosts —
 /// a guest names its resolvers by address.
 #[must_use]
-pub fn plan_forwarded_block_all(mut blanket: Vec<FlowRule>) -> Vec<FlowRule> {
+pub fn plan_forwarded_block_all(blanket: Vec<FlowRule>) -> Vec<FlowRule> {
+    plan_forwarded_block_all_with_foreign(blanket, &[])
+}
+
+/// [`plan_forwarded_block_all`] plus the corporate networks a guest keeps. The
+/// `blanket` must not already spare a corporate tunnel whole.
+#[must_use]
+pub fn plan_forwarded_block_all_with_foreign(
+    mut blanket: Vec<FlowRule>,
+    foreign: &[ForeignTunnelLink],
+) -> Vec<FlowRule> {
     onto_forwarded(&mut blanket);
+    let permits = plan_foreign_tunnel_permits_for(&PrincipalScope::Forwarded, &blanket, foreign);
+    blanket.extend(permits);
     blanket
 }
 
@@ -217,7 +257,7 @@ impl ServiceAccountDnsLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nrr_platform_api::enforcement::{EgressConstraint, Verdict};
+    use nrr_platform_api::enforcement::{EgressConstraint, EgressRef, Verdict};
     use std::net::Ipv4Addr;
 
     fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
@@ -341,6 +381,55 @@ mod tests {
         }
     }
 
+    /// A corporate network stays reachable through its own tunnel for the
+    /// service accounts and forwarded traffic, and only that network.
+    #[test]
+    fn the_corporate_networks_are_kept_for_services_and_forwarded_traffic() {
+        let holds = NetworkHolds::default();
+        let dests = [v4(203, 0, 113, 5)];
+        let guard = service_account_guard(&input(Some(ServiceAccountPosture::Pin), &dests, &holds))
+            .expect("owner with a guard");
+        let corp = [ForeignTunnelLink {
+            name: "corp0".to_string(),
+            networks: vec![block("10.77.0.0/16")],
+        }];
+        let owner = "S-1-5-21-1-2-3-1001";
+        let service = plan_service_account_flows_with_foreign(
+            owner,
+            &guard,
+            KillSwitchProtocols::ALL,
+            &[],
+            &corp,
+        );
+        let forwarded = plan_forwarded_flows_with_foreign(owner, &guard, &corp);
+        for (scope, flows) in [
+            (PrincipalScope::ServiceAccounts, &service),
+            (PrincipalScope::Forwarded, &forwarded),
+        ] {
+            let permits: Vec<_> = flows
+                .iter()
+                .filter(|f| {
+                    f.verdict == Verdict::Permit
+                        && matches!(&f.egress, EgressConstraint::OnlyVia(EgressRef::Adapter(a)) if a.0 == "corp0")
+                })
+                .collect();
+            assert!(!permits.is_empty(), "{scope:?}");
+            for f in permits {
+                assert_eq!(f.principal, scope);
+                assert!(
+                    matches!(f.flow.dst, DstMatch::SubnetV4 { prefix: 16, .. }),
+                    "never an any-destination permit: {f:?}"
+                );
+            }
+        }
+        assert!(
+            plan_service_account_flows(owner, &guard, KillSwitchProtocols::ALL, &[])
+                .iter()
+                .all(|f| !matches!(&f.egress, EgressConstraint::OnlyVia(EgressRef::Adapter(_)))),
+            "without a corporate tunnel nothing is added"
+        );
+    }
+
     /// The tunnel-default modes give the owner a blanket block; the service
     /// accounts still get nothing but the addresses.
     #[test]
@@ -382,7 +471,7 @@ mod tests {
             let guard = service_account_guard(&input(Some(posture), &dests, &holds))
                 .expect("owner with a guard");
             let live =
-                service_account_filters(owner, &guard, luid, KillSwitchProtocols::ALL, &apps);
+                service_account_filters(owner, &guard, luid, KillSwitchProtocols::ALL, &apps, &[]);
             let plan = EnforcementPlan {
                 principal: UserPrincipal::from_windows_sid(owner).expect("valid sid"),
                 flows: plan_service_account_flows(owner, &guard, KillSwitchProtocols::ALL, &apps),
@@ -417,7 +506,7 @@ mod tests {
         for posture in [ServiceAccountPosture::Pin, ServiceAccountPosture::Block] {
             let guard = service_account_guard(&input(Some(posture), &dests, &holds))
                 .expect("owner with a guard");
-            let live = forwarded_guard_filters(owner, &guard, luid);
+            let live = forwarded_guard_filters(owner, &guard, luid, &[]);
             let plan = EnforcementPlan {
                 principal: UserPrincipal::from_windows_sid(owner).expect("valid sid"),
                 flows: plan_forwarded_flows(owner, &guard),

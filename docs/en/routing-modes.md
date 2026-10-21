@@ -2,8 +2,8 @@
 
 **English** · [Русский](../ru/routing-modes.md)
 
-Settings → Routing has five switches that fine-tune how NetRuleRouter resolves
-names and routes traffic once leak protection is on: **DNS through the
+Settings → Routing behavior → Routing method has five switches that fine-tune how
+NetRuleRouter resolves names and routes traffic, whatever leak protection is set to: **DNS through the
 tunnel**, **Fast DNS answers**, **fake-IP**, **fake-IP UDP relay**, and
 **Instant reset when the additional route is unavailable**. Each solves a
 different, narrow problem, and most of them are safe to leave on together.
@@ -13,7 +13,8 @@ what combining them gets you that no single switch does alone.
 They are not equally optional, and the difference matters more than any single
 setting on this page:
 
-- **fake-IP is off by default, and it is the switch that matters most.** It is
+- **fake-IP is on by default for a new Windows installation, and it is the
+  switch that matters most** (an installation that had it off keeps it off). It is
   the only one that separates two sites sharing one server address, and on any
   realistic rule set — anything covering a large platform or a big CDN — that
   sharing is common. Without it, a site you did not route can follow one you
@@ -71,7 +72,8 @@ airtight per site — most importantly, when two sites you care about
 differently (route one, leave the other alone) happen to share the same
 real server address, which is common behind large content delivery networks.
 
-**What it costs:** It requires the local DNS resolver (Mode B) and, on
+**What it costs:** It requires the local DNS resolver (the default routing
+method) and, on
 Windows, loads the bundled virtual-adapter driver. Applications that resolve
 names on their own over encrypted DNS bypass it unless you also turn on
 DoH/DoT blocking.
@@ -131,8 +133,10 @@ worth having, but they do not substitute for it.
 ## Turning them on
 
 DNS through the tunnel, Fast DNS answers and fake-IP live under Settings →
-Routing and are always visible. The two fake-IP refinements — UDP relay and
-Instant reset — appear there once Settings → Experimental features →
+Routing behavior → Routing method. Fast DNS answers and fake-IP appear while the
+local DNS resolver is in use; DNS through the tunnel appears once an additional
+connection is chosen. The two fake-IP refinements — UDP relay and Instant reset —
+appear there once fake-IP is on and Settings → Experimental features →
 **Detailed mode** is on. Every switch applies immediately; none needs a
 restart of the background service.
 

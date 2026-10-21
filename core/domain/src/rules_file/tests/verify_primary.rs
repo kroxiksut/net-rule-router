@@ -214,6 +214,38 @@ fn in_either_file_the_prefix_becomes_the_verify_action() {
 }
 
 #[test]
+fn on_an_ipv6_address_the_prefix_is_a_plain_route_with_a_warning() {
+    let outcome = validate_book(
+        "--- IP
+?2001:db8::1
+?192.0.2.10
+",
+        "",
+    );
+    let profile = outcome.profile().expect("accepted");
+    let action_of = |v6: bool| {
+        profile
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .find(|r| {
+                matches!(&r.address_match, Some(CanonicalAddressMatch::ExactIp(ip)) if ip.is_ipv6() == v6)
+            })
+            .map(|r| r.action)
+    };
+    assert_eq!(
+        (action_of(true), action_of(false)),
+        (Some(RuleAction::Route), Some(RuleAction::Verify)),
+        "the check is IPv4-only: the IPv6 literal is a plain route, the IPv4 one stays checked"
+    );
+    assert!(outcome
+        .warnings()
+        .iter()
+        .any(|w| matches!(w, ValidationWarning::VerifyIgnored { .. })));
+}
+
+#[test]
 fn on_an_application_rule_the_prefix_is_a_plain_route_with_a_warning() {
     let app_rule = |id: &str, name: &str| crate::Rule {
         id: crate::RuleId(id.to_string()),

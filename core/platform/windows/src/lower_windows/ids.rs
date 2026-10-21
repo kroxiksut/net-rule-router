@@ -25,6 +25,7 @@ pub(super) fn make_host_filter(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -58,6 +59,7 @@ pub(super) fn make_chunk_filter(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -165,11 +167,26 @@ pub(super) fn derive_filter_id(
 /// Supplied per call, never cached — the same rule the Linux side follows with
 /// interface names. A stale LUID does not fail loudly; it pins traffic to an
 /// interface that no longer exists while the rule still reads as applied.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EgressLuids {
     /// LUID of the additional link. `0` means "not resolvable right now" and
     /// the kill-switch lowering declines rather than guessing.
     pub secondary: u64,
+    /// Somebody else's tunnels, by the name the plan's egress pins use. A name
+    /// missing here lowers to nothing: its permit stays cut.
+    pub adapters: Vec<(String, u64)>,
+}
+
+impl EgressLuids {
+    /// The LUID behind `name`, when it can be used: `0` and our own link are
+    /// never a foreign tunnel.
+    pub(super) fn adapter(&self, name: &str) -> Option<u64> {
+        self.adapters
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, luid)| *luid)
+            .filter(|luid| *luid != 0 && *luid != self.secondary)
+    }
 }
 
 /// Identity for a subnet-scoped filter. The address itself is not part of the
@@ -260,5 +277,6 @@ pub(super) fn make_subnet_filter(
         remote_subnet,
         remote_subnet_v6,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }

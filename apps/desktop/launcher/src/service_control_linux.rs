@@ -18,8 +18,8 @@ use nrr_shared::client_error_codes::{
 };
 use nrr_shared::ipc_transport::ELEVATION_DECLINED_CLIENT_SLUG;
 
-/// Long enough for the user to read and answer an authentication prompt.
-const PROMPT_BUDGET: Duration = Duration::from_secs(90);
+/// The one budget a service action gets on every OS; covers an authentication prompt.
+const PROMPT_BUDGET: Duration = nrr_broker::protocol::SERVICE_CONTROL_BUDGET;
 
 /// What an action runs.
 #[derive(Debug, PartialEq, Eq)]

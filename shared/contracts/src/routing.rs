@@ -82,69 +82,29 @@ impl BindingSource {
     }
 }
 
-/// Default routing behavior when no rule matches a given connection.
-///
-/// # Free edition modes
-///
-/// Three modes are available. They differ in how unmatched traffic is
-/// handled and what happens when the secondary adapter is unavailable.
-///
-/// | Mode | Unmatched traffic | Secondary unavailable |
-/// |------|-------------------|-----------------------|
-/// | `PreferPrimary` | → primary | primary continues normally |
-/// | `PreferSecondaryWhenAvailable` | → secondary if up, else primary | falls back to primary |
-/// | `StrictSecondaryFailClosed` | → secondary | **blocks all traffic** |
-///
-/// # Default mode selection (Variant B)
-///
-/// - When no secondary adapter is bound: `PreferPrimary` is the default.
-///   Use `default_when_secondary_unbound()`.
-/// - When the user first binds a secondary adapter: `StrictSecondaryFailClosed`
-///   is the recommended default (prevents accidental leak via primary).
-///   Use `recommended_when_secondary_bound()`.
-///
-/// Actual enforcement — monitoring secondary availability, blocking traffic
-/// in `StrictSecondaryFailClosed`, and falling back in
-/// `PreferSecondaryWhenAvailable` — is implemented via real Windows routing
-/// table manipulation.
+/// Default route: where traffic goes when no rule matches it. What happens
+/// while the additional connection is down is leak protection's question,
+/// not this one's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RouteBehaviorMode {
-    /// All unmatched traffic uses the primary adapter. Rules redirect
-    /// specific destinations to secondary. Default when secondary is
-    /// not yet configured.
+    /// The main connection; rules send selected sites through the additional
+    /// one.
     PreferPrimary,
-    /// Unmatched traffic uses secondary when available, falls back to
-    /// primary if secondary is down. Suitable when secondary is preferred
-    /// but not strictly required.
+    /// The additional connection; rules send exceptions through the main one.
     PreferSecondaryWhenAvailable,
-    /// All unmatched traffic must use secondary. If secondary becomes
-    /// unavailable, **all traffic is blocked** — nothing falls back to
-    /// primary. Recommended default when secondary (VPN) is configured.
-    StrictSecondaryFailClosed,
 }
 
 impl RouteBehaviorMode {
-    /// Returns the mode to use when no secondary adapter is bound yet.
-    ///
-    /// `PreferPrimary` is safe here: without a secondary, routing is
-    /// effectively pass-through via the OS routing table.
+    /// Without a secondary there is nothing to prefer: traffic passes through
+    /// the OS routing table.
     pub const fn default_when_secondary_unbound() -> Self {
         Self::PreferPrimary
-    }
-
-    /// Returns the recommended mode when the user first binds a secondary.
-    ///
-    /// `StrictSecondaryFailClosed` prevents accidental traffic leak via
-    /// primary when secondary (typically VPN) is configured but unavailable.
-    pub const fn recommended_when_secondary_bound() -> Self {
-        Self::StrictSecondaryFailClosed
     }
 
     pub const fn slug(self) -> &'static str {
         match self {
             Self::PreferPrimary => "prefer-primary",
             Self::PreferSecondaryWhenAvailable => "prefer-secondary-when-available",
-            Self::StrictSecondaryFailClosed => "strict-secondary-fail-closed",
         }
     }
 
@@ -157,9 +117,7 @@ impl RouteBehaviorMode {
     pub const fn default_route_role(self) -> RouteRole {
         match self {
             Self::PreferPrimary => RouteRole::Primary,
-            Self::PreferSecondaryWhenAvailable | Self::StrictSecondaryFailClosed => {
-                RouteRole::Secondary
-            }
+            Self::PreferSecondaryWhenAvailable => RouteRole::Secondary,
         }
     }
 }
@@ -179,9 +137,6 @@ impl FromStr for RouteBehaviorMode {
             "prefer-secondary-when-available" | "prefer-secondary" | "secondary" => {
                 Ok(Self::PreferSecondaryWhenAvailable)
             }
-            "strict-secondary-fail-closed" | "strict-secondary" | "fail-closed" => {
-                Ok(Self::StrictSecondaryFailClosed)
-            }
             _ => Err("unknown route behavior mode"),
         }
     }
@@ -193,7 +148,6 @@ pub enum RouteSelectionState {
     NotSelected,
     Unavailable,
     RequiresVerification,
-    FailClosedConflict,
 }
 
 impl RouteSelectionState {
@@ -203,7 +157,6 @@ impl RouteSelectionState {
             Self::NotSelected => "not-selected",
             Self::Unavailable => "unavailable",
             Self::RequiresVerification => "requires-verification",
-            Self::FailClosedConflict => "fail-closed-conflict",
         }
     }
 }
@@ -243,6 +196,16 @@ pub enum FreeRuleType {
 }
 
 impl FreeRuleType {
+    /// Every type a user may add, in the order the Add dialog offers them.
+    pub const ALL: [Self; 6] = [
+        Self::Application,
+        Self::Domain,
+        Self::Zone,
+        Self::ExactIp,
+        Self::IpRange,
+        Self::Subnet,
+    ];
+
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Application => "application",

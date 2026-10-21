@@ -23,10 +23,11 @@
 //! claimed name will not return the attacker's IP, and the claim is rejected.
 //! Only a name whose forward record actually contains the dropped IP is trusted.
 //!
-//! This is deliberately narrower and safer than the disabled reactive VPN
-//! self-learning: it never grants a blanket exemption, it only feeds
-//! the normal rule-gated cache path, and every learned fact is one a legitimate
-//! DNS query would have produced anyway.
+//! No exemption is ever blanket: a confirmed name that matches a rule goes
+//! through the normal rule-gated cache path, and one that matches none has only
+//! its confirmed addresses registered as known-direct, so block-all stops cutting
+//! a plain primary-path site. Every learned fact is one a legitimate DNS query
+//! would have produced anyway.
 //!
 //! Mechanism-free by construction: the reverse/forward resolver and the
 //! confirmed-fact sink are injected as traits; the production wiring reuses the
@@ -86,7 +87,8 @@ pub enum LearnOutcome {
 }
 
 /// FCrDNS learner: forward-confirms an NRR-dropped IP into a rule-gated cache
-/// entry. Bounds its own cost with per-IP dedup (each dropped IP is attempted at
+/// entry or, where direct learning is allowed, a known-direct address when no
+/// rule matches the name. Bounds its own cost with per-IP dedup (each dropped IP is attempted at
 /// most once per session) and a hard per-session attempt cap, so a flood of
 /// block-all drops cannot turn into an unbounded PTR/A query storm.
 pub struct ReverseDnsLearner<R: ReverseDnsResolver, S: ConfirmedHostSink> {

@@ -13,8 +13,7 @@
 //!   correct per-user tagging,
 //! - recompile_for_sid swaps live filter sets when the active
 //!   revision changes,
-//! - the fail-closed default Block filter is emitted alongside rule
-//!   filters when the per-SID mode is `StrictSecondaryFailClosed`,
+//! - the additional default route with leak protection off adds no block,
 //! - ExactFqdn rules silently emit zero filters when the FQDN cache
 //!   is cold (DNS warm-up pending),
 //! - per-SID filter sets are isolated by `user_sid` tag and filter
@@ -224,22 +223,13 @@ fn route_policy_record(sid: &str, mode: BehaviorMode) -> RoutePolicyRecord {
             known_stable_ids: vec![],
         }),
         mode,
-        block_secondary_when_unavailable: matches!(mode, BehaviorMode::StrictSecondaryFailClosed),
-        // Fail-OPEN here: these e2e tests isolate the rule/route codegen and
-        // wire NO kill-switch resolver, so the fail-closed posture (which would
-        // add a block-all when the secondary is unresolvable) must not perturb
-        // the filter counts. Fail-closed behaviour is covered by the
-        // per_sid_orchestrator unit tests.
-        kill_switch_fail_closed: false,
+        // Off: these e2e tests isolate the rule/route codegen and wire no
+        // kill-switch resolver; protection is covered by the orchestrator tests.
+        leak_protection: nrr_domain::LeakProtection::Off,
         kill_switch_protocols: 0x7F,
-        kill_switch_block_all: false,
-        // Kill-switch OFF so the leak-guard stays disarmed and does not
-        // perturb the isolated rule/route filter counts (matches the fail-open intent above).
-        kill_switch_enabled: false,
         allow_dns_over_primary: false,
         include_subdomains: false,
         shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
-        mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy::default(),
         resolve_hosts_bypass: true,
         doh_lockdown_enabled: false,
         doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
@@ -258,6 +248,7 @@ fn route_policy_record(sid: &str, mode: BehaviorMode) -> RoutePolicyRecord {
         short_name_suffix: String::new(),
         app_rules_take_all_addresses: false,
         forwarded_outage: String::new(),
+        external_address_auto_check: false,
         binding_source: BindingSource::UserAssigned,
     }
 }
@@ -326,9 +317,7 @@ fn a_secondary_route_rule_becomes_a_slash32_over_the_additional_link_not_a_block
         binding.stable_id = format!("win-adapter:{name}");
         binding.display_name = name.into();
     }
-    policy.kill_switch_enabled = true;
-    policy.kill_switch_fail_closed = true;
-    policy.block_secondary_when_unavailable = true;
+    policy.leak_protection = nrr_domain::LeakProtection::Sites;
     store_route_policy(&state_conn, ROUTE_SID, &policy);
 
     let destination = Ipv4Addr::new(203, 0, 113, 10);
@@ -363,6 +352,7 @@ fn a_secondary_route_rule_becomes_a_slash32_over_the_additional_link_not_a_block
             coord
                 .recompute_active(&[ROUTE_SID.to_string()])
                 .expect("route pass");
+            Ok(())
         })
     };
     let flow_reset = Arc::new(MockStaleFlowReset::new());
@@ -543,13 +533,12 @@ fn recompile_for_sid_reflects_rule_changes() {
     );
 }
 
-/// Per-SID policy with `StrictSecondaryFailClosed` triggers the
-/// codegen's catch-all `Block` filter. Verified via filter action +
-/// the absence of `remote_ip`.
+/// The additional default route with leak protection off adds no blanket
+/// block of its own: only the rule-driven permit lands.
 #[test]
-fn strict_secondary_fail_closed_emits_default_block_filter() {
+fn the_additional_default_route_without_protection_blocks_nothing() {
     let fx = build_fixture();
-    seed_route_binding(&fx, "S", BehaviorMode::StrictSecondaryFailClosed);
+    seed_route_binding(&fx, "S", BehaviorMode::PreferSecondaryWhenAvailable);
     fx.rules_provider.set(applied_rules_snapshot(rule_book(
         vec![exact_ip_rule("r-1", Ipv4Addr::new(203, 0, 113, 9))],
         vec![],
@@ -557,18 +546,14 @@ fn strict_secondary_fail_closed_emits_default_block_filter() {
 
     fx.orchestrator.install_for_sid("S").expect("install");
     let filters = fx.api.wfp_filters.lock().unwrap();
-    // 1 rule-driven Permit + 1 catch-all Block.
-    assert_eq!(filters.len(), 2);
     assert!(
-        filters.iter().any(|f| f.action == WfpAction::Block
-            && f.remote_ip.is_none()
-            && f.remote_ip_set.is_empty()),
-        "fail-closed catch-all Block must be present"
+        filters.iter().all(|f| f.action != WfpAction::Block),
+        "no block without protection"
     );
     assert!(
         filters.iter().any(|f| f.action == WfpAction::Permit
             && (f.remote_ip.is_some() || !f.remote_ip_set.is_empty())),
-        "rule-driven Permit must also be present"
+        "rule-driven Permit must be present"
     );
 }
 

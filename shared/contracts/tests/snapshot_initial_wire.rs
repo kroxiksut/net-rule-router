@@ -249,3 +249,40 @@ fn traffic_carried_by_another_user_is_optional_and_shaped_like_its_push() {
         pushed
     );
 }
+
+/// The start of a first save: absent from an older service's snapshot, and
+/// spelled in the route-policy slugs where it is sent.
+#[test]
+fn the_first_policy_is_optional_and_spelled_in_policy_slugs() {
+    use nrr_shared::ipc_payloads::{BehaviorModeDto, FirstPolicyDto, LeakProtectionDto};
+    let older = parse(snapshot_without_enforcement());
+    assert_eq!(older.first_policy, None);
+    let wire = serde_json::to_value(&older).unwrap_or_else(|e| panic!("{e}"));
+    assert!(wire.get("first-policy").is_none(), "{wire}");
+
+    let mut v = snapshot_without_enforcement();
+    v["first-policy"] = json!({
+        "mode": "prefer-secondary-when-available",
+        "leak-protection-at-least": "everything"
+    });
+    assert_eq!(
+        parse(v).first_policy,
+        Some(FirstPolicyDto {
+            mode: BehaviorModeDto::PreferSecondaryWhenAvailable,
+            leak_protection_at_least: LeakProtectionDto::Everything,
+        })
+    );
+}
+
+/// The caller's unreadable rule book: absent while it reads, `true` while not.
+#[test]
+fn rules_book_unreadable_is_optional_and_omitted_while_false() {
+    let older = parse(snapshot_without_enforcement());
+    assert!(!older.rules_book_unreadable);
+    let wire = serde_json::to_value(&older).unwrap_or_else(|e| panic!("{e}"));
+    assert!(wire.get("rules-book-unreadable").is_none(), "{wire}");
+
+    let mut v = snapshot_without_enforcement();
+    v["rules-book-unreadable"] = json!(true);
+    assert!(parse(v).rules_book_unreadable);
+}

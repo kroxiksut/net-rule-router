@@ -14,10 +14,9 @@
 //! * The QML async-callback chain (`registerRpcCallback`) is JS code
 //!   that doesn't have a Rust equivalent — verified via manual smoke
 //!   below.
-//! * The actual export file content — that's assembled in QML's
-//!   `_buildCanonicalRulesText`; a Rust mirror would duplicate logic
-//!   without testable value. See P7 manual-smoke checklist for the
-//!   real round-trip verification.
+//!
+//! The export itself is checked through `nrr_client_logic`'s writer, the
+//! twin `rules.js::buildCanonicalRulesText` is held to by shared vectors.
 
 #![allow(clippy::expect_used)]
 
@@ -306,4 +305,85 @@ fn passthrough_preview_uses_btreemap_order_for_export_determinism() {
         keys.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
         vec!["Cidr", "Linux", "MacOS"],
     );
+}
+
+/// The `PlatformProfile::os` of this build, as the writer takes it.
+fn native_os() -> &'static str {
+    match native_app_section() {
+        "Linux" => "linux",
+        "MacOS" => "macos",
+        _ => "windows",
+    }
+}
+
+/// One import then one export, the way the window does them: the parser's
+/// rules become rows, its foreign sections go through the sidecar, and the
+/// rules-file writer puts both back together.
+fn export_after_import(handle: &SidecarHandle, text: &str) -> String {
+    use nrr_client_logic::rules_table::{
+        build_rules_file_text, drift_row_from_parsed_rule, RulesFileOptions,
+    };
+    use nrr_client_logic::Route;
+
+    let parsed = parse_canonical_rules(text);
+    handle_sidecar_request(
+        handle,
+        "sidecar.passthrough.write",
+        &json!({ "route": "primary", "sections": to_sections_object(&parsed.passthrough) }),
+    )
+    .expect("write");
+    let read = handle_sidecar_request(
+        handle,
+        "sidecar.passthrough.read",
+        &json!({ "route": "primary" }),
+    )
+    .expect("read");
+    let passthrough: BTreeMap<String, String> = read["sections"]
+        .as_object()
+        .expect("sections object")
+        .iter()
+        .map(|(name, body)| (name.clone(), body.as_str().unwrap_or_default().to_owned()))
+        .collect();
+    let rows: Vec<_> = parsed
+        .rules
+        .iter()
+        .map(|rule| drift_row_from_parsed_rule(rule, Route::Primary))
+        .collect();
+    let options = RulesFileOptions {
+        include_comments: true,
+        exported_at: "2026-01-01T00:00:00Z",
+        passthrough: &passthrough,
+        os: native_os(),
+        syntax_hint: &[],
+    };
+    build_rules_file_text(&rows, Route::Primary, &options)
+}
+
+#[test]
+fn an_exported_file_imports_and_exports_again_byte_for_byte() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let handle = fresh_sidecar(&tmp);
+    let native = native_app_section();
+    let [first, second] = foreign_app_sections();
+    let seed = format!(
+        "--- Zones\nru\n\n--- Domains\nab.test\n*.ya.ru\n\n--- {native}\nmessenger.exe\n\n\
+         --- {first}\n# (reserved - not applied on this host)\nfirefox\nchromium\n\n\
+         --- {second}\nСафари\nVivaldi\n"
+    );
+
+    let exported = export_after_import(&handle, &seed);
+    for body in [
+        format!("--- {first}\n# (reserved - not applied on this host)\nfirefox\nchromium\n"),
+        format!("--- {second}\nСафари\nVivaldi\n"),
+    ] {
+        assert!(
+            exported.contains(&body),
+            "{body:?} not kept in:\n{exported}"
+        );
+    }
+    assert!(exported.contains("ab.test"), "{exported}");
+    assert!(exported.contains("messenger.exe"), "{exported}");
+
+    let again = export_after_import(&handle, &exported);
+    assert_eq!(again, exported, "a second round trip changed the file");
 }

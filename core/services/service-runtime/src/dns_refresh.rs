@@ -125,6 +125,48 @@ pub struct DnsRefreshOrchestrator {
     /// [`REFRESH_LOOPBACK_BACKOFF_MAX`]; cleared the moment the host refreshes
     /// to a routable address.
     loopback_retry_after: Mutex<HashMap<String, (Instant, Duration)>>,
+    /// Which hosts are worth refreshing. Unset, every expired host is.
+    use_gate: Option<UseGate>,
+    /// Whether anyone's plan pins or routes IPv6; while it does, a refresh
+    /// asks for `AAAA` as well, so the IPv6 rows stay as fresh as the IPv4 ones.
+    ipv6: Arc<crate::ipv6_disposition::Ipv6Dispositions>,
+}
+
+/// The hosts a rule names, asked at each tick.
+pub type RuleNamedHosts = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+struct UseGate {
+    named: RuleNamedHosts,
+    used_within: Duration,
+}
+
+/// How long after its last use a host the user's rules do not name stays worth
+/// re-resolving.
+pub const REFRESH_USED_WITHIN: Duration = Duration::from_secs(7 * 24 * 3_600);
+
+/// The hosts the enabled rules of everyone `present` name, for
+/// [`DnsRefreshOrchestrator::with_use_gate`]: exact hosts and the apex of a
+/// suffix rule. A host seen only under a zone or a domain is not among them.
+pub fn rule_named_hosts(
+    rules: Arc<dyn crate::per_sid_orchestrator::RulesProvider>,
+    present: crate::service_tasks::PresentPrincipalsFn,
+) -> RuleNamedHosts {
+    Arc::new(move || {
+        let mut named = std::collections::BTreeMap::new();
+        for sid in present() {
+            if let Some(snapshot) = rules.active_rules_for(&sid) {
+                crate::rule_hostname_seeder::collect_rule_hostnames(
+                    &snapshot.rule_book.primary,
+                    &mut named,
+                );
+                crate::rule_hostname_seeder::collect_rule_hostnames(
+                    &snapshot.rule_book.secondary,
+                    &mut named,
+                );
+            }
+        }
+        named.into_keys().collect()
+    })
 }
 
 /// First wait before a loopback-pinned hostname is re-queried by the refresh.
@@ -154,7 +196,26 @@ impl DnsRefreshOrchestrator {
             negative_ttl_secs: DEFAULT_NEGATIVE_TTL_SECS,
             loopback_logged: Mutex::new(HashSet::new()),
             loopback_retry_after: Mutex::new(HashMap::new()),
+            use_gate: None,
+            ipv6: crate::ipv6_disposition::learning_ipv6_dispositions(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_ipv6_dispositions(
+        mut self,
+        board: Arc<crate::ipv6_disposition::Ipv6Dispositions>,
+    ) -> Self {
+        self.ipv6 = board;
+        self
+    }
+
+    /// Refresh only hosts `named` lists or that were used within
+    /// `used_within`; a host nobody names and nobody visits ages out instead of
+    /// being re-resolved for ever.
+    pub fn with_use_gate(mut self, named: RuleNamedHosts, used_within: Duration) -> Self {
+        self.use_gate = Some(UseGate { named, used_within });
+        self
     }
 
     /// `true` while `hostname` is inside its post-loopback-pin wait.
@@ -261,6 +322,7 @@ impl DnsRefreshOrchestrator {
         };
 
         summary.attempted = expired.len() as u32;
+        let ask_v6 = self.ipv6.any_names_ipv6();
 
         for row in expired {
             // Loopback-pinned rows keep re-expiring by design; honor their
@@ -269,7 +331,7 @@ impl DnsRefreshOrchestrator {
                 summary.skipped = summary.skipped.saturating_add(1);
                 continue;
             }
-            if self.refresh_one(&row, now, &mut summary) == TickStep::Stop {
+            if self.refresh_one(&row, now, ask_v6, &mut summary) == TickStep::Stop {
                 break;
             }
         }
@@ -301,6 +363,7 @@ impl DnsRefreshOrchestrator {
     /// round-trip.
     pub fn resolve_now(&self, hostnames: &[String], now: SystemTime) -> RefreshSummary {
         let mut summary = RefreshSummary::default();
+        let ask_v6 = self.ipv6.any_names_ipv6();
         for hostname in hostnames {
             let canonical = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
             if canonical.is_empty() {
@@ -315,7 +378,7 @@ impl DnsRefreshOrchestrator {
                 canonical_hostname: canonical,
                 last_seen_at: None,
             };
-            self.refresh_one(&row, now, &mut summary);
+            self.refresh_one(&row, now, ask_v6, &mut summary);
         }
         if summary.succeeded > 0 {
             self.touch_last_rebuild_at(now);
@@ -350,6 +413,14 @@ impl DnsRefreshOrchestrator {
     }
 
     fn list_expired(&self, now: SystemTime, limit: usize) -> Result<Vec<ExpiredHostname>, ()> {
+        // Asked before the cache lock: the hosts come from the state DB, whose
+        // holders take this cache lock under it, so the reverse order deadlocks.
+        let gate = self.use_gate.as_ref().map(|gate| {
+            (
+                (gate.named)(),
+                now.checked_sub(gate.used_within).unwrap_or(now),
+            )
+        });
         let guard = match self.cache.lock() {
             Ok(g) => g,
             Err(_) => {
@@ -361,7 +432,13 @@ impl DnsRefreshOrchestrator {
                 return Err(());
             }
         };
-        match guard.list_expired_resolutions(now, limit) {
+        let listed = match gate {
+            Some((named, used_since)) => {
+                guard.list_expired_for_refresh(now, limit, used_since, &named)
+            }
+            None => guard.list_expired_resolutions(now, limit),
+        };
+        match listed {
             Ok(v) => Ok(v),
             Err(e) => {
                 tracing::warn!(
@@ -375,16 +452,33 @@ impl DnsRefreshOrchestrator {
         }
     }
 
+    /// With `ask_v6`, the `AAAA` answer joins the `A` one; a name with only
+    /// `AAAA` records then refreshes instead of failing.
     fn refresh_one(
         &self,
         row: &ExpiredHostname,
         now: SystemTime,
+        ask_v6: bool,
         summary: &mut RefreshSummary,
     ) -> TickStep {
-        match self
+        let mut answer = self
             .resolver
-            .resolve(&row.canonical_hostname, AddressFamily::Ipv4)
-        {
+            .resolve(&row.canonical_hostname, AddressFamily::Ipv4);
+        if ask_v6 && !matches!(answer, Err(DnsResolverError::UnsupportedPlatform { .. })) {
+            if let Ok(v6) = self
+                .resolver
+                .resolve(&row.canonical_hostname, AddressFamily::Ipv6)
+            {
+                answer = match answer {
+                    Ok(mut record) => {
+                        record.addresses.extend(v6.addresses);
+                        Ok(record)
+                    }
+                    Err(_) => Ok(v6),
+                };
+            }
+        }
+        match answer {
             Ok(mut record) => {
                 // Mode B self-interception: the OS resolver path is redirected
                 // to our own resolver, so a system-level re-resolution hands
@@ -488,7 +582,7 @@ impl DnsRefreshOrchestrator {
             Ok(g) => g,
             Err(_) => return false,
         };
-        if let Err(e) = guard.upsert_resolution(entry) {
+        if let Err(e) = guard.refresh_resolution(entry) {
             tracing::warn!(
                 target: "nrr::dns",
                 msg_key = "dns-refresh-upsert-failed",
@@ -656,6 +750,79 @@ mod tests {
     }
 
     #[test]
+    fn the_use_gate_refreshes_named_and_recently_used_hosts_only() {
+        let now = SystemTime::now();
+        let resolver_mock = Arc::new(MockDnsResolver::new());
+        let cache = make_cache();
+        let long_ago = now - Duration::from_secs(40 * 24 * 3_600);
+        let ip = Ipv4Addr::new(198, 51, 100, 30);
+        seed_expired(&cache, "named.test", ip, long_ago, 60);
+        seed_expired(&cache, "idle.test", ip, long_ago, 60);
+        seed_expired(
+            &cache,
+            "busy.test",
+            ip,
+            now - Duration::from_secs(3_600),
+            60,
+        );
+        for host in ["named.test", "busy.test", "idle.test"] {
+            resolver_mock.set_response(
+                host,
+                ResolvedRecord {
+                    canonical_hostname: host.into(),
+                    addresses: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 40))],
+                    ttl_seconds: Some(300),
+                },
+            );
+        }
+        let orchestrator = DnsRefreshOrchestrator::new(
+            Arc::clone(&resolver_mock) as Arc<dyn DnsResolverPort>,
+            cache,
+        )
+        .with_use_gate(
+            Arc::new(|| vec!["named.test".to_string()]),
+            REFRESH_USED_WITHIN,
+        );
+
+        let summary = orchestrator.run_once(now, 16);
+
+        assert_eq!(summary.attempted, 2);
+        let mut asked = resolver_mock.observed_queries();
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec!["busy.test".to_string(), "named.test".to_string()]
+        );
+    }
+
+    // The gate reads the state DB, whose holders take the cache lock under it.
+    #[test]
+    fn the_use_gate_is_asked_outside_the_cache_lock() {
+        let cache = make_cache();
+        let probe = Arc::clone(&cache);
+        let free = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&free);
+        let orchestrator = DnsRefreshOrchestrator::new(
+            Arc::new(MockDnsResolver::new()) as Arc<dyn DnsResolverPort>,
+            cache,
+        )
+        .with_use_gate(
+            Arc::new(move || {
+                seen.store(
+                    probe.try_lock().is_ok(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                Vec::new()
+            }),
+            REFRESH_USED_WITHIN,
+        );
+
+        orchestrator.run_once(SystemTime::now(), 16);
+
+        assert!(free.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
     fn a_routable_refresh_clears_the_loopback_backoff() {
         let orchestrator = DnsRefreshOrchestrator::new(
             Arc::new(MockDnsResolver::new()) as Arc<dyn DnsResolverPort>,
@@ -725,6 +892,69 @@ mod tests {
                 .any(|e| e.addr == Ipv4Addr::new(203, 0, 113, 9)),
             "the address must be in the cache for enforcement to build a filter"
         );
+    }
+
+    /// While anyone's plan pins or routes IPv6, a refresh keeps a host's IPv6
+    /// rows as fresh as its IPv4 ones, and a name with only `AAAA` refreshes.
+    /// Otherwise no `AAAA` is asked for at all.
+    #[test]
+    fn the_refresh_asks_for_aaaa_only_while_a_plan_enforces_ipv6() {
+        use crate::enforcement_planner::Ipv6Guard;
+        use crate::ipv6_disposition::Ipv6Dispositions;
+        let v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let v6: IpAddr = "2001:db8::9".parse().expect("v6");
+        let only_v6: IpAddr = "2001:db8::a".parse().expect("v6");
+        for enforced in [false, true] {
+            let board = Arc::new(Ipv6Dispositions::default());
+            board.set("S-1", Ipv6Guard::Off);
+            if enforced {
+                board.set("S-2", Ipv6Guard::FiltersOnly);
+            }
+            let resolver_mock = Arc::new(MockDnsResolver::new());
+            for (host, addresses) in [
+                ("dual.example", vec![v4, v6]),
+                ("six.example", vec![only_v6]),
+            ] {
+                resolver_mock.set_response(
+                    host,
+                    ResolvedRecord {
+                        canonical_hostname: host.into(),
+                        addresses,
+                        ttl_seconds: Some(300),
+                    },
+                );
+            }
+            let cache = make_cache();
+            let orchestrator = DnsRefreshOrchestrator::new(
+                Arc::clone(&resolver_mock) as Arc<dyn DnsResolverPort>,
+                cache.clone(),
+            )
+            .with_ipv6_dispositions(board);
+
+            let summary = orchestrator.resolve_now(
+                &["dual.example".to_string(), "six.example".to_string()],
+                SystemTime::now(),
+            );
+
+            let queries = resolver_mock.observed_queries().len();
+            assert_eq!(queries, if enforced { 4 } else { 2 }, "enforced={enforced}");
+            assert_eq!(summary.succeeded, if enforced { 2 } else { 1 });
+            let guard = cache.lock().unwrap();
+            let cached = |host: &str| -> Vec<IpAddr> {
+                guard
+                    .get_by_hostname(
+                        host,
+                        &FreshnessThresholds::default_production(),
+                        nrr_storage::resolution_source::CachePriorityStrategy::default(),
+                    )
+                    .map(|l| l.resolved_ips.iter().map(|e| e.addr).collect())
+                    .unwrap_or_default()
+            };
+            let dual = cached("dual.example");
+            assert!(dual.contains(&v4), "{dual:?}");
+            assert_eq!(dual.contains(&v6), enforced, "{dual:?}");
+            assert_eq!(cached("six.example").contains(&only_v6), enforced);
+        }
     }
 
     #[test]

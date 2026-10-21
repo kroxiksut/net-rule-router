@@ -10,7 +10,7 @@
 //! implementation (`etw::EtwDnsObserver`, Windows-only) subscribes to the
 //! `Microsoft-Windows-DNS-Client` ETW provider — pure user-mode, no kernel
 //! callout driver, no DNS-config change, no port-53 binding. It buffers
-//! every completed A-record resolution; a service-runtime consumer drains
+//! every completed A/AAAA resolution; a service-runtime consumer drains
 //! the buffer, keeps the ones that match an active suffix/zone/exact rule,
 //! and writes them to the FQDN cache so the existing route/WFP codegen can
 //! fan them out.
@@ -21,18 +21,24 @@
 //! of apps take — are observed. This is an inherent limit of any
 //! non-driver approach.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 
-/// One observed DNS resolution: a queried hostname and the IPv4 addresses
-/// it resolved to.
+mod query_completed;
+
+pub use query_completed::{parse_query_completed, MAX_ADDRESSES_PER_FAMILY};
+
+/// One observed DNS resolution: a queried hostname and the addresses it
+/// resolved to. At least one of the two lists is non-empty (an empty answer
+/// is not surfaced as an observation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsObservation {
     /// Canonical (lower-cased, no trailing dot) queried hostname.
     pub hostname: String,
-    /// IPv4 addresses the query resolved to. Never empty (an empty answer
-    /// is not surfaced as an observation).
+    /// IPv4 addresses the query resolved to, IPv4-mapped answers included.
     pub ipv4s: Vec<Ipv4Addr>,
+    /// IPv6 addresses the query resolved to; never an IPv4-mapped one.
+    pub ipv6s: Vec<Ipv6Addr>,
     /// The account whose program asked, when the platform can tell (stored
     /// principal form). What a lookup teaches belongs to that user alone.
     pub owner: Option<String>,
@@ -44,6 +50,14 @@ pub trait DnsObservationSource: Send + Sync {
     /// Remove and return all observations buffered since the last drain.
     /// Returns an empty vector when nothing was observed.
     fn drain(&self) -> Vec<DnsObservation>;
+
+    /// Whether the backend is still producing events. A source whose feeding
+    /// thread died drains empty forever, which looks like a quiet network; the
+    /// health surface asks this instead. Sources with no such thread keep the
+    /// default.
+    fn is_feeding(&self) -> bool {
+        true
+    }
 }
 
 /// In-memory scripted source for tests (and for non-Windows builds, where
@@ -66,6 +80,7 @@ impl MockDnsObservationSource {
         self.buffered.lock().unwrap().push(DnsObservation {
             hostname: hostname.to_string(),
             ipv4s,
+            ipv6s: Vec::new(),
             owner: None,
         });
     }
@@ -81,6 +96,11 @@ impl DnsObservationSource for MockDnsObservationSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_with_no_feeding_thread_reports_feeding() {
+        assert!(MockDnsObservationSource::new().is_feeding());
+    }
 
     #[test]
     fn mock_buffers_and_drains_once() {

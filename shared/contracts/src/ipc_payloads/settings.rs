@@ -82,6 +82,19 @@ pub struct RetentionSettingsSetRequest {
     pub pin_lkg: bool,
 }
 
+impl RetentionSettingsSetRequest {
+    /// The service's defaults, for a client's "reset to defaults". Held equal
+    /// to `nrr-storage`'s `RetentionSettings::DEFAULT` by a service-runtime test.
+    pub const DEFAULT: Self = Self {
+        superseded_days: 30,
+        superseded_count_cap: 100,
+        rejected_days: 7,
+        rolledback_days: 14,
+        rolledback_count_cap: 20,
+        pin_lkg: true,
+    };
+}
+
 pub type RetentionSettingsSetResponse = RetentionSettingsDto;
 
 // ── Log/audit retention config ───────────────────────────────────────────────
@@ -231,14 +244,6 @@ pub struct AutostartDto {
 pub struct AutostartGetRequest {}
 
 pub type AutostartGetResponse = AutostartDto;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct AutostartToggleRequest {
-    pub enabled: bool,
-}
-
-pub type AutostartToggleResponse = AutostartDto;
 
 // ── Home and local network suffixes ──────────────────────────────────────
 

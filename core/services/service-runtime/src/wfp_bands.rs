@@ -32,10 +32,6 @@
 
 // ── ALE connect layer ───────────────────────────────────────────────────────
 
-/// The fail-closed catch-all. Below every per-rule weight so a rule-driven
-/// `Permit` always wins.
-pub(crate) const DEFAULT_BLOCK_WEIGHT: u64 = 0x0000_FFFF;
-
 /// `secondary`-route rules.
 pub(crate) const BASE_SECONDARY: u64 = 0x0010_0000;
 
@@ -93,6 +89,38 @@ pub(crate) const CATCHALL_EXEMPT_BASE: u64 = 0x0050_0000;
 /// below the per-app exemptions and explicit user Blocks.
 pub(crate) const NETWORK_CUT_OUT_BASE: u64 = CATCHALL_EXEMPT_BASE + NETWORK_INDEX_BASE;
 
+/// Permits for somebody else's tunnel: egress through it to the networks its own
+/// routes carry, one filter per tunnel per layer. Above every posture block, so
+/// the guard leaves that tunnel's traffic alone; below the user's own Blocks,
+/// which still bind it. The v6 packet layer uses the same base: its only posture
+/// block is the blanket at [`PACKET_BLOCK_BASE`], and a user Block's mirror there
+/// sits at its rule weight, at [`BASE_BLOCK`] or above.
+pub(crate) const FOREIGN_TUNNEL_PERMIT_BASE: u64 =
+    NETWORK_CUT_OUT_BASE + NETWORK_CUT_OUT_MAX as u64;
+
+/// Blocks for addresses the user pinned to our tunnel that lie inside a foreign
+/// tunnel's network: egress through that tunnel is cut for them. The narrower
+/// rule wins, so these sit above the network permits they carve out of.
+pub(crate) const FOREIGN_TUNNEL_PIN_VETO_BASE: u64 =
+    FOREIGN_TUNNEL_PERMIT_BASE + FOREIGN_TUNNEL_MAX_TUNNELS as u64;
+
+/// The DoH/DoT lockdown, restated per foreign tunnel: the lockdown is the user's
+/// explicit protection, so it outranks a corporate tunnel's permit for the
+/// resolver ports and addresses it names. Only the flows leaving through that
+/// tunnel are cut here; the lockdown's own band keeps its place for every other
+/// egress.
+pub(crate) const DOH_FOREIGN_VETO_BASE: u64 =
+    FOREIGN_TUNNEL_PIN_VETO_BASE + FOREIGN_TUNNEL_PIN_VETO_MAX as u64;
+
+/// Another VPN's handshake: the OS IKE service's UDP 500/4500 and each gateway
+/// the user confirmed, on the handshake ports. Above every posture block and
+/// the foreign-tunnel bands, below the app exemptions and the user's Blocks.
+/// The v6 packet layer reuses it for a confirmed v6 gateway.
+pub(crate) const VPN_HANDSHAKE_PERMIT_BASE: u64 = 0x005F_C000;
+
+/// Slots the handshake band holds: gateways times ports, plus the IKE pairs.
+pub(crate) const VPN_HANDSHAKE_SLOTS: u64 = 0x100;
+
 /// Per-app exemptions (the VPN client's own process, and anything the user
 /// exempted by name).
 pub(crate) const APP_EXEMPT_BASE: u64 = 0x0060_0000;
@@ -106,7 +134,6 @@ pub(crate) const BASE_BLOCK: u64 = 0x0070_0000;
 
 /// The ALE order, low to high. The list IS the invariant.
 const ALE_BANDS: &[(&str, u64)] = &[
-    ("DEFAULT_BLOCK_WEIGHT", DEFAULT_BLOCK_WEIGHT),
     ("BASE_SECONDARY", BASE_SECONDARY),
     ("CATCHALL_BLOCK_WEIGHT", CATCHALL_BLOCK_WEIGHT),
     ("APP_KILLSWITCH_BLOCK_BASE", APP_KILLSWITCH_BLOCK_BASE),
@@ -126,6 +153,10 @@ const ALE_BANDS: &[(&str, u64)] = &[
     ("FAKEIP_POOL_PERMIT_BASE", FAKEIP_POOL_PERMIT_BASE),
     ("CATCHALL_EXEMPT_BASE", CATCHALL_EXEMPT_BASE),
     ("NETWORK_CUT_OUT_BASE", NETWORK_CUT_OUT_BASE),
+    ("FOREIGN_TUNNEL_PERMIT_BASE", FOREIGN_TUNNEL_PERMIT_BASE),
+    ("FOREIGN_TUNNEL_PIN_VETO_BASE", FOREIGN_TUNNEL_PIN_VETO_BASE),
+    ("DOH_FOREIGN_VETO_BASE", DOH_FOREIGN_VETO_BASE),
+    ("VPN_HANDSHAKE_PERMIT_BASE", VPN_HANDSHAKE_PERMIT_BASE),
     ("APP_EXEMPT_BASE", APP_EXEMPT_BASE),
     ("BASE_BLOCK", BASE_BLOCK),
 ];
@@ -145,10 +176,29 @@ pub(crate) const PACKET_NETWORK_BLOCK_BASE: u64 =
 /// Held-network egress permits; inside the block band for the reason the ALE
 /// twin gives.
 pub(crate) const PACKET_NETWORK_PERMIT_BASE: u64 = PACKET_NETWORK_BLOCK_BASE + 0x0010_0000;
+/// Transport-layer twins of [`FOREIGN_TUNNEL_PERMIT_BASE`]: past every block on
+/// the layer, the held networks' included.
+pub(crate) const PACKET_FOREIGN_TUNNEL_PERMIT_BASE: u64 =
+    PACKET_NETWORK_PERMIT_BASE + NETWORK_HOLD_MAX as u64 * PACKET_SLOTS_PER_DESTINATION;
+/// Transport-layer twin of [`FOREIGN_TUNNEL_PIN_VETO_BASE`]: above the foreign
+/// permits it carves out of.
+pub(crate) const PACKET_FOREIGN_TUNNEL_PIN_VETO_BASE: u64 =
+    PACKET_FOREIGN_TUNNEL_PERMIT_BASE + FOREIGN_TUNNEL_MAX_TUNNELS as u64;
 /// Packet-layer permits for protocols the kill switch did not select.
 pub(crate) const PACKET_PERMIT_BASE: u64 = 0x0140_0000;
+/// ESP on the transport layer, past every block there: another VPN's
+/// encrypted traffic, which the kernel sends for no user.
+pub(crate) const PACKET_VPN_HANDSHAKE_PERMIT_BASE: u64 = 0x0240_0000;
+/// The fake-IP pool on the transport layer: past every block there, so a ping
+/// to a virtual address reaches our own adapter under any posture.
+pub(crate) const PACKET_FAKEIP_POOL_PERMIT_BASE: u64 = PACKET_EXEMPT_BASE - 0x0001_0000;
 /// Packet-layer exemptions.
 pub(crate) const PACKET_EXEMPT_BASE: u64 = 0x0250_0000;
+/// The v6 packet layer's exemptions (loopback, link-local, tunnel servers, LAN).
+/// Not at [`PACKET_EXEMPT_BASE`]: that sits above a user Block's packet mirror
+/// (at its rule weight, [`BASE_BLOCK`] and up), and a user Block must win. The v6
+/// packet layer holds no per-address pins, so the ALE exemption base is free here.
+pub(crate) const PACKET_V6_EXEMPT_BASE: u64 = CATCHALL_EXEMPT_BASE;
 /// Cut-outs inside held networks, past the per-address egress permits.
 pub(crate) const PACKET_NETWORK_CUT_OUT_BASE: u64 =
     PACKET_EXEMPT_BASE + NETWORK_INDEX_BASE * PACKET_SLOTS_PER_DESTINATION;
@@ -158,7 +208,23 @@ const PACKET_BANDS: &[(&str, u64)] = &[
     ("PACKET_BLOCK_BASE", PACKET_BLOCK_BASE),
     ("PACKET_NETWORK_BLOCK_BASE", PACKET_NETWORK_BLOCK_BASE),
     ("PACKET_NETWORK_PERMIT_BASE", PACKET_NETWORK_PERMIT_BASE),
+    (
+        "PACKET_FOREIGN_TUNNEL_PERMIT_BASE",
+        PACKET_FOREIGN_TUNNEL_PERMIT_BASE,
+    ),
+    (
+        "PACKET_FOREIGN_TUNNEL_PIN_VETO_BASE",
+        PACKET_FOREIGN_TUNNEL_PIN_VETO_BASE,
+    ),
     ("PACKET_PERMIT_BASE", PACKET_PERMIT_BASE),
+    (
+        "PACKET_VPN_HANDSHAKE_PERMIT_BASE",
+        PACKET_VPN_HANDSHAKE_PERMIT_BASE,
+    ),
+    (
+        "PACKET_FAKEIP_POOL_PERMIT_BASE",
+        PACKET_FAKEIP_POOL_PERMIT_BASE,
+    ),
     ("PACKET_EXEMPT_BASE", PACKET_EXEMPT_BASE),
     ("PACKET_NETWORK_CUT_OUT_BASE", PACKET_NETWORK_CUT_OUT_BASE),
 ];
@@ -205,6 +271,22 @@ pub const NETWORK_HOLD_MAX: usize = 0x0000_F000;
 /// blocking a destination the main link names is the outcome the cap must not buy.
 pub const NETWORK_CUT_OUT_MAX: usize = 0x0001_0000;
 
+/// Networks of ONE foreign tunnel a plan permits, per address family: they ride
+/// a single filter per layer as OR'd conditions, so the count costs no filters.
+/// A tunnel that pushes more is cut past the cap rather than opened wider than
+/// its routes.
+pub const FOREIGN_TUNNEL_MAX_NETWORKS: usize = nrr_platform_api::types::MAX_REMOTE_SUBNETS;
+
+/// Foreign tunnels one plan permits: a permit slot per tunnel per layer.
+pub const FOREIGN_TUNNEL_MAX_TUNNELS: usize = 64;
+
+/// Filters the DoH/DoT restatement may add over every foreign tunnel and both
+/// families.
+pub(crate) const DOH_FOREIGN_VETO_MAX: usize = 0x2000;
+
+/// Packed veto filters one plan accepts, over both families and every tunnel.
+pub(crate) const FOREIGN_TUNNEL_PIN_VETO_MAX: usize = 0x8000;
+
 // ── Reading a weight back ───────────────────────────────────────────────────
 
 /// Which band a weight belongs to, by name.
@@ -228,9 +310,9 @@ fn band_of(bands: &[(&'static str, u64)], weight: u64) -> &'static str {
 pub(crate) fn band_of_filter(spec: &nrr_platform_api::types::WfpFilterSpec) -> &'static str {
     use nrr_platform_api::types::WfpLayerKey;
     match spec.layer {
-        WfpLayerKey::OutboundIpPacketV4 | WfpLayerKey::OutboundIpPacketV6 => {
-            band_of(PACKET_BANDS, spec.weight)
-        }
+        WfpLayerKey::OutboundIpPacketV4
+        | WfpLayerKey::OutboundIpPacketV6
+        | WfpLayerKey::OutboundTransportV4 => band_of(PACKET_BANDS, spec.weight),
         _ => band_of(ALE_BANDS, spec.weight),
     }
 }
@@ -330,8 +412,67 @@ const _: () = {
     assert!(PACKET_NETWORK_BLOCK_BASE + hold_slots <= PACKET_NETWORK_PERMIT_BASE);
     assert!(PACKET_NETWORK_PERMIT_BASE + hold_slots <= PACKET_PERMIT_BASE);
     assert!(
+        PACKET_PERMIT_BASE + window <= PACKET_FAKEIP_POOL_PERMIT_BASE,
+        "the transport-layer pool permit would share a slot with an unselected-protocol permit"
+    );
+    assert!(
+        PACKET_BLOCK_BASE < FAKEIP_POOL_PERMIT_BASE && FAKEIP_POOL_PERMIT_BASE < BASE_BLOCK,
+        "the v6 packet layer's pool permit: above the blanket block, below a user Block's mirror"
+    );
+    assert!(
         PACKET_EXEMPT_BASE + window <= PACKET_NETWORK_CUT_OUT_BASE,
         "a network cut-out would share a slot with a per-address egress permit"
+    );
+    // A foreign tunnel's permits outrank every posture block and stay under
+    // the user's own Blocks, on each layer they are emitted at.
+    let foreign = FOREIGN_TUNNEL_MAX_TUNNELS as u64;
+    assert!(
+        FOREIGN_TUNNEL_PIN_VETO_BASE + (FOREIGN_TUNNEL_PIN_VETO_MAX as u64)
+            <= DOH_FOREIGN_VETO_BASE,
+        "the pin vetoes must fit between the foreign permits and the lockdown restatement"
+    );
+    assert!(
+        DOH_FOREIGN_VETO_BASE + (DOH_FOREIGN_VETO_MAX as u64) <= VPN_HANDSHAKE_PERMIT_BASE
+            && VPN_HANDSHAKE_PERMIT_BASE + VPN_HANDSHAKE_SLOTS <= APP_EXEMPT_BASE,
+        "the handshake band must fit between the lockdown restatement and the app exemptions"
+    );
+    assert!(
+        PACKET_PERMIT_BASE + window <= PACKET_VPN_HANDSHAKE_PERMIT_BASE
+            && PACKET_VPN_HANDSHAKE_PERMIT_BASE + VPN_HANDSHAKE_SLOTS
+                <= PACKET_FAKEIP_POOL_PERMIT_BASE,
+        "the transport-layer ESP permit must sit past every unselected-protocol permit"
+    );
+    assert!(
+        PACKET_BLOCK_BASE < VPN_HANDSHAKE_PERMIT_BASE && VPN_HANDSHAKE_PERMIT_BASE < BASE_BLOCK,
+        "the v6 packet layer's gateway permit: above the blanket block, below a user Block's mirror"
+    );
+    assert!(
+        DOH_FOREIGN_VETO_BASE + (DOH_FOREIGN_VETO_MAX as u64) <= APP_EXEMPT_BASE,
+        "the lockdown restatement must stay under the app exemptions"
+    );
+    assert!(
+        DOH_FOREIGN_VETO_BASE > FOREIGN_TUNNEL_PERMIT_BASE + foreign
+            && DOH_FOREIGN_VETO_BASE > CATCHALL_EXEMPT_BASE + 0x1_0000,
+        "the lockdown outranks every permit a foreign tunnel is given"
+    );
+    assert!(DOH_FOREIGN_VETO_BASE + (DOH_FOREIGN_VETO_MAX as u64) <= BASE_BLOCK);
+    assert!(FOREIGN_TUNNEL_PERMIT_BASE + foreign <= FOREIGN_TUNNEL_PIN_VETO_BASE);
+    assert!(PACKET_FOREIGN_TUNNEL_PERMIT_BASE + foreign <= PACKET_FOREIGN_TUNNEL_PIN_VETO_BASE);
+    assert!(
+        PACKET_FOREIGN_TUNNEL_PIN_VETO_BASE + (FOREIGN_TUNNEL_PIN_VETO_MAX as u64)
+            <= PACKET_PERMIT_BASE,
+        "the transport-layer pin vetoes must fit below the unselected-protocol permits"
+    );
+    assert!(
+        PACKET_BLOCK_BASE < FOREIGN_TUNNEL_PERMIT_BASE
+            && FOREIGN_TUNNEL_PERMIT_BASE + foreign <= BASE_BLOCK,
+        "the v6 packet layer: above the blanket block, below a user Block's mirror"
+    );
+    assert!(
+        PACKET_BLOCK_BASE < PACKET_V6_EXEMPT_BASE
+            && PACKET_V6_EXEMPT_BASE + foreign + 0x1000
+                <= FOREIGN_TUNNEL_PERMIT_BASE,
+        "v6 packet exemptions: above the blanket block, below the foreign-tunnel permits and every user Block"
     );
     // The neutral plan carries the same indexes as `u32` ordinals.
     assert!((NETWORK_INDEX_BASE + holds) * PACKET_SLOTS_PER_DESTINATION <= u32::MAX as u64);
@@ -358,8 +499,8 @@ mod tests {
     /// without a table entry changes this number.
     #[test]
     fn every_band_is_in_a_table() {
-        assert_eq!(ALE_BANDS.len(), 16);
-        assert_eq!(PACKET_BANDS.len(), 6);
+        assert_eq!(ALE_BANDS.len(), 19);
+        assert_eq!(PACKET_BANDS.len(), 10);
     }
 
     fn spec_at(
@@ -382,6 +523,7 @@ mod tests {
             remote_subnet: None,
             remote_subnet_v6: None,
             ip_protocol: None,
+            remote_subnet_set: Vec::new(),
         }
     }
 

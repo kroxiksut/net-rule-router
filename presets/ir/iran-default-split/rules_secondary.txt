@@ -34,13 +34,11 @@
 *.claude.com
 *.perplexity.ai
 *.mistral.ai
-api.mistral.ai
 *.cohere.com
 *.cursor.com
 *.openrouter.ai
 *.midjourney.com
 *.jetbrains.com
-plugins.jetbrains.com
 
 *.coursera.org  # Developer and IT services measured as unreachable from this country
 *.gitlab.com  # Developer and IT services measured as unreachable from this country
@@ -60,7 +58,6 @@ discord.exe
 signal.exe
 viber.exe
 # line.exe  # LINE: the process name is too generic, check it on your machine
-skype.exe
 zoom.exe
 slack.exe
 chatgpt.exe

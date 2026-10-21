@@ -28,6 +28,24 @@ impl ServiceController for RecordingController {
     }
 }
 
+/// Reads the run mark at the moment `Stopped` is reported, the last point the
+/// process is guaranteed to be alive.
+struct StopProbe {
+    dir: std::path::PathBuf,
+    active_at_stopped: Mutex<Option<bool>>,
+}
+impl ServiceController for StopProbe {
+    fn report(&self, state: ServiceRuntimeState) {
+        if state == ServiceRuntimeState::Stopped {
+            *self
+                .active_at_stopped
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) =
+                Some(crate::crash_series::run_marked_active(&self.dir));
+        }
+    }
+}
+
 /// Stub IPC server that immediately returns ShutdownRequested on
 /// every accept_one. Used to exercise the supervised-runtime
 /// startup/shutdown sequence without binding a real pipe.
@@ -90,6 +108,7 @@ fn fresh_deps() -> SupervisedRuntimeDeps {
         revision_watch: None,
         dns_refresh_orchestrator: None,
         route_recompute_hook: None,
+        observation_recompute_hook: None,
         route_teardown_hook: None,
         rule_hostname_seeder: None,
         active_routing_sid: None,
@@ -520,55 +539,138 @@ fn a_task_that_keeps_panicking_retires_into_its_component() {
     let _ = supervisor.shutdown();
 }
 
-/// Gaps the contract test knows about. Each entry must still be a gap: when
-/// one closes, its check below fails and the entry has to go.
-const KNOWN_GAPS: &[(&str, &str)] = &[(
-    "hung-task",
-    "the supervisor gives a tick no deadline, so a tick blocked in a syscall or a lock keeps its task alive in name only and health stays as it was",
-)];
-
-fn gap_listed(name: &str) -> bool {
-    KNOWN_GAPS.iter().any(|(gap, _)| *gap == name)
-}
-
-/// A tick that never returns, for a hundred times its interval.
+/// The re-arm a resume fires also brings a retired enforcement task back and
+/// clears `Apply`, with the five-minute timer nowhere near.
 #[test]
-fn a_hung_task_changes_health_or_is_a_listed_gap() {
+fn a_resume_rearm_revives_a_retired_task_and_clears_its_component() {
     use crate::runtime_loop::{ServiceTask, TaskOutcome};
 
     let health = Arc::new(HealthAggregator::new());
     health.clear_lifecycle_override();
-    health.record(HealthComponent::Ipc, ServiceHealthSeverity::Ok, "ok");
+    health.record(HealthComponent::Apply, ServiceHealthSeverity::Ok, "ok");
     let stop = StopToken::new();
     let supervisor = ServiceSupervisor::new(
         stop.clone(),
         Arc::new(HealthFailureSink::new(Arc::clone(&health))),
-    );
-    let entered = Arc::new(AtomicUsize::new(0));
-    let entered_in_task = Arc::clone(&entered);
+    )
+    .with_revive_after(Duration::from_secs(3600))
+    .with_event_revive_floor(Duration::ZERO);
+    let healed = Arc::new(AtomicBool::new(false));
+    let healed_in_task = Arc::clone(&healed);
     supervisor
         .spawn(ServiceTask::periodic(
             ServiceTaskKind::PrincipalEnforcement.id(),
             TaskClass::Recoverable,
             Duration::from_millis(5),
             1,
-            move |stop| {
-                entered_in_task.fetch_add(1, Ordering::SeqCst);
-                while !stop.wait_for(Duration::from_secs(5)) {}
-                TaskOutcome::Continue
+            move |_stop| {
+                if healed_in_task.load(Ordering::SeqCst) {
+                    TaskOutcome::Continue
+                } else {
+                    TaskOutcome::Failed("filter engine gone".into())
+                }
             },
         ))
+        .expect("spawn");
+    let degraded = || {
+        component(&health, HealthComponent::Apply)
+            .is_some_and(|c| c.severity == ServiceHealthSeverity::Degraded)
+    };
+    assert!(wait_for(Duration::from_secs(3), degraded), "retired first");
+
+    let rearms = Arc::new(AtomicUsize::new(0));
+    let rearms_in_hook = Arc::clone(&rearms);
+    let on_resume = reviving(
+        &supervisor,
+        Arc::new(move || {
+            rearms_in_hook.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    healed.store(true, Ordering::SeqCst);
+    on_resume();
+    assert_eq!(
+        rearms.load(Ordering::SeqCst),
+        1,
+        "the re-arm itself still runs"
+    );
+    assert!(
+        wait_for(Duration::from_secs(3), || !degraded()),
+        "{:?}",
+        component(&health, HealthComponent::Apply)
+    );
+    let _ = supervisor.shutdown();
+}
+
+/// A tick that never returns: the audit finds it past its deadline and the
+/// registry's component moves; a tick that comes back clears it again.
+#[test]
+fn a_hung_task_moves_the_component_the_registry_names() {
+    use crate::runtime_loop::{ServiceTask, TaskOutcome};
+    use crate::task_liveness::TaskLiveness;
+
+    let health = Arc::new(HealthAggregator::new());
+    health.clear_lifecycle_override();
+    health.record(HealthComponent::Ipc, ServiceHealthSeverity::Ok, "ok");
+    let liveness = Arc::new(TaskLiveness::new(Arc::clone(&health)));
+    let stop = StopToken::new();
+    let supervisor = ServiceSupervisor::new(
+        stop.clone(),
+        Arc::new(HealthFailureSink::new(Arc::clone(&health))),
+    )
+    .with_liveness(Arc::clone(&liveness));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let entered_in_task = Arc::clone(&entered);
+    supervisor
+        .spawn(
+            ServiceTask::periodic(
+                ServiceTaskKind::PrincipalEnforcement.id(),
+                TaskClass::Recoverable,
+                Duration::from_millis(5),
+                1,
+                move |stop| {
+                    entered_in_task.fetch_add(1, Ordering::SeqCst);
+                    while !stop.wait_for(Duration::from_secs(5)) {}
+                    TaskOutcome::Continue
+                },
+            )
+            .with_tick_deadline(Duration::from_millis(50)),
+        )
         .expect("spawn");
     assert!(wait_for(Duration::from_secs(2), || entered
         .load(Ordering::SeqCst)
         == 1));
-    std::thread::sleep(Duration::from_millis(500));
-    let noticed = health.snapshot().worst_severity > ServiceHealthSeverity::Ok;
+    std::thread::sleep(Duration::from_millis(200));
+    liveness.audit();
+    let apply = component(&health, HealthComponent::Apply).expect("apply recorded");
     let _ = supervisor.shutdown();
+    assert!(
+        apply.severity >= ServiceHealthSeverity::Degraded,
+        "a hung enforcement tick must show in Apply: {apply:?}"
+    );
+    assert!(apply.message.contains("deadline"), "{}", apply.message);
+}
+
+/// A retired task that runs again takes its verdict back, and only its own.
+#[test]
+fn a_task_that_comes_back_after_retirement_clears_its_verdict() {
+    let health = Arc::new(HealthAggregator::new());
+    health.clear_lifecycle_override();
+    health.record(HealthComponent::Apply, ServiceHealthSeverity::Ok, "ok");
+    let sink = HealthFailureSink::new(Arc::clone(&health));
+    let id = TaskId::new(ServiceTaskKind::PrincipalEnforcement.id());
+
+    sink.task_terminated_fatal(&id, "boom");
+    let apply = component(&health, HealthComponent::Apply).expect("apply");
+    assert_eq!(apply.severity, ServiceHealthSeverity::Degraded);
+    assert!(apply.message.contains("retired"), "{}", apply.message);
+
+    sink.task_recovered(&id, TaskClass::Recoverable);
+    let apply = component(&health, HealthComponent::Apply).expect("apply");
     assert_eq!(
-        !noticed,
-        gap_listed("hung-task"),
-        "hung task noticed by health: {noticed}; KNOWN_GAPS must list `hung-task` exactly while it is not"
+        apply.severity,
+        ServiceHealthSeverity::Ok,
+        "{}",
+        apply.message
     );
 }
 
@@ -795,4 +897,137 @@ fn a_graceful_stop_writes_the_last_minute_of_connection_history() {
         ..HistoryRead::default()
     };
     assert_eq!(reader.read(&read, AT).expect("read").0.len(), 1);
+}
+
+/// The clean-stop mark is on disk before SCM is told `Stopped`, so a process
+/// killed right after the report still counts as a clean stop.
+#[test]
+fn clean_stop_is_marked_before_stopped_is_reported() {
+    let stop = StopToken::new();
+    let stop_clone = stop.clone();
+    let join = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        stop_clone.request_stop();
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = BootstrapConfig::new(StorageProfile::TestTemp(dir.path().to_path_buf()));
+    let artifacts = bootstrap(&cfg);
+    let data_dir = artifacts.topology.data_dir.clone();
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    crate::crash_series::begin_run(&data_dir, 1_000);
+    assert!(crate::crash_series::run_marked_active(&data_dir));
+    let probe = StopProbe {
+        dir: data_dir,
+        active_at_stopped: Mutex::new(None),
+    };
+    run_supervised_runtime(&probe, &stop, artifacts, fresh_deps());
+    join.join().unwrap();
+    assert_eq!(
+        *probe
+            .active_at_stopped
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+        Some(false)
+    );
+}
+
+/// A server whose every acceptor fails at once, recording when it was bound,
+/// so the gaps between rebinds are the restart delays the supervisor kept.
+struct TimedFailingServer {
+    binds: Mutex<Vec<std::time::Instant>>,
+    failures: SharedQueue,
+}
+impl IpcServer for TimedFailingServer {
+    fn bind(&self) -> Result<Box<dyn IpcAcceptor>, IpcBindError> {
+        self.binds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(std::time::Instant::now());
+        Ok(Box::new(SharedScriptedAcceptor {
+            outcomes: Arc::clone(&self.failures),
+        }))
+    }
+}
+
+/// The accept loop's restart delays come from the policy saved in the state
+/// database, read the way a service start reads it. The saved base is above
+/// the built-in one, so a supervisor that ignored the setting would restart
+/// sooner than the asserted floors.
+#[test]
+fn a_saved_accept_policy_sets_the_delays_between_rebinds() {
+    use crate::ipc_handlers::providers::{
+        ServiceStabilityConfigProvider, ServiceStabilityConfigWriter,
+    };
+    use crate::managers::{AcceptError, AcceptErrorCategory};
+    use nrr_shared::ipc_payloads::IpcAcceptFailurePolicyDto;
+
+    const MAX_RESTARTS: u32 = 2;
+    const BASE_MS: u32 = 300;
+    let (_db_dir, conn) = migrated_state_db();
+    let settings = crate::production_settings::ProductionServiceStability::new(Arc::clone(&conn));
+    let mut dto = settings.get();
+    dto.ipc_accept_policy = IpcAcceptFailurePolicyDto::Recoverable {
+        max_restarts: MAX_RESTARTS,
+        backoff_base_ms: BASE_MS,
+        backoff_cap_ms: 1_000,
+    };
+    settings.set(&dto, Some("S-1-5-21-test")).expect("set");
+    let stability = crate::boot_settings::read_service_stability_config(&conn).expect("read back");
+
+    let failures: Vec<AcceptOutcome> = (0..=MAX_RESTARTS)
+        .map(|i| {
+            AcceptOutcome::Err(AcceptError {
+                category: AcceptErrorCategory::PipeCreate,
+                message: format!("scripted err {i}"),
+            })
+        })
+        .collect();
+    let server = Arc::new(TimedFailingServer {
+        binds: Mutex::new(Vec::new()),
+        failures: Arc::new(Mutex::new(failures.into_iter().collect())),
+    });
+    let server_dyn: Arc<dyn IpcServer> = server.clone();
+    let deps = SupervisedRuntimeDeps {
+        stability,
+        ..deps_with_server(server_dyn)
+    };
+
+    let controller = RecordingController::default();
+    let stop = StopToken::new();
+    let stop_clone = stop.clone();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let artifacts = bootstrap(&BootstrapConfig::new(StorageProfile::TestTemp(
+        dir.path().to_path_buf(),
+    )));
+    // The first bind is the eager one, then one per failure.
+    let expected_binds = MAX_RESTARTS as usize + 2;
+    let probe = Arc::clone(&server);
+    let join = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + PROBE_BACKSTOP;
+        while probe.binds.lock().unwrap_or_else(|p| p.into_inner()).len() < expected_binds
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop_clone.request_stop();
+    });
+    run_supervised_runtime(&controller, &stop, artifacts, deps);
+    join.join().expect("probe thread");
+
+    let binds = server
+        .binds
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    assert!(binds.len() >= expected_binds, "binds: {}", binds.len());
+    // A failure rebinds at once; the next try waits `base × attempt`.
+    for attempt in 1..=MAX_RESTARTS {
+        let at = attempt as usize;
+        let gap = binds[at + 1].duration_since(binds[at]);
+        let floor = Duration::from_millis(u64::from(BASE_MS * attempt));
+        assert!(
+            gap >= floor,
+            "restart {attempt} came after {gap:?}, before {floor:?}"
+        );
+    }
 }

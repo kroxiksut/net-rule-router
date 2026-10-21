@@ -110,9 +110,8 @@ mod tests {
     }
 
     fn health() -> StatusUpdateEvent {
-        StatusUpdateEvent::HealthChanged {
-            service_state: "running".into(),
-            worst_severity: "ok".into(),
+        StatusUpdateEvent::AdaptersChanged {
+            data_source: "test".into(),
         }
     }
 

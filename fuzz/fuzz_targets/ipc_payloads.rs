@@ -65,7 +65,6 @@ fuzz_target!(|data: &[u8]| {
         RoutingPauseGetRequest,
         RoutingPauseToggleRequest,
         AutostartGetRequest,
-        AutostartToggleRequest,
         LocalDnsSuffixesGetRequest,
         LocalDnsSuffixesSetRequest,
         ServiceStabilityConfigGetRequest,

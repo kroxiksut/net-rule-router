@@ -110,6 +110,9 @@ pub enum NftMatch {
     /// `ct direction reply` — a packet answering a flow that began the other
     /// way.
     CtReply,
+    /// `rt ipsec exists` — the packet's route carries an IPsec transform, so
+    /// the kernel encrypts it after this hook. Linux 4.20 and nftables 0.9.1.
+    RouteIpsec,
 }
 
 /// A single rule in the output chain, in evaluation order.
@@ -201,8 +204,9 @@ fn render_script_rules(out: &mut String, rules: &[NftRule]) {
 /// The first rule of a tag's drop chain, in script form.
 fn drop_report_statement(tag: DropTag) -> String {
     format!(
-        "limit rate {DROP_LOG_RATE_PER_SECOND}/second burst {DROP_LOG_BURST} packets \
+        "meter {} {{ meta skuid limit rate {DROP_LOG_RATE_PER_SECOND}/second burst {DROP_LOG_BURST} packets }} \
          log prefix \"{}\" group {NRR_NFLOG_GROUP} snaplen {NFLOG_SNAPLEN}",
+        tag.chain_name(),
         tag.prefix()
     )
 }
@@ -232,6 +236,7 @@ fn render_match(m: &NftMatch) -> String {
         NftMatch::SkUidSet(ranges) => format!("meta skuid {{ {} }}", uid_items(ranges)),
         NftMatch::Mark(mark) => format!("meta mark {mark:#010x}"),
         NftMatch::CtReply => "ct direction reply".to_owned(),
+        NftMatch::RouteIpsec => "rt ipsec exists".to_owned(),
     }
 }
 
@@ -345,7 +350,7 @@ mod tests {
         assert!(chain_at < jump_at, "{script}");
         assert!(
             script.contains(
-                "limit rate 20/second burst 50 packets log prefix \"nrr:pin\" group 20050 snaplen 80\n    drop\n"
+                "meter drop_pin { meta skuid limit rate 20/second burst 50 packets } log prefix \"nrr:pin\" group 20050 snaplen 80\n    drop\n"
             ),
             "{script}"
         );

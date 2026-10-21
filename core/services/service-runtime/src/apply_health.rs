@@ -49,6 +49,36 @@ fn refused(reason: &str) -> String {
     format!("the platform refused the rules: {reason}")
 }
 
+/// The voice of the route-before-block hook, apart from the pass verdicts: a
+/// later good pass must not wipe a route failure it never retried.
+const ROUTE_SYNC_SOURCE: &str = "route-sync";
+
+/// The route-before-block hook over `recompute`. A failure marks `Apply`
+/// degraded and asks for a full pass, so the retry comes from the next tick
+/// instead of waiting for an input to move; a success clears the mark.
+pub fn route_sync_hook(
+    recompute: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+    health: Arc<HealthAggregator>,
+    retry: crate::pass_inputs::FullPassRequest,
+) -> crate::per_sid_orchestrator::RouteSyncHook {
+    Arc::new(move || match recompute() {
+        Ok(()) => {
+            health.clear_as(ROUTE_SYNC_SOURCE, HealthComponent::Apply);
+            Ok(())
+        }
+        Err(error) => {
+            health.record_as(
+                ROUTE_SYNC_SOURCE,
+                HealthComponent::Apply,
+                ServiceHealthSeverity::Degraded,
+                format!("routes were not updated before new rules took effect: {error}"),
+            );
+            retry.request();
+            Err(error)
+        }
+    })
+}
+
 /// [`PerSidApplyAudit`] that also keeps `Apply` honest: a user whose filters
 /// the platform refused holds it at `Degraded` until a later install, update
 /// or withdrawal for that user succeeds. Users are counted, never named — the
@@ -140,6 +170,37 @@ mod tests {
             guarded: 0,
             routes,
         }
+    }
+
+    #[test]
+    fn a_failed_route_sync_degrades_apply_and_asks_for_a_retry_until_one_works() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let health = health();
+        let retry = crate::pass_inputs::FullPassRequest::default();
+        let failing = Arc::new(AtomicBool::new(true));
+        let hook = {
+            let failing = Arc::clone(&failing);
+            route_sync_hook(
+                move || {
+                    if failing.load(Ordering::SeqCst) {
+                        Err("table busy".to_owned())
+                    } else {
+                        Ok(())
+                    }
+                },
+                Arc::clone(&health),
+                retry.clone(),
+            )
+        };
+        assert_eq!(hook(), Err("table busy".to_owned()));
+        let (severity, message) = apply(&health).expect("apply degraded");
+        assert_eq!(severity, ServiceHealthSeverity::Degraded);
+        assert!(message.contains("table busy"), "{message}");
+        assert!(retry.take(), "a retry was requested");
+        failing.store(false, Ordering::SeqCst);
+        assert_eq!(hook(), Ok(()));
+        assert_eq!(apply(&health), None);
+        assert!(!retry.take(), "a success asks for nothing");
     }
 
     #[test]

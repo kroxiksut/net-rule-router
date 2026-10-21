@@ -24,9 +24,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use nftables::batch::Batch;
-use nftables::expr::{Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, CT};
+use nftables::expr::{
+    Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, RTKey, CT, RT,
+};
 use nftables::schema::{Chain, FlushObject, NfCmd, NfListObject, Nftables, Rule, Table};
-use nftables::stmt::{JumpTarget, Limit, Log, Match, Operator, Statement};
+use nftables::stmt::{JumpTarget, Limit, Log, Match, Meter, Operator, Statement};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
 
 use crate::drop_tag::{
@@ -38,6 +40,39 @@ use crate::nft_ir::{
 };
 
 const FAMILY: NfFamily = NfFamily::INet;
+
+/// The typed model has no `rt ipsec` key, so the match goes out as this
+/// placeholder and [`batch_json`] rewrites it into nft's own form.
+const RT_IPSEC_PLACEHOLDER: &str = "nrr-rt-ipsec";
+
+/// The batch as `nft -j -f -` reads it.
+#[cfg(any(target_os = "linux", test))]
+fn batch_json(batch: &Nftables<'_>) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(batch)?;
+    rewrite_rt_ipsec(&mut value);
+    serde_json::to_string(&value)
+}
+
+/// Our own batch, a few levels deep: no input of anyone else's reaches it.
+#[cfg(any(target_os = "linux", test))]
+fn rewrite_rt_ipsec(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            if map.get("right").and_then(Value::as_str) == Some(RT_IPSEC_PLACEHOLDER) {
+                map.insert(
+                    "left".into(),
+                    serde_json::json!({ "rt": { "key": "ipsec" } }),
+                );
+                map.insert("right".into(), Value::Bool(true));
+                return;
+            }
+            map.values_mut().for_each(rewrite_rt_ipsec);
+        }
+        Value::Array(items) => items.iter_mut().for_each(rewrite_rt_ipsec),
+        _ => {}
+    }
+}
 
 /// The scratch twin of `table`, where a refused batch is taken apart while the
 /// live table keeps enforcing. Derived, not random: every apply of `table`
@@ -162,15 +197,23 @@ fn add_drop_chains<'a, 'r>(
 
 /// Over the limit the rule stops matching and the packet falls through to the
 /// drop unlogged — which is why the limit sits here and not in front of the drop.
+/// The meter keeps one bucket per owning uid, so one user's flood cannot take
+/// another's reports; its entries are bounded by the uids that can own a socket.
 fn drop_report_statements(tag: DropTag) -> Vec<Statement<'static>> {
     vec![
-        Statement::Limit(Limit {
-            rate: DROP_LOG_RATE_PER_SECOND,
-            rate_unit: None,
-            per: Some(Cow::Borrowed("second")),
-            burst: Some(DROP_LOG_BURST),
-            burst_unit: None,
-            inv: None,
+        Statement::Meter(Meter {
+            name: Cow::Owned(tag.chain_name()),
+            key: Expression::Named(NamedExpression::Meta(Meta {
+                key: MetaKey::Skuid,
+            })),
+            stmt: Box::new(Statement::Limit(Limit {
+                rate: DROP_LOG_RATE_PER_SECOND,
+                rate_unit: None,
+                per: Some(Cow::Borrowed("second")),
+                burst: Some(DROP_LOG_BURST),
+                burst_unit: None,
+                inv: None,
+            })),
         }),
         Statement::Log(Some(Log {
             prefix: Some(Cow::Owned(tag.prefix())),
@@ -191,30 +234,46 @@ fn drop_report_statements(tag: DropTag) -> Vec<Statement<'static>> {
 /// Drops are probed silent: whether the kernel takes the drop report is
 /// settled before any search, and a search that blamed the report would skip
 /// the very drops that guard against leaks.
+///
+/// Indices run over both chains, output first: index `rules.len() + j` is
+/// forward rule `j`. The twin has a forward chain whenever ours would.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn render_probe_batch<'a>(ruleset: &'a NftRuleset, indices: &[usize]) -> Nftables<'a> {
     let table: Cow<'a, str> = Cow::Owned(probe_table_name(&ruleset.table));
     let chain: Cow<'a, str> = Cow::Borrowed(ruleset.chain.as_str());
+    let forward: Cow<'a, str> = Cow::Borrowed(NRR_FORWARD_CHAIN);
 
     let mut batch = Batch::new();
     remove_table(&mut batch, table.clone());
     batch.add(NfListObject::Table(table_object(table.clone())));
-    batch.add(NfListObject::Chain(chain_object(
-        table.clone(),
-        chain.clone(),
-        Some(NfHook::Output),
-    )));
-    batch.add(NfListObject::Rule(Rule {
-        family: FAMILY,
-        table: table.clone(),
-        chain: chain.clone(),
-        expr: Cow::Owned(vec![Statement::Accept(None)]),
-        handle: None,
-        index: None,
-        comment: None,
-    }));
-    for rule in indices.iter().filter_map(|&i| ruleset.rules.get(i)) {
-        batch.add(rule_object(&table, &chain, rule, DropReporting::Silent));
+    let open_chain = |batch: &mut Batch<'a>, name: &Cow<'a, str>, hook: NfHook| {
+        batch.add(NfListObject::Chain(chain_object(
+            table.clone(),
+            name.clone(),
+            Some(hook),
+        )));
+        batch.add(NfListObject::Rule(Rule {
+            family: FAMILY,
+            table: table.clone(),
+            chain: name.clone(),
+            expr: Cow::Owned(vec![Statement::Accept(None)]),
+            handle: None,
+            index: None,
+            comment: None,
+        }));
+    };
+    open_chain(&mut batch, &chain, NfHook::Output);
+    if !ruleset.forward.is_empty() {
+        open_chain(&mut batch, &forward, NfHook::Forward);
+    }
+    for &i in indices {
+        let (name, rule) = match i.checked_sub(ruleset.rules.len()) {
+            None => (&chain, ruleset.rules.get(i)),
+            Some(j) => (&forward, ruleset.forward.get(j)),
+        };
+        if let Some(rule) = rule {
+            batch.add(rule_object(&table, name, rule, DropReporting::Silent));
+        }
     }
     batch.to_nftables()
 }
@@ -364,6 +423,14 @@ fn render_match(m: &NftMatch) -> Statement<'static> {
             right: Expression::String(Cow::Borrowed("reply")),
             op: Operator::EQ,
         }),
+        NftMatch::RouteIpsec => Statement::Match(Match {
+            left: Expression::Named(NamedExpression::RT(RT {
+                key: RTKey::ClassId,
+                family: None,
+            })),
+            right: Expression::String(Cow::Borrowed(RT_IPSEC_PLACEHOLDER)),
+            op: Operator::EQ,
+        }),
     }
 }
 
@@ -432,7 +499,8 @@ fn set_match(
 /// One rule the kernel would not accept, dropped so the rest could apply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkippedNftRule {
-    /// Position in the ruleset as it was built.
+    /// Position in the ruleset as it was built: the output rules, then the
+    /// forward ones.
     pub index: usize,
     /// The rule's comment — the only human-readable thing it carries, and what
     /// names the user rule behind it in a report.
@@ -653,7 +721,8 @@ impl NftCliEnforcement {
             Err(NftApplyError::Rejected { .. }) => return Err(refusal),
             Err(environment) => return Err(environment),
         }
-        let outcome = refused_rules(ruleset.rules.len(), refusal, PROBE_BUDGET, |idx| {
+        let probed = ruleset.rules.len() + ruleset.forward.len();
+        let outcome = refused_rules(probed, refusal, PROBE_BUDGET, |idx| {
             self.apply_in_probe(ruleset, idx)
         })
         .and_then(|offenders| {
@@ -758,7 +827,7 @@ impl NftCliEnforcement {
 
     #[cfg(target_os = "linux")]
     fn run_batch(&self, batch: &Nftables<'_>, extra: &[&str]) -> Result<(), NftRunFailure> {
-        let payload = serde_json::to_string(batch).map_err(|e| NftRunFailure::Exited {
+        let payload = batch_json(batch).map_err(|e| NftRunFailure::Exited {
             code: None,
             stderr: format!("the batch could not be serialised: {e}"),
         })?;
@@ -993,30 +1062,37 @@ where
 /// sequence is a different policy.
 ///
 /// `offenders` must be sorted and in range; the search that produces them
-/// guarantees both.
+/// guarantees both. They index both chains as [`render_probe_batch`] does.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn without_rules(ruleset: &NftRuleset, offenders: &[usize]) -> (NftRuleset, Vec<SkippedNftRule>) {
+    let output_len = ruleset.rules.len();
     let skipped = offenders
         .iter()
         .filter_map(|&i| {
-            ruleset.rules.get(i).map(|rule| SkippedNftRule {
+            let rule = match i.checked_sub(output_len) {
+                None => ruleset.rules.get(i),
+                Some(j) => ruleset.forward.get(j),
+            }?;
+            Some(SkippedNftRule {
                 index: i,
                 comment: rule.comment.clone(),
             })
         })
         .collect();
+    let keep = |rules: &[NftRule], offset: usize| -> Vec<NftRule> {
+        rules
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !offenders.contains(&(offset + i)))
+            .map(|(_, rule)| rule.clone())
+            .collect()
+    };
     let kept = NftRuleset {
         family: ruleset.family,
         table: ruleset.table.clone(),
         chain: ruleset.chain.clone(),
-        rules: ruleset
-            .rules
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !offenders.contains(i))
-            .map(|(_, rule)| rule.clone())
-            .collect(),
-        forward: ruleset.forward.clone(),
+        rules: keep(&ruleset.rules, 0),
+        forward: keep(&ruleset.forward, output_len),
     };
     (kept, skipped)
 }
@@ -1074,7 +1150,7 @@ mod tests {
     }
 
     fn json_of(ruleset: &NftRuleset) -> String {
-        serde_json::to_string(&render_batch(ruleset)).expect("the batch must serialise")
+        batch_json(&render_batch(ruleset)).expect("the batch must serialise")
     }
 
     /// The text reaches the tray and the archive: a source line break must not
@@ -1268,6 +1344,52 @@ mod tests {
         assert!(json.contains(r#""prio":-10"#), "{json}");
     }
 
+    /// A forwarded rule is probed on a forward chain of the twin, behind its
+    /// own accept, so the kernel judges it on the hook it will run on.
+    #[test]
+    fn a_probe_batch_puts_a_forwarded_rule_on_the_twins_forward_chain() {
+        let mut set = ruleset(vec![plain("a")]);
+        set.forward = vec![plain("f0"), plain("f1")];
+        let batch = render_probe_batch(&set, &[2]);
+        assert_eq!(
+            commands(&batch),
+            vec![
+                "add table nrr_probe",
+                "delete table nrr_probe",
+                "add table nrr_probe",
+                "add chain nrr_probe/output hooked",
+                "add rule nrr_probe/output",
+                "add chain nrr_probe/forward hooked",
+                "add rule nrr_probe/forward",
+                "add rule nrr_probe/forward",
+            ]
+        );
+        let json = serde_json::to_string(&batch).expect("the batch must serialise");
+        assert!(json.contains(r#""hook":"forward""#), "{json}");
+        assert!(json.contains(r#""comment":"f1""#), "{json}");
+        assert!(!json.contains(r#""comment":"f0""#), "{json}");
+        assert!(!json.contains(r#""comment":"a""#), "{json}");
+    }
+
+    #[test]
+    fn removing_a_refused_forwarded_rule_keeps_both_chains_in_order() {
+        let mut set = ruleset(vec![plain("a"), plain("b")]);
+        set.forward = vec![plain("f0"), plain("f1"), plain("f2")];
+        let (kept, skipped) = without_rules(&set, &[1, 3]);
+        let comments = |rules: &[NftRule]| -> Vec<String> {
+            rules.iter().map(|r| r.comment.clone()).collect()
+        };
+        assert_eq!(comments(&kept.rules), vec!["a"]);
+        assert_eq!(comments(&kept.forward), vec!["f0", "f2"]);
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|s| (s.index, s.comment.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "b"), (3, "f1")],
+        );
+    }
+
     #[test]
     fn teardown_removes_our_table_and_the_probe_twin_whether_or_not_they_exist() {
         assert_eq!(
@@ -1348,6 +1470,33 @@ mod tests {
         assert!(json.contains("route-secondary#0"), "{json}");
     }
 
+    /// `rt ipsec exists` in the form `nft -j` reads, with nothing of the
+    /// placeholder the typed model needs left in the batch.
+    #[test]
+    fn an_ipsec_route_match_goes_out_in_nfts_own_json_form() {
+        let json = json_of(&ruleset(vec![NftRule {
+            matches: vec![NftMatch::SkUid(1000), NftMatch::RouteIpsec],
+            verdict: NftVerdict::Accept,
+            comment: "catch-all-exempt#1638400".into(),
+        }]));
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        let rule = value["nftables"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .find_map(|cmd| cmd.get("add").and_then(|add| add.get("rule")))
+            .expect("the rule");
+        assert_eq!(
+            rule["expr"][1],
+            serde_json::json!({
+                "match": { "left": { "rt": { "key": "ipsec" } }, "right": true, "op": "==" }
+            }),
+            "{json}"
+        );
+        assert!(!json.contains(RT_IPSEC_PLACEHOLDER), "{json}");
+        assert!(!json.contains("classid"), "{json}");
+    }
+
     fn reported(kind: crate::drop_tag::DropKind, comment: &str) -> NftRule {
         NftRule {
             matches: vec![NftMatch::SkUid(1000)],
@@ -1388,8 +1537,16 @@ mod tests {
         );
         let json = serde_json::to_string(&batch).expect("the batch must serialise");
         assert!(
-            json.contains(r#"{"limit":{"rate":20,"per":"second","burst":50}},{"log":{"prefix":"nrr:pin","group":20050,"snaplen":80}}"#),
+            json.contains(r#""meter":{"name":"drop_pin","key":{"meta":{"key":"skuid"}},"stmt":{"limit":{"rate":20,"per":"second","burst":50}}}"#),
             "{json}"
+        );
+        assert!(
+            json.contains(r#"{"log":{"prefix":"nrr:pin","group":20050,"snaplen":80}}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""meter":{"name":"drop_rule""#),
+            "each kind keeps a meter of its own: {json}"
         );
         assert!(json.contains(r#""jump":{"target":"drop_pin"}"#), "{json}");
         assert!(json.contains(r#""jump":{"target":"drop_rule"}"#), "{json}");
@@ -1825,6 +1982,41 @@ mod cli_tests {
             "{last}"
         );
         assert!(!last.contains("kernel-refuses"), "{last}");
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// The same for a rule on the forward chain: the search walks both chains,
+    /// names the forwarded rule, and keeps every other rule of either.
+    #[test]
+    fn a_forwarded_rule_only_the_kernel_refuses_is_named_and_the_rest_applied() {
+        let (cli, log) = recording(
+            "forwarded",
+            r#"case "$input" in *kernel-refuses*) echo 'Error: Could not process rule: Invalid argument' >&2; exit 1;; esac"#,
+        );
+        let mut set = set_of(&["a", "b"]);
+        set.forward = ["f0", "kernel-refuses", "f2"]
+            .iter()
+            .map(|c| NftRule {
+                matches: Vec::new(),
+                verdict: crate::nft_ir::NftVerdict::Drop,
+                comment: (*c).to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            cli.apply_best_effort(&set),
+            Ok(NftApplyOutcome {
+                applied: 2,
+                skipped: vec![SkippedNftRule {
+                    index: 3,
+                    comment: "kernel-refuses".into(),
+                }],
+            })
+        );
+        let runs = batches(&log);
+        let last = runs.last().expect("a final apply");
+        assert!(!last.contains("kernel-refuses"), "{last}");
+        assert!(last.contains(r#""comment":"f0""#), "{last}");
+        assert!(last.contains(r#""comment":"f2""#), "{last}");
         let _ = std::fs::remove_file(&log);
     }
 

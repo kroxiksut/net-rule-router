@@ -253,6 +253,23 @@ fn service() -> FakeService {
         }),
     );
     fake.answer(
+        IpcOperationName::AuditList,
+        json!({
+            "items": [{
+                "event_id": "a2", "seq": 8, "kind": "protection_override_revoked",
+                "created_at": NOON, "result": "success",
+                "reason_code": "protection.override_revoked", "revision_id": null,
+                "has_payload_summary": true, "cause": "crash-loop"
+            }, {
+                "event_id": "a1", "seq": 7, "kind": "protection_override_revoked",
+                "created_at": NOON - 1000, "result": "success",
+                "reason_code": "protection.override_revoked", "revision_id": "rev-7",
+                "has_payload_summary": true, "cause": "some-new-cause"
+            }],
+            "next_cursor": null, "total_count": 2, "stale": false
+        }),
+    );
+    fake.answer(
         IpcOperationName::ConnTraceOutageBlocksList,
         outage(json!({ "since-unix-ms": NOON - 600_000 }), 0),
     );
@@ -375,6 +392,32 @@ fn a_system_dns_left_redirected_tells_the_user_how_to_repair_it() {
     assert!(picture.contains("System DNS could not"), "{picture}");
 }
 
+/// The user is told the saved rules did not read and the last applied ones
+/// hold, in their words rather than the service's English line.
+#[test]
+fn an_unreadable_rule_book_is_said_and_the_last_rules_hold() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::ServiceHealthGet,
+        json!({ "service-state": "degraded", "worst-severity": "degraded",
+                "components": [{
+                    "component": "policy", "severity": "degraded",
+                    "message": format!(
+                        "{}; the last applied rules stay in force (1 account(s))",
+                        nrr_shared::ipc_payloads::RULES_BOOK_UNREADABLE
+                    )
+                }] }),
+    );
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    let picture = render(&app, 200, 40);
+    assert!(picture.contains("could not read saved rules"), "{picture}");
+    assert!(
+        !picture.contains(nrr_shared::ipc_payloads::RULES_BOOK_UNREADABLE),
+        "the service's own line is not repeated: {picture}"
+    );
+}
+
 #[test]
 fn clearing_the_cache_asks_first() {
     let fake = service();
@@ -491,6 +534,36 @@ fn log_lines_are_translated_with_their_fields() {
     );
     assert!(picture.contains("Apply took long"), "{picture}");
     assert_snapshot("logs-120x30", &picture);
+}
+
+/// An audit entry's cause is a service slug: it reads in words, and one the
+/// locale does not know yet falls back to the slug.
+#[test]
+fn audit_entries_word_their_cause() {
+    let fake = service();
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    key(&mut app, KeyCode::Char('l'));
+    key(&mut app, KeyCode::Char('l'));
+    settle(&mut app, &fake);
+    assert!(fake.operations().contains(&IpcOperationName::AuditList));
+    let text = view_text(&app, ScreenId::Diagnostics);
+    assert!(text.contains("protection.override_revoked"), "{text}");
+    assert!(
+        text.contains("the service crashed several times in a row"),
+        "{text}"
+    );
+    assert!(!text.contains("crash-loop"), "{text}");
+    assert!(text.contains("some-new-cause · rev-7"), "{text}");
+
+    let ru = crate::i18n::Texts::load(Some("ru"), &[]);
+    let view = crate::screens::screen(ScreenId::Diagnostics).view(&app, &ru);
+    let words: String = view
+        .panels
+        .iter()
+        .flat_map(|panel| panel.lines.iter().map(|line| line.plain_text()))
+        .collect();
+    assert!(words.contains("серия падений службы"), "{words}");
 }
 
 /// Line mode: the screen, its commands, a page at a time.
@@ -966,7 +1039,7 @@ fn g_groups_the_trace_by_folder_remembers_it_and_f_fills_the_rule_form() {
 
     let picture = render(&app, 120, 40);
     assert!(
-        picture.contains(r"C:\Program Files\AVP  ·  2 program(s)  ·  2 connection(s):"),
+        picture.contains(r"C:\Program Files\AVP  ·  2 programs  ·  2 connections:"),
         "a folder inside a listed folder joins its group:\n{picture}"
     );
     assert!(
@@ -1000,6 +1073,49 @@ fn g_groups_the_trace_by_folder_remembers_it_and_f_fills_the_rule_form() {
     assert_eq!(value, r"C:\Program Files\AVP\*");
 }
 
+/// The add form a rule-from-the-trace key opened, by its value.
+fn form_value(app: &AppState) -> String {
+    match &app.rules.mode {
+        crate::screens::rules::Mode::Form(form) => form.value.clone(),
+        other => panic!("the add form is open, not {other:?}"),
+    }
+}
+
+#[test]
+fn i_and_a_fill_the_rule_form_with_the_connections_address_and_program() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::RulesList,
+        json!({ "rows": [], "supported-rule-types": ["exact-ip", "application"] }),
+    );
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Trace);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Char('i'));
+    assert_eq!(app.screen, ScreenId::Rules);
+    settle(&mut app, &fake);
+    assert_eq!(
+        form_value(&app),
+        "203.0.113.1",
+        "the port is not part of it"
+    );
+
+    if !nrr_shared::platform_profile::PlatformProfile::current()
+        .supports
+        .app_routing
+    {
+        return;
+    }
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Trace);
+    let text = transcript_with(&fake, &["7", "a 2"]);
+    assert!(text.contains("Screen: Rules"), "{text}");
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Char('a'));
+    settle(&mut app, &fake);
+    assert_eq!(form_value(&app), "browser.exe");
+}
+
 #[test]
 fn line_mode_names_a_grouping_and_f_takes_the_folder_of_a_numbered_row() {
     let fake = folder_service();
@@ -1007,7 +1123,7 @@ fn line_mode_names_a_grouping_and_f_takes_the_folder_of_a_numbered_row() {
     assert!(text.contains("Group: By program"), "{text}");
     assert!(text.contains("Group: By folder"), "{text}");
     assert!(
-        text.contains(r"C:\Tools  ·  1 program(s)  ·  1 connection(s):"),
+        text.contains(r"C:\Tools  ·  1 program  ·  1 connection:"),
         "{text}"
     );
     assert!(text.contains("g: the next grouping"), "{text}");
@@ -1026,7 +1142,8 @@ fn a_program_seen_once_is_its_row_alone_and_a_header_is_never_explained() {
     app.settings.prefs.trace_grouping = TraceGrouping::Program;
     open(&mut app, &fake, ScreenId::Trace);
     let picture = render(&app, 120, 40);
-    assert!(!picture.contains("connection(s):"), "{picture}");
+    assert!(!picture.contains("  ·  1 connection:"), "{picture}");
+    assert!(!picture.contains("  ·  2 connections:"), "{picture}");
     assert!(picture.contains("Rows 1–4 of 4."), "{picture}");
 
     let fake = service();
@@ -1035,7 +1152,7 @@ fn a_program_seen_once_is_its_row_alone_and_a_header_is_never_explained() {
     open(&mut app, &fake, ScreenId::Trace);
     let picture = render(&app, 120, 40);
     assert!(
-        picture.contains("browser.exe  ·  12 connection(s):"),
+        picture.contains("browser.exe  ·  12 connections:"),
         "{picture}"
     );
     key(&mut app, KeyCode::Tab);
@@ -1102,4 +1219,81 @@ fn check_site_from_the_trace_follows_the_check_to_its_verdict() {
         app.outbox.take_delayed().is_empty(),
         "a finished check is not read again"
     );
+}
+
+fn diagnostics_with_tamper(card: Value) -> String {
+    let fake = service();
+    let mut status = diagnostics_status();
+    status["dns_tamper"] = card;
+    fake.answer(
+        IpcOperationName::SnapshotDiagnosticsGet,
+        json!({ "status": status }),
+    );
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    render(&app, 200, 60)
+}
+
+#[test]
+fn the_dns_tampering_card_shows_only_when_sites_were_affected() {
+    let quiet = diagnostics_with_tamper(json!({ "affected_hosts": 0, "examples": [] }));
+    assert!(!quiet.contains("changes some DNS answers"), "{quiet}");
+
+    let counted = diagnostics_with_tamper(json!({ "affected_hosts": 3, "examples": [] }));
+    assert!(
+        counted.contains("Your provider changes some DNS answers"),
+        "{counted}"
+    );
+    assert!(counted.contains("For 3 sites"), "{counted}");
+    assert!(!counted.contains("For example"), "{counted}");
+
+    let named = diagnostics_with_tamper(
+        json!({ "affected_hosts": 2, "examples": ["a.example", "b.example"] }),
+    );
+    assert!(
+        named.contains("For example: a.example, b.example"),
+        "{named}"
+    );
+}
+
+#[test]
+fn a_tampered_name_is_cleaned_before_it_reaches_the_terminal() {
+    use nrr_shared::display_text::needs_substitute;
+    let picture = diagnostics_with_tamper(
+        json!({ "affected_hosts": 1, "examples": ["evil\u{202E}.example\u{1b}]0;x\u{7}"] }),
+    );
+    assert!(picture.contains("For example: evil"), "{picture}");
+    // The rows are joined by newlines; only the tampered text must be clean.
+    assert!(
+        !picture.chars().any(|c| c != '\n' && needs_substitute(c)),
+        "{picture}"
+    );
+}
+
+#[test]
+fn a_health_warning_from_the_service_is_listed_and_a_clean_one_is_not() {
+    use nrr_shared::ipc_payloads::{HealthComponentResponse, ServiceHealthResponse};
+    let component = |severity: &str, message: Option<&str>| HealthComponentResponse {
+        component: "crash-recovery".into(),
+        severity: severity.into(),
+        message: message.map(str::to_owned),
+    };
+    let health = |components| ServiceHealthResponse {
+        service_state: "degraded".into(),
+        worst_severity: "warning".into(),
+        active_revision_id: None,
+        components,
+        fake_ip_datapath: None,
+    };
+    let warned = super::diagnostics::health_warning_lines(&health(vec![
+        component(
+            "warning",
+            Some("started again after the service was stopped by something other than this program; protection was off in between"),
+        ),
+        component("ok", Some("fine")),
+        component("warning", None),
+    ]));
+    assert_eq!(warned.len(), 1);
+    assert!(warned[0].segments[0].text.contains("protection was off"));
+    assert!(super::diagnostics::health_warning_lines(&health(Vec::new())).is_empty());
 }

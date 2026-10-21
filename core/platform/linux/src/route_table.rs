@@ -573,6 +573,9 @@ pub(crate) struct RawFibRule {
     pub goto_target: Option<u32>,
     /// Ours by [`crate::policy_routing::is_our_rule`].
     pub ours: bool,
+    /// The table a rule with no selector at all sends everything to; `None`
+    /// for a rule that narrows by address, mark, uid or interface.
+    pub catch_all_table: Option<u32>,
     pub body: Vec<u8>,
 }
 
@@ -604,12 +607,25 @@ fn parse_raw_rule(body: &[u8]) -> Option<RawFibRule> {
         }
         offset += align(len);
     }
-    let ours = parse_rule_message(body).is_some_and(|r| crate::policy_routing::is_our_rule(&r));
+    let parsed = parse_rule_message(body);
+    let ours = parsed
+        .as_ref()
+        .is_some_and(crate::policy_routing::is_our_rule);
+    let catch_all_table = parsed
+        .filter(|r| {
+            !r.narrowed
+                && r.uid_range.is_none()
+                && !r.iif_lo
+                && !r.forwarded
+                && r.suppress_prefixlen.is_none()
+        })
+        .map(|r| r.table);
     Some(RawFibRule {
         ipv6,
         priority,
         goto_target: (body[7] == FR_ACT_GOTO).then_some(jump),
         ours,
+        catch_all_table,
         body: body.to_vec(),
     })
 }
@@ -1123,6 +1139,24 @@ mod tests {
         body[0] = 10; // AF_INET6
         body[7] = RTN_UNICAST;
         assert!(parse_route_message(&body).is_none());
+    }
+
+    /// The IPv6 prefix a router advertised is an on-link row with no gateway:
+    /// the shape the neutral local-network discovery reads for the home prefix.
+    #[test]
+    fn a_connected_ipv6_prefix_parses_as_an_on_link_route() {
+        let prefix: Ipv6Addr = "2001:db8:abcd:1::".parse().expect("v6 literal");
+        let mut body = vec![0u8; RTMSG_LEN];
+        body[0] = AF_INET6_U8;
+        body[1] = 64;
+        body[7] = RTN_UNICAST;
+        push_attr(&mut body, RTA_DST, &prefix.octets());
+        push_attr(&mut body, RTA_OIF, &3u32.to_ne_bytes());
+        let route = parse_route_message(&body).expect("a unicast v6 row");
+        assert_eq!(route.destination, IpAddr::V6(prefix));
+        assert_eq!(route.prefix_length, 64);
+        assert_eq!(route.next_hop, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(route.interface_index, 3);
     }
 
     /// A route with no output interface cannot be acted on.

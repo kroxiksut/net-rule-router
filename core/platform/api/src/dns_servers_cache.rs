@@ -26,7 +26,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::dns::{SystemDnsServersPort, UpstreamDnsCandidate, UpstreamDnsServer};
+use crate::dns::{once_per_server, SystemDnsServersPort, UpstreamDnsCandidate, UpstreamDnsServer};
 use crate::dns_config_change::DnsConfigChangeObserver;
 use crate::error::PlatformError;
 use crate::network_change::{NetworkChangeObserver, NetworkChangeSubscription};
@@ -34,6 +34,10 @@ use crate::network_change::{NetworkChangeObserver, NetworkChangeSubscription};
 /// A link change arrives as a burst of notifications; the list is read once,
 /// this long after the first of them.
 const CHANGE_SETTLE: Duration = Duration::from_millis(250);
+
+/// How long the first IPv6 read may be waited for: the pool's re-selection
+/// asks for it straight after the IPv4 list.
+const V6_FIRST_READ_WAIT: Duration = Duration::from_secs(3);
 
 /// Caches the inner port's answer until the next network change, or until a
 /// lookup reaches none of it.
@@ -72,6 +76,11 @@ struct CacheState {
     completed: u64,
     /// What the last enumeration returned, empty included.
     last: Vec<UpstreamDnsCandidate>,
+    /// The IPv6 servers, read right after each IPv4 list is published so a
+    /// lookup waiting on the IPv4 list never pays for the second command.
+    /// Kept across changes: a stale list beats a child process on a query's path.
+    v6: Option<Vec<UpstreamDnsServer>>,
+    reading_v6: bool,
     /// A cache nobody reads (the resolver never armed) is not re-read on
     /// every change.
     in_use: bool,
@@ -256,12 +265,53 @@ impl Shared {
             drop(state);
             // A panicking mechanism must not leave lookups waiting forever.
             let servers = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.inner.upstream_candidates_v4()
+                self.inner.upstream_candidates_v4_per_link()
             }))
             .unwrap_or_default();
             state = self.lock();
             state.publish(generation, servers);
+            state.reading_v6 = true;
             self.published.notify_all();
+            drop(state);
+            let v6 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.inner.upstream_candidates_v6_per_link()
+            }))
+            .unwrap_or_default();
+            state = self.lock();
+            state.v6 = Some(v6);
+            state.reading_v6 = false;
+            self.published.notify_all();
+        }
+    }
+
+    /// The last IPv6 list; waits, bounded, only for the very first read. With
+    /// `budget` the wait is shorter and a list nobody has asked for yet is
+    /// empty rather than enumerated in place.
+    fn lookup_v6(&self, budget: Option<Duration>) -> Vec<UpstreamDnsServer> {
+        let deadline =
+            Instant::now() + budget.map_or(V6_FIRST_READ_WAIT, |b| b.min(V6_FIRST_READ_WAIT));
+        let mut state = self.lock();
+        while state.v6.is_none() && state.reading_v6 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            state = self
+                .published
+                .wait_timeout(state, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        match &state.v6 {
+            Some(v6) => v6.clone(),
+            None => {
+                // Never enumerated (nobody asked for the IPv4 list first).
+                drop(state);
+                if budget.is_some() {
+                    return Vec::new();
+                }
+                self.inner.upstream_candidates_v6_per_link()
+            }
         }
     }
 }
@@ -289,19 +339,30 @@ impl CacheState {
     }
 }
 
+/// The cache holds the per-link lists; the plain ones are read off them.
 impl SystemDnsServersPort for NetworkChangeCachedDnsServers {
     fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
-        self.shared.lookup(None)
+        once_per_server(self.shared.lookup(None), |c| c.server)
     }
 
     fn upstream_candidates_v4_within(&self, budget: Duration) -> Vec<UpstreamDnsCandidate> {
-        self.shared.lookup(Some(budget))
+        once_per_server(self.shared.lookup(Some(budget)), |c| c.server)
     }
 
-    /// Not cached: asked only by the forwarding pool's re-selection, which is
-    /// floored on its own.
     fn upstream_candidates_v6(&self) -> Vec<UpstreamDnsServer> {
-        self.shared.inner.upstream_candidates_v6()
+        once_per_server(self.shared.lookup_v6(None), |c| c.server)
+    }
+
+    fn upstream_candidates_v6_within(&self, budget: Duration) -> Vec<UpstreamDnsServer> {
+        once_per_server(self.shared.lookup_v6(Some(budget)), |c| c.server)
+    }
+
+    fn upstream_candidates_v4_per_link(&self) -> Vec<UpstreamDnsCandidate> {
+        self.shared.lookup(None)
+    }
+
+    fn upstream_candidates_v6_per_link(&self) -> Vec<UpstreamDnsServer> {
+        self.shared.lookup_v6(None)
     }
 
     fn report_all_unreachable(&self, servers: &[UpstreamDnsCandidate]) {
@@ -309,8 +370,12 @@ impl SystemDnsServersPort for NetworkChangeCachedDnsServers {
         let mut state = self.shared.lock();
         // Only the list in hand, once: a report about an older list, or a
         // second lookup failing on the same one, finds nothing to drop.
+        // Reported in either shape the cache hands out.
         let stale = state.current.as_ref().is_some_and(|current| {
-            current.generation == generation && !current.settled && current.servers == servers
+            current.generation == generation
+                && !current.settled
+                && (current.servers == servers
+                    || once_per_server(current.servers.clone(), |c| c.server) == servers)
         });
         if stale {
             if let Some(dropped) = state.current.take() {
@@ -375,6 +440,69 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .clone()
         }
+    }
+
+    struct V6Counting {
+        v6_calls: AtomicUsize,
+    }
+
+    impl SystemDnsServersPort for V6Counting {
+        fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
+            vec![UpstreamDnsCandidate {
+                interface_index: None,
+                server: Ipv4Addr::new(192, 0, 2, 1),
+            }]
+        }
+
+        fn upstream_candidates_v6(&self) -> Vec<UpstreamDnsServer> {
+            self.v6_calls.fetch_add(1, Ordering::SeqCst);
+            vec![UpstreamDnsServer {
+                interface_index: None,
+                server: "2001:db8::1".parse().expect("literal"),
+            }]
+        }
+    }
+
+    /// The enforcement pass asks for the list under a budget: a cache nobody has
+    /// asked yet answers empty instead of enumerating in the caller's thread.
+    #[test]
+    fn a_budgeted_ipv6_lookup_never_enumerates_in_place() {
+        let inner = Arc::new(V6Counting {
+            v6_calls: AtomicUsize::new(0),
+        });
+        let observer = ManualObserver::default();
+        let cache =
+            NetworkChangeCachedDnsServers::with_settle(inner.clone(), &observer, TEST_SETTLE)
+                .expect("cache");
+        // Once the worker has read both families the budgeted answer is the list.
+        assert!(!cache.upstream_candidates().is_empty());
+        assert_eq!(
+            cache
+                .upstream_candidates_v6_within(Duration::from_millis(20))
+                .len(),
+            1
+        );
+        assert_eq!(inner.v6_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_ipv6_list_is_read_once_per_change_not_per_lookup() {
+        let inner = Arc::new(V6Counting {
+            v6_calls: AtomicUsize::new(0),
+        });
+        let observer = ManualObserver::default();
+        let cache =
+            NetworkChangeCachedDnsServers::with_settle(inner.clone(), &observer, TEST_SETTLE)
+                .expect("cache");
+        assert!(!cache.upstream_candidates().is_empty());
+        for _ in 0..5 {
+            assert_eq!(cache.upstream_candidates_v6().len(), 1);
+        }
+        assert_eq!(
+            inner.v6_calls.load(Ordering::SeqCst),
+            1,
+            "each lookup ran the enumeration again"
+        );
     }
 
     /// Holds each enumeration until the test releases it.
@@ -483,6 +611,33 @@ mod tests {
                 reason: "no DNS settings notification",
             })
         }
+    }
+
+    /// The pool weighs links and reads the per-link list; every other caller
+    /// asks servers in turn and gets each once. One enumeration feeds both,
+    /// and a failure reported against the plain list still drops it.
+    #[test]
+    fn one_enumeration_serves_the_per_link_and_the_plain_lists() {
+        let shared = Ipv4Addr::new(192, 0, 2, 1);
+        let inner = CountingServers::new(vec![
+            UpstreamDnsCandidate::new(Some(9), shared),
+            UpstreamDnsCandidate::new(Some(4), shared),
+        ]);
+        let observer = ManualObserver::default();
+        let cache =
+            NetworkChangeCachedDnsServers::with_settle(inner.clone(), &observer, TEST_SETTLE)
+                .expect("cache");
+        let plain = cache.upstream_candidates_v4();
+        assert_eq!(plain, vec![UpstreamDnsCandidate::new(Some(9), shared)]);
+        assert_eq!(cache.upstream_candidates_v4_per_link().len(), 2);
+        assert_eq!(inner.calls(), 1);
+        cache.report_all_unreachable(&plain);
+        assert_eq!(cache.upstream_candidates_v4_per_link().len(), 2);
+        assert_eq!(
+            inner.calls(),
+            2,
+            "the plain list's failure dropped the cache"
+        );
     }
 
     fn server(last: u8) -> UpstreamDnsCandidate {

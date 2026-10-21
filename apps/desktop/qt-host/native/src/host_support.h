@@ -346,10 +346,10 @@ inline QString resolveAppIconPath(const LaunchOptions &options, const QString &a
 inline QString g_runtimeDirectoryOverride;
 
 #ifndef Q_OS_WIN
-// Owner-only, and never a symlink or another user's directory: the fallback
-// sits in the shared temp dir, where anyone can plant our name first.
+// Owner-only, and never a symlink or another user's directory.
 inline bool ensurePrivateDirectory(const QString &path) {
     const QByteArray native = QFile::encodeName(path);
+    QDir().mkpath(QFileInfo(path).absolutePath());
     if (::mkdir(native.constData(), 0700) != 0 && errno != EEXIST) {
         return false;
     }
@@ -361,34 +361,72 @@ inline bool ensurePrivateDirectory(const QString &path) {
 }
 #endif
 
-// The launcher's directory, or for a hand-run of the binary a fallback in the
-// temp dir (per-user already on Windows, per-uid and checked elsewhere).
-// False when that fallback is not private to this user.
-inline bool adoptRuntimeDirectory(const QString &launcherDirectory) {
-    if (!launcherDirectory.isEmpty()) {
-        g_runtimeDirectoryOverride = QDir::cleanPath(normalizeLocalPath(launcherDirectory));
-        return true;
-    }
+// Same rule as `nrr_shared::user_paths::runtime_dir` (shared/contracts/src/
+// user_paths.rs): the per-user temp folder on Windows; elsewhere
+// `$XDG_RUNTIME_DIR/netrulerouter` or the user config root, never the shared /tmp.
+inline QString defaultRuntimeDirectory() {
 #ifdef Q_OS_WIN
-    return true;
+    return QDir::cleanPath(QDir::tempPath() + QStringLiteral("/NetRuleRouter"));
 #else
-    const QString fallback = QDir::cleanPath(
-        QDir::tempPath() + QStringLiteral("/NetRuleRouter-%1").arg(::geteuid()));
-    if (!ensurePrivateDirectory(fallback)) {
-        return false;
+    QString base = qEnvironmentVariable("XDG_RUNTIME_DIR");
+    if (base.isEmpty() || !QDir::isAbsolutePath(base)) {
+        base = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
     }
-    g_runtimeDirectoryOverride = fallback;
-    return true;
+    return base.isEmpty() ? QString()
+                          : QDir::cleanPath(base + QStringLiteral("/netrulerouter"));
 #endif
 }
 
+// The launcher's directory, or for a hand-run of the binary the default one.
+// False when it is not private to this user: the host then refuses to start
+// rather than fall back to a shared place.
+inline bool adoptRuntimeDirectory(const QString &launcherDirectory) {
+    const QString chosen = launcherDirectory.isEmpty()
+        ? defaultRuntimeDirectory()
+        : QDir::cleanPath(normalizeLocalPath(launcherDirectory));
+    if (chosen.isEmpty()) {
+        return false;
+    }
+#ifdef Q_OS_WIN
+    QDir().mkpath(chosen);
+#else
+    if (!ensurePrivateDirectory(chosen)) {
+        return false;
+    }
+#endif
+    g_runtimeDirectoryOverride = chosen;
+    return true;
+}
+
+// Empty before `adoptRuntimeDirectory` succeeded, so a caller never lands in
+// a directory nobody vetted.
 inline QString appRuntimeDirectoryPath() {
-    const QString path =
-        g_runtimeDirectoryOverride.isEmpty()
-            ? QDir::cleanPath(QDir::tempPath() + QStringLiteral("/NetRuleRouter"))
-            : g_runtimeDirectoryOverride;
-    QDir().mkpath(path);
-    return path;
+    return g_runtimeDirectoryOverride;
+}
+
+// A link in the runtime directory is never read or written through: QSaveFile
+// would resolve it, so the link itself goes first.
+inline bool writeRuntimeMarker(const QString &path) {
+    if (path.isEmpty()) {
+        return false;
+    }
+    if (QFileInfo(path).isSymLink()) {
+        QFile::remove(path);
+    }
+    QSaveFile marker(path);
+    return marker.open(QIODevice::WriteOnly) && marker.commit();
+}
+
+// A marker counts only as a plain file; a link is dropped, never followed.
+inline bool consumeRuntimeMarker(const QString &path) {
+    if (path.isEmpty()) {
+        return false;
+    }
+    if (QFileInfo(path).isSymLink()) {
+        QFile::remove(path);
+        return false;
+    }
+    return QFile::remove(path);
 }
 
 inline QString guiActivationRequestFilePath() {
@@ -400,10 +438,7 @@ inline QString applicationShutdownFlagPath() {
 }
 
 inline void writeApplicationShutdownFlag() {
-    QFile flagFile(applicationShutdownFlagPath());
-    if (flagFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        flagFile.close();
-    }
+    writeRuntimeMarker(applicationShutdownFlagPath());
 }
 
 inline void clearApplicationShutdownFlag() {
@@ -420,10 +455,7 @@ inline QString trayShutdownFlagPath() {
 }
 
 inline void writeTrayShutdownFlag() {
-    QFile flagFile(trayShutdownFlagPath());
-    if (flagFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        flagFile.close();
-    }
+    writeRuntimeMarker(trayShutdownFlagPath());
 }
 
 inline void clearTrayShutdownFlag() {

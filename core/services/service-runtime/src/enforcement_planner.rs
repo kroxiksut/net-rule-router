@@ -33,13 +33,11 @@
 //!   `plan_fail_closed_destinations` / `plan_fail_closed_apps` /
 //!   `plan_fail_closed_block_all` reproduce the rest of `killswitch_codegen` —
 //!   completing the whole module.
-//! - **Slice 5: the system route table + the fail-closed default block.**
+//! - **Slice 5: the system route table.**
 //!   `plan_routes` reproduces `route_codegen::generate_routes` (the `/32` host
 //!   fan-out, the `/1` overlay and the counter-overlay as neutral
-//!   [`RouteIntent`]s), and
-//!   `plan_route_rules` emits the `StrictSecondaryFailClosed`
-//!   [`PrecedenceClass::DefaultCatchAll`] block. Each slice is proven behaviourally
-//!   equivalent to the current codegen by a `#[cfg(windows)] tests::slice*` test.
+//!   [`RouteIntent`]s). Each slice is proven behaviourally equivalent to the
+//!   current codegen by a `#[cfg(windows)] tests::slice*` test.
 
 use std::collections::{BTreeSet, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -153,21 +151,14 @@ const PACKET_SLOTS_PER_DEST: u32 = 16;
 /// only emitted for a host destination, so an app-id block (no remote IP) is not
 /// mirrored — matching today's codegen. Resolution failures emit no flow
 /// (the current codegen's diagnostics are not part of the neutral plan).
-///
-/// Slice 5 — when `behavior_mode` is
-/// [`RouteBehaviorMode::StrictSecondaryFailClosed`], a trailing user-scoped
-/// [`PrecedenceClass::DefaultCatchAll`] `Block` (`dst = Any`, ALE only) is emitted
-/// — the fail-closed default that `wfp_codegen::default_block_spec` appends.
 pub fn plan_route_rules(
     rule_book: &CanonicalRuleBook,
     sid: &str,
-    behavior_mode: RouteBehaviorMode,
     input: &PlannerInput,
 ) -> (Vec<FlowRule>, PlanReport) {
     plan_route_rules_with_shapes(
         rule_book,
         sid,
-        behavior_mode,
         input,
         crate::wfp_codegen::current_rule_shape_support(),
     )
@@ -179,7 +170,6 @@ pub fn plan_route_rules(
 pub fn plan_route_rules_with_shapes(
     rule_book: &CanonicalRuleBook,
     sid: &str,
-    behavior_mode: RouteBehaviorMode,
     input: &PlannerInput,
     shapes: nrr_domain::rule_shape::RuleShapeSupport,
 ) -> (Vec<FlowRule>, PlanReport) {
@@ -288,6 +278,7 @@ pub fn plan_route_rules_with_shapes(
                 app: AppScope::Any,
                 egress: EgressConstraint::Any,
                 coverage,
+                observed_by_program: false,
             };
 
             if let Some(blocks) = rule.address_match.as_ref().and_then(|m| m.ip_blocks()) {
@@ -419,6 +410,7 @@ pub fn plan_route_rules_with_shapes(
                     },
                     egress: EgressConstraint::Any,
                     coverage: Coverage::ConnectOnly,
+                    observed_by_program: false,
                 };
                 if by_path {
                     if !resolved.is_empty() {
@@ -451,46 +443,12 @@ pub fn plan_route_rules_with_shapes(
                     .take(PER_HOSTNAME_IP_CAP)
                     .enumerate()
                 {
-                    flows.push(host_flow(
-                        APP_PATH_FANOUT_CAP as u32 + 1 + i as u32,
-                        IpAddr::V4(ip),
-                    ));
+                    flows.push(FlowRule {
+                        observed_by_program: true,
+                        ..host_flow(APP_PATH_FANOUT_CAP as u32 + 1 + i as u32, IpAddr::V4(ip))
+                    });
                 }
             }
-        }
-    }
-    // Slice 5 — the StrictSecondaryFailClosed default catch-all block (ALE only,
-    // lowest band). Any rule-driven `Permit` above still wins.
-    // (report is returned with the flows at the end)
-    if matches!(behavior_mode, RouteBehaviorMode::StrictSecondaryFailClosed) {
-        let default_block = |ordinal: u32, dst: DstMatch| FlowRule {
-            verdict: Verdict::Block,
-            precedence: Precedence {
-                class: PrecedenceClass::DefaultCatchAll,
-                ordinal,
-            },
-            flow: FlowMatch {
-                dst,
-                dst_port: None,
-                protocol: None,
-            },
-            principal: principal.clone(),
-            app: AppScope::Any,
-            egress: EgressConstraint::Any,
-            coverage: Coverage::ConnectOnly,
-        };
-        flows.push(default_block(0, DstMatch::Any));
-        // Named separately so a backend whose `Any` is one family (the WFP
-        // layers are per family) closes IPv6 too: Strict means nothing a
-        // rule did not name leaves, in either family.
-        if families == FamilyScope::Both {
-            flows.push(default_block(
-                1,
-                DstMatch::SubnetV6 {
-                    net: Ipv6Addr::UNSPECIFIED,
-                    prefix: 0,
-                },
-            ));
         }
     }
     (flows, report)
@@ -724,6 +682,10 @@ mod routes;
 pub use routes::*;
 mod service_accounts;
 pub use service_accounts::*;
+mod vpn_handshake;
+pub use vpn_handshake::*;
+mod ipsec_policy;
+pub use ipsec_policy::*;
 // ── Derived sets ────────────────────────────────────────────────────────────
 //
 // What the kill-switch, its exemptions and the GUI need is not the plan itself
@@ -802,10 +764,8 @@ pub fn vpn_default_exempt_paths(resolver: &dyn AppPathResolver) -> Vec<String> {
 /// The kill switch treats them differently on purpose: such an address is
 /// already guarded by its application's own permit/block pair, and pinning it a
 /// second time per-destination is what made a shared address unreachable for
-/// every other process. The two are told apart by the ordinal window each rule
-/// slot reserves — paths occupy `0..APP_PATH_FANOUT_CAP`, observed addresses
-/// start one past it — which is the same arithmetic `lower_windows` uses to
-/// rebuild the literal weight.
+/// every other process. The flow carries the fact explicitly: a zone rule's own
+/// addresses also run past slot 16, so the slot number cannot tell them apart.
 pub fn app_observed_destinations(flows: &[FlowRule], role: RouteRole) -> Vec<Ipv4Addr> {
     let mut seen = std::collections::HashSet::new();
     flows
@@ -813,7 +773,7 @@ pub fn app_observed_destinations(flows: &[FlowRule], role: RouteRole) -> Vec<Ipv
         .filter(|f| {
             f.verdict == Verdict::Permit && f.precedence.class == PrecedenceClass::RouteRule(role)
         })
-        .filter(|f| f.precedence.ordinal % SLOTS_PER_RULE > APP_PATH_FANOUT_CAP as u32)
+        .filter(|f| f.observed_by_program)
         .filter_map(|f| match f.flow.dst {
             DstMatch::HostV4(ip) => Some(ip),
             _ => None,

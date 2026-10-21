@@ -49,7 +49,7 @@ impl DnsObservationConsumer {
             return;
         };
         for (index, obs) in observations.iter().enumerate() {
-            if kept[index] || obs.ipv4s.is_empty() {
+            if kept[index] || answers_nothing(obs) {
                 continue;
             }
             if !obs
@@ -65,7 +65,7 @@ impl DnsObservationConsumer {
                 .copied()
                 .filter(|ip| !is_non_routable_v4(ip))
                 .collect();
-            if routable.is_empty() {
+            if routable.is_empty() && routable_v6(obs).next().is_none() {
                 continue;
             }
             if rule_set_matches(&obs.hostname, &snapshot.rule_book.secondary)
@@ -75,7 +75,11 @@ impl DnsObservationConsumer {
                 summary.ignored = summary.ignored.saturating_sub(1);
                 self.upsert_counted(
                     &obs.hostname,
-                    &routable,
+                    routable
+                        .iter()
+                        .copied()
+                        .map(IpAddr::V4)
+                        .chain(routable_v6(obs)),
                     now,
                     StorageResolutionSource::Dns,
                     summary,
@@ -140,7 +144,7 @@ impl DnsObservationConsumer {
         let mut loopback_pinned: BTreeSet<&str> = BTreeSet::new();
         let several_served = kept.is_some();
         for (index, obs) in observations.iter().enumerate() {
-            if obs.ipv4s.is_empty() {
+            if answers_nothing(obs) {
                 continue;
             }
             let teaches = !several_served
@@ -171,7 +175,7 @@ impl DnsObservationConsumer {
                 .copied()
                 .filter(|ip| !is_non_routable_v4(ip))
                 .collect();
-            if routable.is_empty() {
+            if routable.is_empty() && routable_v6(obs).next().is_none() {
                 // Two very different reasons the address list can vanish, and
                 // they must not be conflated. Under Mode B our own resolver
                 // answers a rule host with a fake-pool address, so the ONLY
@@ -183,7 +187,7 @@ impl DnsObservationConsumer {
                 // ad-blocking hosts file made it up, so it must keep going
                 // nowhere — not into the cache, not into a route, and never
                 // into a suggestion.
-                if contains_fake_pool_addr(obs.ipv4s.iter().copied().map(IpAddr::V4)) {
+                if contains_fake_pool_addr(observed_addresses(obs)) {
                     // Name-only learning: no address is passed on, so nothing
                     // virtual can reach the cache, a /32, or the census. The
                     // rule match runs only when a principal actually collects
@@ -197,9 +201,11 @@ impl DnsObservationConsumer {
                         batch.observe(
                             batch_ms.saturating_add(index as u64),
                             &obs.hostname,
-                            crate::auto_rules::AutoRulesEngine::classify(
-                                primary.user_authored,
-                                secondary.user_authored,
+                            crate::auto_rules::AutoRulesEngine::classify_in_book(
+                                &obs.hostname,
+                                &snapshot.rule_book,
+                                primary,
+                                secondary,
                             ),
                         );
                     }
@@ -269,9 +275,11 @@ impl DnsObservationConsumer {
                 batch.observe(
                     batch_ms.saturating_add(index as u64),
                     &obs.hostname,
-                    crate::auto_rules::AutoRulesEngine::classify(
-                        primary.user_authored,
-                        secondary.user_authored,
+                    crate::auto_rules::AutoRulesEngine::classify_in_book(
+                        &obs.hostname,
+                        &snapshot.rule_book,
+                        primary,
+                        secondary,
                     ),
                 );
             }
@@ -284,7 +292,11 @@ impl DnsObservationConsumer {
                 }
                 self.upsert_counted(
                     &obs.hostname,
-                    &routable,
+                    routable
+                        .iter()
+                        .copied()
+                        .map(IpAddr::V4)
+                        .chain(routable_v6(obs)),
                     now,
                     StorageResolutionSource::Dns,
                     &mut summary,
@@ -403,4 +415,25 @@ impl DnsObservationConsumer {
         }
         summary
     }
+}
+
+fn answers_nothing(obs: &DnsObservation) -> bool {
+    obs.ipv4s.is_empty() && obs.ipv6s.is_empty()
+}
+
+/// Every address of the answer, both families.
+fn observed_addresses(obs: &DnsObservation) -> impl Iterator<Item = IpAddr> + '_ {
+    let v4 = obs.ipv4s.iter().copied().map(IpAddr::V4);
+    v4.chain(obs.ipv6s.iter().copied().map(IpAddr::V6))
+}
+
+/// The IPv6 addresses of the answer worth caching. They feed the cache only:
+/// the shared-IP census, collateral and the placeholder check are IPv4-keyed,
+/// and the planner's IPv6 guard decides where a cached one is used.
+fn routable_v6(obs: &DnsObservation) -> impl Iterator<Item = IpAddr> + '_ {
+    obs.ipv6s
+        .iter()
+        .copied()
+        .map(IpAddr::V6)
+        .filter(|ip| !is_non_routable(ip))
 }

@@ -62,18 +62,53 @@ by itself.
 | Key | Screen | What you do there |
 |-----|--------|-------------------|
 | `1` | Status | Whether the service is running and routing is active, limited or paused — in words; both routes and their adapters; the notification feed; pause and resume |
-| `2` | First run | Language, which adapter is primary and which additional, a rule set to start from, leak protection |
+| `2` | First run | Language, which adapter is primary and which additional, a rule set to start from, leak protection, routing sites by name, detailed diagnostic logs |
 | `3` | Interfaces and routes | Adapters with their type, state and addresses; which one carries which route; checking an adapter |
 | `4` | Rules | The rule table with search and filter; add, change, delete, switch on and off; mark a rule *not sure* to have it checked on the primary route first; your folder of rule sets; import and export; applying your changes. `c` checks whether the primary route reaches the sites of your additional-route rules, and the answer shows beside each rule, so you can see which rules still do real work; `Shift+O` lists the sites the primary route does not reach first. `v` adds a rule for a VPN's gateway, so a VPN that may connect only from one network (a work VPN allowed only from abroad, say) always connects through the route you choose: it asks for the program and the route, lists the addresses that program connected to lately, and takes a number or an address you type |
 | `5` | Overlaps | Pairs of rules that cover the same traffic, and which route actually wins |
 | `6` | Suggested addresses | Accept or decline what the application suggests adding to your rules |
-| `7` | Connection trace | Recent connections and which route they took, with an explanation for any line. `o` opens the list of what was blocked while the additional route was down. `h` switches to your connection history — one line per program and destination, with how many times it connected — and `t` picks the period: the last hour, today or the last 7 days. `g` groups the list by program or by the folder a program lives in and remembers the choice; in a folder group `f` opens a rule for the whole folder |
+| `7` | Connection trace | Recent connections and which route they took, with an explanation for any line. `o` opens the list of what was blocked while the additional route was down. `h` switches to your connection history — one line per program and destination, with how many times it connected — and `t` picks the period: the last hour, today or the last 7 days. `g` groups the list by program or by the folder a program lives in and remembers the choice; in a folder group `f` opens a rule for the whole folder. `i` and `a` open a rule for the chosen connection's address or program |
 | `8` | Cache | Names and the addresses they resolved to; search and clearing |
 | `9` | Diagnostics and logs | Service health, security alerts, the explanation for a host, the log, exporting the diagnostic archive |
 | `0` | Settings | Notifications, routing behaviour, service management, presets, logs and retention, and the other service-side settings the application has. In the menu, Settings opens into its sections, so the arrows take you straight to the one you need |
 
 Changes to rules are applied the same way as in the application: you first see
 a summary of what will be added, removed and changed, then confirm it.
+
+### More on the Rules screen
+
+- **Deny.** In the rule form the route can also be *Deny*: the destination is
+  not let through any connection, and the rules file shows it as `!value`.
+  `f` can show only the denied rules.
+- **Programs by folder.** An application rule can name a program file or a
+  folder (`C:\Apps\Tool\*`, `/opt/tool/*`). `Ctrl+F` in the form switches a
+  folder rule between "with subfolders" and "this folder only"; a rule the
+  protection of system programs refuses is refused before it is saved, with
+  the reason.
+- **Several rules at once.** `Shift+A`, or `F2` in the add form, takes lines
+  of a rules file typed or pasted (`!`, `?`, `#` and `--- Section` lines work
+  as in the file). Each line is checked before anything is added; lines that
+  were not taken stay in the form. Everything added goes in one step, so one
+  apply sends it together.
+- **Recent changes.** `Shift+R` shows the rules you added or changed in the
+  last hour, today or the last 7 days, newest first, and the ones you
+  deleted; `Shift+U` puts a deleted rule back with the route and switch it
+  had.
+- **A value in the wrong section.** `Shift+T` gives the chosen rule the type
+  its value is (a program name written as a domain, say); `Shift+M` does it
+  for every such rule. `Ctrl+T` does the same in the form.
+- **Allowed despite protection.** `Shift+P` on a rule marked `+override`
+  confirms it despite the protection of system programs, for a term you
+  choose, or takes a confirmation back. A confirmation that reaches past your
+  own programs needs an administrator: on Windows confirm it in the app window
+  or from a terminal started as administrator; on Linux the terminal asks for
+  the administrator's password.
+- **Groups and files.** `g` sends a group of programs or a hypervisor's
+  machines over a route; there `m` shows a hypervisor's machines and what
+  each network adapter needs for your site rules to work inside it, and for a
+  VirtualBox NAT adapter `a` sends all of that machine's traffic over the
+  additional route, `f` lets it follow your rules again. `F` compares your
+  linked rules files with the rules in force and merges them.
 
 ## Keys
 
@@ -126,9 +161,12 @@ a number and press `Enter`; `h` or `?` prints the help, `q` quits.
   until your rules are on screen.
 - **The shared baseline**, settings of the whole computer, and **managing the
   service** — install, start, stop — need an administrator. On Windows start
-  `nrr-tui` from a terminal opened with *Run as administrator*. On Linux
-  `nrr-tui` asks for the administrator's password right in the terminal, over
-  SSH too; under `sudo` the baseline is on screen from the start. In line mode
+  the terminal as administrator and press `b` to edit the shared baseline, or
+  edit it in the app window, which asks for administrator rights itself. From
+  an ordinary terminal the baseline can be viewed, but a change to it is not
+  applied: the interface says to start `nrr-tui` again from a terminal opened
+  as administrator. On Linux `nrr-tui` asks for the administrator's password
+  right in the terminal, over SSH too; under `sudo` the baseline is on screen from the start. In line mode
   (`--plain`) there is no password prompt: the interface shows the `sudo`
   command instead.
 - When the service is not installed or not running, the interface says which,

@@ -37,8 +37,8 @@ impl ConnectionObservationConsumer {
             egress_of,
             active_sid,
             owner_scoped: false,
+            machine_accounts_follow_active: false,
             outage_announced_for: Mutex::new(std::collections::HashMap::new()),
-            not_covered_drop_check: None,
             drop_pairing: None,
             log_ndjson: Arc::new(AtomicBool::new(log_ndjson)),
             app_observations: None,
@@ -51,7 +51,9 @@ impl ConnectionObservationConsumer {
             ipv6_cut_drop_check: None,
             dns_lockdown_drop_check: None,
             service_account_drop_check: None,
+            rule_block_drop_check: None,
             vpn_client_app_learner: None,
+            vpn_gateway_drop: None,
             reverse_dns_learner: None,
             drop_logged: Mutex::new(HashSet::new()),
             name_for_address: None,
@@ -74,6 +76,7 @@ impl ConnectionObservationConsumer {
             block_notice_name_for_address: None,
             block_notice_sink: None,
             stale_flow_reset: None,
+            flow_reset_census: None,
             fail_closed_armed: None,
         }
     }
@@ -98,6 +101,16 @@ impl ConnectionObservationConsumer {
     #[must_use]
     pub fn with_stale_flow_reset(mut self, reset: Arc<dyn StaleFlowReset>) -> Self {
         self.stale_flow_reset = Some(reset);
+        self
+    }
+
+    /// Wire the shared-address census the pin-drop teardown spares by.
+    #[must_use]
+    pub fn with_flow_reset_census(
+        mut self,
+        census: Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
+    ) -> Self {
+        self.flow_reset_census = Some(census);
         self
     }
 
@@ -249,6 +262,14 @@ impl ConnectionObservationConsumer {
         self
     }
 
+    /// Wire the deny-rule classifier (in production: the registry's
+    /// `is_rule_block` on Windows, the drop tag on Linux) so a site the user
+    /// denied costs no lookup of its address.
+    pub fn with_rule_block_drop_check(mut self, check: KillswitchDropCheckFn) -> Self {
+        self.rule_block_drop_check = Some(check);
+        self
+    }
+
     /// Label each connection, and decide its outage, by its owner's links
     /// rather than the active user's (see [`Self::owner_scoped`]).
     #[must_use]
@@ -257,11 +278,11 @@ impl ConnectionObservationConsumer {
         self
     }
 
-    /// Wire the "no rule covers this host" classifier for drop ids that name
-    /// their role, in place of the codegen-hash comparison.
+    /// With [`Self::with_owner_scoped_egress`], label a service account's
+    /// connection, and one with no readable owner, by the active user's links.
     #[must_use]
-    pub fn with_not_covered_drop_check(mut self, check: KillswitchDropCheckFn) -> Self {
-        self.not_covered_drop_check = Some(check);
+    pub fn with_machine_accounts_on_active_links(mut self) -> Self {
+        self.machine_accounts_follow_active = true;
         self
     }
 
@@ -282,6 +303,22 @@ impl ConnectionObservationConsumer {
     pub fn with_vpn_client_app_learner(mut self, learner: VpnClientAppLearnFn) -> Self {
         self.vpn_client_app_learner = Some(learner);
         self
+    }
+
+    /// Wire the sink for another VPN's dropped handshake. Fires only for a
+    /// role-verified guard drop, like the client-app learner.
+    pub fn with_vpn_gateway_drops(mut self, sink: VpnGatewayDropFn) -> Self {
+        self.vpn_gateway_drop = Some(sink);
+        self
+    }
+
+    /// The generation of the application store this consumer feeds, which moves
+    /// only for programs a plan has read.
+    #[must_use]
+    pub fn app_generation(&self) -> u64 {
+        self.app_observations
+            .as_ref()
+            .map_or(0, |store| store.generation())
     }
 
     /// Wire the observed app→IP store so this consumer feeds app-routing.

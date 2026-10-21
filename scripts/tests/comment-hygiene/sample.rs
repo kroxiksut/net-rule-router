@@ -40,3 +40,5 @@ const RAW_OK: &str = r"one line ends here                              and conti
 // a continuation line's leading indentation has no string content before it.
 const SQL_OK: &str = "SELECT * FROM t WHERE a = 1
               AND b = 2";
+// Sub-ticket form with a letter after the first dot (13.R2-GUI.3.c).
+// A version like 13.2 or a bare R2 is not a marker.

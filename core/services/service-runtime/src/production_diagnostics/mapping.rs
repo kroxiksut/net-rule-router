@@ -120,7 +120,25 @@ pub(super) fn audit_event_to_dto(event: &AuditEvent) -> AuditEntryDto {
         reason_code: event.reason_code.clone(),
         revision_id: event.revision_id.clone(),
         has_payload_summary: event.payload_summary_json.is_some(),
+        cause: event.payload_summary_json.as_deref().and_then(cause_of),
     }
+}
+
+/// Longest payload summary looked into, and the longest cause kept.
+const SUMMARY_READ_MAX: usize = 4096;
+
+/// The `cause` of an audit summary, only if it is one the clients have words
+/// for; anything else in the summary stays out.
+fn cause_of(summary: &str) -> Option<String> {
+    if summary.len() > SUMMARY_READ_MAX {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(summary).ok()?;
+    let cause = value.get("cause")?.as_str()?;
+    nrr_shared::diagnostics_dto::AUDIT_CAUSES
+        .iter()
+        .find(|known| **known == cause)
+        .map(|known| (*known).to_owned())
 }
 
 pub(super) fn alert_to_dto(alert: &SecurityAlert) -> SecurityAlertDto {
@@ -248,5 +266,36 @@ pub(super) fn paginate<T>(
         next_cursor,
         total_count: Some(total),
         stale: false,
+    }
+}
+
+#[cfg(test)]
+mod cause_tests {
+    use super::cause_of;
+
+    #[test]
+    fn the_cause_slug_of_a_summary_is_kept() {
+        assert_eq!(
+            cause_of(r#"{"rule":"x","route":"deny","cause":"crash-loop"}"#).as_deref(),
+            Some("crash-loop")
+        );
+        assert_eq!(
+            cause_of(r#"{"cause":"services-changed"}"#).as_deref(),
+            Some("services-changed")
+        );
+    }
+
+    #[test]
+    fn a_summary_without_a_slug_cause_yields_none() {
+        assert_eq!(cause_of(r#"{"rule":"x"}"#), None);
+        assert_eq!(cause_of(r#"{"cause":7}"#), None);
+        assert_eq!(cause_of(r#"{"cause":"Has Space"}"#), None);
+        assert_eq!(cause_of(r#"{"cause":""}"#), None);
+        assert_eq!(cause_of(r#"{"cause":"not-a-known-cause"}"#), None);
+        assert_eq!(cause_of("not json"), None);
+        let long = format!(r#"{{"cause":"{}"}}"#, "a".repeat(49));
+        assert_eq!(cause_of(&long), None);
+        let huge = format!(r#"{{"pad":"{}","cause":"x"}}"#, "a".repeat(5000));
+        assert_eq!(cause_of(&huge), None);
     }
 }

@@ -14,18 +14,23 @@
 //! ## Recovery matrix
 //!
 //! [`RecoveryDecision`] is derived from [`StartupRecoveryState`] by
-//! [`decide_recovery`], which implements the following matrix:
+//! [`decide_recovery`]. A last-known-good revision is not consulted: the active
+//! pointer moves only in the final commit, so an attempt that died earlier left
+//! the previous state standing.
 //!
-//! | Phase on startup | LKG available | Audit available | Decision |
-//! |---|---|---|---|
-//! | None / Applied | any | any | `ProceedNormal` |
-//! | Preparing / Applying | yes | yes | `RollbackAndClearMarker` |
-//! | Preparing / Applying | no | yes | `RequireManualAction` |
-//! | Verifying | any | yes | `VerifyAndClearMarker` |
-//! | RollbackRequired / RollingBack | yes | yes | `RollbackAndClearMarker` |
-//! | RollbackDone | any | yes | `VerifyAndClearMarker` |
-//! | FailedRequiresManualAction | any | any | `RequireManualAction` |
-//! | any | any | no | `RequireManualAction` (audit must succeed) |
+//! | Phase on startup | Audit available | Decision |
+//! |---|---|---|
+//! | no marker, or an unclean stop without one | any | `ProceedNormal` |
+//! | Preparing / Applying / RollbackRequired / RollingBack | yes | `RollbackAndClearMarker` |
+//! | Applied / Verifying / RollbackDone | yes | `VerifyAndClearMarker` |
+//! | FailedRequiresManualAction | any | `RequireManualAction` |
+//! | any marker | no | `RequireManualAction` (audit must succeed) |
+//! | storage or audit unavailable at assessment | any | `RequireManualAction` |
+//!
+//! `RollbackAndClearMarker` performs no rollback here: it audits the deferral
+//! and clears the marker, and the startup reconcile restores enforcement.
+//! Nothing in production writes `FailedRequiresManualAction` today; the phase
+//! is read and honoured so a tool or a later release can set it.
 //!
 //! ## Safe disable
 //!
@@ -388,6 +393,18 @@ where
             RecoveryDecision::ProceedNormal => RecoveryExecutionResult::Recovered,
 
             RecoveryDecision::RequireManualAction { reason } => {
+                // Best effort: when the audit is the reason, this fails too, and
+                // the start is blocked either way.
+                let attempt_id = self
+                    .marker_store
+                    .read()
+                    .map_or_else(|| "none".to_owned(), |m| m.attempt_id);
+                let _ = self
+                    .audit_sink
+                    .emit(RecoveryAuditRecord::ManualActionRequired {
+                        attempt_id,
+                        reason: reason.clone(),
+                    });
                 RecoveryExecutionResult::ManualActionRequired { reason }
             }
 
@@ -888,6 +905,27 @@ mod tests {
             decision,
             RecoveryDecision::RequireManualAction { .. }
         ));
+    }
+
+    #[test]
+    fn a_decision_to_hold_the_start_leaves_a_record_naming_the_attempt() {
+        let c = coord(
+            FakeMarkerStore::with(marker(ApplyPhase::FailedRequiresManualAction)),
+            RecordingAuditSink::ok(),
+        );
+        let decision = decide_recovery(&c.assess(), true);
+        let result = c.execute(decision);
+        assert!(matches!(
+            result,
+            RecoveryExecutionResult::ManualActionRequired { .. }
+        ));
+        assert!(
+            c.audit_sink.records().iter().any(|r| matches!(
+                r,
+                RecoveryAuditRecord::ManualActionRequired { attempt_id, .. } if attempt_id == "att-001"
+            )),
+            "a blocked start without a trail entry cannot be explained afterwards",
+        );
     }
 
     #[test]

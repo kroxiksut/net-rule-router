@@ -470,9 +470,8 @@ mod tests {
         let g = conn.lock().unwrap();
         g.execute(
             "INSERT INTO secondary_block_policy
-                (sid, block_secondary_when_unavailable, kill_switch_fail_closed,
-                 kill_switch_protocols, include_subdomains, updated_at)
-             VALUES (?1, 1, 1, 127, ?2, ?3)",
+                (sid, kill_switch_protocols, include_subdomains, updated_at)
+             VALUES (?1, 127, ?2, ?3)",
             rusqlite::params![sid, on as i64, 1_700_000_000_i64],
         )
         .expect("seed policy");

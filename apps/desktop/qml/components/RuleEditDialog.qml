@@ -108,6 +108,9 @@ Dialog {
     readonly property bool verifyOffered: Rules.ruleTypeAllowsVerify(localRuleType)
         && localRoute !== "block" && !anyZoneValue
     readonly property bool anyZoneValue: Rules.valueIsAnyZone(localValue)
+    // Ticked on an IPv6 address: saved as an ordinary route, as the service does.
+    readonly property bool verifyDroppedForIpv6: localVerify && localRoute !== "block"
+        && Rules.valueIsIpv6Literal(localRuleType, localValue)
     // A deny where "Unsure" would otherwise fit: say why the box is off.
     readonly property bool verifyRefusedByDeny: localRoute === "block"
         && Rules.ruleTypeAllowsVerify(localRuleType) && !anyZoneValue
@@ -346,6 +349,9 @@ Dialog {
         root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
             if (!ok) {
                 console.log("local.rule-value-verdict failed:", code, msg)
+                // Silence would leave OK inactive with no reason on screen.
+                ruleDialog._verdict = { key: key, status: "error",
+                    messageKey: "rules.validation.verdict-unavailable", args: ({}) }
                 return
             }
             ruleDialog._verdict = {
@@ -1091,9 +1097,16 @@ Dialog {
                     // Reduce a pasted browser URL to its bare host (a no-op for
                     // plain hostnames, IPs and application names).
                     var norm = Rules.normalizeHostInput(ruleDialog.localRuleType, text)
+                    // A program in one outer pair of quotes, as a rules file
+                    // reads it. Only typed text: a value loaded for editing
+                    // arrives through localValue and is kept as stored.
+                    if (text !== ruleDialog.localValue)
+                        norm = Pure.formRuleValue(ruleDialog.localRuleType, norm)
                     if (norm !== text) {
-                        text = norm    // re-enters onTextChanged; norm has no URL
-                        return          // punctuation, so the next pass settles.
+                        // The re-entry finds text === localValue and settles.
+                        ruleDialog.localValue = norm
+                        text = norm
+                        return
                     }
                     ruleDialog.localValue = text
                 }
@@ -1419,12 +1432,16 @@ Dialog {
                 color: root.mutedTextColor
                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                 visible: !ruleDialog.bulkMode && (ruleDialog.anyZoneValue
+                    || ruleDialog.verifyDroppedForIpv6
                     || ruleDialog.verifyRefusedByDeny
                     || (ruleDialog.verifyOffered && ruleDialog.localVerify))
                 text: root.uiRevision >= 0
                     ? (ruleDialog.anyZoneValue
                         ? root.tr("dialog.rule.verify-any-zone",
                             "A site in every zone is not checked: the check needs one host.")
+                        : ruleDialog.verifyDroppedForIpv6
+                        ? root.tr("dialog.rule.verify-ipv6",
+                            "An IPv6 address is not checked: the check goes out over IPv4 only, so this stays an ordinary route rule.")
                         : ruleDialog.verifyRefusedByDeny
                         ? root.tr("dialog.rule.verify-deny",
                             "A denied rule is not checked: its traffic goes through no connection.")

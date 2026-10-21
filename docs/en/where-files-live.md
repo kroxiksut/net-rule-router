@@ -1,5 +1,7 @@
 # Where NetRuleRouter keeps its files
 
+**English** · [Русский](../ru/where-files-live.md)
+
 NetRuleRouter stores its data in a few well-known places on your PC. This page tells you what lives where, who writes it, what survives a reinstall, and what is safe to delete by hand.
 
 Nothing here is sent anywhere. Every path below is on your own machine.
@@ -18,11 +20,11 @@ Written by the background service, shared by every user of the PC. The folder be
 
 | What | Why it is there | How you clear it |
 |---|---|---|
-| `nrr_service_state.db` | The rules currently being enforced, your route assignments and behaviour settings | You do not. Resetting it would mean loading your rules again from your own files |
-| `nrr_fqdn_ip_cache.db` | Addresses already looked up, so a routed site works from the first click after a restart | **Settings, Diagnostics and logs**. It is rebuilt as you browse; the only cost is a slower first few minutes |
+| `nrr_service_state.db` | The rules currently being enforced and the revisions behind "Recent", your route assignments and behaviour settings, and the protected rules you confirmed, with their terms | You do not. Resetting it would mean loading your rules again from your own files |
+| `nrr_fqdn_ip_cache.db` | Addresses already looked up, so a routed site works from the first click after a restart | **Settings, Diagnostics and logs**, as an administrator: the cache is shared by the whole computer, so clearing it affects every user. It is rebuilt as you browse; the only cost is a slower first few minutes |
 | `nrr_traffic_stats.db` | The traffic counters shown in the app | **Settings, Diagnostics and logs**. You lose the history, nothing else |
 | `nrr_conn_history.db` | Each user's connection history: which of their programs connected where, and over which route. Kept 7 days unless the user chooses otherwise, and never more than 50 MB for the whole computer — the oldest goes first | **Settings, Diagnostics and logs**, "Clear my history" erases your own; "Keep connection history" switches it off. In NetRuleRouter only you can read yours; an administrator reads only their own too |
-| `logs\` | Operational logs of the service | **Settings, Diagnostics and logs**. To read them, see below |
+| `logs\` | Operational logs of the service | **Settings, Diagnostics and logs**, as an administrator: the logs cover every user and the service itself, so clearing them is a machine-wide action. To read them, see below |
 | `audit\` | The security audit trail | Not offered. It is deliberately excluded from in-app cleanup: it is the record of what changed your routing and when |
 | `archives\` | Diagnostic archives you exported | The copy you were handed is yours to delete; the service keeps its own to its retention limit |
 | `backups\` | Automatic copies taken before risky operations | Kept to a retention limit, so the safety net stays |

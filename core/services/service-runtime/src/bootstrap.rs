@@ -488,7 +488,23 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
                     "ok",
                 );
             }
-            Err(msg) => {
+            Err(CacheOpenFailure::NewerSchema(msg)) => {
+                // Written by a newer build: whole, only not understood. Erasing
+                // it would cost the last good addresses and fake-IP bindings.
+                push(
+                    &mut report,
+                    phases::STORAGE_CACHE,
+                    BootstrapStepStatus::Degraded,
+                    format!("cache is from a newer version, left untouched: {msg}"),
+                );
+                push(
+                    &mut report,
+                    phases::MIGRATIONS_CACHE,
+                    BootstrapStepStatus::Skipped,
+                    "cache unavailable",
+                );
+            }
+            Err(CacheOpenFailure::Other(msg)) => {
                 if config.allow_cache_rebuild {
                     // Drop the corrupt database and re-create it from a
                     // fresh migration. The runtime will treat it as an
@@ -544,7 +560,8 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
                                 "ok (post-rebuild)",
                             );
                         }
-                        Err(rebuild_msg) => {
+                        Err(rebuild_failure) => {
+                            let rebuild_msg = rebuild_failure.message();
                             push(
                                 &mut report,
                                 phases::STORAGE_CACHE,
@@ -1034,19 +1051,41 @@ pub fn sweep_signed_orphaned_candidates(
     }
 }
 
+enum CacheOpenFailure {
+    NewerSchema(String),
+    Other(String),
+}
+
+impl CacheOpenFailure {
+    fn message(&self) -> &str {
+        match self {
+            Self::NewerSchema(m) | Self::Other(m) => m,
+        }
+    }
+}
+
 fn open_and_migrate_cache(
     path: &Path,
     thresholds: &FreshnessThresholds,
     retry: &RetryPolicy,
-) -> Result<SqliteCacheStore, String> {
-    let conn = retry_io(retry, || open_connection(path)).map_err(|e| e.to_string())?;
+) -> Result<SqliteCacheStore, CacheOpenFailure> {
+    let conn = retry_io(retry, || open_connection(path))
+        .map_err(|e| CacheOpenFailure::Other(e.to_string()))?;
     let runner = SqliteMigrationRunner::for_cache_db(conn);
-    runner.run_pending_migrations().map_err(|e| e.to_string())?;
+    runner.run_pending_migrations().map_err(|e| match e {
+        nrr_storage::StorageError::UnsupportedSchemaVersion { .. } => {
+            CacheOpenFailure::NewerSchema(e.to_string())
+        }
+        other => CacheOpenFailure::Other(other.to_string()),
+    })?;
     let verification = runner
         .verify_schema()
-        .map_err(|e| format!("verify_schema: {e}"))?;
+        .map_err(|e| CacheOpenFailure::Other(format!("verify_schema: {e}")))?;
     if !verification.is_ok() {
-        return Err(describe_schema_failure("cache", &verification));
+        return Err(CacheOpenFailure::Other(describe_schema_failure(
+            "cache",
+            &verification,
+        )));
     }
     Ok(SqliteCacheStore::new(
         runner.into_connection(),
@@ -1434,6 +1473,45 @@ mod tests {
 
         let second = bootstrap(&cfg);
         assert!(second.is_ready_to_run(), "report = {:?}", second.report);
+    }
+
+    #[test]
+    fn a_cache_from_a_newer_build_is_left_untouched() {
+        let (_dir, cfg) = temp_profile();
+        let first = bootstrap(&cfg);
+        assert!(first.is_ready_to_run());
+        let cache_path = first.topology.cache_db_path.clone();
+        drop(first);
+        {
+            let conn = rusqlite::Connection::open(&cache_path).expect("open cache");
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at, checksum, app_version)
+                 VALUES (9999, 'future', 0, 'x', '99.0.0')",
+                [],
+            )
+            .expect("plant future version");
+        }
+
+        let second = bootstrap(&cfg);
+        assert!(second.cache_store.is_none());
+        let phase = second
+            .report
+            .phases
+            .iter()
+            .find(|p| p.phase == phases::STORAGE_CACHE)
+            .expect("cache phase recorded");
+        assert_eq!(phase.severity, ServiceHealthSeverity::Degraded);
+        drop(second);
+
+        let conn = rusqlite::Connection::open(&cache_path).expect("reopen cache");
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 9999",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(kept, 1, "the newer database was erased");
     }
 
     #[test]

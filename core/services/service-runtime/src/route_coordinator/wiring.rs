@@ -61,6 +61,8 @@ impl SecondaryRouteCoordinator {
             app_observations: Arc::new(AppObservationStore::new()),
             dns_via_secondary: None,
             network_support: crate::wfp_codegen::current_rule_shape_support(),
+            machine_memo: Mutex::new(super::resolve::MachineMemo::Off),
+            adapter_cache: std::sync::OnceLock::new(),
         }
     }
 

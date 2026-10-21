@@ -18,6 +18,21 @@ fn app_scope(pattern: &str) -> AppScope {
     }
 }
 
+/// Whether `ip` sits on a segment the main link is attached to. A rule host
+/// there keeps its direct route (`NetworkRouteFacts::keeps_host_direct`), so
+/// the leak-guard neither pins nor blocks it: the floor already opens the
+/// segment, and a pin would only cut a device one hop away. Both engines ask.
+#[must_use]
+pub fn on_attached_segment(ip: IpAddr, v4: &[(Ipv4Addr, u8)], v6: &[(Ipv6Addr, u8)]) -> bool {
+    let within = |net: IpAddr, len: u8| {
+        nrr_shared::ip_block::IpBlock::new(net, len).is_some_and(|b| b.contains(ip))
+    };
+    match ip {
+        IpAddr::V4(_) => v4.iter().any(|(net, len)| within(IpAddr::V4(*net), *len)),
+        IpAddr::V6(_) => v6.iter().any(|(net, len)| within(IpAddr::V6(*net), *len)),
+    }
+}
+
 /// The single ALE `ip_protocol` narrowing for a mask (neutral), mirroring
 /// `KillSwitchProtocols::ale_protocol`: `None` when both or neither TCP/UDP are
 /// selected (one proto-agnostic block covers both), else the one selected.
@@ -54,6 +69,7 @@ fn ks_flow(
         app,
         egress,
         coverage,
+        observed_by_program: false,
     }
 }
 
@@ -319,6 +335,7 @@ pub fn plan_doh_dot_block(sid: &str, resolver_ips: &[IpAddr], block_dot: bool) -
         app: AppScope::Any,
         egress: EgressConstraint::Any,
         coverage: Coverage::ConnectOnly,
+        observed_by_program: false,
     };
     let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) = resolver_ips
         .iter()
@@ -372,6 +389,36 @@ pub fn plan_fail_closed_block_all(
     v6: Ipv6Exemptions<'_>,
     allow_dns_over_primary: bool,
     dns_servers: &[Ipv4Addr],
+    protocols: KillSwitchProtocols,
+) -> Vec<FlowRule> {
+    let dns: Vec<IpAddr> = dns_servers.iter().copied().map(IpAddr::V4).collect();
+    plan_fail_closed_block_all_with_dns(
+        sid,
+        server_ips,
+        probe_target_ips,
+        local_subnets,
+        primary_dest_ips,
+        known_direct_ips,
+        v6,
+        allow_dns_over_primary,
+        &dns,
+        protocols,
+    )
+}
+
+/// [`plan_fail_closed_block_all`] with resolvers of either family: on a
+/// network whose only resolvers are IPv6 the port-53 permit has to name them.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_fail_closed_block_all_with_dns(
+    sid: &str,
+    server_ips: &[Ipv4Addr],
+    probe_target_ips: &[Ipv4Addr],
+    local_subnets: &[(Ipv4Addr, u8)],
+    primary_dest_ips: &[Ipv4Addr],
+    known_direct_ips: &[Ipv4Addr],
+    v6: Ipv6Exemptions<'_>,
+    allow_dns_over_primary: bool,
+    dns_servers: &[IpAddr],
     protocols: KillSwitchProtocols,
 ) -> Vec<FlowRule> {
     let any_selected = protocols.tcp
@@ -538,6 +585,10 @@ pub fn plan_fail_closed_block_all(
             .filter(|ip| !nrr_platform_api::is_exempt_from_blocking(**ip))
             .take(crate::killswitch_codegen::MAX_DNS_SERVER_PERMITS)
         {
+            let dst = match *ip {
+                IpAddr::V4(v4) => DstMatch::HostV4(v4),
+                IpAddr::V6(v6) => DstMatch::HostV6(v6),
+            };
             for proto in [L4Proto::Udp, L4Proto::Tcp] {
                 flows.push(FlowRule {
                     verdict: Verdict::Permit,
@@ -546,7 +597,7 @@ pub fn plan_fail_closed_block_all(
                         ordinal: e,
                     },
                     flow: FlowMatch {
-                        dst: DstMatch::HostV4(*ip),
+                        dst,
                         dst_port: Some(53),
                         protocol: Some(proto),
                     },
@@ -554,6 +605,7 @@ pub fn plan_fail_closed_block_all(
                     app: AppScope::Any,
                     egress: EgressConstraint::Any,
                     coverage: Coverage::ConnectOnly,
+                    observed_by_program: false,
                 });
                 e += 1;
             }

@@ -47,7 +47,7 @@ pub struct RuleSet {
     pub paths: [Option<PathBuf>; 2],
 }
 
-fn read_text(path: &Path) -> Result<Option<String>, ReadError> {
+pub fn read_text(path: &Path) -> Result<Option<String>, ReadError> {
     let size = match std::fs::metadata(path) {
         Ok(meta) => meta.len(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -114,8 +114,21 @@ pub fn write_route(
     hint: &[String],
     exported_at: &str,
 ) -> Result<(), (PathBuf, String)> {
-    std::fs::write(path, route_text(route, table, hint, exported_at))
+    write_whole(path, route_text(route, table, hint, exported_at).as_bytes())
         .map_err(|e| (path.to_path_buf(), e.to_string()))
+}
+
+/// Replaces the file in one step: a failure mid-write leaves the old file, not
+/// a truncated one (the window saves through `QSaveFile`).
+fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".nrr-tmp");
+    let temporary = PathBuf::from(temporary);
+    let result = std::fs::write(&temporary, bytes).and_then(|()| std::fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn route_text(route: Route, table: &Table, hint: &[String], exported_at: &str) -> String {
@@ -301,6 +314,17 @@ mod tests {
         assert!(route_differs(&path, Route::Primary, table, hint));
         let gone = dir.path().join("absent.txt");
         assert!(!route_differs(&gone, Route::Primary, table, hint));
+    }
+
+    /// A rewrite replaces the file whole and leaves no temporary behind.
+    #[test]
+    fn a_rewrite_replaces_the_file_and_leaves_no_temporary() {
+        let dir = Scratch::new("files-whole");
+        let path = dir.path().join("rules_primary.txt");
+        std::fs::write(&path, "old contents that are longer than the new ones").expect("seed");
+        write_whole(&path, b"new").expect("write");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "new");
+        assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 1);
     }
 
     /// The terminal writes the syntax hint the GUI writes, in the reader's

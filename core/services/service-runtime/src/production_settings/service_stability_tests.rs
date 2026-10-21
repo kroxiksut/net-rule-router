@@ -627,8 +627,13 @@ fn fake_ip_enabled_change_requests_dns_cache_flush() {
     let (_dir, conn) = fresh_conn();
     let (stab, calls) = stab_with_recording_fake_ip_hook(&conn);
 
-    // Enable: reactive/off -> resolver/on is an effective false -> true.
+    // A fresh install has it on; start from an explicit off.
     let mut dto = ServiceStabilityConfigProvider::get(&stab);
+    dto.fake_ip_enabled = false;
+    ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-TEST")).expect("set off first");
+    calls.lock().unwrap().clear();
+
+    // Enable: off -> resolver/on is an effective false -> true.
     dto.enforcement_mode = "resolver".to_string();
     dto.fake_ip_enabled = true;
     ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-TEST")).expect("set on");

@@ -5,61 +5,44 @@ import QtQuick.Window 2.15
 import QtQuick.Dialogs
 import "../lib/pure.js" as Pure
 
-// VPN-client onboarding.
+// "Your VPN client" picker.
 //
-// Lets the user point NetRuleRouter at the program they use as their VPN, so
-// that program's traffic keeps flowing over the primary link while leak
-// protection ("kill-switch") is engaged. The app already turns an
-// "Application -> primary route" rule into a kill-switch exemption; this dialog
-// only CAPTURES which executable that is.
-//
-// It drives the launcher-local `local.vpn.discover` RPC through the owner
-// (`ownerRoot.rpc.rpcVpnDiscover()` + `ownerRoot.rpc.registerRpcCallback`). That RPC is
-// local, non-elevated, and needs no background service, so onboarding works
-// before the service is even installed. The dialog is otherwise "dumb": it
-// renders the candidate list and emits `vpnConfirmedMulti(displayNames,
-// exePaths)` (multi-select), `vpnConfirmed(displayName, exePath)` (single add
-// from the manual file picker), `skipped()`, or `manualPickRequested()`;
-// the caller (Main.qml) decides what to
-// persist. All shared state comes in through `ownerRoot` (the
-// ApplicationWindow) — never via implicit scope. Themed* wrappers only.
+// Lists the likely VPN programs found on this machine (launcher-local
+// `local.vpn.discover`, no service needed) together with every program
+// already confirmed, opens with the confirmed ones ticked, and on confirm
+// hands the rows and the ticks to the caller, which writes the set over a
+// fresh read (`vpnPickerResultApps`). The stored set is a list, so the picker
+// is multi-choice. A row whose program file is unknown cannot be ticked until
+// the user chooses the file. Themed* wrappers only; shared state through
+// `ownerRoot`.
 Window {
     id: root
 
     /// ApplicationWindow injected by the caller (`ownerRoot: window`).
     property var ownerRoot: null
 
-    /// Scan state and results. `candidates` is a plain JS array of
-    /// `{ displayName, exePath, running, source, interfaceName }` objects
-    /// returned by the RPC. A `kernel-tunnel` row is not a program: it is never
-    /// selectable and offers its link for the secondary role instead.
     property bool scanning: false
     property bool scanFailed: false
     property bool scanRan: false
-    property var candidates: []
+    /// What discovery found: `{ displayName, exePath, running, source,
+    /// interfaceName }`. A `kernel-tunnel` row is never tickable and offers
+    /// its link for the secondary role instead.
+    property var found: []
+    /// Program files the user chose by hand in this session.
+    property var picked: []
+    /// The confirmed set the picker opened over (`exe-path`/`display-name`).
+    property var storedApps: []
+    readonly property var rows: Pure.vpnPickerRows(root.found.concat(root.picked), root.storedApps)
+    /// Ticked paths. Reassigned, never mutated, so bindings re-evaluate.
+    property var selectedPaths: []
+    /// Display name of the found row whose file is being chosen, if any.
+    property string _pickFor: ""
 
-    /// The user's current multi-selection, modelled as a set: a plain JS object
-    /// keyed by each candidate's row key (`_rowKeyOf`) with value `true`. Reset
-    /// by reassignment (never in-place mutation) so QML bindings re-evaluate.
-    /// A candidate with an empty exe path is still selectable — its name is kept
-    /// for the manual-pick follow-up, mirroring the old null-path handling.
-    property var selectedKeys: ({})
-
-    /// Fired when the user confirms a specific program as their VPN. `exePath`
-    /// may be empty when the candidate had no resolved path (manual pick later).
-    /// Retained for the single-add path (the manual file picker below).
-    signal vpnConfirmed(string displayName, string exePath)
-    /// Fired when the user confirms one OR MORE programs as their VPN setup
-    /// (e.g. a client plus its background service and CLI). `displayNames` and
-    /// `exePaths` are parallel arrays in display order; an entry's `exePath`
-    /// may be empty (name-only candidate). The caller persists the full set and
-    /// mirrors the first non-empty path into the single-path preference.
-    signal vpnConfirmedMulti(var displayNames, var exePaths)
+    /// Fired on confirm with the rows on screen and the ticked paths.
+    signal pickConfirmed(var rows, var selected)
     /// Fired when the user says they do not use a VPN (or dismisses).
     signal skipped()
-    /// Fired when the user wants to browse for the executable themselves. The
-    /// actual native file picker is wired later; for now the caller just notes
-    /// the request.
+    /// Fired when the user opens the file picker.
     signal manualPickRequested()
     /// Fired when the user wants a kernel tunnel's link bound as the
     /// secondary route; the dialog has already closed.
@@ -71,93 +54,76 @@ Window {
             : (fallback || key)
     }
 
-    // API-compatible with the other modal child windows in Main.qml.
-    function open() {
-        _resetSelection()
-        candidates = []
+    /// `stored`: the confirmed set as the service holds it.
+    function open(stored) {
+        storedApps = stored || []
+        found = []
+        picked = []
+        selectedPaths = Pure.vpnPickerPreselected(Pure.vpnPickerRows([], storedApps), storedApps)
         scanFailed = false
         scanRan = false
         visible = true
-        // Kick off a scan immediately so the list is populated by the time the
-        // user has read the intro; they can re-scan with the button.
         scan()
     }
 
-    function _resetSelection() {
-        selectedKeys = ({})
+    function _samePath(a, b) {
+        return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase()
     }
-
-    /// Stable per-candidate selection key: the exe path when present, else a
-    /// `name:`-prefixed display name (so a path-less candidate is still keyed).
-    function _rowKeyOf(displayName, exePath) {
-        var p = String(exePath || "")
-        return p !== "" ? p : ("name:" + String(displayName || ""))
-    }
-    function _isSelected(key) {
-        return root.selectedKeys[key] === true
-    }
-    /// Toggle a candidate's membership. Reassigns `selectedKeys` with a fresh
-    /// object so bindings that read it (checkbox `checked`, confirm `enabled`,
-    /// the selected count) re-evaluate — in-place mutation would not notify.
-    function _setSelected(key, on) {
-        var next = {}
-        for (var k in root.selectedKeys) {
-            if (root.selectedKeys[k] === true) next[k] = true
-        }
-        if (on) next[key] = true
-        else delete next[key]
-        root.selectedKeys = next
-    }
-    function _isKernelTunnel(candidate) {
-        return String((candidate || {}).source || "") === "kernel-tunnel"
-    }
-    function _hasSelectable() {
-        for (var i = 0; i < root.candidates.length; i += 1) {
-            if (!root._isKernelTunnel(root.candidates[i])) return true
+    function _isSelected(path) {
+        for (var i = 0; i < root.selectedPaths.length; i += 1) {
+            if (root._samePath(root.selectedPaths[i], path)) return true
         }
         return false
     }
-    function _selectedCount() {
+    function _setSelected(path, on) {
+        var next = []
+        for (var i = 0; i < root.selectedPaths.length; i += 1) {
+            if (!root._samePath(root.selectedPaths[i], path)) next.push(root.selectedPaths[i])
+        }
+        if (on) next.push(String(path))
+        root.selectedPaths = next
+    }
+    function _tickableCount() {
         var n = 0
-        for (var k in root.selectedKeys) {
-            if (root.selectedKeys[k] === true) n += 1
+        for (var i = 0; i < root.rows.length; i += 1) {
+            if (Pure.vpnPickerTickable(root.rows[i])) n += 1
         }
         return n
     }
-    /// True when every candidate is currently selected (and there is at least
-    /// one). Drives the select-all control's toggle semantics and label.
-    function _allSelected() {
-        if (!root.candidates || !root._hasSelectable()) return false
-        for (var i = 0; i < root.candidates.length; i += 1) {
-            var c = root.candidates[i] || {}
-            if (root._isKernelTunnel(c)) continue
-            var key = root._rowKeyOf(String(c.displayName || ""),
-                String(c.exePath || ""))
-            if (root.selectedKeys[key] !== true) return false
+    function _selectedCount() {
+        var n = 0
+        for (var i = 0; i < root.rows.length; i += 1) {
+            var r = root.rows[i]
+            if (Pure.vpnPickerTickable(r) && root._isSelected(r.exePath)) n += 1
         }
-        return true
+        return n
     }
-    /// Toggle every candidate at once. Builds a fresh selection object and
-    /// reassigns `selectedKeys` (never in-place mutation) so bindings notify:
-    /// if everything is already selected this clears the set, otherwise it
-    /// selects all found candidates.
+    function _allSelected() {
+        var tickable = root._tickableCount()
+        return tickable > 0 && root._selectedCount() === tickable
+    }
     function _toggleSelectAll() {
         if (root._allSelected()) {
-            root.selectedKeys = ({})
+            root.selectedPaths = []
             return
         }
-        var next = {}
-        for (var i = 0; i < root.candidates.length; i += 1) {
-            var c = root.candidates[i] || {}
-            if (root._isKernelTunnel(c)) continue
-            var key = root._rowKeyOf(String(c.displayName || ""),
-                String(c.exePath || ""))
-            next[key] = true
+        var next = []
+        for (var i = 0; i < root.rows.length; i += 1) {
+            if (Pure.vpnPickerTickable(root.rows[i])) next.push(root.rows[i].exePath)
         }
-        root.selectedKeys = next
+        root.selectedPaths = next
+    }
+    function _isKernelTunnel(row) {
+        return String((row || {}).source || "") === "kernel-tunnel"
+    }
+    function _pickFileFor(displayName) {
+        root._pickFor = String(displayName || "")
+        root.manualPickRequested()
+        manualPickDialog.open()
     }
 
-    /// Drive the launcher-local `local.vpn.discover` RPC and populate the list.
+    /// Drive the launcher-local `local.vpn.discover` RPC. The ticks survive a
+    /// rescan: they are paths, not places in the list.
     function scan() {
         if (scanning) return
         if (!ownerRoot
@@ -170,7 +136,6 @@ Window {
         }
         scanning = true
         scanFailed = false
-        _resetSelection()
         var corr = ownerRoot.rpc.rpcVpnDiscover()
         if (!corr || corr === "") {
             scanning = false
@@ -183,7 +148,7 @@ Window {
             root.scanRan = true
             if (!ok || !payload) {
                 root.scanFailed = true
-                root.candidates = []
+                root.found = []
                 return
             }
             var list = payload.candidates || payload["candidates"] || []
@@ -200,7 +165,7 @@ Window {
                     interfaceName: String(c["interface"] || "")
                 })
             }
-            root.candidates = normalized
+            root.found = normalized
             root.scanFailed = false
         })
     }
@@ -218,8 +183,8 @@ Window {
         return b.replace(/\.exe$/i, "")
     }
 
-    // Native OS file picker for "My VPN isn't listed" — replaces the old
-    // "coming soon" no-op. On accept the chosen executable IS the confirmed VPN.
+    // Native file picker: "My VPN isn't listed", or the file of a row found
+    // without one.
     FileDialog {
         id: manualPickDialog
         fileMode: FileDialog.OpenFile
@@ -228,12 +193,25 @@ Window {
             root.tr("vpn-onboarding.manual-pick-filter", "Programs (*.exe)"),
             root.tr("vpn-onboarding.manual-pick-all", "All files (*)")
         ]
+        // The file joins the list ticked; confirm saves it with the rest.
         onAccepted: {
             var path = root._localPathFromUrl(selectedFile)
-            var name = root._nameFromPath(path)
-            root.close()
-            root.vpnConfirmed(name, path)
+            var forName = root._pickFor
+            root._pickFor = ""
+            if (String(path || "").trim() === "") return
+            var shown = false
+            for (var i = 0; i < root.rows.length; i += 1) {
+                if (Pure.vpnPickerTickable(root.rows[i]) && root._samePath(root.rows[i].exePath, path))
+                    shown = true
+            }
+            if (!shown) {
+                root.picked = root.picked.concat([{
+                    displayName: forName !== "" ? forName : root._nameFromPath(path),
+                    exePath: path, running: false, source: "manual-pick", interfaceName: "" }])
+            }
+            root._setSelected(path, true)
         }
+        onRejected: root._pickFor = ""
     }
 
     function _sourceHint(source) {
@@ -243,6 +221,10 @@ Window {
         if (source === "installed-program")
             return root.tr("vpn-onboarding.source-installed-program",
                 "found among installed programs")
+        if (source === "confirmed")
+            return root.tr("vpn-onboarding.source-confirmed", "confirmed by you earlier")
+        if (source === "manual-pick")
+            return root.tr("vpn-onboarding.source-manual-pick", "chosen by you")
         return ""
     }
 
@@ -343,8 +325,7 @@ Window {
         Label {
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
-            visible: !root.scanning
-                && (root.candidates.length === 0)
+            visible: !root.scanning && root.found.length === 0
             color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
             text: root.scanFailed
                 ? root.tr("vpn-onboarding.scan-failed",
@@ -356,11 +337,10 @@ Window {
                         "Run a scan to look for VPN apps."))
         }
 
-        // Bulk-select control: select every found candidate at once, or clear
-        // the whole selection when all are already ticked (toggle semantics).
+        // Tick every row at once, or clear the ticks when all are ticked.
         RowLayout {
             Layout.fillWidth: true
-            visible: root._hasSelectable()
+            visible: root._tickableCount() > 0
             spacing: root.ownerRoot ? root.ownerRoot.uiTheme.spacingSm : 8
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
@@ -377,7 +357,7 @@ Window {
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
-            visible: root.candidates.length > 0
+            visible: root.rows.length > 0
             ScrollBar.vertical.policy: ScrollBar.AsNeeded
 
             ColumnLayout {
@@ -385,7 +365,7 @@ Window {
                 spacing: root.ownerRoot ? root.ownerRoot.uiTheme.spacingSm : 8
 
                 Repeater {
-                    model: root.candidates
+                    model: root.rows
                     delegate: Rectangle {
                         id: candidateCard
                         Layout.fillWidth: true
@@ -398,11 +378,9 @@ Window {
                             ? root.ownerRoot.uiTheme.colorAccent
                             : (root.ownerRoot ? root.ownerRoot.uiTheme.stateDefaultBorder : "#555")
 
-                        // Key that identifies this candidate for selection.
-                        property string rowKey: root._rowKeyOf(
-                            String(modelData.displayName || ""),
-                            String(modelData.exePath || ""))
+                        readonly property string rowPath: String(modelData.exePath || "")
                         readonly property bool isTunnel: root._isKernelTunnel(modelData)
+                        readonly property bool tickable: Pure.vpnPickerTickable(modelData)
 
                         RowLayout {
                             id: rowLayout
@@ -415,10 +393,17 @@ Window {
                             // the app theme instead of the Windows Native style.
                             CheckBox {
                                 id: candidateCheck
-                                visible: !candidateCard.isTunnel
+                                visible: candidateCard.tickable
                                 Layout.alignment: Qt.AlignTop
-                                checked: root._isSelected(candidateCard.rowKey)
-                                onToggled: root._setSelected(candidateCard.rowKey, checked)
+                                checked: root._isSelected(candidateCard.rowPath)
+                                // A click assigns `checked` and breaks the binding;
+                                // put it back so "Select all" still drives the box.
+                                onToggled: {
+                                    root._setSelected(candidateCard.rowPath, checked)
+                                    checked = Qt.binding(function() {
+                                        return root._isSelected(candidateCard.rowPath)
+                                    })
+                                }
                                 indicator: Rectangle {
                                     implicitWidth: 20
                                     implicitHeight: 20
@@ -510,7 +495,16 @@ Window {
                                         : root.tr("vpn-onboarding.not-found",
                                             "not found — pick manually")
                                 }
-                                // Source hint (running process / installed program).
+                                // Found without its file: the file must be chosen
+                                // before the program can be confirmed.
+                                ThemedButton {
+                                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                                    visible: !candidateCard.isTunnel && !candidateCard.tickable
+                                    text: root.tr("vpn-onboarding.pick-file", "Choose its program file")
+                                    Accessible.description: Pure.displayText(modelData.displayName)
+                                    onClicked: root._pickFileFor(String(modelData.displayName || ""))
+                                }
+                                // Source hint.
                                 Label {
                                     Layout.fillWidth: true
                                     wrapMode: Text.WordWrap
@@ -562,17 +556,14 @@ Window {
             wrapText: true
             text: root.tr("vpn-onboarding.manual-pick",
                 "My VPN isn't listed / pick it manually")
-            onClicked: {
-                root.manualPickRequested()
-                manualPickDialog.open()
-            }
+            onClicked: root._pickFileFor("")
         }
 
         // Takes the slack the hidden list leaves; without a filler the layout
         // spreads the remaining blocks over the whole window height.
         Item {
             Layout.fillHeight: true
-            visible: root.candidates.length === 0
+            visible: root.rows.length === 0
         }
 
         // Footer: Skip (left) — spacer — confirm (accent, right).
@@ -582,36 +573,32 @@ Window {
             spacing: root.ownerRoot ? root.ownerRoot.uiTheme.spacingSm : 8
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                text: root.tr("vpn-onboarding.skip", "I don't use a VPN")
+                // Over a stored set this only closes: taking programs back is
+                // an untick and a save, never a side effect of "no VPN".
+                text: root.storedApps.length > 0
+                    ? root.tr("action.cancel", "Cancel")
+                    : root.tr("vpn-onboarding.skip", "I don't use a VPN")
                 onClicked: {
+                    var hadStored = root.storedApps.length > 0
                     root.close()
-                    root.skipped()
+                    if (!hadStored) root.skipped()
                 }
             }
             Item { Layout.fillWidth: true }
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                 highlighted: true
-                enabled: root._selectedCount() > 0
-                text: root.tr("vpn-onboarding.confirm", "This is my VPN")
+                // Nothing ticked over a stored set is a choice too: it takes
+                // them all back.
+                enabled: root._selectedCount() > 0 || root.storedApps.length > 0
+                text: root._selectedCount() > 0
+                    ? root.tr("vpn-onboarding.confirm", "This is my VPN")
+                    : root.tr("action.save", "Save")
                 onClicked: {
-                    // Collect the selected candidates in display order so the
-                    // first non-empty path becomes the primary (mirrored into
-                    // the single-path preference by the caller).
-                    var names = []
-                    var paths = []
-                    for (var i = 0; i < root.candidates.length; i += 1) {
-                        var c = root.candidates[i] || {}
-                        if (root._isKernelTunnel(c)) continue
-                        var dn = String(c.displayName || "")
-                        var ep = String(c.exePath || "")
-                        if (root._isSelected(root._rowKeyOf(dn, ep))) {
-                            names.push(dn)
-                            paths.push(ep)
-                        }
-                    }
+                    var shown = root.rows
+                    var ticked = root.selectedPaths
                     root.close()
-                    root.vpnConfirmedMulti(names, paths)
+                    root.pickConfirmed(shown, ticked)
                 }
             }
         }

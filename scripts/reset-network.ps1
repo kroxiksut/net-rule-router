@@ -11,9 +11,10 @@
 # script's job is to find a binary that can run it, and to still get the
 # machine online when there is none. Descending order of fidelity:
 #
-#   1. the repo build (`target\{debug,release}\nrr-service.exe`),
-#   2. the INSTALLED service's binary, read from its registry `ImagePath` —
-#      the case that matters on a user's machine, where no repo exists,
+#   1. the INSTALLED service's binary, read from its registry `ImagePath` —
+#      the one that made the state being cleaned, and the case that matters on
+#      a user's machine, where no repo exists,
+#   2. the repo build (`target\{debug,release}\nrr-service.exe`),
 #   3. emergency mode, plain PowerShell only: drop our NRPT rule, our routes
 #      and our WFP filters by the same signatures `cleanup` uses,
 #   4. restart the Base Filtering Engine when our filters could not be deleted
@@ -46,10 +47,10 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\service-paths.ps1')
 
 $root = Split-Path -Parent $PSScriptRoot
-# Must match `route_codegen.rs::is_owned_route` — emergency mode reproduces the
-# binary's own sweep, and a drifted constant here would either miss our routes
-# or delete somebody else's. The NRPT constants live in lib\service-paths.ps1
-# beside the sweep that uses them.
+# Must match `nrr_platform_api::route_signature::is_owned_route` — emergency
+# mode reproduces the binary's own sweep, and a drifted constant here would
+# either miss our routes or delete somebody else's. The NRPT constants live in
+# lib\service-paths.ps1 beside the sweep that uses them.
 $routeMetric = 5          # SECONDARY_ROUTE_METRIC: host routes and overlay halves
 $networkRouteMetric = 4   # NETWORK_ROUTE_METRIC: a network rule's routes
 $overlayMaxPrefix = 13    # TUNNEL_CATCH_ALL_MAX_PREFIX + 1
@@ -102,14 +103,16 @@ $null = Stop-NrrServiceDeliberately
 Start-Sleep -Seconds 2
 
 # ── Step 1-2: a binary that can run `cleanup` ────────────────────────────────
-$exePath = Resolve-RepoServiceBinary -TargetRoot $targetRoot -Mode $Profile
+# The installed binary first: a repo build of another revision may not know the
+# state the installed one left behind (the BFE emergency path included).
+$exePath = Resolve-InstalledServiceBinary
 if ($exePath) {
-    Write-Host "==> using the repo build: $exePath" -ForegroundColor Cyan
+    Write-Host "==> using the installed service binary: $exePath" -ForegroundColor Cyan
 }
 else {
-    $exePath = Resolve-InstalledServiceBinary
+    $exePath = Resolve-RepoServiceBinary -TargetRoot $targetRoot -Mode $Profile
     if ($exePath) {
-        Write-Host "==> no repo build; using the installed service binary: $exePath" -ForegroundColor Cyan
+        Write-Host "==> no installed service binary; using the repo build: $exePath" -ForegroundColor Cyan
     }
 }
 

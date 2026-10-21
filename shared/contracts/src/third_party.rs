@@ -120,10 +120,30 @@ pub const TABLER_ICONS_COMPONENT: ThirdPartyComponent = ThirdPartyComponent {
     required_for: "user-interface",
 };
 
+/// The Qt toolkit behind the graphical interface. The Windows packages carry its
+/// libraries unmodified under the LGPLv3 (Linux packages use the system's), so
+/// the licence text and notice are what the obligation asks for; the DLLs are
+/// not checked against a single shipped hash because they differ per build.
+pub const QT_COMPONENT: ThirdPartyComponent = ThirdPartyComponent {
+    kind: ThirdPartyComponentKind::Asset,
+    key: "qt",
+    display_name: "Qt",
+    publisher: "The Qt Company and contributors",
+    version: "6",
+    license_name: "LGPLv3",
+    license_path: "third_party/qt/NOTICE.txt",
+    homepage: "https://www.qt.io/",
+    file_name: "",
+    known_sha256: &[],
+    expected_signer: "",
+    required_for: "user-interface",
+};
+
 /// Third-party material that is shipped but has nothing to verify — attribution
 /// only. Reported on EVERY platform, unlike the binaries: the icons are part of
 /// every build.
-pub const THIRD_PARTY_ASSET_COMPONENTS: &[ThirdPartyComponent] = &[TABLER_ICONS_COMPONENT];
+pub const THIRD_PARTY_ASSET_COMPONENTS: &[ThirdPartyComponent] =
+    &[TABLER_ICONS_COMPONENT, QT_COMPONENT];
 
 /// Result of the Authenticode (or platform-equivalent) signature check.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,8 +356,12 @@ mod tests {
     #[test]
     fn every_build_reports_the_icon_attribution() {
         let assets = ThirdPartyComponentStatus::asset_components();
-        assert_eq!(assets.len(), 1);
+        assert_eq!(assets.len(), 2);
         assert_eq!(assets[0].key, "tabler-icons");
+        assert_eq!(assets[1].key, "qt");
+        assert!(assets
+            .iter()
+            .all(|a| a.verdict == IntegrityVerdict::NotApplicable));
     }
 
     #[test]

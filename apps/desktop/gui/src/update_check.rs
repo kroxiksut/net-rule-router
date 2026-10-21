@@ -216,8 +216,10 @@ fn prerelease_rank(tag: &str) -> Option<(usize, u64)> {
 /// dependency: numeric triple compares first; on an equal triple, a release
 /// (no prerelease suffix) is newer than any prerelease, and two prereleases
 /// compare by [`PRERELEASE_STAGES`], then by number. Unparseable input or an
-/// unknown stage → `false` (never nag on what we cannot order).
-fn version_is_newer(candidate: &str, current: &str) -> bool {
+/// unknown stage → `false` (never nag on what we cannot order). The one version
+/// order of the desktop: the update offer and the "service is older" check
+/// both ask it.
+pub fn version_is_newer(candidate: &str, current: &str) -> bool {
     let (Some((cand, cand_pre)), Some((cur, cur_pre))) =
         (split_version(candidate), split_version(current))
     else {

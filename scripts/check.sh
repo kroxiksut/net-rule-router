@@ -13,6 +13,10 @@
 #   ./scripts/check.sh --qmllint-only
 #   ./scripts/check.sh --require-qmllint    (CI: a runner without qmllint fails)
 #   ./scripts/check.sh --fuzz [seconds]     (opt-in: every fuzz target, 60 s each by default)
+#   ./scripts/check.sh --include-privileged (opt-in, VM/test machine only: also runs the
+#                                            `#[ignore]` tests that need root and edit the
+#                                            route table and nftables; uses sudo when not root;
+#                                            never part of the default gate or public CI)
 
 set -euo pipefail
 
@@ -24,6 +28,7 @@ comment_hygiene_only=0
 require_qmllint=0
 qmllint_only=0
 fuzz_seconds=0
+include_privileged=0
 while [ "$#" -gt 0 ]; do
   arg="$1"
   shift
@@ -32,6 +37,7 @@ while [ "$#" -gt 0 ]; do
     --comment-hygiene-only) comment_hygiene_only=1 ;;
     --require-qmllint) require_qmllint=1 ;;
     --qmllint-only) qmllint_only=1 ;;
+    --include-privileged) include_privileged=1 ;;
     --fuzz)
       # The optional duration is the next argument when it is a whole number.
       fuzz_seconds=60
@@ -41,7 +47,7 @@ while [ "$#" -gt 0 ]; do
       fi
       ;;
     *)
-      echo "unknown argument: $arg (expected --require-cargo-deny, --comment-hygiene-only, --require-qmllint, --qmllint-only or --fuzz [seconds])" >&2
+      echo "unknown argument: $arg (expected --require-cargo-deny, --comment-hygiene-only, --require-qmllint, --qmllint-only, --include-privileged or --fuzz [seconds])" >&2
       exit 2
       ;;
   esac
@@ -228,8 +234,8 @@ fi
 cyan "[check] NetRuleRouter workspace quality baseline"
 
 cyan "[check] sync duplicates"
-# Through `bash`, like CI invokes this script: the .sh files are recorded in
-# git without an executable bit, so a direct call fails on a fresh checkout.
+# Through `bash`, like CI invokes this script: a copy that lost its executable
+# bit (an archive, a Windows checkout) still runs.
 bash "$script_dir/clean-sync-duplicates.sh" --self-test
 bash "$script_dir/clean-sync-duplicates.sh"
 
@@ -411,6 +417,18 @@ cyan "[check] tests: cargo test --workspace"
 test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/nrr-gate.XXXXXX")"
 trap 'rm -rf "$test_tmp"' EXIT
 TMPDIR="$test_tmp" cargo test --workspace
+
+if [ "$include_privileged" -eq 1 ]; then
+  cyan "[check] privileged tests: cargo test -p nrr-platform-linux -p nrr-service-runtime -- --ignored"
+  # One thread: these tests share the machine-wide route table and nftables.
+  # Already built above, so root only runs them; PATH is passed on because sudo resets it.
+  privileged=(cargo test -p nrr-platform-linux -p nrr-service-runtime -- --ignored --test-threads=1)
+  if [ "$(id -u)" -eq 0 ]; then
+    TMPDIR="$test_tmp" "${privileged[@]}"
+  else
+    sudo -E env "PATH=$PATH" "TMPDIR=$test_tmp" "${privileged[@]}"
+  fi
+fi
 
 if ! command -v cargo-deny >/dev/null 2>&1; then
   message='cargo-deny is not installed. Install it with `cargo install --locked cargo-deny` to enable dependency/license checks.'

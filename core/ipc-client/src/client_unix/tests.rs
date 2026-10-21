@@ -18,6 +18,7 @@ fn negotiate_over_socketpair_parses_ok() {
             "payload": {
                 "server-version": 1,
                 "negotiated-protocol": CLIENT_PROTOCOL_VERSION,
+                "contract-revision": nrr_shared::ipc::IPC_CONTRACT_REVISION,
                 "service-version": "test-1.0",
                 "session-id": "sess-1",
             }
@@ -340,7 +341,7 @@ fn an_oversized_request_is_refused_without_killing_the_connection() {
             envelope: serde_json::json!({
                 "request-id": "req-big",
                 "operation": "x",
-                "payload": { "blob": "x".repeat(2 * 1024 * 1024) },
+                "payload": { "blob": "x".repeat(nrr_shared::ipc_transport::IPC_MAX_MESSAGE_BYTES) },
             }),
             response_tx: big_tx,
             abandoned: Arc::new(AtomicBool::new(false)),
@@ -471,6 +472,7 @@ fn spawn_stub_server_counting(
                             "payload": {
                                 "server-version": 1,
                     "negotiated-protocol": CLIENT_PROTOCOL_VERSION,
+                                "contract-revision": nrr_shared::ipc::IPC_CONTRACT_REVISION,
                                 "service-version": "stub",
                                 "session-id": "stub-session",
                             }
@@ -763,6 +765,7 @@ fn negotiate_ok_reply() -> Value {
         "payload": {
             "server-version": 1,
             "negotiated-protocol": CLIENT_PROTOCOL_VERSION,
+            "contract-revision": nrr_shared::ipc::IPC_CONTRACT_REVISION,
             "service-version": "stub",
             "session-id": "stub-session",
         }

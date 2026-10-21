@@ -57,16 +57,38 @@ everyone signed in share it.
   their tunnel, the traffic your rules do not route goes through that tunnel
   too, and the app tells you so in the window, the tray and the terminal
   interface, naming the connection. The notice disappears when that stops.
-- **Known limitation.** When the users rely on **different VPN connections**
-  and the first one sends all their traffic through their VPN, addresses that
-  only the second user's rules name can travel through the second user's VPN
-  for the first user too. Nothing is exposed to the open internet — the
-  traffic still goes through a VPN — but not through the one the first user
-  chose. If that matters, give both users the same additional connection, or
-  avoid signing in with two different VPNs at once.
+- **Known limitation.** An address that one user's rules send through their
+  additional connection takes that connection for every other signed-in user
+  whose own rules do not name it, because the route belongs to the whole
+  computer. When everyone uses the same additional connection this changes
+  nothing. When they use different ones, or one of them uses none, another
+  user's traffic to that address goes through a connection they did not
+  choose. If that matters, give everyone the same additional connection, or
+  avoid having people with different VPNs signed in at once.
 
 Background services of the computer follow the routes that are in place,
 so leak protection covers them for every address a signed-in user routes.
+
+## Containers and virtual machines
+
+Traffic the computer passes on for WSL, containers and virtual machines
+belongs to no single user, so it follows the user who signed in first, on
+Windows and on Linux. If that user's additional connection drops and their
+leak protection holds traffic, the traffic of WSL and virtual machines is held
+too, even while another signed-in user's connection is up.
+
+## What stays your own
+
+- **Recent changes** list only your own edits, and **connection history**
+  only your own programs. In NetRuleRouter nobody else reads yours, an
+  administrator included.
+- **Program rules by folder** never take the programs in another person's
+  profile, and a new rule cannot name a folder there. An administrator who
+  wants one rule for everyone's own copy of a program writes it with a
+  profile folder, such as `%LOCALAPPDATA%\Discord\*` or `~/apps/*`: it then
+  names each user's own folder.
+- **Allowing a protected rule** that reaches past your own programs, other
+  people's programs included, needs an administrator.
 
 ## See also
 

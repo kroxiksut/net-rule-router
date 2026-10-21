@@ -1,0 +1,354 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Copyright (c) 2024 Nathaniel Bennett <me[at]nathanielbennett[dotcom]>
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+//! TUN/TAP interface for various other Unix systems.
+//!
+//!
+//!
+//!
+
+mod tap;
+mod tun;
+
+pub use tap::Tap;
+pub use tun::Tun;
+
+use std::net::IpAddr;
+#[cfg(not(target_os = "windows"))]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
+use std::{io, ptr};
+
+use crate::libc_extra::*;
+use crate::{AddAddress, AddressInfo, DeviceState, Interface};
+
+#[cfg(not(doc))]
+#[inline]
+pub(crate) fn ifreq_empty() -> ifreq {
+    ifreq {
+        ifr_name: [0; libc::IFNAMSIZ],
+        ifr_ifru: __c_anonymous_ifr_ifru {
+            ifru_data: ptr::null_mut(),
+        },
+    }
+}
+
+#[repr(transparent)]
+pub(crate) struct TunImpl {
+    tun: Tun,
+}
+
+impl TunImpl {
+    #[cfg(any(target_os = "dragonfly", target_os = "freebsd"))]
+    #[inline]
+    pub fn create() -> io::Result<u32> {
+        Tun::create()
+    }
+
+    #[inline]
+    pub fn create_numbered(device_num: u32) -> io::Result<()> {
+        Tun::create_numbered(device_num)
+    }
+
+    #[inline]
+    pub fn destroy(self) -> io::Result<()> {
+        self.tun.destroy()
+    }
+
+    #[inline]
+    pub fn destroy_named(if_name: Interface) -> io::Result<()> {
+        Tun::destroy_named(if_name)
+    }
+
+    #[inline]
+    pub fn destroy_numbered(device_num: u32) -> io::Result<()> {
+        Tun::destroy_numbered(device_num)
+    }
+
+    #[inline]
+    pub fn exists(if_name: Interface) -> io::Result<bool> {
+        Tun::exists(if_name)
+    }
+
+    #[inline]
+    pub fn exists_numbered(device_num: u32) -> io::Result<bool> {
+        Tun::exists_numbered(device_num)
+    }
+
+    #[cfg(any(feature = "portable-racy", not(target_os = "freebsd")))]
+    #[inline]
+    pub fn open(device_num: u32) -> io::Result<Self> {
+        Ok(Self {
+            tun: Tun::open(device_num)?,
+        })
+    }
+
+    #[cfg(not(any(target_os = "netbsd", target_os = "openbsd")))]
+    #[inline]
+    pub fn new() -> io::Result<Self> {
+        Ok(Self { tun: Tun::new()? })
+    }
+
+    #[inline]
+    pub fn new_compat(device_num: u32) -> io::Result<Self> {
+        Ok(Self {
+            tun: Tun::new_compat(device_num)?,
+        })
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[inline]
+    pub fn new_numbered(device_num: u32) -> io::Result<Self> {
+        Ok(Self {
+            tun: Tun::new_numbered(device_num)?,
+        })
+    }
+
+    #[inline]
+    pub fn addrs(&self) -> io::Result<Vec<AddressInfo>> {
+        self.tun.addrs()
+    }
+
+    #[inline]
+    pub fn add_addr<A: Into<AddAddress>>(&self, req: A) -> io::Result<()> {
+        self.tun.add_addr(req)
+    }
+
+    #[inline]
+    pub fn remove_addr(&self, addr: IpAddr) -> io::Result<()> {
+        self.tun.remove_addr(addr)
+    }
+
+    #[inline]
+    pub fn name(&self) -> io::Result<Interface> {
+        self.tun.name()
+    }
+
+    #[inline]
+    pub fn set_state(&self, state: DeviceState) -> io::Result<()> {
+        self.tun.set_state(state)
+    }
+
+    #[inline]
+    pub fn state(&self) -> io::Result<DeviceState> {
+        self.tun.state()
+    }
+
+    #[inline]
+    pub fn mtu(&self) -> io::Result<usize> {
+        self.tun.mtu()
+    }
+
+    #[inline]
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.tun.set_nonblocking(nonblocking)
+    }
+
+    #[inline]
+    pub fn nonblocking(&self) -> io::Result<bool> {
+        self.tun.nonblocking()
+    }
+
+    /// Sends a packet out over the TUN device.
+    #[inline]
+    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.tun.send(buf)
+    }
+
+    #[inline]
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.tun.recv(buf)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl AsRawFd for TunImpl {
+    fn as_raw_fd(&self) -> RawFd {
+        self.tun.as_raw_fd()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl AsFd for TunImpl {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.tun.as_fd()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl FromRawFd for TunImpl {
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        Self {
+            tun: Tun::from_raw_fd(fd),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl IntoRawFd for TunImpl {
+    fn into_raw_fd(self) -> RawFd {
+        self.tun.into_raw_fd()
+    }
+}
+
+pub(crate) struct TapImpl {
+    tap: Tap,
+}
+
+impl TapImpl {
+    #[cfg(any(target_os = "dragonfly", target_os = "freebsd"))]
+    #[inline]
+    pub fn create() -> io::Result<u32> {
+        Tap::create()
+    }
+
+    #[inline]
+    pub fn create_numbered(device_num: u32) -> io::Result<()> {
+        Tap::create_numbered(device_num)
+    }
+
+    #[inline]
+    pub fn destroy(self) -> io::Result<()> {
+        self.tap.destroy()
+    }
+
+    #[inline]
+    pub fn destroy_named(if_name: Interface) -> io::Result<()> {
+        Tap::destroy_named(if_name)
+    }
+
+    #[inline]
+    pub fn destroy_numbered(device_num: u32) -> io::Result<()> {
+        Tap::destroy_numbered(device_num)
+    }
+
+    #[inline]
+    pub fn exists(if_name: Interface) -> io::Result<bool> {
+        Tap::exists(if_name)
+    }
+
+    #[inline]
+    pub fn exists_numbered(device_num: u32) -> io::Result<bool> {
+        Tap::exists_numbered(device_num)
+    }
+
+    #[cfg(any(not(target_os = "freebsd"), feature = "portable-racy"))]
+    #[inline]
+    pub fn open(device_num: u32) -> io::Result<Self> {
+        Ok(Self {
+            tap: Tap::open(device_num)?,
+        })
+    }
+
+    #[cfg(not(any(target_os = "netbsd", target_os = "openbsd")))]
+    #[inline]
+    pub fn new() -> io::Result<Self> {
+        Ok(Self { tap: Tap::new()? })
+    }
+
+    #[inline]
+    pub fn new_compat(device_num: u32) -> io::Result<Self> {
+        Ok(Self {
+            tap: Tap::new_compat(device_num)?,
+        })
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[inline]
+    pub fn new_numbered(device_num: u32) -> io::Result<Self> {
+        Ok(Self {
+            tap: Tap::new_numbered(device_num)?,
+        })
+    }
+
+    #[inline]
+    pub fn addrs(&self) -> io::Result<Vec<AddressInfo>> {
+        self.tap.addrs()
+    }
+
+    #[inline]
+    pub fn add_addr<A: Into<AddAddress>>(&self, req: A) -> io::Result<()> {
+        self.tap.add_addr(req)
+    }
+
+    #[inline]
+    pub fn remove_addr(&self, addr: IpAddr) -> io::Result<()> {
+        self.tap.remove_addr(addr)
+    }
+
+    #[inline]
+    pub fn name(&self) -> io::Result<Interface> {
+        self.tap.name()
+    }
+
+    #[inline]
+    pub fn set_state(&self, state: DeviceState) -> io::Result<()> {
+        self.tap.set_state(state)
+    }
+
+    #[inline]
+    pub fn state(&self) -> io::Result<DeviceState> {
+        self.tap.state()
+    }
+
+    #[inline]
+    pub fn mtu(&self) -> io::Result<usize> {
+        self.tap.mtu()
+    }
+
+    #[inline]
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.tap.set_nonblocking(nonblocking)
+    }
+
+    #[inline]
+    pub fn nonblocking(&self) -> io::Result<bool> {
+        self.tap.nonblocking()
+    }
+
+    #[inline]
+    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.tap.send(buf)
+    }
+
+    #[inline]
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.tap.recv(buf)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl AsFd for TapImpl {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.tap.as_fd()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl AsRawFd for TapImpl {
+    fn as_raw_fd(&self) -> RawFd {
+        self.tap.as_raw_fd()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl FromRawFd for TapImpl {
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        Self {
+            tap: Tap::from_raw_fd(fd),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl IntoRawFd for TapImpl {
+    fn into_raw_fd(self) -> RawFd {
+        self.tap.into_raw_fd()
+    }
+}

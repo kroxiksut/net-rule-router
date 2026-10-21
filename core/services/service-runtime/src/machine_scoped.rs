@@ -78,7 +78,6 @@ impl MachineScopedSetting {
             | Op::RoutingPauseGet
             | Op::RoutingPauseToggle
             | Op::AutostartGet
-            | Op::AutostartToggle
             | Op::ExplainGet
             | Op::DiagnosticsExportArchive
             | Op::ServiceStabilityConfigGet
@@ -127,7 +126,8 @@ impl MachineScopedSetting {
             | Op::RulesAppPathCoverageGet
             | Op::RulesOverridePreview
             | Op::RulesOverrideGrant
-            | Op::RulesOverrideRevoke => None,
+            | Op::RulesOverrideRevoke
+            | Op::RouteVpnGatewaysSet => None,
         }
     }
 

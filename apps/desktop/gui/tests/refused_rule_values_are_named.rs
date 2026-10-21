@@ -114,7 +114,7 @@ const CONFIRMED_MUTATIONS: &[ConfirmedMutation] = &[
         file: "apps/desktop/qml/flows/FullResetController.qml",
         confirm: "applyEmptyRules",
         completion: None,
-        markers: &["onComplete(failure === \"\")"],
+        markers: &["onComplete(failure === \"\", failure)"],
     },
     ConfirmedMutation {
         file: "apps/desktop/qml/sections/DiagnosticsSection.qml",

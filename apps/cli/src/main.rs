@@ -71,6 +71,12 @@ fn main() -> ExitCode {
         ),
     };
 
+    // Before the stop, by the user who asked: their clients read it from their
+    // own temp directory, and an elevated re-run would write to the admin's.
+    if stops_service(&invocation.command) {
+        nrr_shared::user_paths::note_expected_stop();
+    }
+
     let code = run(invocation.command.clone(), &ctx);
     if code != exit::NEEDS_PRIVILEGE {
         return ExitCode::from(code);
@@ -83,6 +89,22 @@ fn main() -> ExitCode {
         Some(elevated) => ExitCode::from(elevated),
         None => ExitCode::from(code),
     }
+}
+
+/// Whether the verb takes the service down on purpose, so the user's clients
+/// do not report the stop as a failure.
+fn stops_service(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Stop
+            | Command::Restart
+            | Command::Uninstall { .. }
+            | Command::Reinstall
+            | Command::ResetNetwork {
+                stop_service: true,
+                ..
+            }
+    )
 }
 
 /// What every verb needs to know about the invocation it is running under.
@@ -675,6 +697,27 @@ fn yes_no(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_verbs_that_take_the_service_down_leave_the_stop_marker() {
+        assert!(stops_service(&Command::Stop));
+        assert!(stops_service(&Command::Restart));
+        assert!(stops_service(&Command::Reinstall));
+        assert!(stops_service(&Command::Uninstall {
+            purge: false,
+            purge_audit: false
+        }));
+        assert!(stops_service(&Command::ResetNetwork {
+            confirmed: true,
+            stop_service: true
+        }));
+        assert!(!stops_service(&Command::ResetNetwork {
+            confirmed: true,
+            stop_service: false
+        }));
+        assert!(!stops_service(&Command::Start));
+        assert!(!stops_service(&Command::Status));
+    }
 
     fn ctx(elevation: elevate::ElevationPlan) -> Ctx<'static> {
         Ctx {

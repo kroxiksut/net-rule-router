@@ -160,6 +160,91 @@ QtObject {
         })
     }
 
+    // ── Incomplete package ───────────────────────────────────────────────────
+    //
+    // What this copy of the program lacks: the launcher's payload lookup
+    // (`context.deliveryGaps`) plus the service's own components it reports as
+    // missing. One card; its id names the parts, so a part found missing later
+    // replaces the card and a dismissed set stays dismissed.
+    property var _deliveryGaps: []
+    property var _missingComponents: []
+    property string _deliveryNoticeId: ""
+    property bool _shippedComponentsChecked: false
+
+    function noteDeliveryGaps(slugs) {
+        var list = []
+        for (var i = 0; i < (slugs || []).length; i += 1) list.push(String(slugs[i]))
+        _deliveryGaps = list
+        _raiseDeliveryNotice()
+    }
+
+    /// Once a session, when the service first answers: it is the process that
+    /// loads the driver, so only it can say the driver is not there.
+    function checkShippedComponentsOnce() {
+        if (_shippedComponentsChecked) return
+        if (typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcThirdPartyComponentsList !== "function") return
+        var corr = nrrNativeBridge.rpcThirdPartyComponentsList()
+        if (!corr) return
+        _shippedComponentsChecked = true
+        root.rpc.registerRpcCallback(corr, function(ok, payload) {
+            // An older service without the list just leaves the card to the rest.
+            if (!ok) return
+            notificationsController._missingComponents =
+                Pure.missingShippedComponents((payload && payload.components) || [])
+            notificationsController._raiseDeliveryNotice()
+        })
+    }
+
+    function _deliveryPartText(slug) {
+        if (slug === "presets")
+            return root.tr("notifications.delivery-incomplete.part.presets",
+                "the ready-made rule sets")
+        if (slug === "locales")
+            return root.tr("notifications.delivery-incomplete.part.locales",
+                "the interface languages, so the program is shown in English")
+        if (slug === "service-binary")
+            return root.tr("notifications.delivery-incomplete.part.service-binary",
+                "the background service, so it cannot be installed or started from this window")
+        return String(slug)
+    }
+
+    function _raiseDeliveryNotice() {
+        var parts = []
+        var keys = []
+        for (var i = 0; i < _deliveryGaps.length; i += 1) {
+            parts.push(_deliveryPartText(_deliveryGaps[i]))
+            keys.push(_deliveryGaps[i])
+        }
+        for (var j = 0; j < _missingComponents.length; j += 1) {
+            var c = _missingComponents[j]
+            parts.push(root.tr("notifications.delivery-incomplete.part.component",
+                    "{name} (needed for: {feature})")
+                .replace("{name}", String(c.name))
+                .replace("{feature}", root.tr("dialog.third-party.feature." + String(c.feature),
+                    String(c.feature))))
+            keys.push("component:" + String(c.key))
+        }
+        var id = keys.length > 0 ? "delivery-incomplete:" + keys.join(",") : ""
+        if (id === _deliveryNoticeId) return
+        if (_deliveryNoticeId !== "") _dropPushNotice(_deliveryNoticeId)
+        _deliveryNoticeId = id
+        if (id === "") return
+        _addPushNotice({
+            "id": id,
+            "kind": "delivery-incomplete",
+            "severity": "warning",
+            "dismissible": true,
+            "title": root.tr("notifications.delivery-incomplete.title",
+                "The installation is incomplete"),
+            "body": root.tr("notifications.delivery-incomplete.body",
+                    "This copy of the program lacks {parts}. Everything else keeps working. Reinstall the program to restore what is missing.")
+                .replace("{parts}", parts.join("; ")),
+            "actionKey": "open-release-page",
+            "actionText": root.tr("notifications.update-available.action", "Open download page")
+        })
+    }
+
     function _expirePushNotices() {
         var now = Date.now()
         var kept = []
@@ -235,6 +320,7 @@ QtObject {
         else if (actionKey === "open-auto-rule-suggestions") root.autoRuleSuggestionsController.openAutoRuleSuggestions()
         else if (actionKey === "open-interfaces") root.section = "interfaces-routes"
         else if (actionKey === "open-rules") root.section = "rules"
+        else if (actionKey === "open-diagnostics") root.section = "diagnostics"
         else if (actionKey === "open-outage-blocks") root.openOutageBlocks()
         else if (actionKey === "verify-verdicts-move") root.moveVerifyVerdicts()
         else if (actionKey === "verify-verdicts-later") root.dismissVerifyVerdicts()
@@ -244,6 +330,7 @@ QtObject {
         else if (actionKey === "restore-settings") root.settingsRestoreController.restore()
         else if (actionKey === "trust-vpn-client") root._trustVpnClient(actionArg, false)
         else if (actionKey === "trust-vpn-client-bundle") root._trustVpnClient(actionArg, true)
+        else if (actionKey === "trust-vpn-gateway") root._trustVpnGateway(actionArg)
         else if (actionKey === "open-release-page") {
             // The release the notice names; else the project's releases page.
             var u = (root.updateCheckController.offer || {}).url || ""
@@ -323,13 +410,4 @@ QtObject {
         root.noticeLedger.record(String(notificationId))
         _dropPushNotice(notificationId)
     }
-
-    // Reactive mirror of the strict kill-switch
-    // (block-all) setting for the notifications centre. `prefs.routeKillSwitchBlockAll`
-    // is mutated IN PLACE by `applyKillSwitchBlockAll` (which does NOT emit
-    // `prefsChanged`) and is reassigned wholesale on prefs (re)load — so neither
-    // path alone reliably re-evaluates a `prefs.*`-reading binding. This bool is a
-    // real property (its own change signal) driven in BOTH: `onPrefsChanged` (every
-    // prefs reassignment — load / reseed / restore) and `applyKillSwitchBlockAll`
-    // (the in-place live toggle). `activeNotifications` gates the strict notice on it.
 }

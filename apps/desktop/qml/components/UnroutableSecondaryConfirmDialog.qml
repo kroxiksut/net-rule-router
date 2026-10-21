@@ -11,8 +11,10 @@
 //                    route.
 //   "assign-primary" -- ... as the main connection, which the service will not
 //                    route through.
-//   "kill-switch" -- the user is about to arm leak protection while such an
+//   "leak-protection" -- the user is about to arm leak protection while such an
 //                    adapter is already bound.
+//   "holds-now"   -- the user is about to choose "Everything" while the
+//                    additional connection is not available; no adapter named.
 //
 // The dialog is "dumb": it emits `confirmed()` / `cancelled()` and the caller
 // owns the action. Shared state arrives through `ownerRoot` (the
@@ -31,7 +33,7 @@ Dialog {
     /// Reason slug from `Pure.unroutableInterfaceReasonSlug`:
     /// "virtual-host-only" | "no-forwarding-path".
     property string reasonSlug: ""
-    /// "assign" | "assign-primary" | "kill-switch".
+    /// "assign" | "assign-primary" | "leak-protection" | "holds-now".
     property string contextSlug: "assign"
     /// Whether leak protection is armed right now (only read in the "assign"
     /// direction, where it decides between "not routed" and "blocked").
@@ -57,8 +59,9 @@ Dialog {
             "It has no gateway and no route out, so there is nowhere for it to send traffic.")
 
     readonly property bool _primary: contextSlug === "assign-primary"
+    readonly property bool _holdsNow: contextSlug === "holds-now"
 
-    readonly property string _situationText: contextSlug === "kill-switch"
+    readonly property string _situationText: contextSlug === "leak-protection"
         ? tr("dialog.unroutable-secondary.body-kill-switch",
             "It is currently assigned as your additional route.")
         : (_primary
@@ -67,7 +70,7 @@ Dialog {
             : tr("dialog.unroutable-secondary.body-assign",
                 "You are about to assign it as your additional route."))
 
-    readonly property string _killSwitchText: contextSlug === "kill-switch"
+    readonly property string _killSwitchText: contextSlug === "leak-protection"
         ? tr("dialog.unroutable-secondary.effect-kill-switch-arming",
             "Once leak protection is on, those destinations are BLOCKED instead: the sites behind those rules stop loading.")
         : (killSwitchArmed
@@ -80,8 +83,9 @@ Dialog {
     popupType: Popup.Item
     anchors.centerIn: parent
     width: 520
-    title: tr("dialog.unroutable-secondary.title",
-        "This adapter cannot carry traffic out")
+    title: _holdsNow
+        ? tr("dialog.leak-holds-now.title", "The additional connection is not available")
+        : tr("dialog.unroutable-secondary.title", "This adapter cannot carry traffic out")
     standardButtons: Dialog.NoButton
     closePolicy: Popup.NoAutoClose
     background: Rectangle {
@@ -106,6 +110,7 @@ Dialog {
             font.bold: true
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
             textFormat: Text.PlainText
+            visible: !root._holdsNow
             text: root.tr("dialog.unroutable-secondary.adapter-line",
                 "Adapter: {name}").replace("{name}", root.adapterName)
             Accessible.role: Accessible.StaticText
@@ -115,7 +120,10 @@ Dialog {
             Layout.fillWidth: true
             wrapMode: Text.Wrap
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
-            text: root._situationText + " " + root._reasonText
+            text: root._holdsNow
+                ? root.tr("dialog.leak-holds-now.body",
+                    "With leak protection set to Everything, traffic is held right away: the internet stops until the additional connection returns.")
+                : root._situationText + " " + root._reasonText
             Accessible.role: Accessible.StaticText
             Accessible.name: text
         }
@@ -123,6 +131,7 @@ Dialog {
             Layout.fillWidth: true
             wrapMode: Text.Wrap
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+            visible: !root._holdsNow
             text: root._primary
                 ? root.tr("dialog.unroutable-secondary.effect-routing-primary",
                     "The service will not route through it: traffic your rules do not route keeps going the way the system sends it. Choose the connection that reaches the internet as main.")
@@ -138,7 +147,10 @@ Dialog {
                 ? root.ownerRoot.uiTheme.colorWarning
                 : palette.text
             visible: !root._primary
-            text: root._killSwitchText
+            text: root._holdsNow
+                ? root.tr("dialog.leak-holds-now.effect",
+                    "Your local network and what your rules send over the main connection keep working.")
+                : root._killSwitchText
             Accessible.role: Accessible.StaticText
             Accessible.name: text
         }
@@ -160,7 +172,7 @@ Dialog {
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                 highlighted: true
-                text: root.contextSlug === "kill-switch"
+                text: root.contextSlug === "leak-protection" || root._holdsNow
                     ? root.tr("dialog.unroutable-secondary.confirm-kill-switch",
                         "Turn it on anyway")
                     : root.tr("dialog.unroutable-secondary.confirm-assign",

@@ -32,8 +32,11 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::ipc_transport::IPC_MAX_MESSAGE_BYTES;
 
-/// Read one length-prefixed JSON frame from `r` and decode into `T`.
-pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, WireError> {
+const INITIAL_FRAME_CAPACITY: usize = 64 * 1024;
+
+/// Read one length-prefixed frame from `r` and return its payload bytes,
+/// undecoded.
+pub fn read_frame_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, WireError> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).map_err(WireError::Io)?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -46,8 +49,34 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, WireErro
             limit: IPC_MAX_MESSAGE_BYTES,
         });
     }
-    let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload).map_err(WireError::Io)?;
+    // The first chunk is read before reserving the rest: a header alone,
+    // claiming the cap, reserves little. Past it the remainder is reserved
+    // once, so growth never doubles past the declared length.
+    let first = len.min(INITIAL_FRAME_CAPACITY);
+    let mut payload = Vec::with_capacity(first);
+    read_exactly(r, &mut payload, first)?;
+    if len > first {
+        payload.reserve_exact(len - first);
+        read_exactly(r, &mut payload, len - first)?;
+    }
+    Ok(payload)
+}
+
+fn read_exactly<R: Read>(r: &mut R, out: &mut Vec<u8>, n: usize) -> Result<(), WireError> {
+    let before = out.len();
+    r.by_ref()
+        .take(n as u64)
+        .read_to_end(out)
+        .map_err(WireError::Io)?;
+    if out.len() - before != n {
+        return Err(WireError::Io(std::io::ErrorKind::UnexpectedEof.into()));
+    }
+    Ok(())
+}
+
+/// Read one length-prefixed JSON frame from `r` and decode into `T`.
+pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, WireError> {
+    let payload = read_frame_bytes(r)?;
     serde_json::from_slice(&payload).map_err(|e| WireError::Decode(e.to_string()))
 }
 
@@ -195,6 +224,37 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         let result: Result<Sample, _> = read_frame(&mut cursor);
         assert!(matches!(result, Err(WireError::PayloadTooLarge { .. })));
+    }
+
+    #[test]
+    fn a_header_claiming_the_cap_with_no_body_is_a_short_read() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&(IPC_MAX_MESSAGE_BYTES as u32).to_be_bytes());
+        buf.extend_from_slice(b"{}");
+        let mut cursor = Cursor::new(buf);
+        let result: Result<Sample, _> = read_frame(&mut cursor);
+        assert!(matches!(result, Err(WireError::Io(_))));
+    }
+
+    #[test]
+    fn a_frame_at_the_cap_roundtrips() {
+        let body =
+            serde_json::json!({ "kind": "x".repeat(IPC_MAX_MESSAGE_BYTES - 32), "value": 1 });
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame(&mut buf, &body).unwrap();
+        assert!(buf.len() - 4 <= IPC_MAX_MESSAGE_BYTES);
+        let got: serde_json::Value = read_frame(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(got["value"], 1);
+    }
+
+    #[test]
+    fn a_large_frame_reserves_its_declared_length_once() {
+        let len = 3 * 1024 * 1024;
+        let mut buf = (len as u32).to_be_bytes().to_vec();
+        buf.resize(4 + len, b' ');
+        let payload = read_frame_bytes(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(payload.len(), len);
+        assert!(payload.capacity() < len + len / 4, "no doubling slack");
     }
 
     #[test]

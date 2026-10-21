@@ -10,6 +10,7 @@ use super::*;
 /// client). Individual entries are swapped for real
 /// implementations without changing this entrypoint's signature.
 pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc<IpcHandlerDeps>) {
+    attach_own_resolver_offers(&deps);
     for op in IpcOperationName::ALL {
         match op {
             IpcOperationName::ContractNegotiate => {
@@ -269,12 +270,6 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             }
             IpcOperationName::AutostartGet => {
                 registry.register(op, AutostartGetHandler::new(deps.autostart.clone()));
-            }
-            IpcOperationName::AutostartToggle => {
-                registry.register_checked(
-                    op,
-                    AutostartToggleHandler::new(deps.autostart_writer.clone()),
-                );
             }
             // Each gates on its dep being wired; missing dep falls back to
             // the fallback stub so the catalog-coverage test still sees
@@ -636,6 +631,16 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register_checked(op, UnimplementedHandler::new(op));
                 }
             },
+            // The book is process-wide; the boot wires its store and push.
+            IpcOperationName::RouteVpnGatewaysSet => {
+                registry.register_checked(
+                    op,
+                    RouteVpnGatewaysSetHandler::new(
+                        crate::vpn_gateway_confirm::global_vpn_gateways(),
+                        deps.route_policy_apply_trigger.clone(),
+                    ),
+                );
+            }
             IpcOperationName::AutoRuleCandidatesProbe => match deps.auto_rule_probe.clone() {
                 Some(runner) => {
                     registry.register_checked(op, AutoRuleCandidatesProbeHandler::new(runner));
@@ -866,4 +871,24 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             },
         }
     }
+}
+
+/// The trace ring and the suggestion engine meet only here: a program found
+/// resolving names on its own becomes an application offer.
+fn attach_own_resolver_offers(deps: &IpcHandlerDeps) {
+    let (Some(ring), Some(engine)) = (deps.conn_trace_ring.as_ref(), deps.auto_rules.as_ref())
+    else {
+        return;
+    };
+    let engine = Arc::clone(engine);
+    ring.attach_own_resolver_offers(
+        Arc::new(crate::own_resolver_watch::OwnResolverWatch::new(
+            crate::own_resolver_watch::KnownResolvers::builtin(),
+        )),
+        Arc::new(
+            move |sid: &str, program: &str, unnamed: &[std::net::IpAddr]| {
+                engine.note_app_own_resolver(sid, program, unnamed, std::time::SystemTime::now());
+            },
+        ),
+    );
 }

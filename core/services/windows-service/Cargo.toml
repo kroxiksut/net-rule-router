@@ -53,7 +53,7 @@ serde_json = "1"
 # Standard Rust binding for Windows Service Control Manager. MIT/Apache
 # (allowed under our license policy). 0.7 is the current major; pinned
 # to that band so SCM API surface stays stable.
-windows-service = "0.7"
+windows-service = "0.8"
 # Direct Win32 bindings for the named-pipe IPC server:
 # CreateNamedPipeW, ConnectNamedPipe, ReadFile/WriteFile on pipe handles,
 # SDDL → SECURITY_DESCRIPTOR conversion, OpenProcess + token info for

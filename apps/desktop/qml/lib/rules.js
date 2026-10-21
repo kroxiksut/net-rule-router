@@ -38,13 +38,21 @@ function valueIsAnyZone(value) {
     return /\.\*$/.test(String(value || "").trim())
 }
 
+// An IPv6 literal: the check leaves from an IPv4 source, so the service turns
+// a `?` on one into a plain route.
+function valueIsIpv6Literal(ruleType, value) {
+    var rt = String(ruleType || "")
+    return rt === "exact-ipv6" || (rt === "exact-ip" && String(value || "").indexOf(":") >= 0)
+}
+
 // The `?` a row actually carries: a route rule of a type that takes it. A
-// block, another type or a site in every zone drops it.
+// block, another type, a site in every zone or an IPv6 literal drops it.
 function rowIsVerify(row) {
     if (!row || row.verify !== true) return false
     var t = String(row.targetRoute || "")
     return (t === "primary" || t === "secondary") && ruleTypeAllowsVerify(row.ruleType)
         && !valueIsAnyZone(row.matchValue)
+        && !valueIsIpv6Literal(row.ruleType, row.matchValue)
 }
 
 // The preset format version this build writes. Mirrors
@@ -286,6 +294,7 @@ function buildCanonicalRulesText(rulesModel, route, passthroughSections, include
             if (isAuto && section === "Domains") section = "Auto"
             var line = oneLineField(row.matchValue).trim()
             if (line === "") continue
+            if (section === appSection) line = programValueOnLine(line, !!row.enabled)
             // A block row is never rowIsVerify, so the two marks never meet.
             if (rowRoute === "block") line = "!" + line
             else if (rowIsVerify(row)) line = "?" + line
@@ -1003,7 +1012,17 @@ function ruleRowFromForm(f, id, h) {
         // because `ListModel.set` merges roles and would keep the old badge.
         originReason: "",
         originAnchor: "",
-        originAdded: ""
+        originAdded: "",
+        // Verdicts belong to the old value too; the service's answer for the
+        // new one replaces them.
+        validationStatus: "valid",
+        validationMessageKey: "",
+        validationMessageArgs: ({}),
+        hostsOverrideIp: "",
+        hostsOverrideBlocking: false,
+        mainRoute: "",
+        pinnedCount: 0,
+        pinnedSample: ""
     }
 }
 
@@ -1661,6 +1680,26 @@ function _bulkSplitRuleFlags(value) {
     return { value: kept.join(" "), children: children, override: override }
 }
 
+// `unquote_program_value`: the value inside one outer pair of quotes,
+// trimmed; null when it is not enclosed or encloses nothing.
+function _unquoteProgramValue(value) {
+    var v = String(value)
+    if (v.length < 2 || v.charAt(0) !== "\"" || v.charAt(v.length - 1) !== "\"") return null
+    var inner = _rvcTrim(v.substring(1, v.length - 1))
+    return inner === "" ? null : inner
+}
+
+// `program_value_on_line`: a program's value in quotes where the bare value
+// would not read back; the flags stay outside them.
+function programValueOnLine(value, enabled) {
+    var split = _bulkSplitRuleFlags(String(value))
+    var bare = split.value
+    var misread = _unquoteProgramValue(bare) !== null
+        || (!enabled && !_bulkIsDisabledRuleValue("application", bare))
+    if (bare === "" || !misread) return value
+    return storedRuleValue("application", "\"" + bare + "\"", split.children, split.override)
+}
+
 // `stored_rule_value`: a table keeps `+children` and `+override` on a program
 // only.
 function storedRuleValue(ruleType, value, children, override) {
@@ -1955,7 +1994,9 @@ function _bulkLine(ctx, raw, lineNo) {
     var marks = _bulkMarkers(collapsed, type === "domain" || type === "exact-ip")
     var value = marks.rest
     if (value === "") return null
-    if (hashed && !_bulkIsDisabledRuleValue(type, value)) return null
+    var quoted = type === "application" ? _unquoteProgramValue(value) : null
+    if (quoted !== null) value = quoted
+    if (hashed && quoted === null && !_bulkIsDisabledRuleValue(type, value)) return null
     row.value = storedRuleValue(type, value, children, override)
     row.enabled = !hashed
     if (marks.deny) row.route = "block"
@@ -2009,6 +2050,10 @@ function _bulkLine(ctx, raw, lineNo) {
         // A deny takes no check: the `?` is dropped, as the form drops it.
         row.status = "warning"
         row.key = "dialog.rule.verify-deny"
+    } else if (row.verify && valueIsIpv6Literal(row.type, row.value)) {
+        row.verify = false
+        row.status = "warning"
+        row.key = "dialog.rule.verify-ipv6"
     } else {
         row.status = "ok"
     }

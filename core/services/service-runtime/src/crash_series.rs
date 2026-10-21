@@ -96,6 +96,12 @@ pub fn end_run(dir: &Path) {
     let _ = write(dir, &read(dir).stopped());
 }
 
+/// Whether the last recorded run has not been marked as stopped.
+#[cfg(test)]
+pub(crate) fn run_marked_active(dir: &Path) -> bool {
+    read(dir).running
+}
+
 /// Record a start and, when it completes a crash loop, withdraw every
 /// confirmation before the first enforcement pass reads one. Returns how many
 /// users lost theirs.

@@ -2,6 +2,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import "../lib/pure.js" as Pure
+import "../lib/plurals.js" as Plurals
 
 // Top banner stack (extracted from Main.qml). The status banners
 // (backend / combined-amber / drift / merge / compat / secondary-adapter /
@@ -31,6 +32,29 @@ Item {
         + localNetworkOfferBanner.height + appGroupsOfferBanner.height
         + bindingDivergenceBanner.height
     height: totalHeight
+
+    // The service stopped though nobody asked for it: the banner says so and
+    // offers the way out next to "Start service". Re-read on each state change,
+    // not bound, because "was a stop asked for" lives outside QML.
+    property bool serviceWasRunning: false
+    property var serviceLossActions: []
+    function refreshServiceLoss() {
+        if (typeof nrrServiceController === "undefined" || !nrrServiceController) {
+            serviceLossActions = []
+            return
+        }
+        var slug = root._serviceStatusSlug()
+        if (slug === "running") serviceWasRunning = true
+        var expected = typeof nrrServiceController.stopWasExpected === "function"
+            && nrrServiceController.stopWasExpected()
+        serviceLossActions = Pure.serviceLossStep(false, slug, serviceWasRunning,
+            expected === true, root.supports("killSwitch")).actions
+    }
+    Connections {
+        target: (typeof nrrServiceController !== "undefined") ? nrrServiceController : null
+        function onStatusChanged() { topBannerStack.refreshServiceLoss() }
+    }
+    Component.onCompleted: refreshServiceLoss()
 
     // Expansion state of the combined amber banner. Local to the stack — the
     // window owns only the "are both warnings up?" predicate.
@@ -98,7 +122,10 @@ Item {
             Label {
                 Layout.fillWidth: true
                 color: "white"
-                text: root.backendStatusBannerText()
+                text: topBannerStack.serviceLossActions.length > 0
+                    ? root.tr("connection.banner.service-lost",
+                        "The NetRuleRouter service stopped unexpectedly, so your rules are not applied")
+                    : root.backendStatusBannerText()
                 verticalAlignment: Text.AlignVCenter
                 elide: Text.ElideRight
             }
@@ -130,6 +157,18 @@ Item {
                         "dialog.service-not-running.start-service-description",
                         "Start the background service (requires administrator privileges).")
                 onClicked: root._startServiceFromBanner()
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                visible: topBannerStack.serviceLossActions.indexOf("restore-network") >= 0
+                enabled: !(typeof nrrServiceController !== "undefined"
+                    && nrrServiceController && nrrServiceController.busy)
+                text: root.tr("settings.service.recovery.action", "Restore network")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                Accessible.description: root.tr("settings.service.recovery.tooltip",
+                    "Needs administrator rights. Connections open right now may drop.")
+                onClicked: root.focusSetting("restore-network", {})
             }
         }
     }
@@ -443,11 +482,14 @@ Item {
         anchors.top: mergeBanner.bottom
         anchors.left: parent.left
         anchors.right: parent.right
-        height: root.compatBannerHeight
+        height: root.compatBannerVisible
+            ? Math.max(root.compatBannerHeight, compatRow.implicitHeight + 2 * root.uiTheme.spacingXs)
+            : 0
         visible: root.compatBannerVisible
         color: "#c0392b"
         z: 98
         RowLayout {
+            id: compatRow
             anchors.fill: parent
             anchors.leftMargin: root.uiTheme.spacingMd
             anchors.rightMargin: root.uiTheme.spacingMd
@@ -455,7 +497,12 @@ Item {
             Label {
                 Layout.fillWidth: true
                 color: "white"
-                text: root.tr(
+                text: root.contractSkew !== ""
+                    ? root.tr("status.contract-skew." + root.contractSkew,
+                        root.contractSkew === "service-older"
+                            ? "The background service is older than this window. Changes are off until both match: update or restart the service."
+                            : "This window is from a different build than the background service. Changes are off until both match: restart the window or update the app.")
+                    : root.tr(
                     "status.compat-banner-body",
                     "Incompatible versions: service {sv} (protocol {sp}), app {gv} (protocol {gp}). Update the {target}.")
                     .replace("{sv}", root._compatServiceVersion || "—")
@@ -467,7 +514,7 @@ Item {
                             ? root.tr("status.compat-banner-target-gui", "app")
                             : root.tr("status.compat-banner-target-service", "service"))
                 verticalAlignment: Text.AlignVCenter
-                elide: Text.ElideRight
+                wrapMode: Text.WordWrap
                 Accessible.role: Accessible.StaticText
                 Accessible.name: text
             }
@@ -544,10 +591,11 @@ Item {
                             ? root.tr("status.secondary-unresolved",
                                 "The additional adapter \"{name}\" assigned to your rules isn't available right now — start it, or choose a different adapter in Interfaces and routes. While it's missing, matching traffic is blocked (leak protection) instead of leaking over your main connection.")
                                 .replace("{name}", Pure.displayText(root.prefs.selectedSecondaryInterfaceName))
-                            : root.tr("status.vpn-split-conflict",
-                                "Your additional adapter \"{name}\" is up and carrying exactly what you asked it to: your {n} rule(s) go through it, everything else stays on your main connection. That is selective routing doing its job — nothing here needs fixing. If you would rather send everything through it, switch the mode in Settings → Routing behavior.")
-                                .replace("{name}", root.interfacesRolesController._vpnConflictSecondaryDisplayName())
-                                .replace("{n}", String(root.interfacesRolesController._enabledSecondaryRuleCount()))))
+                            : Plurals.counted(root.tr, "status.vpn-split-conflict.",
+                                root.interfacesRolesController._enabledSecondaryRuleCount(),
+                                "Your additional adapter \"{name}\" is up and carrying exactly what you asked it to: your {count} rule goes through it, everything else stays on your main connection. That is selective routing doing its job — nothing here needs fixing. If you would rather send everything through it, switch the mode in Settings → Routing behavior.",
+                                "Your additional adapter \"{name}\" is up and carrying exactly what you asked it to: your {count} rules go through it, everything else stays on your main connection. That is selective routing doing its job — nothing here needs fixing. If you would rather send everything through it, switch the mode in Settings → Routing behavior.")
+                                .replace("{name}", root.interfacesRolesController._vpnConflictSecondaryDisplayName())))
                     : ""
                 textFormat: Text.PlainText
                 verticalAlignment: Text.AlignVCenter
@@ -788,9 +836,9 @@ Item {
         }
     }
 
-    // Block-all fail-closed warning. Last in the top banner stack.
-    // Amber (a live, deliberately-protective state that is currently blocking
-    // unknown traffic — not a hard error), content-driven height so the
+    // "Holding all traffic" warning. Last in the top banner stack.
+    // Amber (a live, deliberately-protective state that is currently holding
+    // traffic — not a hard error), content-driven height so the
     // wrapping explanation is never clipped. Gated by `blockAllBannerVisible`
     // (posture armed + the warnKillSwitchBlockAll pref opt-in + not
     // acknowledged). The close button persists an acknowledgement that hides
@@ -821,7 +869,7 @@ Item {
                 Layout.fillWidth: true
                 color: "white"
                 text: root.tr("settings.routing.kill-switch.block-all-active-banner",
-                    "Leak protection is blocking unknown traffic: the additional adapter can't be found (down, not started, or reinstalled under a new ID). Sites open as they become known; reconnect the VPN or re-bind the adapter to lift the block.")
+                    "Leak protection is holding all traffic: the additional connection can't be found (down, not started, or reinstalled under a new ID). The internet waits until it returns; reconnect the VPN or assign the adapter again.")
                 verticalAlignment: Text.AlignVCenter
                 wrapMode: Text.WordWrap
                 Accessible.role: Accessible.StaticText

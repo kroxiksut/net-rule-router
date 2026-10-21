@@ -23,7 +23,9 @@ Notifications:
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the listed programs as your VPN, so leak protection keeps them working
+  a: allow the listed VPNs to reach their servers, so leak protection lets them connect
   p: confirm the suggested main connection; another one is chosen under Interfaces and routes
+  v: send the blocked site named under the state over the additional route; you are asked first
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Diagnostics and logs
@@ -31,7 +33,7 @@ Service: OK
 Service:
   Service unavailable
   Loading...
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
 Audit trail:
   No data from the service yet
   No data from the service yet
@@ -45,7 +47,7 @@ Diagnostic archive export:
   Ready
   x: Diagnostic archive export
 Commands on this screen:
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
   c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
@@ -74,7 +76,7 @@ Service:
   The service started 2.4 s before this boot reached the sign-in screen.
   Cache healthy · Entries: 42
   3 log file(s)
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
 Audit trail:
   Audit chain intact
   Security alerts requiring attention: 1
@@ -93,7 +95,7 @@ Diagnostic archive export:
   Ready
   x: Diagnostic archive export
 Commands on this screen:
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
   c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
@@ -115,7 +117,7 @@ Service:
   The service started 2.4 s before this boot reached the sign-in screen.
   Cache healthy · Entries: 42
   3 log file(s)
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
 Audit trail:
   Audit chain intact
   Security alerts requiring attention: 1
@@ -134,7 +136,7 @@ Diagnostic archive export:
   Ready
   x: Diagnostic archive export
 Commands on this screen:
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
   c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
@@ -153,7 +155,7 @@ Service:
   The service started 2.4 s before this boot reached the sign-in screen.
   Cache healthy · Entries: 42
   3 log file(s)
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
 Audit trail:
   Audit chain intact
   Security alerts requiring attention: 1
@@ -173,7 +175,7 @@ Diagnostic archive export:
   Ready
   x: Diagnostic archive export
 Commands on this screen:
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
   c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
@@ -190,9 +192,9 @@ Service: OK
 Operational logs:
   Level: All levels · Event type: any · Time range: Current session
   Loading...
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
 Commands on this screen:
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
   c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
@@ -210,9 +212,9 @@ Service: OK
 Operational logs:
   Level: Info · Event type: any · Time range: Current session
   Loading...
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
 Commands on this screen:
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
   c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route

@@ -1,0 +1,182 @@
+//! The order of a full reset and what each step's result decides
+//! (`fullResetNext` in `pure.js`).
+//!
+//! The service is stopped last because every earlier step needs it answering;
+//! a step that fails does not abort the ones after it, except when the client
+//! cannot gain the rights the step asked for: then the flow stops and says so,
+//! rather than stopping a service whose rules are still in place.
+
+/// One step of the reset, in the order they run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    ClearLogs,
+    ResetSidecar,
+    PurgePrincipalData,
+    ApplyEmptyRules,
+    StopService,
+}
+
+/// The order the steps run in.
+pub const ORDER: [Step; 5] = [
+    Step::ClearLogs,
+    Step::ResetSidecar,
+    Step::PurgePrincipalData,
+    Step::ApplyEmptyRules,
+    Step::StopService,
+];
+
+impl Step {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClearLogs => "clear-logs",
+            Self::ResetSidecar => "reset-sidecar",
+            Self::PurgePrincipalData => "purge-principal-data",
+            Self::ApplyEmptyRules => "apply-empty-rules",
+            Self::StopService => "stop-service",
+        }
+    }
+
+    pub fn parse(slug: &str) -> Option<Self> {
+        ORDER.into_iter().find(|s| s.as_str() == slug)
+    }
+}
+
+/// How a step ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Ok,
+    Failed,
+    /// Refused for want of administrator rights.
+    Forbidden,
+    /// Nothing to do on this client.
+    Skipped,
+}
+
+impl Outcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+            Self::Forbidden => "forbidden",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    /// An unknown word counts as a failure, never as success.
+    pub fn parse(slug: &str) -> Self {
+        match slug {
+            "ok" => Self::Ok,
+            "forbidden" => Self::Forbidden,
+            "skipped" => Self::Skipped,
+            _ => Self::Failed,
+        }
+    }
+}
+
+/// What to do after the steps done so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next {
+    Run(Step),
+    /// All steps ran; `cleared` says the service-side state is gone and the
+    /// service stopped.
+    Finish {
+        cleared: bool,
+    },
+    /// The flow ends here: `step` was refused and this client cannot elevate.
+    NeedsElevation {
+        step: Step,
+    },
+}
+
+/// The next move (`fullResetNext`). `done` is the steps already run, in order,
+/// with their outcomes; `can_elevate` says the client asks for administrator
+/// approval by itself when a step is refused (the window does, the terminal
+/// does not).
+pub fn next(can_elevate: bool, done: &[(Step, Outcome)]) -> Next {
+    if let Some(&(step, Outcome::Forbidden)) = done.last() {
+        let needs_rights = matches!(step, Step::PurgePrincipalData | Step::ApplyEmptyRules);
+        if needs_rights && !can_elevate {
+            return Next::NeedsElevation { step };
+        }
+    }
+    match ORDER.get(done.len()) {
+        Some(step) => Next::Run(*step),
+        None => {
+            let ok = |wanted: Step| done.iter().any(|&(s, o)| s == wanted && o == Outcome::Ok);
+            Next::Finish {
+                cleared: ok(Step::PurgePrincipalData)
+                    && ok(Step::ApplyEmptyRules)
+                    && ok(Step::StopService),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use Outcome::{Failed, Forbidden, Ok as Good, Skipped};
+
+    fn run(results: &[Outcome]) -> Vec<(Step, Outcome)> {
+        ORDER.into_iter().zip(results.iter().copied()).collect()
+    }
+
+    #[test]
+    fn steps_run_in_the_documented_order() {
+        let mut done = Vec::new();
+        for expected in ORDER {
+            assert_eq!(next(false, &done), Next::Run(expected));
+            done.push((expected, Good));
+        }
+        assert_eq!(next(false, &done), Next::Finish { cleared: true });
+    }
+
+    #[test]
+    fn the_service_is_stopped_last() {
+        assert_eq!(ORDER[4], Step::StopService);
+    }
+
+    #[test]
+    fn a_failed_best_effort_step_does_not_abort() {
+        assert_eq!(next(false, &run(&[Failed])), Next::Run(Step::ResetSidecar));
+        let done = run(&[Failed, Skipped, Good, Good, Good]);
+        assert_eq!(next(false, &done), Next::Finish { cleared: true });
+    }
+
+    #[test]
+    fn a_refused_purge_stops_the_flow_without_elevation() {
+        let done = run(&[Good, Skipped, Forbidden]);
+        assert_eq!(
+            next(false, &done),
+            Next::NeedsElevation {
+                step: Step::PurgePrincipalData
+            }
+        );
+        assert_eq!(next(true, &done), Next::Run(Step::ApplyEmptyRules));
+    }
+
+    #[test]
+    fn refused_rules_never_reach_the_service_stop_without_elevation() {
+        let done = run(&[Good, Good, Good, Forbidden]);
+        assert_eq!(
+            next(false, &done),
+            Next::NeedsElevation {
+                step: Step::ApplyEmptyRules
+            }
+        );
+    }
+
+    #[test]
+    fn a_refused_log_clear_is_not_a_reason_to_stop() {
+        assert_eq!(
+            next(false, &run(&[Forbidden])),
+            Next::Run(Step::ResetSidecar)
+        );
+    }
+
+    #[test]
+    fn a_failed_stop_downgrades_the_result() {
+        let done = run(&[Good, Good, Good, Good, Failed]);
+        assert_eq!(next(false, &done), Next::Finish { cleared: false });
+    }
+}

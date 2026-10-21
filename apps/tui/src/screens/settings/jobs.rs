@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use base64::Engine as _;
+use nrr_client_logic::review::{operation_outcome, Outcome};
+use nrr_client_logic::rollback::{rollback_verdict, RollbackPhase};
 use nrr_client_logic::{route_policy, stability};
 use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
 use nrr_platform_api::service_control::ServiceControlError;
@@ -14,15 +16,16 @@ use nrr_shared::ipc_payloads::{
     ApplyFailurePolicyDto, BlockNoticeMuteDto, BlockNoticeMuteScopeDto,
     BlockNoticeMutesListResponse, ConnHistoryClearResponse, ConnHistoryListResponse,
     LocalDnsSuffixesGetResponse, LocalNetworksGetResponse, LocalNetworksSetResponse,
-    LogRetentionConfigDto, LogRetentionConfigSetRequest, LogsClearResponse, RetentionSettingsDto,
-    RetentionSettingsSetRequest, SettingsExportFullResponse, StorageUsageDto,
-    TrafficStatsGetResponse, TrafficStatsSettingsDto,
+    LogRetentionConfigDto, LogRetentionConfigSetRequest, LogsClearResponse,
+    ProductImpactDisableDryRunResponse, RetentionSettingsDto, RetentionSettingsSetRequest,
+    RollbackTargetDto, SettingsExportFullResponse, StorageUsageDto, TrafficStatsGetResponse,
+    TrafficStatsSettingsDto,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 
 use super::items::Words;
-use super::{text, Failure, Loadable, ServiceInfo};
+use super::{text, Failure, Loadable, RollbackOffer, ServiceInfo};
 use crate::backend::{Job, RegistrationProbe, Reply};
 use crate::state::AppState;
 use crate::view::StateTone;
@@ -32,7 +35,7 @@ const SERVICE_WAIT: Duration = Duration::from_secs(30);
 /// Written into the service's log with every stability write.
 const ORIGIN: &str = "user:tui";
 
-fn call(client: &dyn IpcClient, op: Op, payload: Value) -> Result<Value, Failure> {
+pub(super) fn call(client: &dyn IpcClient, op: Op, payload: Value) -> Result<Value, Failure> {
     client
         .call(op, payload, ipc_operation_timeout(op))
         .map_err(|e| Failure::from_ipc(&e))
@@ -84,7 +87,7 @@ fn written<T: Send + 'static>(
 // ── Reads ────────────────────────────────────────────────────────────────────
 
 /// The live `route-policy`, raw: a write echoes back every field it carries.
-fn policy_of(client: &dyn IpcClient) -> Result<Map<String, Value>, Failure> {
+pub(super) fn policy_of(client: &dyn IpcClient) -> Result<Map<String, Value>, Failure> {
     let snapshot = call(client, Op::SnapshotInitialGet, json!({}))?;
     Ok(object(
         snapshot.get("route-policy").cloned().unwrap_or(Value::Null),
@@ -350,6 +353,8 @@ pub fn write_policy(changes: Map<String, Value>) -> Job {
             let base = route_policy::build_full_update_request(&current, default_mode());
             let mut request = base.clone();
             request.extend(changes);
+            // A new default route may not offer the level held; the level moves with it.
+            route_policy::settle_leak_protection(&mut request);
             // Only what changed: a whole row would revert what the tray wrote since.
             let Some(named) = route_policy::name_changes(&base, request.clone()) else {
                 return Ok(current);
@@ -372,6 +377,10 @@ pub fn write_stability(partial: Map<String, Value>) -> Job {
     job(move |client| {
         let result = (|| {
             let live = object(call(client, Op::ServiceStabilityConfigGet, json!({}))?);
+            // A Set that changes nothing would still ask for an administrator.
+            if stability::patch_changes_nothing(&live, &partial) {
+                return Ok(live);
+            }
             let config = stability::merge_write(&live, &Map::new(), &Map::new(), &partial);
             let answer = call(
                 client,
@@ -469,6 +478,130 @@ pub fn set_log_retention(request: LogRetentionConfigSetRequest) -> Job {
             });
         written(result, Words::Key(text::SAVED), |app, config| {
             app.settings.data.log_retention = Loadable::Ready(config);
+        })
+    })
+}
+
+/// The GUI's "Apply rules" switch: the service keeps the state per user and
+/// announces it, so the screen follows the answer, not the click.
+pub fn set_rules_paused(paused: bool) -> Job {
+    job(move |client| {
+        let result = call(client, Op::RoutingPauseToggle, json!({ "paused": paused }));
+        Reply::new(move |app| match result {
+            Ok(_) => {
+                if let Some(snapshot) = app.snapshot.as_mut() {
+                    snapshot.routing_paused = paused;
+                }
+                app.settings.done(Words::Key(text::SAVED));
+            }
+            Err(failure) => app.settings.failed(text::NOT_SAVED, failure),
+        })
+    })
+}
+
+/// The GUI's two-phase safe disable: a dry run mints the token, the confirm
+/// spends it with the same reason. The row's confirmation is the review.
+pub fn safe_disable(reason: String) -> Job {
+    job(move |client| {
+        let result = read::<ProductImpactDisableDryRunResponse>(
+            client,
+            Op::ProductImpactDisableTemporary,
+            json!({ "reason": reason, "dry-run": true }),
+        )
+        .and_then(|dry| {
+            call(
+                client,
+                Op::ProductImpactDisableTemporary,
+                json!({
+                    "reason": reason,
+                    "dry-run": false,
+                    // The client lifts this to the envelope.
+                    "_envelope_confirmation_token": dry.confirmation_token,
+                }),
+            )
+        });
+        Reply::new(move |app| match result {
+            Ok(_) => app.settings.done(Words::Key(text::SAFE_DISABLE_DONE)),
+            Err(failure) => app.settings.failed(text::NOT_SAVED, failure),
+        })
+    })
+}
+
+/// The GUI's safe-rollback dry run: asks what would be restored and keeps
+/// the token that restores it.
+pub fn rollback_lookup() -> Job {
+    job(|client| {
+        let result = call(client, Op::RollbackRequest, json!({ "dry-run": true }));
+        Reply::new(move |app| match result {
+            Ok(answer) => {
+                let verdict = rollback_verdict(true, &answer, None);
+                match (verdict.phase, verdict.target) {
+                    (RollbackPhase::Ready, Some(target)) => {
+                        app.settings.rollback = RollbackOffer::Ready {
+                            token: verdict.token,
+                            target,
+                        };
+                    }
+                    (RollbackPhase::None, _) => app.settings.rollback = RollbackOffer::Nothing,
+                    _ => {
+                        let failure = Failure {
+                            slug: verdict.code,
+                            elevation: false,
+                            detail: String::new(),
+                        };
+                        app.settings.failed(text::ROLLBACK_FAILED, failure);
+                    }
+                }
+            }
+            Err(failure) => app.settings.failed(text::ROLLBACK_FAILED, failure),
+        })
+    })
+}
+
+/// Spends the lookup's token. The rollback runs before the answer; the
+/// operation record has the verdict when there is one.
+pub fn rollback_run(token: String, target: RollbackTargetDto) -> Job {
+    job(move |client| {
+        let result = call(
+            client,
+            Op::RollbackRequest,
+            json!({ "dry-run": false, "_envelope_confirmation_token": token }),
+        )
+        .map(|answer| {
+            let id = answer
+                .get("operation-id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if id.is_empty() {
+                return None;
+            }
+            let status = call(
+                client,
+                Op::OperationStatusGet,
+                json!({ "operation-id": id }),
+            )
+            .ok()
+            .and_then(|v| serde_json::from_value(v).ok());
+            operation_outcome(status.as_ref())
+        });
+        Reply::new(move |app| match result {
+            Ok(Some(Outcome::Failed(code))) => {
+                let failure = Failure {
+                    slug: code,
+                    elevation: false,
+                    detail: String::new(),
+                };
+                app.settings.failed(text::ROLLBACK_FAILED, failure);
+            }
+            Ok(Some(Outcome::Applied)) => {
+                let at = target.activated_at.unwrap_or(0).saturating_mul(1000);
+                let time = app.settings.clock.format(at);
+                app.settings
+                    .done(Words::Fill(text::ROLLBACK_DONE, vec![("time", time)]));
+            }
+            Ok(None) => app.settings.done(Words::Key(text::ROLLBACK_SUBMITTED)),
+            Err(failure) => app.settings.failed(text::ROLLBACK_FAILED, failure),
         })
     })
 }

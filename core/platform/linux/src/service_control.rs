@@ -86,6 +86,10 @@ pub trait SystemdOps {
     fn run(&self, argv: &[String]) -> io::Result<CommandOutcome>;
     /// Whether anything, a dangling link included, is at `path`.
     fn exists(&self, path: &Path) -> bool;
+    /// Remove the packet policy, routes and routing rules a daemon left;
+    /// whether the machine is clean. Behind the port so a test never sweeps
+    /// the kernel it runs on.
+    fn sweep_machine_state(&self) -> bool;
 }
 
 /// The real implementation: filesystem writes and `systemctl` spawns.
@@ -150,6 +154,13 @@ impl SystemdOps for FsOps {
 
     fn exists(&self, path: &Path) -> bool {
         std::fs::symlink_metadata(path).is_ok()
+    }
+
+    fn sweep_machine_state(&self) -> bool {
+        // Both run whatever the first one says.
+        let filters_swept = sweep_nft_policy();
+        let routing_swept = sweep_routing();
+        filters_swept && routing_swept
     }
 
     fn run(&self, argv: &[String]) -> io::Result<CommandOutcome> {
@@ -635,8 +646,8 @@ impl ServiceControlPort for LinuxServiceControl {
         // The unit is gone, but the packet policy the daemon installed is not:
         // an instance that was killed rather than stopped leaves its nft table
         // behind, and nothing is left that would clear it. Same reason the
-        // Windows port sweeps WFP and NRPT here.
-        let machine_state_cleared = Some(sweep_nft_policy());
+        // Windows port sweeps WFP, NRPT and routes here.
+        let machine_state_cleared = Some(self.ops.sweep_machine_state());
         self.sweep_autostart_entries(&AutostartSweepEnv::from_process());
 
         if !spec.remove_service_owned_data {
@@ -781,6 +792,29 @@ fn sweep_nft_policy() -> bool {
         );
     }
     true
+}
+
+/// Our routing rules and routes, by the signature the `cleanup` verb sweeps
+/// with: a stop that kept the rule routes, or a killed daemon, leaves them.
+/// Rules first: without one pointing at it a table is inert.
+fn sweep_routing() -> bool {
+    let rules = crate::policy_routing::sweep_selectors()
+        .map_err(|e| e.to_string())
+        .map(|_| ());
+    let routes = crate::policy_routing::sweep_routes()
+        .map_err(|e| e.to_string())
+        .map(|_| ());
+    for error in [&rules, &routes]
+        .into_iter()
+        .filter_map(|r| r.as_ref().err())
+    {
+        tracing::warn!(
+            target: "nrr::routes",
+            error = %error,
+            "could not remove every route or routing rule of ours at uninstall; a reboot clears them",
+        );
+    }
+    rules.is_ok() && routes.is_ok()
 }
 
 /// Whose tray autostart entry a removal sweeps.
@@ -985,6 +1019,9 @@ mod tests {
         }
         fn exists(&self, path: &Path) -> bool {
             self.present.iter().any(|p| p == path)
+        }
+        fn sweep_machine_state(&self) -> bool {
+            true
         }
     }
 

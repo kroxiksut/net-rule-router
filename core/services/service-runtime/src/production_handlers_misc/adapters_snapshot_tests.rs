@@ -181,7 +181,7 @@ fn fold_cached_external_persists_fresh_resolution_keyed_by_name() {
         .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
 
     let mut rows = rows_with_fresh_ethernet_probe();
-    provider.fold_cached_external(&mut rows);
+    provider.fold_cached_external(&mut rows, true);
 
     let calls = recorder.calls.lock().expect("lock");
     assert_eq!(
@@ -227,7 +227,7 @@ fn a_remembered_address_under_a_reused_name_is_forgotten_not_shown() {
     for row in &mut rows {
         row.observed_facts.external_ip = None;
     }
-    provider.fold_cached_external(&mut rows);
+    provider.fold_cached_external(&mut rows, true);
 
     assert_eq!(
         recorder.forgotten.lock().expect("lock").as_slice(),
@@ -249,7 +249,7 @@ fn a_remembered_address_under_a_reused_name_is_forgotten_not_shown() {
     for row in &mut rows {
         row.observed_facts.external_ip = None;
     }
-    provider.fold_cached_external(&mut rows);
+    provider.fold_cached_external(&mut rows, true);
     assert!(recorder.forgotten.lock().expect("lock").is_empty());
 }
 
@@ -266,14 +266,14 @@ fn fold_cached_external_does_not_persist_a_replayed_address() {
         .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
 
     let mut first = rows_with_fresh_ethernet_probe();
-    provider.fold_cached_external(&mut first);
+    provider.fold_cached_external(&mut first, true);
     assert_eq!(recorder.calls.lock().expect("lock").len(), 1);
 
     let mut second = rows_with_fresh_ethernet_probe();
     for row in &mut second {
         row.observed_facts.external_ip = None;
     }
-    provider.fold_cached_external(&mut second);
+    provider.fold_cached_external(&mut second, true);
     assert_eq!(
         recorder.calls.lock().expect("lock").len(),
         1,
@@ -287,5 +287,81 @@ fn without_a_recorder_fold_cached_external_is_a_noop_for_persistence() {
     let provider = provider_over(api);
     let mut rows = nrr_platform_api::interface_rows::fallback_rows();
     // Must not panic without a recorder wired.
-    provider.fold_cached_external(&mut rows);
+    provider.fold_cached_external(&mut rows, true);
+}
+
+fn ethernet_external(
+    rows: &[nrr_platform_api::interface_rows::InterfaceRouteRow],
+) -> Option<String> {
+    rows.iter()
+        .find(|row| row.name == "Ethernet")
+        .and_then(|row| row.observed_facts.external_ip.clone())
+}
+
+fn without_fresh_probe(
+    mut rows: Vec<nrr_platform_api::interface_rows::InterfaceRouteRow>,
+) -> Vec<nrr_platform_api::interface_rows::InterfaceRouteRow> {
+    for row in &mut rows {
+        row.observed_facts.external_ip = None;
+    }
+    rows
+}
+
+/// The tunnel went down: the exit it had is not its exit any more, and on its
+/// return it may leave by another one, so nothing is shown until it is
+/// checked again.
+#[test]
+fn a_link_that_went_down_shows_no_remembered_external_address() {
+    let provider = provider_over(Arc::new(MockWindowsApi::new()));
+    let mut fresh = rows_with_fresh_ethernet_probe();
+    provider.fold_cached_external(&mut fresh, true);
+
+    let mut up = without_fresh_probe(rows_with_fresh_ethernet_probe());
+    provider.fold_cached_external(&mut up, true);
+    assert_eq!(
+        ethernet_external(&up).as_deref(),
+        Some("203.0.113.10"),
+        "a link that stayed up keeps its address across snapshots"
+    );
+
+    let mut down = without_fresh_probe(rows_with_fresh_ethernet_probe());
+    for row in &mut down {
+        if row.name == "Ethernet" {
+            row.availability_status = nrr_platform_api::BasicAvailabilityStatus::Unavailable;
+        }
+    }
+    provider.fold_cached_external(&mut down, true);
+    assert_eq!(ethernet_external(&down), None, "a down link has no exit");
+
+    let mut back = without_fresh_probe(rows_with_fresh_ethernet_probe());
+    provider.fold_cached_external(&mut back, true);
+    assert_eq!(
+        ethernet_external(&back),
+        None,
+        "back up, on the same local address: still unknown until checked"
+    );
+}
+
+/// A tunnel whose adapter is removed while disconnected (WireGuard does this)
+/// comes back with the same local address; the address it had must not.
+#[test]
+fn a_link_gone_from_a_live_enumeration_is_forgotten() {
+    let provider = provider_over(Arc::new(MockWindowsApi::new()));
+    let mut fresh = rows_with_fresh_ethernet_probe();
+    provider.fold_cached_external(&mut fresh, true);
+
+    let mut gone: Vec<_> = without_fresh_probe(rows_with_fresh_ethernet_probe())
+        .into_iter()
+        .filter(|row| row.name != "Ethernet")
+        .collect();
+    // A placeholder answer says nothing about which adapters exist.
+    provider.fold_cached_external(&mut gone, false);
+    let mut still = without_fresh_probe(rows_with_fresh_ethernet_probe());
+    provider.fold_cached_external(&mut still, true);
+    assert_eq!(ethernet_external(&still).as_deref(), Some("203.0.113.10"));
+
+    provider.fold_cached_external(&mut gone, true);
+    let mut back = without_fresh_probe(rows_with_fresh_ethernet_probe());
+    provider.fold_cached_external(&mut back, true);
+    assert_eq!(ethernet_external(&back), None);
 }

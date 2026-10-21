@@ -65,16 +65,17 @@ pub fn match_rules(
     let avail = &input.match_class_availability;
 
     // A literal-IP Block is an absolute veto: it names the address itself, and
-    // enforcement drops that address whatever name rule a tenant of it has.
+    // enforcement drops that address whatever name rule a tenant of it has. It
+    // reads the same addresses as the literal-IP tier: resolved and observed.
+    let effective_ips = effective_ips_for_matching(input, lookup);
     if avail.exact_ip.is_none() {
-        if let Some(ip) = observed_ip(input) {
-            let vetoes: Vec<_> = collect_exact_ip(rule_book, ip, &input.app_identity)
-                .into_iter()
-                .filter(|c| c.action == RuleAction::Block)
-                .collect();
-            if let Some(winner) = select_winner(vetoes) {
-                return RequestedRouteDecision::MatchedRoute { candidate: winner };
-            }
+        let vetoes: Vec<_> = effective_ips
+            .iter()
+            .flat_map(|ip| collect_exact_ip(rule_book, *ip, &input.app_identity))
+            .filter(|c| c.action == RuleAction::Block)
+            .collect();
+        if let Some(winner) = select_winner(vetoes) {
+            return RequestedRouteDecision::MatchedRoute { candidate: winner };
         }
     }
 
@@ -99,7 +100,6 @@ pub fn match_rules(
     }
 
     // Tier 3: Zone/ExactIp — order per ZonePriorityPolicy
-    let effective_ips = effective_ips_for_matching(input, lookup);
     for tier3_class in zone_policy.tier3_order() {
         let maybe_winner = match tier3_class {
             MatchClass::Zone => {

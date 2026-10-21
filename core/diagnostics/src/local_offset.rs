@@ -5,6 +5,8 @@
 //! read at 10:33 must not say 02:33.
 
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use chrono::{Local, Offset};
 
@@ -12,23 +14,33 @@ use chrono::{Local, Offset};
 /// within the minute, long enough that a busy log never queries the OS twice.
 const REFRESH_MILLIS: i64 = 60_000;
 
-/// Packed cache: the offset in the low 32 bits, the read's monotonic-ish
-/// timestamp in the high bits. One atomic keeps the pair consistent.
+/// Packed cache: the offset in the low 20 bits, the read's monotonic timestamp
+/// in the high bits. One atomic keeps the pair consistent.
 static CACHE: AtomicI64 = AtomicI64::new(i64::MIN);
 
 /// Seconds to add to UTC to get local wall-clock time.
 #[must_use]
 pub fn seconds() -> i32 {
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let cached = CACHE.load(Ordering::Relaxed);
+    // The cache ages on the monotonic clock: aged on the wall clock, a clock
+    // set back would hold the old offset until it passed the read's mark.
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let now_ms =
+        i64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(i64::MAX);
+    cached_or_read(&CACHE, now_ms, || {
+        Local::now().offset().fix().local_minus_utc()
+    })
+}
+
+fn cached_or_read(cache: &AtomicI64, now_ms: i64, read: impl FnOnce() -> i32) -> i32 {
+    let cached = cache.load(Ordering::Relaxed);
     if cached != i64::MIN {
         let (at_ms, offset) = unpack(cached);
-        if now_ms.saturating_sub(at_ms) < REFRESH_MILLIS {
+        if (0..REFRESH_MILLIS).contains(&now_ms.saturating_sub(at_ms)) {
             return offset;
         }
     }
-    let offset = Local::now().offset().fix().local_minus_utc();
-    CACHE.store(pack(now_ms, offset), Ordering::Relaxed);
+    let offset = read();
+    cache.store(pack(now_ms, offset), Ordering::Relaxed);
     offset
 }
 
@@ -82,6 +94,26 @@ mod tests {
         assert_eq!(rfc3339_suffix(8 * 3600), "+08:00");
         assert_eq!(rfc3339_suffix(-(5 * 3600 + 1800)), "-05:30");
         assert_eq!(rfc3339_suffix(5 * 3600 + 2700), "+05:45");
+    }
+
+    #[test]
+    fn a_read_offset_is_reused_for_a_minute_then_read_again() {
+        let cache = AtomicI64::new(i64::MIN);
+        assert_eq!(cached_or_read(&cache, 5_000, || 3 * 3600), 3 * 3600);
+        assert_eq!(
+            cached_or_read(&cache, 64_000, || panic!("read within the minute")),
+            3 * 3600
+        );
+        // The zone changed meanwhile: the next read past the minute sees it.
+        assert_eq!(cached_or_read(&cache, 66_000, || 4 * 3600), 4 * 3600);
+    }
+
+    /// A mark ahead of the clock is never "fresh": the cached pair is read
+    /// again instead of being held until the clock catches up with it.
+    #[test]
+    fn a_mark_ahead_of_the_clock_is_read_again() {
+        let cache = AtomicI64::new(pack(3_600_000, 3 * 3600));
+        assert_eq!(cached_or_read(&cache, 1_000, || -5 * 3600), -5 * 3600);
     }
 
     #[test]

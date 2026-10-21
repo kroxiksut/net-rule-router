@@ -10,6 +10,7 @@ use nrr_domain::user_principal::UserPrincipal;
 use nrr_platform_api::conn_observe::TransportProtocol;
 use nrr_platform_api::fake_ip::FakeIpPoolConfig;
 use nrr_platform_api::types::SERVICE_ACCOUNT_SIDS;
+use nrr_platform_api::vpn_discovery::looks_like_vpn;
 use nrr_shared::ipc_payloads::{
     VpnGatewayCandidateDto, VpnGatewayCandidatesRequest, VpnGatewayCandidatesResponse,
 };
@@ -72,16 +73,19 @@ pub(crate) fn is_service_account(owner: &str, unix_sys_uid_max: u32) -> bool {
 /// Whether `caller` may be offered a row owned by `owner`: their own, the
 /// machine's, or a service account's. Never another person's, elevated or not:
 /// another user's destinations are theirs, and a VPN client runs as a service.
+/// `service_rows` is false for an unelevated caller asking about a program that
+/// is no VPN client: a service account's other programs are not theirs to list.
 pub(super) fn gateway_row_visible(
     caller: &str,
     owner: Option<&str>,
     unix_sys_uid_max: u32,
+    service_rows: bool,
 ) -> bool {
     let Some(owner) = owner.map(str::trim).filter(|o| !o.is_empty()) else {
         return true;
     };
     (!caller.is_empty() && owner.eq_ignore_ascii_case(caller))
-        || is_service_account(owner, unix_sys_uid_max)
+        || (service_rows && is_service_account(owner, unix_sys_uid_max))
 }
 
 /// An address a VPN gateway can have: public, and not one of the product's
@@ -241,8 +245,14 @@ impl IpcHandler for VpnGatewayCandidatesListHandler {
         }
         // Derived from the connection, never from the request.
         let caller = ctx.caller_stored();
+        let service_rows = ctx.caller_is_elevated || looks_like_vpn(&program);
         let rows = self.ring.snapshot_where(0, usize::MAX, |rec| {
-            gateway_row_visible(caller, rec.user_sid.as_deref(), self.unix_sys_uid_max)
+            gateway_row_visible(
+                caller,
+                rec.user_sid.as_deref(),
+                self.unix_sys_uid_max,
+                service_rows,
+            )
         });
         let (candidates, omitted) = fold_gateway_candidates(&rows, &program);
         serialise(
@@ -615,28 +625,69 @@ mod tests {
         assert!(resp.observer_active, "positive control");
     }
 
+    /// A service account's rows are offered for a VPN client; for any other
+    /// program they stay with an elevated caller.
+    #[test]
+    fn service_account_rows_of_other_programs_are_not_listed_to_an_ordinary_caller() {
+        const OTHER: &str = "backup-agent.exe";
+        let handler = handler_over(vec![
+            row(
+                OTHER,
+                Some("S-1-5-18"),
+                TransportProtocol::Tcp,
+                "203.0.113.1:443",
+                1,
+            ),
+            row(
+                OTHER,
+                Some("S-1-5-21-1-2-3-1001"),
+                TransportProtocol::Tcp,
+                "203.0.113.2:443",
+                1,
+            ),
+            row(OTHER, None, TransportProtocol::Tcp, "203.0.113.3:443", 1),
+        ]);
+        let me_id = me().as_stored().to_owned();
+        let own = handler_over(vec![row(
+            OTHER,
+            Some(&me_id),
+            TransportProtocol::Tcp,
+            "203.0.113.4:443",
+            1,
+        )]);
+        assert_eq!(
+            sorted_addresses(ask(&own, OTHER, &ctx(Some(me()), false)).expect("answers")),
+            doc_addresses(&[4]),
+            "their own program's rows are theirs"
+        );
+        assert_eq!(
+            sorted_addresses(ask(&handler, OTHER, &ctx(Some(me()), false)).expect("answers")),
+            doc_addresses(&[3]),
+            "another account's program is not listed to an ordinary caller"
+        );
+        assert_eq!(
+            sorted_addresses(ask(&handler, OTHER, &ctx(Some(me()), true)).expect("answers")),
+            doc_addresses(&[1, 3]),
+            "an elevated caller still sees service accounts' rows"
+        );
+    }
+
     #[test]
     fn the_audience_rule_on_its_own() {
-        assert!(gateway_row_visible(
-            "unix:uid:1000",
-            Some("UNIX:UID:1000"),
-            999
-        ));
-        assert!(gateway_row_visible("unix:uid:1000", Some(""), 999));
-        assert!(gateway_row_visible("", None, 999));
-        assert!(gateway_row_visible("", Some("S-1-5-18"), 999));
-        assert!(!gateway_row_visible("", Some("unix:uid:1000"), 999));
-        assert!(gateway_row_visible("S-1-5-21-9", Some("unix:uid:999"), 999));
-        assert!(!gateway_row_visible(
-            "S-1-5-21-9",
-            Some("unix:uid:1000"),
-            999
-        ));
-        assert!(!gateway_row_visible(
-            "S-1-5-21-9",
-            Some("__baseline__"),
-            999
-        ));
-        assert!(!gateway_row_visible("S-1-5-21-9", Some("S-1-5-21-10"), 999));
+        let visible =
+            |caller, owner, service_rows| gateway_row_visible(caller, owner, 999, service_rows);
+        assert!(visible("unix:uid:1000", Some("UNIX:UID:1000"), true));
+        assert!(visible("unix:uid:1000", Some(""), true));
+        assert!(visible("", None, true));
+        assert!(visible("", Some("S-1-5-18"), true));
+        assert!(!visible("", Some("unix:uid:1000"), true));
+        assert!(visible("S-1-5-21-9", Some("unix:uid:999"), true));
+        assert!(!visible("S-1-5-21-9", Some("unix:uid:1000"), true));
+        assert!(!visible("S-1-5-21-9", Some("__baseline__"), true));
+        assert!(!visible("S-1-5-21-9", Some("S-1-5-21-10"), true));
+        // Without service rows only the caller's own and the machine's remain.
+        assert!(!visible("S-1-5-21-9", Some("S-1-5-18"), false));
+        assert!(visible("S-1-5-21-9", None, false));
+        assert!(visible("S-1-5-21-9", Some("s-1-5-21-9"), false));
     }
 }

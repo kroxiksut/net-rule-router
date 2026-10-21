@@ -22,13 +22,13 @@ use crate::ipc::{
 };
 use crate::ipc_handlers::payloads::{
     ApplyFailurePolicyGetRequest, ApplyFailurePolicySetRequest, AutostartGetRequest,
-    AutostartToggleRequest, LogRetentionConfigGetRequest, LogRetentionConfigSetRequest,
-    RetentionSettingsDto, RetentionSettingsGetRequest, RetentionSettingsSetRequest,
-    RoutingPauseGetRequest, RoutingPauseToggleRequest, StorageUsageGetRequest,
-    TrafficStatsGetRequest, TrafficStatsSetRequest,
+    LogRetentionConfigGetRequest, LogRetentionConfigSetRequest, RetentionSettingsDto,
+    RetentionSettingsGetRequest, RetentionSettingsSetRequest, RoutingPauseGetRequest,
+    RoutingPauseToggleRequest, StorageUsageGetRequest, TrafficStatsGetRequest,
+    TrafficStatsSetRequest,
 };
 use crate::ipc_handlers::providers::{
-    ApplyFailurePolicyProvider, ApplyFailurePolicyWriter, AutostartProvider, AutostartWriter,
+    ApplyFailurePolicyProvider, ApplyFailurePolicyWriter, AutostartProvider,
     LogRetentionConfigProvider, LogRetentionConfigWriter, RetentionSettingsProvider,
     RetentionSettingsWriter, RoutingPauseProvider, RoutingPauseWriter, SettingsWriteError,
     StorageUsageProvider, TrafficStatsProvider, TrafficStatsWriter,
@@ -815,40 +815,6 @@ impl IpcHandler for AutostartGetHandler {
     }
 }
 
-pub struct AutostartToggleHandler {
-    writer: Arc<dyn AutostartWriter>,
-}
-
-impl AutostartToggleHandler {
-    pub fn new(writer: Arc<dyn AutostartWriter>) -> Self {
-        Self { writer }
-    }
-}
-
-impl CheckedIpcHandler for AutostartToggleHandler {
-    type Checked = AutostartToggleRequest;
-
-    fn precheck(
-        &self,
-        request: &IpcRequestEnvelope,
-        _ctx: &IpcRequestContext,
-    ) -> Result<Self::Checked, IpcError> {
-        decode("autostart.toggle", request)
-    }
-
-    fn execute(
-        &self,
-        req: Prechecked<Self::Checked>,
-        _request: &IpcRequestEnvelope,
-        ctx: &IpcRequestContext,
-    ) -> HandlerOutcome {
-        match self.writer.toggle(ctx.caller_stored(), req.enabled) {
-            Ok(dto) => serialise("autostart.toggle", dto),
-            Err(e) => Err(map_settings_write_error(e)),
-        }
-    }
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1404,43 +1370,5 @@ mod tests {
                 updated_at: 0,
             }
         }
-    }
-
-    struct FakeAutostartWriter {
-        last: Mutex<Option<(String, bool)>>,
-    }
-    impl AutostartWriter for FakeAutostartWriter {
-        fn toggle(&self, sid: &str, enabled: bool) -> Result<AutostartDto, SettingsWriteError> {
-            *self.last.lock().unwrap() = Some((sid.to_string(), enabled));
-            Ok(AutostartDto {
-                enabled,
-                last_known_state: if enabled { "enabled" } else { "disabled" }.into(),
-                overridden_value: None,
-                updated_at: 99,
-            })
-        }
-    }
-
-    #[test]
-    fn autostart_toggle_records_intent() {
-        let w = Arc::new(FakeAutostartWriter {
-            last: Mutex::new(None),
-        });
-        let h = AutostartToggleHandler::new(w.clone());
-        let payload = serde_json::json!({"enabled": true});
-        let value = h
-            .handle(
-                &req(IpcOperationName::AutostartToggle, payload),
-                &ctx("S-A"),
-            )
-            .unwrap();
-        let parsed: AutostartDto = serde_json::from_value(value).unwrap();
-        assert!(parsed.enabled);
-        assert_eq!(parsed.last_known_state, "enabled");
-        assert_eq!(
-            *w.last.lock().unwrap(),
-            Some(("S-A".to_string(), true)),
-            "the toggle is attributed to the caller, whose news it is"
-        );
     }
 }

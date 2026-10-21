@@ -6,13 +6,15 @@ use nrr_client_logic::adapters::{
     display_name, held_other_role, is_own_fake_ip_tun, role_hint, rows_are_live as source_is_live,
     unroutable_reason,
 };
-use nrr_client_logic::route_policy::{build_full_update_request, name_changes};
+use nrr_client_logic::route_policy::{
+    build_full_update_request, name_changes, settle_leak_protection,
+};
 use nrr_client_logic::Route;
 use nrr_ipc_client::{ipc_error_to_wire, ipc_operation_timeout, IpcClient, IpcClientError};
 use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
-    InterfaceRowDto, RouteBindingDto, RoutePolicyDto, SnapshotInterfacesResponse,
+    InterfaceRowDto, LeakProtectionDto, RouteBindingDto, RoutePolicyDto, SnapshotInterfacesResponse,
 };
 use serde_json::{json, Map, Value};
 
@@ -301,6 +303,7 @@ fn write_policy(
     let base = build_full_update_request(&stored, "");
     let mut request = base.clone();
     edit(&mut request);
+    settle_leak_protection(&mut request);
     // Only what changed: a whole row would revert what the tray wrote since.
     let Some(request) = name_changes(&base, request) else {
         return Ok((serde_json::from_value(Value::Object(stored)).ok(), None));
@@ -366,7 +369,7 @@ pub fn kill_switch_on(app: &AppState) -> bool {
     app.snapshot
         .as_ref()
         .and_then(|s| s.route_policy.as_ref())
-        .is_some_and(|p| p.kill_switch_enabled)
+        .is_some_and(|p| p.leak_protection != LeakProtectionDto::Off)
 }
 
 /// The GUI's warning before an adapter with no way out takes a role.

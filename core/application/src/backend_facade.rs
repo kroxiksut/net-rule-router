@@ -2,13 +2,12 @@ use nrr_shared::diagnostics_dto::{DiagnosticsStatusDto, SecurityAlertsView};
 
 // One re-export path for these preview modules: `crate::mock_backend`.
 // Consumers reach them as `nrr_application::mock_backend::{diagnostics,
-// network_interfaces, rules}`, not through this module too.
-use crate::mock_backend::{diagnostics, network_interfaces, rules};
+// network_interfaces}`, not through this module too.
+use crate::mock_backend::{diagnostics, network_interfaces};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BackendProviderKind {
     Mock,
-    PreviewLocal,
     /// Real IPC facade, currently connected to the service.
     IpcConnected,
     /// Real IPC facade, disconnected — either reconnecting or serving stale cache.
@@ -68,10 +67,6 @@ pub trait BackendFacade {
         &self,
         request: network_interfaces::RouteSelectionRequest,
     ) -> network_interfaces::InterfacesRoutesPreviewSnapshot;
-    fn rules_snapshot(
-        &self,
-        request: rules::RulesScreenRequest,
-    ) -> rules::RulesScreenPreviewSnapshot;
 
     /// Current connection state. `Connected` for in-process providers; the
     /// IPC-backed facade mirrors the live channel.
@@ -129,68 +124,71 @@ impl BackendFacade for MockBackendFacade {
     ) -> network_interfaces::InterfacesRoutesPreviewSnapshot {
         network_interfaces::interfaces_snapshot_from(self.interface_rows, &request)
     }
-
-    fn rules_snapshot(
-        &self,
-        request: rules::RulesScreenRequest,
-    ) -> rules::RulesScreenPreviewSnapshot {
-        rules::rules_screen_preview_snapshot(request)
-    }
 }
 
-/// Same data as [`MockBackendFacade`], reserved for the future local-only
-/// enforcement preview path — distinct [`BackendProviderKind`] so callers can
-/// tell the two apart, everything else delegated rather than duplicated.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PreviewLocalBackendFacade {
-    inner: MockBackendFacade,
+/// Stand-in for a service that cannot be reached: every service-owned answer
+/// is "unknown", never the preview content, which reads as a healthy service.
+/// Adapter rows are a local fact and stay.
+#[derive(Clone, Debug)]
+pub struct UnavailableBackendFacade {
+    kind: BackendProviderKind,
+    status: BackendConnectionStatus,
+    local: MockBackendFacade,
 }
 
-impl PreviewLocalBackendFacade {
-    /// See [`MockBackendFacade::over`].
+impl UnavailableBackendFacade {
     #[must_use]
-    pub fn over(interface_rows: &'static dyn network_interfaces::InterfaceRowsPort) -> Self {
+    pub fn new(status: BackendConnectionStatus) -> Self {
+        let kind = match status {
+            BackendConnectionStatus::ServiceNotInstalled => {
+                BackendProviderKind::IpcServiceNotInstalled
+            }
+            BackendConnectionStatus::ProtocolMismatch { .. } => {
+                BackendProviderKind::IpcProtocolMismatch
+            }
+            _ => BackendProviderKind::IpcDisconnected,
+        };
         Self {
-            inner: MockBackendFacade::over(interface_rows),
+            kind,
+            status,
+            local: MockBackendFacade::default(),
         }
     }
 }
 
-impl BackendFacade for PreviewLocalBackendFacade {
+impl BackendFacade for UnavailableBackendFacade {
     fn provider_kind(&self) -> BackendProviderKind {
-        BackendProviderKind::PreviewLocal
+        self.kind
     }
 
     fn diagnostics_status_snapshot(&self) -> DiagnosticsStatusDto {
-        self.inner.diagnostics_status_snapshot()
+        DiagnosticsStatusDto::unavailable()
     }
 
-    fn list_security_alerts(&self, state_filter: Option<&str>) -> SecurityAlertsView {
-        self.inner.list_security_alerts(state_filter)
+    fn list_security_alerts(&self, _state_filter: Option<&str>) -> SecurityAlertsView {
+        SecurityAlertsView::unavailable()
     }
 
     fn interfaces_snapshot(
         &self,
         request: network_interfaces::RouteSelectionRequest,
     ) -> network_interfaces::InterfacesRoutesPreviewSnapshot {
-        self.inner.interfaces_snapshot(request)
+        self.local.interfaces_snapshot(request)
     }
 
-    fn rules_snapshot(
-        &self,
-        request: rules::RulesScreenRequest,
-    ) -> rules::RulesScreenPreviewSnapshot {
-        self.inner.rules_snapshot(request)
+    fn connection_status(&self) -> BackendConnectionStatus {
+        self.status.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        network_interfaces, BackendFacade, BackendProviderKind, MockBackendFacade,
-        PreviewLocalBackendFacade,
+        network_interfaces, BackendConnectionStatus, BackendFacade, BackendProviderKind,
+        MockBackendFacade, UnavailableBackendFacade,
     };
     use network_interfaces::{InterfacesDataSource, MockInterfaceRows};
+    use nrr_shared::diagnostics_dto::DiagnosticsDataOrigin;
 
     /// Fixed rows, so the contract is checked the same on every host.
     fn fixed_rows() -> &'static MockInterfaceRows {
@@ -208,17 +206,31 @@ mod tests {
             interfaces.rows.len(),
             network_interfaces::fallback_rows().len()
         );
-        assert!(!facade.rules_snapshot(Default::default()).rows.is_empty());
     }
 
     #[test]
-    fn facade_contract_is_provider_agnostic_for_mock_and_preview_local() {
+    fn the_mock_serves_its_fixed_rows_without_probing() {
         let rows = fixed_rows();
         assert_provider_contract(&MockBackendFacade::over(rows), BackendProviderKind::Mock);
-        assert_provider_contract(
-            &PreviewLocalBackendFacade::over(rows),
-            BackendProviderKind::PreviewLocal,
+        assert_eq!(rows.probe_requests(), vec![false], "never probes");
+    }
+
+    #[test]
+    fn an_unreachable_service_never_reads_as_healthy() {
+        let facade = UnavailableBackendFacade::new(BackendConnectionStatus::ServiceStopped);
+        let status = facade.diagnostics_status_snapshot();
+        assert_eq!(status.origin, DiagnosticsDataOrigin::Unavailable);
+        assert!(!status.overall_healthy);
+        assert!(facade.list_security_alerts(None).stale);
+        assert_eq!(facade.provider_kind(), BackendProviderKind::IpcDisconnected);
+        assert_eq!(
+            facade.connection_status(),
+            BackendConnectionStatus::ServiceStopped
         );
-        assert_eq!(rows.probe_requests(), vec![false, false], "never probes");
+        assert_eq!(
+            UnavailableBackendFacade::new(BackendConnectionStatus::ServiceNotInstalled)
+                .provider_kind(),
+            BackendProviderKind::IpcServiceNotInstalled
+        );
     }
 }

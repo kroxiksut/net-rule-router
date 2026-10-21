@@ -645,4 +645,13 @@ mod tests {
             assert_eq!(outcome.to_policy_state(), expected);
         }
     }
+
+    /// A stored hash must survive a crypto-crate upgrade digit for digit.
+    #[test]
+    fn the_content_hash_spelling_is_pinned() {
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }

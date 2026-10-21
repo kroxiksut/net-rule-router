@@ -223,12 +223,9 @@ impl ProductionDiagnosticsFacade {
             } => {
                 // No rule matched → the DEFAULT route. Derive it from
                 // `behavior_mode` exactly as production does
-                // (`decision_final_action.rs::check_availability`): PreferPrimary
-                // → primary; PreferSecondary* / Strict → secondary.
-                // Availability/fail-policy nuance — e.g. Strict → blocked when
-                // secondary is down — needs a live adapter snapshot the
-                // synthetic probe lacks; reporting the requested default route
-                // is correct for the probe.
+                // (`decision_final_action.rs::check_availability`). Availability
+                // needs a live adapter snapshot the synthetic probe lacks, so
+                // the requested default route is reported.
                 let (role, action) = default_route_explain_projection(*behavior_mode);
                 (
                     Some(role.to_string()),
@@ -742,11 +739,9 @@ pub(super) fn match_class_reason_slug(
 /// (when no rule matched) to the `(compact-view route slug, final-action
 /// locale key)` the synthetic explain reports. Mirrors the production
 /// requested-role derivation in `decision_final_action.rs::check_availability`:
-/// `PreferPrimary → primary`; `PreferSecondaryWhenAvailable` /
-/// `StrictSecondaryFailClosed → secondary`. Availability/fail-policy nuance
-/// (e.g. Strict → blocked when secondary is unavailable) needs a live adapter
-/// snapshot the synthetic probe does not have, so the *requested* default
-/// route is reported. Both locale keys already exist (used by the
+/// `PreferPrimary → primary`; `PreferSecondaryWhenAvailable → secondary`.
+/// Availability needs a live adapter snapshot the synthetic probe does not
+/// have, so the *requested* default route is reported. Both locale keys already exist (used by the
 /// `MatchedRoute` arm), so this adds no new strings.
 pub(super) fn default_route_explain_projection(
     behavior_mode: nrr_domain::RouteBehaviorMode,
@@ -755,8 +750,7 @@ pub(super) fn default_route_explain_projection(
         nrr_domain::RouteBehaviorMode::PreferPrimary => {
             ("primary", "diag.explain.final-action.route-primary")
         }
-        nrr_domain::RouteBehaviorMode::PreferSecondaryWhenAvailable
-        | nrr_domain::RouteBehaviorMode::StrictSecondaryFailClosed => {
+        nrr_domain::RouteBehaviorMode::PreferSecondaryWhenAvailable => {
             ("secondary", "diag.explain.final-action.route-secondary")
         }
     }

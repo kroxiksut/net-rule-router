@@ -18,6 +18,13 @@
 //! a user pin a corporate-VPN endpoint by hand. [`upsert_observed`] and
 //! [`load_ips`] are the only surface currently in use.
 //!
+//! # Whose servers
+//!
+//! Every row names the user whose links showed the server ([`MACHINE_SCOPE`]
+//! `''` for a platform with one machine-wide route table and no per-user
+//! plans). A server one user's tunnel uses must never open a hole in, or
+//! withdraw a route from, another user's plan.
+//!
 //! [`upsert_observed`]: VpnBootstrapEndpointsRepository::upsert_observed
 //! [`load_ips`]: VpnBootstrapEndpointsRepository::load_ips
 
@@ -27,10 +34,14 @@ use rusqlite::{params, Connection};
 
 use crate::error::{StorageError, StorageResult};
 
+/// The owner of a set kept for the whole machine, and of every row written
+/// before sets had owners.
+pub const MACHINE_SCOPE: &str = "";
+
 /// The `source` column value for a route-observed endpoint.
 const SOURCE_OBSERVED: &str = "observed";
 
-/// Hard cap on retained endpoints, per source. The exemption set punches
+/// Hard cap on retained endpoints, per owner and source. The exemption set punches
 /// holes in the fail-closed kill-switch, so
 /// it must never grow without bound (a churny VPN, or — if reactive learning is
 /// ever re-enabled — a hostile learner, could otherwise accumulate arbitrarily
@@ -49,12 +60,12 @@ impl<'c> VpnBootstrapEndpointsRepository<'c> {
         Self { conn }
     }
 
-    /// Upsert each observed server `ip` (source `'observed'`, no port/protocol),
-    /// stamping `now` (UTC Unix millis) as the learn time. Additive: an IP that is
+    /// Upsert each server `ip` that `sid`'s links showed (source `'observed'`,
+    /// no port/protocol), stamping `now` (UTC Unix millis) as the learn time. Additive: an IP that is
     /// no longer observed is intentionally NOT deleted — a briefly-unobserved
     /// server (VPN blip) should keep its exemption so the tunnel can reconnect.
-    /// Idempotent per `(ip, 'observed')`; re-observing refreshes `learned_at`.
-    pub fn upsert_observed(&self, ips: &[Ipv4Addr], now: i64) -> StorageResult<()> {
+    /// Idempotent per `(sid, ip, 'observed')`; re-observing refreshes `learned_at`.
+    pub fn upsert_observed(&self, sid: &str, ips: &[Ipv4Addr], now: i64) -> StorageResult<()> {
         if ips.is_empty() {
             return Ok(());
         }
@@ -65,27 +76,27 @@ impl<'c> VpnBootstrapEndpointsRepository<'c> {
         for ip in ips {
             tx.execute(
                 "INSERT INTO vpn_bootstrap_endpoints
-                 (ip, port, protocol, source, learned_at)
-                 VALUES (?1, NULL, NULL, ?2, ?3)
-                 ON CONFLICT(ip, source) DO UPDATE SET learned_at = excluded.learned_at",
-                params![ip.to_string(), SOURCE_OBSERVED, now],
+                 (sid, ip, port, protocol, source, learned_at)
+                 VALUES (?1, ?2, NULL, NULL, ?3, ?4)
+                 ON CONFLICT(sid, ip, source) DO UPDATE SET learned_at = excluded.learned_at",
+                params![sid, ip.to_string(), SOURCE_OBSERVED, now],
             )
             .map_err(|e| StorageError::Internal(format!("vpn_bootstrap_endpoints insert: {e}")))?;
         }
-        // Evict the oldest rows beyond the per-source cap so the exemption
+        // Evict the oldest of this owner's rows beyond the cap so the exemption
         // set can never grow unbounded. Keeps the newest
         // `MAX_ENDPOINTS_PER_SOURCE` by `learned_at` (ties broken by `ip` for a
         // deterministic result); a re-observed live server refreshes its
         // `learned_at` above, so it is always among the kept newest.
         tx.execute(
             "DELETE FROM vpn_bootstrap_endpoints
-             WHERE source = ?1 AND ip NOT IN (
+             WHERE sid = ?1 AND source = ?2 AND ip NOT IN (
                  SELECT ip FROM vpn_bootstrap_endpoints
-                 WHERE source = ?1
+                 WHERE sid = ?1 AND source = ?2
                  ORDER BY learned_at DESC, ip ASC
-                 LIMIT ?2
+                 LIMIT ?3
              )",
-            params![SOURCE_OBSERVED, MAX_ENDPOINTS_PER_SOURCE as i64],
+            params![sid, SOURCE_OBSERVED, MAX_ENDPOINTS_PER_SOURCE as i64],
         )
         .map_err(|e| StorageError::Internal(format!("vpn_bootstrap_endpoints prune: {e}")))?;
         tx.commit()
@@ -93,19 +104,22 @@ impl<'c> VpnBootstrapEndpointsRepository<'c> {
         Ok(())
     }
 
-    /// Load every persisted endpoint IP (all sources), newest first. A row whose
+    /// Load every endpoint IP `sid` owns (all sources), newest first. A row whose
     /// `ip` fails to parse as an IPv4 address is skipped rather than failing the
     /// whole load — defence-in-depth against a hand-corrupted row (this writer only
     /// ever writes `ip.to_string()`, so this is a can't-happen guard). `nrr-storage`
     /// carries no logging framework by design, so the skip is silent; the caller
     /// (the route coordinator) is the layer that logs observability for the set.
-    pub fn load_ips(&self) -> StorageResult<Vec<Ipv4Addr>> {
+    pub fn load_ips(&self, sid: &str) -> StorageResult<Vec<Ipv4Addr>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT ip FROM vpn_bootstrap_endpoints ORDER BY learned_at DESC, ip ASC")
+            .prepare(
+                "SELECT ip FROM vpn_bootstrap_endpoints WHERE sid = ?1
+                 ORDER BY learned_at DESC, ip ASC",
+            )
             .map_err(|e| StorageError::Internal(format!("vpn_bootstrap_endpoints prepare: {e}")))?;
         let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([sid], |row| row.get::<_, String>(0))
             .map_err(|e| StorageError::Internal(format!("vpn_bootstrap_endpoints query: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
@@ -142,6 +156,7 @@ mod tests {
         let conn = open_state_db(&dir);
         let repo = VpnBootstrapEndpointsRepository::new(&conn);
         repo.upsert_observed(
+            "S-A",
             &[
                 Ipv4Addr::new(203, 0, 113, 5),
                 Ipv4Addr::new(198, 51, 100, 9),
@@ -149,7 +164,7 @@ mod tests {
             100,
         )
         .expect("upsert");
-        let mut ips = repo.load_ips().expect("load");
+        let mut ips = repo.load_ips("S-A").expect("load");
         ips.sort();
         assert_eq!(
             ips,
@@ -165,7 +180,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let repo = VpnBootstrapEndpointsRepository::new(&conn);
-        assert!(repo.load_ips().expect("load").is_empty());
+        assert!(repo.load_ips("S-A").expect("load").is_empty());
     }
 
     #[test]
@@ -173,8 +188,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let repo = VpnBootstrapEndpointsRepository::new(&conn);
-        repo.upsert_observed(&[], 100).expect("noop upsert");
-        assert!(repo.load_ips().expect("load").is_empty());
+        repo.upsert_observed("S-A", &[], 100).expect("noop upsert");
+        assert!(repo.load_ips("S-A").expect("load").is_empty());
     }
 
     #[test]
@@ -183,10 +198,10 @@ mod tests {
         let conn = open_state_db(&dir);
         let repo = VpnBootstrapEndpointsRepository::new(&conn);
         let ip = Ipv4Addr::new(203, 0, 113, 5);
-        repo.upsert_observed(&[ip], 100).expect("first");
-        repo.upsert_observed(&[ip], 200).expect("second");
+        repo.upsert_observed("S-A", &[ip], 100).expect("first");
+        repo.upsert_observed("S-A", &[ip], 200).expect("second");
         // Still a single row (PRIMARY KEY(ip, source) dedup).
-        assert_eq!(repo.load_ips().expect("load"), vec![ip]);
+        assert_eq!(repo.load_ips("S-A").expect("load"), vec![ip]);
         let learned_at: i64 = conn
             .query_row(
                 "SELECT learned_at FROM vpn_bootstrap_endpoints WHERE ip = ?1",
@@ -203,17 +218,17 @@ mod tests {
         let conn = open_state_db(&dir);
         // Inject a malformed row directly (a corrupt/hand-edited DB).
         conn.execute(
-            "INSERT INTO vpn_bootstrap_endpoints (ip, port, protocol, source, learned_at)
-             VALUES ('not-an-ip', NULL, NULL, 'observed', 50)",
+            "INSERT INTO vpn_bootstrap_endpoints (sid, ip, port, protocol, source, learned_at)
+             VALUES ('S-A', 'not-an-ip', NULL, NULL, 'observed', 50)",
             [],
         )
         .expect("inject bad row");
         let repo = VpnBootstrapEndpointsRepository::new(&conn);
-        repo.upsert_observed(&[Ipv4Addr::new(203, 0, 113, 5)], 100)
+        repo.upsert_observed("S-A", &[Ipv4Addr::new(203, 0, 113, 5)], 100)
             .expect("upsert good");
         // The bad row is skipped, the good one survives.
         assert_eq!(
-            repo.load_ips().expect("load"),
+            repo.load_ips("S-A").expect("load"),
             vec![Ipv4Addr::new(203, 0, 113, 5)]
         );
     }
@@ -230,10 +245,10 @@ mod tests {
         let total = MAX_ENDPOINTS_PER_SOURCE + 8;
         for i in 0..total {
             let ip = Ipv4Addr::new(203, 0, 113, i as u8);
-            repo.upsert_observed(&[ip], 1_000 + i as i64)
+            repo.upsert_observed("S-A", &[ip], 1_000 + i as i64)
                 .expect("upsert");
         }
-        let kept = repo.load_ips().expect("load");
+        let kept = repo.load_ips("S-A").expect("load");
         assert_eq!(
             kept.len(),
             MAX_ENDPOINTS_PER_SOURCE,
@@ -254,13 +269,48 @@ mod tests {
         let conn = open_state_db(&dir);
         let ip = Ipv4Addr::new(10, 0, 0, 1);
         let repo = VpnBootstrapEndpointsRepository::new(&conn);
-        repo.upsert_observed(&[ip], 100).expect("observed");
+        repo.upsert_observed("S-A", &[ip], 100).expect("observed");
         conn.execute(
-            "INSERT INTO vpn_bootstrap_endpoints (ip, port, protocol, source, learned_at)
-             VALUES (?1, 1194, 'udp', 'manual', 200)",
+            "INSERT INTO vpn_bootstrap_endpoints (sid, ip, port, protocol, source, learned_at)
+             VALUES ('S-A', ?1, 1194, 'udp', 'manual', 200)",
             params![ip.to_string()],
         )
         .expect("manual insert");
-        assert_eq!(repo.load_ips().expect("load"), vec![ip, ip]);
+        assert_eq!(repo.load_ips("S-A").expect("load"), vec![ip, ip]);
+    }
+
+    #[test]
+    fn one_owners_servers_are_never_read_as_anothers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_state_db(&dir);
+        let repo = VpnBootstrapEndpointsRepository::new(&conn);
+        let (alice, bob) = (
+            Ipv4Addr::new(203, 0, 113, 1),
+            Ipv4Addr::new(198, 51, 100, 2),
+        );
+        repo.upsert_observed("S-ALICE", &[alice], 100)
+            .expect("alice");
+        repo.upsert_observed("S-BOB", &[bob], 100).expect("bob");
+        assert_eq!(repo.load_ips("S-ALICE").expect("load"), vec![alice]);
+        assert_eq!(repo.load_ips("S-BOB").expect("load"), vec![bob]);
+        assert!(repo.load_ips(MACHINE_SCOPE).expect("load").is_empty());
+    }
+
+    #[test]
+    fn the_cap_counts_each_owner_apart() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_state_db(&dir);
+        let repo = VpnBootstrapEndpointsRepository::new(&conn);
+        let all: Vec<Ipv4Addr> = (0..MAX_ENDPOINTS_PER_SOURCE as u8)
+            .map(|i| Ipv4Addr::new(203, 0, 113, i))
+            .collect();
+        repo.upsert_observed("S-ALICE", &all, 100).expect("alice");
+        repo.upsert_observed("S-BOB", &[Ipv4Addr::new(198, 51, 100, 1)], 200)
+            .expect("bob");
+        assert_eq!(
+            repo.load_ips("S-ALICE").expect("load").len(),
+            MAX_ENDPOINTS_PER_SOURCE,
+            "another owner's write evicted nothing here"
+        );
     }
 }

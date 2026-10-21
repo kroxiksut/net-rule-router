@@ -8,7 +8,7 @@
 //! ## Service-owned vs client-supplied data
 //!
 //! Service owns: adapter bindings (per-SID via `RouteBindingsRepository`),
-//! route behavior mode.
+//! route behavior mode, leak protection.
 //!
 //! Client supplies in the request: rules-file paths on disk
 //! (`UiPreferences::last_saved_path_<role>`).
@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use nrr_storage::route_bindings::{BehaviorMode, RouteBindingsRepository, RoutePolicyRecord};
+use nrr_storage::route_bindings::{RouteBindingsRepository, RoutePolicyRecord};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -191,11 +191,13 @@ fn emit_settings_yaml(
     out.push('\n');
     out.push('\n');
 
-    // behavior: block — service-owned route mode.
-    // will add file_change_behavior + include_child_processes.
+    // behavior: block — service-owned route mode and leak protection.
     out.push_str("  behavior:\n");
     out.push_str("    route_mode: ");
-    out.push_str(&yaml_quote(behavior_slug(record.mode)));
+    out.push_str(&yaml_quote(record.mode.slug()));
+    out.push('\n');
+    out.push_str("    leak_protection: ");
+    out.push_str(&yaml_quote(record.leak_protection.as_slug()));
     out.push('\n');
 
     out
@@ -232,14 +234,6 @@ fn emit_adapter(
     }
 }
 
-const fn behavior_slug(mode: BehaviorMode) -> &'static str {
-    match mode {
-        BehaviorMode::PreferPrimary => "prefer-primary",
-        BehaviorMode::PreferSecondaryWhenAvailable => "prefer-secondary-when-available",
-        BehaviorMode::StrictSecondaryFailClosed => "strict-secondary-fail-closed",
-    }
-}
-
 /// Emits a double-quoted YAML scalar with `\` and `"` escaped per the
 /// YAML 1.2 spec, plus the control characters required for safety.
 fn yaml_quote(s: &str) -> String {
@@ -268,7 +262,7 @@ mod tests {
     use super::*;
 
     use nrr_storage::repository::MigrationRunner;
-    use nrr_storage::route_bindings::{BindingSource, RouteBindingRecord};
+    use nrr_storage::route_bindings::{BehaviorMode, BindingSource, RouteBindingRecord};
     use nrr_storage::SqliteMigrationRunner;
 
     fn open_state_db_in_memory() -> Arc<Mutex<Connection>> {
@@ -317,12 +311,28 @@ mod tests {
         assert!(yaml.contains("exported_at: \"2026-05-20T12:00:00Z\"\n"));
         assert!(yaml.contains("primary:\n      system_id: \"\"\n"));
         assert!(yaml.contains("route_mode: \"prefer-primary\"\n"));
+        assert!(yaml.contains("leak_protection: \"off\"\n"));
         // The hash crosses IPC: fixed-width lowercase hex of the YAML bytes.
         let expected: String = Sha256::digest(yaml.as_bytes())
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(out.content_hash_hex, expected);
+    }
+
+    /// The hash crosses IPC and is compared by the importer: a hash-crate
+    /// upgrade that changed its spelling must fail here, not in the field.
+    #[test]
+    fn the_empty_export_hash_is_pinned() {
+        let conn = open_state_db_in_memory();
+        let exporter = ProductionSettingsExporter::new(Arc::clone(&conn));
+        let out = exporter
+            .export_settings("S-1-5-21-test", None, None, "2026-05-20T12:00:00Z")
+            .expect("export");
+        assert_eq!(
+            out.content_hash_hex,
+            "3ea47bb7297b73ca67159dac8e0d064486b7bd7abaf5cadb128cd0dcd9faa7f4"
+        );
     }
 
     #[test]
@@ -342,15 +352,11 @@ mod tests {
                 known_stable_ids: vec![],
             }),
             mode: BehaviorMode::PreferSecondaryWhenAvailable,
-            block_secondary_when_unavailable: false,
-            kill_switch_fail_closed: true,
+            leak_protection: nrr_domain::LeakProtection::Everything,
             kill_switch_protocols: 0x7F,
-            kill_switch_block_all: false,
-            kill_switch_enabled: false,
             allow_dns_over_primary: false,
             include_subdomains: false,
             shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
-            mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy::default(),
             resolve_hosts_bypass: true,
             doh_lockdown_enabled: false,
             doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
@@ -369,6 +375,7 @@ mod tests {
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
             forwarded_outage: String::new(),
+            external_address_auto_check: false,
             binding_source: BindingSource::UserAssigned,
         };
         seed_bindings(&conn, "S-1-5-21-test", &record);
@@ -403,6 +410,10 @@ mod tests {
         assert!(
             yaml.contains("route_mode: \"prefer-secondary-when-available\""),
             "wrong route_mode; got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("leak_protection: \"everything\""),
+            "wrong leak_protection; got:\n{yaml}"
         );
     }
 

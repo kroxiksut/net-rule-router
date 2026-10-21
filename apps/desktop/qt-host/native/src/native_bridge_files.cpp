@@ -7,9 +7,14 @@
 static bool saveFileContents(const char *op, const QString &path,
                              const QByteArray &bytes) {
     QSaveFile file(path);
-    // A folder the user may write in but not create files in stays writable
-    // in place, still checked at commit.
+    // A link at `path` is written through to its target (a rules file the user
+    // linked on purpose). A folder the user may write in but not create files
+    // in stays writable in place, still checked at commit; that path can leave
+    // a truncated file on failure, so it is logged.
     file.setDirectWriteFallback(true);
+    if (!QFileInfo(QFileInfo(path).absolutePath()).isWritable()) {
+        qWarning() << op << "folder not writable, saving in place:" << path;
+    }
     if (!file.open(QIODevice::WriteOnly)) {
         qWarning() << op << "open failed:" << path << "error=" << file.errorString();
         return false;

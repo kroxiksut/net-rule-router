@@ -296,12 +296,12 @@ int main(int argc, char *argv[]) {
     }
 
     QString contextError;
-    QVariantMap contextObject;
-    if (!contextFilePath.isEmpty()) {
-        contextObject = loadContextObject(contextFilePath, &contextError);
-        if (contextObject.isEmpty() && !contextError.isEmpty()) {
-            qWarning().noquote() << contextError;
-        }
+    const QVariantMap contextObject = loadContextObject(contextFilePath, &contextError);
+    if (contextObject.isEmpty() && !contextError.isEmpty()) {
+        // Running on QML defaults would present a first run and let the first
+        // preferences write replace the real settings.
+        qCritical().noquote() << contextError;
+        return 1;
     }
 
     // Theme is needed for the DWM dark title bar (at first window show), so

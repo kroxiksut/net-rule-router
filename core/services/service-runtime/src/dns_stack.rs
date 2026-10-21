@@ -65,6 +65,10 @@ pub struct DnsStackInputs {
     /// user's book alone.
     pub served_sids: Option<crate::dns_resolver_ports::ResolverPrincipalsFn>,
     pub recompute_hook: crate::supervised_runtime::RouteRecomputeHook,
+    /// The run for a reconcile whose fact no pass input sees (a new
+    /// exemption): never judged unchanged. Absent, such a request uses
+    /// `recompute_hook`.
+    pub forced_recompute_hook: Option<crate::supervised_runtime::RouteRecomputeHook>,
     pub known_direct: Option<Arc<crate::known_direct::KnownDirectRegistry>>,
     pub block_all_armed: Option<Flag>,
     /// "Is the guard blocking an unresolved additional link?" — wider than
@@ -141,17 +145,27 @@ pub fn configured_dns_servers() -> &'static std::sync::OnceLock<Arc<dyn SystemDn
     &SERVERS
 }
 
-/// The configured DNS servers if the list is at hand within a few
-/// milliseconds; empty otherwise — the enforcement pass never waits on the OS.
+/// The configured DNS servers, both families, if the list is at hand within a
+/// few milliseconds; empty otherwise — the enforcement pass never waits on the
+/// OS. A network whose only resolvers are IPv6 needs them here as much as an
+/// IPv4 one needs its own.
 pub fn configured_dns_servers_now() -> Vec<std::net::IpAddr> {
+    const BUDGET: Duration = Duration::from_millis(20);
     configured_dns_servers()
         .get()
         .map(|servers| {
-            servers
-                .upstream_candidates_v4_within(Duration::from_millis(20))
+            let mut all: Vec<std::net::IpAddr> = servers
+                .upstream_candidates_v4_within(BUDGET)
                 .into_iter()
                 .map(|candidate| std::net::IpAddr::V4(candidate.server))
-                .collect()
+                .collect();
+            all.extend(
+                servers
+                    .upstream_candidates_v6_within(BUDGET)
+                    .into_iter()
+                    .map(|candidate| candidate.server),
+            );
+            all
         })
         .unwrap_or_default()
 }
@@ -266,7 +280,7 @@ fn build_dns_resolver_instance(
         tracing::warn!(
             target: "nrr::dns-resolver",
             msg_key = "dns-stack-modeb-no-upstream-answered",
-            "Mode B requested but no upstream IPv4 DNS answered a probe; staying reactive",
+            "Mode B requested but no upstream DNS server answered a probe; staying reactive",
         );
         return Err(ArmRefusal::Unavailable);
     };
@@ -315,6 +329,9 @@ fn build_dns_resolver_instance(
     let sink = Arc::new(CacheFactSink::new(Arc::clone(&inputs.cache)));
     let mut reconciler = HookSyncReconciler::new(inputs.recompute_hook.clone())
         .with_liveness(inputs.liveness.clone());
+    if let Some(forced) = inputs.forced_recompute_hook.clone() {
+        reconciler = reconciler.with_forced_hook(forced);
+    }
     let first_contact: Option<crate::dns_resolver_ports::FirstContactFn> =
         match inputs.route_coordinator.clone() {
             Some(coordinator) => {
@@ -409,12 +426,12 @@ fn build_dns_resolver_instance(
             );
         }
     }
-    let user_suffix = short_name_suffix(suffixes, Arc::clone(active_sid));
+    let user_suffix = short_name_suffix(suffixes, Arc::clone(&principals));
     listener = listener.with_short_name_suffix(Arc::clone(&user_suffix));
     listener = listener.with_ipv6_disposition({
         let sid = Arc::clone(active_sid);
         Arc::new(move || {
-            sid().map_or(crate::enforcement_planner::Ipv6Guard::Off, |sid| {
+            sid().map_or(Some(crate::enforcement_planner::Ipv6Guard::Off), |sid| {
                 crate::ipv6_disposition::global_ipv6_dispositions().of(&sid)
             })
         })
@@ -546,14 +563,15 @@ fn route_first_contact_for_each(
         .sum()
 }
 
-/// The routing principal's short-name domain, from the snapshot the settings
-/// writer publishes: asked on every unanswered bare label and, on a platform
-/// that writes it into the OS search list, whenever the guard reads the claims.
+/// The short-name domain of the first served user who named one (a query
+/// carries no owner), from the snapshot the settings writer publishes: asked on
+/// every unanswered bare label and, on a platform that writes it into the OS
+/// search list, whenever the guard reads the claims.
 fn short_name_suffix(
     suffixes: &'static crate::short_name_suffixes::UserShortNameSuffixes,
-    active_sid: crate::supervised_runtime::ActiveRoutingSidFn,
+    served: crate::dns_resolver_ports::ResolverPrincipalsFn,
 ) -> crate::dns_listener::ShortNameSuffixFn {
-    Arc::new(move || suffixes.of(&active_sid()?))
+    Arc::new(move || served().iter().find_map(|sid| suffixes.of(sid)))
 }
 
 /// A name one server calls non-existent is re-asked of the machine's private
@@ -697,7 +715,21 @@ mod tests {
         suffixes: &'static UserShortNameSuffixes,
         sid: Option<&'static str>,
     ) -> Option<String> {
-        short_name_suffix(suffixes, Arc::new(move || sid.map(str::to_string)))()
+        short_name_suffix(
+            suffixes,
+            Arc::new(move || sid.into_iter().map(str::to_string).collect()),
+        )()
+    }
+
+    #[test]
+    fn a_second_users_short_name_domain_is_used_when_the_first_named_none() {
+        let (_dir, conn) = settings_with(true, "corp.example");
+        let suffixes = loaded_from(&conn);
+        let served = Arc::new(|| vec!["S-OTHER".to_string(), SID.to_string()]);
+        assert_eq!(
+            short_name_suffix(suffixes, served)().as_deref(),
+            Some("corp.example")
+        );
     }
 
     #[test]
@@ -765,9 +797,7 @@ mod tests {
             serde_json::from_value::<crate::ipc_handlers::payloads::RoutePolicyUpdateRequest>(
                 serde_json::json!({
                     "mode": "prefer-primary",
-                    "block-secondary-when-unavailable": true,
-                    "kill-switch-block-all": false,
-                    "kill-switch-enabled": true,
+                    "leak-protection": "sites",
                     "doh-lockdown-enabled": false,
                     "kill-switch-strict-shared-ips": false,
                     "binding-source": "user-assigned",
@@ -979,6 +1009,57 @@ mod tests {
         }
         assert!(private(Duration::from_secs(2)).is_empty());
         assert_eq!(inner.calls(), 3, "a burst on both feeds is one more read");
+    }
+
+    /// Counts both families, as the two PowerShell scripts do.
+    struct BothFamilies {
+        v4: std::sync::atomic::AtomicUsize,
+        v6: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SystemDnsServersPort for BothFamilies {
+        fn upstream_candidates_v4(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsCandidate> {
+            self.v4.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![nrr_platform_api::dns::UpstreamDnsCandidate::new(
+                Some(2),
+                std::net::Ipv4Addr::new(192, 0, 2, 53),
+            )]
+        }
+
+        fn upstream_candidates_v6(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+            self.v6.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Vec::new()
+        }
+    }
+
+    struct Silent;
+
+    impl crate::dns_upstream::UpstreamProbe for Silent {
+        fn responds(&self, _server: std::net::SocketAddr) -> bool {
+            false
+        }
+    }
+
+    /// The upstream pool on the shared cached list: a run of failed forwards,
+    /// each of which re-selects, and the network-change refresh read the
+    /// machine's servers once between them, never once per failure.
+    #[test]
+    fn the_upstream_pool_on_the_cached_list_enumerates_once() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let inner = Arc::new(BothFamilies {
+            v4: Default::default(),
+            v6: Default::default(),
+        });
+        let observer = ManualObserver::default();
+        let servers = cached_system_dns(Arc::clone(&inner) as _, &observer, &observer);
+        let pool = crate::dns_upstream::UpstreamDnsPool::new(servers, Arc::new(Silent));
+        for _ in 0..30 {
+            pool.note_failure();
+            pool.reprobe();
+        }
+        let _ = pool.note_network_change();
+        assert_eq!(inner.v4.load(SeqCst), 1, "IPv4 enumerated per failure");
+        assert_eq!(inner.v6.load(SeqCst), 1, "IPv6 enumerated per failure");
     }
 
     /// Enumerates as slowly as a PowerShell run.

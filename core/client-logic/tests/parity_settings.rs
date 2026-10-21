@@ -11,6 +11,7 @@ use js_harness::{arg, check, text, JsLib};
 use nrr_client_logic::notice_mutes::{
     notice_kind_muted, notice_mute_request, MUTABLE_NOTICE_KINDS, NOTICE_MUTE_CHOICES_MS,
 };
+use nrr_client_logic::routing_settings::{self, RoutingContext};
 use nrr_client_logic::stability;
 use nrr_client_logic::units::format_storage_bytes;
 use serde_json::{json, Map, Value};
@@ -213,6 +214,57 @@ fn stability_patch_for_platform_matches_js() {
                 "patch": stability::patch_for_platform(&object(&input["partial"]), supports),
                 "any": stability::any_key_applies(supports),
             })
+        },
+    );
+}
+
+#[test]
+fn stability_patch_changes_nothing_matches_js() {
+    check(
+        "stability_patch_changes_nothing",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "stabilityPatchChangesNothing({}, {})",
+                arg(input, "live"),
+                arg(input, "partial")
+            )
+        },
+        |input| {
+            Value::from(stability::patch_changes_nothing(
+                &object(&input["live"]),
+                &object(&input["partial"]),
+            ))
+        },
+    );
+}
+
+// ---- routing settings ----
+
+#[test]
+fn offered_routing_settings_match_js() {
+    check(
+        "routing_settings_offered",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "offeredRoutingSettings({}, {}, {}, {}, {})",
+                arg(input, "supports"),
+                arg(input, "mode"),
+                arg(input, "leak"),
+                arg(input, "bound"),
+                arg(input, "fake-ip")
+            )
+        },
+        |input| {
+            let truthy = |key: &str| input.get(key) == Some(&Value::Bool(true));
+            json!(routing_settings::offered(&RoutingContext {
+                supports: input.get("supports").and_then(Value::as_object),
+                enforcement_mode: text(input, "mode"),
+                leak_protection: text(input, "leak"),
+                secondary_bound: truthy("bound"),
+                fake_ip_enabled: truthy("fake-ip"),
+            }))
         },
     );
 }

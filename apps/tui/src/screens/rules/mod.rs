@@ -4,23 +4,28 @@
 //! apply through one "changes" view.
 
 mod ace;
+pub mod app_routes;
 mod apply;
 mod bulk;
 mod coverage;
+mod file_merge;
 mod files;
 mod folder;
 mod form;
 mod gateway;
 mod main_route;
+mod merge;
 pub mod overrides;
 mod own_settings;
 mod recent;
 mod render;
+mod spare;
 mod table;
 mod text;
 pub mod verdicts;
 
 pub use bulk::start_moving;
+pub use files::presets_root;
 
 use std::path::{Path, PathBuf};
 
@@ -37,7 +42,8 @@ use self::files::{Preset, RuleSet};
 use self::form::{offered_types, Field, Form, Saved};
 use self::table::{RouteFilter, Table, PAGE};
 use super::{overlaps, Screen, ScreenId};
-use crate::i18n::{Key, Texts};
+use crate::i18n::{Key, Plural, Texts};
+use crate::paste::TextTarget;
 use crate::state::AppState;
 use crate::view::ScreenView;
 
@@ -56,6 +62,8 @@ pub enum Mode {
     Bulk(Box<bulk::BulkForm>),
     /// `P`: a protected rule confirmed to apply despite the protection.
     Override(Box<overrides::Confirm>),
+    /// Edits over the rules changed elsewhere, to be picked through.
+    Merge(Box<merge::Merge>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +103,8 @@ pub enum ChoicePurpose {
     /// The apply was refused as built on rules no longer in force: put the
     /// edits on top of the rules now in force, or keep the list as it is.
     ChangedElsewhere,
+    /// `C`: remove the rules a wildcard of the same route already covers.
+    RemoveSpare(Vec<spare::Spare>),
 }
 
 /// The rule sets offered, and where they came from.
@@ -145,6 +155,8 @@ pub struct Note {
     pub failure: Option<Failure>,
     /// A sentence said after this one.
     pub then: Option<Box<Note>>,
+    /// Said in the plural form `count` takes, instead of `key`.
+    pub counted: Option<(Plural, usize)>,
 }
 
 impl Note {
@@ -154,24 +166,31 @@ impl Note {
             args: Vec::new(),
             failure: None,
             then: None,
+            counted: None,
         }
     }
 
     fn with(key: Key, args: Vec<(&'static str, String)>) -> Self {
         Self {
-            key,
             args,
-            failure: None,
-            then: None,
+            ..Self::new(key)
         }
     }
 
     fn failed(key: Key, failure: Failure) -> Self {
         Self {
-            key,
-            args: Vec::new(),
             failure: Some(failure),
-            then: None,
+            ..Self::new(key)
+        }
+    }
+
+    fn counted(plural: Plural, count: usize) -> Self {
+        Self {
+            counted: Some((plural, count)),
+            ..Self::new(Key {
+                id: plural.stem,
+                en: plural.other,
+            })
         }
     }
 
@@ -182,14 +201,15 @@ impl Note {
 
     /// The failure fills an `{error}` the sentence has, else follows it.
     pub fn text(&self, texts: &Texts) -> String {
-        let mut out = match &self.failure {
-            Some(failure) if texts.get(self.key).contains("{error}") => {
+        let mut out = match (&self.failure, self.counted) {
+            (_, Some((plural, count))) => texts.counted(plural, count),
+            (Some(failure), None) if texts.get(self.key).contains("{error}") => {
                 let mut args = self.args.clone();
                 args.push(("error", failure.text(texts)));
                 texts.fill(self.key, &args)
             }
-            Some(failure) => texts.fill(self.key, &self.args) + &failure.text(texts),
-            None => texts.fill(self.key, &self.args),
+            (Some(failure), None) => texts.fill(self.key, &self.args) + &failure.text(texts),
+            (None, None) => texts.fill(self.key, &self.args),
         };
         if let Some(next) = &self.then {
             out.push(' ');
@@ -247,6 +267,10 @@ pub struct RulesState {
     printed: Vec<String>,
     /// Edits waiting for the re-read they are laid over, then reviewed.
     rebase: Option<table::Edits>,
+    /// The payload under review is not the rows on screen (the bound files
+    /// merged with the service's rules): once it is in force the rows are
+    /// read back instead of being marked applied.
+    reload_after_apply: bool,
 }
 
 impl RulesState {
@@ -261,6 +285,7 @@ impl RulesState {
 
 /// The texts were loaded or changed language.
 pub fn on_texts(app: &mut AppState, texts: &Texts) {
+    super::app_groups::on_texts(app, texts);
     app.rules.my_rules = texts.get(text::MY_RULES);
     app.rules.gateway_comment = texts.get(text::GATEWAY_COMMENT);
     app.rules.file_hint = text::file_hint_keys()
@@ -292,6 +317,9 @@ impl Screen for RulesScreen {
             text::HELP_MOVE_TO_TYPE,
             text::HELP_MAIN_ROUTE,
             text::HELP_GATEWAY,
+            text::HELP_APP_GROUPS,
+            text::HELP_FILES_MERGE,
+            text::HELP_SPARE,
             text::HELP_FORM,
             text::HELP_BULK,
             text::HELP_RECENT,
@@ -316,6 +344,9 @@ impl Screen for RulesScreen {
             text::PLAIN_VERDICTS,
             text::PLAIN_MAIN_ROUTE,
             text::PLAIN_GATEWAY,
+            text::PLAIN_APP_GROUPS,
+            text::PLAIN_FILES_MERGE,
+            text::PLAIN_SPARE,
             text::PLAIN_BULK,
             text::PLAIN_MOVE_TO_TYPE,
             text::PLAIN_RECENT,
@@ -336,6 +367,17 @@ impl Screen for RulesScreen {
         !matches!(app.rules.mode, Mode::List)
     }
 
+    fn text_target(&self, app: &AppState) -> TextTarget {
+        match &app.rules.mode {
+            Mode::Input(_) => TextTarget::Line,
+            Mode::Form(form) if matches!(form.field, Field::Value | Field::Comment) => {
+                TextTarget::Line
+            }
+            Mode::Bulk(form) if form.field == bulk::BulkField::Text => TextTarget::Lines,
+            _ => TextTarget::None,
+        }
+    }
+
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
         let handled = match std::mem::take(&mut app.rules.mode) {
             Mode::List => list_key(app, key),
@@ -346,6 +388,7 @@ impl Screen for RulesScreen {
             Mode::Gateway(stage) => gateway::on_key(app, *stage, key),
             Mode::Bulk(form) => bulk::on_key(app, form, key),
             Mode::Override(confirm) => overrides::on_key(app, confirm, key),
+            Mode::Merge(merge) => merge::on_key(app, merge, key),
         };
         settle(app);
         handled
@@ -378,6 +421,7 @@ impl Screen for RulesScreen {
             Mode::Gateway(stage) => gateway::plain_prompt(stage),
             Mode::Bulk(form) => Some(bulk::plain_prompt(form)),
             Mode::Override(confirm) => Some(overrides::plain_prompt(confirm)),
+            Mode::Merge(_) => Some(text::MERGE_PLAIN_PROMPT),
         }
     }
 }
@@ -447,7 +491,7 @@ fn line_in_mode(app: &mut AppState, line: &str) -> bool {
         Mode::Review(mut review) => {
             match line {
                 "y" | "Y" => confirm(app, review),
-                "n" | "N" => {}
+                "n" | "N" => app.rules.quit_after_apply = false,
                 "c" | "C" if review.is_critical() => {
                     review.understood = !review.understood;
                     app.rules.mode = Mode::Review(review);
@@ -477,6 +521,14 @@ fn line_in_mode(app: &mut AppState, line: &str) -> bool {
         Mode::Override(confirm) => {
             if line != "!" {
                 overrides::on_line(app, confirm, line);
+            }
+            true
+        }
+        Mode::Merge(merge) => {
+            if line == "!" {
+                merge::on_line(app, merge, "n");
+            } else {
+                merge::on_line(app, merge, line);
             }
             true
         }
@@ -514,16 +566,16 @@ pub fn load_failure(app: &AppState, texts: &Texts) -> Option<String> {
 /// The list cannot change while it is applied or its changes are reviewed:
 /// the apply marks what is on screen as applied.
 pub fn edits_locked(app: &AppState) -> bool {
-    app.rules.busy.is_some() || matches!(app.rules.mode, Mode::Review(_))
+    app.rules.busy.is_some() || matches!(app.rules.mode, Mode::Review(_) | Mode::Merge(_))
 }
 
 /// Rules of the two routes that cover the same sites, over the rules on
-/// screen rather than the applied ones.
-pub fn route_overlaps(app: &AppState) -> Vec<RouteOverlap> {
-    // A rule set the wire refuses has nothing to compare; the row says why.
+/// screen rather than the applied ones. `None`: the rule set is one the wire
+/// refuses, so there is nothing to compare.
+pub fn route_overlaps(app: &AppState) -> Option<Vec<RouteOverlap>> {
     apply::book_of(app.rules.table.rules())
         .map(|book| find_route_overlaps(&book, include_subdomains(app)))
-        .unwrap_or_default()
+        .ok()
 }
 
 /// The reader's subdomain setting; absent means on, the product default.
@@ -535,6 +587,17 @@ fn include_subdomains(app: &AppState) -> bool {
 }
 
 /// Open the question "apply / discard / stay" on this screen.
+/// Whether the "apply / discard / stay" question is already on screen.
+pub fn quit_question_open(app: &AppState) -> bool {
+    matches!(
+        &app.rules.mode,
+        Mode::Choice(Choice {
+            purpose: ChoicePurpose::Quit,
+            ..
+        })
+    )
+}
+
 pub fn ask_before_quit(app: &mut AppState) {
     app.open(ScreenId::Rules);
     app.rules.mode = Mode::Choice(Choice {
@@ -576,6 +639,14 @@ pub fn on_progress(
 /// service's own additions, a reset): reread once the list is free.
 pub fn on_revision_changed(app: &mut AppState) {
     reread_when_free(app);
+}
+
+/// The service wrote rules for an answer given here (an accepted suggestion,
+/// a blocked site routed): the bound files follow once they are read back.
+pub fn rules_written_for_an_answer(app: &mut AppState) {
+    app.rules.verdicts.rewrite_files = true;
+    load_if_needed(app);
+    on_revision_changed(app);
 }
 
 /// Nothing on screen holds a row number into the list or edits it: no
@@ -622,16 +693,34 @@ fn loaded(app: &mut AppState, result: Result<RulesListResponse, Failure>) {
     match result {
         Ok(list) => {
             rules.load_error = None;
-            rules.unrecognized = list.unrecognized;
-            rules.base_revision = list.base_revision.clone();
-            rules.table.load(&list.rows);
-            if let Some(edits) = rules.rebase.take() {
-                rules.table.apply_edits(edits);
-                rules.note = Some(Note::new(text::REBASED));
-                rebased = true;
+            let view = rules.rebase.as_ref().map(|edits| edits.preview(&list.rows));
+            match (rules.rebase.take(), view) {
+                // The edits stay on screen, standing on the revision they were
+                // made against, until the user has picked.
+                (Some(edits), Some(view)) if !view.is_noop() => {
+                    rules.mode = Mode::Merge(Box::new(merge::Merge::new(
+                        edits,
+                        list.rows.clone(),
+                        list.base_revision.clone(),
+                        list.unrecognized,
+                        view,
+                    )));
+                    return;
+                }
+                (edits, _) => {
+                    rules.unrecognized = list.unrecognized;
+                    rules.base_revision = list.base_revision.clone();
+                    rules.table.load(&list.rows);
+                    if let Some(edits) = edits {
+                        rules.table.apply_edits(edits, &[]);
+                        rules.note = Some(Note::new(text::REBASED));
+                        rebased = true;
+                    }
+                }
             }
             overlaps::refresh(app);
             verdicts::write_bound_files(app);
+            file_merge::check_drift(app);
             // The set the service holds was read again: an apply may be in it.
             recent::refresh(app);
         }
@@ -673,6 +762,9 @@ fn rebase_edits(app: &mut AppState) {
 fn previewed(app: &mut AppState, previewed: Previewed) {
     let rules = &mut app.rules;
     rules.busy = None;
+    if !matches!(previewed, Previewed::Review(_)) {
+        rules.reload_after_apply = false;
+    }
     match previewed {
         Previewed::Review(review) => rules.mode = Mode::Review(review),
         Previewed::NothingToApply => {
@@ -698,11 +790,19 @@ fn finished(app: &mut AppState, finished: Finished) {
     let rules = &mut app.rules;
     rules.busy = None;
     let quit = std::mem::take(&mut rules.quit_after_apply);
+    let applied = matches!(finished, Finished::Applied { .. });
+    let reload = std::mem::take(&mut rules.reload_after_apply);
     rules.note = Some(match finished {
         Finished::Applied { base } => {
             // The next apply is built on what this one left in force.
             rules.base_revision = base;
-            rules.table.mark_applied();
+            if reload {
+                // The files are written from the rules read back.
+                rules.verdicts.rewrite_files = true;
+                rules.reread_due = true;
+            } else {
+                rules.table.mark_applied();
+            }
             app.snapshot_refresh_due = true;
             if quit {
                 app.quit = true;
@@ -722,6 +822,12 @@ fn finished(app: &mut AppState, finished: Finished) {
             Note::failed(text::ACTIVATE_FAILED, failure)
         }
     });
+    if applied && !reload {
+        // The bound files follow the rules in force, or the tray reverts them.
+        let note = app.rules.note.take();
+        verdicts::write_bound_files_now(app);
+        app.rules.note = app.rules.note.take().or(note);
+    }
     settle(app);
 }
 
@@ -871,6 +977,11 @@ fn ask(app: &mut AppState, purpose: ChoicePurpose) {
             .iter()
             .position(|set| set.selection_key() == list.selected)
             .unwrap_or(0),
+        // The destructive answer is listed first but never preselected.
+        ChoicePurpose::Delete(_)
+        | ChoicePurpose::Reload
+        | ChoicePurpose::Overwrite(_)
+        | ChoicePurpose::RemoveSpare(_) => 1,
         _ => 0,
     };
     app.rules.mode = Mode::Choice(Choice { purpose, cursor });
@@ -1215,6 +1326,7 @@ fn pick(app: &mut AppState, choice: Choice) {
             }
         }
         ChoicePurpose::Reload if at == 0 => load(app),
+        ChoicePurpose::RemoveSpare(spare) if at == 0 => spare::remove(app, &spare),
         ChoicePurpose::Quit => match at {
             0 => {
                 app.rules.quit_after_apply = true;
@@ -1286,6 +1398,9 @@ fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
             'n' => return verdicts::not_now(app),
             'c' => return main_route::start(app),
             'v' => return gateway::start(app),
+            'g' => app.open(ScreenId::AppGroups),
+            'F' => return file_merge::start(app),
+            'C' => return spare::start(app),
             'O' => change_order(app),
             'T' => return move_to_type(app, selected),
             'M' => return move_all_to_type(app),
@@ -1472,7 +1587,10 @@ fn choice_key(app: &mut AppState, mut choice: Choice, key: KeyEvent) -> bool {
 
 fn review_key(app: &mut AppState, mut review: Box<Review>, key: KeyEvent) -> bool {
     match key.code {
-        KeyCode::Esc => return true,
+        KeyCode::Esc => {
+            app.rules.quit_after_apply = false;
+            return true;
+        }
         KeyCode::Enter => {
             confirm(app, review);
             return true;
@@ -1566,6 +1684,9 @@ fn list_line(app: &mut AppState, line: &str) -> bool {
         "n" => return verdicts::not_now(app),
         "c" => return main_route::start(app),
         "v" => return gateway::start(app),
+        "g" => app.open(ScreenId::AppGroups),
+        "F" => return file_merge::start(app),
+        "C" => return spare::start(app),
         "O" => change_order(app),
         "A" => return bulk::start(app, TargetRoute::Primary, String::new(), false),
         "T" => {

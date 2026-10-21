@@ -1,5 +1,6 @@
 case "$1" in
   remove)
+    nrr_pkg_finish_dns_undo
     if nrr_pkg_have_systemd; then
       systemctl daemon-reload || true
       systemctl reset-failed "$NRR_UNIT_NAME" >/dev/null 2>&1 || true

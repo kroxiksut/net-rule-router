@@ -1,0 +1,93 @@
+{
+  "description": "pure.js rulesBookNoticeStep: raise the notice that the user's own saved rules cannot be read when that appears, keep a dismissed one down while it lasts, and make the next occurrence news once the book reads again",
+  "cases": [
+    {
+      "name": "the book stops reading",
+      "input": {
+        "wasRaised": false,
+        "unreadable": true
+      },
+      "expected": {
+        "raise": true,
+        "raised": true
+      }
+    },
+    {
+      "name": "still unreadable after the notice",
+      "input": {
+        "wasRaised": true,
+        "unreadable": true
+      },
+      "expected": {
+        "raise": false,
+        "raised": true
+      }
+    },
+    {
+      "name": "reads again",
+      "input": {
+        "wasRaised": true,
+        "unreadable": false
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "never unreadable",
+      "input": {
+        "wasRaised": false,
+        "unreadable": false
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "unknown earlier reading counts as not raised",
+      "input": {
+        "wasRaised": null,
+        "unreadable": true
+      },
+      "expected": {
+        "raise": true,
+        "raised": true
+      }
+    },
+    {
+      "name": "a truthy non-true earlier reading is not raised",
+      "input": {
+        "wasRaised": "yes",
+        "unreadable": true
+      },
+      "expected": {
+        "raise": true,
+        "raised": true
+      }
+    },
+    {
+      "name": "a non-true reading is not the state",
+      "input": {
+        "wasRaised": false,
+        "unreadable": "yes"
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "a missing reading is not the state",
+      "input": {
+        "wasRaised": true,
+        "unreadable": null
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    }
+  ]
+}

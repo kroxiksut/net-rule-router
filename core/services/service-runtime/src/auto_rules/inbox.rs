@@ -201,7 +201,7 @@ impl AutoRulesEngine {
             return Ok(ActionSummary {
                 applied: 0,
                 unknown,
-                pending: self.pending_count(sid),
+                pending: self.pending_count_after_answer(sid),
                 anchor_skipped: false,
             });
         }
@@ -246,7 +246,7 @@ impl AutoRulesEngine {
                 Ok(ActionSummary {
                     applied: selected.len() as u32,
                     unknown,
-                    pending: self.pending_count(sid),
+                    pending: self.pending_count_after_answer(sid),
                     anchor_skipped: outcome.anchor_skipped,
                 })
             }
@@ -276,7 +276,7 @@ impl AutoRulesEngine {
             return ActionSummary {
                 applied: 0,
                 unknown,
-                pending: self.pending_count(sid),
+                pending: self.pending_count_after_answer(sid),
                 anchor_skipped: false,
             };
         }
@@ -301,7 +301,7 @@ impl AutoRulesEngine {
         ActionSummary {
             applied: selected.len() as u32,
             unknown,
-            pending: self.pending_count(sid),
+            pending: self.pending_count_after_answer(sid),
             anchor_skipped: false,
         }
     }
@@ -383,7 +383,7 @@ impl AutoRulesEngine {
         ActionSummary {
             applied: restored,
             unknown,
-            pending: self.pending_count(sid),
+            pending: self.pending_count_after_answer(sid),
             anchor_skipped: false,
         }
     }
@@ -438,7 +438,7 @@ impl AutoRulesEngine {
         ActionSummary {
             applied: forgotten,
             unknown: (ids.len() as u32).saturating_sub(forgotten),
-            pending: self.pending_count(sid),
+            pending: self.pending_count_after_answer(sid),
             anchor_skipped: false,
         }
     }

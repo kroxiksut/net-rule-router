@@ -157,7 +157,10 @@ fn the_override_request_is_read_and_written_on_program_lines() {
         written.contains("!/var/www/* +override  # site\n"),
         "{written}"
     );
-    assert!(written.contains("# !/usr/bin/* +override\n"), "{written}");
+    assert!(
+        written.contains("# !/usr/bin/* +children +override\n"),
+        "{written}"
+    );
     assert!(written.contains("example.com\n"), "{written}");
     assert!(!written.contains("example.com +override"), "{written}");
     assert_eq!(parse_rules_file(&written).parsed, outcome.parsed);
@@ -262,7 +265,10 @@ fn deny_prefix_round_trips_through_write_and_parse() {
         written.contains("\n!ads.example.com  # tracker\n# !off.example.com\n"),
         "writer must put `!` right before the value, got:\n{written}"
     );
-    assert!(written.contains("\n!codex.exe\n"), "got:\n{written}");
+    assert!(
+        written.contains("\n!codex.exe +children\n"),
+        "got:\n{written}"
+    );
     assert!(!written.contains("+block"), "got:\n{written}");
     let reparsed = parse_rules_file(&written).parsed;
     assert_eq!(reparsed, parsed);

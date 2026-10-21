@@ -288,6 +288,14 @@ impl Screen for CacheScreen {
         state.typing.is_some() || state.question.is_some()
     }
 
+    fn text_target(&self, app: &AppState) -> crate::paste::TextTarget {
+        if app.inspect.cache.typing.is_some() && app.inspect.cache.question.is_none() {
+            crate::paste::TextTarget::Line
+        } else {
+            crate::paste::TextTarget::None
+        }
+    }
+
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
         if app.inspect.cache.question.is_some() {
             if let Some(given) = answer_key(key) {
@@ -422,7 +430,12 @@ fn cleared_text(texts: &Texts, cleared: &Cleared) -> String {
         Cleared::Failed(slug) => format!(
             "{}{}",
             texts.get(keys::CACHE_CLEAR_FAILED),
-            error_text(texts, slug)
+            // Machine-wide: the same refusal as the log clearing in Settings.
+            if slug == "forbidden" {
+                crate::screens::settings::elevation_text(texts)
+            } else {
+                error_text(texts, slug)
+            }
         ),
     }
 }
@@ -483,4 +496,24 @@ fn detail_lines(texts: &Texts, e: &CacheEntryDto) -> Vec<ViewLine> {
         wall_clock(e.expires_at_ms)
     )));
     lines
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    use crate::testing::texts_en;
+
+    /// A machine-wide clearing refused for want of rights says what the log
+    /// clearing in Settings says: how to start the terminal with them.
+    #[test]
+    fn a_forbidden_clearing_gives_the_settings_remedy() {
+        let texts = texts_en();
+        let said = cleared_text(&texts, &Cleared::Failed("forbidden".into()));
+        assert!(
+            said.ends_with(&crate::screens::settings::elevation_text(&texts)),
+            "{said}"
+        );
+        let other = cleared_text(&texts, &Cleared::Failed("timeout".into()));
+        assert!(!other.contains("administrator"), "{other}");
+    }
 }

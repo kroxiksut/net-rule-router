@@ -18,6 +18,9 @@ all        nrr_cli.pdb
 all        nrr-tui.exe
 all        nrr_tui.pdb
 all        wintun.dll
+all        licenses\NetRuleRouter-LICENSE.txt
+all        licenses\THIRD_PARTY_LICENSES.md
+all        licenses\Wintun-LICENSE.txt
 all        vcruntime140.dll
 all        msvcp140.dll
 all        configs\doh-dot-resolvers.seed.json
@@ -37,6 +40,9 @@ full       NetRuleRouterTray.exe
 full       NetRuleRouterTray.pdb
 full       nrr_qt_native_host.exe
 full       Qt6Core.dll
+full       licenses\Qt-NOTICE.txt
+full       licenses\Qt-LGPL-3.0.html
+full       licenses\Qt-GPL-3.0.html
 full       Qt6Quick.dll
 # The two image decoders the app needs; without them every icon or the
 # window icon goes blank.

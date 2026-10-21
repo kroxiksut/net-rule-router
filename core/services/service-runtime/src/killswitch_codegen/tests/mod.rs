@@ -11,7 +11,7 @@
 #[test]
 fn the_v6_cut_still_lets_the_tunnel_itself_out() {
     const LUID: u64 = 0x1234_5678;
-    let out = catch_all_v6_filters("S", LUID, &[], &[]);
+    let out = catch_all_v6_filters("S", LUID, &[], &[], false);
     for layer in [
         WfpLayerKey::AleAuthConnectV6,
         WfpLayerKey::OutboundIpPacketV6,
@@ -25,7 +25,7 @@ fn the_v6_cut_still_lets_the_tunnel_itself_out() {
     }
     // An unresolved tunnel has no egress to permit - and must not turn the
     // cut into a permit-everything by accident.
-    let unresolved = catch_all_v6_filters("S", 0, &[], &[]);
+    let unresolved = catch_all_v6_filters("S", 0, &[], &[], false);
     assert!(unresolved.iter().all(|f| f.local_interface_luid.is_none()));
     assert!(unresolved.iter().any(|f| f.action == WfpAction::Block));
 }
@@ -45,12 +45,14 @@ fn the_catch_all_spares_what_its_twin_spares() {
         local_subnets: Vec::new(),
         local_subnets_v6: Vec::new(),
         foreign_tunnel_luids: Vec::new(),
+        foreign_tunnel_networks: Vec::new(),
         primary_dest_ips: vec![primary],
         allow_dns_over_primary: false,
         dns_servers: Vec::new(),
         known_direct_ips: vec![direct],
         probe_target_ips: Vec::new(),
         secondary_luid: 0,
+        guest_network_luids: Vec::new(),
     };
     let out = catch_all_kill_switch_filters(
         "S",
@@ -322,6 +324,7 @@ fn full_resolution() -> KillSwitchResolution {
         local_subnets: vec![(ip(192, 168, 1, 0), 24)],
         local_subnets_v6: Vec::new(),
         foreign_tunnel_luids: Vec::new(),
+        foreign_tunnel_networks: Vec::new(),
     }
 }
 

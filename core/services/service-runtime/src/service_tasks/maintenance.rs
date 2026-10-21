@@ -103,13 +103,9 @@ pub fn build_revision_watch_task(mut watch: crate::revision_watch::RevisionWatch
     )
 }
 
-/// Periodic revisions retention pass. Reads the active
-/// `RetentionSettings` from `nrr_service_state.db`, runs
-/// `RevisionsRepository::prune_by_retention`, then calls
-/// `touch_last_cleanup` so the next pass sees an updated timestamp. The
-/// task is `Optional` for the same reason as `diagnostics-cleanup` — a
-/// stalled prune produces a degraded mode (DB grows), not a routing
-/// failure. Failures are logged and swallowed; the next tick retries.
+/// Periodic revisions retention pass. The task is `Optional` for the same
+/// reason as `diagnostics-cleanup` — a stalled prune produces a degraded mode
+/// (DB grows), not a routing failure.
 pub fn build_revisions_retention_task(conn: Arc<Mutex<rusqlite::Connection>>) -> ServiceTask {
     ServiceTask::periodic(
         TASK_ID_REVISIONS_RETENTION,
@@ -121,61 +117,65 @@ pub fn build_revisions_retention_task(conn: Arc<Mutex<rusqlite::Connection>>) ->
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let conn = match conn.lock() {
-                Ok(c) => c,
-                Err(_) => return TaskOutcome::Continue,
-            };
-            let retention_repo = nrr_storage::RetentionSettingsRepository::new(&conn);
-            let settings = match retention_repo.get_or_default() {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "nrr::retention",
-                        msg_key = "svctask-retention-settings-read-failed",
-                        error = %e,
-                        "retention settings read failed; skipping prune",
-                    );
-                    return TaskOutcome::Continue;
-                }
-            };
-            let revisions_repo = nrr_storage::revisions::RevisionsRepository::new(&conn);
-            match revisions_repo.prune_by_retention(&settings, now) {
-                Ok(summary) => {
-                    if summary.superseded_dropped
-                        + summary.rejected_dropped
-                        + summary.rolledback_dropped
-                        > 0
-                    {
-                        tracing::info!(
-                            target: "nrr::retention",
-                            msg_key = "svctask-revisions-pruned",
-                            superseded = summary.superseded_dropped,
-                            rejected = summary.rejected_dropped,
-                            rolled_back = summary.rolledback_dropped,
-                            "revisions retention prune completed",
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "nrr::retention",
-                        msg_key = "svctask-revisions-prune-failed",
-                        error = %e,
-                        "revisions retention prune failed",
-                    );
-                }
-            }
-            if let Err(e) = retention_repo.touch_last_cleanup(now) {
-                tracing::warn!(
-                    target: "nrr::retention",
-                    msg_key = "svctask-revisions-touch-failed",
-                    error = %e,
-                    "touch_last_cleanup failed",
-                );
+            if let Ok(conn) = conn.lock() {
+                run_revisions_retention_pass(&conn, now);
             }
             TaskOutcome::Continue
         },
     )
+}
+
+/// One retention pass with the stored settings, stamped as the last cleanup.
+/// Shared by the hourly task and a settings change, so a tighter limit takes
+/// effect when it is saved rather than up to an hour later. Failures are
+/// logged and swallowed; the next pass retries.
+pub fn run_revisions_retention_pass(conn: &rusqlite::Connection, now_secs: i64) {
+    let retention_repo = nrr_storage::RetentionSettingsRepository::new(conn);
+    let settings = match retention_repo.get_or_default() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "nrr::retention",
+                msg_key = "svctask-retention-settings-read-failed",
+                error = %e,
+                "retention settings read failed; skipping prune",
+            );
+            return;
+        }
+    };
+    let revisions_repo = nrr_storage::revisions::RevisionsRepository::new(conn);
+    match revisions_repo.prune_by_retention(&settings, now_secs) {
+        Ok(summary) => {
+            if summary.superseded_dropped + summary.rejected_dropped + summary.rolledback_dropped
+                > 0
+            {
+                tracing::info!(
+                    target: "nrr::retention",
+                    msg_key = "svctask-revisions-pruned",
+                    superseded = summary.superseded_dropped,
+                    rejected = summary.rejected_dropped,
+                    rolled_back = summary.rolledback_dropped,
+                    "revisions retention prune completed",
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "nrr::retention",
+                msg_key = "svctask-revisions-prune-failed",
+                error = %e,
+                "revisions retention prune failed",
+            );
+        }
+    }
+    if let Err(e) = retention_repo.touch_last_cleanup(now_secs) {
+        tracing::warn!(
+            target: "nrr::retention",
+            msg_key = "svctask-revisions-touch-failed",
+            error = %e,
+            "touch_last_cleanup failed",
+        );
+    }
 }
 
 // ── Storage WAL checkpoint ───────────────────────────────────────────────────
@@ -224,6 +224,11 @@ pub fn build_storage_checkpoint_task(deps: StorageCheckpointDeps) -> ServiceTask
                 }
             }
             if let Some(state) = deps.state.as_ref() {
+                crate::block_notice_journal_store::purge_all_stale(
+                    state,
+                    i64::try_from(crate::conn_observation_consumer::now_unix_ms())
+                        .unwrap_or(i64::MAX),
+                );
                 if let Ok(c) = state.lock() {
                     checkpoint_logged(
                         "service-state",
@@ -325,7 +330,7 @@ pub fn build_operation_results_gc_task(
             // issued by an unelevated, unqueued, unlimited call and each parks
             // its payload until confirmed or expired.
             if let Some(tokens) = tokens.as_ref() {
-                let dropped = tokens.gc_expired(now);
+                let dropped = tokens.gc_expired(crate::boot_clock::BootInstant::now());
                 if dropped > 0 {
                     tracing::debug!(
                         target: "nrr::ipc",

@@ -214,7 +214,9 @@ ColumnLayout {
         visible: section.shownRows.length === 0
         wrapMode: Text.Wrap
         color: root.mutedTextColor
-        text: root.uiRevision < 0 ? ""
+        text: root.uiRevision < 0 || section.controller.loadState === "none" ? ""
+            : section.controller.loadState === "error"
+            ? root.tr("rules.overlaps.load-failed", "Could not check the rules for overlaps. Try again in a moment.")
             : section.controller.overlaps.length === 0
             ? root.tr("rules.overlaps.empty", "No rules of the two routes cover the same sites or addresses.")
             : root.tr("rules.overlaps.all-resolved", "Every overlap is resolved.")

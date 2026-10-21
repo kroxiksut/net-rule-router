@@ -137,6 +137,7 @@ pub(super) fn doh_port_block(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: proto,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -174,6 +175,7 @@ pub(super) fn ale_app_egress_permit(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -195,6 +197,7 @@ pub(super) fn ale_app_block(pattern: &str, weight: u64, user_sid: Option<String>
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -248,5 +251,6 @@ pub(super) fn packet_permit(ip: Ipv4Addr, weight: u64, proto: Option<u8>) -> Wfp
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: proto,
+        remote_subnet_set: Vec::new(),
     }
 }

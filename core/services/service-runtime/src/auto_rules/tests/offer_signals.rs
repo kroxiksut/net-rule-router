@@ -221,6 +221,101 @@ fn a_program_already_named_by_a_rule_is_not_offered() {
         .note_app_main_link_blocked(SID, "messenger.exe", &stalled, wall_clock()));
 }
 
+fn unnamed_addresses() -> Vec<std::net::IpAddr> {
+    (1..=3)
+        .map(|last| std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, last)))
+        .collect()
+}
+
+/// The user's mode gates whole-program offers too: with unmatched traffic
+/// already on the additional route, moving a program there changes nothing.
+#[test]
+fn a_user_whose_default_is_the_additional_route_is_not_offered_a_program_move() {
+    let f = fixture(AutoRulesMode::Suggest);
+    f.set_behavior_mode(RouteBehaviorMode::PreferSecondaryWhenAvailable);
+    assert!(!f.engine.note_app_main_link_blocked(
+        SID,
+        "Messenger.exe",
+        &unnamed_addresses(),
+        wall_clock()
+    ));
+    assert!(!f.engine.note_app_own_resolver(
+        SID,
+        "Fetcher.exe",
+        &unnamed_addresses(),
+        wall_clock()
+    ));
+    assert!(f.engine.candidates(SID).is_empty());
+}
+
+/// A program resolving names itself is offered whole: no site rule can reach
+/// it, and nothing is claimed about how the main route treats it.
+#[test]
+fn a_program_resolving_names_itself_is_offered_as_an_application_rule() {
+    let f = fixture(AutoRulesMode::Suggest);
+    assert!(f
+        .engine
+        .note_app_own_resolver(SID, "Fetcher.exe", &unnamed_addresses(), wall_clock()));
+    let offered = f.engine.candidates(SID);
+    assert_eq!(offered.len(), 1);
+    let c = &offered[0];
+    assert_eq!(c.proposed_match, "fetcher.exe");
+    assert_eq!(
+        c.match_kind,
+        nrr_shared::ipc_payloads::AUTO_RULE_MATCH_KIND_APPLICATION
+    );
+    assert_eq!(
+        c.signal,
+        nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_APP_OWN_RESOLVER
+    );
+    assert_eq!(c.route, RouteRole::Secondary.slug());
+    assert!(c.primary_behavior.is_empty());
+    assert_eq!(c.observed_members.len(), 3);
+}
+
+/// Without a rule by name on the additional route there is nothing the
+/// program's own lookups could miss.
+#[test]
+fn a_program_resolving_names_itself_is_not_offered_without_site_rules_to_miss() {
+    let f = fixture(AutoRulesMode::Suggest);
+    f.rules
+        .book
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .secondary = CanonicalRuleSet::from_rules(Vec::new());
+    assert!(!f.engine.note_app_own_resolver(
+        SID,
+        "fetcher.exe",
+        &unnamed_addresses(),
+        wall_clock()
+    ));
+    assert!(f.engine.candidates(SID).is_empty());
+}
+
+/// A standing offer for the same program keeps its own, measured evidence.
+#[test]
+fn a_program_already_offered_keeps_its_standing_offer() {
+    let f = fixture(AutoRulesMode::Suggest);
+    assert!(f.engine.note_app_main_link_blocked(
+        SID,
+        "fetcher.exe",
+        &unnamed_addresses(),
+        wall_clock()
+    ));
+    assert!(!f.engine.note_app_own_resolver(
+        SID,
+        "fetcher.exe",
+        &unnamed_addresses(),
+        wall_clock()
+    ));
+    let offered = f.engine.candidates(SID);
+    assert_eq!(offered.len(), 1);
+    assert_eq!(
+        offered[0].signal,
+        nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED
+    );
+}
+
 /// Neither link reaches the host: the offer is withheld, and the notice list
 /// says why — once, however many probes come back empty. A host the tunnel
 /// does reach says nothing.

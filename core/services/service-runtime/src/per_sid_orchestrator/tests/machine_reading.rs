@@ -169,8 +169,10 @@ fn one_compute_enumerates_the_adapters_and_reads_the_route_table_once() {
     let port = counting_machine();
     let source = Arc::new(ScriptedSource::default());
     let mut policy = snap_full("wifi", "tap");
-    // Strict with the guard armed asks the kill-switch resolver three times.
-    policy.mode = PerSidBehaviorMode::StrictSecondaryFailClosed;
+    // Protection on asks the kill-switch and the IPv6 resolvers, each of
+    // which reads the machine when it is not handed the compute's reading.
+    policy.mode = PerSidBehaviorMode::PreferSecondaryWhenAvailable;
+    policy.leak_protection = nrr_domain::LeakProtection::Everything;
     source.set(SID, policy);
     let rules = Arc::new(ScriptedRules::default());
     rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 9)));

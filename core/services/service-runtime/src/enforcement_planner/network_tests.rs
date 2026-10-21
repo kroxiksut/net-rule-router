@@ -76,7 +76,6 @@ fn plan(rule_book: &CanonicalRuleBook, ipv6: Ipv6Guard) -> Vec<FlowRule> {
     plan_route_rules_with_shapes(
         rule_book,
         SID,
-        RouteBehaviorMode::PreferPrimary,
         &PlannerInput {
             fqdn_cache: &NoCache,
             app_resolver: &NoApps,
@@ -140,7 +139,6 @@ fn the_service_shape_gate_lets_networks_through() {
             vec![],
         ),
         SID,
-        RouteBehaviorMode::PreferPrimary,
         &PlannerInput {
             fqdn_cache: &NoCache,
             app_resolver: &NoApps,
@@ -279,7 +277,6 @@ fn network_rules_lower_to_the_filters_the_codegen_emits() {
         CodegenInput {
             sid: SID,
             rule_book: &rule_book,
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
             fqdn_cache: &cache,
             app_observations: &NoApps,
             app_resolver: &NoApps,
@@ -294,7 +291,6 @@ fn network_rules_lower_to_the_filters_the_codegen_emits() {
     let flows = plan_route_rules_with_shapes(
         &rule_book,
         SID,
-        RouteBehaviorMode::PreferPrimary,
         &PlannerInput {
             fqdn_cache: &cache,
             app_resolver: &NoApps,

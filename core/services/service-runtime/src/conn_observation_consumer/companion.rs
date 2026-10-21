@@ -131,6 +131,7 @@ impl ConnectionObservationConsumer {
     /// the named connection beside it was a page load.
     pub(super) fn note_navigation_attempt(
         &self,
+        owner: Option<&str>,
         process: Option<&str>,
         remote: IpAddr,
         at_ms: u64,
@@ -150,7 +151,7 @@ impl ConnectionObservationConsumer {
                 }),
             IpAddr::V6(_) => None,
         };
-        sink(process, hostname.as_deref(), at_ms);
+        sink(owner, process, hostname.as_deref(), at_ms);
     }
 
     /// Somebody went to a censored host: this connection is to an address a
@@ -269,18 +270,19 @@ impl ConnectionObservationConsumer {
             // reverse lookup, and only if a routed site is actually in play:
             // on an idle machine every direct connection would queue a query
             // for nothing.
-            if self.primary_egress_may_learn(owner) {
-                if let Some(learner) = self.reverse_dns_learner.as_ref() {
-                    if is_learnable_endpoint(ip) {
-                        // Not a drop at all — a flow that left over the primary
-                        // beside a routed site. Nothing forbids the direct
-                        // classification here.
-                        learner(
-                            ip,
-                            true,
-                            crate::conn_observation_consumer::ReverseLearnOrigin::PrimaryEgress,
-                        );
-                    }
+            // Cheapest checks first: a private or reserved address never
+            // spends the shared budget.
+            if let Some(learner) = self.reverse_dns_learner.as_ref() {
+                if is_learnable_endpoint(ip) && self.primary_egress_may_learn(owner) {
+                    // Not a drop at all — a flow that left over the primary
+                    // beside a routed site. Nothing forbids the direct
+                    // classification here.
+                    learner(
+                        ip,
+                        true,
+                        crate::conn_observation_consumer::ReverseLearnOrigin::PrimaryEgress,
+                        owner,
+                    );
                 }
             }
             return;

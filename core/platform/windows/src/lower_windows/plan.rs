@@ -4,20 +4,27 @@ use super::*;
 
 /// One plan in, the filters that express it out.
 ///
-/// The five `lower_*` functions above each handle one precedence class; this is
-/// the composition the backend applies. Order is the arbitration order — route
-/// rules, then the per-destination kill-switch, then the DoH/DoT block, then
-/// the catch-all — and it is the property the oracle tests pin, not the ids.
+/// The `lower_*` functions each handle one precedence class; this is the
+/// composition the backend applies. Arbitration comes from the weight bands,
+/// which the oracle tests pin, not from this order or the ids.
 ///
 /// Routes are deliberately NOT here: they are a different mechanism (the route
 /// table, not the filter engine) with a different failure mode, and folding
 /// them in would hide a partial apply behind one number.
-pub fn lower_plan(plan: &EnforcementPlan, egress: EgressLuids) -> Vec<WfpFilterSpec> {
+pub fn lower_plan(plan: &EnforcementPlan, egress: &EgressLuids) -> Vec<WfpFilterSpec> {
     let mut out = lower_route_rules(plan);
     out.extend(lower_kill_switch(plan, egress.secondary));
-    out.extend(lower_doh_dot_block(plan));
     out.extend(lower_catch_all_kill_switch(plan, egress.secondary));
     out.extend(lower_fake_ip_pool(plan));
+    // A foreign tunnel is spared on the layers the blocks above sit on, and
+    // the lockdown restated over its permits, so both read what came before.
+    let foreign = lower_foreign_tunnels(plan, egress, &out);
+    out.extend(foreign);
+    out.extend(lower_vpn_handshake(plan));
+    let doh = lower_doh_dot_block(plan);
+    let doh_vetoes = lower_doh_foreign_vetoes(plan, egress, &doh, &out);
+    out.extend(doh);
+    out.extend(doh_vetoes);
     out
 }
 
@@ -68,6 +75,7 @@ pub fn lower_fake_ip_pool(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
             remote_subnet: subnet_v4,
             remote_subnet_v6: subnet_v6,
             ip_protocol: proto,
+            remote_subnet_set: Vec::new(),
         });
     }
     out

@@ -10,10 +10,13 @@ mod js_harness;
 use js_harness::{arg, check, check_cases, lit, load_vectors, merged, text, Case, JsLib};
 use nrr_client_logic::auto_rules::{
     any_zone_site, count_dismissed_hosts, count_served_by_main_link, count_shown_pending_hosts,
-    filter_by_status, filter_served_by_main_link, group_rows, main_route_rank, registrable_domain,
-    rows_shown_by_default, search, sort_groups, SortMode, SuggestionGroup, SuggestionHost,
+    filter_by_status, filter_served_by_main_link, group_rows, is_self_signed_row, main_route_rank,
+    notice_due, notice_kind, registrable_domain, rows_shown_by_default, search, sort_groups,
+    SortMode, SuggestionGroup, SuggestionHost,
 };
-use nrr_shared::ipc_payloads::{AutoRuleCandidateDto, AutoRuleDismissedEntryDto};
+use nrr_shared::ipc_payloads::{
+    AutoRuleCandidateDto, AutoRuleDismissedEntryDto, StatusUpdateEvent,
+};
 use serde_json::{json, Map, Value};
 
 #[test]
@@ -165,6 +168,81 @@ fn suggestion_groups_match_js() {
                     .map(|row| row.id.as_str())
                     .collect::<Vec<_>>(),
                 "groups": shown.iter().map(group_shape).collect::<Vec<_>>(),
+            })
+        },
+    );
+}
+
+/// The TUI reads the typed push, the GUI the raw one; both decide alike,
+/// including for a service that predates the `announces` flag.
+#[test]
+fn notice_due_matches_js() {
+    let (document, raw) = load_vectors("auto_rule_notice_due");
+    let base = &document["base-event"];
+    let cases: Vec<Case> = raw
+        .into_iter()
+        .map(|case| {
+            let mut input = case.input;
+            input["event"] = merged(base, &input["event"]);
+            Case { input, ..case }
+        })
+        .collect();
+    check_cases(
+        "auto_rule_notice_due",
+        &cases,
+        &mut JsLib::pure(),
+        |input| format!("autoRuleNoticeDue({})", lit(&input["event"])),
+        |input| {
+            let event: StatusUpdateEvent =
+                serde_json::from_value(input["event"].clone()).expect("a suggestions push");
+            let StatusUpdateEvent::AutoRuleCandidatesChanged {
+                announces,
+                pending_count,
+                ..
+            } = event
+            else {
+                panic!("the vector holds a suggestions push")
+            };
+            Value::from(notice_due(announces, pending_count))
+        },
+    );
+}
+
+#[test]
+fn notice_kind_matches_js() {
+    let (document, raw) = load_vectors("auto_rule_notice_kind");
+    let base = &document["base-candidate"];
+    let cases: Vec<Case> = raw
+        .into_iter()
+        .map(|case| {
+            let mut input = case.input;
+            let rows: Vec<Value> = input["rows"]
+                .as_array()
+                .expect("rows is an array")
+                .iter()
+                .map(|patch| merged(base, patch))
+                .collect();
+            input["rows"] = Value::from(rows);
+            Case { input, ..case }
+        })
+        .collect();
+    check_cases(
+        "auto_rule_notice_kind",
+        &cases,
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "(function (rows) {{ return {{ kind: autoRuleNoticeKind(rows), \
+                 selfSigned: rows.map(autoRuleIsSelfSigned) }} }})({})",
+                lit(&input["rows"])
+            )
+        },
+        |input| {
+            let rows: Vec<AutoRuleCandidateDto> =
+                serde_json::from_value(input["rows"].clone()).expect("candidate rows");
+            json!({
+                "kind": notice_kind(&rows).as_str(),
+                "selfSigned": rows.iter().map(is_self_signed_row).collect::<Vec<_>>(),
             })
         },
     );

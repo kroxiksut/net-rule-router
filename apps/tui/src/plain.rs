@@ -2,7 +2,7 @@
 //! new line, the menu is numbered, input is a question answered with Enter —
 //! the form screen readers in a console read reliably.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use std::time::Instant;
@@ -53,7 +53,7 @@ impl<W: Write> PlainSession<W> {
             .iter()
             .skip(app.notices.len().saturating_sub(fresh))
         {
-            writeln!(self.out, "{}", notice_line(notice, texts))?;
+            writeln!(self.out, "{}", strip_controls(&notice_line(notice, texts)))?;
         }
         self.notices_seen = app.notice_count;
 
@@ -64,7 +64,7 @@ impl<W: Write> PlainSession<W> {
                 Some(i) => {
                     before.swap_remove(i);
                 }
-                None => writeln!(self.out, "{line}")?,
+                None => writeln!(self.out, "{}", strip_controls(line))?,
             }
         }
         self.seen = now;
@@ -73,7 +73,8 @@ impl<W: Write> PlainSession<W> {
 
     /// One answer to the prompt.
     pub fn input(&mut self, line: &str, app: &mut AppState, texts: &Texts) -> io::Result<()> {
-        let answer = line.trim();
+        let typed = strip_controls(line);
+        let answer = typed.trim();
         // A screen waiting for its own answer reads it first: a number there
         // picks an option, it does not open a screen.
         let current = screen(app.screen);
@@ -138,15 +139,15 @@ impl<W: Write> PlainSession<W> {
         writeln!(
             self.out,
             "{}",
-            texts.fill(keys::PLAIN_SCREEN, &[("name", &view.title)])
+            strip_controls(&texts.fill(keys::PLAIN_SCREEN, &[("name", &view.title)]))
         )?;
         for line in connection_lines(app, texts) {
-            writeln!(self.out, "{}", line.plain_text())?;
+            writeln!(self.out, "{}", strip_controls(&line.plain_text()))?;
         }
         for panel in &view.panels {
-            writeln!(self.out, "{}:", panel.title)?;
+            writeln!(self.out, "{}:", strip_controls(&panel.title))?;
             for line in &panel.lines {
-                writeln!(self.out, "  {}", line.plain_text())?;
+                writeln!(self.out, "  {}", strip_controls(&line.plain_text()))?;
             }
         }
         self.print_commands(app, texts)?;
@@ -195,6 +196,15 @@ impl<W: Write> PlainSession<W> {
         self.out.flush()
     }
 
+    /// The input stream ended: unapplied rule edits cannot be asked about any
+    /// more, so say they are gone rather than drop them silently.
+    pub fn input_ended(&mut self, app: &AppState, texts: &Texts) -> io::Result<()> {
+        if crate::screens::rules::holds_unapplied(app) {
+            writeln!(self.out, "{}", texts.get(keys::PLAIN_INPUT_ENDED_UNAPPLIED))?;
+        }
+        self.out.flush()
+    }
+
     pub fn bell(&mut self) -> io::Result<()> {
         self.out.write_all(b"\x07")?;
         self.out.flush()
@@ -218,6 +228,18 @@ fn summary(app: &AppState, texts: &Texts) -> Vec<String> {
         .collect()
 }
 
+/// Text from the service or the user's input, with control characters (escape
+/// sequences, backspace, carriage return) taken out; a tab becomes a space.
+fn strip_controls(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
 fn notice_line(notice: &Notice, texts: &Texts) -> String {
     let level = match notice.level {
         NoticeLevel::Warning => keys::LEVEL_WARNING,
@@ -225,6 +247,9 @@ fn notice_line(notice: &Notice, texts: &Texts) -> String {
     };
     format!("{}: {} — {}", texts.get(level), notice.title, notice.body)
 }
+
+/// One typed line is bounded: the rest of an overlong one arrives as the next.
+const MAX_LINE_BYTES: u64 = 64 * 1024;
 
 enum Incoming {
     Backend(BackendEvent),
@@ -252,10 +277,26 @@ pub fn run(
     thread::Builder::new()
         .name("nrr-tui-input".into())
         .spawn(move || {
-            for line in io::stdin().lock().lines() {
-                let Ok(line) = line else { break };
-                if tx.send(Incoming::Line(Some(line))).is_err() {
-                    return;
+            // A line that is not UTF-8 is still a line: it must not end the
+            // session and take the unapplied edits with it.
+            let mut input = io::stdin().lock();
+            let mut raw = Vec::new();
+            loop {
+                raw.clear();
+                match input
+                    .by_ref()
+                    .take(MAX_LINE_BYTES)
+                    .read_until(b'\n', &mut raw)
+                {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let line = String::from_utf8_lossy(&raw)
+                            .trim_end_matches(['\r', '\n'])
+                            .to_string();
+                        if tx.send(Incoming::Line(Some(line))).is_err() {
+                            return;
+                        }
+                    }
                 }
             }
             let _ = tx.send(Incoming::Line(None));
@@ -294,7 +335,10 @@ pub fn run(
                     session.start(app, &current)?;
                 }
             }
-            Ok(Incoming::Line(None)) | Err(_) => app.quit = true,
+            Ok(Incoming::Line(None)) | Err(_) => {
+                session.input_ended(app, texts)?;
+                app.quit = true;
+            }
         }
     }
     Ok(())

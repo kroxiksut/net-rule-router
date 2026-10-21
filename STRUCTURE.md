@@ -74,6 +74,7 @@ Bundled baseline locale files (`en.json`, `ru.json`) — the source of truth for
 
 ### third_party/
 Vendored third-party components redistributed with the product, with their licences
+- `third_party/tappers` — vendored source of the `tappers` TUN crate (our fork), excluded from the workspace, Linux-only dependency of `nrr-platform-linux`; provenance in its `PROVENANCE.md`, independence held by `core/platform/linux/tests/vendored_tappers.rs`
 
 ### packaging/
 Per-platform files the build stamps into binaries or the delivery installs:
@@ -208,6 +209,7 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - `client-logic/` must not reach any desktop, launcher, IPC-client or service crate at any depth (`core/client-logic/tests/dependency_boundary.rs`)
 - `apps/tui` must not reach Qt, desktop, launcher, broker or service crates at any depth (`apps/tui/tests/dependency_boundary.rs`)
 - `nftlink` must not depend on any `nrr-*` crate, so it can be published on its own (enforced by `core/platform/nftlink/tests/independence.rs`)
+- the vendored `third_party/tappers` must not depend on any `nrr-*` crate, so the upstream release can replace it as a version bump; only a Linux build links it (`core/platform/linux/tests/vendored_tappers.rs`)
 
 ## Key Design Invariants
 

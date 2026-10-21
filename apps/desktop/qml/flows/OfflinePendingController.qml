@@ -60,31 +60,20 @@ QtObject {
     function _offlineRoutingKeyLabel(namespace, key) {
         switch (key) {
             case "mode":
-                return root.tr("settings.routing.default-route.title", "Default route for unmatched traffic")
-            case "block-secondary-when-unavailable":
+                return root.tr("settings.routing.default-route.title", "Default route")
+            case "leak-protection":
                 return root.tr("settings.routing.kill-switch.title", "Leak protection")
-            case "kill-switch-enabled":
-                return root.tr("settings.routing.kill-switch.enable-label", "Enable leak protection")
-            case "kill-switch-fail-closed":
-                return root.tr("settings.routing.kill-switch.failure-mode.label",
-                    "If the additional adapter can't be found")
             case "kill-switch-protocols":
                 return root.tr("settings.routing.kill-switch.protocols.label", "Protocols leak protection cuts")
-            case "kill-switch-block-all":
-                return root.tr("settings.routing.kill-switch.block-all-label",
-                    "When the additional adapter is unavailable, block ALL traffic")
             case "allow-dns-over-primary":
                 return root.tr("settings.routing.kill-switch.allow-dns-label",
-                    "Allow name resolution over the main link while blocked")
+                    "Allow name resolution over the main connection while blocked")
             case "include-subdomains":
                 return root.tr("settings.routing-behavior.include-subdomains.label",
                     "Also cover subdomains for domain rules")
             case "shared-ip-policy":
                 return root.tr("settings.routing-behavior.shared-ip.label",
                     "When a routed domain shares an IP address with other sites")
-            case "mode-a-coverage-strategy":
-                return root.tr("settings.routing.mode-a-coverage.label",
-                    "When the additional route is unavailable (watching system DNS)")
             case "resolve-hosts-bypass":
                 return root.tr("settings.routing.hosts-bypass.label",
                     "Resolve routed domains bypassing the hosts file")
@@ -148,20 +137,14 @@ QtObject {
                     ? root.behaviorModeLabel(String(value)) : String(value)
             case "shared-ip-policy":
                 return root.tr("settings.routing-behavior.shared-ip.option-" + String(value), String(value))
-            case "mode-a-coverage-strategy":
-                return root.tr("settings.routing.mode-a-coverage.option-" + String(value), String(value))
+            case "leak-protection":
+                return root.tr("settings.routing.leak-protection.option-" + String(value), String(value))
             case "doh-lockdown-scope":
                 return root.tr("settings.routing.doh-lockdown.scope-" + String(value), String(value))
             case "enforcement-mode":
                 return root.tr("settings.routing.enforcement-mode.option-" + String(value),
                     String(value) === "resolver"
                         ? "Local DNS resolver (default)" : "Watching system DNS (legacy)")
-            case "kill-switch-fail-closed":
-                return (value === true)
-                    ? root.tr("settings.routing.kill-switch.failure-mode.option-fail-closed",
-                        "Block traffic (recommended)")
-                    : root.tr("settings.routing.kill-switch.failure-mode.option-fail-open",
-                        "Allow traffic and warn me")
             case "routing-stop-policy":
                 return (String(value) === "persist")
                     ? root.tr("dialog.offline-pending.stop-policy-persist", "Keep matched routes")
@@ -226,6 +209,9 @@ QtObject {
                 var rows = []
                 var k
                 for (k in rp) {
+                    // A key this build has no field for (parked by an older
+                    // build) is nothing the service could apply.
+                    if (root._routePolicyEffective(cur, k) === undefined) continue
                     if (rp[k] !== root._routePolicyEffective(cur, k)) {
                         rows.push({
                             label: _offlineRoutingKeyLabel("route-policy", k),
@@ -374,9 +360,12 @@ QtObject {
                 var req = root._buildFullRoutePolicyReq(cur)
                 var changed = false
                 for (var k in rp) {
-                    if (rp[k] !== root._routePolicyEffective(cur, k)) { req[k] = rp[k]; changed = true }
+                    var held = root._routePolicyEffective(cur, k)
+                    if (held === undefined) continue
+                    if (rp[k] !== held) { req[k] = rp[k]; changed = true }
                 }
-                return changed ? req : null
+                // A parked default route may not offer the level the row holds.
+                return changed ? Pure.settleLeakProtection(req) : null
             }, function(ok) {
                 state.rpDone = true; state.rpOk = ok; settle()
             }, "offline-pending-apply")

@@ -1,9 +1,10 @@
 //! The add and edit form (the GUI's `RuleEditDialog` and `saveRule`).
 
+use nrr_client_logic::rule_form::form_rule_value;
 use nrr_client_logic::rule_value_class::misplaced_target_type;
 use nrr_client_logic::rules_overlaps::overlaps_of_rule;
 use nrr_client_logic::rules_table::{
-    normalize_host_input, value_is_any_zone, RuleRow, RuleType, TargetRoute,
+    normalize_host_input, value_is_any_zone, value_is_ipv6_literal, RuleRow, RuleType, TargetRoute,
 };
 use nrr_shared::platform_profile::PlatformProfile;
 use nrr_shared::rules_json::FREE_MAX_RULES;
@@ -179,6 +180,14 @@ impl Form {
     /// "Unsure" fits a domain or one address on a route, never a deny.
     pub fn verify_offered(&self) -> bool {
         self.rule_type.allows_verify() && self.route != TargetRoute::Block && !self.any_zone()
+    }
+
+    /// Ticked on an IPv6 address: the service saves an ordinary route, so the
+    /// form says so before saving.
+    pub fn verify_dropped_for_ipv6(&self) -> bool {
+        self.verify
+            && self.route != TargetRoute::Block
+            && value_is_ipv6_literal(&self.rule_type, self.value.trim())
     }
 
     /// A deny where "Unsure" would otherwise fit: the form says why it is off.
@@ -417,7 +426,7 @@ impl Form {
     /// The rule a save would write, under the id it would get; `None` while
     /// the value is refused.
     fn candidate(&self, table: &Table) -> Option<RuleRow> {
-        let value = normalize_host_input(&self.rule_type, self.value.trim());
+        let value = self.typed_value();
         let refused =
             Verdict::for_route(&self.rule_type, &value, &self.route).status == VerdictStatus::Error;
         if value.is_empty() || refused {
@@ -443,12 +452,19 @@ impl Form {
         }
     }
 
-    /// Write the form into the table (`saveRule`). A URL typed or pasted into
-    /// a host value is cut to its host here, once the whole text is in: a
+    /// The value as the rule it names: a URL cut to its host, a program taken
+    /// out of one outer pair of quotes. Read once the whole text is in: a
     /// terminal delivers a paste as keystrokes, and cutting on each one would
     /// stop at `https:`.
+    fn typed_value(&self) -> String {
+        let value = normalize_host_input(&self.rule_type, self.value.trim());
+        form_rule_value(self.rule_type.as_str(), &value)
+    }
+
+    /// Write the form into the table (`saveRule`), its value read as
+    /// [`Self::typed_value`] reads it.
     pub fn save(&mut self, table: &mut Table) -> Saved {
-        self.value = normalize_host_input(&self.rule_type, self.value.trim());
+        self.value = self.typed_value();
         if self
             .verdict()
             .is_none_or(|v| v.status == VerdictStatus::Error)
@@ -564,6 +580,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unsure_on_an_ipv6_address_is_said_to_be_dropped() {
+        let mut form = Form::add();
+        form.route = TargetRoute::Secondary;
+        form.rule_type = RuleType::ExactIp;
+        form.verify = true;
+        form.value = "2001:db8::1".into();
+        assert!(form.verify_dropped_for_ipv6());
+        form.value = "203.0.113.7".into();
+        assert!(!form.verify_dropped_for_ipv6());
+        form.value = "2001:db8::1".into();
+        form.verify = false;
+        assert!(!form.verify_dropped_for_ipv6());
+    }
+
+    #[test]
     fn a_site_in_every_zone_is_not_offered_unsure_and_saves_without_it() {
         let mut form = Form::add();
         form.route = TargetRoute::Secondary;
@@ -574,6 +605,28 @@ mod tests {
         assert!(form.any_zone());
         assert!(!form.verify_offered());
         assert!(!form.saved_verify());
+    }
+
+    /// A program typed in quotes is saved as the rules file would read it;
+    /// no other type loses them.
+    #[test]
+    fn a_program_in_quotes_is_saved_without_them() {
+        let mut table = Table::default();
+        let mut form = Form::add();
+        form.rule_type = RuleType::Application;
+        form.value = " \"Adobe Reader.exe\" ".into();
+        assert!(matches!(form.save(&mut table), Saved::Added { .. }));
+        assert_eq!(
+            table
+                .rules()
+                .map(|r| r.match_value.as_str())
+                .collect::<Vec<_>>(),
+            ["Adobe Reader.exe"]
+        );
+
+        let mut form = Form::add();
+        form.value = "\"example.com\"".into();
+        assert_eq!(form.typed_value(), "\"example.com\"");
     }
 
     /// A deny and "Unsure" never meet: picking the deny clears the tick, and

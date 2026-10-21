@@ -9,6 +9,8 @@
 //! Same inherent impl, split across files. Behaviour is unchanged.
 
 use super::*;
+use crate::routed_host_flow_refresh::{flows_to_reset, Course, Courses, FlowPaths};
+use nrr_platform_api::fake_ip::stale_flows::FlowLinks;
 
 /// The sockets a destination pin was seen dropping to one address this batch.
 #[derive(Debug, Default)]
@@ -52,6 +54,46 @@ pub(super) fn stale_flows_behind_drops(
         .collect()
 }
 
+/// What of `candidates` a batch of pin drops tears down: the flows behind the
+/// drops, decided per owner by the one reset decision every path shares, so a
+/// shared-address direct host, another user's connection and a flow riding a
+/// link of the owner's that is neither of ours all stay.
+pub(super) fn pin_drop_resets(
+    candidates: Vec<EstablishedFlow>,
+    victims: &std::collections::BTreeMap<std::net::IpAddr, PinDropVictims>,
+    shared_direct: &std::collections::HashSet<std::net::Ipv4Addr>,
+    links_of: impl Fn(&str) -> FlowLinks,
+) -> Vec<EstablishedFlow> {
+    let behind = stale_flows_behind_drops(candidates, victims);
+    // Grouped case-folded, queried with the owner as the OS reported it.
+    let mut by_owner: std::collections::BTreeMap<String, (String, Vec<EstablishedFlow>)> =
+        std::collections::BTreeMap::new();
+    for flow in behind {
+        // An owner nobody can vouch for is never torn down.
+        if let Some(owner) = flow.owner.as_deref() {
+            by_owner
+                .entry(owner.to_ascii_lowercase())
+                .or_insert_with(|| (owner.to_owned(), Vec::new()))
+                .1
+                .push(flow);
+        }
+    }
+    let mut out = Vec::new();
+    for (owner, flows) in by_owner.into_values() {
+        // The pin sends its destination through the tunnel.
+        let mut courses = Courses::default();
+        for flow in &flows {
+            courses.insert_host(flow.remote.ip(), Course::Secondary);
+        }
+        let paths = FlowPaths {
+            links: links_of(&owner),
+            courses,
+        };
+        out.extend(flows_to_reset(flows, &owner, shared_direct, &Default::default(), &paths).reset);
+    }
+    out
+}
+
 impl ConnectionObservationConsumer {
     /// Destinations whose flows this session already tore down once — the fact
     /// that separates "socket older than the pin" from "the application holds a
@@ -89,31 +131,34 @@ impl ConnectionObservationConsumer {
             .is_some_and(|(spec_id, check)| check(spec_id))
     }
 
+    /// Did one of the user's own deny rules produce this drop?
+    // `pub(super)` because the impl is split across files.
+    pub(super) fn is_rule_block_drop(&self, rec: &ConnectionTraceRecord) -> bool {
+        rec.nrr_drop_spec_id
+            .zip(self.rule_block_drop_check.as_ref())
+            .is_some_and(|(spec_id, check)| check(spec_id))
+    }
+
     /// Which of our filters dropped `rec` — one reading for the block notice
     /// and the connection trace, so the two never name different causes.
     pub(super) fn reason_for_drop(
         &self,
         rec: &ConnectionTraceRecord,
         killswitch_verified: bool,
-        default_block_id: Option<u64>,
     ) -> nrr_domain::block_notice::BlockReason {
+        // Identified exactly, so it outranks the outage reading: the user's own
+        // rule blocked it whether or not the route is down.
+        if !killswitch_verified && self.is_rule_block_drop(rec) {
+            return nrr_domain::block_notice::BlockReason::BlockedByRule;
+        }
         let ipv6_cut = rec
             .nrr_drop_spec_id
             .zip(self.ipv6_cut_drop_check.as_ref())
             .is_some_and(|(spec_id, check)| check(spec_id));
         let armed = self.fail_closed_armed.as_ref().is_some_and(|armed| armed());
-        let not_covered = rec
-            .nrr_drop_spec_id
-            .zip(self.not_covered_drop_check.as_ref())
-            .is_some_and(|(spec_id, check)| check(spec_id));
         block_reason_for(
             rec.nrr_drop_spec_id,
             killswitch_verified,
-            if not_covered {
-                rec.nrr_drop_spec_id
-            } else {
-                default_block_id
-            },
             armed,
             ipv6_cut,
             self.is_dns_lockdown_drop(rec),
@@ -124,15 +169,12 @@ impl ConnectionObservationConsumer {
     /// wired sink. A foreign filter (`blocked_by_nrr == Some(false)`) never
     /// reaches this method — see the `consume` call site — because blaming
     /// our policy for someone else's firewall would be actively wrong.
-    /// `default_block_id` is the deterministic id of the "no rule covers this
-    /// host" catch-all for the active SID (see `block_reason_for`).
     // `pub(super)` because the impl is split across files and the caller
     // is now another module.
     pub(super) fn note_block_attempt(
         &self,
         rec: &ConnectionTraceRecord,
         killswitch_verified: bool,
-        default_block_id: Option<u64>,
     ) {
         let Some(sink) = self.block_notice_sink.as_ref() else {
             return;
@@ -146,7 +188,7 @@ impl ConnectionObservationConsumer {
         ) {
             return;
         }
-        let reason = self.reason_for_drop(rec, killswitch_verified, default_block_id);
+        let reason = self.reason_for_drop(rec, killswitch_verified);
         // A route that had not come up since the start when this drop happened
         // is not an outage yet: its status notice speaks for it if it never does.
         if reason == nrr_domain::block_notice::BlockReason::RouteUnavailable

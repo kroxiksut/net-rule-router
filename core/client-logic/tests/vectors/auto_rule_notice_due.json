@@ -1,0 +1,55 @@
+{
+  "description": "pure.js autoRuleNoticeDue: whether an auto-rule-candidates-changed push raises a notice. Only a push that announces offers does, and never over an empty inbox; a push that only moves the count updates the badges. A push without the flag comes from a service that sent nothing but announcements. Each event is `base-event` with its patch laid over it.",
+  "base-event": {
+    "type": "auto-rule-candidates-changed",
+    "sid": "S-1-5-21-1",
+    "top-anchor": "site.example"
+  },
+  "cases": [
+    {
+      "name": "new offers waiting",
+      "input": { "event": { "pending-count": 3, "announces": true } },
+      "expected": true
+    },
+    {
+      "name": "a single new offer",
+      "input": { "event": { "pending-count": 1, "announces": true } },
+      "expected": true
+    },
+    {
+      "name": "an announcement over an empty inbox says nothing",
+      "input": { "event": { "pending-count": 0, "announces": true } },
+      "expected": false
+    },
+    {
+      "name": "the count moved after an answer elsewhere",
+      "input": { "event": { "pending-count": 1, "announces": false } },
+      "expected": false
+    },
+    {
+      "name": "the count fell to zero",
+      "input": { "event": { "pending-count": 0, "announces": false } },
+      "expected": false
+    },
+    {
+      "name": "the count grew without news",
+      "input": { "event": { "pending-count": 6, "announces": false } },
+      "expected": false
+    },
+    {
+      "name": "an older service without the flag announced",
+      "input": { "event": { "pending-count": 2 } },
+      "expected": true
+    },
+    {
+      "name": "an older service without the flag, nothing waiting",
+      "input": { "event": { "pending-count": 0 } },
+      "expected": false
+    },
+    {
+      "name": "a large inbox",
+      "input": { "event": { "pending-count": 10000, "announces": true } },
+      "expected": true
+    }
+  ]
+}

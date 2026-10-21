@@ -31,7 +31,10 @@ members = [
 ]
 # The fuzz targets are their own nightly-only workspace (`scripts/fuzz.sh`), so
 # the stable gate, clippy and cargo-deny never see libfuzzer.
-exclude = ["fuzz"]
+# `third_party/tappers` is a vendored copy built only as a dependency: as a
+# member, `cargo test --workspace` would run its tests, which create real
+# interfaces and need root, and our lints would judge code we keep verbatim.
+exclude = ["fuzz", "third_party/tappers"]
 resolver = "2"
 
 [workspace.package]

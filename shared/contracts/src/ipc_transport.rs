@@ -75,6 +75,13 @@ pub enum IpcErrorCode {
     /// before privileged operations resume. The error payload
     /// carries the recovery action slug.
     RecoveryRequired,
+    /// The service does not know the requested operation: a client newer than
+    /// the service. The connection stays open; the client tells the user to
+    /// restart or update the service.
+    UnsupportedOperation,
+    /// The answer did not fit one frame. The operation itself ran, so a mutating
+    /// request may have taken effect; the client refreshes instead of retrying.
+    ResponseTooLarge,
     /// Catch-all for unexpected internal failures. The payload
     /// carries a diagnostic id so an operator can correlate with
     /// the audit trail; no implementation detail is leaked.
@@ -84,7 +91,7 @@ pub enum IpcErrorCode {
 impl IpcErrorCode {
     /// Every variant; the `client_error_codes` contract test reads the enum
     /// body and fails on a variant missing here.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::RulesLocked,
@@ -97,6 +104,8 @@ impl IpcErrorCode {
         Self::ConfirmationUnknown,
         Self::ServiceDegraded,
         Self::RecoveryRequired,
+        Self::UnsupportedOperation,
+        Self::ResponseTooLarge,
         Self::Internal,
     ];
 
@@ -116,6 +125,8 @@ impl IpcErrorCode {
             Self::ConfirmationUnknown => "confirmation-unknown",
             Self::ServiceDegraded => "service-degraded",
             Self::RecoveryRequired => "recovery-required",
+            Self::UnsupportedOperation => "unsupported-operation",
+            Self::ResponseTooLarge => "response-too-large",
             Self::Internal => "internal",
         }
     }
@@ -219,19 +230,20 @@ pub fn terminal_needs_elevation_client_code() -> &'static str {
 /// (`nrr-windows-service`) enforce this limit. Frames larger than this
 /// are rejected at the transport boundary with a malformed-request error.
 ///
-/// Set to 1 MiB because `MutationSubmit` with `MutationKind::PresetImport`
-/// carries the raw preset bytes (base64-wrapped) in the payload, and
-/// `PresetExportGet` / `SettingsExportFull` responses ship base64-wrapped
-/// file content.
+/// Set to 4 MiB because `rules.list` is one unpaged answer and a full rule
+/// book (up to `FREE_MAX_RULES` rows) is larger than 1 MiB at ordinary row
+/// sizes; `MutationSubmit` with `MutationKind::PresetImport` and the export
+/// responses also ship base64-wrapped file content. The frame is read as it
+/// arrives, so the cap reserves nothing for a peer that only sends a header.
 ///
 /// This is the OUTER limit: `nrr_domain::import::IMPORT_FILE_SIZE_LIMIT_BYTES`
-/// is derived from it, backing out the base64 expansion and envelope overhead,
-/// so a file the domain accepts always fits a frame and the refusal a user sees
-/// comes from the layer that understands what they did.
+/// is derived from a frame budget inside it, backing out the base64 expansion
+/// and envelope overhead, so a file the domain accepts always fits a frame and
+/// the refusal a user sees comes from the layer that understands what they did.
 ///
 /// Re-exported as `nrr_service_runtime::IPC_MAX_MESSAGE_BYTES` to keep
 /// the import path stable for existing callers.
-pub const IPC_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+pub const IPC_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 // ── Operation class ──────────────────────────────────────────────────────────
 
@@ -668,8 +680,7 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // RoutePolicyUpdate.
         | IpcOperationName::RouteLinkProviderSet
         | IpcOperationName::MigrationMarkComplete
-        | IpcOperationName::RoutingPauseToggle
-        | IpcOperationName::AutostartToggle => IpcOperationClass::UserScopedConfiguration,
+        | IpcOperationName::RoutingPauseToggle => IpcOperationClass::UserScopedConfiguration,
         // Service-global mutations admin-gated upstream. Service stability
         // config shares the same envelope class as other service-global
         // settings writes.
@@ -791,6 +802,8 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         IpcOperationName::RulesOverrideGrant | IpcOperationName::RulesOverrideRevoke => {
             IpcOperationClass::UserScopedConfiguration
         }
+        // The caller's own gateways: per-SID, audited, no elevation.
+        IpcOperationName::RouteVpnGatewaysSet => IpcOperationClass::UserScopedConfiguration,
     }
 }
 

@@ -65,6 +65,7 @@ pub(super) fn ale_block(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: proto,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -112,6 +113,7 @@ fn packet_block(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: proto,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -151,6 +153,7 @@ pub(super) fn packet_exempt_subnet(
         remote_subnet: Some((net, prefix_len)),
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -183,6 +186,7 @@ pub(super) fn packet_exempt_host(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -263,13 +267,14 @@ fn packet_permit_host_with_kind(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
-/// The named-protocol block set for one scope (`Some(ip)` = a /32 in mode A;
-/// `None` = block-all in mode B), narrowed to `protocols`: one block per
-/// selected named packet protocol (ICMP/IGMP/GRE/ESP). `idx` offsets weights
-/// so per-destination sets in mode A never collide.
+/// The named-protocol block set for one scope (a chunk = per destination;
+/// `All` = block-all), narrowed to `protocols`: one block per selected named
+/// packet protocol (ICMP/IGMP/GRE/ESP). `idx` offsets weights so
+/// per-destination sets never collide.
 ///
 /// these blocks live at `OUTBOUND_TRANSPORT_V4`, NOT the packet
 /// layer: the IPPACKET layers have no `FWPM_CONDITION_IP_PROTOCOL`, so every
@@ -341,6 +346,7 @@ pub(super) fn packet_egress_permit(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: proto,
+        remote_subnet_set: Vec::new(),
     }
 }
 

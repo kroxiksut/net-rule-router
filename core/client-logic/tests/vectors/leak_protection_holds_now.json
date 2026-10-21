@@ -1,0 +1,80 @@
+{
+  "description": "pure.js leakProtectionHoldsNow: whether a level holds the internet the moment it applies (the first-run note). `secondary` patches the adapters base row; null means nothing is bound",
+  "cases": [
+    {
+      "name": "everything while the additional connection is down",
+      "input": {
+        "level": "everything",
+        "secondary": {
+          "availability": "unavailable"
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "everything with nothing bound",
+      "input": {
+        "level": "everything",
+        "secondary": null
+      },
+      "expected": true
+    },
+    {
+      "name": "an adapter not yet checked counts as not available",
+      "input": {
+        "level": "everything",
+        "secondary": {
+          "availability": "requires-check"
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "everything while it is up",
+      "input": {
+        "level": "everything",
+        "secondary": {}
+      },
+      "expected": false
+    },
+    {
+      "name": "everything over a dead-end adapter that is up",
+      "input": {
+        "level": "everything",
+        "secondary": {
+          "gateway": "",
+          "has-forwarding-path": false
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "routed sites while it is down",
+      "input": {
+        "level": "sites",
+        "secondary": {
+          "availability": "unavailable"
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "off while it is down",
+      "input": {
+        "level": "off",
+        "secondary": {
+          "availability": "unavailable"
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "off with nothing bound",
+      "input": {
+        "level": "off",
+        "secondary": null
+      },
+      "expected": false
+    }
+  ]
+}

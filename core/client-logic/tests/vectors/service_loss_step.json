@@ -1,0 +1,211 @@
+{
+  "description": "pure.js serviceLossStep: tell the user the service stopped on its own, offer start and restore",
+  "cases": [
+    {
+      "name": "killed service offers both",
+      "input": {
+        "wasRaised": false,
+        "status": "stopped",
+        "wasRunning": true,
+        "stopExpected": false,
+        "canRestore": true
+      },
+      "expected": {
+        "raise": true,
+        "raised": true,
+        "actions": [
+          "start-service",
+          "restore-network"
+        ]
+      }
+    },
+    {
+      "name": "already told, stays down",
+      "input": {
+        "wasRaised": true,
+        "status": "stopped",
+        "wasRunning": true,
+        "stopExpected": false,
+        "canRestore": true
+      },
+      "expected": {
+        "raise": false,
+        "raised": true,
+        "actions": [
+          "start-service",
+          "restore-network"
+        ]
+      }
+    },
+    {
+      "name": "stopped by the user is silent",
+      "input": {
+        "wasRaised": false,
+        "status": "stopped",
+        "wasRunning": true,
+        "stopExpected": true,
+        "canRestore": true
+      },
+      "expected": {
+        "raise": false,
+        "raised": false,
+        "actions": []
+      }
+    },
+    {
+      "name": "never saw it run is silent",
+      "input": {
+        "wasRaised": false,
+        "status": "stopped",
+        "wasRunning": false,
+        "stopExpected": false,
+        "canRestore": true
+      },
+      "expected": {
+        "raise": false,
+        "raised": false,
+        "actions": []
+      }
+    },
+    {
+      "name": "no restore on this platform",
+      "input": {
+        "wasRaised": false,
+        "status": "stopped",
+        "wasRunning": true,
+        "stopExpected": false,
+        "canRestore": false
+      },
+      "expected": {
+        "raise": true,
+        "raised": true,
+        "actions": [
+          "start-service"
+        ]
+      }
+    },
+    {
+      "name": "running clears the notice",
+      "input": {
+        "wasRaised": true,
+        "status": "running",
+        "wasRunning": true,
+        "stopExpected": false,
+        "canRestore": true
+      },
+      "expected": {
+        "raise": false,
+        "raised": false,
+        "actions": []
+      }
+    },
+    {
+      "name": "a second loss is news again",
+      "input": {
+        "wasRaised": false,
+        "status": "stopped",
+        "wasRunning": true,
+        "stopExpected": false,
+        "canRestore": true
+      },
+      "expected": {
+        "raise": true,
+        "raised": true,
+        "actions": [
+          "start-service",
+          "restore-network"
+        ]
+      }
+    },
+    {
+      "name": "pending is not a loss",
+      "input": {
+        "wasRaised": false,
+        "status": "pending",
+        "wasRunning": true,
+        "stopExpected": false,
+        "canRestore": true
+      },
+      "expected": {
+        "raise": false,
+        "raised": false,
+        "actions": []
+      }
+    },
+    {
+      "name": "not installed is not a loss",
+      "input": {
+        "wasRaised": false,
+        "status": "not-installed",
+        "wasRunning": true,
+        "stopExpected": false,
+        "canRestore": true
+      },
+      "expected": {
+        "raise": false,
+        "raised": false,
+        "actions": []
+      }
+    },
+    {
+      "name": "unreadable state is not a loss",
+      "input": {
+        "wasRaised": false,
+        "status": "unknown",
+        "wasRunning": true,
+        "stopExpected": false,
+        "canRestore": true
+      },
+      "expected": {
+        "raise": false,
+        "raised": false,
+        "actions": []
+      }
+    },
+    {
+      "name": "unknown flags count as false",
+      "input": {
+        "wasRaised": null,
+        "status": "stopped",
+        "wasRunning": null,
+        "stopExpected": null,
+        "canRestore": null
+      },
+      "expected": {
+        "raise": false,
+        "raised": false,
+        "actions": []
+      }
+    },
+    {
+      "name": "non-boolean flags are not true",
+      "input": {
+        "wasRaised": false,
+        "status": "stopped",
+        "wasRunning": "yes",
+        "stopExpected": false,
+        "canRestore": "yes"
+      },
+      "expected": {
+        "raise": false,
+        "raised": false,
+        "actions": []
+      }
+    },
+    {
+      "name": "missing status is not a loss",
+      "input": {
+        "wasRaised": false,
+        "status": null,
+        "wasRunning": true,
+        "stopExpected": false,
+        "canRestore": true
+      },
+      "expected": {
+        "raise": false,
+        "raised": false,
+        "actions": []
+      }
+    }
+  ]
+}

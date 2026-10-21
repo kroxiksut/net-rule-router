@@ -1,9 +1,10 @@
 //! «Diagnostics and logs»: the service's state, security alerts and their
-//! acknowledgement, the explain probe, the diagnostic archive, and the
-//! operational log. The same operations as the GUI's two sections:
-//! `service.health.get`, `snapshot.diagnostics.get`, `mutation.submit`
-//! (`security-alert-ack`), `operation.status.get`, `diagnostics.explain.get`,
-//! `diagnostics.export-archive` and `logs.list`.
+//! acknowledgement, the explain probe, the diagnostic archive, the
+//! operational log and the audit trail. The same operations as the GUI's two
+//! sections: `service.health.get`, `snapshot.diagnostics.get`,
+//! `mutation.submit` (`security-alert-ack`), `operation.status.get`,
+//! `diagnostics.explain.get`, `diagnostics.export-archive`, `logs.list` and
+//! `audit.list`.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,15 +17,17 @@ use nrr_client_logic::review::{operation_outcome, Outcome};
 use nrr_client_logic::units::format_storage_bytes;
 use nrr_ipc_client::IpcClient;
 use nrr_shared::diagnostics_dto::{
-    DiagnosticsDataOrigin, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter,
+    AuditEntryDto, DiagnosticsDataOrigin, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter,
     OTHER_PRINCIPAL_ALERT_ID,
 };
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
-    DiagnosticsExportArchiveRequest, DiagnosticsExportArchiveResponse, ExplainGetRequest,
-    ExplainGetResponse, ExplainInputSampleDto, IntegrityRowKind, LogsListRequest, LogsListResponse,
-    MutationConfirmResponse, MutationDryRunResponse, MutationKind, MutationSubmitRequest,
-    OperationStatusRequest, OperationStatusResponse, ServiceHealthResponse, UnverifiedRowDto,
+    AuditListRequest, AuditListResponse, DiagnosticsExportArchiveRequest,
+    DiagnosticsExportArchiveResponse, ExplainGetRequest, ExplainGetResponse, ExplainInputSampleDto,
+    IntegrityRowKind, LogsListRequest, LogsListResponse, MutationConfirmResponse,
+    MutationDryRunResponse, MutationKind, MutationSubmitRequest, OperationStatusRequest,
+    OperationStatusResponse, ServiceHealthResponse, UnverifiedRowDto,
 };
 use nrr_shared::pagination::{PageCursor, PaginationParams};
 use serde_json::{json, Value};
@@ -52,6 +55,7 @@ enum Part {
     #[default]
     Overview,
     Log,
+    Audit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +126,18 @@ struct Log {
     advance: bool,
 }
 
+#[derive(Debug, Default)]
+struct AuditTrail {
+    asked: bool,
+    loading: bool,
+    entries: Vec<AuditEntryDto>,
+    cursor: Option<PageCursor>,
+    error: Option<String>,
+    pager: Pager,
+    generation: u64,
+    advance: bool,
+}
+
 #[derive(Debug)]
 pub struct DiagState {
     part: Part,
@@ -139,6 +155,7 @@ pub struct DiagState {
     typing: Option<(Field, String)>,
     archive: Archive,
     log: Log,
+    audit: AuditTrail,
     /// "Current session" in the log starts when this program did.
     session_start_ms: i64,
 }
@@ -164,6 +181,7 @@ impl Default for DiagState {
             typing: None,
             archive: Archive::default(),
             log: Log::default(),
+            audit: AuditTrail::default(),
             session_start_ms: now,
         }
     }
@@ -481,7 +499,7 @@ fn verdict_label(texts: &Texts, probe: &Probe) -> String {
     };
     let blocking = matches!(
         probe.enforcement.as_str(),
-        "blocked-unknown-under-block-all"
+        "everything-waits-when-secondary-down"
             | "fail-closed-when-secondary-down"
             | "collateral-blocked-strict"
     );
@@ -657,15 +675,107 @@ fn log_row(texts: &Texts, e: &LogEntryDto) -> String {
     )
 }
 
+// ── Audit trail ──────────────────────────────────────────────────────────────
+
+fn load_audit(app: &mut AppState, reset: bool) {
+    let audit = &mut app.inspect.diag.audit;
+    if reset {
+        audit.generation += 1;
+        audit.entries.clear();
+        audit.cursor = None;
+        audit.pager = Pager::default();
+        audit.advance = false;
+    }
+    audit.asked = true;
+    audit.loading = true;
+    audit.error = None;
+    let generation = audit.generation;
+    let request = AuditListRequest {
+        pagination: PaginationParams {
+            cursor: audit.cursor.clone(),
+            page_size: LOG_PAGE_SIZE,
+        },
+        ..AuditListRequest::default()
+    };
+    queue(app, move |client| {
+        let result = serde_json::to_value(&request)
+            .map_err(unencodable)
+            .and_then(|payload| call(client, IpcOperationName::AuditList, payload))
+            .and_then(|answer| {
+                serde_json::from_value::<AuditListResponse>(answer).map_err(bad_response)
+            });
+        Reply::new(move |app| {
+            let audit = &mut app.inspect.diag.audit;
+            if audit.generation != generation {
+                return;
+            }
+            audit.loading = false;
+            match result {
+                Ok(page) => {
+                    audit.entries.extend(page.items);
+                    audit.cursor = page.next_cursor;
+                    if std::mem::take(&mut audit.advance) {
+                        audit.pager.next_page(audit.entries.len());
+                    }
+                }
+                Err(slug) => {
+                    audit.advance = false;
+                    audit.error = Some(slug);
+                }
+            }
+        })
+    });
+}
+
+fn more_audit(app: &mut AppState) {
+    let audit = &mut app.inspect.diag.audit;
+    let len = audit.entries.len();
+    if audit.pager.next_page(len) || audit.cursor.is_none() || audit.loading {
+        return;
+    }
+    audit.advance = true;
+    load_audit(app, false);
+}
+
+/// A cause is a service slug: it is shown only through its translation.
+fn audit_cause(texts: &Texts, slug: &str) -> String {
+    texts.dynamic(&format!("audit.cause.{slug}"), slug)
+}
+
+fn audit_row(texts: &Texts, e: &AuditEntryDto) -> String {
+    let mut row = format!(
+        "#{} · {} · {} · {} · {}",
+        e.seq,
+        wall_clock_seconds(e.created_at),
+        e.kind,
+        e.result,
+        e.reason_code
+    );
+    if let Some(cause) = e.cause.as_deref().filter(|c| !c.is_empty()) {
+        row.push_str(" · ");
+        row.push_str(&audit_cause(texts, cause));
+    }
+    if let Some(revision) = e.revision_id.as_deref().filter(|r| !r.is_empty()) {
+        row.push_str(" · ");
+        row.push_str(revision);
+    }
+    row
+}
+
 fn switch_part(app: &mut AppState) {
     let state = &mut app.inspect.diag;
     state.typing = None;
     state.part = match state.part {
         Part::Overview => Part::Log,
-        Part::Log => Part::Overview,
+        Part::Log => Part::Audit,
+        Part::Audit => Part::Overview,
     };
-    if state.part == Part::Log && !state.log.asked && app.link.is_connected() {
+    let connected = app.link.is_connected();
+    let state = &app.inspect.diag;
+    if state.part == Part::Log && !state.log.asked && connected {
         load_log(app, true);
+    } else if state.part == Part::Audit && !state.audit.asked && connected {
+        load_audit(app, true);
     }
 }
 
@@ -716,6 +826,11 @@ impl Screen for DiagnosticsScreen {
                 lines: log_lines(app, texts),
                 feed: false,
             }],
+            Part::Audit => vec![Panel {
+                title: texts.get(keys::AUDIT),
+                lines: audit_lines(app, texts),
+                feed: false,
+            }],
         };
         ScreenView {
             title: texts.get(crate::keys::SCREEN_DIAGNOSTICS),
@@ -763,6 +878,13 @@ impl Screen for DiagnosticsScreen {
         {
             load_log(app, true);
         }
+        let audit = &app.inspect.diag.audit;
+        if app.inspect.diag.part == Part::Audit
+            && !audit.loading
+            && (!audit.asked || audit.error.is_some())
+        {
+            load_audit(app, true);
+        }
     }
 
     fn takes_focus(&self) -> bool {
@@ -772,6 +894,15 @@ impl Screen for DiagnosticsScreen {
     fn captures_keys(&self, app: &AppState) -> bool {
         let state = &app.inspect.diag;
         state.typing.is_some() || matches!(state.ack, Ack::Review { .. })
+    }
+
+    fn text_target(&self, app: &AppState) -> crate::paste::TextTarget {
+        let state = &app.inspect.diag;
+        if state.typing.is_some() && !matches!(state.ack, Ack::Review { .. }) {
+            crate::paste::TextTarget::Line
+        } else {
+            crate::paste::TextTarget::None
+        }
     }
 
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
@@ -809,6 +940,7 @@ impl Screen for DiagnosticsScreen {
         match app.inspect.diag.part {
             Part::Overview => overview_key(app, key),
             Part::Log => log_key(app, key),
+            Part::Audit => audit_key(app, key),
         }
     }
 
@@ -828,6 +960,7 @@ impl Screen for DiagnosticsScreen {
         match app.inspect.diag.part {
             Part::Overview => overview_line(app, line),
             Part::Log => log_line(app, line),
+            Part::Audit => audit_line(app, line),
         }
     }
 }
@@ -918,7 +1051,56 @@ fn log_line(app: &mut AppState, line: &str) -> bool {
     true
 }
 
+fn audit_key(app: &mut AppState, key: KeyEvent) -> bool {
+    let audit = &mut app.inspect.diag.audit;
+    let len = audit.entries.len();
+    match key.code {
+        KeyCode::Char('r') => load_audit(app, true),
+        KeyCode::PageDown if audit.pager.page_start() + super::PAGE_ROWS >= len => {
+            more_audit(app);
+        }
+        KeyCode::Down if audit.pager.selected + 1 >= len => more_audit(app),
+        code => return audit.pager.on_key(code, len),
+    }
+    true
+}
+
+fn audit_line(app: &mut AppState, line: &str) -> bool {
+    match command(line) {
+        ("n", "") => more_audit(app),
+        ("p", "") => app.inspect.diag.audit.pager.previous_page(),
+        ("r", "") => load_audit(app, true),
+        _ => return false,
+    }
+    true
+}
+
 // ── Pictures ─────────────────────────────────────────────────────────────────
+
+/// What the service says is wrong with a part of itself (a start after an
+/// unasked stop, say), as it words it; the DNS case has its own line above.
+pub(super) fn health_warning_lines(health: &ServiceHealthResponse) -> Vec<ViewLine> {
+    const SHOWN: usize = 5;
+    health
+        .components
+        .iter()
+        .filter(|c| !matches!(c.severity.as_str(), "ok" | "healthy" | "info"))
+        .filter_map(|c| {
+            let message = c.message.as_deref().filter(|m| !m.is_empty())?;
+            // Said by their own translated lines.
+            if message.contains(nrr_shared::ipc_payloads::SYSTEM_DNS_NOT_RESTORED)
+                || message.starts_with(nrr_shared::ipc_payloads::RULES_BOOK_UNREADABLE)
+            {
+                return None;
+            }
+            Some(ViewLine::new(vec![Segment::state(
+                format!("{}: {}", display_text(&c.component), display_text(message)),
+                StateTone::Caution,
+            )]))
+        })
+        .take(SHOWN)
+        .collect()
+}
 
 fn service_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     let state = &app.inspect.diag;
@@ -955,14 +1137,20 @@ fn service_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
                 texts.get(keys::PENDING)
             )));
         }
-        if serde_json::to_value(h)
-            .is_ok_and(|health| nrr_client_logic::system_dns::not_restored(&health))
-        {
+        let health_json = serde_json::to_value(h).unwrap_or_default();
+        if nrr_client_logic::system_dns::not_restored(&health_json) {
             lines.push(ViewLine::new(vec![Segment::state(
                 texts.get(keys::DNS_NOT_RESTORED),
                 StateTone::Bad,
             )]));
         }
+        if nrr_client_logic::diagnostics::rules_book_unreadable(&health_json) {
+            lines.push(ViewLine::new(vec![Segment::state(
+                texts.get(keys::RULES_BOOK_UNREADABLE),
+                StateTone::Caution,
+            )]));
+        }
+        lines.extend(health_warning_lines(h));
     }
     if state.loading && state.status.is_none() {
         lines.push(ViewLine::text(texts.get(keys::LOADING)));
@@ -1011,9 +1199,55 @@ fn service_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
                 storage.push_str(&texts.get(keys::LOG_DIR_NOT_WRITABLE));
             }
             lines.push(ViewLine::text(storage));
+            lines.extend(missing_capability_lines(
+                texts,
+                &status.missing_capabilities,
+            ));
+            lines.extend(dns_tamper_lines(texts, status));
         }
     }
     lines.push(ViewLine::text(texts.get(keys::DIAG_HELP_SWITCH)));
+    lines
+}
+
+/// What this machine cannot do and what that costs: silent while nothing is
+/// missing.
+fn missing_capability_lines(texts: &Texts, missing: &[String]) -> Vec<ViewLine> {
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![ViewLine::text(texts.get(keys::MISSING_HEADING))];
+    for slug in missing {
+        let title = texts.dynamic(&format!("platform.missing.{slug}.title"), slug);
+        let effect = texts.dynamic(&format!("platform.missing.{slug}.effect"), "");
+        lines.push(ViewLine::text(format!("  {title}")));
+        if !effect.is_empty() {
+            lines.push(ViewLine::text(format!("    {effect}")));
+        }
+    }
+    lines
+}
+
+/// The provider-tampering card: silent while no site was affected. The example
+/// names come from other hosts, so they pass the display cleaner.
+fn dns_tamper_lines(texts: &Texts, status: &DiagnosticsStatusDto) -> Vec<ViewLine> {
+    let card = &status.dns_tamper;
+    if card.affected_hosts == 0 {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        ViewLine::text(texts.get(keys::DNS_TAMPER_HEADING)),
+        ViewLine::text(texts.fill(
+            keys::DNS_TAMPER_BODY,
+            &[("count", card.affected_hosts.to_string())],
+        )),
+    ];
+    if !card.examples.is_empty() {
+        let names: Vec<_> = card.examples.iter().map(|n| display_text(n)).collect();
+        lines.push(ViewLine::text(
+            texts.fill(keys::DNS_TAMPER_EXAMPLES, &[("names", names.join(", "))]),
+        ));
+    }
     lines
 }
 
@@ -1286,4 +1520,104 @@ fn log_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     ));
     lines.push(ViewLine::text(texts.get(keys::DIAG_HELP_SWITCH)));
     lines
+}
+
+fn audit_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
+    let audit = &app.inspect.diag.audit;
+    let mut lines = Vec::new();
+    if !app.link.is_connected() && audit.asked {
+        lines.push(ViewLine::text(texts.get(keys::STALE)));
+    }
+    if let Some(slug) = &audit.error {
+        lines.push(ViewLine::text(format!(
+            "{}: {}",
+            texts.get(keys::LOGS_FAILED),
+            error_text(texts, slug)
+        )));
+    }
+    if audit.loading && audit.entries.is_empty() {
+        lines.push(ViewLine::text(texts.get(keys::LOADING)));
+    } else if audit.asked && !audit.loading && audit.error.is_none() && audit.entries.is_empty() {
+        lines.push(ViewLine::text(texts.get(keys::AUDIT_EMPTY)));
+    }
+    let mut pager = audit.pager;
+    pager.clamp(audit.entries.len());
+    lines.extend(page_lines(
+        texts,
+        pager,
+        audit.entries.len(),
+        audit.cursor.is_some(),
+        |i| audit_row(texts, &audit.entries[i]),
+    ));
+    lines.push(ViewLine::text(texts.get(keys::DIAG_HELP_SWITCH)));
+    lines
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+    use crate::testing::texts_en;
+
+    fn probe(route: &str, enforcement: &str) -> Probe {
+        Probe {
+            input: "a.example".into(),
+            route: route.into(),
+            reason_key: String::new(),
+            enforcement: enforcement.into(),
+            shared: 0,
+            total: 0,
+            blocking_ip: String::new(),
+        }
+    }
+
+    /// A host no rule names waits under "Everything" while the additional
+    /// connection is down, on either route: shown as blocked, like the rest.
+    #[test]
+    fn a_waiting_host_is_shown_as_blocked() {
+        let texts = texts_en();
+        let blocked = texts.get(keys::VERDICT_BLOCK);
+        for route in ["primary", "secondary"] {
+            let shown = verdict_label(
+                &texts,
+                &probe(route, "everything-waits-when-secondary-down"),
+            );
+            assert!(shown.ends_with(&blocked), "{shown}");
+        }
+        let allowed = verdict_label(&texts, &probe("primary", ""));
+        assert!(
+            allowed.ends_with(&texts.get(keys::VERDICT_PERMIT)),
+            "{allowed}"
+        );
+    }
+
+    /// Each missing capability is named with what it costs, under one heading;
+    /// a machine that lacks nothing shows no card at all.
+    #[test]
+    fn missing_capabilities_are_named_with_their_effect() {
+        let texts = texts_en();
+        assert!(missing_capability_lines(&texts, &[]).is_empty());
+
+        let shown: Vec<String> = missing_capability_lines(
+            &texts,
+            &["user-routes".to_owned(), "block-reports".to_owned()],
+        )
+        .iter()
+        .map(ViewLine::plain_text)
+        .collect();
+        assert_eq!(shown[0], texts.get(keys::MISSING_HEADING));
+        for slug in ["user-routes", "block-reports"] {
+            for part in ["title", "effect"] {
+                let text = texts.dynamic(&format!("platform.missing.{slug}.{part}"), "");
+                assert!(!text.is_empty(), "{slug}.{part} has no text");
+                assert!(
+                    shown.iter().any(|line| line.trim() == text),
+                    "{slug}.{part} not shown: {shown:?}"
+                );
+            }
+        }
+        assert!(
+            !shown.iter().any(|line| line.contains("user-routes")),
+            "a slug is never shown raw: {shown:?}"
+        );
+    }
 }

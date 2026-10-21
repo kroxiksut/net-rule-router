@@ -14,7 +14,8 @@ pub(crate) mod tests;
 use crossterm::event::{KeyCode, KeyEvent};
 use nrr_client_logic::auto_rules::{
     count_dismissed_hosts, count_served_by_main_link, filter_by_status, filter_served_by_main_link,
-    group_rows, sort_groups, HostStatus, SortMode, SuggestionGroup, SuggestionHost,
+    group_rows, notice_due, notice_kind, rows_shown_by_default, sort_groups, HostStatus,
+    NoticeKind, SortMode, SuggestionGroup, SuggestionHost,
 };
 use nrr_client_logic::route_policy::build_full_update_request;
 use nrr_ipc_client::{ipc_error_to_wire, ipc_operation_timeout, IpcClient};
@@ -184,6 +185,14 @@ fn group_key(group: &SuggestionGroup) -> String {
 
 pub struct SuggestionsScreen;
 
+/// The service's count, the one the tray menu and the window's sidebar show.
+fn list_title(app: &AppState, texts: &Texts) -> String {
+    match app.suggestions.pending_count {
+        0 => texts.get(keys::LIST_TITLE),
+        count => texts.fill(keys::LIST_TITLE_COUNTED, &[("count", count.to_string())]),
+    }
+}
+
 impl Screen for SuggestionsScreen {
     fn view(&self, app: &AppState, texts: &Texts) -> ScreenView {
         ScreenView {
@@ -195,7 +204,7 @@ impl Screen for SuggestionsScreen {
                     feed: false,
                 },
                 Panel {
-                    title: texts.get(keys::LIST_TITLE),
+                    title: list_title(app, texts),
                     lines: list_lines(app, texts),
                     feed: true,
                 },
@@ -228,11 +237,11 @@ impl Screen for SuggestionsScreen {
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
         if app.suggestions.confirm.is_some() {
             return match key.code {
-                KeyCode::Enter | KeyCode::Char('y') => {
+                KeyCode::Char('y') => {
                     confirm_always(app);
                     true
                 }
-                KeyCode::Esc | KeyCode::Char('n') => {
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => {
                     cancel_always(app);
                     true
                 }
@@ -500,12 +509,21 @@ fn accept_job(ids: Vec<String>, as_any_zone: bool) -> Job {
         let answer = accept(client, ids, as_any_zone);
         Reply::new(move |app| {
             if let Ok(answer) = &answer {
-                app.suggestions.pending_count = answer.pending;
-                app.suggestions.reload_hint = answer.anchor_skipped;
+                took(app, answer);
             }
             finish(app, answer.map(|a| Note::Added(a.applied)));
         })
     })
+}
+
+/// An accepted batch: the counts on screen, and the bound files follow the
+/// rules the service now holds.
+fn took(app: &mut AppState, answer: &AutoRuleCandidatesActionResponse) {
+    app.suggestions.pending_count = answer.pending;
+    app.suggestions.reload_hint = answer.anchor_skipped;
+    if answer.applied > 0 {
+        crate::screens::rules::rules_written_for_an_answer(app);
+    }
 }
 
 fn accept(
@@ -567,8 +585,7 @@ fn always_job(ids: Vec<String>) -> Job {
                 }
             }
             if let Ok(answer) = &outcome {
-                app.suggestions.pending_count = answer.pending;
-                app.suggestions.reload_hint = answer.anchor_skipped;
+                took(app, answer);
                 if let Some(policy) = app.snapshot.as_mut().and_then(|s| s.route_policy.as_mut()) {
                     policy.auto_rules_mode = AUTO_MODE.to_owned();
                 }
@@ -620,21 +637,26 @@ fn probe(app: &mut AppState) {
     }));
 }
 
-/// The service's `auto-rule-candidates-changed`: re-read the list when it is
-/// in use, and a notice when more offers wait than before. The notice is a
-/// pointer, never a question asked over the user's work.
-pub fn changed(
-    app: &mut AppState,
-    pending_count: u64,
-    top_anchor: &str,
-    texts: &Texts,
-) -> Option<(String, String)> {
-    let grew = pending_count > app.suggestions.pending_count;
-    app.suggestions.pending_count = pending_count;
+/// Re-read the lists when they are on screen or were read before.
+pub fn reload_if_in_use(app: &mut AppState) {
     if app.link.is_connected() && (app.suggestions.loaded || app.screen == ScreenId::Suggestions) {
         load(app);
     }
-    if !grew {
+}
+
+/// The service's `auto-rule-candidates-changed`: the count, a re-read of the
+/// list when it is in use, and a notice when the push announces new offers.
+/// The notice is a pointer, never a question asked over the user's work.
+pub fn changed(
+    app: &mut AppState,
+    pending_count: u64,
+    announces: bool,
+    top_anchor: &str,
+    texts: &Texts,
+) -> Option<(String, String)> {
+    app.suggestions.pending_count = pending_count;
+    reload_if_in_use(app);
+    if !notice_due(announces, pending_count) {
         return None;
     }
     let site = if top_anchor.is_empty() {
@@ -642,10 +664,11 @@ pub fn changed(
     } else {
         display_text(top_anchor).into_owned()
     };
+    let (title, body) = notice_keys(notice_kind_of(&app.suggestions.candidates, top_anchor));
     let screen = ScreenId::Suggestions;
     let body = format!(
         "{} {}",
-        texts.fill(keys::NOTICE_BODY, &[("name", site.as_str())]),
+        texts.fill(body, &[("name", site.as_str())]),
         texts.fill(
             keys::NOTICE_OPEN,
             &[
@@ -654,7 +677,42 @@ pub fn changed(
             ],
         )
     );
-    Some((texts.get(keys::NOTICE_TITLE), body))
+    Some((texts.get(title), body))
+}
+
+/// What the offers named after `top_anchor` are about, by the list last read.
+/// An offer the list has not caught up with reads as a site's companions, the
+/// notice it always was.
+fn notice_kind_of(candidates: &[AutoRuleCandidateDto], top_anchor: &str) -> NoticeKind {
+    let named: Vec<AutoRuleCandidateDto> = rows_shown_by_default(candidates)
+        .into_iter()
+        .filter(|row| !top_anchor.is_empty() && row.anchor == top_anchor)
+        .cloned()
+        .collect();
+    notice_kind(&named)
+}
+
+fn notice_keys(kind: NoticeKind) -> (Key, Key) {
+    match kind {
+        NoticeKind::Companions => (keys::NOTICE_TITLE, keys::NOTICE_BODY),
+        NoticeKind::SitesBlocked => (
+            keys::NOTICE_TITLE_SITES_BLOCKED,
+            keys::NOTICE_BODY_SITES_BLOCKED,
+        ),
+        NoticeKind::ProgramsBlocked => (
+            keys::NOTICE_TITLE_APP_BLOCKED,
+            keys::NOTICE_BODY_APP_BLOCKED,
+        ),
+        NoticeKind::ProgramsOwnResolver => (
+            keys::NOTICE_TITLE_APP_OWN_RESOLVER,
+            keys::NOTICE_BODY_APP_OWN_RESOLVER,
+        ),
+        NoticeKind::MixedBlocked => (
+            keys::NOTICE_TITLE_MIXED_BLOCKED,
+            keys::NOTICE_BODY_MIXED_BLOCKED,
+        ),
+        NoticeKind::Assorted => (keys::NOTICE_TITLE_ASSORTED, keys::NOTICE_BODY_ASSORTED),
+    }
 }
 
 // ── Picture ──────────────────────────────────────────────────────────────────

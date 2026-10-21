@@ -98,15 +98,11 @@ fn route_policy_update_request_sample(auto_rules_mode: &str) -> RoutePolicyUpdat
         primary: None,
         secondary: None,
         mode: BehaviorModeDto::PreferPrimary,
-        block_secondary_when_unavailable: true,
-        kill_switch_fail_closed: true,
+        leak_protection: LeakProtectionDto::Off,
         kill_switch_protocols: 0x7F,
-        kill_switch_block_all: false,
-        kill_switch_enabled: false,
         allow_dns_over_primary: true,
         include_subdomains: false,
         shared_ip_policy: shared_ip_policy_default(),
-        mode_a_coverage_strategy: mode_a_coverage_strategy_default(),
         resolve_hosts_bypass: true,
         doh_lockdown_enabled: false,
         doh_lockdown_scope: doh_lockdown_scope_default(),
@@ -125,6 +121,7 @@ fn route_policy_update_request_sample(auto_rules_mode: &str) -> RoutePolicyUpdat
         short_name_suffix: String::new(),
         app_rules_take_all_addresses: false,
         forwarded_outage: String::new(),
+        external_address_auto_check: false,
         binding_source: BindingSourceDto::UserAssigned,
         apply_only: Vec::new(),
     }
@@ -155,6 +152,63 @@ fn auto_rules_mode_defaults_to_suggest_when_an_older_peer_omits_it() {
         serde_json::from_value(json).expect("deserialise pre-field payload");
     assert_eq!(parsed.auto_rules_mode, "suggest");
     assert_eq!(auto_rules_mode_default(), "suggest");
+}
+
+#[test]
+fn leak_protection_travels_as_one_of_three_slugs() {
+    for (choice, slug) in [
+        (LeakProtectionDto::Off, "off"),
+        (LeakProtectionDto::Sites, "sites"),
+        (LeakProtectionDto::Everything, "everything"),
+    ] {
+        let mut request = route_policy_update_request_sample("suggest");
+        request.leak_protection = choice;
+        let json = serde_json::to_value(&request).expect("serialise");
+        assert_eq!(json["leak-protection"], slug);
+        let back: RoutePolicyUpdateRequest = serde_json::from_value(json).expect("deserialise");
+        assert_eq!(back.leak_protection, choice);
+    }
+}
+
+#[test]
+fn a_request_without_leak_protection_is_malformed_not_off() {
+    let mut json =
+        serde_json::to_value(route_policy_update_request_sample("suggest")).expect("serialise");
+    json.as_object_mut()
+        .expect("object payload")
+        .remove("leak-protection");
+    assert!(serde_json::from_value::<RoutePolicyUpdateRequest>(json).is_err());
+}
+
+#[test]
+fn an_unknown_leak_protection_or_mode_slug_is_refused() {
+    for (key, stray) in [
+        ("leak-protection", "on"),
+        ("leak-protection", "fail-closed"),
+        ("mode", "strict-secondary-fail-closed"),
+    ] {
+        let mut json =
+            serde_json::to_value(route_policy_update_request_sample("suggest")).expect("serialise");
+        json[key] = serde_json::Value::String(stray.into());
+        assert!(
+            serde_json::from_value::<RoutePolicyUpdateRequest>(json).is_err(),
+            "{key} = {stray}"
+        );
+    }
+}
+
+#[test]
+fn the_retired_protection_keys_are_gone_from_the_wire() {
+    let json =
+        serde_json::to_value(route_policy_update_request_sample("suggest")).expect("serialise");
+    for retired in [
+        "kill-switch-enabled",
+        "kill-switch-fail-closed",
+        "kill-switch-block-all",
+        "mode-a-coverage-strategy",
+    ] {
+        assert!(json.get(retired).is_none(), "{retired} still ships");
+    }
 }
 
 #[test]
@@ -196,15 +250,28 @@ fn app_rules_take_all_addresses_travels_as_kebab_case_and_defaults_off() {
     assert!(!parsed.app_rules_take_all_addresses);
 }
 
+#[test]
+fn external_address_auto_check_travels_as_kebab_case_and_defaults_off() {
+    let mut on = route_policy_update_request_sample("suggest");
+    on.external_address_auto_check = true;
+    let json = serde_json::to_value(&on).expect("serialise");
+    assert_eq!(json["external-address-auto-check"], true);
+
+    // The check sends a request through the tunnel: a peer that predates the
+    // field never turns it on.
+    let mut json = json;
+    let obj = json.as_object_mut().expect("object payload");
+    obj.remove("external-address-auto-check");
+    let parsed: RoutePolicyUpdateRequest =
+        serde_json::from_value(json).expect("deserialise pre-field payload");
+    assert!(!parsed.external_address_auto_check);
+}
+
 /// Every push event a client can receive, one sample per variant.
 /// `every_variant_is_sampled` holds this list to the enum, so the shape tests
 /// below cover a new variant the moment it is declared.
 fn every_status_update_event() -> Vec<StatusUpdateEvent> {
     vec![
-        StatusUpdateEvent::HealthChanged {
-            service_state: "running".into(),
-            worst_severity: "info".into(),
-        },
         StatusUpdateEvent::ProtectionCoverageChanged {
             reason: "blanket-block-not-armed".into(),
         },
@@ -220,6 +287,8 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
         StatusUpdateEvent::RoutingPauseStateChanged {
             sid: "S-1-5-21".into(),
             paused: false,
+            resumes_at_ms: Some(1_700_000_000_000),
+            until_restart: false,
         },
         StatusUpdateEvent::ApplyFailurePolicyChanged {
             policy: "best-effort".into(),
@@ -247,17 +316,22 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             sid: "S-1-5-21".into(),
             pending_count: 59,
             top_anchor: "example.com".into(),
+            announces: false,
         },
         StatusUpdateEvent::SecondaryExternalAddressObserved {
             sid: "S-1-5-21".into(),
             adapter_name: "Tunnel".into(),
             external_address: "203.0.113.7".into(),
+            quiet: false,
+        },
+        StatusUpdateEvent::SecondaryExternalAddressCleared {
+            sid: "S-1-5-21".into(),
         },
         StatusUpdateEvent::BlockNoticeRaised {
             sid: "S-1-5-21".into(),
             destination: "cdn.example".into(),
             app: "messenger.exe".into(),
-            reason: "not-covered-by-rules".into(),
+            reason: "route-unavailable".into(),
             attempts: 1,
             launched_by: vec!["launcher.exe".into()],
         },
@@ -283,6 +357,10 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             carried: true,
             link: "Example Tunnel".into(),
         },
+        StatusUpdateEvent::RulesBookUnreadable {
+            sid: "S-1-5-21".into(),
+            unreadable: true,
+        },
         StatusUpdateEvent::RuleDuplicatesDetected {
             sid: "S-1-5-21".into(),
             count: 2,
@@ -297,6 +375,13 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             clients: vec![PendingVpnClientDto {
                 exe_path: r"C:\Users\someone\Downloads\x-vpn.exe".into(),
                 bundled_exe_paths: Vec::new(),
+            }],
+        },
+        StatusUpdateEvent::VpnGatewayAwaitingConfirmation {
+            sid: "S-1-5-21".into(),
+            gateways: vec![VpnGatewayDto {
+                address: "203.0.113.20".into(),
+                program: String::new(),
             }],
         },
         StatusUpdateEvent::UnassignedTunnelDetected {
@@ -399,19 +484,50 @@ fn push_event_keys_the_ui_reads_are_stable() {
         sid: "S-1-5-21".into(),
         pending_count: 59,
         top_anchor: "example.com".into(),
+        announces: false,
     })
     .expect("serialise");
     assert_eq!(pending["pending-count"], 59);
     assert_eq!(pending["top-anchor"], "example.com");
+    assert_eq!(pending["announces"], false);
+    // An older service pushed only announcements and sent no flag.
+    let older: StatusUpdateEvent = serde_json::from_value(serde_json::json!({
+        "type": "auto-rule-candidates-changed",
+        "sid": "S-1-5-21",
+        "pending-count": 2,
+        "top-anchor": "example.com"
+    }))
+    .expect("deserialise");
+    assert!(matches!(
+        older,
+        StatusUpdateEvent::AutoRuleCandidatesChanged {
+            announces: true,
+            ..
+        }
+    ));
 
     let address = serde_json::to_value(StatusUpdateEvent::SecondaryExternalAddressObserved {
         sid: "S-1-5-21".into(),
         adapter_name: "Tunnel".into(),
         external_address: "203.0.113.7".into(),
+        quiet: true,
     })
     .expect("serialise");
     assert_eq!(address["external-address"], "203.0.113.7");
     assert_eq!(address["adapter-name"], "Tunnel");
+    assert_eq!(address["quiet"], true);
+    // A sender that predates `quiet` announces, as it always did.
+    let older: StatusUpdateEvent = serde_json::from_value(serde_json::json!({
+        "type": "secondary-external-address-observed",
+        "sid": "S-1-5-21",
+        "adapter-name": "Tunnel",
+        "external-address": "203.0.113.7",
+    }))
+    .expect("an older observation still parses");
+    assert!(matches!(
+        older,
+        StatusUpdateEvent::SecondaryExternalAddressObserved { quiet: false, .. }
+    ));
 
     let progress = serde_json::to_value(StatusUpdateEvent::MutationProgress {
         correlation_id: "corr-1".into(),
@@ -437,14 +553,14 @@ fn push_event_keys_the_ui_reads_are_stable() {
         sid: "S-1-5-21".into(),
         destination: "cdn.example".into(),
         app: "messenger.exe".into(),
-        reason: "not-covered-by-rules".into(),
+        reason: "route-unavailable".into(),
         attempts: 1,
         launched_by: vec!["cmd.exe".into(), "explorer.exe".into()],
     })
     .expect("serialise");
     assert_eq!(notice["type"], "block-notice-raised");
     assert_eq!(notice["destination"], "cdn.example");
-    assert_eq!(notice["reason"], "not-covered-by-rules");
+    assert_eq!(notice["reason"], "route-unavailable");
     assert_eq!(notice["attempts"], 1);
     assert_eq!(notice["launched-by"][0], "cmd.exe");
     assert_eq!(notice["launched-by"][1], "explorer.exe");
@@ -504,6 +620,20 @@ fn traffic_carried_by_another_user_reaches_only_its_own_user() {
         link: String::new(),
     };
     assert_eq!(event.addressee(), Some("S-1-5-21-1"));
+}
+
+/// A rule book that cannot be read is its owner's news alone, and says so on
+/// the wire by name.
+#[test]
+fn an_unreadable_rule_book_reaches_only_its_own_user() {
+    let event = StatusUpdateEvent::RulesBookUnreadable {
+        sid: "S-1-5-21-1".into(),
+        unreadable: true,
+    };
+    assert_eq!(event.addressee(), Some("S-1-5-21-1"));
+    let wire = serde_json::to_value(&event).expect("serialise");
+    assert_eq!(wire["type"], "rules-book-unreadable");
+    assert_eq!(wire["unreadable"], true);
 }
 
 /// The alert gate refuses every user's rule changes, so the news that it
@@ -985,7 +1115,8 @@ fn auto_rule_signal_slugs_are_pinned() {
         [
             "placeholder-answer",
             "main-link-blocked",
-            "app-main-link-blocked"
+            "app-main-link-blocked",
+            "app-own-resolver"
         ]
     );
     for signal in AUTO_RULE_SELF_SIGNED_SIGNALS {
@@ -1336,4 +1467,82 @@ fn a_rule_override_travels_as_the_clients_read_it() {
         older,
         StatusUpdateEvent::RuleOverridesChanged { cause, .. } if cause.is_empty()
     ));
+}
+
+/// A full rule book must load and save through one frame: `rules.list` is a
+/// single unpaged answer and a save carries the whole set.
+#[test]
+fn a_full_rule_book_fits_one_ipc_frame() {
+    use crate::ipc_transport::IPC_MAX_MESSAGE_BYTES;
+    use crate::rules_json::{
+        AddressMatchDto, CanonicalRulesJsonV1, RuleAction, RuleDto, FREE_MAX_RULES,
+        RULES_JSON_SCHEMA_VERSION,
+    };
+
+    // Room for the envelope, the token and the response's own members.
+    const HEADROOM: usize = 64 * 1024;
+    let host = |i: usize| format!("service-{i:05}.region-eu.example-network.com");
+    let comment = "streaming service the family uses in the evening";
+
+    let rows: Vec<RuleRowEntry> = (0..FREE_MAX_RULES)
+        .map(|i| {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("R-{:04}", i + 1),
+                "rule-type": "domain",
+                "match-value": host(i),
+                "target-route": "secondary",
+                "comment": comment,
+                "enabled": true,
+                "validation-status": "ok",
+                "main-route": "answered",
+            }))
+            .expect("row")
+        })
+        .collect();
+    let listed = serde_json::to_vec(&serde_json::json!({
+        "ok": true,
+        "payload": RulesListResponse {
+            rows,
+            supported_rule_types: vec!["domain".into(); 4],
+            active_revision_id: Some("00000000-0000-0000-0000-000000000000".into()),
+            unrecognized: 0,
+            main_route_pending: 0,
+            base_revision: Some("0".repeat(64)),
+        },
+    }))
+    .expect("list serialises");
+    assert!(
+        listed.len() + HEADROOM <= IPC_MAX_MESSAGE_BYTES,
+        "a full rules.list answer is {} bytes, over the {IPC_MAX_MESSAGE_BYTES} byte frame",
+        listed.len()
+    );
+
+    let rules: Vec<RuleDto> = (0..FREE_MAX_RULES)
+        .map(|i| RuleDto {
+            id: format!("R-{:04}", i + 1),
+            enabled: true,
+            address_match: Some(AddressMatchDto::ExactFqdn { value: host(i) }),
+            app_match: None,
+            comment: comment.into(),
+            action: RuleAction::Route,
+            origin: None,
+        })
+        .collect();
+    let saved = serde_json::to_vec(&serde_json::json!({
+        "mutation-kind": "rules-update",
+        "payload": {
+            "route": "primary",
+            "rules": CanonicalRulesJsonV1 {
+                schema_version: RULES_JSON_SCHEMA_VERSION,
+                primary: rules,
+                secondary: vec![],
+            },
+        },
+    }))
+    .expect("save serialises");
+    assert!(
+        saved.len() + HEADROOM <= IPC_MAX_MESSAGE_BYTES,
+        "a full rules save is {} bytes, over the {IPC_MAX_MESSAGE_BYTES} byte frame",
+        saved.len()
+    );
 }

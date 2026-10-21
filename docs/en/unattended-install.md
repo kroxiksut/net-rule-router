@@ -30,8 +30,8 @@ NetRuleRouter-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /LOG=C:\temp\nrr-setup.log
 |---|---|
 | `PROVISION` | Rules for the main connection |
 | `PROVISION_SECONDARY` | Rules for the additional connection |
-| `PROVISION_SETTINGS` | A settings file exported from another computer: its routing mode becomes the starting one. The connections in it are not carried over, because each computer has its own |
-| `SECONDARY_UNSET` | `direct` (default): until an additional connection is chosen, its rules go straight out. `block`: they are held back until then |
+| `PROVISION_SETTINGS` | A settings file exported from another computer: its default route (the main or the additional connection) becomes the starting one, and its leak protection the weakest a user starts with. The connections in it are not carried over, because each computer has its own |
+| `SECONDARY_UNSET` | `direct` (default): until an additional connection is chosen, its rules go straight out. `block`: they are held back until then, and a user who has not chosen leak protection starts with **Routed sites** |
 
 Use full paths. Every parameter is optional.
 

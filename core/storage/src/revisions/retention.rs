@@ -309,14 +309,14 @@ impl<'c> RevisionsRepository<'c> {
                  WHERE principal = ?1 AND status = ?2 AND revision_id != ?3
                        AND revision_id NOT IN
                            (SELECT revision_id FROM active_revision_pointer WHERE principal = ?1)
-                 ORDER BY {time_col} ASC, revision_id ASC LIMIT ?4"
+                 ORDER BY {time_col} ASC, rowid ASC LIMIT ?4"
             ),
             None => format!(
                 "SELECT revision_id FROM revisions
                  WHERE principal = ?1 AND status = ?2
                        AND revision_id NOT IN
                            (SELECT revision_id FROM active_revision_pointer WHERE principal = ?1)
-                 ORDER BY {time_col} ASC, revision_id ASC LIMIT ?3"
+                 ORDER BY {time_col} ASC, rowid ASC LIMIT ?3"
             ),
         };
         let mut stmt = self

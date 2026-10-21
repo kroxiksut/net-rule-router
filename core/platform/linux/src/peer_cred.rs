@@ -17,11 +17,11 @@
 //!
 //! - **No exe-basename whitelist.** The Windows pipe accepts only
 //!   `NetRuleRouter.exe` / `NetRuleRouterTray.exe`. On Linux the connecting
-//!   *executable* is not part of the peer credential, and the `0700`
-//!   `RuntimeDirectory=netrulerouter` (systemd) already restricts who can even
-//!   reach the socket to processes running as a permitted user. So this module
-//!   resolves identity but never rejects on an exe basis — the socket
-//!   directory permissions are the gate, not a per-connection allowlist.
+//!   *executable* is not part of the peer credential, and there is no
+//!   directory gate: any local user may reach the socket. So this module
+//!   resolves identity but never rejects on an exe basis; what a caller may do
+//!   follows from its own principal and from polkit, not from reaching the
+//!   socket.
 //! - **Elevation = `uid == 0` (root).** The Windows flag reads
 //!   `TokenElevation`; the Linux analog is "is the caller root". The GUI runs
 //!   non-root and reaches privileged operations through the root service
@@ -111,9 +111,8 @@ pub struct UnixClientIdentity {
 /// Classify a connected `AF_UNIX` stream into a [`UnixClientIdentity`], the
 /// Linux analog of [`classify_pipe_client`]. Reads the peer credentials via
 /// [`read_peer_cred`] and resolves them to a [`UserPrincipal`]. Unlike the
-/// Windows path this never rejects on an exe basis (the `0700` socket
-/// directory is the gate); it only fails if the kernel refuses the
-/// credential read (a genuine `getsockopt` error).
+/// Windows path this never rejects on an exe basis; it only fails if the
+/// kernel refuses the credential read (a genuine `getsockopt` error).
 pub fn classify_unix_client(stream: &UnixStream) -> io::Result<UnixClientIdentity> {
     let cred = read_peer_cred(stream)?;
     Ok(UnixClientIdentity {

@@ -138,12 +138,6 @@ pub const WFP_SUBLAYER_WEIGHT: u32 = 0xFFFF;
 /// evaluation order within the sub-layer.
 pub use nrr_platform_api::types::FILTER_WEIGHT_BASE;
 
-// ── Named pipe ────────────────────────────────────────────────────────────────
-
-/// Name of the local named pipe used for GUI/tray ↔ service IPC.
-/// Full path: `\\.\pipe\NrrService`
-pub const IPC_PIPE_NAME: &str = r"\\.\pipe\NrrService";
-
 // ── Timeouts and limits ───────────────────────────────────────────────────────
 
 /// Maximum number of WFP filters per transaction. Prevents

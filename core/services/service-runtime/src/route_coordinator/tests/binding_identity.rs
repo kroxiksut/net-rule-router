@@ -668,3 +668,107 @@ fn the_gui_name_matcher_ignores_the_same_generic_words_as_the_service() {
         .collect();
     assert_eq!(gui, super::binding_resolver::GENERIC_NAME_TOKENS);
 }
+
+#[test]
+fn a_stale_binding_never_heals_to_another_clients_tunnel_on_the_same_driver() {
+    // Two clients ship the stock TAP driver, so their descriptions agree. The
+    // user's tunnel is down; the one that is up belongs to an employer.
+    let api = Arc::new(MockWindowsApi::new());
+    let mut theirs = adapter("employer", 2, true, true, Some([10, 9, 0, 1]));
+    theirs.description = "TAP-Windows Adapter V9".into();
+    theirs.friendly_name = "Corp Connection".into();
+    api.set_adapter_infos(vec![theirs]);
+    api.set_route_table(Vec::new());
+
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_secondary_named("S-TAP", "win-adapter:gone", "TAP-Windows Adapter V9");
+    let healed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&healed);
+    let coord = coordinator_with_policy(api, Arc::new(FakeRules::new()), policy)
+        .with_binding_heal_persist(Arc::new(move |_, _, id, _| {
+            seen.lock().unwrap().push(id.to_string());
+        }));
+
+    assert!(
+        coord.resolve("S-TAP").secondary.is_none(),
+        "the employer's tunnel must not be adopted"
+    );
+    assert!(healed.lock().unwrap().is_empty(), "nothing is persisted");
+}
+
+fn choice_notices(
+    bus: &crate::ipc_handlers::event_bus::EventBus,
+    sub: &str,
+) -> Vec<(String, Vec<String>)> {
+    use nrr_shared::ipc_payloads::StatusUpdateEvent;
+    bus.peek_pending_for(sub, 16)
+        .iter()
+        .filter_map(|e| match &e.event {
+            StatusUpdateEvent::EnforcementStatusChanged {
+                status,
+                role,
+                candidates,
+                ..
+            } if role == "secondary" => Some((status.clone(), candidates.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn an_employers_tunnel_sharing_one_vendor_word_is_offered_not_adopted() {
+    use crate::ipc_handlers::event_bus::EventBus;
+
+    let api = Arc::new(MockWindowsApi::new());
+    let mut theirs = adapter("employer", 2, true, true, Some([10, 9, 0, 1]));
+    theirs.description = "Cisco AnyConnect VPN Virtual Miniport Adapter".into();
+    theirs.friendly_name = "Cisco AnyConnect VPN Connection".into();
+    api.set_adapter_infos(vec![theirs]);
+    api.set_route_table(Vec::new());
+
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_secondary_named("S-CISCO", "win-adapter:gone", "AnyConnect VPN");
+    let bus = Arc::new(EventBus::new());
+    let sub = bus
+        .subscribe_as("test".into(), Some("S-CISCO".into()), None)
+        .subscription_id;
+    let coord = coordinator_with_policy(api, Arc::new(FakeRules::new()), policy)
+        .with_event_bus(Arc::clone(&bus));
+
+    assert!(coord.resolve("S-CISCO").secondary.is_none());
+    assert_eq!(
+        choice_notices(&bus, &sub),
+        vec![(
+            "adapter-choice-needed".to_string(),
+            vec!["Cisco AnyConnect VPN Connection".to_string()]
+        )],
+        "the user is told which tunnel was refused"
+    );
+}
+
+#[test]
+fn a_stock_driver_only_match_asks_the_user_instead_of_failing_closed_silently() {
+    use crate::ipc_handlers::event_bus::EventBus;
+
+    let api = Arc::new(MockWindowsApi::new());
+    let mut mine = adapter("mine", 3, true, true, Some([10, 8, 0, 1]));
+    mine.description = "Wintun Userspace Tunnel".into();
+    mine.friendly_name = "OpenVPN Wintun".into();
+    api.set_adapter_infos(vec![mine]);
+    api.set_route_table(Vec::new());
+
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_secondary_named("S-STOCK", "win-adapter:gone", "OpenVPN Wintun");
+    let bus = Arc::new(EventBus::new());
+    let sub = bus
+        .subscribe_as("test".into(), Some("S-STOCK".into()), None)
+        .subscription_id;
+    let coord = coordinator_with_policy(api, Arc::new(FakeRules::new()), policy)
+        .with_event_bus(Arc::clone(&bus));
+
+    assert!(coord.resolve("S-STOCK").secondary.is_none());
+    let notices = choice_notices(&bus, &sub);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].0, "adapter-choice-needed");
+    assert_eq!(notices[0].1, vec!["OpenVPN Wintun".to_string()]);
+}

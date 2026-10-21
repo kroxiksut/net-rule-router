@@ -98,6 +98,21 @@ if [ "$(id -u)" -ne 0 ]; then
   sudo_prefix=(sudo)
 fi
 
+# The walk installs from the build tree and ends by uninstalling: on a machine
+# that already has the service (from a package or from install-service.sh) it
+# would repoint the unit at the tree binary and then remove it.
+for existing in "${NRR_PACKAGE_UNIT_FILES[@]}" "$NRR_UNIT_FILE"; do
+  if [ -e "$existing" ]; then
+    echo "$unit_name is already installed ($existing); refusing to replace and then remove it. Use --console-only, or smoke on a machine without the service." >&2
+    exit 1
+  fi
+done
+existing_state="$(systemctl show "$unit_name" --property=LoadState --value 2>/dev/null || true)"
+if [ -n "$existing_state" ] && [ "$existing_state" != "not-found" ]; then
+  echo "$unit_name is already known to systemd (LoadState=$existing_state); refusing to replace and then remove it. Use --console-only." >&2
+  exit 1
+fi
+
 cyan "==> install (enables and starts the unit)"
 "${sudo_prefix[@]}" "$exe_path" install
 

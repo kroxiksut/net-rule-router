@@ -12,26 +12,42 @@
 //!
 //! `$PATH`, plus the export directories Flatpak and Snap publish into (usually
 //! on `$PATH` already, listed so a service started with a bare environment
-//! still finds them). Only regular files with an execute bit count — a
-//! directory or a stray data file with a matching name is not an application.
+//! still finds them). An application installed outside them (`/opt/<vendor>`,
+//! an unpacked bundle) is found through the `Exec=` of its desktop entry and
+//! through the images of running processes, the Linux twins of the Windows
+//! App Paths and process sources. Only regular files with an execute bit
+//! count — a directory or a stray data file with a matching name is not an
+//! application.
 //!
 //! Resolution is never an error: an app that is not installed resolves to an
 //! empty vector, same as on Windows.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use nrr_platform_api::app_folders::{AppPath, PathPrograms, ProgramFolderIndex};
 use nrr_platform_api::app_path_resolver::{dedup_paths, glob_match, AppPathResolver};
 
-/// Production resolver over `$PATH` and the package-manager export dirs.
+use crate::app_scan::{application_dirs, desktop_apps_in, running_processes};
+
+/// How long one scan of `/proc` and the desktop entries answers every rule:
+/// a plan resolves each application rule in turn, and one scan serves them all.
+const ELSEWHERE_TTL: Duration = Duration::from_secs(5);
+
+type ElsewhereCache = Arc<Mutex<Option<(Instant, Arc<Vec<PathBuf>>)>>>;
+
+/// Production resolver over `$PATH`, the package-manager export dirs, desktop
+/// entries and running processes.
 ///
 /// No cache for names: this runs while an apply is being planned, not on the
 /// traffic path, and a directory listing per candidate is cheap next to the
-/// filter codegen that follows. Rules by path go through a watched index.
+/// filter codegen that follows. Only the process and desktop-entry scan is
+/// shared, for [`ELSEWHERE_TTL`]. Rules by path go through a watched index.
 #[derive(Clone)]
 pub struct LinuxAppPathResolver {
     folders: Arc<ProgramFolderIndex>,
+    elsewhere: ElsewhereCache,
 }
 
 impl Default for LinuxAppPathResolver {
@@ -47,8 +63,63 @@ impl LinuxAppPathResolver {
     /// shares to read its change number and hear of a changed folder.
     #[must_use]
     pub fn with_program_folders(folders: Arc<ProgramFolderIndex>) -> Self {
-        Self { folders }
+        Self {
+            folders,
+            elsewhere: Arc::default(),
+        }
     }
+
+    /// Executables seen outside the search directories, from one scan reused
+    /// for [`ELSEWHERE_TTL`].
+    fn located_elsewhere(&self) -> Arc<Vec<PathBuf>> {
+        let now = Instant::now();
+        let mut cached = self
+            .elsewhere
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((at, paths)) = cached.as_ref() {
+            if now.duration_since(*at) < ELSEWHERE_TTL {
+                return Arc::clone(paths);
+            }
+        }
+        let paths = Arc::new(executables_located_elsewhere(
+            Path::new("/proc"),
+            &application_dirs(),
+        ));
+        *cached = Some((now, Arc::clone(&paths)));
+        paths
+    }
+}
+
+/// Running-process images and the absolute `Exec=` programs of desktop
+/// entries. A wrapper (`flatpak`, `env`) is not the application's own file.
+fn executables_located_elsewhere(proc_root: &Path, desktop_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = running_processes(proc_root)
+        .into_iter()
+        .filter_map(|process| process.exe)
+        .collect();
+    for dir in desktop_dirs {
+        out.extend(
+            desktop_apps_in(dir)
+                .iter()
+                .filter_map(|app| app.own_exe_path())
+                .map(PathBuf::from),
+        );
+    }
+    dedup_paths(out)
+}
+
+/// The entries of `candidates` whose file name one of `patterns` matches.
+fn matching_by_name(patterns: &[String], candidates: &[PathBuf]) -> Vec<PathBuf> {
+    candidates
+        .iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| patterns.iter().any(|p| glob_match(p, name)))
+        })
+        .cloned()
+        .collect()
 }
 
 impl AppPathResolver for LinuxAppPathResolver {
@@ -73,6 +144,11 @@ impl AppPathResolver for LinuxAppPathResolver {
                 }
             }
         }
+        found.extend(
+            matching_by_name(&patterns, &self.located_elsewhere())
+                .into_iter()
+                .filter(|path| is_executable_file(path)),
+        );
         dedup_paths(found)
     }
 
@@ -283,6 +359,60 @@ mod tests {
                 "{expected} missing from {directories:?}",
             );
         }
+    }
+
+    #[test]
+    fn a_desktop_entry_names_an_application_installed_outside_path() {
+        let root = tempfile::tempdir().expect("dir");
+        let apps = root.path().join("applications");
+        std::fs::create_dir_all(&apps).expect("apps dir");
+        std::fs::write(
+            apps.join("vendor-client.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Client\nExec=\"/opt/vendor/client\" %U\n",
+        )
+        .expect("entry");
+        std::fs::write(
+            apps.join("wrapped.desktop"),
+            "[Desktop Entry]\nType=Application\nExec=/usr/bin/flatpak run org.example.App\n",
+        )
+        .expect("wrapped entry");
+        let found = executables_located_elsewhere(&root.path().join("no-proc"), &[apps]);
+        assert_eq!(found, vec![PathBuf::from("/opt/vendor/client")]);
+    }
+
+    #[test]
+    fn only_the_queried_name_comes_back_from_the_other_sources() {
+        let candidates = [
+            PathBuf::from("/opt/vendor/client"),
+            PathBuf::from("/opt/vendor/client-helper"),
+            PathBuf::from("/opt/other/editor"),
+        ];
+        assert_eq!(
+            matching_by_name(&candidate_patterns("client.exe"), &candidates),
+            vec![PathBuf::from("/opt/vendor/client")],
+        );
+        assert_eq!(
+            matching_by_name(&candidate_patterns("client*"), &candidates).len(),
+            2
+        );
+        assert!(matching_by_name(&candidate_patterns("absent"), &candidates).is_empty());
+    }
+
+    /// A running program found through its process image, not through `$PATH`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_running_process_image_is_a_source() {
+        let root = tempfile::tempdir().expect("dir");
+        let proc_root = root.path().join("proc");
+        let bin = root.path().join("opt/vendor/client");
+        std::fs::create_dir_all(bin.parent().expect("parent")).expect("bin dir");
+        std::fs::write(&bin, "#!/bin/sh\n").expect("bin");
+        std::fs::create_dir_all(proc_root.join("4242")).expect("pid dir");
+        std::os::unix::fs::symlink(&bin, proc_root.join("4242/exe")).expect("exe link");
+        // A kernel thread has no image and contributes nothing.
+        std::fs::create_dir_all(proc_root.join("2")).expect("kthread dir");
+        std::fs::create_dir_all(proc_root.join("self-not-a-pid")).expect("non-pid dir");
+        assert_eq!(executables_located_elsewhere(&proc_root, &[]), vec![bin]);
     }
 
     /// The live half: every Linux host has a shell on `$PATH`, and a rule

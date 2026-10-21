@@ -6,9 +6,9 @@ rust-version = "1.94.1"
 publish = false
 license = "MPL-2.0"
 
-# Library-only after 13.R-GUI.4. The user-facing `NetRuleRouterTray.exe` is
-# now produced by `nrr-launcher`; this crate contributes
-# `write_qt_tray_context_file` and supporting types consumed by the launcher.
+# A library: `nrr-launcher` builds `NetRuleRouterTray.exe`, so a binary here
+# would collide with it in `target/<profile>/`. This crate holds
+# `write_qt_tray_context_file` and the types the launcher calls it with.
 [lib]
 name = "nrr_desktop_tray"
 path = "src/lib.rs"

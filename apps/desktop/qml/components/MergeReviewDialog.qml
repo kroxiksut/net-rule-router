@@ -217,7 +217,6 @@ Dialog {
             text: dialog._t("dialog.merge.body",
                 "Combine your linked rules file with the rules the service is currently enforcing. Rules on only one side are always kept; rules that exist on both but differ are shown as conflicts.")
             wrapMode: Text.Wrap
-            font.pixelSize: 13
             color: dialog._textColor()
             Accessible.role: Accessible.StaticText
             Accessible.name: text
@@ -228,7 +227,6 @@ Dialog {
             Layout.fillWidth: true
             visible: dialog.loading
             text: dialog._t("dialog.merge.loading", "Comparing file and app rules…")
-            font.pixelSize: 13
             color: dialog._mutedColor()
         }
         Label {
@@ -236,8 +234,7 @@ Dialog {
             visible: !dialog.loading && dialog.errorText !== ""
             text: dialog.errorText
             wrapMode: Text.Wrap
-            font.pixelSize: 13
-            color: "#c0392b"
+            color: dialog.ownerRoot ? dialog.ownerRoot.uiTheme.colorDanger : "#c92a2a"
         }
         Label {
             Layout.fillWidth: true
@@ -245,7 +242,6 @@ Dialog {
             text: dialog._t("dialog.merge.no-op",
                 "The file and the app rules already match — nothing to merge.")
             wrapMode: Text.Wrap
-            font.pixelSize: 13
             color: dialog._mutedColor()
         }
 
@@ -284,7 +280,6 @@ Dialog {
                     text: dialog.tr("dialog.merge.duplicates-hint",
                         "Each of these was enabled on both routes, so the merge kept the main route's copy and switched the other one off. Pick a different route if that is not what you meant — the other copy stays in your list, switched off.")
                     wrapMode: Text.Wrap
-                    font.pixelSize: 12
                     color: dialog._mutedColor()
                 }
                 Repeater {
@@ -297,7 +292,6 @@ Dialog {
                             Layout.fillWidth: true
                             text: String(modelData["match-summary"] || "")
                             wrapMode: Text.Wrap
-                            font.pixelSize: 12
                             color: dialog._textColor()
                         }
                         ThemedComboBox {
@@ -337,26 +331,23 @@ Dialog {
                         visible: dialog._fileOnly().length > 0
                         Label {
                             text: dialog._typeLabel(modelData["type-slug"])
-                            font.pixelSize: 12
                             color: dialog._mutedColor()
                             Layout.preferredWidth: 96
                         }
                         Label {
                             Layout.fillWidth: true
                             text: String(modelData.value || "")
-                            font.pixelSize: 12
                             font.family: "Consolas, Courier New, monospace"
                             color: dialog._textColor()
                             elide: Text.ElideRight
                         }
                         Label {
                             text: dialog._itemRouteLabel(modelData)
-                            font.pixelSize: 11
                             color: dialog._mutedColor()
                         }
                         Rectangle {
                             visible: String(modelData.action) === "block"
-                            color: "#c0392b"
+                            color: dialog.ownerRoot ? dialog.ownerRoot.uiTheme.colorDanger : "#c92a2a"
                             radius: 3
                             implicitHeight: blockBadgeF.implicitHeight + 2
                             implicitWidth: blockBadgeF.implicitWidth + 10
@@ -364,7 +355,6 @@ Dialog {
                                 id: blockBadgeF
                                 anchors.centerIn: parent
                                 text: dialog.tr("dialog.merge.badge-block", "Denied")
-                                font.pixelSize: 10
                                 color: "white"
                             }
                         }
@@ -390,26 +380,23 @@ Dialog {
                         spacing: 8
                         Label {
                             text: dialog._typeLabel(modelData["type-slug"])
-                            font.pixelSize: 12
                             color: dialog._mutedColor()
                             Layout.preferredWidth: 96
                         }
                         Label {
                             Layout.fillWidth: true
                             text: String(modelData.value || "")
-                            font.pixelSize: 12
                             font.family: "Consolas, Courier New, monospace"
                             color: dialog._textColor()
                             elide: Text.ElideRight
                         }
                         Label {
                             text: dialog._itemRouteLabel(modelData)
-                            font.pixelSize: 11
                             color: dialog._mutedColor()
                         }
                         Rectangle {
                             visible: String(modelData.action) === "block"
-                            color: "#c0392b"
+                            color: dialog.ownerRoot ? dialog.ownerRoot.uiTheme.colorDanger : "#c92a2a"
                             radius: 3
                             implicitHeight: blockBadgeC.implicitHeight + 2
                             implicitWidth: blockBadgeC.implicitWidth + 10
@@ -417,7 +404,6 @@ Dialog {
                                 id: blockBadgeC
                                 anchors.centerIn: parent
                                 text: dialog.tr("dialog.merge.badge-block", "Denied")
-                                font.pixelSize: 10
                                 color: "white"
                             }
                         }
@@ -441,26 +427,23 @@ Dialog {
                         spacing: 8
                         Label {
                             text: dialog._typeLabel(modelData["type-slug"])
-                            font.pixelSize: 12
                             color: dialog._mutedColor()
                             Layout.preferredWidth: 96
                         }
                         Label {
                             Layout.fillWidth: true
                             text: String(modelData.value || "")
-                            font.pixelSize: 12
                             font.family: "Consolas, Courier New, monospace"
                             color: dialog._textColor()
                             elide: Text.ElideRight
                         }
                         Label {
                             text: dialog._itemRouteLabel(modelData)
-                            font.pixelSize: 11
                             color: dialog._mutedColor()
                         }
                         Rectangle {
                             visible: String(modelData.action) === "block"
-                            color: "#c0392b"
+                            color: dialog.ownerRoot ? dialog.ownerRoot.uiTheme.colorDanger : "#c92a2a"
                             radius: 3
                             implicitHeight: blockBadgeD.implicitHeight + 2
                             implicitWidth: blockBadgeD.implicitWidth + 10
@@ -468,7 +451,6 @@ Dialog {
                                 id: blockBadgeD
                                 anchors.centerIn: parent
                                 text: dialog.tr("dialog.merge.badge-block", "Denied")
-                                font.pixelSize: 10
                                 color: "white"
                             }
                         }
@@ -493,26 +475,23 @@ Dialog {
                         spacing: 8
                         Label {
                             text: dialog._typeLabel(modelData["type-slug"])
-                            font.pixelSize: 12
                             color: dialog._mutedColor()
                             Layout.preferredWidth: 96
                         }
                         Label {
                             Layout.fillWidth: true
                             text: String(modelData.value || "")
-                            font.pixelSize: 12
                             font.family: "Consolas, Courier New, monospace"
                             color: dialog._textColor()
                             elide: Text.ElideRight
                         }
                         Label {
                             text: dialog._itemRouteLabel(modelData)
-                            font.pixelSize: 11
                             color: dialog._mutedColor()
                         }
                         Rectangle {
                             visible: String(modelData.action) === "block"
-                            color: "#c0392b"
+                            color: dialog.ownerRoot ? dialog.ownerRoot.uiTheme.colorDanger : "#c92a2a"
                             radius: 3
                             implicitHeight: blockBadgeS.implicitHeight + 2
                             implicitWidth: blockBadgeS.implicitWidth + 10
@@ -520,7 +499,6 @@ Dialog {
                                 id: blockBadgeS
                                 anchors.centerIn: parent
                                 text: dialog.tr("dialog.merge.badge-block", "Denied")
-                                font.pixelSize: 10
                                 color: "white"
                             }
                         }
@@ -548,14 +526,12 @@ Dialog {
                             spacing: 8
                             Label {
                                 text: dialog._typeLabel(modelData["type-slug"])
-                                font.pixelSize: 12
                                 color: dialog._mutedColor()
                                 Layout.preferredWidth: 96
                             }
                             Label {
                                 Layout.fillWidth: true
                                 text: String(modelData.value || "")
-                                font.pixelSize: 12
                                 font.family: "Consolas, Courier New, monospace"
                                 color: dialog._textColor()
                                 elide: Text.ElideRight
@@ -588,13 +564,11 @@ Dialog {
                             Label {
                                 text: dialog._t("dialog.merge.pick-file", "File") + ": "
                                     + dialog._sideSummary(modelData.file)
-                                font.pixelSize: 11
                                 color: dialog._mutedColor()
                             }
                             Label {
                                 text: dialog._t("dialog.merge.pick-service", "App") + ": "
                                     + dialog._sideSummary(modelData.service)
-                                font.pixelSize: 11
                                 color: dialog._mutedColor()
                             }
                         }
@@ -610,8 +584,7 @@ Dialog {
             text: dialog.tr("dialog.merge.unresolved-hint",
                 "Pick a side for every conflict before merging.")
             wrapMode: Text.Wrap
-            font.pixelSize: 12
-            color: "#a04400"
+            color: dialog.ownerRoot ? dialog.ownerRoot.uiTheme.colorWarning : "#d97706"
         }
 
         // ── Buttons ──────────────────────────────────────────────

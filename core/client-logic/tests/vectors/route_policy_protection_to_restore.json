@@ -1,5 +1,5 @@
 {
-  "description": "pure.js routePolicyProtectionToRestore: protection the record holds on and the service lost, switched back on without asking",
+  "description": "pure.js routePolicyProtectionToRestore: protection the record holds stronger than the service, brought back without asking",
   "cases": [
     {
       "name": "nothing recorded",
@@ -13,18 +13,18 @@
       "name": "on in the record, off at the service",
       "input": {
         "intent": {
-          "kill-switch-enabled": true
+          "leak-protection": "sites"
         },
         "service": {
-          "kill-switch-enabled": false
+          "leak-protection": "off"
         }
       },
       "expected": [
-        "kill-switch-enabled"
+        "leak-protection"
       ]
     },
     {
-      "name": "off by the service's default counts as off",
+      "name": "off by the service's fallback counts as off",
       "input": {
         "intent": {
           "doh-lockdown-enabled": true
@@ -36,39 +36,94 @@
       ]
     },
     {
-      "name": "already on",
+      "name": "already as strong",
       "input": {
         "intent": {
-          "kill-switch-block-all": true
+          "leak-protection": "everything"
         },
         "service": {
-          "kill-switch-block-all": true
+          "leak-protection": "everything"
         }
       },
       "expected": []
     },
     {
-      "name": "never switched off this way",
+      "name": "a stronger level at the service stays",
       "input": {
         "intent": {
-          "kill-switch-fail-closed": false
+          "leak-protection": "sites"
         },
         "service": {
-          "kill-switch-fail-closed": true
+          "leak-protection": "everything"
         }
       },
       "expected": []
+    },
+    {
+      "name": "never weakened this way",
+      "input": {
+        "intent": {
+          "leak-protection": "off"
+        },
+        "service": {
+          "leak-protection": "sites"
+        }
+      },
+      "expected": []
+    },
+    {
+      "name": "everything over routed sites",
+      "input": {
+        "intent": {
+          "leak-protection": "everything"
+        },
+        "service": {
+          "mode": "prefer-primary",
+          "leak-protection": "sites"
+        }
+      },
+      "expected": [
+        "leak-protection"
+      ]
+    },
+    {
+      "name": "routed sites under the additional route come back as everything",
+      "input": {
+        "intent": {
+          "leak-protection": "sites"
+        },
+        "service": {
+          "mode": "prefer-secondary-when-available",
+          "leak-protection": "off"
+        }
+      },
+      "expected": [
+        "leak-protection"
+      ]
     },
     {
       "name": "a damaged value is not on",
       "input": {
         "intent": {
-          "kill-switch-enabled": "true",
-          "kill-switch-block-all": 1
+          "leak-protection": "block-all",
+          "kill-switch-strict-shared-ips": 1
         },
         "service": {}
       },
       "expected": []
+    },
+    {
+      "name": "a retired guard is restored as its level",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": true,
+          "kill-switch-block-all": true
+        },
+        "service": {}
+      },
+      "expected": [
+        "leak-protection"
+      ]
     },
     {
       "name": "a non-protective key is not restored here",
@@ -87,8 +142,8 @@
       "name": "several, sorted",
       "input": {
         "intent": {
+          "leak-protection": "everything",
           "kill-switch-strict-shared-ips": true,
-          "kill-switch-block-all": true,
           "doh-lockdown-enabled": true
         },
         "service": {
@@ -97,19 +152,23 @@
       },
       "expected": [
         "doh-lockdown-enabled",
-        "kill-switch-block-all",
-        "kill-switch-strict-shared-ips"
+        "kill-switch-strict-shared-ips",
+        "leak-protection"
       ]
     },
     {
-      "name": "fail-closed defaults on, so a record of on is nothing to do",
+      "name": "the strict mode of an earlier build restores everything",
       "input": {
         "intent": {
-          "kill-switch-fail-closed": true
+          "mode": "strict-secondary-fail-closed"
         },
-        "service": {}
+        "service": {
+          "leak-protection": "sites"
+        }
       },
-      "expected": []
+      "expected": [
+        "leak-protection"
+      ]
     }
   ]
 }

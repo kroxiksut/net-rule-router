@@ -127,6 +127,39 @@ mod tests {
     }
 
     #[test]
+    fn a_file_its_group_may_write_is_refused() {
+        let (_dir, file) = private_dir_with_file();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o664)).expect("chmod");
+        let why = untrusted_writer_trusting(&file, &[ROOT_UID, my_uid()]).expect("readable");
+        assert!(why.is_some_and(|why| why.contains("writable by group or others")));
+    }
+
+    #[test]
+    fn a_folder_its_group_may_write_is_refused() {
+        let (dir, file) = private_dir_with_file();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o775)).expect("chmod");
+        let why = untrusted_writer_trusting(&file, &[ROOT_UID, my_uid()]).expect("readable");
+        assert!(why.is_some_and(|why| why.contains("writable by group or others")));
+    }
+
+    #[test]
+    fn a_folder_further_up_that_others_may_write_is_refused() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        let inner = outer.path().join("netrulerouter");
+        fs::create_dir(&inner).expect("mkdir");
+        fs::set_permissions(&inner, fs::Permissions::from_mode(0o755)).expect("chmod inner");
+        let file = inner.join("first-run.json");
+        fs::write(&file, b"{}").expect("write");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("chmod file");
+        fs::set_permissions(outer.path(), fs::Permissions::from_mode(0o777)).expect("chmod outer");
+        let why = untrusted_writer_trusting(&file, &[ROOT_UID, my_uid()]).expect("readable");
+        assert!(
+            why.is_some_and(|why| why.contains("writable by group or others")),
+            "whoever may rename the folder can swap the sheet"
+        );
+    }
+
+    #[test]
     fn a_folder_others_may_write_is_refused_even_when_sticky() {
         let (dir, file) = private_dir_with_file();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o1777)).expect("chmod");

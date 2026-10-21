@@ -23,7 +23,9 @@ Notifications:
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the listed programs as your VPN, so leak protection keeps them working
+  a: allow the listed VPNs to reach their servers, so leak protection lets them connect
   p: confirm the suggested main connection; another one is chosen under Interfaces and routes
+  v: send the blocked site named under the state over the additional route; you are asked first
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Overlaps
@@ -44,7 +46,7 @@ Screen: Overlaps
 Service: OK
 Overlaps:
   When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
-  4 overlap(s) not confirmed
+  4 overlaps not confirmed
   Show resolved: No
 Rules that cover the same sites:
   1. ads.example.net (Domain) names the same sites as ads.example.net (Domain) on Primary. They are denied: on a tie a deny wins over a route.
@@ -72,7 +74,7 @@ Screen: Overlaps
 Service: OK
 Overlaps:
   When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
-  3 overlap(s) not confirmed
+  3 overlaps not confirmed
   Show resolved: No
 Rules that cover the same sites:
   1. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Additional.
@@ -95,7 +97,7 @@ Screen: Overlaps
 Service: OK
 Overlaps:
   When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
-  3 overlap(s) not confirmed
+  3 overlaps not confirmed
   Show resolved: No
   There is no item 9 in the list. Use the number shown before an item.
 Rules that cover the same sites:
@@ -119,7 +121,7 @@ Screen: Overlaps
 Service: OK
 Overlaps:
   When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
-  2 overlap(s) not confirmed
+  2 overlaps not confirmed
   Show resolved: No
   Rule changes take effect only after you review and apply them.
   Review and apply the change on screen 4, Rules.
@@ -141,7 +143,7 @@ Screen: Overlaps
 Service: OK
 Overlaps:
   When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
-  0 overlap(s) not confirmed
+  0 overlaps not confirmed
   Show resolved: No
   Rule changes take effect only after you review and apply them.
   Review and apply the change on screen 4, Rules.
@@ -158,7 +160,7 @@ Screen: Overlaps
 Service: OK
 Overlaps:
   When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
-  0 overlap(s) not confirmed
+  0 overlaps not confirmed
   Show resolved: Yes
   Rule changes take effect only after you review and apply them.
   Review and apply the change on screen 4, Rules.

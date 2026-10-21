@@ -67,11 +67,14 @@ $buildDir = Join-Path $targetRoot $(if ($Profile -eq 'release') { 'release' } el
 # and, in release, looks for it only next to its own binary. The terminal
 # interface rides along when built, so an administrator terminal finds both
 # consoles in one place.
+# The DLL is matched to the machine's architecture, not hardcoded to amd64.
+$osArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+$wintunArch = switch ($osArch) { 'ARM64' { 'arm64' } 'x86' { 'x86' } default { 'amd64' } }
 $payload = @(
     @{ Name = 'nrr-service.exe'; From = (Join-Path $buildDir 'nrr-service.exe'); Required = $true },
     @{ Name = 'nrr-cli.exe';     From = (Join-Path $buildDir 'nrr-cli.exe');     Required = $true },
     @{ Name = 'nrr-tui.exe';     From = (Join-Path $buildDir 'nrr-tui.exe');     Required = $false },
-    @{ Name = 'wintun.dll';      From = (Join-Path $root 'third_party\wintun\bin\amd64\wintun.dll'); Required = $true }
+    @{ Name = 'wintun.dll';      From = (Join-Path $root "third_party\wintun\bin\$wintunArch\wintun.dll"); Required = $true }
 )
 
 foreach ($item in $payload) {

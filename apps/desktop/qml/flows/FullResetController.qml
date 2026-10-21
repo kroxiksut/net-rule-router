@@ -25,14 +25,6 @@ QtObject {
     // takes effect on the next launch (fresh first-run).
     function fullReset(allPrincipals) {
         root.statusLine = root.tr("status.full-reset-running", "Performing full reset…")
-        if (root.bridgeAvailable && typeof nrrNativeBridge.rpcLogsClear === "function") {
-            var cl = nrrNativeBridge.rpcLogsClear(false, true)
-            root.rpc.registerRpcCallback(cl, function() {})
-        }
-        if (root.bridgeAvailable && typeof nrrNativeBridge.rpcSidecarReset === "function") {
-            var cs = nrrNativeBridge.rpcSidecarReset()
-            root.rpc.registerRpcCallback(cs, function() {})
-        }
         if (root.bridgeAvailable && typeof nrrNativeBridge.clearGuiLogs === "function") {
             nrrNativeBridge.clearGuiLogs()
         }
@@ -52,21 +44,86 @@ QtObject {
         root.emitPrefs()
         Pure.clearModel(root.rulesModel)
         root.clearAllUnsavedChanges()
-        // Purge auxiliary state FIRST: disjoint tables from the rules-apply
-        // step, but this order survives a declined UAC prompt below.
-        _purgePrincipalData(allPrincipals === true, function(purgeOk) {
-            applyEmptyRules(function(rulesOk) {
-                // Stop the service LAST: it tears its filters down on the way
-                // out, and everything above needs it answering. A machine left
-                // in the post-reset state has nothing to enforce, so a running
-                // service would only be a process with no policy.
-                _stopService(function(stopOk) {
-                    root.fullResetCompleteDialog.serviceCleared =
-                        !!purgeOk && !!rulesOk && !!stopOk
-                    root.fullResetCompleteDialog.open()
-                })
-            })
+        _startServiceThen(function() { _runResetSteps(allPrincipals === true, []) })
+    }
+
+    // A stopped service answers none of the steps, so the reset would only
+    // report what it could not clear: it is started first, and the last step
+    // stops it again. A declined or failed start leaves the steps to say so.
+    function _startServiceThen(next) {
+        var ctl = (typeof nrrServiceController !== "undefined") ? nrrServiceController : null
+        // 2 = stopped in the controller's status vocabulary.
+        if (!ctl || parseInt(ctl.status) !== 2 || typeof ctl.startService !== "function") {
+            next()
+            return
+        }
+        ctl.startService()
+        _startWatch.attempts = 0
+        _startWatch.onDone = next
+        _startWatch.restart()
+    }
+
+    // Waits for the started service to answer on its channel, not only to run.
+    property Timer _startWatch: Timer {
+        id: _startWatch
+        interval: 500
+        repeat: true
+        property int attempts: 0
+        property var onDone: null
+        onTriggered: {
+            attempts += 1
+            var ctl = (typeof nrrServiceController !== "undefined") ? nrrServiceController : null
+            var st = ctl ? parseInt(ctl.status) : 0
+            // 3 = start pending, 4 = running: anything else once the prompt
+            // is gone means the start was declined or failed.
+            var gaveUp = !(ctl && ctl.busy === true) && st !== 3 && st !== 4 && attempts >= 3
+            if (root._routingBackendConnected() || gaveUp || attempts >= 40) {
+                stop()
+                var cb = onDone
+                onDone = null
+                if (typeof cb === "function") cb()
+            }
+        }
+    }
+
+    // Asks the shared step machine what comes next, runs that step, records
+    // its outcome and repeats. The window's own preference reset above is the
+    // one GUI-only part. The launcher elevates a refused step by itself, so
+    // the machine is told the client can elevate.
+    function _runResetSteps(allPrincipals, done) {
+        var next = Pure.fullResetNext(true, done)
+        if (next.action !== "run") {
+            root.fullResetCompleteDialog.serviceCleared = next.action === "finish" && next.cleared
+            root.fullResetCompleteDialog.open()
+            return
+        }
+        _runResetStep(next.step, allPrincipals, function(result) {
+            done.push({ step: next.step, result: result })
+            _runResetSteps(allPrincipals, done)
         })
+    }
+
+    // Runs one step and reports "ok" | "failed" | "forbidden" | "skipped". The
+    // two cleanup calls are best-effort and never gate the rest.
+    function _runResetStep(step, allPrincipals, report) {
+        var viaBool = function(ok, code) {
+            report(ok ? "ok" : (String(code || "") === "forbidden" ? "forbidden" : "failed"))
+        }
+        var fireAndForget = function(method, a, b) {
+            if (!root.bridgeAvailable || typeof nrrNativeBridge[method] !== "function") {
+                report("skipped")
+                return
+            }
+            var c = nrrNativeBridge[method](a, b)
+            root.rpc.registerRpcCallback(c, function() {})
+            report("ok")
+        }
+        if (step === "clear-logs") fireAndForget("rpcLogsClear", false, true)
+        else if (step === "reset-sidecar") fireAndForget("rpcSidecarReset")
+        else if (step === "purge-principal-data") _purgePrincipalData(allPrincipals, viaBool)
+        else if (step === "apply-empty-rules") applyEmptyRules(viaBool)
+        else if (step === "stop-service") _stopService(viaBool)
+        else report("skipped")
     }
 
     // Stop the background service as the last step of a full reset. Elevation
@@ -126,7 +183,7 @@ QtObject {
         // Full reset means the service keeps nothing of ours either — its own
         // copy of the rules goes with the auxiliary state.
         var c = nrrNativeBridge.rpcPrincipalDataPurge(true, allPrincipals === true)
-        root.rpc.registerRpcCallback(c, function(ok) { onComplete(!!ok) })
+        root.rpc.registerRpcCallback(c, function(ok, p, code) { onComplete(!!ok, code) })
     }
 
     /// How many OTHER OS users the service holds rules for. `done(count)`; a
@@ -150,7 +207,8 @@ QtObject {
     // (the Full-reset confirm already gated the action). Same payload shape
     // as `startBothRoutesPresetImportReviewFlow`; the confirm phase carries
     // the dry-run token. Non-admin → confirm Forbidden → launcher R3 elevates
-    // (UAC) and retries; `onComplete(true)` only once the operation completed.
+    // (UAC) and retries; `onComplete(true)` only once the operation completed,
+    // else `onComplete(false, errorCode)`.
     function applyEmptyRules(onComplete) {
         if (!root.bridgeAvailable || typeof nrrNativeBridge.rpcMutationSubmit !== "function") {
             onComplete(false)
@@ -166,17 +224,17 @@ QtObject {
         }
         var c1 = nrrNativeBridge.rpcMutationSubmit("preset-import", payload, true, "")
         root.rpc.registerLongRpcCallback(c1, function(ok, p, code, msg) {
-            if (!ok || !p) { onComplete(false); return }
+            if (!ok || !p) { onComplete(false, code); return }
             var token = (p && p["confirmation-token"]) || ""
             var c2 = nrrNativeBridge.rpcMutationSubmit("preset-import", payload, false, token)
-            root.rpc.registerLongRpcCallback(c2, function(ok2, p2) {
-                if (!ok2) { onComplete(false); return }
+            root.rpc.registerLongRpcCallback(c2, function(ok2, p2, code2) {
+                if (!ok2) { onComplete(false, code2); return }
                 // The confirm only accepts the change; its verdict is on the
                 // operation record.
                 root.rpc.readMutationOutcome(p2, root.rpc.settleByPreview("preset-import", payload),
                     function(failure) {
                         if (failure !== "") console.log("full-reset: empty rules refused:", failure)
-                        onComplete(failure === "")
+                        onComplete(failure === "", failure)
                     })
             })
         })

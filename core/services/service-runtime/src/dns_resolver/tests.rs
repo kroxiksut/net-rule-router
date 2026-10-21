@@ -636,6 +636,73 @@ impl SyncReconciler for SlowReconciler<'_> {
     }
 }
 
+/// Tells a plain reconcile from a forced one.
+struct ForcingSpy<'a>(&'a CallLog);
+impl SyncReconciler for ForcingSpy<'_> {
+    fn reconcile_now(&self, _deadline: Duration) -> ReconcileOutcome {
+        self.0.push("reconcile");
+        ReconcileOutcome::Installed
+    }
+    fn reconcile_forced(&self, _deadline: Duration) -> ReconcileOutcome {
+        self.0.push("forced");
+        ReconcileOutcome::Installed
+    }
+    fn request_reconcile(&self) {
+        self.0.push("request_reconcile");
+    }
+}
+
+fn answer_with(
+    log: &CallLog,
+    fast_answers: bool,
+    addr: Ipv4Addr,
+    view: &dyn EnforcedAddressView,
+) -> QueryOutcome {
+    handle_a_query(
+        "assistant.example",
+        AnswerHold {
+            budget: Duration::from_secs(3),
+            deadline: Duration::from_millis(150),
+            fast_answers,
+        },
+        &oracle(&["assistant.example"]),
+        &FakeUpstream {
+            answer: Ok(resolved(&[addr])),
+        },
+        &CachedSink {
+            log,
+            cached: vec![addr],
+        },
+        &ForcingSpy(log),
+        &NoopFakeIpAnswerer,
+        &OpenLeakGuard,
+        view,
+    )
+}
+
+/// The answer for an address the policy already carries brings no fact a pass
+/// could miss, so it never forces one.
+#[test]
+fn an_answer_for_an_enforced_address_does_not_force_a_pass() {
+    let addr = ip(100, 64, 0, 160);
+    for fast_answers in [true, false] {
+        let log = CallLog::default();
+        answer_with(&log, fast_answers, addr, &Enforcing(vec![addr]));
+        assert!(
+            !log.snapshot().contains(&"forced"),
+            "fast_answers={fast_answers}: {:?}",
+            log.snapshot()
+        );
+    }
+}
+
+#[test]
+fn an_answer_for_an_address_the_policy_lacks_forces_the_pass() {
+    let log = CallLog::default();
+    answer_with(&log, true, ip(100, 64, 0, 161), &NoEnforcement);
+    assert_eq!(log.snapshot(), ["record", "forced"]);
+}
+
 #[test]
 fn fast_answers_skips_the_hold_when_every_answered_address_is_enforced() {
     let log = CallLog::default();
@@ -1276,6 +1343,24 @@ fn scoped_answerer_gives_an_in_scope_host_a_stable_fake_address() {
     // A different host gets a different address.
     let other = answerer.fake_answer("claude.ai").expect("in scope");
     assert_ne!(other, first);
+}
+
+#[test]
+fn scoped_answerer_leaves_corporate_names_and_addresses_real() {
+    let cell = Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new());
+    cell.claim_namespaces_for_tests(&["corp.example"]);
+    cell.publish_networks(vec![nrr_domain::ipv4_network::Ipv4Network::parse(
+        "192.168.78.0/24",
+    )
+    .expect("net")]);
+    let allocator = Arc::new(Mutex::new(FakeIpAllocator::default()));
+    let answerer = ScopedFakeIpAnswerer::new(FakeIpScope::enabled(Vec::<String>::new()), allocator)
+        .with_foreign_tunnels(cell);
+    assert_eq!(answerer.fake_answer("rdg.corp.example"), None);
+    assert!(!answerer.carries_on_v4("rdg.corp.example"));
+    assert!(!answerer.may_substitute(&[ip(192, 168, 78, 40)]));
+    assert!(answerer.may_substitute(&[ip(203, 0, 113, 40)]));
+    assert!(answerer.fake_answer("assistant.example").is_some());
 }
 
 #[test]

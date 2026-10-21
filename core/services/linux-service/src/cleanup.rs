@@ -12,7 +12,6 @@
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use nrr_platform_api::service_control::{ServiceControlPort, ServiceRunState};
 use nrr_shared::product_identity::{BinaryRole, PRODUCT_NAME};
@@ -302,13 +301,7 @@ impl CleanupHost for SystemHost {
     }
 
     fn sweep_routes(&self) -> Result<usize, String> {
-        use nrr_platform_api::{RouteEntry, RouteTableRef};
-        use nrr_platform_linux::policy_routing::is_our_table;
-        nrr_service_runtime::route_reconciler::sweep_owned_routes_with(
-            Arc::new(nrr_platform_linux::LinuxApi),
-            &|r: &RouteEntry| matches!(r.table, RouteTableRef::Tagged(n) if is_our_table(n)),
-        )
-        .map_err(|e| e.to_string())
+        nrr_platform_linux::policy_routing::sweep_routes().map_err(|e| e.to_string())
     }
 }
 

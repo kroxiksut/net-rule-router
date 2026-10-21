@@ -184,6 +184,10 @@ impl ConnectionObservationSource for EtwKernelNetworkObserver {
         );
         batch
     }
+
+    fn is_feeding(&self) -> bool {
+        self.session.pump_alive()
+    }
 }
 
 impl EtwKernelNetworkObserver {

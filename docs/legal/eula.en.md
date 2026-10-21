@@ -40,20 +40,24 @@ third-party components, their licenses, and how to verify them is in the
 You are using an **early test version**. This means:
 
 - individual features may work incorrectly or not work at all;
-- the leak protection and block-all
-  modes have **not been fully verified** — enabling them may lead to a
-  partial or complete loss of network access until the mode is disabled
-  or the computer is restarted;
+- leak protection, its "Everything" setting above all, has **not been
+  fully verified** — turning it on may lead to a partial or complete loss
+  of network access until it is set back to "Off" or the additional
+  connection returns. Restarting the computer does not undo this: the
+  protection comes back with the service. The quick way out is
+  **Restore network** (section 4);
 - settings and rules may not carry over to future versions;
 - file formats and program behavior may change without preserving
   compatibility.
 
-By enabling experimental modes you act **at your own risk**.
+By turning on leak protection or other experimental features you act **at
+your own risk**.
 
 ## 4. How the software changes your system
 
-The software requires the installation of a background Windows service
-(administrator rights are needed). The software modifies the routing
+The software requires the installation of a background system service (a
+Windows service, or a systemd service on Linux; administrator rights are
+needed). The software modifies the routing
 table and creates network traffic filters. All such changes are
 **temporary**: they are removed when the service is stopped and do not
 survive a computer restart.
@@ -99,8 +103,10 @@ lost profits, and loss of data.
 ## 7. Privacy
 
 The software runs locally. It does not require registration or user
-accounts, does not send telemetry (telemetry is off by default), and
-performs no hidden network calls. Diagnostic archives with logs are
+accounts and does not send telemetry. The network requests it makes on
+its own, what each is for and how to switch it off, are listed in the
+project's SECURITY.md. The check for new versions contacts the project's release page on GitHub;
+it can be switched off in the settings. Diagnostic archives with logs are
 created only by an explicit action of the User, and the User decides
 whom to share them with.
 

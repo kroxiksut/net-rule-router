@@ -1,7 +1,12 @@
 //! The size ceiling a controlled import file must fit under.
 //!
 //! A preset reaches the service inside one IPC frame, so the file limit is
-//! derived from the frame limit rather than set beside it.
+//! derived from a frame budget rather than set beside it.
+
+/// The part of one IPC frame an imported file may fill. Smaller than the frame
+/// itself: the frame is sized for the rules list, and this limit is the one
+/// users see in the import refusal.
+const IMPORT_FRAME_BUDGET_BYTES: usize = 1024 * 1024;
 
 /// Room reserved inside one IPC frame for everything that is not the file:
 /// the envelope (operation, ids, class, token), the mutation payload's own
@@ -18,8 +23,7 @@ const IMPORT_ENVELOPE_HEADROOM_BYTES: usize = 16 * 1024;
 /// lets a file pass here and then be refused by the transport as "frame too
 /// large" — the wrong layer, in the wrong words.
 pub const IMPORT_FILE_SIZE_LIMIT_BYTES: u64 =
-    ((nrr_shared::ipc_transport::IPC_MAX_MESSAGE_BYTES - IMPORT_ENVELOPE_HEADROOM_BYTES) / 4 * 3)
-        as u64;
+    ((IMPORT_FRAME_BUDGET_BYTES - IMPORT_ENVELOPE_HEADROOM_BYTES) / 4 * 3) as u64;
 
 #[cfg(test)]
 mod tests {
@@ -33,7 +37,8 @@ mod tests {
     /// crate keeps no JSON or base64 dependency to do it here.
     #[test]
     fn the_largest_accepted_import_still_fits_one_frame() {
-        const FRAME: usize = nrr_shared::ipc_transport::IPC_MAX_MESSAGE_BYTES;
+        const FRAME: usize = IMPORT_FRAME_BUDGET_BYTES;
+        const { assert!(FRAME <= nrr_shared::ipc_transport::IPC_MAX_MESSAGE_BYTES) };
         // base64 emits 4 characters per 3 input bytes, rounded up.
         let encoded = (IMPORT_FILE_SIZE_LIMIT_BYTES as usize).div_ceil(3) * 4;
         assert!(

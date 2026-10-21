@@ -157,8 +157,14 @@ fn collect_log_files(dir: &Path, prefix: &str) -> Vec<FileEntry> {
             })
         })
         .collect();
-    // Sort oldest first — we remove from the front.
-    files.sort_by_key(|f| f.modified);
+    // Oldest first — we remove from the front. The audit chain is ordered by
+    // its file names; a modification time moves with the clock and with whoever
+    // touches the file, and the "newest" file here is the one the writer holds.
+    if prefix == "nrr_audit_" {
+        files.sort_by_cached_key(|f| crate::rotation::rotation_sort_key(&f.path));
+    } else {
+        files.sort_by_key(|f| f.modified);
+    }
     files
 }
 
@@ -367,6 +373,36 @@ mod tests {
         let r = CleanupJob::run_audit(dir.path(), &policy);
         assert_eq!(r.files_deleted, 0);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn the_audit_live_file_is_the_last_by_name_not_by_mtime() {
+        let dir = tempfile::tempdir().expect("temp");
+        let big = |name: &str| {
+            let path = create_file(dir.path(), name, b"x");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_len(8 * 1024 * 1024))
+                .expect("grow");
+            path
+        };
+        let live = big("nrr_audit_20260102-1.ndjson");
+        let older = big("nrr_audit_20260101-1.ndjson");
+        // A clock step back left the live file with the OLDER modification time.
+        let long_ago = SystemTime::now() - Duration::from_secs(10 * 86_400);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&live)
+            .and_then(|f| f.set_modified(long_ago))
+            .expect("age the live file");
+        let policy = AuditRetentionPolicy {
+            max_age_days: 0,
+            max_total_size_bytes: 10 * 1024 * 1024,
+        };
+        CleanupJob::run_audit(dir.path(), &policy);
+        assert!(live.exists(), "the file the writer holds was deleted");
+        assert!(!older.exists());
     }
 
     #[test]

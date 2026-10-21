@@ -98,6 +98,7 @@ fn set_spec(shape: &Shape, n: usize, id_raw: u64) -> WfpFilterSpec {
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: shape.proto,
+        remote_subnet_set: Vec::new(),
     }
 }
 

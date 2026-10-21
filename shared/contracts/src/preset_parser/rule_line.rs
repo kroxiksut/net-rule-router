@@ -17,7 +17,8 @@ use super::*;
 /// the rule into prose.
 ///
 /// One predicate for both parsers of this format, so the two cannot disagree
-/// about which lines survive a round-trip.
+/// about which lines survive a round-trip. A program this cannot tell from a
+/// note (`Web Content`) is written in quotes instead ([`program_value_on_line`]).
 pub fn is_disabled_rule_value(rule_type: ParsedRuleType, value: &str) -> bool {
     // A deny in the retired spelling stays a rule, so validation can say how
     // it is written now instead of the line vanishing as prose.
@@ -55,6 +56,46 @@ pub fn is_disabled_rule_value(rule_type: ParsedRuleType, value: &str) -> bool {
 pub fn looks_like_a_rule_value(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty() && !value.contains(char::is_whitespace)
+}
+
+/// Encloses a program rule's value whose bare spelling would not read back:
+/// `# "Web Content" +children`. The marks go before it, the flags after it.
+pub const PROGRAM_VALUE_QUOTE: char = '"';
+
+/// The value inside one outer pair of [`PROGRAM_VALUE_QUOTE`], trimmed;
+/// `None` when `value` is not enclosed or encloses nothing. Read in a program
+/// section only, after the marks and flags are off. Nothing inside is escaped
+/// and only the outer pair comes off, so a quote within the value reads back
+/// as written.
+#[must_use]
+pub fn unquote_program_value(value: &str) -> Option<&str> {
+    let inner = value
+        .strip_prefix(PROGRAM_VALUE_QUOTE)?
+        .strip_suffix(PROGRAM_VALUE_QUOTE)?
+        .trim();
+    (!inner.is_empty()).then_some(inner)
+}
+
+/// A program rule's value as its line spells it: in quotes where the bare
+/// value would read back as something else — a note, when the line is
+/// disabled, or a shorter value, when it starts and ends with a quote itself.
+/// Any other value comes back as given, so a file that reads back whole keeps
+/// its bytes. `value` may carry the flags a table keeps on it
+/// ([`stored_rule_value`]); they stay outside the quotes.
+#[must_use]
+pub fn program_value_on_line(value: &str, enabled: bool) -> std::borrow::Cow<'_, str> {
+    let (bare, flags) = split_rule_flags(value);
+    let misread = unquote_program_value(&bare).is_some()
+        || (!enabled && !is_disabled_rule_value(ParsedRuleType::Application, &bare));
+    if bare.is_empty() || !misread {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let quoted = format!("{PROGRAM_VALUE_QUOTE}{bare}{PROGRAM_VALUE_QUOTE}");
+    std::borrow::Cow::Owned(stored_rule_value(
+        ParsedRuleType::Application,
+        &quoted,
+        flags,
+    ))
 }
 
 /// A character one field of this line-oriented format cannot carry: a line
@@ -169,14 +210,18 @@ pub(super) fn parse_rule_line(
     // `nrr_domain::rules_file`.
     let reads_verify = matches!(rule_type, ParsedRuleType::Domain | ParsedRuleType::ExactIp);
     let (match_value, markers) = split_rule_markers(&match_value, reads_verify);
-    let match_value = match_value.to_string();
+    let quoted = match rule_type {
+        ParsedRuleType::Application => unquote_program_value(match_value),
+        _ => None,
+    };
+    let match_value = quoted.unwrap_or(match_value).to_string();
 
     if match_value.is_empty() {
         return None;
     }
 
     let enabled = if started_with_hash {
-        if !is_disabled_rule_value(rule_type, &match_value) {
+        if quoted.is_none() && !is_disabled_rule_value(rule_type, &match_value) {
             return None; // prose comment
         }
         false

@@ -1,0 +1,181 @@
+{
+  "description": "pure.js dnsUpstreamForeignOnly: whether a health answer says only another VPN's resolver answers",
+  "cases": [
+    {
+      "name": "no answer",
+      "input": {
+        "health": null
+      },
+      "expected": false
+    },
+    {
+      "name": "no components",
+      "input": {
+        "health": {
+          "components": []
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "missing components",
+      "input": {
+        "health": {
+          "service-state": "running"
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "the adapters component says so",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "adapters",
+              "severity": "degraded",
+              "message": "only another VPN's DNS server answers (tunnel0)"
+            }
+          ]
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "exactly the constant",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "adapters",
+              "severity": "degraded",
+              "message": "only another VPN's DNS server answers"
+            }
+          ]
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "the words later in the message",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "adapters",
+              "severity": "degraded",
+              "message": "x only another VPN's DNS server answers"
+            }
+          ]
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "the same words on another component",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "apply",
+              "severity": "degraded",
+              "message": "only another VPN's DNS server answers"
+            }
+          ]
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "adapters degraded for another reason",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "adapters",
+              "severity": "degraded",
+              "message": "no usable link"
+            }
+          ]
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "adapters without a message",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "adapters",
+              "severity": "degraded"
+            }
+          ]
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "adapters with a null message",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "adapters",
+              "severity": "degraded",
+              "message": null
+            }
+          ]
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "among other components",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "storage",
+              "severity": "ok"
+            },
+            null,
+            {
+              "component": "adapters",
+              "severity": "degraded",
+              "message": "only another VPN's DNS server answers (x)"
+            }
+          ]
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "components not a list",
+      "input": {
+        "health": {
+          "components": {
+            "component": "adapters",
+            "message": "only another VPN's DNS server answers"
+          }
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "component name differs in case",
+      "input": {
+        "health": {
+          "components": [
+            {
+              "component": "Adapters",
+              "severity": "degraded",
+              "message": "only another VPN's DNS server answers"
+            }
+          ]
+        }
+      },
+      "expected": false
+    }
+  ]
+}

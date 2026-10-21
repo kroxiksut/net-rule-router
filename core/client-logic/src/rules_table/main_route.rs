@@ -5,6 +5,12 @@ use std::collections::HashSet;
 
 use super::{RuleRow, RuleType, TargetRoute};
 
+/// Seconds between two reads of a running check's progress.
+pub const CHECK_POLL_SECS: u64 = 2;
+/// Reads after which a check is given up: a service that restarted mid-check
+/// forgot it. The window's timer keeps the same limit.
+pub const CHECK_MAX_POLLS: u32 = 300;
+
 /// Sort rank of a main-route verdict (`mainRouteRank`): what the main route
 /// does not reach first, a rule never checked last.
 pub fn main_route_rank(slug: &str) -> u8 {

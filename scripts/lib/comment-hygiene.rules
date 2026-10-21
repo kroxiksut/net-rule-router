@@ -13,7 +13,7 @@ anywhere=(?<![A-Za-z])(?i:blocks?)[\s_-]*\d|[бБ]лок[а-яё]*\s*\d|TODO\((?
 # Markers judged only inside comment text: string literals and test data carry
 # the same shapes legitimately (timestamps, dotted versions). The sub-block form
 # is fenced on both sides so dotted-quad addresses are not read as block numbers.
-comment=(?<![\d.])1\d\.\d+\.[0-9A-Za-z](?!\.?\d)|(?<![A-Za-z])(?i:block)\s+[A-Z]\b|Phase\s+[A-Z]\b|20\d\d-[01]\d-[0-3]\d|\bTASKS_RU\b|(?<!\p{L})П\d
+comment=(?<![\d.])1\d\.\d+\.[0-9A-Za-z](?!\.?\d)|(?<![\d.])1\d\.R\d*-[A-Za-z]|(?<![A-Za-z])(?i:block)\s+[A-Z]\b|Phase\s+[A-Z]\b|20\d\d-[01]\d-[0-3]\d|\bTASKS_RU\b|(?<!\p{L})П\d
 
 # A comment-tier hit is forgiven when the comment is about time arithmetic.
 exempt=UTC|epoch|RFC|ISO\s?8601|≈|\d_\d{3}_

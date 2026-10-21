@@ -1721,3 +1721,40 @@ fn enforced_since_lists_what_came_into_force_newest_first() {
         1
     );
 }
+
+#[test]
+fn last_known_good_follows_superseded_by_not_the_wall_clock() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let repo = RevisionsRepository::new(&conn);
+    drive_to_status(&repo, "rev-A", "h-A");
+    repo.mark_apply_succeeded("rev-A", None, 100).expect("a");
+    drive_to_status(&repo, "rev-B", "h-B");
+    repo.mark_apply_succeeded("rev-B", Some("rev-A"), 200)
+        .expect("b");
+    // The clock stepped back before the next switch.
+    drive_to_status(&repo, "rev-C", "h-C");
+    repo.mark_apply_succeeded("rev-C", Some("rev-B"), 150)
+        .expect("c");
+
+    let lkg = repo.last_known_good().expect("lkg").expect("present");
+    assert_eq!(lkg.revision_id, "rev-B");
+}
+
+#[test]
+fn last_known_good_survives_two_switches_in_one_second() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let repo = RevisionsRepository::new(&conn);
+    drive_to_status(&repo, "rev-Z", "h-Z");
+    repo.mark_apply_succeeded("rev-Z", None, 100).expect("z");
+    drive_to_status(&repo, "rev-M", "h-M");
+    repo.mark_apply_succeeded("rev-M", Some("rev-Z"), 200)
+        .expect("m");
+    drive_to_status(&repo, "rev-A", "h-A");
+    repo.mark_apply_succeeded("rev-A", Some("rev-M"), 200)
+        .expect("a");
+
+    let lkg = repo.last_known_good().expect("lkg").expect("present");
+    assert_eq!(lkg.revision_id, "rev-M");
+}

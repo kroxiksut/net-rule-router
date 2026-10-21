@@ -31,10 +31,11 @@ use nrr_storage::repository::CacheRepository;
 use nrr_storage::resolution_source::StorageResolutionSource;
 
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
-use crate::net_filter::{contains_fake_pool_addr, is_non_routable_v4};
+use crate::net_filter::{contains_fake_pool_addr, is_non_routable, is_non_routable_v4};
 
-/// The IPv4 half of a cache answer. Named rather than inlined so a grep finds
-/// every place still tied to one family.
+/// The IPv4 half of a cache answer, for the collateral owner map: the
+/// shared-IP census it feeds is keyed by IPv4 in storage. Named rather than
+/// inlined so a grep finds every place still tied to one family.
 fn v4_only(ip: IpAddr) -> Option<Ipv4Addr> {
     match ip {
         IpAddr::V4(v4) => Some(v4),

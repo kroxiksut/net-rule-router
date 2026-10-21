@@ -54,87 +54,37 @@ use crate::wfp_codegen::SUFFIX_FANOUT_BACKSTOP;
 /// product limit.
 pub const MAX_ROUTES_PER_RULE: usize = 4096;
 
-/// Prefix length of a host route — the shape every address rule fans out to.
-pub const HOST_PREFIX: u8 = 32;
+// The signature every reader with no record of what it installed recognises
+// our rows by; it lives below the service so the uninstall path shares it.
+use nrr_platform_api::route_signature::TUNNEL_CATCH_ALL_MAX_PREFIX;
+pub use nrr_platform_api::route_signature::{
+    is_network_shape, is_overlay_route, is_owned_route, is_owned_shape, HOST_PREFIX,
+    HOST_PREFIX_V6, NETWORK_ROUTE_METRIC, SECONDARY_ROUTE_METRIC,
+};
 
-/// The same shape in IPv6.
-pub const HOST_PREFIX_V6: u8 = 128;
-
-/// Whether `prefix_length` is a shape THIS codegen emits at
-/// [`SECONDARY_ROUTE_METRIC`]; network routes carry their own signature
-/// ([`is_network_shape`] at [`NETWORK_ROUTE_METRIC`]).
+/// The rows of a system table that crash recovery may take for ours.
 ///
-/// Startup orphan adoption and the uninstall sweep identify our leftovers by
-/// metric plus shape. Besides host routes, IPv4 carries the overlay: its
-/// lengths follow the tunnel's own catch-alls ([`counter_overlay_for`]), so
-/// the range is every length that function can return rather than a list of
-/// the ones seen so far — an unrecognised half survives a crash and keeps
-/// steering traffic after the service is gone. Pinned by tests that generate
-/// every mode, with and without a tunnel redirect set.
-///
-/// The FAMILY is part of the shape. `/32` in IPv6 is a prefix, not a host
-/// route, so a family-blind answer adopts a stranger and hands the reconciler
-/// a route to delete that was never ours. Only host routes are emitted over
-/// IPv6 — the overlay halves and the counter-overlay are IPv4 mechanisms.
+/// A metric-5 row of our shape is adopted outright. A network rule's route
+/// (metric 4, any length down to a rule's widest) is adopted only on an
+/// interface we have reason to have written to: one that also carries a
+/// metric-5 route of ours, or one a user's stored binding names as the
+/// additional link (`known_secondaries`). A book of only subnet rules has no
+/// metric-5 row, and another program's route on an unrelated link stays its own.
 #[must_use]
-pub fn is_owned_shape(destination: IpAddr, prefix_length: u8) -> bool {
-    match destination {
-        IpAddr::V4(_) => prefix_length == HOST_PREFIX || OVERLAY_PREFIXES.contains(&prefix_length),
-        IpAddr::V6(_) => prefix_length == HOST_PREFIX_V6,
-    }
-}
-
-/// Every length an overlay half can have: the `/1` split-default pair up to
-/// one bit longer than the narrowest tunnel catch-all we answer.
-const OVERLAY_PREFIXES: std::ops::RangeInclusive<u8> = 1..=TUNNEL_CATCH_ALL_MAX_PREFIX + 1;
-
-/// Metric for our secondary routes. Low = preferred over the default
-/// route, but we never touch the system default itself (`is_ours = true`
-/// only). A VPN may still install a lower-metric route for the same
-/// destination — documented in `strategy.rs`'s risk matrix.
-pub const SECONDARY_ROUTE_METRIC: u32 = 5;
-
-/// Metric for a network rule's routes. Its own value, because a rule network
-/// can have an overlay half's length (`/8`..`/13`): by shape alone the two are
-/// one thing, and pausing or a crash would treat the rule as an overlay.
-pub const NETWORK_ROUTE_METRIC: u32 = 4;
-
-/// Whether a row read back from the system table carries our signature. The OS
-/// never marks a route as ours, so crash recovery adopts by this and nothing
-/// else — metric, a shape we emit at that metric, and the main table (a Linux
-/// dump also returns other tables, which we never write).
-#[must_use]
-pub fn is_owned_route(route: &RouteEntry) -> bool {
-    route.table == nrr_platform_api::RouteTableRef::Main
-        && match route.metric {
-            SECONDARY_ROUTE_METRIC => is_owned_shape(route.destination, route.prefix_length),
-            NETWORK_ROUTE_METRIC => is_network_shape(route.destination, route.prefix_length),
-            _ => false,
-        }
-}
-
-/// A length a network rule's route can have: no wider than a rule may be,
-/// down to a single address (a piece split around a tunnel server).
-#[must_use]
-pub fn is_network_shape(destination: IpAddr, prefix_length: u8) -> bool {
-    let max = if destination.is_ipv4() {
-        HOST_PREFIX
-    } else {
-        HOST_PREFIX_V6
-    };
-    (nrr_domain::ip_network_policy::widest_rule_prefix(destination.is_ipv4())..=max)
-        .contains(&prefix_length)
-}
-
-/// One of our overlay halves — the routes that carry what no rule names.
-/// Never a rule's route, whatever its length: those sit at
-/// [`NETWORK_ROUTE_METRIC`] or are host routes.
-#[must_use]
-pub fn is_overlay_route(route: &RouteEntry) -> bool {
-    route.metric == SECONDARY_ROUTE_METRIC
-        && route.table == nrr_platform_api::RouteTableRef::Main
-        && route.destination.is_ipv4()
-        && OVERLAY_PREFIXES.contains(&route.prefix_length)
+pub fn adoptable_orphans(table: Vec<RouteEntry>, known_secondaries: &[u32]) -> Vec<RouteEntry> {
+    let mut corroborated: std::collections::HashSet<u32> = table
+        .iter()
+        .filter(|r| is_owned_route(r) && r.metric == SECONDARY_ROUTE_METRIC)
+        .map(|r| r.interface_index)
+        .collect();
+    corroborated.extend(known_secondaries.iter().copied());
+    table
+        .into_iter()
+        .filter(|r| {
+            is_owned_route(r)
+                && (r.metric == SECONDARY_ROUTE_METRIC || corroborated.contains(&r.interface_index))
+        })
+        .collect()
 }
 
 /// the two split-default halves. Together they cover all of
@@ -232,11 +182,6 @@ pub fn tunnel_catch_all_prefixes(routes: &[RouteEntry], ifindex: u32) -> Vec<(Ip
     out.dedup();
     out
 }
-
-/// Longest prefix that still reads as "steer a chunk of the internet" rather
-/// than "reach one network": examplevpn's set bottoms out at `/9`, a corporate
-/// split tunnel names `/16`s and narrower, which are its business, not ours.
-const TUNNEL_CATCH_ALL_MAX_PREFIX: u8 = 12;
 
 /// Where matched traffic is sent: an adapter's gateway + interface index,
 /// resolved by the caller from the active route binding. Used for the
@@ -600,8 +545,7 @@ fn note_held(held: &mut Option<(IpAddr, usize)>, ip: IpAddr) {
 ///   ([`COUNTER_OVERLAY`]) via primary out-specifics a redirect VPN's `/1`, so
 ///   all non-rule traffic rides the primary — additive, the VPN's own routes
 ///   are never removed.
-/// - **`PreferSecondaryWhenAvailable` / `StrictSecondaryFailClosed`**
-///   (mode B): NetRuleRouter owns a split-default overlay
+/// - **`PreferSecondaryWhenAvailable`** (mode B): NetRuleRouter owns a split-default overlay
 ///   ([`OVERLAY_LOW`] + [`OVERLAY_HIGH`]) via the secondary so *everything*
 ///   travels the tunnel, and primary-bound rules are pulled back to the
 ///   primary NIC as `/32` exceptions.
@@ -710,8 +654,7 @@ pub fn generate_routes_with(
             }
             out
         }
-        RouteBehaviorMode::PreferSecondaryWhenAvailable
-        | RouteBehaviorMode::StrictSecondaryFailClosed => {
+        RouteBehaviorMode::PreferSecondaryWhenAvailable => {
             let mut out = RouteCodegenOutput::default();
             // Own the split-default overlay → all traffic to the tunnel.
             out.routes

@@ -66,8 +66,36 @@ Window {
     // Settings — leak protection and name-level enforcement only help if they
     // are on before the first rule applies. Diagnostics stay off: they are for
     // reporting a problem, not for everyday use.
-    property bool wantKillSwitch: true
-    property bool wantDohLockdown: true
+    // Leak protection level offered by default: what the rules route never
+    // leaks, and the rest of the internet keeps working. A partial answer
+    // sheet from the installer starts the choices from its answers, as the
+    // terminal setup does; the user still confirms them.
+    readonly property var _sheet: root.startupController
+            && root.startupController.provisioning
+            && root.startupController.provisioning.present === true
+        ? root.startupController.provisioning : null
+    property string wantLeakProtection: _sheet && String(_sheet.leakProtection || "") !== ""
+        ? Pure.routePolicyCoerce("leak-protection", _sheet.leakProtection) : "sites"
+    // The default route the level is offered under, as the service holds it or
+    // the install-time choices start it; the wizard does not ask it.
+    readonly property string defaultRoute: root.uiRevision >= 0
+        ? String(root._serviceDefaultRoute || root.prefs.routeBehaviorMode || "") : ""
+    // No level below what the administrator set for a first save is offered.
+    readonly property string leakFloor: root.uiRevision >= 0
+        ? String(root._serviceLeakFloor || "off") : "off"
+    readonly property var leakLevelsOffered:
+        Pure.leakProtectionChoicesAtLeast(defaultRoute, leakFloor)
+    readonly property string leakProtectionChoice:
+        Pure.raiseLeakProtection(defaultRoute, wantLeakProtection, leakFloor)
+    // "Everything" while the additional connection is not available stops the
+    // internet as soon as it applies; said under the choice.
+    readonly property bool leakHoldsNow: root.uiRevision >= 0
+        && Pure.leakProtectionHoldsNow(leakProtectionChoice,
+            root.interfacesRolesController
+                && typeof root.interfacesRolesController.boundSecondaryRow === "function"
+                ? root.interfacesRolesController.boundSecondaryRow() : null)
+    property bool wantDohLockdown: _sheet && typeof _sheet.dohLockdown === "boolean"
+        ? _sheet.dohLockdown : true
     property bool wantFakeIp: true
     property bool wantDiagnosticLogs: false
     // Duration of the log windows `wantDiagnosticLogs` opens (verbose logging
@@ -116,7 +144,7 @@ Window {
         if (_protectionApplied) return
         _protectionApplied = true
         if (root.routePolicyController) {
-            root.routePolicyController.applyFirstRunProtections(wantKillSwitch, wantDohLockdown)
+            root.routePolicyController.applyFirstRunProtections(leakProtectionChoice, wantDohLockdown)
         }
         if (wantBlockNoticesMuted) {
             root.commitPrefs({ notifyBlockNotices: false })
@@ -719,20 +747,58 @@ Window {
                     text: root.tr("dialog.first-run-wizard.protection-description",
                         "Recommended for everyone. Each of these can be changed later in Settings.")
                 }
-                CheckBox {
-                    id: firstRunKillSwitchCheck
+                // The same three-way choice as Settings; the levels share this
+                // parent, which makes them exclusive.
+                ColumnLayout {
                     Layout.fillWidth: true
-                    checked: firstRunWindow.wantKillSwitch
-                    text: root.tr("dialog.first-run-wizard.protection-kill-switch",
-                        "Block routed traffic when the additional route is down")
-                    contentItem: Label {
-                        text: firstRunKillSwitchCheck.text
-                        leftPadding: firstRunKillSwitchCheck.indicator.width + firstRunKillSwitchCheck.spacing
+                    spacing: 0
+                    Accessible.role: Accessible.Grouping
+                    Accessible.name: leakProtectionTitle.text
+                    Label {
+                        id: leakProtectionTitle
+                        text: root.tr("settings.routing.kill-switch.title", "Leak protection")
                         color: root.textColor
-                        wrapMode: Text.WordWrap
-                        verticalAlignment: Text.AlignVCenter
                     }
-                    onToggled: firstRunWindow.wantKillSwitch = checked
+                    ThemedRadioButton {
+                        theme: root.uiTheme
+                        Layout.fillWidth: true
+                        visible: firstRunWindow.leakLevelsOffered.indexOf("off") >= 0
+                        checked: firstRunWindow.leakProtectionChoice === "off"
+                        text: root.tr("settings.routing.leak-protection.option-off", "Off")
+                            + " — " + root.tr("settings.routing.leak-protection.note-off",
+                                "If the additional connection drops, traffic continues over your main connection.")
+                        onToggled: if (checked) firstRunWindow.wantLeakProtection = "off"
+                    }
+                    ThemedRadioButton {
+                        theme: root.uiTheme
+                        Layout.fillWidth: true
+                        visible: firstRunWindow.leakLevelsOffered.indexOf("sites") >= 0
+                        checked: firstRunWindow.leakProtectionChoice === "sites"
+                        text: root.tr("settings.routing.leak-protection.option-sites", "Routed sites")
+                            + " — " + root.tr("settings.routing.leak-protection.note-sites",
+                                "What your rules send through the additional connection never goes out the main one. Everything else keeps working.")
+                        onToggled: if (checked) firstRunWindow.wantLeakProtection = "sites"
+                    }
+                    ThemedRadioButton {
+                        theme: root.uiTheme
+                        Layout.fillWidth: true
+                        checked: firstRunWindow.leakProtectionChoice === "everything"
+                        text: root.tr("settings.routing.leak-protection.option-everything", "Everything")
+                            + " — " + root.tr("settings.routing.leak-protection.note-everything",
+                                "Nothing leaves except through the additional connection, your local network and what your rules send over the main connection. If the additional connection drops, the internet waits until it returns.")
+                        onToggled: if (checked) firstRunWindow.wantLeakProtection = "everything"
+                    }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    visible: firstRunWindow.leakHoldsNow
+                    text: root.uiRevision >= 0
+                        ? root.tr("dialog.leak-holds-now.body",
+                            "With leak protection set to Everything, traffic is held right away: the internet stops until the additional connection returns.")
+                        : ""
                 }
                 CheckBox {
                     id: firstRunDohCheck

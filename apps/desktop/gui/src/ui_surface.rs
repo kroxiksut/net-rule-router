@@ -2,7 +2,6 @@ use nrr_application::backend_facade::{
     BackendConnectionStatus, BackendFacade, BackendProviderKind,
 };
 use nrr_application::mock_backend::network_interfaces::RouteSelectionRequest;
-use nrr_application::mock_backend::rules::RulesScreenRequest;
 use nrr_shared::launcher_rpc::HostAnswerDeadlines;
 use nrr_shared::{
     resolve_catalog_text, AppSection, AppShellModel, LocaleLoadStatus, RouteBehaviorMode, ThemeMode,
@@ -37,6 +36,18 @@ fn bundled_resource(relative: &str) -> Option<PathBuf> {
     #[cfg(not(debug_assertions))]
     let checkout = None;
     find_bundled(executable_dir.as_deref(), checkout, relative)
+}
+
+/// The service executable beside this one: the only place the window's
+/// install and start actions take it from.
+fn sibling_service_binary_present() -> bool {
+    env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(Path::to_path_buf))
+        .is_some_and(|dir| {
+            dir.join(nrr_shared::product_identity::BinaryRole::Service.host_file_name())
+                .is_file()
+        })
 }
 
 fn find_bundled(
@@ -175,6 +186,7 @@ pub fn write_qt_context_file_at(
     backend: &dyn BackendFacade,
     backend_status: &BackendConnectionStatus,
     service_started_on_launch: bool,
+    preferences_unreadable: bool,
     answer_deadlines: &HostAnswerDeadlines,
     machine_files: &dyn nrr_platform_api::admin_authored::AdminAuthoredFiles,
 ) -> Result<(), String> {
@@ -230,9 +242,8 @@ pub fn write_qt_context_file_at(
         secondary_candidate_confirmed: preferences.secondary_role_user_confirmed,
         behavior_mode: preferences.route_behavior_mode,
     };
-    // Backend snapshots flow through `BackendFacade`. For mock /
-    // preview-local providers, the methods delegate to the same
-    // `preview_*` helpers. For the production `IpcBackendFacade`,
+    // Backend snapshots flow through `BackendFacade`. For the mock
+    // provider, the methods delegate to the `preview_*` helpers. For the production `IpcBackendFacade`,
     // they round-trip to the running service when
     // `backend_status == Connected` and serve from a stale cache
     // (with `stale=true` flagged in the typed wrappers) on transient
@@ -270,16 +281,6 @@ pub fn write_qt_context_file_at(
         )
     };
     timed("interfaces", t);
-    let t = std::time::Instant::now();
-    let rules_snapshot = if budget_left(&cold_start_started) {
-        backend.rules_snapshot(RulesScreenRequest::default())
-    } else {
-        budget_spent = true;
-        nrr_application::mock_backend::rules::rules_screen_preview_snapshot(
-            RulesScreenRequest::default(),
-        )
-    };
-    timed("rules", t);
     let t = std::time::Instant::now();
     // Out of budget there is no answer, so neither may read as a healthy
     // service: the same "unknown" the facade hands out on an IPC failure.
@@ -335,6 +336,11 @@ pub fn write_qt_context_file_at(
     let reset_script_command = reset_script_path.as_deref().map(reset_script_command_line);
     let license_text = load_license_text();
     let eula_text = load_eula_text(&preferences.language);
+    let delivery_gaps = delivery::missing_parts(&delivery::DeliveryFacts {
+        presets_dir: bundled_resource("presets").is_some_and(|path| path.is_dir()),
+        bundled_locale_loaded: delivery::bundled_locale_loaded(&locale_reports),
+        service_binary: (!cfg!(debug_assertions)).then(sibling_service_binary_present),
+    });
     let locale_diagnostics = json!({
         "acceptedWithWarnings": locales_with_warnings.len(),
         "rejected": rejected_locales.len(),
@@ -407,67 +413,18 @@ pub fn write_qt_context_file_at(
         })
         .collect::<Vec<_>>();
 
-    // The QML dialog uses the `FreeRuleType` slugs as ids and reads localized
-    // titles via `rules.type.<id>`.
-    // Validation status is the per-row verdict of `nrr-domain` — the one the
-    // Add/Edit dialog is gated on, so a typed and an imported row are judged
-    // alike.
-    //
-    // In production the parser-supplied status ships over IPC from the
-    // service via `RulesListResponse.rows[i].validation_status`. The
-    // in-place revalidation below is retained as a fallback for the
-    // preview (mock) mode only, whose fixture (`nrr-mock-backend::rules`)
-    // carries only valid match values today.
-    // Demo rules are something the user asks for — the first-run wizard's
-    // "use built-in demo rules", the Rules screen's "load demo rules" — never
-    // something a launch hands them. A service-backed start therefore carries
-    // NO rows: the table stays empty until the live revision arrives, and
-    // stays empty for good if the user has no rules yet. Only a mock/preview
-    // build still renders the preview seed; it has no service to read.
-    let rules_rows_json: Vec<serde_json::Value> =
-        if backend_provider_is_service_backed(backend.provider_kind()) {
-            Vec::new()
-        } else {
-            rules_snapshot
-                .rows
-                .iter()
-                .map(|row| {
-                    let validation = nrr_application::rule_value_validation::validate_rule_value(
-                        row.rule_type.slug(),
-                        row.match_value,
-                    );
-                    json!({
-                        "id": row.id,
-                        "enabled": row.enabled,
-                        "ruleType": row.rule_type.slug(),
-                        "ruleTypeTitle": row.rule_type.title(),
-                        "matchValue": row.match_value,
-                        "targetRoute": match row.target_route {
-                            nrr_shared::RouteRole::Primary => "primary",
-                            nrr_shared::RouteRole::Secondary => "secondary",
-                        },
-                        "verify": false,
-                        "comment": row.comment,
-                        "validationStatus": validation.status_slug(),
-                        "validationMessageKey": validation.message_key(),
-                        "validationMessageArgs": validation.args(),
-                    })
-                })
-                .collect()
-        };
-    // The empty-rules state is driven entirely by `EmptyState` in
-    // `RulesSection.qml`; users see "Add your first rule" instead of a
-    // pre-populated invalid example.
-
-    // The rule-type list comes from the backend snapshot alone: a hardcoded
-    // entry next to it showed that type twice in the Add-Rule dropdown.
-    let mut supported_rule_types: Vec<serde_json::Value> = Vec::new();
-    supported_rule_types.extend(rules_snapshot.supported_rule_types.iter().map(|rule_type| {
-        json!({
-            "id": rule_type.slug(),
-            "title": rule_type.title(),
+    // Rules are not part of the cold start: the window reads them from the
+    // service once it is up, and demo rules are something the user asks for.
+    // The Add dialog uses these slugs as ids and titles them `rules.type.<id>`.
+    let supported_rule_types: Vec<serde_json::Value> = nrr_shared::FreeRuleType::ALL
+        .iter()
+        .map(|rule_type| {
+            json!({
+                "id": rule_type.slug(),
+                "title": rule_type.title(),
+            })
         })
-    }));
+        .collect();
 
     // Data we served locally was never verified against the service, so the
     // window must not claim a live connection. `Connecting` is the state the
@@ -493,7 +450,7 @@ pub fn write_qt_context_file_at(
             "completesFirstRun": loaded.answers.completes_first_run(),
             "primaryConnection": loaded.answers.primary_connection,
             "secondaryConnection": loaded.answers.secondary_connection,
-            "killSwitch": loaded.answers.kill_switch,
+            "leakProtection": loaded.answers.leak_protection.map(|level| level.as_slug()),
             "dohLockdown": loaded.answers.doh_lockdown,
             "fakeIp": loaded.answers.fake_ip,
             "ruleSet": loaded.answers.rule_set,
@@ -542,6 +499,11 @@ pub fn write_qt_context_file_at(
         "backendServiceBacked": backend_service_backed,
         // The service was stopped and this launch started it again.
         "serviceStartedOnLaunch": service_started_on_launch,
+        // The settings file could not be read: this session runs on defaults
+        // and saves nothing, so the window says so.
+        "preferencesUnreadable": preferences_unreadable,
+        // Parts of the package this copy lacks (`delivery.rs` slugs).
+        "deliveryGaps": delivery_gaps,
         "iconFileUrl": icon_file_url,
         "platformProfile": platform_profile,
         // How long `RpcTransport.qml` waits for each answer; the launcher owns the budgets.
@@ -601,10 +563,6 @@ pub fn write_qt_context_file_at(
             "selectedSecondaryInterfaceName": preferences.selected_secondary_interface_name.clone(),
             "secondaryRoleUserConfirmed": preferences.secondary_role_user_confirmed,
             "routeBehaviorMode": preferences.route_behavior_mode.slug(),
-            // The UI mirror of the service per-SID
-            // `block-secondary-when-unavailable` flag, so the Routing
-            // settings checkbox renders the saved choice. The
-            // authoritative value is written through `route.policy.update`.
             "showBluetoothAdapters": preferences.show_bluetooth_adapters,
             // Display toggle for the security-audit viewing tab in the Logs
             // area (default off). Device-local; the audit trail is recorded
@@ -624,10 +582,10 @@ pub fn write_qt_context_file_at(
             // rows in the Interfaces section (default on). Device-local.
             "showRememberedAdapters": preferences.show_remembered_adapters,
             "autoConfirmAdapterIdChange": preferences.auto_confirm_adapter_id_change,
-            // Opt-out for the "leak protection is blocking unknown
-            // traffic" banner (default on). Device-local display preference.
+            // Opt-out for the "leak protection is holding all traffic"
+            // banner (default on). Device-local display preference.
             "warnKillSwitchBlockAll": preferences.warn_kill_switch_block_all,
-            // Persisted acknowledgement of the block-all banner (default off).
+            // Persisted acknowledgement of that banner (default off).
             // Device-local display state; cleared by the GUI when the posture disarms.
             "killSwitchBannerAcknowledged": preferences.kill_switch_banner_acknowledged,
             // Persisted acknowledgement of the "additional adapter not found"
@@ -668,20 +626,8 @@ pub fn write_qt_context_file_at(
             // authoritative values are written through `route.policy.update`.
             "routeIncludeSubdomains": preferences.route_include_subdomains,
             "routeSharedIpPolicy": preferences.route_shared_ip_policy.clone(),
-            "routeKillSwitchBlockAll": preferences.route_kill_switch_block_all,
-            "routeKillSwitchFailClosed": preferences.route_kill_switch_fail_closed,
             "routeKillSwitchProtocols": preferences.route_kill_switch_protocols,
-            // The MASTER kill-switch toggle and the DNS-over-primary opt-in
-            // must round-trip through this context emit and the incoming
-            // QtPreferencesPayload parse — otherwise they can only ride the
-            // service state DB, and a clean service-DB wipe silently loses
-            // them. Emitting (and parsing below) makes the offline re-seed
-            // after a wipe work.
-            "routeKillSwitchEnabled": preferences.route_kill_switch_enabled,
             "routeAllowDnsOverPrimary": preferences.route_allow_dns_over_primary,
-            // Mode-A coverage strategy + hosts-bypass mirrors (the same
-            // emit/parse/apply triple as every other per-SID policy mirror).
-            "routeModeACoverageStrategy": preferences.route_mode_a_coverage_strategy.clone(),
             "routeResolveHostsBypass": preferences.route_resolve_hosts_bypass,
             "routeEnforcementMode": preferences.route_enforcement_mode.clone(),
             // Device-local mirror of the GLOBAL "secondary tunnel liveness
@@ -784,12 +730,17 @@ pub fn write_qt_context_file_at(
         },
         "rules": {
             "supportedRuleTypes": supported_rule_types,
-            "rows": rules_rows_json,
+            "rows": [],
         },
         "diagnostics": {
             "overallHealthy": diagnostics_status.overall_healthy,
             "stale": diagnostics_status.stale,
             "origin": diagnostics_status.origin.as_str(),
+            "missingCapabilities": diagnostics_status.missing_capabilities,
+            "dnsTamper": {
+                "affectedHosts": diagnostics_status.dns_tamper.affected_hosts,
+                "examples": diagnostics_status.dns_tamper.examples,
+            },
             "serviceHealth": {
                 "state": diagnostics_status.service_health.state,
                 "activeRevisionId": diagnostics_status.service_health.active_revision_id,
@@ -867,6 +818,7 @@ pub fn write_qt_context_file_at(
                 "reasonCode": entry.reason_code,
                 "revisionId": entry.revision_id,
                 "hasPayloadSummary": entry.has_payload_summary,
+                "cause": entry.cause,
             })).collect::<Vec<_>>(),
             "nextPageToken": audit_page.next_cursor.as_ref().map(|c| c.as_str().to_string()),
             "totalKnownCount": audit_page.total_count,
@@ -1088,17 +1040,9 @@ struct QtPreferencesPayload {
     #[serde(default)]
     route_shared_ip_policy: Option<String>,
     #[serde(default)]
-    route_kill_switch_block_all: Option<bool>,
-    #[serde(default)]
-    route_kill_switch_fail_closed: Option<bool>,
-    #[serde(default)]
     route_kill_switch_protocols: Option<u32>,
     #[serde(default)]
-    route_kill_switch_enabled: Option<bool>,
-    #[serde(default)]
     route_allow_dns_over_primary: Option<bool>,
-    #[serde(default)]
-    route_mode_a_coverage_strategy: Option<String>,
     #[serde(default)]
     route_resolve_hosts_bypass: Option<bool>,
     #[serde(default)]
@@ -1189,6 +1133,7 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
+mod delivery;
 mod preferences_payload;
 // ── Backend status payload helper ─────────────────────────────────────────
 
@@ -1224,10 +1169,10 @@ fn backend_connection_status_to_payload(status: &BackendConnectionStatus) -> ser
 }
 
 /// Is the facade behind this launch a REAL service connection, or a
-/// mock/preview stand-in?
+/// mock stand-in?
 ///
-/// `BackendConnectionStatus` alone cannot answer that: an explicit mock or
-/// preview-local launch reports `Connected` while nothing it returns ever
+/// `BackendConnectionStatus` alone cannot answer that: an explicit mock
+/// launch reports `Connected` while nothing it returns ever
 /// reaches the service. The GUI needs the distinction because a routing change
 /// made against a stand-in has to be PARKED (offered again once a real service
 /// is reachable), exactly like a change made while the service was stopped —
@@ -1238,7 +1183,7 @@ fn backend_connection_status_to_payload(status: &BackendConnectionStatus) -> ser
 /// the session supersedes this (see `Main.qml`'s `_routingBackendConnected`).
 fn backend_provider_is_service_backed(kind: BackendProviderKind) -> bool {
     match kind {
-        BackendProviderKind::Mock | BackendProviderKind::PreviewLocal => false,
+        BackendProviderKind::Mock => false,
         BackendProviderKind::IpcConnected
         | BackendProviderKind::IpcDisconnected
         | BackendProviderKind::IpcServiceNotInstalled

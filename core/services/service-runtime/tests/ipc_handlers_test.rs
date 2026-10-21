@@ -273,6 +273,8 @@ impl FakeDiagnostics {
                 },
                 stale: false,
                 origin: DiagnosticsDataOrigin::Service,
+                missing_capabilities: Vec::new(),
+                dns_tamper: Default::default(),
             }),
         }
     }
@@ -434,7 +436,6 @@ fn deps_full(
         Arc::new(EmptyRoutingPause),
         Arc::new(EmptyRoutingPauseWriter),
         Arc::new(EmptyAutostart),
-        Arc::new(EmptyAutostartWriter),
     ))
 }
 
@@ -607,25 +608,6 @@ impl nrr_service_runtime::AutostartProvider for EmptyAutostart {
     }
 }
 
-struct EmptyAutostartWriter;
-impl nrr_service_runtime::AutostartWriter for EmptyAutostartWriter {
-    fn toggle(
-        &self,
-        _sid: &str,
-        enabled: bool,
-    ) -> Result<
-        nrr_service_runtime::ipc_handlers::payloads::AutostartDto,
-        nrr_service_runtime::SettingsWriteError,
-    > {
-        Ok(nrr_service_runtime::ipc_handlers::payloads::AutostartDto {
-            enabled,
-            last_known_state: if enabled { "enabled" } else { "disabled" }.into(),
-            overridden_value: None,
-            updated_at: 0,
-        })
-    }
-}
-
 // Empty provider implementations for the integration
 // tests that don't exercise per-SID handlers. The route-policy unit
 // tests live in `route_policy_update.rs::tests` (lib-side); this file
@@ -657,15 +639,11 @@ impl nrr_service_runtime::RoutePolicyWriter for EmptyRoutePolicyWriter {
                 primary: request.primary.clone(),
                 secondary: request.secondary.clone(),
                 mode: request.mode,
-                block_secondary_when_unavailable: request.block_secondary_when_unavailable,
-                kill_switch_fail_closed: request.kill_switch_fail_closed,
+                leak_protection: request.leak_protection,
                 kill_switch_protocols: request.kill_switch_protocols,
-                kill_switch_block_all: request.kill_switch_block_all,
-                kill_switch_enabled: request.kill_switch_enabled,
                 allow_dns_over_primary: request.allow_dns_over_primary,
                 include_subdomains: request.include_subdomains,
                 shared_ip_policy: request.shared_ip_policy.clone(),
-                mode_a_coverage_strategy: request.mode_a_coverage_strategy.clone(),
                 resolve_hosts_bypass: request.resolve_hosts_bypass,
                 secondary_link_provider_apps: Vec::new(),
                 doh_lockdown_enabled: request.doh_lockdown_enabled,
@@ -686,6 +664,7 @@ impl nrr_service_runtime::RoutePolicyWriter for EmptyRoutePolicyWriter {
                 short_name_suffix: String::new(),
                 app_rules_take_all_addresses: false,
                 forwarded_outage: String::new(),
+                external_address_auto_check: false,
                 binding_source: request.binding_source,
             },
         )
@@ -826,19 +805,24 @@ fn production_handlers_register_every_operation_in_catalog() {
         IpcOperationName::RoutingPauseGet,
         IpcOperationName::RoutingPauseToggle,
         IpcOperationName::AutostartGet,
-        IpcOperationName::AutostartToggle,
         IpcOperationName::ExplainGet,
         // Log/audit retention config get/set (FakeLogRetention wired in
         // deps_default). Set gets a valid payload + UserScopedConfiguration
         // envelope below.
         IpcOperationName::LogRetentionConfigGet,
         IpcOperationName::LogRetentionConfigSet,
+        // The confirmed VPN gateways live in the always-present book.
+        IpcOperationName::RouteVpnGatewaysSet,
     ];
 
     for op in IpcOperationName::ALL {
         let (payload, envelope_overrides) = match op {
             IpcOperationName::ContractNegotiate => (
-                serde_json::json!({ "client-version": 1, "client-kind": "gui" }),
+                serde_json::json!({
+                    "client-version": 1,
+                    "client-kind": "gui",
+                    "contract-revision": nrr_shared::ipc::IPC_CONTRACT_REVISION,
+                }),
                 None,
             ),
             IpcOperationName::MutationSubmit => (
@@ -879,12 +863,10 @@ fn production_handlers_register_every_operation_in_catalog() {
                     "primary": null,
                     "secondary": null,
                     "mode": "prefer-primary",
-                    "block-secondary-when-unavailable": false,
                     "binding-source": "user-assigned",
-                    // Required, no wire default: a protection toggle must not
-                    // be turnable off by omission.
-                    "kill-switch-enabled": false,
-                    "kill-switch-block-all": false,
+                    // Required, no wire default: protection must not be
+                    // turnable off by omission.
+                    "leak-protection": "off",
                     "kill-switch-strict-shared-ips": false,
                     "doh-lockdown-enabled": false,
                 }),
@@ -928,8 +910,8 @@ fn production_handlers_register_every_operation_in_catalog() {
                 serde_json::json!({"paused": false}),
                 Some((IpcOperationClass::UserScopedConfiguration, None)),
             ),
-            IpcOperationName::AutostartToggle => (
-                serde_json::json!({"enabled": false}),
+            IpcOperationName::RouteVpnGatewaysSet => (
+                serde_json::json!({"gateways": []}),
                 Some((IpcOperationClass::UserScopedConfiguration, None)),
             ),
             // ExplainGet requires exactly one of
@@ -1024,6 +1006,7 @@ fn contract_negotiate_round_trip() {
         "client-version": IPC_PROTOCOL_VERSION,
         "client-kind": "gui",
         "supported-features": ["push-events"],
+        "contract-revision": nrr_shared::ipc::IPC_CONTRACT_REVISION,
     });
     let resp = router.dispatch(
         read_envelope(IpcOperationName::ContractNegotiate, payload),
@@ -1382,7 +1365,9 @@ fn rollback_refuses_an_expired_token() {
     let token = tokens.issue(
         IpcOperationName::RollbackRequest,
         StoredMutation::confirmation_of(serde_json::json!({}), ctx.caller_stored(), true),
-        std::time::Instant::now() - std::time::Duration::from_secs(1),
+        nrr_service_runtime::boot_clock::BootInstant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("the clock reads past its start"),
     );
     let resp = rollback_with(&router, &token, ctx);
     assert_eq!(error_code(&resp), IpcErrorCode::ConfirmationExpired);
@@ -1771,9 +1756,8 @@ fn subscribe_envelope(payload: serde_json::Value) -> IpcRequestEnvelope {
 fn status_updates_subscribe_returns_ack_via_router() {
     let bus = Arc::new(EventBus::new());
     let router = make_router(deps_with_event_bus(bus.clone()));
-    bus.publish(StatusUpdateEvent::HealthChanged {
-        service_state: "running".into(),
-        worst_severity: "ok".into(),
+    bus.publish(StatusUpdateEvent::AdaptersChanged {
+        data_source: "test".into(),
     });
 
     let resp = router.dispatch(
@@ -1795,9 +1779,8 @@ fn status_updates_subscribe_with_pre_buffer_cursor_signals_gap() {
     // Overflow the buffer so the oldest retained event id is well
     // past 1.
     for _ in 0..(nrr_service_runtime::EVENT_BUFFER_CAPACITY + 10) {
-        bus.publish(StatusUpdateEvent::HealthChanged {
-            service_state: "running".into(),
-            worst_severity: "ok".into(),
+        bus.publish(StatusUpdateEvent::AdaptersChanged {
+            data_source: "test".into(),
         });
     }
     let router = make_router(deps_with_event_bus(bus));
@@ -1820,9 +1803,8 @@ fn status_updates_subscribe_replay_window_within_buffer() {
     // exactly the events between last_seen and head. This is the
     // contract the transport pump relies on for replay.
     let bus = Arc::new(EventBus::new());
-    bus.publish(StatusUpdateEvent::HealthChanged {
-        service_state: "running".into(),
-        worst_severity: "ok".into(),
+    bus.publish(StatusUpdateEvent::AdaptersChanged {
+        data_source: "test".into(),
     }); // 1
     bus.publish(StatusUpdateEvent::AdaptersChanged {
         data_source: "windows-live".into(),

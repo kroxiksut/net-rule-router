@@ -14,7 +14,7 @@ use super::*;
 /// keep-logic), draining the named IPs off the observe-tick hot path. The thread
 /// ends when the sender (held by the conn-trace consumer) is dropped at shutdown.
 pub(super) fn spawn_fcrdns_learner_worker(
-    rx: std::sync::mpsc::Receiver<(std::net::Ipv4Addr, bool, ReverseLearnOrigin)>,
+    rx: std::sync::mpsc::Receiver<nrr_service_runtime::conn_observation_consumer::ReverseLearnJob>,
     consumer: Arc<nrr_service_runtime::dns_observation_consumer::DnsObservationConsumer>,
     companion: Option<CompanionFromReverseDeps<'_>>,
     liveness: Arc<TaskLiveness>,
@@ -33,7 +33,7 @@ pub(super) fn spawn_fcrdns_learner_worker(
 
     let pool = upstream_dns_pool();
     let upstream: Arc<dyn Fn() -> Option<std::net::SocketAddr> + Send + Sync> =
-        Arc::new(move || pool.current().or_else(|| pool.note_network_change()));
+        Arc::new(move || pool.current_or_select());
 
     let resolver = FcrdnsUpstreamResolver::new(upstream, Duration::from_millis(1500));
     // Two sinks over the same consumer: one for the exact-match fast path
@@ -44,11 +44,19 @@ pub(super) fn spawn_fcrdns_learner_worker(
     // blind spot made visible: nothing else in the service ever learned it
     // exists. If it loaded beside a routed site, that is a companion worth
     // asking about.
+    // The worker names one address at a time, so the owner of the address in
+    // hand is the owner of whatever the sink reports.
+    let job_owner: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
     if let Some(deps) = companion {
         let engine = Arc::clone(deps.engine);
         let active_sid = Arc::clone(deps.active_sid);
+        let job_owner = Arc::clone(&job_owner);
         sink = sink.with_companion_sink(Arc::new(move |hostname: &str| {
-            let Some(sid) = active_sid() else {
+            let owner = job_owner.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let Some(sid) = nrr_service_runtime::conn_observation_consumer::suggestion_owner(
+                owner.as_deref(),
+                &active_sid,
+            ) else {
                 return;
             };
             engine.note_candidate_in_use(&sid, hostname, std::time::SystemTime::now());
@@ -67,8 +75,9 @@ pub(super) fn spawn_fcrdns_learner_worker(
                 None,
                 Watch::Work(Duration::from_secs(60)),
             );
-            for (ip, allow_direct, origin) in rx {
+            for (ip, allow_direct, origin, owner) in rx {
                 let _learning = lease.work();
+                *job_owner.lock().unwrap_or_else(|p| p.into_inner()) = owner;
                 // The two feeds mean different things; only one of them is a
                 // drop. Naming the wrong one costs the next reader a hunt for
                 // a filter that never fired.
@@ -194,8 +203,11 @@ pub(super) struct ObservationSinks {
     /// routable V4 OUR block dropped, or one that left over the main link
     /// beside routed traffic, is enqueued for the worker to name +
     /// forward-confirm. `None` disables reverse-learning.
-    pub(super) reverse_dns_learner_tx:
-        Option<std::sync::mpsc::SyncSender<(std::net::Ipv4Addr, bool, ReverseLearnOrigin)>>,
+    pub(super) reverse_dns_learner_tx: Option<
+        std::sync::mpsc::SyncSender<
+            nrr_service_runtime::conn_observation_consumer::ReverseLearnJob,
+        >,
+    >,
     /// Deletes one remembered application destination. Wired when the state DB
     /// is open: a destination withdrawn for moving another process's traffic
     /// must not be re-seeded from disk at the next start.
@@ -204,6 +216,9 @@ pub(super) struct ObservationSinks {
     /// The rule book's routed application patterns. Without it the collateral
     /// check cannot tell a pin from an ordinary observation and stays silent.
     pub(super) routed_apps: Option<nrr_service_runtime::conn_observation_consumer::RoutedAppsFn>,
+    /// The shared-address census a pin-drop teardown spares by.
+    pub(super) flow_reset_census:
+        Option<Arc<dyn nrr_service_runtime::fqdn_cache_lookup::FqdnCacheLookup>>,
 }
 
 /// What the connection-trace wiring hands back: the merged observation source,
@@ -233,6 +248,7 @@ pub(super) fn build_conn_trace_pair(
         reverse_dns_learner_tx,
         app_destination_forget,
         routed_apps,
+        flow_reset_census,
     } = sinks;
     // The observer runs whenever the route path is available (it is a
     // passive kernel event subscription that also feeds app-routing's observed
@@ -257,6 +273,9 @@ pub(super) fn build_conn_trace_pair(
         // The on-disk NDJSON sink follows the live switch; the in-memory GUI
         // ring is always fed (wired below).
         .with_log_ndjson_flag(ndjson_on)
+        // Several people can be signed in at once, each with links of their own.
+        .with_owner_scoped_egress()
+        .with_machine_accounts_on_active_links()
         // App-routing via observation: feed the process-wide
         // observed app→IP store the codegen reads for `Application` rules.
         .with_app_observations(
@@ -310,6 +329,10 @@ pub(super) fn build_conn_trace_pair(
         consumer_builder = consumer_builder.with_service_account_drop_check(Arc::new(move |id| {
             service_registry.is_service_account(id)
         }));
+        // …and the user's own denies, whose destinations are never named.
+        let rule_registry = Arc::clone(vpn_learning.killswitch_drop_registry);
+        consumer_builder = consumer_builder
+            .with_rule_block_drop_check(Arc::new(move |id| rule_registry.is_rule_block(id)));
         // The same posture the GUI banner reads decides how a drop is
         // EXPLAINED: while the block-all is armed, an outage is the cause.
         let posture = vpn_learning.block_all_posture.clone();
@@ -363,6 +386,10 @@ pub(super) fn build_conn_trace_pair(
             });
         consumer_builder = consumer_builder.with_vpn_client_app_learner(app_learner);
     }
+    // The same role-verified drop, of a handshake no recognised client made:
+    // its owner is asked whether to let that VPN through.
+    consumer_builder = consumer_builder
+        .with_vpn_gateway_drops(nrr_service_runtime::vpn_gateway_confirm::production_drop_sink());
     // FCrDNS reverse-learning drop hook. When
     // OUR enforcement drops a routable destination under block-all (the browser
     // reached it from its own cache / DoH so the observer never saw the name), the
@@ -374,8 +401,11 @@ pub(super) fn build_conn_trace_pair(
     // observe tick never blocks on DNS I/O.
     if let Some(tx) = reverse_dns_learner_tx {
         consumer_builder = consumer_builder.with_reverse_dns_learner(Arc::new(
-            move |ip: std::net::Ipv4Addr, allow_direct: bool, origin: ReverseLearnOrigin| {
-                let _ = tx.try_send((ip, allow_direct, origin));
+            move |ip: std::net::Ipv4Addr,
+                  allow_direct: bool,
+                  origin: ReverseLearnOrigin,
+                  owner: Option<&str>| {
+                let _ = tx.try_send((ip, allow_direct, origin, owner.map(str::to_owned)));
             },
         ));
     }
@@ -450,7 +480,7 @@ pub(super) fn build_conn_trace_pair(
                     // offer is born: this is the moment the product decides a
                     // host is worth asking about.
                     let reached = nrr_service_runtime::navigation_registry::global_navigation()
-                        .counts_of(hostname);
+                        .counts_of(owner, hostname);
                     nrr_service_runtime::navigation_registry::log_counts(hostname, &reached);
                     engine_health.note_main_link_blocked_host(
                         &sid,
@@ -535,8 +565,11 @@ pub(super) fn build_conn_trace_pair(
         {
             let nav = nrr_service_runtime::navigation_registry::global_navigation();
             consumer_builder = consumer_builder.with_navigation_attempt(Arc::new(
-                move |process: Option<&str>, hostname: Option<&str>, at_ms: u64| {
-                    if let Some(dist) = nav.note_attempt(process, hostname, at_ms) {
+                move |owner: Option<&str>,
+                      process: Option<&str>,
+                      hostname: Option<&str>,
+                      at_ms: u64| {
+                    if let Some(dist) = nav.note_attempt(owner, process, hostname, at_ms) {
                         nrr_service_runtime::navigation_registry::log_distribution(&dist);
                     }
                 },
@@ -571,6 +604,9 @@ pub(super) fn build_conn_trace_pair(
     consumer_builder = consumer_builder.with_stale_flow_reset(Arc::new(
         nrr_platform_windows::stale_flows::WindowsStaleFlowReset::new(),
     ));
+    if let Some(census) = flow_reset_census {
+        consumer_builder = consumer_builder.with_flow_reset_census(census);
+    }
     let consumer = Arc::new(consumer_builder);
     let backend = conn_trace_backend();
     type DynSource = Arc<dyn nrr_platform_windows::conn_observe::ConnectionObservationSource>;

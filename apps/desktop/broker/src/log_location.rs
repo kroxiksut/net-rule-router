@@ -67,6 +67,23 @@ pub fn log_dir_refusal(
     None
 }
 
+/// Why a log directory of our own must not take elevated writes although its
+/// owner is trusted: a group every account belongs to may add files to it
+/// (`open` is what the DACL check reported). Unknown counts as open.
+pub fn open_dir_refusal(dir: &Path, open: Result<bool, String>) -> Option<String> {
+    match open {
+        Ok(false) => None,
+        Ok(true) => Some(format!(
+            "{} lets ordinary accounts add files to it",
+            dir.display()
+        )),
+        Err(detail) => Some(format!(
+            "cannot read the permissions of {}: {detail}",
+            dir.display()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +206,13 @@ mod tests {
             },
         );
         assert_eq!(asked, vec![PathBuf::from(PRODUCT), PathBuf::from(LOGS)]);
+    }
+
+    #[test]
+    fn a_directory_ordinary_accounts_can_write_to_is_refused() {
+        let dir = Path::new(LOGS);
+        assert_eq!(open_dir_refusal(dir, Ok(false)), None);
+        assert!(open_dir_refusal(dir, Ok(true)).is_some());
+        assert!(open_dir_refusal(dir, Err("denied".into())).is_some());
     }
 }

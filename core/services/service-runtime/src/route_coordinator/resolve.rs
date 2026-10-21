@@ -3,6 +3,18 @@
 
 use super::*;
 
+/// How long a shared reading of the machine is trusted.
+const MACHINE_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The state of the reading [`SecondaryRouteCoordinator::read_machine`] shares.
+pub(super) enum MachineMemo {
+    /// Every call reads: no pass has just finished.
+    Off,
+    /// A pass has finished; the next call reads and keeps the result.
+    Armed,
+    Held(std::time::Instant, MachineReading),
+}
+
 impl SecondaryRouteCoordinator {
     /// resolve the secondary (VPN)
     /// interface LUID for `sid`, or `None` when there is no usable secondary
@@ -66,8 +78,12 @@ impl SecondaryRouteCoordinator {
         &self,
         sid: &str,
     ) -> Option<crate::secondary_external_address::SecondaryLink> {
-        let target = self.resolve(sid).secondary?;
-        let infos = self.api.get_adapter_infos().ok()?;
+        // One enumeration for the resolution and the lookup: this runs on a
+        // short tick for every user.
+        let infos = self.adapters_now().ok()?;
+        let target = self
+            .resolve_inner(sid, None, Some(infos.as_slice()))
+            .secondary?;
         let info = infos.iter().find(|i| i.index == target.interface_index)?;
         Some(crate::secondary_external_address::SecondaryLink {
             sid: sid.to_string(),
@@ -118,7 +134,7 @@ impl SecondaryRouteCoordinator {
     /// currently has no IPv4 address.
     pub fn resolve_egress_source_ips(&self, sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>) {
         let r = self.resolve(sid);
-        let infos = match self.api.get_adapter_infos() {
+        let infos = match self.adapters_now() {
             Ok(infos) => infos,
             Err(_) => return (None, None),
         };
@@ -133,14 +149,74 @@ impl SecondaryRouteCoordinator {
         (source_of(r.primary), source_of(r.secondary))
     }
 
+    /// Share the adapter list with the pass fingerprint: both re-read it only
+    /// after `generation` moves. Returns the one cache.
+    pub fn adapter_cache(
+        &self,
+        generation: nrr_platform_api::net_change::NetChangeGeneration,
+    ) -> Arc<nrr_platform_api::net_change::ChangeCached<Vec<AdapterInfo>>> {
+        let api = Arc::clone(&self.api);
+        Arc::clone(self.adapter_cache.get_or_init(|| {
+            Arc::new(nrr_platform_api::net_change::ChangeCached::new(
+                generation,
+                move || api.get_adapter_infos().ok(),
+            ))
+        }))
+    }
+
+    /// The adapters, from the cache while the network has not moved. Anything
+    /// that is not the start of a pass reads this way.
+    pub(super) fn adapters_now(&self) -> Result<Vec<AdapterInfo>, PlatformError> {
+        match self.adapter_cache.get().and_then(|cache| cache.get()) {
+            Some(adapters) => Ok(adapters),
+            None => self.api.get_adapter_infos(),
+        }
+    }
+
+    /// The adapters read past the cache, for the start of a pass: a pass
+    /// asked for by a network event may run before the OS notice is counted,
+    /// and must not plan from the list the event just outdated. The reading
+    /// is kept, so the rest of the pass reads it back for free.
+    pub(super) fn adapters_for_pass(&self) -> Result<Vec<AdapterInfo>, PlatformError> {
+        match self.adapter_cache.get().and_then(|cache| cache.refresh()) {
+            Some(adapters) => Ok(adapters),
+            None => self.api.get_adapter_infos(),
+        }
+    }
+
     /// One reading of the links and the route table, for a pass that asks
     /// several of the questions below and must get one machine's answers.
+    ///
+    /// Right after a pass, the apply that follows asks several times (the plan,
+    /// the unresolved-binding check): they share one reading, which a write of
+    /// ours or the next pass drops.
     pub fn read_machine(&self) -> MachineReading {
-        MachineReading::new(
+        let mut memo = self.machine_memo.lock().unwrap_or_else(|p| p.into_inner());
+        if let MachineMemo::Held(at, kept) = &*memo {
+            if at.elapsed() < MACHINE_MEMO_TTL {
+                return kept.clone();
+            }
+        }
+        let reading = MachineReading::new(
             self.api.get_ip_forward_table(),
-            self.api.get_adapter_infos(),
+            self.adapters_now(),
             |route| self.reconciler.owns(route),
-        )
+        );
+        if !matches!(*memo, MachineMemo::Off) {
+            *memo = MachineMemo::Held(std::time::Instant::now(), reading.clone());
+        }
+        reading
+    }
+
+    /// Our own write, or a pass about to start: what was read no longer holds.
+    pub(super) fn drop_machine_memo(&self) {
+        *self.machine_memo.lock().unwrap_or_else(|p| p.into_inner()) = MachineMemo::Off;
+    }
+
+    /// A pass has just finished: the next [`Self::read_machine`] reads, and the
+    /// ones after it share that reading.
+    pub(super) fn arm_machine_memo(&self) {
+        *self.machine_memo.lock().unwrap_or_else(|p| p.into_inner()) = MachineMemo::Armed;
     }
 
     /// Resolve `sid`'s routing inputs (mode + primary/secondary targets) from
@@ -157,7 +233,7 @@ impl SecondaryRouteCoordinator {
         let adapters = match reading {
             Some(reading) => reading.adapters_or_error().ok()?,
             None => {
-                live = self.api.get_adapter_infos().ok()?;
+                live = self.adapters_now().ok()?;
                 live.as_slice()
             }
         };
@@ -171,6 +247,17 @@ impl SecondaryRouteCoordinator {
         &self,
         sid: &str,
         reading: Option<&MachineReading>,
+    ) -> RouteResolution {
+        self.resolve_inner(sid, reading, None)
+    }
+
+    /// [`Self::resolve_from`] over `adapters` the caller has just enumerated,
+    /// so a caller that needs them afterwards reads them once.
+    pub(super) fn resolve_inner(
+        &self,
+        sid: &str,
+        reading: Option<&MachineReading>,
+        adapters: Option<&[AdapterInfo]>,
     ) -> RouteResolution {
         let Some(policy) = self.route_source.load_for_sid(sid) else {
             self.clear_no_secondary(sid);
@@ -197,10 +284,11 @@ impl SecondaryRouteCoordinator {
         self.clear_no_policy(sid);
         let mode = behavior_mode_for_codegen(&policy);
         let live;
-        let infos = match reading {
-            Some(reading) => reading.adapters_or_error(),
-            None => {
-                live = self.api.get_adapter_infos();
+        let infos = match (adapters, reading) {
+            (Some(known), _) => Ok(known),
+            (None, Some(reading)) => reading.adapters_or_error(),
+            (None, None) => {
+                live = self.adapters_now();
                 live.as_deref()
             }
         };
@@ -258,18 +346,26 @@ impl SecondaryRouteCoordinator {
                 let foreign_tunnels = super::exemptions::foreign_tunnel_indexes(
                     infos,
                     &[sec.interface_index],
+                    &[sec.interface_index],
                     &routes,
                 );
                 match derive_primary_target(&routes, sec.interface_index, &foreign_tunnels) {
                     Some(derived) => {
-                        tracing::info!(
-                            target: "nrr::route-coordinator",
-                            msg_key = "route-primary-derived",
-                            sid = %sid,
-                            ifindex = derived.interface_index,
-                            gateway = %derived.gateway,
-                            "no primary adapter bound — derived the primary from the OS default route (unmatched traffic will egress the real link, not the tunnel)",
-                        );
+                        // The derive repeats on every resolve; only a change is news.
+                        if self.note_primary_derived_once(
+                            sid,
+                            derived.interface_index,
+                            derived.gateway,
+                        ) {
+                            tracing::info!(
+                                target: "nrr::route-coordinator",
+                                msg_key = "route-primary-derived",
+                                sid = %sid,
+                                ifindex = derived.interface_index,
+                                gateway = %derived.gateway,
+                                "no primary adapter bound — derived the primary from the OS default route (unmatched traffic will egress the real link, not the tunnel)",
+                            );
+                        }
                         primary = Some(derived);
                     }
                     None => {

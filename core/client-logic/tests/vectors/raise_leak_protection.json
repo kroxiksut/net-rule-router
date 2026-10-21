@@ -1,0 +1,85 @@
+{
+  "description": "pure.js raiseLeakProtection: a level raised to the install-time floor, both as the default route offers them",
+  "cases": [
+    {
+      "name": "no floor keeps the level",
+      "input": {
+        "route": "prefer-primary",
+        "level": "sites",
+        "floor": "off"
+      },
+      "expected": "sites"
+    },
+    {
+      "name": "an absent floor keeps the level",
+      "input": {
+        "route": "prefer-primary",
+        "level": "off"
+      },
+      "expected": "off"
+    },
+    {
+      "name": "off is raised to the floor",
+      "input": {
+        "route": "prefer-primary",
+        "level": "off",
+        "floor": "sites"
+      },
+      "expected": "sites"
+    },
+    {
+      "name": "routed sites is raised to everything",
+      "input": {
+        "route": "prefer-primary",
+        "level": "sites",
+        "floor": "everything"
+      },
+      "expected": "everything"
+    },
+    {
+      "name": "a stronger level stays",
+      "input": {
+        "route": "prefer-primary",
+        "level": "everything",
+        "floor": "sites"
+      },
+      "expected": "everything"
+    },
+    {
+      "name": "the strict install mode as folded raises off",
+      "input": {
+        "route": "prefer-secondary-when-available",
+        "level": "off",
+        "floor": "everything"
+      },
+      "expected": "everything"
+    },
+    {
+      "name": "a floor of routed sites under the additional connection is everything",
+      "input": {
+        "route": "prefer-secondary-when-available",
+        "level": "off",
+        "floor": "sites"
+      },
+      "expected": "everything"
+    },
+    {
+      "name": "the level is settled against the route without a floor",
+      "input": {
+        "route": "prefer-secondary-when-available",
+        "level": "sites",
+        "floor": "off"
+      },
+      "expected": "everything"
+    },
+    {
+      "name": "an unknown level reads as off",
+      "input": {
+        "route": "prefer-primary",
+        "level": "on",
+        "floor": "off"
+      },
+      "expected": "off"
+    }
+  ]
+}

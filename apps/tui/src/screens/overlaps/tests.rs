@@ -88,7 +88,7 @@ fn pairs_say_which_route_the_sites_take() {
         ]
     );
     let wide = render(&app, 200, 60);
-    assert!(wide.contains("4 overlap(s) not confirmed"), "{wide}");
+    assert!(wide.contains("4 overlaps not confirmed"), "{wide}");
     assert!(
         wide.contains(
             "video.example.com (Domain) goes over Additional: it is narrower than *.example.com (Domain) on Primary."
@@ -329,7 +329,7 @@ fn line_mode_offers_the_same_answers_by_number() {
         .expect("confirm all");
     session.input("s", &mut app, &texts).expect("show resolved");
     let text = String::from_utf8(session.into_inner()).expect("UTF-8");
-    assert!(text.contains("4 overlap(s) not confirmed"), "{text}");
+    assert!(text.contains("4 overlaps not confirmed"), "{text}");
     assert!(text.contains("There is no item 9 in the list."), "{text}");
     assert!(text.contains("on screen 4, Rules"), "{text}");
     assert!(text.contains("Show resolved: Yes"), "{text}");
@@ -370,6 +370,23 @@ fn a_revision_event_reads_the_conflicts_and_the_rules_again() {
         Instant::now(),
     );
     assert!(effects.contains(&crate::state::Effect::Refresh));
+    drain(&mut app, &fake);
+    assert!(fake.sent(IpcOperationName::RulesList).len() > before);
+}
+
+/// A hole in the push stream may have swallowed a revision event, so it reads
+/// the rules again as well as asking for the snapshot.
+#[test]
+fn a_hole_in_the_push_stream_reads_the_rules_again() {
+    let fake = service();
+    let mut app = on_screen(&fake);
+    let before = fake.sent(IpcOperationName::RulesList).len();
+    let effects = app.apply(
+        BackendEvent::Push(crate::backend::PushEvent::Gap),
+        &texts_en(),
+        Instant::now(),
+    );
+    assert_eq!(effects, vec![crate::state::Effect::Refresh]);
     drain(&mut app, &fake);
     assert!(fake.sent(IpcOperationName::RulesList).len() > before);
 }

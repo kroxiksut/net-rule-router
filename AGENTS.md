@@ -60,8 +60,6 @@ Supporting binary (NOT a user entry point):
 
 The legacy `nrr-qt-host.exe` Rust orchestrator and the `--nrr-helper=...` self-spawn helpers are gone as runtime processes. `nrr-desktop-gui` and `nrr-desktop-tray` survive as pure libraries; `nrr-qt-host` survives as a build-only crate exposing `NATIVE_HOST_EXE`.
 
-**Important:** the old C++ copies named `NetRuleRouter.exe` / `NetRuleRouterTray.exe` in `apps/desktop/qt-host/build.rs` (the dead `copy_native_product_executable` helper) must stay disabled. Re-enabling collides with the launcher outputs in `target/<profile>/`.
-
 ### Crate Boundaries
 
 Layout is what `ls` and the crate manifests show. Rules the layout does not tell you:
@@ -100,13 +98,15 @@ GUI subsystem, embedded icon and the DWM dark title bar: `apps/desktop/AGENTS.md
 
 | Channel | Direction | Mechanism | Triggered by |
 |---|---|---|---|
-| QML context | launcher → C++ host | temp JSON file (`%TEMP%\nrr-qt-context-…json`), `--nrr-context-file=` | every launcher startup |
+| QML context | launcher → C++ host | JSON file in the runtime directory (`%TEMP%\NetRuleRouter\nrr-qt-context-…json`), `--nrr-context-file=` | every launcher startup |
 | Preferences round-trip | C++ host → launcher | `NRR_PREFS_JSON:<payload>` lines on stdout, parsed in launcher background threads | every QML `emitPrefs()` call |
 | Activation hand-off | secondary launcher → primary C++ host | `%TEMP%\NetRuleRouter\gui-activation.json` (polled at 350 ms) | duplicate `NetRuleRouter.exe` launch |
 | Shutdown | tray "Exit" → main GUI | `%TEMP%\NetRuleRouter\app-shutdown.flag` (polled from QML at 250 ms) | tray menu "Exit" |
 | Tray "Open" → GUI | C++ tray host → new `NetRuleRouter.exe` process | `QProcess::startDetached(...)` with `--source=tray --section=…` | tray menu actions |
 | ensureTrayRunning | main GUI C++ host → new `NetRuleRouterTray.exe` process | `QProcess::startDetached` | `Component.onCompleted` of `Main.qml` |
-| Service IPC | GUI/Tray ↔ service | Named pipe `\\.\pipe\NetRuleRouter\service-v1` (versioned, DACL-protected, 4-byte BE u32 length + UTF-8 JSON, 1 MiB message cap via `IPC_MAX_MESSAGE_BYTES` — 64 KiB is the pipe buffer, not the limit — 32 concurrent). The client checks the server's PID against the SCM's before its first byte (`ipc-client/src/server_identity.rs`); a new transport keeps that check. | every `NamedPipeIpcClient::call` |
+| Service IPC | GUI/Tray ↔ service | Named pipe `\\.\pipe\NetRuleRouter\service-v1` (versioned, DACL-protected, 4-byte BE u32 length + UTF-8 JSON, 4 MiB message cap via `IPC_MAX_MESSAGE_BYTES` — 64 KiB is the pipe buffer, not the limit — 32 concurrent). The client checks the server's PID against the SCM's before its first byte (`ipc-client/src/server_identity.rs`); a new transport keeps that check. | every `NamedPipeIpcClient::call` |
+
+The `%TEMP%\NetRuleRouter` paths above are the Windows spelling of one per-user runtime directory, `nrr_shared::user_paths::runtime_dir` (Linux: `$XDG_RUNTIME_DIR/netrulerouter`, mode 0700, never the shared `/tmp`). Files there are written by rename and never read through a link.
 
 A push event about one user's state goes only to that user's connections; no request names another SID as its target.
 

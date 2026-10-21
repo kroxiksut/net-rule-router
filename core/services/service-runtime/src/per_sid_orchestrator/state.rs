@@ -59,7 +59,7 @@ pub type FlowLinksResolver = Arc<
 /// resolves the fail-closed exemptions for a SID when the
 /// secondary is unresolvable but a fail-closed kill-switch must still arm.
 /// Returns the primary's local subnets + any cached VPN-server IPs so a
-/// block-all (mode B) does not brick LAN/manageability or trap tunnel
+/// block-all does not brick LAN/manageability or trap tunnel
 /// reconnection. Defaults to empty; production resolves it through the route
 /// coordinator (`fail_closed_exemptions`).
 pub type FailClosedExemptionsResolver =
@@ -131,8 +131,15 @@ pub type EnforcedSidsSource = Arc<dyn Fn() -> Result<Vec<String>, String> + Send
 /// production impl recomputes the active user's secondary route table. Called
 /// from the filter reconcile just before a NEW destination-scoped block is
 /// installed, so the destination's route is up first. It must not call back
-/// into the orchestrator (the coordinator's route recompute does not).
-pub type RouteSyncHook = Arc<dyn Fn() + Send + Sync>;
+/// into the orchestrator (the coordinator's route recompute does not). `Err`
+/// is the reason the routes are not in place; the pins go in regardless, and
+/// whoever built the hook owns the retry.
+pub type RouteSyncHook = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// The narrow form of [`RouteSyncHook`]: routes only the given hosts of `sid`.
+/// `true` when it routed at least one of them; `false` sends the caller to the
+/// full hook, which also covers networks and everything the host plan declined.
+pub type ScopedRouteSyncHook = Arc<dyn Fn(&str, &[std::net::IpAddr]) -> bool + Send + Sync>;
 
 pub struct PerSidApplyOrchestrator {
     /// One lock per SID, held across COMPUTE AND APPLY.
@@ -207,8 +214,8 @@ pub struct PerSidApplyOrchestrator {
     pub(super) ipv6_guard_resolver: Ipv6GuardResolver,
     pub(super) flow_links_resolver: FlowLinksResolver,
     /// fail-closed exemptions resolver. Used when the
-    /// secondary is unresolvable yet the user requested a kill-switch with
-    /// the fail-closed posture: mode B then blocks *all* egress except these
+    /// secondary is unresolvable while leak protection is on: the block-all
+    /// then blocks *all* egress except these
     /// exemptions (primary local subnets + any cached VPN-server IPs) so the
     /// box stays manageable and the tunnel can reconnect. Defaults to empty
     /// (loopback/link-local/broadcast are always exempt in the codegen).
@@ -358,6 +365,9 @@ pub struct PerSidApplyOrchestrator {
     /// recompute could pin an address whose route pass had already run).
     /// `None` (default) keeps the historical ordering.
     pub(super) route_sync: Option<RouteSyncHook>,
+    /// Tried before `route_sync` when a reconcile pins only a few hosts: a new
+    /// pin then routes its own addresses instead of re-planning the table.
+    pub(super) scoped_route_sync: Option<ScopedRouteSyncHook>,
     /// Queue drained by the resume watchdog. A fail-closed posture that persists
     /// past a heartbeat asks here for a fresh binding resolution — the machine
     /// may have woken into a network where the bound tunnel adapter is gone.
@@ -368,4 +378,15 @@ pub struct PerSidApplyOrchestrator {
     /// drops their set, one who arrived installs theirs.
     pub(super) service_account_owner: Mutex<Vec<String>>,
     pub(super) service_account_dns_log: crate::enforcement_planner::ServiceAccountDnsLog,
+    /// Per user, the foreign-network cut last announced: said once per change.
+    pub(super) foreign_cut_seen: Mutex<std::collections::HashMap<String, (usize, usize)>>,
+    /// The images hosting the OS IKE service. Empty (default) opens no IKE.
+    pub(super) ike_service_images: Vec<String>,
+    /// Asks for a full pass over every user. `None` (default) leaves the
+    /// others to their own next plan.
+    pub(super) peer_replan: Option<PeerReplanRequest>,
 }
+
+/// Asks for a full enforcement pass. Called from inside a compute, under the
+/// SID's apply lock, so it must return at once and run the pass elsewhere.
+pub type PeerReplanRequest = Arc<dyn Fn() + Send + Sync>;

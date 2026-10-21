@@ -109,17 +109,17 @@ impl PerSidApplyOrchestrator {
     pub(super) fn shadow_compare_neutral_plan(
         &self,
         sid: &str,
-        behavior_mode: nrr_domain::RouteBehaviorMode,
         rule_book: &nrr_domain::canonical::CanonicalRuleBook,
         fqdn_cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
         secondary_ip_denylist: &std::collections::HashSet<std::net::Ipv4Addr>,
         app_takeover: bool,
+        ipv6: crate::enforcement_planner::Ipv6Guard,
         live: &[nrr_platform_api::types::WfpFilterSpec],
     ) -> bool {
         // Same input, same verdict — and the verdict is already in the log.
         // Re-deriving it costs a full plan plus a lowering on a path that also
         // carries DNS answers and the GUI's own requests.
-        let fingerprint = shadow_compare_fingerprint(behavior_mode, live);
+        let fingerprint = shadow_compare_fingerprint(live);
         {
             let mut seen = self
                 .shadow_compare_seen
@@ -136,11 +136,11 @@ impl PerSidApplyOrchestrator {
         }
         let Some(verdict) = self.neutral_plan_verdict(
             sid,
-            behavior_mode,
             rule_book,
             fqdn_cache,
             secondary_ip_denylist,
             app_takeover,
+            ipv6,
             live,
         ) else {
             return false;
@@ -184,11 +184,11 @@ impl PerSidApplyOrchestrator {
     pub(super) fn neutral_plan_verdict(
         &self,
         sid: &str,
-        behavior_mode: nrr_domain::RouteBehaviorMode,
         rule_book: &nrr_domain::canonical::CanonicalRuleBook,
         fqdn_cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
         secondary_ip_denylist: &std::collections::HashSet<std::net::Ipv4Addr>,
         app_takeover: bool,
+        ipv6: crate::enforcement_planner::Ipv6Guard,
         live: &[nrr_platform_api::types::WfpFilterSpec],
     ) -> Option<NeutralPlanVerdict> {
         use nrr_platform_api::enforcement::{EnforcementPlan, UserPrincipal};
@@ -215,11 +215,9 @@ impl PerSidApplyOrchestrator {
             // carried different addresses, and with them different ordinals,
             // so the two plans could not agree on anything downstream.
             secondary_ip_denylist,
-            // The drift check compares the neutral plan with what the live pass
-            // produced, and the live pass is the one that decides whether a link
-            // can carry IPv6. Naming the family here would compare two different
-            // questions.
-            ipv6: crate::enforcement_planner::Ipv6Guard::Off,
+            // The family setting the live pass resolved: another one would
+            // compare two different questions.
+            ipv6,
             // The live pass asked the same question.
             packet_blocks: self.rules_provider.rules_are_baseline_for(sid),
         };
@@ -227,13 +225,7 @@ impl PerSidApplyOrchestrator {
             principal,
             // The report is the GUI's business, and this is the shadow
             // comparison — it looks at filters only.
-            flows: crate::enforcement_planner::plan_route_rules(
-                rule_book,
-                sid,
-                behavior_mode,
-                &input,
-            )
-            .0,
+            flows: crate::enforcement_planner::plan_route_rules(rule_book, sid, &input).0,
             routes: Vec::new(),
             policy_rules: Vec::new(),
         };
@@ -264,10 +256,7 @@ impl PerSidApplyOrchestrator {
 /// unchanged set means unchanged inputs. Ids are content-addressed, which is
 /// what makes them safe to fold; the weight goes in too, because arbitration
 /// order is half of what the comparison checks.
-fn shadow_compare_fingerprint(
-    behavior_mode: nrr_domain::RouteBehaviorMode,
-    live: &[nrr_platform_api::types::WfpFilterSpec],
-) -> u64 {
+fn shadow_compare_fingerprint(live: &[nrr_platform_api::types::WfpFilterSpec]) -> u64 {
     // FNV-1a, the same hash the filter ids themselves are built with.
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -278,7 +267,6 @@ fn shadow_compare_fingerprint(
             hash = hash.wrapping_mul(PRIME);
         }
     };
-    fold(behavior_mode as u64);
     fold(live.len() as u64);
     for spec in live {
         fold(spec.id.raw);
@@ -310,6 +298,7 @@ mod tests {
             remote_subnet: None,
             remote_subnet_v6: None,
             ip_protocol: None,
+            remote_subnet_set: Vec::new(),
         }
     }
 

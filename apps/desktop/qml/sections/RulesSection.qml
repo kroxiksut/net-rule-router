@@ -3623,9 +3623,13 @@ ColumnLayout {
                 // these addresses travels the additional link for the whole
                 // computer, which is how an unrelated site can end up there.
                 RowLayout {
+                    id: pinnedRow
                     Layout.fillWidth: true
                     Layout.leftMargin: 28
                     visible: (model.pinnedCount || 0) > 0
+                    // A click opens the list in place: hover alone hides it
+                    // from touch, keyboard and screen-reader users.
+                    property bool listOpen: false
                     Rectangle {
                         id: pinnedBadge
                         Layout.alignment: Qt.AlignVCenter
@@ -3651,14 +3655,37 @@ ColumnLayout {
                             font.pixelSize: Math.max(10,
                                 root.uiTheme.baseFontSizePx - 2)
                         }
-                        HoverHandler { id: pinnedBadgeHover }
+                        HoverHandler {
+                            id: pinnedBadgeHover
+                            cursorShape: Qt.PointingHandCursor
+                        }
+                        TapHandler {
+                            onTapped: pinnedRow.listOpen = !pinnedRow.listOpen
+                        }
+                        Accessible.role: Accessible.Button
+                        Accessible.name: pinnedBadgeLabel.text
+                        Accessible.description: ToolTip.text
+                        Accessible.onPressAction: pinnedRow.listOpen = !pinnedRow.listOpen
                         ToolTip.visible: pinnedBadgeHover.hovered
                         ToolTip.delay: 300
                         ToolTip.text: root.tr("rules.app-pins.tooltip",
                             "These are the addresses this application has been seen using, and they now travel the additional link for EVERY program on this computer — a route cannot be told which process it is for. An address another program starts using is given back to the main connection automatically.")
                             + "\n" + String(model.pinnedSample || "")
                     }
-                    Item { Layout.fillWidth: true }
+                    Label {
+                        Layout.fillWidth: true
+                        visible: pinnedRow.listOpen
+                        text: String(model.pinnedSample || "")
+                        color: root.mutedTextColor
+                        wrapMode: Text.WrapAnywhere
+                        textFormat: Text.PlainText
+                        font.pixelSize: Math.max(10,
+                            root.uiTheme.baseFontSizePx - 2)
+                    }
+                    Item {
+                        Layout.fillWidth: true
+                        visible: !pinnedRow.listOpen
+                    }
                 }
             }
         }

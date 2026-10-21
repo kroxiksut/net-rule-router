@@ -209,6 +209,19 @@ nrr_pkg_stop_and_reset_network() {
   return 0
 }
 
+# Second chance after the files are gone: an interrupted or failed pre-removal
+# step must not leave the redirect for a reboot nobody can fix. Idempotent, acts
+# only on traces of ours, and never while a daemon of ours is still answering.
+nrr_pkg_finish_dns_undo() {
+  if nrr_pkg_have_systemd && systemctl is-active --quiet "$NRR_UNIT_NAME"; then
+    return 0
+  fi
+  if ! nrr_pkg_undo_dns_by_hand; then
+    echo "$NRR_PRODUCT_NAME: DNS could not be given back; the saved system DNS settings stay in $NRR_STATE_DIR." >&2
+  fi
+  return 0
+}
+
 # Erase the service data. The audit trail stays, as with purge-data.sh: it is
 # a security record, and deleting it is a separate, deliberate step. The saved
 # system DNS settings are restored first and erased only once they have been:

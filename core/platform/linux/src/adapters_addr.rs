@@ -27,6 +27,12 @@ pub(crate) struct InterfaceAddresses {
     pub(crate) v6: Vec<Ipv6Addr>,
 }
 
+/// The link an address label belongs to: an alias (`eth0:1`) carries the
+/// address of `eth0`, and the kernel forbids `:` in a link name.
+fn link_of_label(label: &str) -> &str {
+    label.split_once(':').map_or(label, |(link, _)| link)
+}
+
 /// Every interface's unicast addresses, keyed by link name.
 ///
 /// An empty map on failure rather than an error: an adapter with no addresses
@@ -51,9 +57,8 @@ pub(crate) fn unicast_addresses_by_interface() -> HashMap<String, InterfaceAddre
             continue;
         }
         // SAFETY: non-null per the check above, and NUL-terminated by contract.
-        let name = unsafe { CStr::from_ptr(entry.ifa_name) }
-            .to_string_lossy()
-            .into_owned();
+        let label = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy();
+        let name = link_of_label(&label).to_owned();
         // SAFETY: non-null per the check above. Reading `sa_family` is valid
         // for any address family; only after it matches do we treat the pointer
         // as the larger family-specific struct.
@@ -84,6 +89,13 @@ pub(crate) fn unicast_addresses_by_interface() -> HashMap<String, InterfaceAddre
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_alias_label_names_its_link() {
+        assert_eq!(link_of_label("eth0:1"), "eth0");
+        assert_eq!(link_of_label("eth0"), "eth0");
+        assert_eq!(link_of_label("wlp3s0:work"), "wlp3s0");
+    }
 
     /// Live host: the loopback interface exists and carries 127.0.0.1. This is
     /// the one claim about the syscall that holds on every Linux machine,

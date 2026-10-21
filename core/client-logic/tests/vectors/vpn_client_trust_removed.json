@@ -1,0 +1,41 @@
+{
+  "description": "pure.js vpnClientTrustRemovedApps: the link provider set after one program is removed",
+  "cases": [
+    { "name": "empty list", "input": { "existing": [], "exePath": "C:\\A\\a.exe" }, "expected": [] },
+    {
+      "name": "only entry removed",
+      "input": { "existing": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" } ], "exePath": "C:\\A\\a.exe" },
+      "expected": []
+    },
+    {
+      "name": "others kept in order",
+      "input": { "existing": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" }, { "exe-path": "C:\\B\\b.exe", "display-name": "B" }, { "exe-path": "C:\\C\\c.exe", "display-name": "C" } ], "exePath": "C:\\B\\b.exe" },
+      "expected": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" }, { "exe-path": "C:\\C\\c.exe", "display-name": "C" } ]
+    },
+    {
+      "name": "case and spaces ignored",
+      "input": { "existing": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" }, { "exe-path": "C:\\B\\b.exe", "display-name": "B" } ], "exePath": "  c:\\a\\A.EXE " },
+      "expected": [ { "exe-path": "C:\\B\\b.exe", "display-name": "B" } ]
+    },
+    {
+      "name": "absent path changes nothing",
+      "input": { "existing": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" } ], "exePath": "C:\\Z\\z.exe" },
+      "expected": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" } ]
+    },
+    {
+      "name": "path compared without regard to case",
+      "input": { "existing": [ { "exe-path": "/opt/b/b-vpn", "display-name": "b-vpn" } ], "exePath": "/OPT/b/b-vpn" },
+      "expected": []
+    },
+    {
+      "name": "blank path removes nothing named",
+      "input": { "existing": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" } ], "exePath": "  " },
+      "expected": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" } ]
+    },
+    {
+      "name": "duplicates of the path all go",
+      "input": { "existing": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" }, { "exe-path": "c:\\a\\a.exe", "display-name": "a" }, { "exe-path": "C:\\B\\b.exe", "display-name": "B" } ], "exePath": "C:\\A\\a.exe" },
+      "expected": [ { "exe-path": "C:\\B\\b.exe", "display-name": "B" } ]
+    }
+  ]
+}

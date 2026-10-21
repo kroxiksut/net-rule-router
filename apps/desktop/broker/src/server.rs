@@ -31,9 +31,11 @@ use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_transport::IpcErrorCode;
 use nrr_shared::product_identity::BinaryRole;
 
-use nrr_platform_windows::trusted_location::{first_reparse_point, owner_is_trusted};
+use nrr_platform_windows::trusted_location::{
+    first_reparse_point, lock_down_service_tree, open_to_everyone, owner_is_trusted,
+};
 
-use crate::log_location::{log_dir_refusal, PathFact};
+use crate::log_location::{log_dir_refusal, open_dir_refusal, PathFact};
 use crate::protocol::{
     relay_timeout, BrokerRequest, BrokerResponse, BrokerServerArgs, ANSWER_MARGIN, BROKER_PING,
     BROKER_SERVICE_CONTROL, BROKER_SHUTDOWN, MAX_FORWARD_TIMEOUT, SERVICE_CONTROL_BUDGET,
@@ -159,10 +161,20 @@ fn prepare_trusted_log_dir(dir: &Path, owned_from: &Path) -> Result<(), String> 
         return Err(reason);
     }
     match first_reparse_point(dir) {
-        Ok(None) => Ok(()),
-        Ok(Some(link)) => Err(format!("{} is a link to somewhere else", link.display())),
-        Err(e) => Err(e),
+        Ok(None) => {}
+        Ok(Some(link)) => return Err(format!("{} is a link to somewhere else", link.display())),
+        Err(e) => return Err(e),
     }
+    // Under ProgramData the directory inherits "Users may create files": it is
+    // locked down to SYSTEM and Administrators before anything is appended.
+    // The install directory is left to its own permissions.
+    if dir != owned_from {
+        lock_down_service_tree(dir).map_err(|e| format!("lock down {}: {e}", dir.display()))?;
+        if let Some(reason) = open_dir_refusal(dir, open_to_everyone(dir)) {
+            return Err(reason);
+        }
+    }
+    Ok(())
 }
 
 fn probe_log_path(path: &Path, owner_matters: bool) -> PathFact {
@@ -452,7 +464,10 @@ pub fn run_broker_server(args: BrokerServerArgs) -> ExitCode {
     if let Some(path) = broker_log_path() {
         rotate_broker_log(&path);
     }
-    let nonce = match read_and_delete_token_file(std::path::Path::new(&args.token_file)) {
+    let nonce = match read_and_delete_token_file(
+        std::path::Path::new(&args.token_file),
+        &args.client_sid,
+    ) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("[nrr-broker] fatal: cannot read token file: {e}");

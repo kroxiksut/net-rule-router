@@ -11,13 +11,14 @@ use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nrr_domain::enforcement_mode::EnforcementMode;
 use nrr_platform_api::dns_redirect::{
     DnsNamespaceExemption, RedirectHandle, RedirectState, SystemDnsRedirectPort,
 };
 
+use crate::boot_clock::BootInstant;
 use crate::dns_listener::DnsInterceptListener;
 use crate::service_tasks::ServiceTaskKind;
 use crate::task_liveness::{TaskLiveness, ThreadExit, ThreadLease, Watch};
@@ -67,6 +68,13 @@ pub const CLAIMS_SAFETY_RECHECK_INTERVAL: Duration = Duration::from_secs(300);
 
 /// A link coming up is a burst of events; the claims are read once it settles.
 const RECHECK_SETTLE: Duration = Duration::from_millis(250);
+
+/// How long a namespace stays exempt after a read stops reporting it. Our own
+/// write of the suffix list is a DNS settings change: the read it wakes can
+/// come back short while the OS re-reads its adapters and servers, and lifting
+/// the exemption on that read sent a corporate VPN's names to the public
+/// upstream until the next change, minutes later.
+const RELEASE_AFTER: Duration = Duration::from_secs(30);
 
 /// Raised when something happened that can change which namespaces are claimed
 /// or how short names are completed — a link or route change, a DNS settings
@@ -118,6 +126,70 @@ struct NamespaceClaims {
     /// `None` re-reads on every guard tick: with nothing to say what changed,
     /// only a look can tell.
     feed: Option<ChangeFeed>,
+    held: Arc<Mutex<HeldClaims>>,
+}
+
+/// The namespaces handed out last, and since when each one missing from the
+/// reads has been missing.
+struct HeldClaims {
+    last: Vec<DnsNamespaceExemption>,
+    missing_since: Vec<(String, BootInstant)>,
+    release_after: Duration,
+}
+
+impl Default for HeldClaims {
+    fn default() -> Self {
+        Self::releasing_after(RELEASE_AFTER)
+    }
+}
+
+impl HeldClaims {
+    fn releasing_after(release_after: Duration) -> Self {
+        Self {
+            last: Vec::new(),
+            missing_since: Vec::new(),
+            release_after,
+        }
+    }
+
+    /// What to hand out after `read`: a new or changed namespace at once, one
+    /// gone from the read only after `RELEASE_AFTER` of absence.
+    fn settle(
+        &mut self,
+        read: Vec<DnsNamespaceExemption>,
+        now: BootInstant,
+    ) -> Vec<DnsNamespaceExemption> {
+        let in_read = |suffix: &str| read.iter().any(|e| e.suffix == suffix);
+        let mut kept: Vec<DnsNamespaceExemption> = Vec::new();
+        let mut missing: Vec<(String, BootInstant)> = Vec::new();
+        for previous in &self.last {
+            if in_read(&previous.suffix) {
+                continue;
+            }
+            let since = self
+                .missing_since
+                .iter()
+                .find(|(suffix, _)| *suffix == previous.suffix)
+                .map_or(now, |(_, since)| *since);
+            if now.saturating_duration_since(since) < self.release_after {
+                kept.push(previous.clone());
+                missing.push((previous.suffix.clone(), since));
+            }
+        }
+        let mut out = read;
+        out.extend(kept);
+        out.sort_by(|a, b| a.suffix.cmp(&b.suffix));
+        self.last.clone_from(&out);
+        self.missing_since = missing;
+        out
+    }
+
+    /// Whether a held namespace is due to be let go.
+    fn release_due(&self, now: BootInstant) -> bool {
+        self.missing_since
+            .iter()
+            .any(|(_, since)| now.saturating_duration_since(*since) >= self.release_after)
+    }
 }
 
 /// Says when the claims changed, so a quiet tick reads nothing: on Windows a
@@ -132,8 +204,13 @@ struct ChangeFeed {
 impl NamespaceClaims {
     /// Read once for every consumer, and published for the listener.
     fn refresh(&self) -> Arc<[DnsNamespaceExemption]> {
-        let claims: Arc<[DnsNamespaceExemption]> =
-            self.source.as_ref().map(|s| s().into()).unwrap_or_default();
+        let read = self.source.as_ref().map(|s| s()).unwrap_or_default();
+        let claims: Arc<[DnsNamespaceExemption]> = self
+            .held
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .settle(read, BootInstant::now())
+            .into();
         self.published.publish(Arc::clone(&claims));
         claims
     }
@@ -147,10 +224,17 @@ impl NamespaceClaims {
 
     /// Whether this tick must read: always without a feed, otherwise when it
     /// was raised or the safety interval ran out.
-    fn due(&self, raised: bool, last_read: Instant) -> bool {
-        self.feed
-            .as_ref()
-            .is_none_or(|f| raised || last_read.elapsed() >= f.safety_interval)
+    fn due(&self, raised: bool, last_read: BootInstant) -> bool {
+        let release = self
+            .held
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .release_due(BootInstant::now());
+        release
+            || self
+                .feed
+                .as_ref()
+                .is_none_or(|f| raised || last_read.elapsed() >= f.safety_interval)
     }
 }
 
@@ -363,7 +447,7 @@ impl DnsResolverService {
         links: GuardLinks,
     ) {
         // The arm has just read the claims.
-        let mut last_read = Instant::now();
+        let mut last_read = BootInstant::now();
         // Something that undoes the redirect on every check is said once, not
         // every tick; a check that finds it in place ends the streak.
         let mut missing_streak = false;
@@ -377,6 +461,7 @@ impl DnsResolverService {
             };
             let raised = Self::wait_tick(&claims, tick, &stop);
             if stop.load(Ordering::SeqCst) {
+                links.say_upstream(None);
                 if let Some(lease) = lease {
                     lease.finish(ThreadExit::Stopped);
                 }
@@ -389,7 +474,7 @@ impl DnsResolverService {
             // it would capture those names for a whole interval.
             let due = claims.due(raised, last_read);
             let current = if due {
-                last_read = Instant::now();
+                last_read = BootInstant::now();
                 claims.refresh()
             } else {
                 claims.published.current()
@@ -401,6 +486,7 @@ impl DnsResolverService {
                     continue;
                 };
                 if pool.reprobe().is_none() {
+                    links.say_upstream(pool.upstream_dark_cause());
                     continue;
                 }
                 let _held = links.latch.hold();
@@ -410,6 +496,7 @@ impl DnsResolverService {
                 match redirect.redirect_to(handle.listener) {
                     Ok(_) => {
                         lifted = false;
+                        links.say_upstream(None);
                         Self::apply_exemptions(&redirect, &claims, &current, &mut applied);
                         short_names.keep(&redirect, &current);
                         let _ = redirect.flush_cache();
@@ -444,6 +531,7 @@ impl DnsResolverService {
             // restore at stop.
             if let Some(pool) = links.pool.as_ref() {
                 if pool.upstream_dark() {
+                    links.say_upstream(pool.upstream_dark_cause());
                     let _held = links.latch.hold();
                     if links.latch.is_restored() {
                         continue;
@@ -453,11 +541,21 @@ impl DnsResolverService {
                             let _ = redirect.flush_cache();
                             lifted = true;
                             applied.clear();
-                            tracing::warn!(
-                                target: "nrr::dns-resolver",
-                                msg_key = "dns-resolver-redirect-lifted-no-upstream",
-                                "Mode B: no upstream DNS server answers — the system's DNS is handed back to the OS until one does",
-                            );
+                            if pool.upstream_dark_cause()
+                                == Some(crate::dns_upstream::UpstreamDarkCause::OnlyForeignAnswers)
+                            {
+                                tracing::warn!(
+                                    target: "nrr::dns-resolver",
+                                    msg_key = "dns-resolver-redirect-lifted-only-foreign",
+                                    "Mode B: only another VPN's DNS server answers — the system's DNS is handed back to the OS and name-based routing is off until a resolver of ours answers",
+                                );
+                            } else {
+                                tracing::warn!(
+                                    target: "nrr::dns-resolver",
+                                    msg_key = "dns-resolver-redirect-lifted-no-upstream",
+                                    "Mode B: no upstream DNS server answers — the system's DNS is handed back to the OS until one does",
+                                );
+                            }
                         }
                         Err(error) => tracing::warn!(
                             target: "nrr::dns-resolver",
@@ -717,6 +815,7 @@ impl DnsResolverService {
                 let links = GuardLinks {
                     latch: Arc::clone(&latch),
                     pool: Some(Arc::clone(self.listener.upstream_pool())),
+                    liveness: self.liveness.clone(),
                 };
                 move || {
                     Self::guard(
@@ -831,6 +930,25 @@ impl RedirectLatch {
 struct GuardLinks {
     latch: Arc<RedirectLatch>,
     pool: Option<Arc<crate::dns_upstream::UpstreamDnsPool>>,
+    liveness: Option<Arc<TaskLiveness>>,
+}
+
+impl GuardLinks {
+    /// Health says so when the only answering resolver is another VPN's;
+    /// every other cause (offline, say) is not a standing fault.
+    fn say_upstream(&self, cause: Option<crate::dns_upstream::UpstreamDarkCause>) {
+        let Some(liveness) = self.liveness.as_ref() else {
+            return;
+        };
+        let trouble = (cause == Some(crate::dns_upstream::UpstreamDarkCause::OnlyForeignAnswers))
+            .then(|| {
+                format!(
+                    "{}; name-based routing is off until a resolver of ours answers",
+                    nrr_shared::ipc_payloads::DNS_ONLY_FOREIGN_RESOLVER
+                )
+            });
+        liveness.say_dns_upstream(trouble.as_deref());
+    }
 }
 
 /// Restores the system's DNS exactly once, on the first call or on drop —
@@ -901,6 +1019,11 @@ pub type DnsResolverFactory = Arc<dyn Fn() -> Result<DnsResolverService, ArmRefu
 #[derive(Default)]
 pub struct DnsResolverController {
     inner: Mutex<ControllerInner>,
+    /// Raised by [`Self::shutdown`] before it waits for the lock: an arm that
+    /// holds the lock while it probes the upstreams (seconds) must not start a
+    /// resolver once teardown has begun, or its redirect outlives the process
+    /// when the teardown budget runs out first.
+    shutting_down: AtomicBool,
 }
 
 #[derive(Default)]
@@ -974,12 +1097,12 @@ impl DnsResolverController {
     /// before it was listening would otherwise never arrive.
     pub fn arm_if_signed_in(&self) {
         let mut inner = self.lock();
-        Self::arm_on_sign_in_locked(&mut inner);
+        self.arm_on_sign_in_locked(&mut inner);
     }
 
     /// Clear the sign-in wait and arm when the probe sees a user. `false`
     /// when not waiting, or still nobody.
-    fn arm_on_sign_in_locked(inner: &mut ControllerInner) -> bool {
+    fn arm_on_sign_in_locked(&self, inner: &mut ControllerInner) -> bool {
         if inner.disarmed || !inner.desired || !inner.awaiting_sign_in {
             return false;
         }
@@ -993,7 +1116,7 @@ impl DnsResolverController {
         );
         inner.awaiting_sign_in = false;
         inner.restart_cooldown = 0;
-        Self::start_locked(inner);
+        self.start_locked(inner);
         true
     }
 
@@ -1070,7 +1193,7 @@ impl DnsResolverController {
         inner.desired = true;
         inner.restart_cooldown = 0;
         inner.awaiting_sign_in = false;
-        Self::start_locked(&mut inner);
+        self.start_locked(&mut inner);
     }
 
     /// Report whether an upstream DNS server is reachable right now.
@@ -1099,7 +1222,7 @@ impl DnsResolverController {
     /// or while backing off after a failed re-arm. Idempotent and cheap.
     pub fn tick(&self) {
         let mut inner = self.lock();
-        Self::tick_locked(&mut inner);
+        self.tick_locked(&mut inner);
     }
 
     /// [`Self::tick`] that gives way when a start or stop holds the controller:
@@ -1110,16 +1233,16 @@ impl DnsResolverController {
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return,
         };
-        Self::tick_locked(&mut inner);
+        self.tick_locked(&mut inner);
     }
 
-    fn tick_locked(inner: &mut ControllerInner) {
+    fn tick_locked(&self, inner: &mut ControllerInner) {
         if inner.disarmed || !inner.desired {
             return;
         }
         if inner.awaiting_sign_in {
             if inner.poll_sign_in {
-                Self::arm_on_sign_in_locked(inner);
+                self.arm_on_sign_in_locked(inner);
             }
             return;
         }
@@ -1138,10 +1261,10 @@ impl DnsResolverController {
             "Mode B: resolver is enabled but its serve thread has exited — re-arming (watchdog)",
         );
         inner.restart_cooldown = RESOLVER_RESTART_BACKOFF_TICKS;
-        Self::start_locked(inner);
+        self.start_locked(inner);
     }
 
-    fn start_locked(inner: &mut ControllerInner) {
+    fn start_locked(&self, inner: &mut ControllerInner) {
         if inner.disarmed {
             // Terminally shut down (service teardown). Never re-arm — an IPC
             // set racing the shutdown must not resurrect the resolver.
@@ -1176,6 +1299,9 @@ impl DnsResolverController {
                 return;
             }
         };
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return; // built while teardown began: never redirected, dropped here
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         match std::thread::Builder::new()
@@ -1223,6 +1349,7 @@ impl DnsResolverController {
     /// outlive the process, stranding system DNS at a dead listener until the next
     /// boot's `clear_orphan_redirect`.
     pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
         let mut inner = self.lock();
         inner.disarmed = true;
         Self::stop_locked(&mut inner);
@@ -1260,6 +1387,7 @@ mod tests {
     use nrr_platform_api::PlatformError;
     use std::sync::atomic::Ordering;
     use std::sync::Mutex;
+    use std::time::Instant;
 
     // ── Trivial listener ports — never invoked when `stop` is preset, so they
     // only need to satisfy the trait bounds. ────────────────────────────────
@@ -1454,6 +1582,56 @@ mod tests {
         }
     }
 
+    /// The field case: the read woken by our own suffix-list write came back
+    /// empty, and the corporate namespace went to the public upstream until
+    /// the next change, minutes later.
+    #[test]
+    fn one_short_read_keeps_a_corporate_namespace_exempt() {
+        let start = BootInstant::now();
+        let mut held = HeldClaims::default();
+        let corp = vec![exemption("corp.example")];
+        assert_eq!(held.settle(corp.clone(), start), corp);
+        let short = held.settle(Vec::new(), start + Duration::from_millis(600));
+        assert_eq!(short, corp, "kept through one short read");
+        assert!(!held.release_due(start + Duration::from_secs(10)));
+        assert_eq!(
+            held.settle(corp.clone(), start + Duration::from_secs(10)),
+            corp
+        );
+        assert!(
+            !held.release_due(start + Duration::from_secs(60)),
+            "back, nothing pending"
+        );
+    }
+
+    #[test]
+    fn a_namespace_gone_for_the_whole_wait_is_let_go() {
+        let start = BootInstant::now();
+        let mut held = HeldClaims::default();
+        held.settle(vec![exemption("corp.example")], start);
+        let missing_from = start + Duration::from_secs(1);
+        assert_eq!(held.settle(Vec::new(), missing_from).len(), 1);
+        assert!(!held.release_due(missing_from + (RELEASE_AFTER - Duration::from_secs(1))));
+        assert!(held.release_due(missing_from + RELEASE_AFTER));
+        assert!(held
+            .settle(Vec::new(), missing_from + RELEASE_AFTER)
+            .is_empty());
+        assert!(!held.release_due(missing_from + RELEASE_AFTER * 2));
+    }
+
+    #[test]
+    fn a_new_namespace_is_exempt_at_once_beside_a_held_one() {
+        let start = BootInstant::now();
+        let mut held = HeldClaims::default();
+        held.settle(vec![exemption("old.corp.example")], start);
+        let both = held.settle(
+            vec![exemption("new.corp.example")],
+            start + Duration::from_secs(1),
+        );
+        let suffixes: Vec<&str> = both.iter().map(|e| e.suffix.as_str()).collect();
+        assert_eq!(suffixes, ["new.corp.example", "old.corp.example"]);
+    }
+
     /// The field case: a corporate VPN claims its own namespace, and we step
     /// out of it BEFORE the cache flush. The flush is what sends every warm
     /// name back through the table, so an exemption written after it would
@@ -1549,6 +1727,7 @@ mod tests {
                     })
                 }),
                 published: ClaimsSnapshot::default(),
+                held: Arc::new(Mutex::new(HeldClaims::releasing_after(Duration::ZERO))),
                 feed: safety.map(|safety_interval| ChangeFeed {
                     raised: Arc::clone(&raised),
                     safety_interval,
@@ -1895,6 +2074,7 @@ mod tests {
                 })
             }),
             published: ClaimsSnapshot::default(),
+            held: Arc::new(Mutex::new(HeldClaims::releasing_after(Duration::ZERO))),
             feed: Some(ChangeFeed {
                 raised: Arc::clone(&recheck),
                 safety_interval: Duration::from_secs(3600),
@@ -2020,6 +2200,7 @@ mod tests {
                     NamespaceClaims {
                         source: Some(source),
                         published: ClaimsSnapshot::default(),
+                        held: Arc::new(Mutex::new(HeldClaims::releasing_after(Duration::ZERO))),
                         feed: Some(ChangeFeed {
                             raised,
                             safety_interval: Duration::from_secs(3600),
@@ -2089,6 +2270,7 @@ mod tests {
                     NamespaceClaims {
                         source: Some(source),
                         published: ClaimsSnapshot::default(),
+                        held: Arc::new(Mutex::new(HeldClaims::releasing_after(Duration::ZERO))),
                         feed: Some(ChangeFeed {
                             raised,
                             safety_interval: Duration::from_secs(3600),
@@ -2410,6 +2592,72 @@ mod tests {
         assert!(
             !controller.is_running(),
             "shutdown must permanently latch against re-arm"
+        );
+    }
+
+    /// An arm still probing the upstreams under the controller lock when the
+    /// shutdown begins starts nothing once the probe returns: a teardown that
+    /// gives up waiting for the lock leaves no redirect behind it.
+    #[test]
+    fn an_arm_still_probing_when_shutdown_begins_starts_nothing() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let redirect = Arc::new(RecordingRedirect::default());
+        let redirect_for_factory = Arc::clone(&redirect);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        let controller = Arc::new(DnsResolverController::new());
+        controller.set_factory(Arc::new(move || {
+            let _ = entered_tx.lock().unwrap().send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+            Ok(DnsResolverService::new(
+                listener(),
+                Arc::clone(&redirect_for_factory) as Arc<dyn SystemDnsRedirectPort>,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+        }));
+        let teardown = std::thread::spawn({
+            let controller = Arc::clone(&controller);
+            move || {
+                entered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the arm is probing");
+                let shutting = std::thread::spawn(move || controller.shutdown());
+                std::thread::sleep(Duration::from_millis(200));
+                release_tx.send(()).expect("release the probe");
+                shutting.join().expect("shutdown");
+            }
+        });
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let writer = Arc::new(nrr_diagnostics::LogWriter::open(
+            nrr_diagnostics::LogWriterConfig::new(dir.path()),
+        ));
+        let subscriber =
+            tracing_subscriber::registry().with(nrr_diagnostics::NdjsonTracingLayer::new(writer));
+        tracing::subscriber::with_default(subscriber, || controller.start());
+        teardown.join().expect("teardown");
+
+        let mut started = 0;
+        for entry in std::fs::read_dir(dir.path()).expect("logs dir") {
+            let text = std::fs::read_to_string(entry.expect("entry").path()).expect("read");
+            started += text
+                .lines()
+                .filter(|l| l.contains("diag.event.dns-resolver-thread-started"))
+                .count();
+        }
+        assert_eq!(
+            started, 0,
+            "the arm finished after the shutdown began and started a resolver"
+        );
+        assert!(!controller.is_running());
+        assert!(
+            redirect.calls.lock().unwrap().is_empty(),
+            "the system's DNS was never touched"
         );
     }
 

@@ -117,6 +117,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "first_run_sheet"
+path = "fuzz_targets/first_run_sheet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "user_settings"
 path = "fuzz_targets/user_settings.rs"
 test = false
@@ -201,6 +208,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "logind_signal"
+path = "fuzz_targets/logind_signal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "process_command_line"
 path = "fuzz_targets/process_command_line.rs"
 test = false
@@ -210,6 +224,27 @@ bench = false
 [[bin]]
 name = "site_check_http"
 path = "fuzz_targets/site_check_http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "own_tun_identity"
+path = "fuzz_targets/own_tun_identity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_query_completed"
+path = "fuzz_targets/dns_query_completed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resolvectl_monitor_line"
+path = "fuzz_targets/resolvectl_monitor_line.rs"
 test = false
 doc = false
 bench = false

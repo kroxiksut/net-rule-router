@@ -1,13 +1,12 @@
 //! Every rule type the Add dialog offers is named, explained and filterable.
 //!
-//! The dialog lists the backend's types and reads their texts by slug, so a
+//! The dialog lists `FreeRuleType::ALL` and reads each type's texts by slug, so a
 //! type without a locale entry shows its raw slug, and one missing from the
 //! filter can be added but never found again. The rules file writer must also
 //! know the section each type lives in, in the order the Rust writer uses.
 
 use std::path::{Path, PathBuf};
 
-use nrr_mock_backend::rules::{rules_screen_preview_snapshot, RulesScreenRequest};
 use nrr_shared::FreeRuleType;
 
 fn repo_file(relative: &str) -> String {
@@ -24,12 +23,6 @@ fn locale_has(locale: &serde_json::Value, key: &str) -> bool {
         .is_some_and(|text| !text.is_empty())
 }
 
-fn offered_types() -> Vec<FreeRuleType> {
-    rules_screen_preview_snapshot(RulesScreenRequest::default())
-        .supported_rule_types
-        .to_vec()
-}
-
 #[test]
 fn every_offered_rule_type_has_its_texts_in_both_locales() {
     for lang in ["en", "ru"] {
@@ -37,7 +30,7 @@ fn every_offered_rule_type_has_its_texts_in_both_locales() {
             repo_file(&format!("locales/{lang}.json")).trim_start_matches('\u{feff}'),
         )
         .unwrap_or_else(|e| panic!("{lang}.json parses: {e}"));
-        for rule_type in offered_types() {
+        for rule_type in FreeRuleType::ALL {
             let slug = rule_type.slug();
             // The application texts are per platform.
             let suffix = if rule_type == FreeRuleType::Application {
@@ -63,7 +56,7 @@ fn every_offered_rule_type_can_be_filtered_for() {
         .lines()
         .find(|line| line.contains("model: [ \"all\", \"zone\""))
         .expect("the type filter's model is a literal list");
-    for rule_type in offered_types() {
+    for rule_type in FreeRuleType::ALL {
         assert!(
             model.contains(&format!("\"{}\"", rule_type.slug())),
             "the type filter does not offer `{}`: {model}",

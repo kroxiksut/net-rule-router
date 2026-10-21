@@ -59,8 +59,10 @@ exe_path="$(nrr_built_service_binary "$target_root" "$profile")"
 
 if [ ! -f "$exe_path" ]; then
   echo "Service binary not found at $exe_path" >&2
-  nrr_cyan "Building (cargo build -p nrr-linux-service -p nrr-cli -p nrr-tui)..."
-  (cd "$repo_root" && cargo build -p nrr-linux-service -p nrr-cli -p nrr-tui) >/dev/null
+  build_flags=()
+  [ "$profile" = "release" ] && build_flags=(--release)
+  nrr_cyan "Building (cargo build ${build_flags[*]:-} -p nrr-linux-service -p nrr-cli -p nrr-tui)..."
+  (cd "$repo_root" && cargo build ${build_flags[@]+"${build_flags[@]}"} -p nrr-linux-service -p nrr-cli -p nrr-tui) >/dev/null
   exe_path="$(nrr_built_service_binary "$target_root" "$profile")"
   if [ ! -f "$exe_path" ]; then
     echo "Service binary still missing after build at $exe_path" >&2

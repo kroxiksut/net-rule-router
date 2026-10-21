@@ -465,6 +465,7 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
+            observed_by_program: false,
         }
     }
 
@@ -735,6 +736,7 @@ mod tests {
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
+            observed_by_program: false,
         }
     }
 

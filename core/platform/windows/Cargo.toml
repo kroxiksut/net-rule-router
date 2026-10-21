@@ -40,12 +40,11 @@ getrandom   = "0.3"
 tracing     = "0.1"
 
 [target.'cfg(windows)'.dependencies]
-ipconfig = "0.3"
 # Service Control Manager bindings behind the neutral `ServiceControlPort`
 # (`service_control.rs`): register/remove/start/stop/query the background
 # service. MIT/Apache, same crate and version band the service binary used
 # before the mechanism moved here.
-windows-service = "0.7"
+windows-service = "0.8"
 # Wintun bindings — the Windows mechanism behind
 # `nrr_platform_api::fake_ip::TunAdapterPort`. Windows is the only OS without a
 # usermode TUN of its own; Linux/macOS use their native `/dev/net/tun` / `utun`.

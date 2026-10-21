@@ -219,12 +219,36 @@ fn people(
     (people, facts)
 }
 
-fn live_people() -> Result<(Vec<LiveUser>, HashMap<u32, SignInFacts>), LogindError> {
+fn live_people() -> Result<People, LogindError> {
     Ok(people(
         live_users()?,
         crate::service_account_uids::read_sys_uid_max(),
         sign_in_facts,
     ))
+}
+
+/// How long one answer serves every caller: the enforcement tick and the DNS
+/// observation tick both ask, and each unshared ask is a `loginctl` process.
+const PEOPLE_FRESH_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
+
+type People = (Vec<LiveUser>, HashMap<u32, SignInFacts>);
+
+/// [`live_people`], shared for [`PEOPLE_FRESH_FOR`]. Only an answer is kept,
+/// never a failure, so a broken `loginctl` is asked again at the next call.
+fn live_people_shared() -> Result<People, LogindError> {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, People)>> =
+        std::sync::Mutex::new(None);
+    // Held across the call: a second caller waits for the answer instead of
+    // starting its own.
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((at, people)) = last.as_ref() {
+        if at.elapsed() < PEOPLE_FRESH_FOR {
+            return Ok(people.clone());
+        }
+    }
+    let people = live_people()?;
+    *last = Some((std::time::Instant::now(), people.clone()));
+    Ok(people)
 }
 
 /// `Sessions=2 5 c1` lines, one per user, as `show-user` prints them.
@@ -380,7 +404,7 @@ impl nrr_platform_api::active_principals::ActivePrincipalSource for LogindActive
         Vec<nrr_platform_api::enforcement::UserPrincipal>,
         nrr_platform_api::active_principals::ActivePrincipalError,
     > {
-        let (users, _) = live_people().map_err(|e| {
+        let (users, _) = live_people_shared().map_err(|e| {
             nrr_platform_api::active_principals::ActivePrincipalError::new(e.to_string())
         })?;
         Ok(users
@@ -395,7 +419,7 @@ impl nrr_platform_api::active_principals::ActivePrincipalSource for LogindActive
         Vec<nrr_platform_api::active_principals::PresentPrincipal>,
         nrr_platform_api::active_principals::ActivePrincipalError,
     > {
-        let (users, facts) = live_people().map_err(|e| {
+        let (users, facts) = live_people_shared().map_err(|e| {
             nrr_platform_api::active_principals::ActivePrincipalError::new(e.to_string())
         })?;
         Ok(users

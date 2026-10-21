@@ -43,6 +43,9 @@ use crate::schema::FreshnessStateDb;
 /// resolution is dropped by cleanup. A rule host that could not be
 /// re-resolved for this long is treated as dead so the cache cannot grow
 /// unbounded; anything refreshed within the window is retained.
+/// Bound parameters per query when the refresh asks for a list of named hosts.
+const NAMED_CHUNK: usize = 200;
+
 const HELD_RESOLUTION_BACKSTOP_SECS: i64 = 30 * 86_400;
 
 /// A restamp of an address last confirmed longer ago than this counts as news:
@@ -77,6 +80,131 @@ impl SqliteCacheStore {
 
     fn note_news(&self) {
         self.news.set(self.news.get().wrapping_add(1));
+    }
+
+    /// `bump_last_seen` is false for a background refresh: the hostname's last
+    /// use must stay the user's, or a host nobody visits would look used for ever.
+    fn write_resolution(&self, entry: ResolutionEntry, bump_last_seen: bool) -> StorageResult<()> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction().map_err(db_err)?;
+
+        let resolved_at_ms = system_time_to_ms(entry.resolved_at);
+        // `fallback_ttl_secs` is both the no-TTL fallback AND a lower FLOOR on
+        // the refresh cadence: a CDN that reports a 60 s TTL is floored
+        // so we re-resolve at most every ~5 min (not every minute), while a
+        // longer advertised TTL is honoured. `expires_at` only drives WHEN the
+        // DNS-refresh task re-resolves — it does NOT purge the row: a failed
+        // refresh keeps the last-known-good entry (see `cleanup_expired`), so the
+        // rule's /32 stays available to the leak-guard.
+        let ttl = entry
+            .ttl_seconds
+            .unwrap_or(self.thresholds.fallback_ttl_secs)
+            .max(self.thresholds.fallback_ttl_secs);
+        let expires_at_ms = resolved_at_ms + ttl as i64 * 1_000;
+        let source_str = entry.source.as_str();
+        let rev_id = entry.active_revision_id.as_deref();
+
+        // 1. Upsert hostname row.
+        tx.execute(
+            "INSERT INTO hostnames (canonical_host, raw_sample, first_seen_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(canonical_host) DO UPDATE SET
+                 last_seen_at = CASE WHEN ?4 THEN excluded.last_seen_at ELSE last_seen_at END,
+                 raw_sample   = COALESCE(excluded.raw_sample, raw_sample)",
+            params![
+                entry.canonical_hostname,
+                entry.raw_hostname_sample,
+                resolved_at_ms,
+                bump_last_seen
+            ],
+        )
+        .map_err(db_err)?;
+
+        let hostname_id: i64 = tx
+            .query_row(
+                "SELECT id FROM hostnames WHERE canonical_host = ?1",
+                params![entry.canonical_hostname],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+
+        // 2. Upsert each resolved address. The family comes from the address,
+        // never from the call site: one address must not be filed twice.
+        let mut news = false;
+        for ip in entry.resolved_ips.iter().map(IpAddr::to_canonical) {
+            // `to_canonical` files `::ffff:a.b.c.d` as IPv4: as v6 it would be
+            // a second row for one address no IPv4 reader ever sees.
+            let family = AddressFamily::of(ip).as_str();
+            // `Display` for both families is the canonical text form (RFC 5952
+            // compresses and lower-cases v6), which is what the UNIQUE key
+            // relies on.
+            let canonical_ip = ip.to_string();
+            // The packed column is a v4-only index; a v6 row leaves it NULL.
+            let packed = match ip {
+                IpAddr::V4(v4) => Some(ipv4_packed(v4)),
+                IpAddr::V6(_) => None,
+            };
+
+            tx.execute(
+                "INSERT INTO ip_addresses
+                 (address_family, canonical_ip, ipv4_packed, first_seen_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT(address_family, canonical_ip) DO UPDATE SET
+                     last_seen_at = excluded.last_seen_at,
+                     ipv4_packed  = excluded.ipv4_packed",
+                params![family, canonical_ip, packed, resolved_at_ms],
+            )
+            .map_err(db_err)?;
+
+            let ip_id: i64 = tx
+                .query_row(
+                    "SELECT id FROM ip_addresses
+                     WHERE address_family = ?1 AND canonical_ip = ?2",
+                    params![family, canonical_ip],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+
+            let last_confirmed: Option<i64> = tx
+                .query_row(
+                    "SELECT MAX(resolved_at) FROM hostname_ip_resolutions
+                     WHERE hostname_id = ?1 AND ip_id = ?2",
+                    params![hostname_id, ip_id],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            news |= last_confirmed.is_none_or(|at| at < resolved_at_ms - RESTAMP_IS_NEWS_AFTER_MS);
+
+            // 3. Upsert resolution row (one per hostname/ip/source triple).
+            tx.execute(
+                "INSERT INTO hostname_ip_resolutions
+                 (hostname_id, ip_id, source, ttl_seconds, resolved_at,
+                  expires_at, freshness_state, active_revision_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'fresh', ?7)
+                 ON CONFLICT(hostname_id, ip_id, source) DO UPDATE SET
+                     ttl_seconds        = excluded.ttl_seconds,
+                     resolved_at        = excluded.resolved_at,
+                     expires_at         = excluded.expires_at,
+                     freshness_state    = 'fresh',
+                     active_revision_id = excluded.active_revision_id",
+                params![
+                    hostname_id,
+                    ip_id,
+                    source_str,
+                    entry.ttl_seconds.map(|t| t as i64),
+                    resolved_at_ms,
+                    expires_at_ms,
+                    rev_id,
+                ],
+            )
+            .map_err(db_err)?;
+        }
+
+        tx.commit().map_err(db_err)?;
+        if news {
+            self.note_news();
+        }
+        Ok(())
     }
 
     /// Consumes the store and returns the underlying connection.
@@ -161,16 +289,18 @@ impl CacheRepository for SqliteCacheStore {
             })?;
             let stored = FreshnessStateDb::from_str(&row.freshness_str)
                 .unwrap_or(FreshnessStateDb::StaleNotUsable);
+            let (resolved_at_ms, expires_at_ms) =
+                clamp_stamps_to_now(row.resolved_at_ms, row.expires_at_ms, now_ms);
             let source = StorageResolutionSource::from_str(&row.source_str)
                 .unwrap_or(StorageResolutionSource::CacheRebuild);
 
             resolved_ips.push(CachedIpEntry {
                 addr,
-                cache_state: effective_freshness(stored, row.expires_at_ms, now_ms, thresholds),
+                cache_state: effective_freshness(stored, expires_at_ms, now_ms, thresholds),
                 source,
-                resolved_at: Some(ms_to_system_time(row.resolved_at_ms)),
+                resolved_at: Some(ms_to_system_time(resolved_at_ms)),
                 ttl_seconds: row.ttl_seconds.map(|t| t as u32),
-                expires_at: Some(ms_to_system_time(row.expires_at_ms)),
+                expires_at: Some(ms_to_system_time(expires_at_ms)),
                 active_revision_id: row.active_revision_id,
             });
         }
@@ -276,123 +406,11 @@ impl CacheRepository for SqliteCacheStore {
     // ── Write ─────────────────────────────────────────────────────────────────
 
     fn upsert_resolution(&self, entry: ResolutionEntry) -> StorageResult<()> {
-        let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction().map_err(db_err)?;
+        self.write_resolution(entry, true)
+    }
 
-        let resolved_at_ms = system_time_to_ms(entry.resolved_at);
-        // `fallback_ttl_secs` is both the no-TTL fallback AND a lower FLOOR on
-        // the refresh cadence: a CDN that reports a 60 s TTL is floored
-        // so we re-resolve at most every ~5 min (not every minute), while a
-        // longer advertised TTL is honoured. `expires_at` only drives WHEN the
-        // DNS-refresh task re-resolves — it does NOT purge the row: a failed
-        // refresh keeps the last-known-good entry (see `cleanup_expired`), so the
-        // rule's /32 stays available to the leak-guard.
-        let ttl = entry
-            .ttl_seconds
-            .unwrap_or(self.thresholds.fallback_ttl_secs)
-            .max(self.thresholds.fallback_ttl_secs);
-        let expires_at_ms = resolved_at_ms + ttl as i64 * 1_000;
-        let source_str = entry.source.as_str();
-        let rev_id = entry.active_revision_id.as_deref();
-
-        // 1. Upsert hostname row.
-        tx.execute(
-            "INSERT INTO hostnames (canonical_host, raw_sample, first_seen_at, last_seen_at)
-             VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(canonical_host) DO UPDATE SET
-                 last_seen_at = excluded.last_seen_at,
-                 raw_sample   = COALESCE(excluded.raw_sample, raw_sample)",
-            params![
-                entry.canonical_hostname,
-                entry.raw_hostname_sample,
-                resolved_at_ms
-            ],
-        )
-        .map_err(db_err)?;
-
-        let hostname_id: i64 = tx
-            .query_row(
-                "SELECT id FROM hostnames WHERE canonical_host = ?1",
-                params![entry.canonical_hostname],
-                |r| r.get(0),
-            )
-            .map_err(db_err)?;
-
-        // 2. Upsert each resolved address. The family comes from the address,
-        // never from the call site: one address must not be filed twice.
-        let mut news = false;
-        for ip in &entry.resolved_ips {
-            let family = AddressFamily::of(*ip).as_str();
-            // `Display` for both families is the canonical text form (RFC 5952
-            // compresses and lower-cases v6), which is what the UNIQUE key
-            // relies on.
-            let canonical_ip = ip.to_string();
-            // The packed column is a v4-only index; a v6 row leaves it NULL.
-            let packed = match ip {
-                IpAddr::V4(v4) => Some(ipv4_packed(*v4)),
-                IpAddr::V6(_) => None,
-            };
-
-            tx.execute(
-                "INSERT INTO ip_addresses
-                 (address_family, canonical_ip, ipv4_packed, first_seen_at, last_seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?4)
-                 ON CONFLICT(address_family, canonical_ip) DO UPDATE SET
-                     last_seen_at = excluded.last_seen_at,
-                     ipv4_packed  = excluded.ipv4_packed",
-                params![family, canonical_ip, packed, resolved_at_ms],
-            )
-            .map_err(db_err)?;
-
-            let ip_id: i64 = tx
-                .query_row(
-                    "SELECT id FROM ip_addresses
-                     WHERE address_family = ?1 AND canonical_ip = ?2",
-                    params![family, canonical_ip],
-                    |r| r.get(0),
-                )
-                .map_err(db_err)?;
-
-            let last_confirmed: Option<i64> = tx
-                .query_row(
-                    "SELECT MAX(resolved_at) FROM hostname_ip_resolutions
-                     WHERE hostname_id = ?1 AND ip_id = ?2",
-                    params![hostname_id, ip_id],
-                    |r| r.get(0),
-                )
-                .map_err(db_err)?;
-            news |= last_confirmed.is_none_or(|at| at < resolved_at_ms - RESTAMP_IS_NEWS_AFTER_MS);
-
-            // 3. Upsert resolution row (one per hostname/ip/source triple).
-            tx.execute(
-                "INSERT INTO hostname_ip_resolutions
-                 (hostname_id, ip_id, source, ttl_seconds, resolved_at,
-                  expires_at, freshness_state, active_revision_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'fresh', ?7)
-                 ON CONFLICT(hostname_id, ip_id, source) DO UPDATE SET
-                     ttl_seconds        = excluded.ttl_seconds,
-                     resolved_at        = excluded.resolved_at,
-                     expires_at         = excluded.expires_at,
-                     freshness_state    = 'fresh',
-                     active_revision_id = excluded.active_revision_id",
-                params![
-                    hostname_id,
-                    ip_id,
-                    source_str,
-                    entry.ttl_seconds.map(|t| t as i64),
-                    resolved_at_ms,
-                    expires_at_ms,
-                    rev_id,
-                ],
-            )
-            .map_err(db_err)?;
-        }
-
-        tx.commit().map_err(db_err)?;
-        if news {
-            self.note_news();
-        }
-        Ok(())
+    fn refresh_resolution(&self, entry: ResolutionEntry) -> StorageResult<()> {
+        self.write_resolution(entry, false)
     }
 
     fn record_shared_ip_direct_host(
@@ -451,6 +469,7 @@ impl CacheRepository for SqliteCacheStore {
 
     fn snapshot_resolutions(&self) -> StorageResult<Vec<(String, IpAddr, SystemTime)>> {
         let conn = self.conn.borrow();
+        let now_ms = system_time_to_ms(SystemTime::now());
         // Same join, same per-hostname ordering as `get_by_hostname`; only the
         // hostname predicate is gone. Freshness is deliberately NOT filtered
         // here either — that path returns every cached row and lets the caller
@@ -483,7 +502,7 @@ impl CacheRepository for SqliteCacheStore {
             let Ok(addr) = ip.parse::<IpAddr>() else {
                 continue;
             };
-            out.push((host, addr, ms_to_system_time(resolved_at_ms)));
+            out.push((host, addr, ms_to_system_time(resolved_at_ms.min(now_ms))));
         }
         Ok(out)
     }
@@ -494,12 +513,15 @@ impl CacheRepository for SqliteCacheStore {
         // LIMIT: the snapshot applies those in memory.
         let mut stmt = conn
             .prepare(
-                "SELECT canonical_host, last_seen_at FROM hostnames
-                 ORDER BY last_seen_at DESC, canonical_host ASC",
+                "SELECT canonical_host, MIN(last_seen_at, ?1) AS seen FROM hostnames
+                 ORDER BY seen DESC, canonical_host ASC",
             )
             .map_err(db_err)?;
+        let now_ms = system_time_to_ms(SystemTime::now());
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .query_map([now_ms], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
             .map_err(db_err)?;
         let mut out = Vec::new();
         for row in rows {
@@ -639,8 +661,7 @@ impl CacheRepository for SqliteCacheStore {
             ],
         )
         .map_err(db_err)?;
-        drop(conn);
-        self.note_news();
+        // Not news: no plan reads a negative entry, so it must not re-plan.
         Ok(())
     }
 
@@ -685,7 +706,7 @@ impl CacheRepository for SqliteCacheStore {
                 "SELECT h.canonical_host, MAX(h.last_seen_at)
                  FROM hostname_ip_resolutions r
                  JOIN hostnames h ON h.id = r.hostname_id
-                 WHERE r.expires_at <= ?1
+                 WHERE (r.expires_at <= ?1 OR r.resolved_at > ?1)
                    AND r.source IN ('dns', 'manual_refresh')
                  GROUP BY h.canonical_host
                  ORDER BY MAX(h.last_seen_at) DESC, h.canonical_host ASC
@@ -708,6 +729,85 @@ impl CacheRepository for SqliteCacheStore {
         for row in rows {
             out.push(row.map_err(db_err)?);
         }
+        Ok(out)
+    }
+
+    fn list_expired_for_refresh(
+        &self,
+        now: SystemTime,
+        limit: usize,
+        used_since: SystemTime,
+        named: &[String],
+    ) -> StorageResult<Vec<ExpiredHostname>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.borrow();
+        let now_ms = system_time_to_ms(now);
+        let used_ms = system_time_to_ms(used_since);
+        const HEAD: &str = "SELECT h.canonical_host, MAX(h.last_seen_at)
+             FROM hostname_ip_resolutions r
+             JOIN hostnames h ON h.id = r.hostname_id
+             WHERE (r.expires_at <= ?1 OR r.resolved_at > ?1)
+               AND r.source IN ('dns', 'manual_refresh')";
+        const TAIL: &str = " GROUP BY h.canonical_host
+             ORDER BY MAX(h.last_seen_at) DESC, h.canonical_host ASC
+             LIMIT ?2";
+        let read = |r: &rusqlite::Row<'_>| -> rusqlite::Result<ExpiredHostname> {
+            let last_seen_ms: Option<i64> = r.get(1)?;
+            Ok(ExpiredHostname {
+                canonical_hostname: r.get(0)?,
+                last_seen_at: last_seen_ms.map(ms_to_system_time),
+            })
+        };
+        let mut out: Vec<ExpiredHostname> = Vec::new();
+        {
+            let sql = format!("{HEAD} AND h.last_seen_at >= ?3{TAIL}");
+            let mut stmt = conn.prepare_cached(&sql).map_err(db_err)?;
+            let rows = stmt
+                .query_map(params![now_ms, limit as i64, used_ms], read)
+                .map_err(db_err)?;
+            for row in rows {
+                out.push(row.map_err(db_err)?);
+            }
+        }
+        // Hosts a rule names are refreshed whatever their last use; the rest of
+        // the named set is read in bounded chunks of bound parameters.
+        let mut seen: std::collections::HashSet<String> =
+            out.iter().map(|h| h.canonical_hostname.clone()).collect();
+        for chunk in named.chunks(NAMED_CHUNK) {
+            // Numbered: a bare `?` would take the index ?2 already holds.
+            let marks = (3..3 + chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("{HEAD} AND h.canonical_host IN ({marks}){TAIL}");
+            let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+            let mut args: Vec<rusqlite::types::Value> = vec![
+                rusqlite::types::Value::Integer(now_ms),
+                rusqlite::types::Value::Integer(limit as i64),
+            ];
+            args.extend(
+                chunk
+                    .iter()
+                    .map(|h| rusqlite::types::Value::Text(h.clone())),
+            );
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(args), read)
+                .map_err(db_err)?;
+            for row in rows {
+                let row = row.map_err(db_err)?;
+                if seen.insert(row.canonical_hostname.clone()) {
+                    out.push(row);
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            b.last_seen_at
+                .cmp(&a.last_seen_at)
+                .then_with(|| a.canonical_hostname.cmp(&b.canonical_hostname))
+        });
+        out.truncate(limit);
         Ok(out)
     }
 
@@ -918,12 +1018,28 @@ impl CacheRepository for SqliteCacheStore {
             // so the cache does not grow with every site the user browses.
             // (A successful refresh replaces a held row in place via
             // `upsert_resolution`'s ON CONFLICT, keeping it current.)
-            let held_backstop_ms = now_ms - HELD_RESOLUTION_BACKSTOP_SECS * 1_000;
+            //
+            // The backstop applies only while the cache is being written at all.
+            // When nothing is newer than it, the clock stepped forward (or the
+            // service was off for the whole period) and every row would look
+            // abandoned: the last-known-good set stays until a refresh renews it.
+            let mut held_backstop_ms = now_ms - HELD_RESOLUTION_BACKSTOP_SECS * 1_000;
+            let anything_recent: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM hostname_ip_resolutions WHERE resolved_at >= ?1)",
+                    params![held_backstop_ms],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            if !anything_recent {
+                held_backstop_ms = i64::MIN;
+            }
+            // A stamp from the future (clock stepped back) is expired too.
             let expired_resolutions_removed: u64 = tx
                 .execute(
                     "DELETE FROM hostname_ip_resolutions WHERE id IN (
                          SELECT id FROM hostname_ip_resolutions
-                         WHERE expires_at < ?1
+                         WHERE (expires_at < ?1 OR resolved_at > ?1)
                            AND (source = 'observed_from_traffic' OR resolved_at < ?2)
                          ORDER BY id LIMIT ?3)",
                     params![now_ms, held_backstop_ms, batch],
@@ -949,7 +1065,7 @@ impl CacheRepository for SqliteCacheStore {
                 .execute(
                     "DELETE FROM negative_cache WHERE id IN (
                          SELECT id FROM negative_cache
-                         WHERE expires_at < ?1 OR created_at < ?2
+                         WHERE expires_at < ?1 OR created_at < ?2 OR created_at > ?1
                          ORDER BY id LIMIT ?3)",
                     params![now_ms, neg_cutoff_ms, batch],
                 )
@@ -1341,6 +1457,17 @@ fn system_time_to_ms(t: SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// A row stamped after `now_ms` was written before the clock stepped back.
+/// Both stamps move back by the excess, so the row reads as resolved now with
+/// its own TTL instead of staying fresh for the length of the step.
+fn clamp_stamps_to_now(resolved_at_ms: i64, expires_at_ms: i64, now_ms: i64) -> (i64, i64) {
+    let excess = resolved_at_ms.saturating_sub(now_ms).max(0);
+    (
+        resolved_at_ms.saturating_sub(excess),
+        expires_at_ms.saturating_sub(excess),
+    )
 }
 
 fn ms_to_system_time(ms: i64) -> SystemTime {

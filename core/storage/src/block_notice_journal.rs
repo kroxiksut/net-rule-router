@@ -147,6 +147,18 @@ impl<'c> BlockNoticeJournalRepository<'c> {
         Ok(removed)
     }
 
+    /// Drop every user's notices past the age bound. A user who never signs in
+    /// again is never touched by `append`/`list_pending`, so a slow timer calls
+    /// this to keep their rows from living forever.
+    pub fn purge_all_stale(&self, now_ms: i64) -> StorageResult<usize> {
+        self.conn
+            .execute(
+                "DELETE FROM block_notice_journal WHERE raised_at < ?1",
+                params![now_ms.saturating_sub(MAX_AGE_MS)],
+            )
+            .map_err(|e| StorageError::Internal(format!("block_notice_journal purge all: {e}")))
+    }
+
     fn purge_stale(&self, sid: &str, now_ms: i64) -> StorageResult<()> {
         self.conn
             .execute(
@@ -321,6 +333,24 @@ mod tests {
             .list_pending("S-1", 1_000 + MAX_AGE_MS + 1)
             .expect("list");
         assert!(pending.is_empty(), "a week-old notice is no longer news");
+    }
+
+    #[test]
+    fn the_general_sweep_drops_stale_rows_of_users_who_never_read() {
+        let conn = migrated_conn();
+        let repo = BlockNoticeJournalRepository::new(&conn);
+        repo.append("S-gone", &notice("old.example"), 1_000)
+            .expect("append");
+        repo.append("S-here", &notice("new.example"), MAX_AGE_MS)
+            .expect("append");
+
+        let removed = repo.purge_all_stale(1_000 + MAX_AGE_MS + 1).expect("sweep");
+        assert_eq!(removed, 1);
+        assert!(repo
+            .list_pending("S-here", MAX_AGE_MS + 2)
+            .expect("list")
+            .iter()
+            .any(|e| e.notice.destination == "new.example"));
     }
 
     #[test]

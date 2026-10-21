@@ -3,7 +3,12 @@
     [switch]$CommentHygieneOnly,
     # CI passes it: a runner without qmllint means the Qt install step broke.
     [switch]$RequireQmlLint,
-    [switch]$QmlLintOnly
+    [switch]$QmlLintOnly,
+    # Opt-in, for a VM or a test machine: also runs the `#[ignore]` tests that
+    # need administrator rights and mutate real network state (WFP filters,
+    # routes, DNS). Needs an elevated shell. Never part of the default gate and
+    # never run by public CI.
+    [switch]$IncludePrivileged
 )
 
 Set-StrictMode -Version Latest
@@ -258,14 +263,14 @@ function Test-DoubledWords {
     $pattern = '\b([A-Za-z]{3,})\s+\1\b(?!-)'
     $offences = @()
 
-    Get-ChildItem -Path $roots -Recurse -File -Include '*.rs', '*.qml', '*.cpp', '*.h', '*.js', '*.ps1' |
+    Get-ChildItem -Path $roots -Recurse -File -Include '*.rs', '*.qml', '*.cpp', '*.h', '*.js', '*.ps1', '*.sh' |
         Where-Object { $_.FullName -notmatch '\\target\\' } |
         ForEach-Object {
             $file = $_
             $lineNo = 0
             foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
                 $lineNo += 1
-                $prefix = if ($file.Extension -eq '.ps1') { '#' } else { '//' }
+                $prefix = if (@('.ps1', '.sh') -contains $file.Extension) { '#' } else { '//' }
                 $commentAt = $line.IndexOf($prefix)
                 if ($commentAt -lt 0) { continue }
                 $comment = $line.Substring($commentAt)
@@ -552,6 +557,14 @@ $previousTmp, $previousTemp = $env:TMP, $env:TEMP
 $env:TMP, $env:TEMP = $testTemp, $testTemp
 try {
     Invoke-CargoStep 'tests' @('test', '--workspace')
+    if ($IncludePrivileged) {
+        $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+        if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw '-IncludePrivileged needs an elevated shell: the ignored tests open the WFP engine and edit routes.'
+        }
+        # One thread: these tests share the machine-wide filter engine and route table.
+        Invoke-CargoStep 'privileged tests' @('test', '-p', 'nrr-platform-windows', '-p', 'nrr-service-runtime', '--', '--ignored', '--test-threads=1')
+    }
 } finally {
     $env:TMP, $env:TEMP = $previousTmp, $previousTemp
     foreach ($attempt in 1..5) {

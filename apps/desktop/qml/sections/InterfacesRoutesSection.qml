@@ -328,8 +328,7 @@ ColumnLayout {
                     labelResolver: function(item) {
                         return item ? root.behaviorModeLabel(item.id) : ""
                     }
-                    // Hover hint explaining the
-                    // selected mode (e.g. what "Strict secondary" does). Reuses
+                    // Hover hint explaining the selected default route. Reuses
                     // the existing settings.routing-behavior.mode.<slug>.description
                     // keys (the catalog is flat: the JSON nests these under
                     // `settings`, so the lookup key MUST carry that prefix).
@@ -346,9 +345,13 @@ ColumnLayout {
                         currentIndex = Pure.optionIndexById(
                             ((root.context.interfaces || {}).supportedBehaviorModes) || [],
                             (root.context.interfaces || {}).selectedBehaviorMode || "", 0)
-                        if (currentIndex >= 0 && currentIndex < root.behaviorModeModel.count)
-                            displayText = root.behaviorModeLabel(root.behaviorModeModel.get(currentIndex).id)
+                        if (currentIndex >= 0 && currentIndex < root.behaviorModeModel.count) {
+                            _shownMode = String(root.behaviorModeModel.get(currentIndex).id)
+                            displayText = root.behaviorModeLabel(_shownMode)
+                        }
                     }
+                    /// The route on show, restored when a raise is not confirmed.
+                    property string _shownMode: ""
                     popup.width: root.comboPopupWidth(behaviorCombo, root.behaviorModeModel, "id",
                         function(item) { return root.behaviorModeLabel(item.id) })
                     /// Show `slug`, whether the user picked it or the service kept it.
@@ -358,16 +361,23 @@ ColumnLayout {
                             String(slug || ""), currentIndex)
                         if (idx < 0 || idx >= root.behaviorModeModel.count) return
                         currentIndex = idx
-                        behaviorCombo.displayText = root.behaviorModeLabel(root.behaviorModeModel.get(idx).id)
+                        behaviorCombo._shownMode = String(root.behaviorModeModel.get(idx).id)
+                        behaviorCombo.displayText = root.behaviorModeLabel(behaviorCombo._shownMode)
                     }
                     onActivated: {
-                        var id = root.behaviorModeModel.get(currentIndex).id
-                        // The per-SID policy is what enforcement reads; the
-                        // preference mirror follows once the service confirms.
-                        if (typeof root.routePolicyController.applyRouteBehaviorMode === "function") {
-                            root.routePolicyController.applyRouteBehaviorMode(id)
+                        var id = String(root.behaviorModeModel.get(currentIndex).id)
+                        var proceed = function() {
+                            behaviorCombo._showMode(id)
+                            // The per-SID policy is what enforcement reads; the
+                            // preference mirror follows once the service confirms.
+                            if (typeof root.routePolicyController.applyRouteBehaviorMode === "function")
+                                root.routePolicyController.applyRouteBehaviorMode(id)
                         }
-                        behaviorCombo.displayText = root.behaviorModeLabel(id)
+                        // A route that raises leak protection to "Everything"
+                        // while the additional connection is down asks first.
+                        if (typeof root.confirmDefaultRoute !== "function") { proceed(); return }
+                        if (behaviorCombo._shownMode !== "") behaviorCombo._showMode(behaviorCombo._shownMode)
+                        root.confirmDefaultRoute(root.routingState.leakProtection, id, proceed)
                     }
                     Connections {
                         target: root ? root.routePolicyController : null

@@ -60,6 +60,7 @@ fn probe_exemptions() -> FailClosedExemptions {
         local_subnets: vec![(Ipv4Addr::new(192, 168, 0, 0), 24)],
         local_subnets_v6: Vec::new(),
         foreign_tunnel_luids: Vec::new(),
+        foreign_tunnel_networks: Vec::new(),
         primary_dest_ips: Vec::new(),
         allow_dns_over_primary: false,
         dns_servers: Vec::new(),
@@ -68,6 +69,7 @@ fn probe_exemptions() -> FailClosedExemptions {
         // real derived next-hop it stands in for.
         probe_target_ips: vec![Ipv4Addr::new(10, 91, 192, 1)],
         secondary_luid: 0,
+        guest_network_luids: Vec::new(),
     }
 }
 
@@ -206,7 +208,7 @@ fn probe_leak_proof_pair_and_dns_exempt_filters_materialize_on_windows() {
     );
     let dns_exemptions = FailClosedExemptions {
         allow_dns_over_primary: true,
-        dns_servers: vec![Ipv4Addr::new(192, 0, 2, 53)],
+        dns_servers: vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53))],
         ..probe_exemptions()
     };
     specs.extend(fail_closed_block_all_filters(

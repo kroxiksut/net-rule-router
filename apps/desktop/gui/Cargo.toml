@@ -6,10 +6,10 @@ rust-version = "1.94.1"
 publish = false
 license = "MPL-2.0"
 
-# Library-only after 13.R-GUI.4. The user-facing `NetRuleRouter.exe` is now
-# produced by `nrr-launcher`; this crate contributes the QML context emitter
-# (`ui_surface::write_qt_context_file_at`), launch-request parser, prefs
-# round-trip, and the section-rendering helpers consumed by the launcher.
+# A library: `nrr-launcher` builds `NetRuleRouter.exe` and owns the process,
+# so a second binary here would collide with it in `target/<profile>/`. This
+# crate holds the QML context emitter, launch-request parser and prefs
+# round-trip the launcher calls.
 [lib]
 name = "nrr_desktop_gui"
 path = "src/lib.rs"
@@ -17,7 +17,6 @@ path = "src/lib.rs"
 [dependencies]
 nrr-application = { path = "../../../core/application" }
 nrr-ui-support = { path = "../../../core/ui-support" }
-nrr-mock-backend = { path = "../../../core/mock-backend" }
 nrr-shared = { path = "../../../shared/contracts" }
 # "Open logs folder" must land in the directory the service actually writes to;
 # the roots are declared once in the platform layer, not re-derived here.

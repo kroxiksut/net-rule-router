@@ -2,7 +2,8 @@
 
 use super::*;
 use nrr_shared::preset_parser::{
-    neutralize_field, DENY_PREFIX, OVERRIDE_FLAG, VERIFY_PRIMARY_PREFIX,
+    neutralize_field, program_value_on_line, CHILDREN_FLAG, DENY_PREFIX, OVERRIDE_FLAG,
+    VERIFY_PRIMARY_PREFIX,
 };
 
 /// Serialises a [`RulesFileParsed`] (and optional unsupported sections) back to
@@ -24,7 +25,8 @@ use nrr_shared::preset_parser::{
 ///   round-trip.
 /// - Active rule line: `value` (no inline comment) or `value  # comment`
 ///   (two spaces before `#`, matching docs/en/rules-file-format.md Complete example examples).
-/// - Disabled rule line: `# value` or `# value  # comment`.
+/// - Disabled rule line: `# value` or `# value  # comment`; a program the
+///   parser would take for a note is enclosed in quotes: `# "Web Content"`.
 /// - Sections are separated by a blank line for readability.
 /// - A line break or other control character in a single-line field (value,
 ///   comment, metadata, section name) is written as a space. Validation
@@ -162,8 +164,9 @@ pub fn write_rules_file_with_passthrough(
 /// - Disabled rule: `# value` or `# value  # comment`.
 /// - "Check where it works": `?value`, or `# ?value` when disabled.
 /// - Deny: `!value`, or `# !value` when disabled. A deny takes no `?`.
-/// - A program's override request: `value +override`, in a program section
-///   only (`program_section`).
+/// - A program's flags: `value +children +override`, in a program section
+///   only (`program_section`), where a value that would not read back bare
+///   goes in quotes (`program_value_on_line`).
 ///
 /// The two-space separator before the inline `#` mirrors the canonical form
 /// shown in docs/en/rules-file-format.md Complete example examples.
@@ -187,7 +190,16 @@ fn write_entry_line(
     } else if entry.verify_primary {
         out.push(VERIFY_PRIMARY_PREFIX);
     }
-    out.push_str(&neutralize_field(&entry.match_value));
+    let value = neutralize_field(&entry.match_value);
+    if program_section {
+        out.push_str(&program_value_on_line(&value, entry.enabled));
+    } else {
+        out.push_str(&value);
+    }
+    if program_section && entry.children_requested {
+        out.push(' ');
+        out.push_str(CHILDREN_FLAG);
+    }
     if program_section && entry.override_requested {
         out.push(' ');
         out.push_str(OVERRIDE_FLAG);

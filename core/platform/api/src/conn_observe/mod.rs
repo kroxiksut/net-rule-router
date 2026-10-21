@@ -126,6 +126,14 @@ pub trait ConnectionObservationSource: Send + Sync {
     /// Remove and return all connections buffered since the last drain. Returns
     /// an empty vector when nothing was observed.
     fn drain(&self) -> Vec<ConnectionObservation>;
+
+    /// Whether the backend is still producing events. A source whose feeding
+    /// thread died drains empty forever, which looks like a quiet network; the
+    /// health surface asks this instead. Sources with no such thread keep the
+    /// default.
+    fn is_feeding(&self) -> bool {
+        true
+    }
 }
 
 /// In-memory scripted source for tests (and for OSes without a live backend,
@@ -185,11 +193,34 @@ impl ConnectionObservationSource for MergedConnectionObservationSource {
         }
         out
     }
+
+    fn is_feeding(&self) -> bool {
+        self.sources.iter().all(|s| s.is_feeding())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Dead;
+    impl ConnectionObservationSource for Dead {
+        fn drain(&self) -> Vec<ConnectionObservation> {
+            Vec::new()
+        }
+        fn is_feeding(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn merged_source_is_feeding_only_while_every_part_is() {
+        let live: Arc<dyn ConnectionObservationSource> =
+            Arc::new(MockConnectionObservationSource::default());
+        let dead: Arc<dyn ConnectionObservationSource> = Arc::new(Dead);
+        assert!(MergedConnectionObservationSource::new(vec![live.clone()]).is_feeding());
+        assert!(!MergedConnectionObservationSource::new(vec![live, dead]).is_feeding());
+    }
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     fn sample() -> ConnectionObservation {

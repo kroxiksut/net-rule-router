@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 7
 # name: ID Indonesia Default Split - Primary Route
 # description: Indonesia/local services routed to primary
 # author: NetRuleRouter contributors

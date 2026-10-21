@@ -12,35 +12,18 @@ pub struct PerSidPolicySnapshot {
     pub primary: Option<PerSidBinding>,
     pub secondary: Option<PerSidBinding>,
     pub mode: PerSidBehaviorMode,
-    pub block_secondary_when_unavailable: bool,
-    /// kill-switch failure posture. `true` = fail-closed
-    /// (block when the secondary can't be resolved at apply time); `false` =
-    /// fail-open (allow; the GUI warns). Only consulted when
-    /// `block_secondary_when_unavailable` is on.
-    pub kill_switch_fail_closed: bool,
+    /// The user's leak-protection choice. With [`Self::mode`] and the tunnel's
+    /// state it decides the posture, through `nrr_domain::protection_posture`.
+    pub leak_protection: nrr_domain::LeakProtection,
     /// which IP protocols the emergency block cuts, as the
     /// v16 bitmask (decoded via
     /// [`crate::killswitch_codegen::KillSwitchProtocols::from_bits`]). All =
-    /// 127 (default). Only consulted when the kill-switch arms.
+    /// 127 (default). Only consulted while leak protection is on.
     pub kill_switch_protocols: u16,
-    /// when `true`, the split-mode
-    /// ([`RouteBehaviorMode::PreferPrimary`]) fail-closed block covers ALL
-    /// egress (catch-all) instead of only the enumerated secondary destination
-    /// IPs, so ICMP/ping and rotating/un-cached IPs of secondary-rule hosts
-    /// cannot leak to the primary while the secondary adapter is down. Only consulted in
-    /// `PreferPrimary` + fail-closed — the other two modes already catch-all.
-    /// Default `false` (per-IP).
-    pub kill_switch_block_all: bool,
-    /// MASTER kill-switch toggle. `false` (default) = OFF, so
-    /// the whole leak-guard is disarmed (full opt-in — any leak while the
-    /// secondary is down is then the user's deliberate choice). The
-    /// `kill_switch_fail_closed` / `kill_switch_block_all` / `kill_switch_protocols`
-    /// fields above are only consulted when this is `true`.
-    pub kill_switch_enabled: bool,
     /// OPT-IN "allow name resolution over the primary link while
-    /// the kill-switch block-all is engaged". `false` (default) = strict (blocks DNS
+    /// the block-all is engaged". `false` (default) = strict (blocks DNS
     /// too); `true` = add a port-scoped DNS permit so zones keep resolving. Only
-    /// consulted in the block-all / secondary-unresolved path.
+    /// consulted in the block-all path.
     pub allow_dns_over_primary: bool,
     /// how a SHARED secondary IP is treated. Drives the
     /// secondary-IP denylist fed to the route/WFP codegen. Default
@@ -55,12 +38,6 @@ pub struct PerSidPolicySnapshot {
     /// `true` ("strict"): pin every shared IP regardless of co-tenancy. Routing
     /// (`/32` while the secondary is up) stays governed by `shared_ip_policy`.
     pub kill_switch_strict_shared_ips: bool,
-    /// Mode-A (`PreferPrimary`) coverage strategy for a routed domain's
-    /// un-seeded edge IP. `FailClosedUnknown` (default) escalates
-    /// the per-IP fail-closed to the catch-all so the rotating-IP leak
-    /// (e.g. assistant over primary) cannot happen; `PerIp` keeps
-    /// per-IP-only pinning. Consulted only in `PreferPrimary` + fail-closed.
-    pub mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy,
     /// exe paths of the secondary binding's **link-provider
     /// apps** (the VPN client et al. the user confirmed via onboarding —
     /// `route_link_provider_apps` per-SID table). Folded into the kill-switch
@@ -74,8 +51,8 @@ pub struct PerSidPolicySnapshot {
     /// blocked so the observer sees plaintext DNS again.
     pub doh_lockdown_enabled: bool,
     /// when the lockdown applies:
-    /// [`DohLockdownScope::LeakProtectionOnly`] (only while the kill-switch master
-    /// toggle is on) or [`DohLockdownScope::Always`].
+    /// [`DohLockdownScope::LeakProtectionOnly`] (only while leak protection is
+    /// on) or [`DohLockdownScope::Always`].
     pub doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope,
     /// The lockdown decides itself from the rule book (see
     /// [`crate::doh_lockdown_policy`]); the two fields above then say nothing.
@@ -138,7 +115,6 @@ pub struct PerSidBinding {
 pub enum PerSidBehaviorMode {
     PreferPrimary,
     PreferSecondaryWhenAvailable,
-    StrictSecondaryFailClosed,
 }
 
 /// Trait the orchestrator uses to read per-SID policy snapshots.
@@ -146,6 +122,13 @@ pub enum PerSidBehaviorMode {
 /// inject a scripted [`HashMap`].
 pub trait RoutePolicySource: Send + Sync {
     fn load_for_sid(&self, sid: &str) -> Option<PerSidPolicySnapshot>;
+
+    /// Why the last [`Self::load_for_sid`] of `sid` found nothing, when the
+    /// store could not be read: that is not "no policy", and only the latter
+    /// may remove what is installed. Fixtures never fail to read.
+    fn read_failure_for(&self, _sid: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Snapshot of the currently-active rules revision. Fed into the WFP
@@ -164,10 +147,7 @@ pub struct ActiveRulesSnapshot {
 ///
 /// `None` means "no active revision" — orchestrator installs no
 /// rule-driven filters for that SID and records `Applied` with
-/// `filter_count = 0`. The behaviour-mode catch-all (e.g.
-/// `StrictSecondaryFailClosed → Block`) still runs only if rules
-/// are available; without rules the orchestrator is effectively
-/// pass-through.
+/// `filter_count = 0`; without rules the orchestrator is pass-through.
 /// What a rules read found. A book that could not be read is not an empty
 /// one: nothing is removed on its account.
 #[derive(Clone, Debug)]
@@ -334,6 +314,9 @@ pub enum OrchestratorError {
     /// The principal's rule book could not be read or decoded. Nothing was
     /// touched: what is installed stays until the book reads again.
     RulesUnreadable(String),
+    /// The principal's route policy could not be read. Nothing was touched:
+    /// the guard installed stays until the policy reads again.
+    PolicyUnreadable(String),
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -345,6 +328,9 @@ impl std::fmt::Display for OrchestratorError {
             }
             Self::WfpFailed(m) => write!(f, "wfp plan failed: {m}"),
             Self::RulesUnreadable(m) => write!(f, "rule book unreadable, nothing changed: {m}"),
+            Self::PolicyUnreadable(m) => {
+                write!(f, "route policy unreadable, nothing changed: {m}")
+            }
             Self::MembershipUnknown(m) => {
                 write!(f, "who holds a filter set could not be decided: {m}")
             }

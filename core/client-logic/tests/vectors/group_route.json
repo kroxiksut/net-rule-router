@@ -1,0 +1,15 @@
+{
+  "description": "pure.js groupRouteOf / nrr_client_logic::app_routes::group_route: the first enabled application rule that covers a program decides its route; a group is that route when its programs agree, mixed when they differ",
+  "cases": [
+    { "name": "no rules is primary", "input": { "rules": [], "programs": ["a.exe"] }, "expected": "primary" },
+    { "name": "empty group is primary", "input": { "rules": [ { "value": "a.exe", "route": "secondary", "enabled": true } ], "programs": [] }, "expected": "primary" },
+    { "name": "exact rule", "input": { "rules": [ { "value": "a.exe", "route": "secondary", "enabled": true } ], "programs": ["a.exe"] }, "expected": "secondary" },
+    { "name": "case is folded", "input": { "rules": [ { "value": "VBoxHeadless.EXE", "route": "secondary", "enabled": true } ], "programs": ["vboxheadless.exe"] }, "expected": "secondary" },
+    { "name": "pattern covers", "input": { "rules": [ { "value": "vbox*.exe", "route": "secondary", "enabled": true } ], "programs": ["vboxsvc.exe", "vboxheadless.exe"] }, "expected": "secondary" },
+    { "name": "disabled rule is ignored", "input": { "rules": [ { "value": "a.exe", "route": "secondary", "enabled": false } ], "programs": ["a.exe"] }, "expected": "primary" },
+    { "name": "first covering rule wins", "input": { "rules": [ { "value": "a*.exe", "route": "primary", "enabled": true }, { "value": "a.exe", "route": "secondary", "enabled": true } ], "programs": ["a.exe"] }, "expected": "primary" },
+    { "name": "programs that differ are mixed", "input": { "rules": [ { "value": "a.exe", "route": "secondary", "enabled": true } ], "programs": ["a.exe", "b.exe"] }, "expected": "mixed" },
+    { "name": "a deny is a route of its own", "input": { "rules": [ { "value": "a.exe", "route": "block", "enabled": true } ], "programs": ["a.exe"] }, "expected": "block" },
+    { "name": "non-ASCII names", "input": { "rules": [ { "value": "ПРОГРАММА.exe", "route": "secondary", "enabled": true } ], "programs": ["программа.exe"] }, "expected": "secondary" }
+  ]
+}

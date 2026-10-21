@@ -198,6 +198,8 @@ fn run_primary(
     guard: SingleInstanceGuard,
 ) -> ExitCode {
     let tag = surface_tag(config.surface);
+    // No write handle means the settings file could not be read this session.
+    let preferences_unreadable = store.is_none();
     // The single-instance lock for `tag` is confirmed held by this process
     // (that's the only way `run_primary` gets called) — safe to rotate the
     // previous session's log out of the way before the first line lands.
@@ -261,6 +263,7 @@ fn run_primary(
         &backend_bundle,
         &request,
         tray_status,
+        preferences_unreadable,
     ) {
         Ok(path) => path,
         Err(error) => {
@@ -339,6 +342,14 @@ fn run_primary(
         env::var("NRR_QML_AUTOCLOSE_MS").ok()
     }) {
         host_arguments.push(argument);
+    }
+    // Only Linux ships the xcb and wayland plugins; elsewhere a stray DISPLAY
+    // (XQuartz) would ask for a plugin the host cannot load.
+    if cfg!(target_os = "linux") {
+        if let Some(arguments) = tray_platform_arguments(config.surface, |name| env::var(name).ok())
+        {
+            host_arguments.extend(arguments.map(str::to_owned));
+        }
     }
 
     // In a cargo tree the Qt host lives deep under `target/<profile>/build/…`,
@@ -467,6 +478,7 @@ fn run_primary(
     // them) are still on their way through the reader threads.
     const HOST_EXIT_DRAIN: Duration = Duration::from_millis(300);
     let mut host_gone = false;
+    let mut oversize_logged = false;
     loop {
         let poll = if host_gone {
             HOST_EXIT_DRAIN
@@ -531,6 +543,29 @@ fn run_primary(
             // Qt messages, QML console.log and `NRR_HOST_*` markers reach the
             // per-surface log, which outlives a launcher spawned detached.
             child_process::HostMessage::Log(text) => diag_log(tag, &format!("child: {text}")),
+            // The request is lost; its caller is told rather than left waiting.
+            child_process::HostMessage::Oversized(head) => {
+                if !oversize_logged {
+                    oversize_logged = true;
+                    diag_log(
+                        tag,
+                        "nrr-launcher: dropped a host stdout line over the size limit",
+                    );
+                }
+                if let (Some(stdin), Some(id)) = (
+                    child_stdin.as_ref(),
+                    child_process::oversized_request_id(head),
+                ) {
+                    crate::rpc_dispatcher::write_response(
+                        stdin,
+                        &nrr_shared::launcher_rpc::LauncherRpcResponse::err(
+                            id,
+                            nrr_shared::client_error_codes::MALFORMED_INPUT,
+                            "the request was too large to carry",
+                        ),
+                    );
+                }
+            }
         }
     }
     diag_log(
@@ -598,6 +633,23 @@ fn auto_close_argument(
         .ok()
         .filter(|ms| *ms > 0)?;
     Some(format!("--nrr-auto-close-ms={ms}"))
+}
+
+/// Qt platform for the tray host. A Wayland client cannot place its own window,
+/// so the tray's corner notice landed mid-screen; through XWayland it keeps its
+/// corner, and without XWayland Qt falls back to Wayland. A platform the user
+/// chose is kept. An argument, not `QT_QPA_PLATFORM`: the main window the tray
+/// starts must not inherit it.
+fn tray_platform_arguments(
+    surface: LauncherSurface,
+    read: impl Fn(&str) -> Option<String>,
+) -> Option<[&'static str; 2]> {
+    let set = |name: &str| read(name).is_some_and(|value| !value.trim().is_empty());
+    let wayland = set("WAYLAND_DISPLAY")
+        || read("XDG_SESSION_TYPE")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("wayland"));
+    (surface == LauncherSurface::Tray && wayland && set("DISPLAY") && !set("QT_QPA_PLATFORM"))
+        .then_some(["-platform", "xcb;wayland"])
 }
 
 /// How long a duplicate launch waits for the primary to consume the activation
@@ -873,13 +925,21 @@ pub fn write_activation_request_with_note(
 
     let serialized =
         serde_json::to_string(&serde_json::Value::Object(payload)).map_err(io::Error::other)?;
+    // Written beside and renamed in: the host polls this file and must never
+    // read half of it.
+    let mut staging = path.as_os_str().to_owned();
+    staging.push(".tmp");
+    let staging = std::path::PathBuf::from(staging);
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(path)?;
+        .open(&staging)?;
     file.write_all(serialized.as_bytes())?;
-    Ok(())
+    drop(file);
+    fs::rename(&staging, path).inspect_err(|_| {
+        let _ = fs::remove_file(&staging);
+    })
 }
 
 // ─── Preferences round-trip ──────────────────────────────────────────────

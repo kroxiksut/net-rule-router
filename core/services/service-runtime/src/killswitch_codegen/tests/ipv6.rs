@@ -31,8 +31,8 @@ fn catch_all_emits_v6_exemptions_and_block_all_at_both_v6_layers() {
         let at: Vec<_> = out.iter().filter(|f| f.layer == layer).collect();
         assert_eq!(
             at.len(),
-            4,
-            "{layer:?}: loopback + link-local + link-local-multicast exemptions + one block-all"
+            5,
+            "{layer:?}: tunnel egress + loopback + link-local + link-local-multicast exemptions + one block-all"
         );
         // ::1/128, fe80::/10 and ff02::/16 exemptions.
         assert!(at.iter().any(|f| f.action == WfpAction::Permit
@@ -82,13 +82,61 @@ fn catch_all_v6_coverage_present_even_when_only_tcp_udp_selected() {
     );
     assert_eq!(
         v6_filters(&out).len(),
-        8,
-        "8 V6 filters regardless of V4 mask"
+        10,
+        "10 V6 filters regardless of V4 mask"
+    );
+}
+
+/// With the tunnel up, IPv6 leaving through it is allowed exactly as IPv4 is:
+/// the v6 egress permit is bound to the tunnel's own LUID, read from the
+/// resolution even when the shared exemption record carries none. No v6
+/// permit without an interface or destination condition is ever emitted.
+#[test]
+fn the_catch_all_permits_v6_egress_through_the_tunnel_only() {
+    let resolution = full_resolution();
+    let out = catch_all_kill_switch_filters(
+        "S",
+        &resolution,
+        &FailClosedExemptions::default(),
+        KillSwitchProtocols::ALL,
+    );
+    for layer in [
+        WfpLayerKey::AleAuthConnectV6,
+        WfpLayerKey::OutboundIpPacketV6,
+    ] {
+        let egress: Vec<_> = out
+            .iter()
+            .filter(|f| {
+                f.layer == layer
+                    && f.action == WfpAction::Permit
+                    && f.local_interface_luid.is_some()
+            })
+            .collect();
+        assert_eq!(egress.len(), 1, "{layer:?}: one tunnel egress permit");
+        assert_eq!(
+            egress[0].local_interface_luid,
+            Some(resolution.secondary_luid),
+            "{layer:?}: the egress permit names the tunnel"
+        );
+        let block = out
+            .iter()
+            .find(|f| f.layer == layer && f.action == WfpAction::Block)
+            .expect("v6 block-all");
+        assert!(egress[0].weight > block.weight);
+    }
+    assert!(
+        v6_filters(&out)
+            .iter()
+            .all(|f| f.action != WfpAction::Permit
+                || f.local_interface_luid.is_some()
+                || f.remote_subnet_v6.is_some()
+                || !f.remote_ip_set_v6.is_empty()),
+        "an unconditional v6 permit would let IPv6 out over the main link"
     );
 }
 
 #[test]
-fn fail_closed_mode_b_emits_v6_coverage() {
+fn the_block_all_emits_v6_coverage() {
     let out = fail_closed_block_all_filters(
         "S",
         &FailClosedExemptions::default(),
@@ -97,7 +145,7 @@ fn fail_closed_mode_b_emits_v6_coverage() {
     assert_eq!(
         v6_filters(&out).len(),
         8,
-        "V6 half present in fail-closed mode B"
+        "V6 half present in the block-all"
     );
 }
 
@@ -155,7 +203,7 @@ fn v6_filter_ids_are_distinct_across_layers_and_targets() {
 fn the_v6_block_spares_the_tunnel_endpoint_and_the_local_prefix() {
     let server: std::net::Ipv6Addr = "2001:db8:ffff::7".parse().expect("literal");
     let lan: std::net::Ipv6Addr = "2001:db8:1::".parse().expect("literal");
-    let out = catch_all_v6_filters("S", 0x1234, &[server], &[(lan, 64)]);
+    let out = catch_all_v6_filters("S", 0x1234, &[server], &[(lan, 64)], false);
     for layer in [
         WfpLayerKey::AleAuthConnectV6,
         WfpLayerKey::OutboundIpPacketV6,
@@ -225,4 +273,72 @@ fn the_v6_pin_set_skips_the_scopes_that_must_never_be_cut() {
         out.is_empty(),
         "every input was an address that must never be cut"
     );
+}
+
+/// The packet layer has no user condition, so with another principal on the
+/// machine the v6 cut must live at the ALE layer alone: any packet-layer v6
+/// block would take that principal's IPv6 down with ours.
+#[test]
+fn with_other_principals_the_v6_cut_has_no_packet_layer_filter() {
+    let server: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let lan = ("2001:db8:1::".parse::<Ipv6Addr>().unwrap(), 64u8);
+    let out = catch_all_v6_filters("S", 7, &[server], &[lan], true);
+    assert!(
+        out.iter()
+            .all(|f| f.layer != WfpLayerKey::OutboundIpPacketV6),
+        "a machine-wide v6 packet filter survived"
+    );
+    assert!(
+        out.iter().any(|f| f.layer == WfpLayerKey::AleAuthConnectV6
+            && f.action == WfpAction::Block
+            && f.user_sid.as_deref() == Some("S")),
+        "the per-SID ALE v6 block must remain"
+    );
+    assert!(out
+        .iter()
+        .any(|f| f.layer == WfpLayerKey::AleAuthConnectV6 && f.local_interface_luid == Some(7)));
+    assert!(out
+        .iter()
+        .any(|f| f.remote_subnet_v6 == Some((server, 128))));
+}
+
+/// The block-all honours the flag: with another principal holding a block, no
+/// machine-wide v6 packet filter is emitted at all.
+#[test]
+fn the_flag_reaches_the_block_all() {
+    let ex = FailClosedExemptions {
+        secondary_luid: 7,
+        ..FailClosedExemptions::default()
+    };
+    let alone = fail_closed_block_all_filters_for("S", &ex, KillSwitchProtocols::ALL, false);
+    let shared = fail_closed_block_all_filters_for("S", &ex, KillSwitchProtocols::ALL, true);
+    assert!(alone
+        .iter()
+        .any(|f| f.layer == WfpLayerKey::OutboundIpPacketV6));
+    assert!(shared
+        .iter()
+        .all(|f| f.layer != WfpLayerKey::OutboundIpPacketV6));
+    // The v4 packet layer (named protocols) is untouched by the flag.
+    assert!(shared
+        .iter()
+        .any(|f| f.layer == WfpLayerKey::OutboundTransportV4));
+}
+
+#[test]
+fn a_user_block_mirror_outranks_every_v6_packet_exemption() {
+    let server: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let lan = ("2001:db8:1::".parse::<Ipv6Addr>().unwrap(), 64u8);
+    let out = catch_all_v6_filters("S", 7, &[server], &[lan], false);
+    let packet_permits: Vec<_> = out
+        .iter()
+        .filter(|f| f.layer == WfpLayerKey::OutboundIpPacketV6 && f.action == WfpAction::Permit)
+        .collect();
+    assert!(packet_permits.len() >= 5);
+    for p in packet_permits {
+        assert!(
+            p.weight < crate::wfp_bands::BASE_BLOCK,
+            "a v6 packet exemption at {:#x} would outrank the packet mirror of a user Block",
+            p.weight
+        );
+    }
 }

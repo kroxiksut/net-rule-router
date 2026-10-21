@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use nrr_shared::ipc_payloads::StatusUpdateEvent;
 use nrr_storage::{
-    AutostartLastKnownState, AutostartStateRecord, AutostartStateRepository, LogRetentionConfig,
+    AutostartStateRecord, AutostartStateRepository, LogRetentionConfig,
     LogRetentionConfigRepository, RetentionSettings, RetentionSettingsRepository,
     RoutingPauseStateRepository,
 };
@@ -30,7 +30,7 @@ use crate::ipc_handlers::payloads::{
     RetentionSettingsDto, RetentionSettingsSetRequest, RoutingPauseDto, StorageUsageDto,
 };
 use crate::ipc_handlers::providers::{
-    ApplyFailurePolicyProvider, ApplyFailurePolicyWriter, AutostartProvider, AutostartWriter,
+    ApplyFailurePolicyProvider, ApplyFailurePolicyWriter, AutostartProvider,
     LogRetentionConfigProvider, LogRetentionConfigWriter, RetentionSettingsProvider,
     RetentionSettingsWriter, RoutingPauseProvider, RoutingPauseWriter, SettingsWriteError,
     StorageUsageProvider,
@@ -194,6 +194,8 @@ impl RetentionSettingsWriter for ProductionRetentionSettings {
         let repo = RetentionSettingsRepository::new(&conn);
         repo.set(&payload, now)
             .map_err(|e| SettingsWriteError::Storage(e.to_string()))?;
+        // A tighter limit applies on save, not at the next hourly pass.
+        crate::service_tasks::run_revisions_retention_pass(&conn, now);
         let written = repo
             .get_or_default()
             .map_err(|e| SettingsWriteError::Storage(e.to_string()))?;
@@ -527,6 +529,8 @@ impl RoutingPauseWriter for ProductionRoutingPause {
                 StatusUpdateEvent::RoutingPauseStateChanged {
                     sid: sid.to_string(),
                     paused,
+                    resumes_at_ms: None,
+                    until_restart: false,
                 },
             );
         }
@@ -543,7 +547,6 @@ where
     conn: Arc<Mutex<Connection>>,
     helper: Arc<nrr_platform_api::autostart::AutostartHelper<P>>,
     tray_binary_path: PathBuf,
-    event_bus: Option<Arc<EventBus>>,
 }
 
 impl<P> ProductionAutostart<P>
@@ -559,13 +562,7 @@ where
             conn,
             helper,
             tray_binary_path,
-            event_bus: None,
         }
-    }
-
-    pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
-        self.event_bus = Some(bus);
-        self
     }
 
     fn record_to_dto(rec: AutostartStateRecord) -> AutostartDto {
@@ -630,64 +627,6 @@ where
             Ok(state) => Self::merge_observation(rec, state),
             Err(_) => Self::record_to_dto(rec),
         }
-    }
-}
-
-impl<P> AutostartWriter for ProductionAutostart<P>
-where
-    P: nrr_platform_api::autostart::AutostartRegistryPort + Send + Sync + 'static,
-{
-    fn toggle(&self, sid: &str, enabled: bool) -> Result<AutostartDto, SettingsWriteError> {
-        let helper_outcome = if enabled {
-            self.helper.set_enabled(&self.tray_binary_path)
-        } else {
-            self.helper.clear()
-        };
-        helper_outcome.map_err(|e| match e {
-            nrr_platform_api::autostart::AutostartError::InvalidPath => {
-                SettingsWriteError::Invalid("autostart binary path is invalid".into())
-            }
-            nrr_platform_api::autostart::AutostartError::RegistryAccess { code, message } => {
-                SettingsWriteError::Storage(format!(
-                    "registry access failed (code={code}): {message}"
-                ))
-            }
-        })?;
-
-        // Persist intent in the singleton row + record observed state.
-        let observed = self
-            .helper
-            .get_state(&self.tray_binary_path)
-            .map_err(|e| SettingsWriteError::Storage(format!("autostart probe failed: {e}")))?;
-        let now = now_secs();
-        let last_known = match &observed {
-            nrr_platform_api::autostart::AutostartCurrentState::Enabled { .. } => {
-                Some(AutostartLastKnownState::Enabled)
-            }
-            nrr_platform_api::autostart::AutostartCurrentState::Disabled => {
-                Some(AutostartLastKnownState::Disabled)
-            }
-            nrr_platform_api::autostart::AutostartCurrentState::OverriddenExternally { .. } => {
-                Some(AutostartLastKnownState::OverriddenExternally)
-            }
-        };
-        let conn = lock_conn(&self.conn)?;
-        let repo = AutostartStateRepository::new(&conn);
-        repo.set(enabled, last_known, now)
-            .map_err(|e| SettingsWriteError::Storage(e.to_string()))?;
-        let rec = repo
-            .get_or_default()
-            .map_err(|e| SettingsWriteError::Storage(e.to_string()))?;
-        let dto = Self::merge_observation(rec, observed);
-        // A caller the transport could not name has no subscriber to tell.
-        if let Some(bus) = self.event_bus.as_ref().filter(|_| !sid.is_empty()) {
-            bus.publish(StatusUpdateEvent::AutostartStateChanged {
-                sid: sid.to_string(),
-                enabled: dto.enabled,
-                last_known_state: dto.last_known_state.clone(),
-            });
-        }
-        Ok(dto)
     }
 }
 
@@ -1361,47 +1300,3 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
 // `service_stability_handlers.rs` tests) round-tripped through real SQLite.
 #[cfg(test)]
 mod service_stability_tests;
-
-#[cfg(test)]
-mod autostart_push_tests {
-    use super::*;
-    use nrr_platform_api::autostart::{AutostartHelper, MockAutostartRegistry};
-    use nrr_storage::{open_connection, repository::MigrationRunner, SqliteMigrationRunner};
-
-    fn autostart_on(bus: &Arc<EventBus>) -> (tempfile::TempDir, impl AutostartWriter) {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let conn = open_connection(&dir.path().join("nrr_service_state.db")).expect("open");
-        let runner = SqliteMigrationRunner::for_state_db(conn);
-        runner.run_pending_migrations().expect("migrate");
-        let writer = ProductionAutostart::new(
-            Arc::new(Mutex::new(runner.into_connection())),
-            Arc::new(AutostartHelper::new(MockAutostartRegistry::new())),
-            std::env::temp_dir().join("NetRuleRouterTray.exe"),
-        )
-        .with_event_bus(Arc::clone(bus));
-        (dir, writer)
-    }
-
-    /// Autostart lives in the user's own hive. Broadcast, one user's click
-    /// flipped the switch on every other session's settings page.
-    #[test]
-    fn an_autostart_change_reaches_only_the_user_who_made_it() {
-        let bus = Arc::new(EventBus::new());
-        let alice = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), Some(0));
-        let bob = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), Some(0));
-        let (_dir, autostart) = autostart_on(&bus);
-
-        autostart.toggle("S-1-A", true).expect("toggle");
-
-        let mine = bus.peek_pending_for(&alice.subscription_id, 16);
-        assert_eq!(mine.len(), 1);
-        assert!(matches!(
-            &mine[0].event,
-            StatusUpdateEvent::AutostartStateChanged { sid, enabled: true, .. } if sid == "S-1-A"
-        ));
-        assert!(
-            bus.peek_pending_for(&bob.subscription_id, 16).is_empty(),
-            "another session must not see this user's autostart change"
-        );
-    }
-}

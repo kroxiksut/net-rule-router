@@ -695,7 +695,7 @@ if [ "$want_deb" -eq 1 ]; then
     qt_modules=""
     for module in qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-templates \
       qml6-module-qtquick-layouts qml6-module-qtquick-window qml6-module-qtquick-dialogs \
-      qml6-module-qt-labs-platform qml6-module-qtqml-workerscript qt6-qpa-plugins; do
+      qml6-module-qt-labs-platform qml6-module-qtqml-workerscript qt6-qpa-plugins qt6-svg-plugins; do
       qt_modules="$qt_modules, $module (>= $qt_floor)"
     done
     depends="$base_name (= $deb_version), $(deb_shlibs "${gui_elves[@]}")$qt_modules"
@@ -786,7 +786,10 @@ fi'
       rpm_scriptlet '%preun' 'if [ "$1" -eq 0 ]; then
   nrr_pkg_stop_and_reset_network
 fi'
-      rpm_scriptlet '%postun' 'if [ "$1" -eq 0 ] && nrr_pkg_have_systemd; then
+      rpm_scriptlet '%postun' 'if [ "$1" -eq 0 ]; then
+  nrr_pkg_finish_dns_undo
+fi
+if [ "$1" -eq 0 ] && nrr_pkg_have_systemd; then
   systemctl daemon-reload || true
   systemctl reset-failed "$NRR_UNIT_NAME" >/dev/null 2>&1 || true
 fi'
@@ -832,6 +835,7 @@ if [ "$want_rpm" -eq 1 ]; then
       "Requires: $base_name = $package_version-$release" \
       "Requires: qt6-qtbase-gui >= $rpm_qt_floor" \
       "Requires: qt6-qtdeclarative >= $rpm_qt_floor" \
+      "Requires: qt6-qtsvg >= $rpm_qt_floor" \
       "Requires: polkit" \
       "Recommends: qt6-qtwayland"
   fi

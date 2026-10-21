@@ -331,6 +331,7 @@ pub(super) fn ale_set_filter(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: proto,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -370,5 +371,6 @@ pub(super) fn packet_set_filter(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: proto,
+        remote_subnet_set: Vec::new(),
     }
 }

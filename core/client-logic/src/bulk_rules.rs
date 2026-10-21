@@ -21,7 +21,7 @@ use nrr_shared::auto_rule::{parse_provenance_comment, AUTO_SECTION_NAME};
 use nrr_shared::preset_parser::{
     carries_retired_block_flag, is_disabled_rule_value, is_syntax_hint_line, parse_section_header,
     split_deny, split_rule_flags, split_rule_markers, split_verify_primary, stored_rule_value,
-    without_retired_block_flag, RuleFlags,
+    unquote_program_value, without_retired_block_flag, RuleFlags,
 };
 use nrr_shared::rule_value_class::{classify_rule_value, rule_type_from_slug, RuleValueClass};
 
@@ -512,7 +512,13 @@ impl<'a> Planner<'a> {
         if value.is_empty() {
             return None;
         }
-        if hashed {
+        let quoted = if rule_type == "application" {
+            unquote_program_value(value)
+        } else {
+            None
+        };
+        let value = quoted.unwrap_or(value);
+        if hashed && quoted.is_none() {
             let parsed = rule_type_from_slug(rule_type)?;
             if !is_disabled_rule_value(parsed, value) {
                 return None;

@@ -46,7 +46,7 @@ fn only_the_rule_dialog_save_notes_an_own_edit() {
 #[test]
 fn a_stale_pass_does_not_settle_an_edit_it_has_not_read() {
     let main = qml("Main.qml");
-    assert!(main.contains("ok && !_rulesOverlapStale)"));
+    assert!(main.contains("ok && !_rulesOverlapStale, !!ok)"));
     let controller = qml("flows/RuleOverlapsController.qml");
     let update = function_body(&controller, "update");
     assert!(update.contains("fresh === false"));

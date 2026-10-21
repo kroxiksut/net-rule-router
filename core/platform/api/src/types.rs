@@ -398,6 +398,14 @@ pub struct WfpFilterSpec {
     /// `fe80::/10`. Single hosts go in [`Self::remote_ip_set_v6`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_subnet_v6: Option<(Ipv6Addr, u8)>,
+    /// Match condition: SEVERAL remote subnets of the layer's family, one
+    /// `FWPM_CONDITION_IP_REMOTE_ADDRESS` condition each. WFP ORs conditions
+    /// that share a field key, so one filter carries a whole tunnel's networks.
+    /// Two or more entries; a single subnet uses [`Self::remote_subnet`] /
+    /// [`Self::remote_subnet_v6`], and the three are mutually exclusive. Sorted
+    /// and free of duplicates when emitted by codegen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_subnet_set: Vec<(IpAddr, u8)>,
     /// Match condition (multi-protocol kill-switch): IP protocol
     /// number (`FWPM_CONDITION_IP_PROTOCOL`, `FWP_UINT8`). Common values:
     /// ICMP=1, IGMP=2, TCP=6, UDP=17, GRE=47, ESP=50. `None` = any protocol.
@@ -408,6 +416,34 @@ pub struct WfpFilterSpec {
     /// `FWP_E_CONDITION_NOT_FOUND`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip_protocol: Option<u8>,
+}
+
+/// Most subnet conditions one filter carries (`remote_subnet_set`). The
+/// engine accepts far more; this is the bound codegen and decode both keep.
+pub const MAX_REMOTE_SUBNETS: usize = 256;
+
+fn subnet_has_v4(net: Ipv4Addr, len: u8, ip: Ipv4Addr) -> bool {
+    let len = u32::from(len.min(32));
+    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    u32::from(net) & mask == u32::from(ip) & mask
+}
+
+fn subnet_has_v6(net: Ipv6Addr, len: u8, ip: Ipv6Addr) -> bool {
+    let len = u32::from(len.min(128));
+    let mask = if len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - len)
+    };
+    u128::from(net) & mask == u128::from(ip) & mask
+}
+
+fn set_has(set: &[(IpAddr, u8)], ip: IpAddr) -> bool {
+    set.iter().any(|(net, len)| match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(a)) => subnet_has_v4(*n, *len, a),
+        (IpAddr::V6(n), IpAddr::V6(a)) => subnet_has_v6(*n, *len, a),
+        _ => false,
+    })
 }
 
 impl WfpFilterSpec {
@@ -445,6 +481,7 @@ impl WfpFilterSpec {
             || !self.remote_ip_set_v6.is_empty()
             || self.remote_subnet.is_some()
             || self.remote_subnet_v6.is_some()
+            || !self.remote_subnet_set.is_empty()
     }
 
     /// Whether leaving this filter out lets through traffic it exists to stop:
@@ -458,13 +495,17 @@ impl WfpFilterSpec {
     /// Whether this filter's v4 destination conditions cover `ip` — the
     /// single-address form or the packed set.
     pub fn covers_v4(&self, ip: Ipv4Addr) -> bool {
-        self.remote_ip == Some(ip) || self.remote_ip_set.contains(&ip)
+        self.remote_ip == Some(ip)
+            || self.remote_ip_set.contains(&ip)
+            || set_has(&self.remote_subnet_set, IpAddr::V4(ip))
     }
 
     /// Whether this filter's v6 destination conditions cover `ip` — the packed
     /// set or a `/128` subnet condition, the two spellings of one host.
     pub fn covers_v6(&self, ip: Ipv6Addr) -> bool {
-        self.remote_ip_set_v6.contains(&ip) || self.remote_subnet_v6 == Some((ip, 128))
+        self.remote_ip_set_v6.contains(&ip)
+            || self.remote_subnet_v6 == Some((ip, 128))
+            || set_has(&self.remote_subnet_set, IpAddr::V6(ip))
     }
 
     pub fn validate_layer_conditions(&self) -> Result<(), &'static str> {
@@ -480,6 +521,22 @@ impl WfpFilterSpec {
             }
             if !self.layer.is_v6() {
                 return Err("an IPv6 address condition needs an IPv6 layer");
+            }
+        }
+        if !self.remote_subnet_set.is_empty() {
+            if self.remote_subnet.is_some() || self.remote_subnet_v6.is_some() {
+                return Err("remote_subnet_set and a single remote subnet are mutually exclusive");
+            }
+            if self.remote_subnet_set.len() > MAX_REMOTE_SUBNETS {
+                return Err("remote_subnet_set is over the per-filter cap");
+            }
+            let v6 = self.layer.is_v6();
+            if self
+                .remote_subnet_set
+                .iter()
+                .any(|(net, len)| net.is_ipv6() != v6 || *len > if v6 { 128 } else { 32 })
+            {
+                return Err("remote_subnet_set holds a subnet of the wrong family or length");
             }
         }
         if self.layer.is_forwarding() && self.remote_port.is_some() {
@@ -552,6 +609,11 @@ pub struct WfpFilterRecord {
     /// IPv6 exemption permits with their subnet condition intact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_subnet_v6: Option<(Ipv6Addr, u8)>,
+    /// Mirrors `WfpFilterSpec::remote_subnet_set`; enumeration recovers every
+    /// subnet condition beyond the first, so rollback re-adds the whole set
+    /// rather than a filter that matches more.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_subnet_set: Vec<(IpAddr, u8)>,
     /// Multi-protocol kill-switch: `FWPM_CONDITION_IP_PROTOCOL`
     /// (`FWP_UINT8`) value the filter was added with. The enumeration path
     /// recovers it, so rollback re-adds packet-layer kill-switch filters with
@@ -565,12 +627,16 @@ impl WfpFilterRecord {
     /// single-address form or the packed set. Twin of
     /// [`WfpFilterSpec::covers_v4`].
     pub fn covers_v4(&self, ip: Ipv4Addr) -> bool {
-        self.remote_ip == Some(ip) || self.remote_ip_set.contains(&ip)
+        self.remote_ip == Some(ip)
+            || self.remote_ip_set.contains(&ip)
+            || set_has(&self.remote_subnet_set, IpAddr::V4(ip))
     }
 
     /// Twin of [`WfpFilterSpec::covers_v6`].
     pub fn covers_v6(&self, ip: Ipv6Addr) -> bool {
-        self.remote_ip_set_v6.contains(&ip) || self.remote_subnet_v6 == Some((ip, 128))
+        self.remote_ip_set_v6.contains(&ip)
+            || self.remote_subnet_v6 == Some((ip, 128))
+            || set_has(&self.remote_subnet_set, IpAddr::V6(ip))
     }
 }
 
@@ -620,5 +686,73 @@ mod service_account_tests {
         for sid in ["S-1-5-21-1-2-3-1001", "S-1-12-1-5", "", "unix:uid:0"] {
             assert!(!is_service_account_sid(sid), "{sid}");
         }
+    }
+}
+
+#[cfg(test)]
+mod subnet_set_tests {
+    use super::*;
+
+    fn permit(layer: WfpLayerKey, set: Vec<(IpAddr, u8)>) -> WfpFilterSpec {
+        WfpFilterSpec {
+            layer,
+            action: WfpAction::Permit,
+            remote_ip: None,
+            remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
+            remote_port: None,
+            weight: 1,
+            id: WfpFilterId { raw: 1 },
+            user_sid: None,
+            app_pattern: None,
+            local_interface_luid: Some(7),
+            remote_subnet: None,
+            remote_subnet_v6: None,
+            remote_subnet_set: set,
+            ip_protocol: None,
+        }
+    }
+
+    fn v4(a: u8, b: u8, len: u8) -> (IpAddr, u8) {
+        (IpAddr::V4(Ipv4Addr::new(a, b, 0, 0)), len)
+    }
+
+    #[test]
+    fn a_subnet_set_covers_its_members_and_nothing_else() {
+        let f = permit(
+            WfpLayerKey::AleAuthConnectV4,
+            vec![v4(10, 1, 16), v4(172, 16, 12)],
+        );
+        assert!(f.names_a_destination());
+        assert!(f.covers_v4(Ipv4Addr::new(10, 1, 200, 3)));
+        assert!(f.covers_v4(Ipv4Addr::new(172, 31, 0, 1)));
+        assert!(!f.covers_v4(Ipv4Addr::new(10, 2, 0, 1)));
+        assert!(!f.covers_v4(Ipv4Addr::new(172, 32, 0, 1)));
+        assert!(!f.covers_v6(Ipv6Addr::LOCALHOST), "another family");
+        assert!(f.validate_layer_conditions().is_ok());
+    }
+
+    #[test]
+    fn a_subnet_set_is_refused_when_it_cannot_be_what_it_says() {
+        let mut both = permit(WfpLayerKey::AleAuthConnectV4, vec![v4(10, 1, 16)]);
+        both.remote_subnet = Some((Ipv4Addr::new(10, 9, 0, 0), 16));
+        assert!(both.validate_layer_conditions().is_err(), "single and set");
+
+        let wrong_family = permit(WfpLayerKey::AleAuthConnectV6, vec![v4(10, 1, 16)]);
+        assert!(wrong_family.validate_layer_conditions().is_err());
+
+        let too_long = permit(WfpLayerKey::AleAuthConnectV4, vec![v4(10, 1, 33)]);
+        assert!(too_long.validate_layer_conditions().is_err());
+
+        let many: Vec<_> = (0..=MAX_REMOTE_SUBNETS)
+            .map(|n| {
+                (
+                    IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + ((n as u32) << 8))),
+                    24,
+                )
+            })
+            .collect();
+        let over = permit(WfpLayerKey::AleAuthConnectV4, many);
+        assert!(over.validate_layer_conditions().is_err(), "past the bound");
     }
 }

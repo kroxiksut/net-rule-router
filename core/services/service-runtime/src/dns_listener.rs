@@ -90,13 +90,22 @@ enum Transport {
 #[derive(Default)]
 struct SourceLimiter {
     buckets: HashMap<SocketAddr, (f64, Instant)>,
+    /// The full table is swept at most once per [`SOURCE_IDLE`]: a sweep per
+    /// newcomer cost every datagram of a many-socket flood a pass over the table.
+    swept: Option<Instant>,
 }
 
 impl SourceLimiter {
     fn admit(&mut self, src: SocketAddr, now: Instant) -> bool {
         if self.buckets.len() >= SOURCE_TABLE_CAP && !self.buckets.contains_key(&src) {
-            self.buckets
-                .retain(|_, (_, seen)| now.duration_since(*seen) < SOURCE_IDLE);
+            if self
+                .swept
+                .is_none_or(|at| now.duration_since(at) >= SOURCE_IDLE)
+            {
+                self.swept = Some(now);
+                self.buckets
+                    .retain(|_, (_, seen)| now.duration_since(*seen) < SOURCE_IDLE);
+            }
             if self.buckets.len() >= SOURCE_TABLE_CAP {
                 // A flood from thousands of sockets has filled the table; the
                 // queue bound still holds, and a newcomer is not refused for it.
@@ -148,6 +157,34 @@ impl ShedLog {
             shed = self.shed,
             "Mode B: a DNS query was failed at once instead of queued — the listener is saturated or one source is past its share",
         );
+    }
+}
+
+/// What every thread of one serve loop watches: the caller's `stop`, or the
+/// receive loop having ended on its own (an error streak, a panic).
+#[derive(Clone, Copy)]
+struct StopSignal<'a> {
+    stop: &'a AtomicBool,
+    ended: &'a AtomicBool,
+}
+
+impl StopSignal<'_> {
+    fn is_set(self) -> bool {
+        self.stop.load(Ordering::Relaxed) || self.ended.load(Ordering::Relaxed)
+    }
+}
+
+/// Dropped when the receive loop ends, by return or by unwind.
+struct ServeEnd<'a> {
+    ended: &'a AtomicBool,
+    on_stop: &'a dyn Fn(),
+}
+
+impl Drop for ServeEnd<'_> {
+    fn drop(&mut self) {
+        // Caught: a panic here while already unwinding would abort the service.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.on_stop)()));
+        self.ended.store(true, Ordering::Relaxed);
     }
 }
 
@@ -206,12 +243,18 @@ pub type PrivateResolversFn = Arc<dyn Fn(Duration) -> Vec<std::net::Ipv4Addr> + 
 pub type ShortNameSuffixFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// How many private resolvers are re-asked before a "no such name" stands.
-/// A machine has one or two; the bound only stops a strange configuration
-/// from turning one failed lookup into a burst.
-const MAX_PRIVATE_RETRIES: usize = 2;
+/// Enough for a corporate resolver that is not first by metric; the datagram's
+/// time budget, not this count, is the real bound on the burst.
+const MAX_PRIVATE_RETRIES: usize = 4;
 
-/// What policy may do about IPv6 for the routing principal right now.
-pub type Ipv6DispositionFn = Arc<dyn Fn() -> crate::enforcement_planner::Ipv6Guard + Send + Sync>;
+/// What policy may do about IPv6 for the routing principal right now; `None`
+/// while its first plan is still to come.
+pub type Ipv6DispositionFn =
+    Arc<dyn Fn() -> Option<crate::enforcement_planner::Ipv6Guard> + Send + Sync>;
+
+/// Negative TTL of the AAAA withheld before the first plan: short, so the
+/// family comes back soon after a plan says what carries it.
+const UNPLANNED_AAAA_TTL_SECS: u32 = 5;
 
 /// Admission control for the enforce-before-answer path — see
 /// [`MAX_CONCURRENT_RULE_HOST_RESOLVES`]. A worker that cannot get in within
@@ -443,7 +486,7 @@ impl DnsInterceptListener {
             companion_rescue: Arc::new(NoopCompanionRescue),
             leak_guard: Arc::new(crate::dns_resolver::OpenLeakGuard),
             unresolved: Arc::new(NoopUnresolvedRuleHosts),
-            ipv6_disposition: Arc::new(|| crate::enforcement_planner::Ipv6Guard::Off),
+            ipv6_disposition: Arc::new(|| Some(crate::enforcement_planner::Ipv6Guard::Off)),
             enforced_view: Arc::new(crate::dns_resolver::NoEnforcement),
             upstream_dns: Arc::new(crate::dns_upstream::UpstreamDnsPool::fixed(upstream_dns)),
             deadline,
@@ -757,7 +800,8 @@ impl DnsInterceptListener {
     /// The tunnel carries IPv6: the host's v6 is routed like its v4. Only the
     /// main link does: NODATA, so the client uses the family the tunnel
     /// carries. Nothing carries it: forwarded untouched — suppressing it would
-    /// make a v6-only destination unreachable for no protection at all.
+    /// make a v6-only destination unreachable for no protection at all. No
+    /// plan yet: NODATA, briefly cached.
     ///
     /// The fake-IP probe is [`FakeIpAnswerer::carries_on_v4`], never
     /// `fake_answer`: the latter allocates a lease and records health.
@@ -782,16 +826,23 @@ impl DnsInterceptListener {
             return nodata();
         }
         match (self.ipv6_disposition)() {
-            Ipv6Guard::FiltersAndRoutes => self.route_aaaa(query, qname, lane_wait, budget),
+            // No plan yet (boot, sign-in): nothing routes the host's v6 or pins
+            // it, so a forwarded answer opens the first connection on the main
+            // link. Its IPv4 is answered and routed meanwhile.
+            None => build_negative_response(query, RCODE_NOERROR, UNPLANNED_AAAA_TTL_SECS)
+                .map_or(ListenerAction::Forward, ListenerAction::Respond),
+            Some(Ipv6Guard::FiltersAndRoutes) => self.route_aaaa(query, qname, lane_wait, budget),
             // The tunnel cannot carry the family, so the host's v6 addresses
             // are pinned to it and blocked. Handing one out would only make the
             // client wait on it; its IPv4 rides the tunnel.
-            Ipv6Guard::FiltersOnly => nodata(),
+            Some(Ipv6Guard::FiltersOnly) => nodata(),
             // Nothing pins the family and the tunnel is gone: a forward asks
             // the main link for the name, and its CNAME chain hands the A
             // lookup a target no rule names.
-            Ipv6Guard::Off if self.leak_guard.blocking_for_host(qname) => self.withheld(query),
-            Ipv6Guard::Off => {
+            Some(Ipv6Guard::Off) if self.leak_guard.blocking_for_host(qname) => {
+                self.withheld(query)
+            }
+            Some(Ipv6Guard::Off) => {
                 // A hole, not a routine forward: the user wrote a rule for
                 // this host and its IPv6 traffic is about to ignore it. Said
                 // once per name — silence is what makes "the rule did not
@@ -1081,6 +1132,11 @@ impl DnsInterceptListener {
         socket.set_read_timeout(Some(Duration::from_millis(500)))?;
         let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, SocketAddr)>(SERVE_QUEUE_DEPTH);
         let rx = Mutex::new(rx);
+        let ended = AtomicBool::new(false);
+        let signal = StopSignal {
+            stop,
+            ended: &ended,
+        };
         std::thread::scope(|scope| {
             for _ in 0..SERVE_WORKER_THREADS {
                 scope.spawn(|| loop {
@@ -1094,7 +1150,7 @@ impl DnsInterceptListener {
                     match msg {
                         // Stopping: the system's DNS is restored already and
                         // nobody is waiting on us; the queue is thrown away.
-                        Ok(_) if stop.load(Ordering::Relaxed) => continue,
+                        Ok(_) if signal.is_set() => continue,
                         Ok((query, src)) => self.handle_datagram_contained(socket, &query, src),
                         // Sender dropped — the serve loop exited; drain is done.
                         Err(_) => return,
@@ -1102,8 +1158,15 @@ impl DnsInterceptListener {
                 });
             }
             if let Some(tcp) = tcp {
-                scope.spawn(move || self.accept_tcp(tcp, stop, scope));
+                scope.spawn(move || self.accept_tcp(tcp, signal, scope));
             }
+            // However the receive loop ends, a panic included, the stop hook
+            // runs before the scope joins anything, and the TCP side is told
+            // to quit: it would otherwise wait for a `stop` that never comes.
+            let end = ServeEnd {
+                ended: &ended,
+                on_stop,
+            };
             let mut buf = [0u8; DNS_DATAGRAM_BUFFER_BYTES];
             let mut consecutive_errors = 0u32;
             let mut last_noise_log: Option<Instant> = None;
@@ -1167,7 +1230,7 @@ impl DnsInterceptListener {
                     Err(TrySendError::Disconnected(_)) => break Ok(()),
                 }
             };
-            on_stop();
+            drop(end);
             drop(tx); // disconnect → workers drain the queue and exit
             result
         })
@@ -1203,21 +1266,21 @@ impl DnsInterceptListener {
         );
     }
 
-    /// Accept DNS-over-TCP connections until `stop`. Each connection is one
-    /// scoped thread, at most [`TCP_MAX_CONNECTIONS`] at a time; anything past
-    /// that is closed unread. Polling with a short sleep keeps `stop` honoured:
-    /// `accept` has no timeout of its own.
+    /// Accept DNS-over-TCP connections until serving ends. Each connection is
+    /// one scoped thread, at most [`TCP_MAX_CONNECTIONS`] at a time; anything
+    /// past that is closed unread. Polling with a short sleep keeps the signal
+    /// honoured: `accept` has no timeout of its own.
     fn accept_tcp<'scope, 'env: 'scope>(
         &'scope self,
         tcp: &'scope TcpListener,
-        stop: &'scope AtomicBool,
+        signal: StopSignal<'scope>,
         scope: &'scope std::thread::Scope<'scope, 'env>,
     ) {
         if tcp.set_nonblocking(true).is_err() {
             return;
         }
         let active = &self.tcp_active;
-        while !stop.load(Ordering::Relaxed) {
+        while !signal.is_set() {
             let stream = match tcp.accept() {
                 Ok((stream, _)) => stream,
                 Err(_) => {
@@ -1233,7 +1296,7 @@ impl DnsInterceptListener {
             }
             scope.spawn(move || {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.serve_tcp_connection(stream, stop);
+                    self.serve_tcp_connection(stream, signal);
                 }));
                 active.fetch_sub(1, Ordering::AcqRel);
             });
@@ -1244,7 +1307,7 @@ impl DnsInterceptListener {
     /// same path as a datagram, with the upstream asked over TCP so a large
     /// answer comes back whole. Bounded in idle time, lifetime, query size and
     /// query count; the peer shapes every byte read here.
-    fn serve_tcp_connection(&self, mut stream: TcpStream, stop: &AtomicBool) {
+    fn serve_tcp_connection(&self, mut stream: TcpStream, signal: StopSignal<'_>) {
         use crate::dns_wire::{read_tcp_message, write_tcp_message};
         if stream.set_nonblocking(false).is_err() {
             return;
@@ -1254,7 +1317,7 @@ impl DnsInterceptListener {
         let mut stream =
             DeadlineStream::new(&mut stream, TCP_CONNECTION_LIFETIME, TCP_IDLE_TIMEOUT);
         for _ in 0..TCP_MAX_QUERIES_PER_CONNECTION {
-            if stop.load(Ordering::Relaxed) || opened.elapsed() >= TCP_CONNECTION_LIFETIME {
+            if signal.is_set() || opened.elapsed() >= TCP_CONNECTION_LIFETIME {
                 return;
             }
             let Ok(Some(query)) = read_tcp_message(&mut stream, TCP_MAX_QUERY_BYTES) else {

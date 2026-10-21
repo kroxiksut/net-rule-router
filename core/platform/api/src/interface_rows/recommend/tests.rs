@@ -280,6 +280,27 @@ fn the_sole_default_route_holder_stays_a_primary_whatever_its_kind() {
     }
 }
 
+/// Our fake-IP adapter is no candidate for the way out: whatever it reports,
+/// the provider's link beside it stays the sole uplink by structure.
+#[test]
+fn our_fake_ip_adapter_does_not_spoil_the_sole_uplink() {
+    let mut provider = wired("Provider");
+    provider.kind = AdapterKind::Tunnel;
+    let mut ours = tunnel(nrr_shared::product_identity::TUN_ADAPTER_NAME);
+    ours.has_default_route = true;
+    ours.has_forwarding_path = Some(true);
+    let mut rows = vec![provider, ours];
+
+    assign_recommendations(&mut rows);
+
+    let provider = find(&rows, "Provider");
+    assert!(has_signal(provider, "sole-uplink-by-structure"));
+    assert_eq!(
+        provider.recommendation.class,
+        RecommendationClass::PreferredPrimary
+    );
+}
+
 /// A gateway-less point-to-point uplink (PPPoE) is found by its forwarding
 /// path when no row holds a gateway.
 #[test]

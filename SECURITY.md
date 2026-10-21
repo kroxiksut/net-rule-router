@@ -29,12 +29,17 @@ Browser-side encrypted DNS (DoH/DoT) hides names from the provider and from the 
 
 Each of these is described, with what to do about it, in [`docs/en/known-limitations.md`](docs/en/known-limitations.md), and stays listed until it is fixed:
 - leak protection is not in force for the first seconds after the computer starts, until the service has applied the rules;
-- without virtual addresses (fake-IP; Windows only, off by default), sites that share one server address cannot be routed apart;
+- without virtual addresses (fake-IP; Windows only, on by default for a new installation), sites that share one server address cannot be routed apart;
 - a rule for a site name does not cover an application that looks up names on its own while leak protection is off;
 - on Windows, leak protection that blocks everything for one user also holds back IPv6, ping and VPN protocols such as IPsec for the other users of the computer;
 - with leak protection blocking everything, the sign-in page of a public Wi-Fi network cannot open;
 - on Linux with strict reverse-path filtering, a second signed-in user may get no replies over the additional connection;
-- the tray and the window do not yet offer a way back after the service stops unexpectedly.
+- name lookups are shared by the computer: with several users signed in, they follow the rules of the user who signed in first;
+- on Windows the route table is shared by the computer: an address one user routes through their connection takes that connection for the other signed-in users whose rules do not name it;
+- on a Windows computer where Group Policy manages DNS, a rule for a site name takes effect only after the first connection to the site, virtual addresses do not work, and the app does not say so yet;
+- for names answered on the computer itself (`hosts`, `.local`), a rule for a site name does not take effect.
+
+The installers and binaries are not signed yet (Windows shows an unknown publisher). Release files come with a checksum file and a build attestation: `gh attestation verify <file> --repo kroxiksut/net-rule-router` checks a download against the workflow that built it.
 
 ## Components and who owns what
 
@@ -65,7 +70,7 @@ Each Windows user's rule edits are their own: no other user sees them, and makin
 
 Why a non-elevated edit is safe:
 - **Scope.** A user's edit can only write that user's own data, because the service takes the user from the connection. It cannot reach another user's rules or the baseline.
-- **Isolation.** One user's edit, rollback, reset or cleanup never touches another user's data, and a user's rules only affect that user's traffic.
+- **Isolation.** One user's edit, rollback, reset or cleanup never touches another user's data. On Linux a user's rules route only that user's traffic; on Windows the computer has one route table, so an address one user routes through their connection takes that connection for the other signed-in users too (see [`docs/en/several-users.md`](docs/en/several-users.md)).
 - **Confirmation belongs to the proposer.** A proposed change can be confirmed only by the same user who proposed it. (It is bound to the user, not to the particular app session.)
 - **Audit and integrity.** Every change — own edit, reset, baseline edit — is recorded with its author, and silently reassigning a stored change to a different user is detectable.
 
@@ -96,6 +101,8 @@ On Windows every executable loads libraries only from the Windows system directo
 | `%LOCALAPPDATA%\NetRuleRouter\` | Per-user, per-machine app cache | Writable by that user. |
 | Your rules files | Wherever you saved them | Yours. Imported, never enforced by reference. |
 
+The service trusts what it reads back from its own data folder (the unfinished-activation record, its settings) only because that folder is closed to ordinary users; the service re-secures the folder on every start, and a record it finds there is acted on as its own.
+
 The service never reads the preferences file and holds no rules there. The app does keep a few remembered intents in it — for example a change made while the service was stopped — and replays them to the service when it connects. A replayed intent is an ordinary request from that user: the service validates it like any other, and it cannot reach another user's data or the baseline. Settings that apply to the whole machine are the exception: they are never replayed, not even when the app itself runs as an administrator. When the service uses a different value, the app shows that and changes nothing until the user either applies their choice — an ordinary change that asks for administrator approval — or keeps the service's value. Details of every file: [`docs/en/where-files-live.md`](docs/en/where-files-live.md).
 
 ## Integrity and tamper alerts
@@ -111,7 +118,7 @@ If the check itself cannot run at startup — the signing key or the stored reco
 
 Security alerts stay visible until acknowledged, and while an alert about tampered data is open, rule changes wait.
 
-The audit trail is append-only and hash-chained, is kept separately from operational logs, and is never removed by in-app cleanup. Imports, rejected revisions and every acknowledgement or resolution of a security alert are recorded as events of their own.
+The audit trail is append-only and hash-chained, is kept separately from operational logs, and is never removed by in-app cleanup; it is kept within the retention limits set in Settings, the oldest records going first. Imports, rejected revisions and every acknowledgement or resolution of a security alert are recorded as events of their own.
 
 **Known gaps.**
 - On Linux the signing key is protected by file permissions (readable by the service account only), not encrypted at rest.
@@ -137,12 +144,24 @@ Before an import takes effect, the app shows where the change came from (an edit
 - By default the service applies everything it can and reports any rule it had to skip, so one unresolvable rule does not leave you with no policy at all. An administrator can switch to all-or-nothing, where a failed apply is rolled back to the previous state.
 - After an apply the service checks what was actually installed and reports differences; that check reports, it does not roll back.
 
+## Protection of system programs
+
+A deny or an additional-route rule cannot take what the computer needs to stay on the network: the system folder, critical system processes, network services, folders many programs share, and the product's own programs. The window, the tray and the terminal interface refuse such a rule before it is saved; one already in a rules file is kept but not applied, and the reason is shown.
+
+A user who means it marks the rule `+override` in the rules file, which is only a request. The rule is applied once that user confirms it in the window or the terminal interface, after seeing what it takes and typing its value, for a term they choose (an hour up to until revoked). A rule that reaches past the user's own programs — system folders or processes, service accounts, other users' programs — needs an administrator to confirm it. Confirmations are kept by the service, not in the rules file, so editing a file never grants one, and every confirmation, revocation and expiry is recorded in the audit trail. Restoring the network revokes them all, and so does a run of service failures in a row. The root of a disk and the product's own programs can never be confirmed.
+
+One user's program rule never covers the programs in another user's profile, and a new rule cannot name a folder there; the shared baseline reaches each user's own folder through a profile-relative path such as `%LOCALAPPDATA%` or `~`.
+
 ## Network activity of the product itself
 
-There is no telemetry and no account login. Besides the traffic you route, the product itself:
-- looks up the host names named in your rules and keeps their addresses fresh;
-- checks that the additional connection is alive, and asks a public address-discovery (STUN) service which public address it exits from;
-- when you use rule suggestions, tests whether a site answers over the main connection;
+There is no telemetry and no account login: nothing reports how you use the product. It does make a few requests of its own, most of them in the background, each for something you get from it. Besides the traffic you route, it:
+- looks up the host names named in your rules, and the sites under your domain and zone rules that you opened recently, and keeps their addresses fresh, so a rule keeps working when a site moves to a new address. A name stops being looked up once no rule covers it;
+- asks the DNS server of your own connection which site an address belongs to, when a program reached the address without a name lookup the service saw, so your rules recognise that site too. These lookups are made only while rule suggestions or leak protection are on, and never for a site your own deny rule blocks. Rule suggestions are on by default; with suggestions and leak protection off (Settings → Routing), none are made;
+- checks that the DNS servers of your connection answer, so names are looked up through one that works;
+- checks that the additional connection is alive, with a ping to that connection's own gateway;
+- if you turn on **Check the external address each time the additional route connects** (Settings → Routing behavior → Your VPN client, or Routing in the terminal interface; off by default, per user), asks a public address-discovery (STUN) service of Google or Cloudflare, each time the additional connection comes up, which public address that connection exits from, and shows it in a notification. The same question is asked for each of your connections when you press **Check external address** in the interfaces list (or `x` in the terminal interface), whether the automatic check is on or not. The STUN service learns that address and nothing else;
+- when you ask it to check the main route (on the rule suggestions or on the rules), tests whether those sites answer over the main connection, so you can see whether sending them through the additional one changes anything;
+- when you open a site whose rule is marked `?` (bundled country presets use them), tries whether it opens over the route you wrote and, if it does not, over the other one. Only sites you actually open are tried, never the whole list; a rule without `?` is never tried;
 - once the first release is published (before that, no such request is made), every N days (14 by default, adjustable), from the app window, makes one anonymous request to the project's GitHub releases page to see whether a newer version exists. It only shows a notification: it never downloads, installs or changes routing. The check can be turned off in Settings, and then the request is not made at all. Help → Check for updates makes the same single request when you choose it, whether or not the automatic check is on.
 
 Logging is minimal by default. Verbose logging is an explicit choice that switches itself off after the chosen period or at the next restart. Browser-history seeding is opt-in and reads only the requesting user's own browser profiles.

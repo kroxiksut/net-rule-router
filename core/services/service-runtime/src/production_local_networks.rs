@@ -28,20 +28,55 @@ use nrr_storage::local_network_rules::{
 use rusqlite::Connection;
 
 use crate::ipc_handlers::providers::LocalNetworksProvider;
-use crate::route_coordinator::SecondaryRouteCoordinator;
+use crate::local_network_source::LocalNetworkSource;
+use crate::route_coordinator::{LocalNetworkPolicy, LocalNetworkPolicyFn};
+
+/// The stored answers of every principal as the policy the enforcement reads,
+/// read per call so a change in Settings lands on the next pass. Unreadable
+/// rows degrade to "no stored decisions", never to a wider exemption.
+pub fn stored_local_network_policy(state_conn: Arc<Mutex<Connection>>) -> LocalNetworkPolicyFn {
+    Arc::new(move |sid: &str| {
+        let mut policy = LocalNetworkPolicy::default();
+        let guard = state_conn.lock().unwrap_or_else(|p| p.into_inner());
+        let Ok(rules) = LocalNetworkRulesRepository::new(&guard).list_for_sid(sid) else {
+            return policy;
+        };
+        for rule in rules {
+            // The adapter half survives a hypervisor switch renumbering its
+            // segment; the reader resolves it against the adapters that exist.
+            if !rule.adapter.is_empty() {
+                policy
+                    .adapter_answers
+                    .push((rule.adapter.clone(), rule.allow));
+            }
+            let Some(network) = Ipv4Network::parse(&rule.cidr) else {
+                if let Some(block) = IpBlock::parse(&rule.cidr).filter(|b| !b.is_ipv4()) {
+                    policy.answers_v6.push((block, rule.allow));
+                }
+                continue;
+            };
+            if rule.allow {
+                policy.allowed.push(network);
+            } else {
+                policy.refused.push(network);
+            }
+        }
+        policy
+    })
+}
 
 /// Reason slugs returned for entries the service declined to store.
 const REJECT_MALFORMED: &str = "malformed-cidr";
 const REJECT_NOT_PRIVATE: &str = "not-private";
 
 pub struct ProductionLocalNetworks {
-    coordinator: Arc<SecondaryRouteCoordinator>,
+    coordinator: Arc<dyn LocalNetworkSource>,
     state_conn: Arc<Mutex<Connection>>,
 }
 
 impl ProductionLocalNetworks {
     pub fn new(
-        coordinator: Arc<SecondaryRouteCoordinator>,
+        coordinator: Arc<dyn LocalNetworkSource>,
         state_conn: Arc<Mutex<Connection>>,
     ) -> Self {
         Self {

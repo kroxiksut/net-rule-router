@@ -27,8 +27,9 @@
 //! The dispatcher is called for a SID whose policy is live: one with a tray
 //! connection in [`ActiveSidRegistry`], one the route table serves, or one the
 //! platform's presence authority names (logind on Linux, where no tray feeds
-//! the registry). For anybody else only the flag moves, and the next
-//! connect or pass reads it.
+//! the registry). An authority that cannot answer counts as naming them: the
+//! dispatcher's pass then reports whether it could act. For anybody else only
+//! the flag moves, and the next connect or pass reads it.
 //!
 //! ## The flag follows the platform
 //!
@@ -183,9 +184,8 @@ impl RoutingPauseCoordinator {
         self
     }
 
-    /// Stored principals the presence authority names right now. An authority
-    /// that cannot answer names nobody: a pause then only stores its flag,
-    /// which the next pass reads, rather than failing outright.
+    /// Stored principals the presence authority names right now; nobody when
+    /// it cannot answer.
     fn present_sids(&self) -> Vec<String> {
         self.presence
             .as_ref()
@@ -250,7 +250,16 @@ impl RoutingPauseCoordinator {
         self.route_coord
             .as_ref()
             .is_some_and(|c| c.is_served(sid, &self.registry.active_sids()))
-            || self.present_sids().iter().any(|s| s == sid)
+            || self
+                .presence
+                .as_ref()
+                .is_some_and(|source| match source.active_principals() {
+                    Ok(principals) => principals.iter().any(|p| p.as_stored() == sid),
+                    // Unknown is not absent. Storing the flag alone would report
+                    // a pause over enforcement the pass leaves untouched until
+                    // the authority answers; the dispatcher's pass says so.
+                    Err(_) => true,
+                })
     }
 
     /// Take a paused user's routes out of the table. Alone in it, the table is
@@ -917,6 +926,49 @@ mod tests {
             paused,
             vec!["unix:uid:1000".to_owned(), "unix:uid:1001".to_owned()]
         );
+    }
+
+    /// With logind not answering, the pass leaves enforcement as it is. A
+    /// pause that only stored its flag then reported "paused" over live
+    /// routing; it goes to the dispatcher, whose refusal leaves no flag.
+    #[test]
+    fn a_presence_authority_that_cannot_answer_does_not_turn_a_pause_into_a_flag() {
+        use nrr_platform_api::active_principals::ActivePrincipalError;
+        use nrr_platform_api::enforcement::UserPrincipal;
+
+        struct Unanswerable;
+        impl ActivePrincipalSource for Unanswerable {
+            fn active_principals(&self) -> Result<Vec<UserPrincipal>, ActivePrincipalError> {
+                Err(ActivePrincipalError::new("logind is not answering"))
+            }
+            fn authority(&self) -> &'static str {
+                "test"
+            }
+        }
+
+        let fx = build_fx();
+        let coord = RoutingPauseCoordinator::new(
+            Arc::clone(&fx.coord.conn),
+            Arc::clone(&fx.registry),
+            Arc::clone(&fx.dispatcher) as Arc<dyn PauseDispatcher>,
+            Arc::clone(&fx.audit) as Arc<dyn RoutingPauseAudit>,
+            FixedClock::new(1_700_000_000) as Arc<dyn Clock>,
+        )
+        .with_presence_source(Arc::new(Unanswerable));
+        fx.dispatcher.queue_remove(
+            "unix:uid:1000",
+            Err("could not determine who is logged in".to_owned()),
+        );
+
+        assert!(matches!(
+            coord.pause("unix:uid:1000", None),
+            Err(PauseError::Dispatch { .. })
+        ));
+        assert_eq!(fx.dispatcher.remove_log(), vec!["unix:uid:1000".to_owned()]);
+        assert!(!coord.is_paused("unix:uid:1000").expect("is_paused"));
+
+        coord.pause("unix:uid:1000", None).expect("the pass landed");
+        assert!(coord.is_paused("unix:uid:1000").expect("is_paused"));
     }
 
     // ── Pause-aware listener ──────────────────────────────────────────────────

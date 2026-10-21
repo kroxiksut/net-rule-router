@@ -148,7 +148,8 @@ impl FakeIpAssembly {
         let mut answerer =
             ScopedFakeIpAnswerer::new(self.scope.clone(), Arc::clone(&self.allocator))
                 .with_runtime_exclusions(Arc::clone(&self.runtime_exclusions))
-                .with_health(Arc::clone(&self.health));
+                .with_health(Arc::clone(&self.health))
+                .with_foreign_tunnels(crate::foreign_tunnels::global_foreign_tunnels());
         if let Some(read) = self.secondary_subnets.as_ref() {
             answerer = answerer.with_secondary_subnets(Arc::clone(read));
         }
@@ -191,7 +192,8 @@ impl FakeIpAssembly {
             armed,
         )
         .with_runtime_exclusions(Arc::clone(&self.runtime_exclusions))
-        .with_health(Arc::clone(&self.health));
+        .with_health(Arc::clone(&self.health))
+        .with_foreign_tunnels(crate::foreign_tunnels::global_foreign_tunnels());
         match self.network_owner.as_ref() {
             Some(owner) => answerer.with_network_owner(Arc::clone(owner)),
             None => answerer,
@@ -368,7 +370,7 @@ struct WatchdogState {
     last_answers: u64,
     last_ingress: u64,
     strikes: u32,
-    last_rebuild: Option<std::time::Instant>,
+    last_rebuild: Option<crate::boot_clock::BootInstant>,
     last_tcp_relay_flows_opened: u64,
     last_tcp_dial_ok: u64,
     last_tcp_dial_refused: u64,
@@ -381,7 +383,7 @@ struct WatchdogState {
     /// Rate limit for the "desired but not running" outage warning — the one
     /// periodic signal that survives a dead stack (every per-flow event source
     /// lives inside the stack and goes silent with it).
-    last_outage_warn: Option<std::time::Instant>,
+    last_outage_warn: Option<crate::boot_clock::BootInstant>,
 }
 
 /// A tick counts as a strike when at least this many virtual addresses were
@@ -777,7 +779,8 @@ impl FakeIpController {
                         .last_outage_warn
                         .is_none_or(|at| at.elapsed() >= OUTAGE_WARN_INTERVAL);
                     if due {
-                        inner.watchdog.last_outage_warn = Some(std::time::Instant::now());
+                        inner.watchdog.last_outage_warn =
+                            Some(crate::boot_clock::BootInstant::now());
                         tracing::warn!(
                             target: "nrr::fake-ip",
                             msg_key = "fakeip-datapath-not-running",
@@ -822,7 +825,7 @@ impl FakeIpController {
             answers_delta,
             "fake-IP datapath wedged: virtual addresses are being answered but NO packets arrive — rebuilding the TUN stack",
         );
-        inner.watchdog.last_rebuild = Some(std::time::Instant::now());
+        inner.watchdog.last_rebuild = Some(crate::boot_clock::BootInstant::now());
         Self::stop_locked(&mut inner);
         Self::start_locked(&mut inner);
         // Re-baseline after the rebuild so the fresh stack starts clean.

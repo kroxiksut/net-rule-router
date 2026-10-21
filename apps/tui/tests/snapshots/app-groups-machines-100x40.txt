@@ -1,0 +1,40 @@
+Service: OK
+╭> Screens───────────────────────────╮╭Application and device routes───────────────────────────────╮
+│  1 Status                          ││A whole group of programs, or the machines of a hypervisor, │
+│  2 First run                       ││can be sent over the main or the additional route at once.  │
+│  3 Interfaces and routes           ││Changes go to your rules list, where you review and apply   │
+│  4 Rules                           ││them.                                                       │
+│>     Application and device routes ││detected on this computer                                   │
+│  5 Overlaps                        ││Virtual machine traffic follows the route assigned to its   │
+│  6 Suggested addresses             ││program. The default is the main route. A machine's local   │
+│  7 Connection trace                ││networks (host-to-guest access) always keep working,        │
+│  8 Cache                           ││whichever route you pick.                                   │
+│  9 Diagnostics and logs            ││Can't find your program? Add it as an ordinary application  │
+│  0 Settings                        ││rule, or tell us through any channel — the dictionary keeps │
+│                                    ││growing.                                                    │
+│                                    ││                                                            │
+│                                    ││                                                            │
+│                                    ││                                                            │
+│                                    │╰────────────────────────────────────────────────────────────╯
+│                                    │╭Machines of VirtualBox──────────────────────────────────────╮
+│                                    ││VirtualBox runs every machine as one program                │
+│                                    ││(VBoxHeadless.exe, VBoxSVC.exe), so a route applies to all  │
+│                                    ││of its machines.                                            │
+│                                    ││Every VirtualBox machine goes over Primary.                 │
+│                                    ││Machine: Lab                                                │
+│                                    ││  1. Adapter 1: NAT                                         │
+│                                    ││     For your site rules to work inside this machine, set   │
+│                                    ││its DNS server to 10.0.2.2.                                 │
+│                                    ││     This machine follows your rules: sites from the rules  │
+│                                    ││take their route, everything else goes over Primary.        │
+│                                    ││  Adapter 2: Bridged                                        │
+│                                    ││     This adapter is bridged: its traffic goes straight to  │
+│                                    ││your network and bypasses your rules. Switch it to NAT for  │
+│                                    ││the rules to apply.                                         │
+│                                    ││The change is made in VirtualBox and works only while the   │
+│                                    ││machine is powered off. If Additional reconnects with a new │
+│                                    ││address, tie the machine again.                             │
+│                                    ││                                                            │
+│                                    ││                                                            │
+╰────────────────────────────────────╯╰────────────────────────────────────────────────────────────╯
+F1: help   q: quit

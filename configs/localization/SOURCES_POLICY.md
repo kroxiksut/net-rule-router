@@ -10,7 +10,6 @@ This document defines how bundled and user-provided locale files are discovered 
 - `user` source:
 - files from managed local storage `NetRuleRouter/managed/locales`
 - optional override path via `NRR_USER_LOCALES_DIR`
-- legacy `NRR_LOCALES_DIR` remains supported as a user-source override for backward compatibility
 
 ## Merge And Resolution Order
 

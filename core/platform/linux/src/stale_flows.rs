@@ -71,7 +71,17 @@ impl LinuxStaleFlowReset {
 
     fn established(&self) -> Option<Vec<DiagSocket>> {
         match dump_established() {
-            Ok(sockets) => Some(sockets),
+            Ok(tcp) => {
+                // QUIC and other connected UDP sockets stay on the old link
+                // exactly like TCP ones; a kernel that cannot close them is
+                // remembered, so the extra dump is not paid again.
+                let udp = if crate::kernel_capabilities::udp_reset_available() {
+                    dump_udp_established().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                Some(merge_listings(tcp, udp))
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "nrr::flow-reset",
@@ -93,10 +103,13 @@ impl StaleFlowReset for LinuxStaleFlowReset {
         let ids: Vec<SockId> = sockets
             .iter()
             .filter(|s| {
-                s.endpoints().is_some_and(|(_, remote)| match remote.ip() {
-                    IpAddr::V4(v4) => addr_in_range(v4, base, prefix_len),
-                    IpAddr::V6(_) => false,
-                })
+                // The pool's sweep is TCP only: UDP there is not worth a
+                // second pass.
+                s.id.protocol == IPPROTO_TCP
+                    && s.endpoints().is_some_and(|(_, remote)| match remote.ip() {
+                        IpAddr::V4(v4) => addr_in_range(v4, base, prefix_len),
+                        IpAddr::V6(_) => false,
+                    })
             })
             .map(|s| s.id)
             .collect();
@@ -163,10 +176,34 @@ impl StaleFlowReset for LinuxStaleFlowReset {
             let listed = self.listed.lock().unwrap_or_else(|p| p.into_inner());
             ids_for(flows, &listed)
         };
-        let tally = destroy_all(&ids);
-        tally.report();
-        tally.destroyed
+        let (udp, tcp): (Vec<SockId>, Vec<SockId>) =
+            ids.into_iter().partition(|id| id.protocol == IPPROTO_UDP);
+        let mut destroyed = 0;
+        for (batch, protocol) in [(tcp, IPPROTO_TCP), (udp, IPPROTO_UDP)] {
+            if batch.is_empty() {
+                continue;
+            }
+            let tally = destroy_all(&batch);
+            tally.report_for(protocol);
+            destroyed += tally.destroyed;
+        }
+        destroyed
     }
+}
+
+/// TCP rows first, then the UDP rows whose four-tuple no TCP row has: a flow
+/// is named by its endpoints alone upstream, so a pair that exists in both
+/// protocols is listed once, as TCP. Leaving the UDP twin alone is the safe
+/// side: it may belong to another user than the flow that was selected.
+fn merge_listings(tcp: Vec<DiagSocket>, udp: Vec<DiagSocket>) -> Vec<DiagSocket> {
+    let taken: std::collections::HashSet<FourTuple> =
+        tcp.iter().filter_map(DiagSocket::endpoints).collect();
+    let mut all = tcp;
+    all.extend(
+        udp.into_iter()
+            .filter(|s| s.endpoints().is_some_and(|t| !taken.contains(&t))),
+    );
+    all
 }
 
 /// The kernel id to destroy for each flow: the one its listing returned, or —
@@ -210,10 +247,12 @@ const NLM_F_DUMP: u16 = 0x300;
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
 const TCP_ESTABLISHED: u8 = 1;
 const ENOENT: i32 = 2;
 const EPERM: i32 = 1;
 const EOPNOTSUPP: i32 = 95;
+const EIO: i32 = 5;
 
 /// `struct inet_diag_sockid`: ports, two 16-byte addresses, interface, cookie.
 const SOCKID_LEN: usize = 48;
@@ -231,6 +270,8 @@ const NO_COOKIE: u32 = u32::MAX;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SockId {
     family: u8,
+    /// `IPPROTO_TCP` or `IPPROTO_UDP`: the same four-tuple can exist in both.
+    protocol: u8,
     raw: [u8; SOCKID_LEN],
 }
 
@@ -247,6 +288,7 @@ impl SockId {
         raw[44..48].copy_from_slice(&NO_COOKIE.to_ne_bytes());
         Self {
             family: AF_INET,
+            protocol: IPPROTO_TCP,
             raw,
         }
     }
@@ -262,6 +304,7 @@ impl SockId {
         raw[44..48].copy_from_slice(&NO_COOKIE.to_ne_bytes());
         Self {
             family: AF_INET6,
+            protocol: IPPROTO_TCP,
             raw,
         }
     }
@@ -352,6 +395,7 @@ fn header(buf: &mut Vec<u8>, length: usize, message_type: u16, flags: u16, seq: 
 
 fn request(
     family: u8,
+    protocol: u8,
     sockid: &[u8; SOCKID_LEN],
     message_type: u16,
     flags: u16,
@@ -360,16 +404,18 @@ fn request(
     let length = NLMSG_HEADER_LEN + REQUEST_LEN;
     let mut buf = Vec::with_capacity(length);
     header(&mut buf, length, message_type, flags, seq);
-    buf.extend_from_slice(&[family, IPPROTO_TCP, 0, 0]);
+    buf.extend_from_slice(&[family, protocol, 0, 0]);
     buf.extend_from_slice(&(1u32 << TCP_ESTABLISHED).to_ne_bytes());
     buf.extend_from_slice(sockid);
     buf
 }
 
-/// Ask for every established TCP socket of `family`.
-fn encode_dump_request(family: u8, seq: u32) -> Vec<u8> {
+/// Ask for every established socket of `protocol` and `family`. A connected
+/// UDP socket (QUIC) is reported in the same state a connected TCP one is.
+fn encode_dump_request(family: u8, protocol: u8, seq: u32) -> Vec<u8> {
     request(
         family,
+        protocol,
         &[0u8; SOCKID_LEN],
         SOCK_DIAG_BY_FAMILY,
         NLM_F_REQUEST | NLM_F_DUMP,
@@ -381,6 +427,7 @@ fn encode_dump_request(family: u8, seq: u32) -> Vec<u8> {
 fn encode_destroy_request(id: &SockId, seq: u32) -> Vec<u8> {
     request(
         id.family,
+        id.protocol,
         &id.raw,
         SOCK_DESTROY,
         NLM_F_REQUEST | NLM_F_ACK,
@@ -439,6 +486,7 @@ fn parse_diag_msg(payload: &[u8]) -> Option<DiagSocket> {
     Some(DiagSocket {
         id: SockId {
             family: payload[0],
+            protocol: IPPROTO_TCP,
             raw,
         },
         state: payload[1],
@@ -526,6 +574,39 @@ impl DestroyTally {
 
     /// Log what was NOT closed and why; the caller logs what was.
     fn report(&self) {
+        self.report_for(IPPROTO_TCP);
+    }
+
+    /// [`Self::report`] for a batch of one protocol. A UDP refusal says
+    /// nothing about TCP: it lowers only the UDP flag.
+    fn report_for(&self, protocol: u8) {
+        if protocol == IPPROTO_UDP {
+            if self.destroyed > 0 || self.gone > 0 {
+                crate::kernel_capabilities::record_udp_reset(true);
+            } else if self.unsupported > 0 {
+                crate::kernel_capabilities::record_udp_reset(false);
+            }
+            if self.unsupported > 0 || self.refused > 0 {
+                tracing::warn!(
+                    target: "nrr::flow-reset",
+                    msg_key = "linux-flow-reset-udp-refused",
+                    refused = self.unsupported + self.refused,
+                    "the kernel did not close some UDP (QUIC) sockets; they stay on their previous route until they close",
+                );
+            }
+            return;
+        }
+        if self.destroyed > 0 || self.gone > 0 {
+            crate::kernel_capabilities::record(
+                crate::kernel_capabilities::KernelCapability::ConnectionReset,
+                true,
+            );
+        } else if self.unsupported > 0 {
+            crate::kernel_capabilities::record(
+                crate::kernel_capabilities::KernelCapability::ConnectionReset,
+                false,
+            );
+        }
         if self.unsupported > 0 {
             tracing::warn!(
                 target: "nrr::flow-reset",
@@ -565,6 +646,11 @@ const RECEIVE_TIMEOUT_SECS: libc::time_t = 2;
 
 #[cfg(not(target_os = "linux"))]
 fn dump_established() -> Result<Vec<DiagSocket>, String> {
+    Err("sock_diag needs a Linux kernel".to_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dump_udp_established() -> Result<Vec<DiagSocket>, String> {
     Err("sock_diag needs a Linux kernel".to_owned())
 }
 
@@ -611,9 +697,21 @@ fn processes_holding<'a>(
 
 #[cfg(target_os = "linux")]
 fn dump_established() -> Result<Vec<DiagSocket>, String> {
-    let mut sockets = dump_family(AF_INET, "IPv4")?;
+    dump_both_families(IPPROTO_TCP)
+}
+
+/// Connected UDP sockets. A kernel without `udp_diag` refuses the dump; the
+/// caller then proceeds with TCP alone.
+#[cfg(target_os = "linux")]
+fn dump_udp_established() -> Result<Vec<DiagSocket>, String> {
+    dump_both_families(IPPROTO_UDP)
+}
+
+#[cfg(target_os = "linux")]
+fn dump_both_families(protocol: u8) -> Result<Vec<DiagSocket>, String> {
+    let mut sockets = dump_family(AF_INET, protocol, "IPv4")?;
     // A kernel without IPv6 refuses this family; its v4 answer still stands.
-    if let Ok(v6) = dump_family(AF_INET6, "IPv6") {
+    if let Ok(v6) = dump_family(AF_INET6, protocol, "IPv6") {
         sockets.extend(v6);
     }
     Ok(sockets)
@@ -622,10 +720,10 @@ fn dump_established() -> Result<Vec<DiagSocket>, String> {
 /// One family on a socket of its own: a dump stopped at the cap leaves the
 /// rest of its answer queued, which the next request on that socket would read.
 #[cfg(target_os = "linux")]
-fn dump_family(family: u8, name: &str) -> Result<Vec<DiagSocket>, String> {
+fn dump_family(family: u8, protocol: u8, name: &str) -> Result<Vec<DiagSocket>, String> {
     let socket = DiagNetlink::open().map_err(|e| e.to_string())?;
     let sockets = socket
-        .dump(family, 1)
+        .dump(family, protocol, 1)
         .map_err(|e| format!("{name} dump: {e}"))?;
     if sockets.len() >= MAX_DUMP_SOCKETS {
         tracing::warn!(
@@ -655,12 +753,27 @@ fn destroy_all(ids: &[SockId]) -> DestroyTally {
         }
     };
     for (seq, id) in (1u32..).zip(ids) {
-        let errno = socket
-            .destroy(id, seq)
-            .unwrap_or_else(|e| e.raw_os_error().unwrap_or(0));
-        tally.record(classify_destroy(errno));
+        tally.record(classify_destroy(errno_of(socket.destroy(id, seq))));
     }
     tally
+}
+
+/// The errno of one destroy attempt. A failure without one (no acknowledgement
+/// came) is a refusal: only the kernel's own `0` means the socket was closed.
+fn errno_of(result: std::io::Result<i32>) -> i32 {
+    result.unwrap_or_else(|e| e.raw_os_error().unwrap_or(EIO))
+}
+
+/// Whether the kernel can close a socket on request, asked by naming one that
+/// cannot exist: a kernel with `CONFIG_INET_DIAG_DESTROY` answers "no such
+/// socket", one without it "not supported". Closes nothing. `None` when the
+/// answer proves nothing (no privilege, no reply).
+#[cfg(target_os = "linux")]
+pub fn probe_destroy_support() -> Option<bool> {
+    let nowhere = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1);
+    let socket = DiagNetlink::open().ok()?;
+    let errno = socket.destroy(&SockId::for_v4(nowhere, nowhere), 1).ok()?;
+    crate::kernel_capabilities::destroy_support_from_errno(errno)
 }
 
 /// An `AF_NETLINK`/`NETLINK_SOCK_DIAG` socket, closed on drop.
@@ -757,8 +870,8 @@ impl DiagNetlink {
         }
     }
 
-    fn dump(&self, family: u8, seq: u32) -> std::io::Result<Vec<DiagSocket>> {
-        self.send(&encode_dump_request(family, seq))?;
+    fn dump(&self, family: u8, protocol: u8, seq: u32) -> std::io::Result<Vec<DiagSocket>> {
+        self.send(&encode_dump_request(family, protocol, seq))?;
         // A dump datagram never exceeds this; a shorter buffer would truncate
         // a message rather than split it.
         let mut buffer = vec![0u8; 64 * 1024];
@@ -768,7 +881,12 @@ impl DiagNetlink {
             if read == 0 {
                 return Ok(sockets);
             }
-            match parse_dump_datagram(&buffer[..read], &mut sockets) {
+            let before = sockets.len();
+            let progress = parse_dump_datagram(&buffer[..read], &mut sockets);
+            for socket in &mut sockets[before..] {
+                socket.id.protocol = protocol;
+            }
+            match progress {
                 DumpProgress::More if sockets.len() < MAX_DUMP_SOCKETS => {}
                 DumpProgress::More | DumpProgress::Done => return Ok(sockets),
                 DumpProgress::Failed(errno) => {
@@ -867,7 +985,7 @@ mod tests {
 
     #[test]
     fn a_dump_request_asks_for_established_tcp_of_one_family() {
-        let bytes = encode_dump_request(AF_INET6, 9);
+        let bytes = encode_dump_request(AF_INET6, IPPROTO_TCP, 9);
         assert_eq!(bytes.len(), NLMSG_HEADER_LEN + REQUEST_LEN);
         assert_eq!(read_u32(&bytes, 0) as usize, bytes.len());
         assert_eq!(
@@ -900,6 +1018,7 @@ mod tests {
         );
         let id = SockId {
             family: AF_INET6,
+            protocol: IPPROTO_TCP,
             raw,
         };
         let bytes = encode_destroy_request(&id, 42);
@@ -1009,6 +1128,52 @@ mod tests {
     }
 
     #[test]
+    fn a_udp_dump_and_destroy_name_the_udp_protocol() {
+        assert_eq!(
+            &encode_dump_request(AF_INET, IPPROTO_UDP, 3)[16..20],
+            &[AF_INET, IPPROTO_UDP, 0, 0]
+        );
+        let mut id = SockId::for_v4(
+            SocketAddrV4::new(v4(192, 0, 2, 7), 50_000),
+            SocketAddrV4::new(v4(203, 0, 113, 9), 443),
+        );
+        id.protocol = IPPROTO_UDP;
+        let bytes = encode_destroy_request(&id, 4);
+        assert_eq!(bytes[17], IPPROTO_UDP);
+        assert_eq!(u16::from_ne_bytes([bytes[4], bytes[5]]), SOCK_DESTROY);
+    }
+
+    fn udp_socket(local: SocketAddrV4, remote: SocketAddrV4, uid: u32) -> DiagSocket {
+        let mut id = SockId::for_v4(local, remote);
+        id.protocol = IPPROTO_UDP;
+        DiagSocket {
+            id,
+            state: TCP_ESTABLISHED,
+            uid,
+            inode: 1,
+        }
+    }
+
+    /// A UDP twin of a listed TCP flow is dropped, so a reset naming that pair
+    /// can never reach a socket the selection did not pick.
+    #[test]
+    fn a_pair_present_in_both_protocols_is_listed_once_as_tcp() {
+        let local = SocketAddrV4::new(v4(192, 0, 2, 7), 50_000);
+        let remote = SocketAddrV4::new(v4(203, 0, 113, 9), 443);
+        let tcp = DiagSocket {
+            id: SockId::for_v4(local, remote),
+            state: TCP_ESTABLISHED,
+            uid: 1000,
+            inode: 5,
+        };
+        let twin = udp_socket(local, remote, 1001);
+        let other = udp_socket(SocketAddrV4::new(v4(192, 0, 2, 7), 50_001), remote, 1000);
+        let merged = merge_listings(vec![tcp.clone()], vec![twin, other.clone()]);
+        assert_eq!(merged, vec![tcp, other]);
+        assert_eq!(merged[1].id.protocol, IPPROTO_UDP);
+    }
+
+    #[test]
     fn only_established_sockets_are_kept() {
         let id = SockId::for_v4(
             SocketAddrV4::new(v4(192, 0, 2, 7), 1),
@@ -1082,6 +1247,23 @@ mod tests {
         assert_eq!((tally.unsupported, tally.refused, tally.gone), (1, 1, 1));
     }
 
+    #[test]
+    fn a_missing_acknowledgement_is_never_a_success() {
+        let silent = Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no acknowledgement",
+        ));
+        assert_eq!(
+            classify_destroy(errno_of(silent)),
+            DestroyOutcome::Refused(EIO)
+        );
+        assert_eq!(classify_destroy(errno_of(Ok(0))), DestroyOutcome::Destroyed);
+        assert_eq!(
+            classify_destroy(errno_of(Err(std::io::Error::from_raw_os_error(EPERM)))),
+            DestroyOutcome::Refused(EPERM)
+        );
+    }
+
     /// A flow built from endpoints alone must find the same socket the kernel
     /// would list for an unbound `AF_INET` connection.
     #[test]
@@ -1110,6 +1292,7 @@ mod tests {
         let (local, remote) = (SocketAddr::V4(local4), SocketAddr::V4(remote4));
         let listed_id = SockId {
             family: AF_INET6,
+            protocol: IPPROTO_TCP,
             raw: v6_sockid(
                 mapped(*local4.ip()),
                 local4.port(),

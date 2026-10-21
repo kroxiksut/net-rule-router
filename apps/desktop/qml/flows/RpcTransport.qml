@@ -432,6 +432,11 @@ QtObject {
             ? bridge.rpcRouteLinkProviderSet(payload)
             : ""
     }
+    function rpcRouteVpnGatewaysSet(payload) {
+        return (bridgeAvailable && typeof bridge.rpcRouteVpnGatewaysSet === "function")
+            ? bridge.rpcRouteVpnGatewaysSet(payload)
+            : ""
+    }
     // The user's own record of the service's settings, in their settings file.
     function rpcUserSettingsIntentGet() {
         return (bridgeAvailable && typeof bridge.rpcUserSettingsIntentGet === "function")

@@ -1,5 +1,7 @@
 # Сборка NetRuleRouter для Windows
 
+[English](../en/packaging-windows.md) · **Русский**
+
 `scripts/package-windows.ps1` превращает рабочую копию в папку, которая
 запускается на чистой машине с Windows: без Qt, без Rust, без репозитория и без
 установщика. Папку копируют на целевой компьютер и запускают
@@ -46,6 +48,7 @@ NetRuleRouter\
   qml\                  модули самого Qt
   apps\desktop\qml\     интерфейс программы
   locales\  presets\  configs\  assets\  scripts\
+  licenses\            тексты лицензий: продукта, Wintun и (в полном пакете) Qt
 ```
 
 Две детали этой раскладки — не оформление, а необходимость:

@@ -175,3 +175,34 @@ fn schema_survives_three_reopens() -> SidecarResult<()> {
     }
     Ok(())
 }
+
+/// A process killed mid-session leaves its last writes only in the WAL. The
+/// files are copied while the writer still holds them, which is what a crash
+/// leaves on disk; the next open must replay the log, not lose the comment.
+#[test]
+fn a_comment_left_only_in_the_wal_survives_a_crash() -> SidecarResult<()> {
+    let live = tempfile::tempdir()?;
+    let crashed = tempfile::tempdir()?;
+    let path = live.path().join("sidecar.db");
+    let db = SidecarDb::open(&path)?;
+    let sig =
+        RuleSignature::build("domain", "example.com", "primary").expect("a signature with no pipe");
+    db.write_comment(&sig, "written before the crash")?;
+
+    let wal = live.path().join("sidecar.db-wal");
+    let wal_len = std::fs::metadata(&wal)?.len();
+    assert!(
+        wal_len > 0,
+        "the write must still be in the WAL for this test to mean anything"
+    );
+    std::fs::copy(&path, crashed.path().join("sidecar.db"))?;
+    std::fs::copy(&wal, crashed.path().join("sidecar.db-wal"))?;
+    drop(db);
+
+    let reopened = SidecarDb::open(crashed.path().join("sidecar.db"))?;
+    assert_eq!(
+        reopened.read_comment(&sig)?.as_deref(),
+        Some("written before the crash")
+    );
+    Ok(())
+}

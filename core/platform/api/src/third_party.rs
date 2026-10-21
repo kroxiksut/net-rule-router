@@ -10,7 +10,7 @@
 
 pub use nrr_shared::third_party::{
     IntegrityVerdict, SignatureStatus, ThirdPartyComponent, ThirdPartyComponentKind,
-    ThirdPartyComponentStatus, TABLER_ICONS_COMPONENT, THIRD_PARTY_ASSET_COMPONENTS,
+    ThirdPartyComponentStatus, QT_COMPONENT, TABLER_ICONS_COMPONENT, THIRD_PARTY_ASSET_COMPONENTS,
     THIRD_PARTY_BINARY_COMPONENTS, WINTUN_COMPONENT,
 };
 

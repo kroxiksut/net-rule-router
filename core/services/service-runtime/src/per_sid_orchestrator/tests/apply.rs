@@ -47,7 +47,11 @@ fn doh_lockdown_emits_blocks_when_enabled_and_in_scope() {
         let mut snap = snap_primary_only("Wi-Fi");
         snap.doh_lockdown_enabled = true;
         snap.doh_lockdown_scope = scope;
-        snap.kill_switch_enabled = kill_switch;
+        snap.leak_protection = if kill_switch {
+            nrr_domain::LeakProtection::Sites
+        } else {
+            nrr_domain::LeakProtection::Off
+        };
         snap.doh_resolver_ips = vec![
             Ipv4Addr::new(198, 51, 100, 8).into(),
             Ipv4Addr::new(198, 51, 100, 1).into(),
@@ -180,11 +184,11 @@ fn the_neutral_plan_agrees_with_the_filters_the_orchestrator_computes() {
     let verdict = orch
         .neutral_plan_verdict(
             sid,
-            nrr_domain::RouteBehaviorMode::PreferPrimary,
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
             false,
+            crate::enforcement_planner::Ipv6Guard::Off,
             &live,
         )
         .expect("a well-formed SID yields a verdict");
@@ -213,7 +217,6 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
     let (_api, orch, src, rules, _audit) = fixture();
     let book = rules_with_n_primary_ips(3);
     rules.set(book.clone());
-    let mode = nrr_domain::RouteBehaviorMode::PreferPrimary;
 
     // A real filter set to compare against. Computing it also runs the compare
     // for THIS sid — the periodic path does exactly that — so the sid under
@@ -230,11 +233,11 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
     assert!(
         !orch.shadow_compare_neutral_plan(
             seed_sid,
-            mode,
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
             false,
+            crate::enforcement_planner::Ipv6Guard::Off,
             &live,
         ),
         "computing the filters already compared this input — the periodic pass must not pay for it twice"
@@ -244,11 +247,11 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
     assert!(
         orch.shadow_compare_neutral_plan(
             sid,
-            mode,
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
             false,
+            crate::enforcement_planner::Ipv6Guard::Off,
             &live
         ),
         "the first sighting of an input has to be compared"
@@ -256,11 +259,11 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
     assert!(
         !orch.shadow_compare_neutral_plan(
             sid,
-            mode,
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
             false,
+            crate::enforcement_planner::Ipv6Guard::Off,
             &live
         ),
         "the same input yields the same verdict — recomputing it buys nothing"
@@ -271,11 +274,11 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
     assert!(
         !orch.shadow_compare_neutral_plan(
             sid,
-            mode,
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
             false,
+            crate::enforcement_planner::Ipv6Guard::Off,
             narrower
         ),
         "a change inside the window is sampled later, not compared on the spot"
@@ -300,11 +303,11 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
     assert!(
         orch.shadow_compare_neutral_plan(
             sid,
-            mode,
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
             false,
+            crate::enforcement_planner::Ipv6Guard::Off,
             narrower
         ),
         "a different filter set after the window must be compared again"
@@ -321,7 +324,6 @@ fn the_shadow_compare_is_remembered_per_user() {
     let (_api, orch, src, rules, _audit) = fixture();
     let book = rules_with_n_primary_ips(3);
     rules.set(book.clone());
-    let mode = nrr_domain::RouteBehaviorMode::PreferPrimary;
 
     let seed_sid = "S-1-5-21-PER-USER-SEED";
     src.set(seed_sid, snap_full("Wi-Fi", "TAP"));
@@ -336,20 +338,20 @@ fn the_shadow_compare_is_remembered_per_user() {
     let first = "S-1-5-21-NEUTRAL-A";
     assert!(orch.shadow_compare_neutral_plan(
         first,
-        mode,
         &book.rule_book,
         orch.fqdn_cache.as_ref(),
         &std::collections::HashSet::new(),
         false,
+        crate::enforcement_planner::Ipv6Guard::Off,
         &live
     ));
     assert!(!orch.shadow_compare_neutral_plan(
         first,
-        mode,
         &book.rule_book,
         orch.fqdn_cache.as_ref(),
         &std::collections::HashSet::new(),
         false,
+        crate::enforcement_planner::Ipv6Guard::Off,
         &live
     ));
 
@@ -357,11 +359,11 @@ fn the_shadow_compare_is_remembered_per_user() {
     assert!(
         orch.shadow_compare_neutral_plan(
             second,
-            mode,
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
             false,
+            crate::enforcement_planner::Ipv6Guard::Off,
             &live
         ),
         "another user has not been evidenced yet, whatever the first one's input was"
@@ -879,6 +881,7 @@ fn coverage_names_v6_hosts_and_the_sweep_tears_down_the_owners_v6_connection() {
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     };
     let spec6 = spec(WfpLayerKey::AleAuthConnectV6, None, vec![v6]);
     let spec4 = spec(WfpLayerKey::AleAuthConnectV4, Some(v4), Vec::new());
@@ -910,4 +913,41 @@ fn coverage_names_v6_hosts_and_the_sweep_tears_down_the_owners_v6_connection() {
 
     assert_eq!(reset.queried(), vec![IpAddr::V6(v6)]);
     assert_eq!(reset.reset_flows(), vec![owners]);
+}
+
+/// An apply that fails inside the engine still leaves its planned ids on disk:
+/// whatever the engine took before the failure is reaped by id at the next start.
+#[test]
+fn a_failed_apply_still_journals_the_filters_it_planned() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("wfp-filters.ledger");
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let source = Arc::new(ScriptedSource::default());
+    source.set("S-1-5-21-LEDGER", snap_primary_only("Wi-Fi"));
+    let rules = Arc::new(ScriptedRules::default());
+    rules.set(rules_with_n_primary_ips(2));
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
+        Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_filter_ledger(Arc::new(crate::wfp_filter_ledger::WfpFilterLedger::new(
+        path.clone(),
+    )));
+
+    api.set_force_error(Some(nrr_platform_api::error::PlatformError::Transient {
+        operation: "wfp_add_filter",
+        detail: "engine refused".to_string(),
+    }));
+    assert!(orch.install_for_sid("S-1-5-21-LEDGER").is_err());
+
+    let journalled = crate::wfp_filter_ledger::WfpFilterLedger::new(path).read();
+    assert!(
+        !journalled.is_empty(),
+        "the planned ids must be on disk before the engine is asked"
+    );
+    assert!(orch.installed_sids().is_empty(), "nothing is tracked");
 }

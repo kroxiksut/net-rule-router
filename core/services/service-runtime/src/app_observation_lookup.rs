@@ -241,6 +241,10 @@ pub struct AppObservationStore {
     per_principal: Option<PrincipalAppObservations>,
     /// How this platform spells the paths rules and images use.
     path_style: PathStyle,
+    /// Networks the corporate tunnels beside ours carry; never learnt.
+    foreign_tunnels: Arc<crate::foreign_tunnels::ForeignTunnelCell>,
+    /// The foreign facts the last [`Self::shed_foreign`] pass swept against.
+    shed_seen: Mutex<Option<Arc<crate::foreign_tunnels::ForeignTunnelFacts>>>,
     /// Rules by path a plan has asked about, each with the places its programs
     /// live at. Never held while another lock of this store is taken.
     path_places: Mutex<HashMap<String, Vec<AppPath>>>,
@@ -308,6 +312,8 @@ impl AppObservationStore {
             watched: Mutex::new(Vec::new()),
             per_principal: None,
             path_style: nrr_domain::rules_file::HostPlatform::compiled().path_style(),
+            foreign_tunnels: Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new()),
+            shed_seen: Mutex::new(None),
             path_places: Mutex::new(HashMap::new()),
             image_normalizer: OnceLock::new(),
             script_pairs: Mutex::new(BoundedRecentSet::new(SCRIPT_PAIR_CAP)),
@@ -343,6 +349,16 @@ impl AppObservationStore {
         self
     }
 
+    /// Keep the networks of `cell` out of what this store learns.
+    #[must_use]
+    pub fn with_foreign_tunnels(
+        mut self,
+        cell: Arc<crate::foreign_tunnels::ForeignTunnelCell>,
+    ) -> Self {
+        self.foreign_tunnels = cell;
+        self
+    }
+
     /// A store that keeps each user's observations apart (see
     /// [`PrincipalAppObservations`]).
     #[must_use]
@@ -351,6 +367,13 @@ impl AppObservationStore {
             per_principal: Some(PrincipalAppObservations::new()),
             ..Self::new()
         }
+        .with_foreign_tunnels(crate::foreign_tunnels::global_foreign_tunnels())
+    }
+
+    /// An address no application rule learns: unroutable in itself, private,
+    /// or carried by a corporate tunnel.
+    fn is_off_limits(&self, ip: Ipv4Addr) -> bool {
+        is_unroutable(ip) || self.foreign_tunnels.carries(ip)
     }
 
     /// The store a connection owned by `owner` is recorded in: this one, or,
@@ -424,7 +447,7 @@ impl AppObservationStore {
 
     pub fn record(&self, process_path: &str, ip: Ipv4Addr) -> bool {
         // Kept per user, an address is recorded through `scope_for`, never here.
-        if self.per_principal.is_some() || is_unroutable(ip) {
+        if self.per_principal.is_some() || self.is_off_limits(ip) {
             return false;
         }
         let key = app_key(process_path);
@@ -536,7 +559,7 @@ impl AppObservationStore {
             .filter(|(app, ip)| {
                 // A remembered path rule's key is its bucket, not a process.
                 if is_path_pattern(app) {
-                    !is_unroutable(*ip) && self.record_key(observation_key(app), *ip)
+                    !self.is_off_limits(*ip) && self.record_key(observation_key(app), *ip)
                 } else {
                     self.record(app, *ip)
                 }
@@ -651,6 +674,76 @@ impl AppObservationStore {
         removed
     }
 
+    /// Drop the learnt destinations a corporate tunnel came to carry after they
+    /// were learnt (the filter at record time cannot see a tunnel that was not
+    /// published yet). One snapshot comparison when nothing was republished;
+    /// otherwise a bounded sweep of the capped sets. Returns how many pairs went.
+    pub fn shed_foreign(&self) -> usize {
+        if let Some(stores) = self.per_principal.as_ref() {
+            return stores.all().iter().map(|(_, s)| s.shed_foreign()).sum();
+        }
+        let facts = self.foreign_tunnels.snapshot();
+        {
+            let mut seen = self.shed_seen.lock().unwrap_or_else(|p| p.into_inner());
+            let unchanged = match (seen.as_ref(), facts.as_ref()) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            if unchanged {
+                return 0;
+            }
+            seen.clone_from(&facts);
+        }
+        let Some(facts) = facts else {
+            return 0;
+        };
+        let mut shed: Vec<(String, Vec<Ipv4Addr>)> = Vec::new();
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            for (app, set) in g.iter_mut() {
+                let gone: Vec<Ipv4Addr> = set
+                    .iter()
+                    .copied()
+                    .filter(|ip| facts.carries(*ip))
+                    .collect();
+                for ip in &gone {
+                    set.remove(ip);
+                }
+                if !gone.is_empty() {
+                    shed.push((app.clone(), gone));
+                }
+            }
+        }
+        if shed.is_empty() {
+            return 0;
+        }
+        {
+            let mut stamps = self.last_seen.lock().unwrap_or_else(|p| p.into_inner());
+            let mut ledger = self
+                .seen_since_flush
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for (app, ips) in &shed {
+                for ip in ips {
+                    stamps.remove(&(app.clone(), *ip));
+                    ledger.remove(&(app.clone(), *ip));
+                }
+            }
+        }
+        if shed.iter().any(|(app, _)| self.planned(app)) {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
+        let count = shed.iter().map(|(_, ips)| ips.len()).sum();
+        tracing::info!(
+            target: "nrr::app-observations",
+            msg_key = "app-observations-foreign-shed",
+            destinations = count,
+            "learnt destinations inside a network another VPN now carries were dropped",
+        );
+        count
+    }
+
     /// Note that `process_path` was seen talking to `ip`.
     ///
     /// Separate from [`record`](Self::record) on purpose, and fed only from
@@ -672,7 +765,7 @@ impl AppObservationStore {
         rule_paths: &[String],
         ip: Ipv4Addr,
     ) {
-        if is_unroutable(ip) {
+        if self.is_off_limits(ip) {
             return;
         }
         let name = app_key(process_path);
@@ -811,7 +904,7 @@ impl AppObservationStore {
     /// name keeps what [`Self::record`] gives it. Returns `true` when `ip` is
     /// new to one of them.
     pub fn record_for_rule_paths(&self, rule_paths: &[String], ip: Ipv4Addr) -> bool {
-        if self.per_principal.is_some() || is_unroutable(ip) {
+        if self.per_principal.is_some() || self.is_off_limits(ip) {
             return false;
         }
         let mut is_new = false;
@@ -1013,6 +1106,8 @@ struct CensusIndex {
 
 impl AppObservationLookup for AppObservationStore {
     fn ips_for_app(&self, app: &str) -> Vec<Ipv4Addr> {
+        // A plan is about to read: nothing a tunnel now carries goes into it.
+        self.shed_foreign();
         if is_path_pattern(app) {
             let key = observation_key(app);
             self.watch(&key);
@@ -1130,12 +1225,19 @@ static GLOBAL_APP_OBSERVATIONS: OnceLock<Arc<AppObservationStore>> = OnceLock::n
 /// return the same `Arc`.
 pub fn global_app_observations() -> Arc<AppObservationStore> {
     GLOBAL_APP_OBSERVATIONS
-        .get_or_init(|| Arc::new(AppObservationStore::new()))
+        .get_or_init(|| {
+            Arc::new(
+                AppObservationStore::new()
+                    .with_foreign_tunnels(crate::foreign_tunnels::global_foreign_tunnels()),
+            )
+        })
         .clone()
 }
 
 /// IPs the kill-switch / routing must never touch — loopback, unspecified,
-/// link-local, broadcast. Mirrors the codegen's exemption intent. The fake-IP
+/// link-local, broadcast, and private space (a rule that names a private address
+/// or the network it lives in owns it; a program's first contact must not pin
+/// the corporate network onto the additional link). The fake-IP
 /// pool is equally out: a virtual address observed as an app's destination is
 /// our own TUN terminating the flow, and mirroring it as a per-IP route/filter
 /// would steer pool traffic onto a physical adapter, away from the TUN.
@@ -1145,6 +1247,7 @@ fn is_unroutable(ip: Ipv4Addr) -> bool {
         || ip.is_link_local()
         || ip.is_broadcast()
         || ip.is_multicast()
+        || ip.is_private()
         || nrr_platform_api::fake_ip::FakeIpPoolConfig::is_default_pool_addr(std::net::IpAddr::V4(
             ip,
         ))
@@ -1180,7 +1283,10 @@ impl PrincipalAppObservations {
         if stores.len() >= PRINCIPAL_STORE_CAP {
             stores.remove(0);
         }
-        let store = Arc::new(AppObservationStore::new());
+        let store = Arc::new(
+            AppObservationStore::new()
+                .with_foreign_tunnels(crate::foreign_tunnels::global_foreign_tunnels()),
+        );
         stores.push((principal.to_owned(), Arc::clone(&store)));
         self.membership.fetch_add(1, Ordering::Relaxed);
         store
@@ -1916,5 +2022,50 @@ mod tests {
         for name in ["chrome.exe", "*vpn*", "", r"\device\x.exe", "C:x"] {
             assert!(!is_path_pattern(name), "{name}");
         }
+    }
+    #[test]
+    fn private_and_tunnel_carried_addresses_are_never_learnt() {
+        let cell = Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new());
+        cell.publish_networks(vec![nrr_domain::ipv4_network::Ipv4Network::parse(
+            "100.64.8.0/24",
+        )
+        .expect("net")]);
+        let store = AppObservationStore::new().with_foreign_tunnels(cell);
+        assert!(!store.record("app.exe", Ipv4Addr::new(192, 168, 78, 5)));
+        assert!(!store.record("app.exe", Ipv4Addr::new(10, 1, 0, 5)));
+        assert!(!store.record("app.exe", Ipv4Addr::new(100, 64, 8, 5)));
+        assert_eq!(
+            store.seed_many(&[("app.exe".to_string(), Ipv4Addr::new(100, 64, 8, 6))]),
+            0
+        );
+        assert!(store.record("app.exe", addr(5)));
+        assert_eq!(store.ips_for_app("app.exe"), vec![addr(5)]);
+    }
+
+    /// The corporate tunnel connected after the address was learnt.
+    #[test]
+    fn an_address_learnt_before_its_tunnel_was_published_is_dropped_at_publication() {
+        let cell = Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new());
+        let store = AppObservationStore::new().with_foreign_tunnels(Arc::clone(&cell));
+        let inside = Ipv4Addr::new(100, 64, 8, 5);
+        assert!(store.record("app.exe", inside));
+        assert!(store.record("app.exe", addr(5)));
+        let _ = store.ips_for_app("app.exe");
+        assert_eq!(store.shed_foreign(), 0, "nothing is foreign yet");
+        let before = store.generation();
+        cell.publish_networks(vec![nrr_domain::ipv4_network::Ipv4Network::parse(
+            "100.64.8.0/24",
+        )
+        .expect("net")]);
+        assert_eq!(store.ips_for_app("app.exe"), vec![addr(5)]);
+        assert_ne!(store.generation(), before, "a plan must be recomputed");
+        assert_eq!(store.shed_foreign(), 0, "one sweep per publication");
+        assert!(
+            store
+                .take_seen_since_flush("app.exe")
+                .iter()
+                .all(|ip| *ip != inside),
+            "a shed pair is not re-confirmed"
+        );
     }
 }

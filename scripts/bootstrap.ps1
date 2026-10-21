@@ -18,7 +18,14 @@ if (-not (Test-Tool 'cargo')) {
     throw 'cargo was not found. Install Rust toolchain first.'
 }
 
-$target = if ($env:NRR_RUST_TARGET) { $env:NRR_RUST_TARGET } else { 'x86_64-pc-windows-msvc' }
+# The repository root, whatever the caller's directory is.
+$repoRoot = Split-Path -Parent $PSScriptRoot
+
+# The OS architecture, not the PowerShell process's: a 32-bit shell on 64-bit
+# Windows still builds for the machine.
+$osArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+$defaultTarget = if ($osArch -eq 'ARM64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+$target = if ($env:NRR_RUST_TARGET) { $env:NRR_RUST_TARGET } else { $defaultTarget }
 $installedTargets = & rustup target list --installed
 if ($LASTEXITCODE -ne 0) {
     throw 'Failed to query installed rustup targets.'
@@ -32,8 +39,9 @@ if ($installedTargets -notcontains $target) {
     }
 }
 
-if (-not (Test-Path '.env')) {
-    Copy-Item '.env.example' '.env'
+$envFile = Join-Path $repoRoot '.env'
+if (-not (Test-Path $envFile)) {
+    Copy-Item (Join-Path $repoRoot '.env.example') $envFile
     Write-Host '[bootstrap] created .env from .env.example'
 } else {
     Write-Host '[bootstrap] .env already exists; skip'
@@ -58,9 +66,15 @@ if ($StrictQt) {
     }
 }
 
-& cargo check --workspace
-if ($LASTEXITCODE -ne 0) {
-    throw 'cargo check --workspace failed during bootstrap.'
+Push-Location $repoRoot
+try {
+    & cargo check --workspace
+    if ($LASTEXITCODE -ne 0) {
+        throw 'cargo check --workspace failed during bootstrap.'
+    }
+}
+finally {
+    Pop-Location
 }
 
 Write-Host '[bootstrap] completed successfully' -ForegroundColor Green

@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 
 use nrr_shared::ipc_payloads::{
-    AutoRuleCandidateDto, AutoRuleConsumerDto, AutoRuleDismissedEntryDto,
+    is_self_signed_signal, AutoRuleCandidateDto, AutoRuleConsumerDto, AutoRuleDismissedEntryDto,
     AUTO_RULE_MATCH_KIND_APPLICATION, AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
-    AUTO_RULE_PRIMARY_BEHAVIOR_STALLS,
+    AUTO_RULE_PRIMARY_BEHAVIOR_STALLS, AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED,
+    AUTO_RULE_SIGNAL_APP_OWN_RESOLVER,
 };
 
 use crate::js;
@@ -79,6 +80,82 @@ pub fn shown_by_default(candidate: &AutoRuleCandidateDto) -> bool {
 /// The offers a surface may show unasked (`autoRuleRowsShownByDefault`).
 pub fn rows_shown_by_default(rows: &[AutoRuleCandidateDto]) -> Vec<&AutoRuleCandidateDto> {
     rows.iter().filter(|row| shown_by_default(row)).collect()
+}
+
+/// Does an `auto-rule-candidates-changed` push raise a notice
+/// (`autoRuleNoticeDue`)? Only one that announces offers, and never over an
+/// empty inbox: a push that only moves the count updates the badges.
+pub fn notice_due(announces: bool, pending_count: u64) -> bool {
+    announces && pending_count > 0
+}
+
+/// Is this an offer the host or program made about itself
+/// (`autoRuleIsSelfSigned`)? A slug this build does not know still reads as
+/// one when the row names itself as its own anchor.
+pub fn is_self_signed_row(row: &AutoRuleCandidateDto) -> bool {
+    is_self_signed_signal(&row.signal)
+        || (!row.anchor.is_empty() && row.anchor == row.proposed_match)
+}
+
+/// What one notice over a set of offers is about, which picks its heading
+/// (`autoRuleNoticeKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    /// Addresses a routed site needs.
+    Companions,
+    /// Sites the main route will not carry.
+    SitesBlocked,
+    /// Programs the main route will not carry.
+    ProgramsBlocked,
+    /// Programs that look names up on their own, out of reach of site rules.
+    ProgramsOwnResolver,
+    /// Programs and sites that fail on the main route.
+    MixedBlocked,
+    /// Offers with different reasons; each row says its own.
+    Assorted,
+}
+
+impl NoticeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Companions => "companions",
+            Self::SitesBlocked => "sites-blocked",
+            Self::ProgramsBlocked => "programs-blocked",
+            Self::ProgramsOwnResolver => "programs-own-resolver",
+            Self::MixedBlocked => "mixed-blocked",
+            Self::Assorted => "assorted",
+        }
+    }
+}
+
+/// The heading a notice over `rows` takes: a claim true of every row, or one
+/// that claims nothing when the rows disagree.
+pub fn notice_kind(rows: &[AutoRuleCandidateDto]) -> NoticeKind {
+    if rows.is_empty() {
+        return NoticeKind::Companions;
+    }
+    let count = |signal: &str| rows.iter().filter(|r| r.signal == signal).count();
+    let own = count(AUTO_RULE_SIGNAL_APP_OWN_RESOLVER);
+    if own > 0 {
+        return if own == rows.len() {
+            NoticeKind::ProgramsOwnResolver
+        } else {
+            NoticeKind::Assorted
+        };
+    }
+    let blocked = count(AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED);
+    if blocked > 0 {
+        return if blocked == rows.len() {
+            NoticeKind::ProgramsBlocked
+        } else {
+            NoticeKind::MixedBlocked
+        };
+    }
+    if rows.iter().all(is_self_signed_row) {
+        NoticeKind::SitesBlocked
+    } else {
+        NoticeKind::Companions
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

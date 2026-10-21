@@ -19,6 +19,9 @@ use super::*;
 /// 4. Any other non-empty line → active rule, optionally with an inline comment
 ///    after `#`.
 ///
+/// In a program section a value in quotes is a rule on or off, read without
+/// them (`nrr_shared::preset_parser::unquote_program_value`).
+///
 /// Lines before the first section header are treated as free comments.
 /// Tries to extract the format version from a preamble line of the form
 /// `# NetRuleRouter rules file — version N`.
@@ -221,7 +224,7 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
             }
             let (value, comment) = split_inline_comment(rest);
             let (value, flags) = nrr_shared::preset_parser::split_rule_flags(value.trim());
-            let (value, markers) = take_rule_markers(&value, verify_values);
+            let (value, markers, quoted) = take_rule_markers(&value, verify_values, program_values);
             // By the section, not by whether this host applies it: a disabled
             // spaced path in another OS's section is still a rule to keep.
             let rule_type = match &current {
@@ -229,6 +232,7 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                 _ => None,
             };
             let is_rule = match rule_type {
+                _ if quoted => true,
                 Some(kind) => nrr_shared::preset_parser::is_disabled_rule_value(kind, &value),
                 None => !value.contains(char::is_whitespace),
             };
@@ -244,6 +248,7 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                     blocked: markers.deny,
                     verify_primary: markers.verify,
                     override_requested: flags.override_requested && program_values,
+                    children_requested: flags.children && program_values,
                     origin: None,
                 },
                 markers,
@@ -254,7 +259,7 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
             if value.is_empty() {
                 continue;
             }
-            let (value, markers) = take_rule_markers(&value, verify_values);
+            let (value, markers, _) = take_rule_markers(&value, verify_values, program_values);
             if value.is_empty() {
                 continue;
             }
@@ -266,6 +271,7 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                     blocked: markers.deny,
                     verify_primary: markers.verify,
                     override_requested: flags.override_requested && program_values,
+                    children_requested: flags.children && program_values,
                     origin: None,
                 },
                 markers,
@@ -393,13 +399,25 @@ pub(crate) fn extract_rule_flags(value: &str) -> String {
 
 /// Lifts the `!` prefix off `value` in any section, and the `?` prefix in a
 /// host-name or exact-IP one; a mark anywhere else stays part of the value,
-/// which validation then refuses. One reading with the GUI parser.
+/// which validation then refuses. One reading with the GUI parser. In a
+/// program section the quotes a value is enclosed in come off too, and the
+/// last field says whether there were any.
 fn take_rule_markers(
     value: &str,
     verify_values: bool,
-) -> (String, nrr_shared::preset_parser::RuleMarkers) {
+    program_values: bool,
+) -> (String, nrr_shared::preset_parser::RuleMarkers, bool) {
     let (rest, markers) = nrr_shared::preset_parser::split_rule_markers(value, verify_values);
-    (rest.to_string(), markers)
+    let quoted = if program_values {
+        nrr_shared::preset_parser::unquote_program_value(rest)
+    } else {
+        None
+    };
+    (
+        quoted.unwrap_or(rest).to_string(),
+        markers,
+        quoted.is_some(),
+    )
 }
 
 // ── File-to-RuleSet conversion ────────────────────────────────────────────────

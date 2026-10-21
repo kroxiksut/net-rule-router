@@ -73,6 +73,26 @@ pub struct DiagnosticsStatusDto {
     /// answers really are service answers, hence the `Service` default.
     #[serde(default)]
     pub origin: DiagnosticsDataOrigin,
+    /// Slugs of what this machine cannot do or a foreign setup gets in the way
+    /// of (`platform.missing.<slug>.*` in the locale files). Empty from older
+    /// services.
+    #[serde(default)]
+    pub missing_capabilities: Vec<String>,
+    /// Hosts the provider's resolver answered with something unusable while an
+    /// independent one answered clean. Absent from older services.
+    #[serde(default)]
+    pub dns_tamper: DnsTamperCard,
+}
+
+/// What the Diagnostics screen says about a provider tampering with DNS answers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsTamperCard {
+    /// Hosts affected in the recent window; zero means nothing seen.
+    #[serde(default)]
+    pub affected_hosts: u32,
+    /// A few names, only for a machine-wide reader.
+    #[serde(default)]
+    pub examples: Vec<String>,
 }
 
 impl DiagnosticsStatusDto {
@@ -111,6 +131,8 @@ impl DiagnosticsStatusDto {
             },
             stale: true,
             origin: DiagnosticsDataOrigin::Unavailable,
+            missing_capabilities: Vec::new(),
+            dns_tamper: DnsTamperCard::default(),
         }
     }
 }
@@ -313,7 +335,24 @@ pub struct AuditEntryDto {
     pub revision_id: Option<String>,
     /// Whether payload summary is available (audit always has this unless redacted).
     pub has_payload_summary: bool,
+    /// Why the event happened, when its summary names a cause (a slug such as
+    /// `crash-loop`), so an export says it without shipping the summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
 }
+
+/// Every [`AuditEntryDto::cause`] the service writes. Clients word each as
+/// `audit.cause.<slug>`, so a new one needs its text in every locale.
+pub const AUDIT_CAUSES: &[&str] = &[
+    "revoked",
+    "expired",
+    "full-reset",
+    "emergency-reset",
+    "crash-loop",
+    "services-changed",
+    "unsigned",
+    "tampered",
+];
 
 // ── Filter types ──────────────────────────────────────────────────────────────
 
@@ -427,8 +466,8 @@ pub struct ClearLogsResult {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DiagnosticArchiveHealthEnrichmentDto {
     /// Kebab-case slug of the caller's per-SID `BehaviorModeDto`
-    /// (`"prefer-primary"`, `"prefer-secondary-when-available"`,
-    /// `"strict-secondary-fail-closed"`). `None` when no per-SID route
+    /// (`"prefer-primary"`, `"prefer-secondary-when-available"`). `None` when
+    /// no per-SID route
     /// policy row exists yet for the caller, or the caller SID could not be
     /// resolved (e.g. a service-internal / test caller).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -481,12 +520,48 @@ mod tests {
             },
             stale: false,
             origin: DiagnosticsDataOrigin::Service,
+            missing_capabilities: vec!["user-routes".into()],
+            dns_tamper: DnsTamperCard {
+                affected_hosts: 3,
+                examples: vec!["a.example".into()],
+            },
         };
         let json = serde_json::to_string(&dto).expect("serialize");
         let back: DiagnosticsStatusDto = serde_json::from_str(&json).expect("deserialize");
         assert!(back.overall_healthy);
         assert!(!back.stale);
         assert_eq!(back.origin, DiagnosticsDataOrigin::Service);
+        assert_eq!(back.missing_capabilities, ["user-routes"]);
+        assert_eq!(back.dns_tamper.affected_hosts, 3);
+        assert_eq!(back.dns_tamper.examples, ["a.example"]);
+    }
+
+    /// A service that predates the card reports no tampering.
+    #[test]
+    fn a_snapshot_without_the_dns_tamper_card_decodes_as_none_seen() {
+        let json = serde_json::to_string(&DiagnosticsStatusDto::unavailable()).expect("serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("dns_tamper")
+            .expect("field present");
+        let back: DiagnosticsStatusDto = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(back.dns_tamper, DnsTamperCard::default());
+    }
+
+    /// A service that predates the field reports nothing missing.
+    #[test]
+    fn a_snapshot_without_missing_capabilities_decodes_as_none_missing() {
+        let json = serde_json::to_string(&DiagnosticsStatusDto::unavailable()).expect("serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("missing_capabilities")
+            .expect("field present");
+        let back: DiagnosticsStatusDto = serde_json::from_value(value).expect("deserialize");
+        assert!(back.missing_capabilities.is_empty());
     }
 
     #[test]
@@ -544,11 +619,31 @@ mod tests {
             reason_code: "review.approved".into(),
             revision_id: Some("rev-001".into()),
             has_payload_summary: false,
+            cause: None,
         };
         let json = serde_json::to_string(&dto).expect("serialize");
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["kind"], "revision_activated");
         assert_eq!(v["seq"], 1);
+        assert!(v.get("cause").is_none(), "no cause, no key");
+    }
+
+    #[test]
+    fn audit_entry_dto_carries_its_cause_into_an_export() {
+        let dto = AuditEntryDto {
+            event_id: "adt-002".into(),
+            seq: 2,
+            kind: "protection_override_revoked".into(),
+            created_at: 1,
+            result: "success".into(),
+            reason_code: "integrity.protection_override_revoked".into(),
+            revision_id: None,
+            has_payload_summary: true,
+            cause: Some("crash-loop".into()),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&dto).expect("serialize")).expect("json");
+        assert_eq!(v["cause"], "crash-loop");
     }
 
     #[test]

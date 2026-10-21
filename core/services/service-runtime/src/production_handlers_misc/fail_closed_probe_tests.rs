@@ -1,6 +1,7 @@
 use super::*;
 use crate::ipc_handlers::payloads::AdapterEntry;
 use crate::ipc_handlers::providers::FailClosedStateProbe;
+use nrr_domain::LeakProtection;
 use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
 use nrr_storage::repository::MigrationRunner;
 use nrr_storage::route_bindings::{
@@ -20,69 +21,44 @@ fn open_state_db() -> (tempfile::TempDir, Arc<Mutex<Connection>>) {
     (dir, Arc::new(Mutex::new(conn)))
 }
 
-fn seed_policy(conn: &Arc<Mutex<Connection>>, mode: BehaviorMode, block_when_unavailable: bool) {
-    // Default posture is fail-closed (block) — the common case.
-    seed_policy_posture(conn, mode, block_when_unavailable, true);
+/// Protection on under the main default route, the common case.
+fn seed_policy(conn: &Arc<Mutex<Connection>>) {
+    seed_policy_posture(conn, BehaviorMode::PreferPrimary, LeakProtection::Sites);
 }
 
 fn seed_policy_posture(
     conn: &Arc<Mutex<Connection>>,
     mode: BehaviorMode,
-    block_when_unavailable: bool,
-    kill_switch_fail_closed: bool,
+    leak_protection: LeakProtection,
+) {
+    seed_record(conn, mode, leak_protection, SECONDARY_ID);
+}
+
+fn seed_record(
+    conn: &Arc<Mutex<Connection>>,
+    mode: BehaviorMode,
+    leak_protection: LeakProtection,
+    secondary_stable_id: &str,
 ) {
     let guard = conn.lock().unwrap();
-    let repo = RouteBindingsRepository::new(&guard);
-    repo.update_for_sid(
-        TEST_SID,
-        &RoutePolicyRecord {
-            primary: Some(RouteBindingRecord {
-                stable_id: "primary-id".into(),
-                display_name: "Primary".into(),
-                user_confirmed: true,
-                known_stable_ids: vec![],
-            }),
-            secondary: Some(RouteBindingRecord {
-                stable_id: SECONDARY_ID.into(),
-                display_name: "Secondary VPN".into(),
-                user_confirmed: true,
-                known_stable_ids: vec![],
-            }),
-            mode,
-            block_secondary_when_unavailable: block_when_unavailable,
-            kill_switch_fail_closed,
-            kill_switch_protocols: 0x7F,
-            kill_switch_block_all: false,
-            // This fixture drives fail-closed behaviour tests; keep
-            // the master toggle ON so the armed path is exercised.
-            kill_switch_enabled: true,
-            allow_dns_over_primary: false,
-            include_subdomains: false,
-            shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
-            mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy::default(),
-            resolve_hosts_bypass: true,
-            doh_lockdown_enabled: false,
-            doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
-            doh_lockdown_auto: true,
-            browser_history_auto_seed: false,
-            kill_switch_strict_shared_ips: false,
-            auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
-            auto_rules_eager_delivery_names: false,
-            primary_probe_auto: false,
-            primary_probe_timeout_ms: 1500,
-            primary_probe_max_targets: 8,
-            primary_probe_repeat_secs: 300,
-            local_networks_auto_accept: false,
-            zone_priority_over_ip: false,
-            short_name_completion: false,
-            short_name_suffix: String::new(),
-            app_rules_take_all_addresses: false,
-            forwarded_outage: String::new(),
-            binding_source: BindingSource::UserAssigned,
-        },
-        100,
-    )
-    .expect("update_for_sid");
+    let mut record = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+    record.primary = Some(RouteBindingRecord {
+        stable_id: "primary-id".into(),
+        display_name: "Primary".into(),
+        user_confirmed: true,
+        known_stable_ids: vec![],
+    });
+    record.secondary = Some(RouteBindingRecord {
+        stable_id: secondary_stable_id.into(),
+        display_name: "Secondary VPN".into(),
+        user_confirmed: true,
+        known_stable_ids: vec![],
+    });
+    record.mode = mode;
+    record.leak_protection = leak_protection;
+    RouteBindingsRepository::new(&guard)
+        .update_for_sid(TEST_SID, &record, 100)
+        .expect("update_for_sid");
 }
 
 fn adapter(id: &str, oper_status: &str) -> AdapterEntry {
@@ -118,7 +94,7 @@ fn no_secondary_bound_returns_inactive_state() {
 #[test]
 fn secondary_offline_with_block_policy_on_yields_active() {
     let (_d, conn) = open_state_db();
-    seed_policy(&conn, BehaviorMode::PreferPrimary, true);
+    seed_policy(&conn);
     let probe = ProductionFailClosedProbe::new(conn);
     // Secondary adapter listed as Down → offline + block ON.
     let adapters = vec![adapter("primary-id", "Up"), adapter(SECONDARY_ID, "Down")];
@@ -129,57 +105,85 @@ fn secondary_offline_with_block_policy_on_yields_active() {
 #[test]
 fn secondary_up_with_block_policy_on_yields_inactive() {
     let (_d, conn) = open_state_db();
-    seed_policy(&conn, BehaviorMode::PreferPrimary, true);
+    seed_policy(&conn);
     let probe = ProductionFailClosedProbe::new(conn);
     let adapters = vec![adapter(SECONDARY_ID, "Up")];
     let state = probe.probe(TEST_SID, &adapters).expect("Some");
     assert!(!state.fail_closed_active);
 }
 
+/// The banner shows exactly while protection blocks: protection on and the
+/// additional connection down, under either default route. With protection
+/// off traffic rides the main connection and the ordinary notice says so.
 #[test]
-fn secondary_offline_with_block_toggle_off_still_yields_active() {
-    // A bound secondary arms the leak-guard on
-    // its own, so the opt-in `block_secondary_when_unavailable` toggle no
-    // longer disables protection. An offline secondary with the default
-    // fail-closed posture is therefore ACTIVE even with the toggle off.
-    // The user's opt-out is the fail-OPEN posture, below.
-    let (_d, conn) = open_state_db();
-    seed_policy(&conn, BehaviorMode::PreferPrimary, false);
-    let probe = ProductionFailClosedProbe::new(conn);
-    let adapters = vec![adapter(SECONDARY_ID, "Down")];
-    let state = probe.probe(TEST_SID, &adapters).expect("Some");
-    assert!(state.fail_closed_active);
-}
-
-#[test]
-fn secondary_offline_with_fail_open_posture_yields_inactive() {
-    // The way to let traffic ride the primary
-    // when the secondary drops is the fail-OPEN posture
-    // (kill_switch_fail_closed = false), NOT unticking the block toggle.
-    let (_d, conn) = open_state_db();
-    seed_policy_posture(&conn, BehaviorMode::PreferPrimary, false, false);
-    let probe = ProductionFailClosedProbe::new(conn);
-    let adapters = vec![adapter(SECONDARY_ID, "Down")];
-    let state = probe.probe(TEST_SID, &adapters).expect("Some");
-    assert!(!state.fail_closed_active);
-}
-
-#[test]
-fn strict_secondary_fail_closed_mode_triggers_without_explicit_block_flag() {
-    let (_d, conn) = open_state_db();
-    // StrictSecondaryFailClosed mode counts as block-when-unavailable
-    // regardless of the explicit flag.
-    seed_policy(&conn, BehaviorMode::StrictSecondaryFailClosed, false);
-    let probe = ProductionFailClosedProbe::new(conn);
-    let adapters = vec![adapter(SECONDARY_ID, "Down")];
-    let state = probe.probe(TEST_SID, &adapters).expect("Some");
-    assert!(state.fail_closed_active);
+fn the_banner_follows_protection_and_the_secondary_state() {
+    for (mode, protection, secondary_up, active) in [
+        (
+            BehaviorMode::PreferPrimary,
+            LeakProtection::Off,
+            false,
+            false,
+        ),
+        (
+            BehaviorMode::PreferPrimary,
+            LeakProtection::Sites,
+            false,
+            true,
+        ),
+        (
+            BehaviorMode::PreferPrimary,
+            LeakProtection::Sites,
+            true,
+            false,
+        ),
+        (
+            BehaviorMode::PreferPrimary,
+            LeakProtection::Everything,
+            false,
+            true,
+        ),
+        (
+            BehaviorMode::PreferPrimary,
+            LeakProtection::Everything,
+            true,
+            false,
+        ),
+        (
+            BehaviorMode::PreferSecondaryWhenAvailable,
+            LeakProtection::Off,
+            false,
+            false,
+        ),
+        (
+            BehaviorMode::PreferSecondaryWhenAvailable,
+            LeakProtection::Everything,
+            false,
+            true,
+        ),
+        (
+            BehaviorMode::PreferSecondaryWhenAvailable,
+            LeakProtection::Everything,
+            true,
+            false,
+        ),
+    ] {
+        let (_d, conn) = open_state_db();
+        seed_policy_posture(&conn, mode, protection);
+        let probe = ProductionFailClosedProbe::new(conn);
+        let status = if secondary_up { "Up" } else { "Down" };
+        let adapters = vec![adapter(SECONDARY_ID, status)];
+        let state = probe.probe(TEST_SID, &adapters).expect("Some");
+        assert_eq!(
+            state.fail_closed_active, active,
+            "{mode:?} {protection:?} secondary {status}"
+        );
+    }
 }
 
 #[test]
 fn missing_secondary_adapter_in_snapshot_counts_as_offline() {
     let (_d, conn) = open_state_db();
-    seed_policy(&conn, BehaviorMode::PreferPrimary, true);
+    seed_policy(&conn);
     let probe = ProductionFailClosedProbe::new(conn);
     // Secondary stable_id NOT in the adapter list at all (e.g.
     // device unplugged) — must be treated as offline.
@@ -194,56 +198,12 @@ const GUID_SECONDARY: &str = "{12AB34CD-0000-0000-0000-000000000001}";
 const MAC_SECONDARY: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
 
 fn seed_policy_with_secondary_stable_id(conn: &Arc<Mutex<Connection>>, secondary_stable_id: &str) {
-    let guard = conn.lock().unwrap();
-    let repo = RouteBindingsRepository::new(&guard);
-    repo.update_for_sid(
-        TEST_SID,
-        &RoutePolicyRecord {
-            primary: Some(RouteBindingRecord {
-                stable_id: "primary-id".into(),
-                display_name: "Primary".into(),
-                user_confirmed: true,
-                known_stable_ids: vec![],
-            }),
-            secondary: Some(RouteBindingRecord {
-                stable_id: secondary_stable_id.into(),
-                display_name: "Secondary VPN".into(),
-                user_confirmed: true,
-                known_stable_ids: vec![],
-            }),
-            mode: BehaviorMode::PreferPrimary,
-            block_secondary_when_unavailable: true,
-            kill_switch_fail_closed: true,
-            kill_switch_protocols: 0x7F,
-            kill_switch_block_all: false,
-            kill_switch_enabled: true,
-            allow_dns_over_primary: false,
-            include_subdomains: false,
-            shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
-            mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy::default(),
-            resolve_hosts_bypass: true,
-            doh_lockdown_enabled: false,
-            doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
-            doh_lockdown_auto: true,
-            browser_history_auto_seed: false,
-            kill_switch_strict_shared_ips: false,
-            auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
-            auto_rules_eager_delivery_names: false,
-            primary_probe_auto: false,
-            primary_probe_timeout_ms: 1500,
-            primary_probe_max_targets: 8,
-            primary_probe_repeat_secs: 300,
-            local_networks_auto_accept: false,
-            zone_priority_over_ip: false,
-            short_name_completion: false,
-            short_name_suffix: String::new(),
-            app_rules_take_all_addresses: false,
-            forwarded_outage: String::new(),
-            binding_source: BindingSource::UserAssigned,
-        },
-        100,
-    )
-    .expect("update_for_sid");
+    seed_record(
+        conn,
+        BehaviorMode::PreferPrimary,
+        LeakProtection::Sites,
+        secondary_stable_id,
+    );
 }
 
 /// Wire `AdapterEntry` as `adapter_to_entry` would produce it for a live

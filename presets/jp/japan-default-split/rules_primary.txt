@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 7
 # name: Japan Default Split - Primary Route
 # description: Local services routed to primary
 # author: NetRuleRouter contributors

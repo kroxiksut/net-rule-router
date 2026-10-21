@@ -1,0 +1,69 @@
+{
+  "description": "pure.js vpnPickerPreselected: the picker opens with every stored program ticked",
+  "cases": [
+    { "name": "nothing stored, nothing ticked", "input": { "rows": [ { "displayName": "A", "exePath": "C:\\A\\a.exe", "source": "running-process" } ], "stored": [] }, "expected": [] },
+    {
+      "name": "both stored programs ticked, not only the first",
+      "input": {
+        "rows": [
+          { "displayName": "example-gui.exe", "exePath": "C:\\Example\\example-gui.exe", "source": "running-process" },
+          { "displayName": "Corp Client", "exePath": "C:\\Corp\\corp-client.exe", "source": "installed-program" },
+          { "displayName": "Other", "exePath": "C:\\Other\\other.exe", "source": "installed-program" }
+        ],
+        "stored": [
+          { "exe-path": "C:\\Corp\\corp-client.exe", "display-name": "Corp Client" },
+          { "exe-path": "C:\\Example\\example-gui.exe", "display-name": "Example" }
+        ]
+      },
+      "expected": [ "C:\\Example\\example-gui.exe", "C:\\Corp\\corp-client.exe" ]
+    },
+    {
+      "name": "paths compared without regard to case, the row's spelling returned",
+      "input": {
+        "rows": [ { "displayName": "A", "exePath": "C:\\A\\a.exe", "source": "running-process" } ],
+        "stored": [ { "exe-path": " c:\\a\\A.EXE ", "display-name": "A" } ]
+      },
+      "expected": [ "C:\\A\\a.exe" ]
+    },
+    {
+      "name": "a confirmed row is ticked",
+      "input": {
+        "rows": [ { "displayName": "B", "exePath": "C:\\B\\b.exe", "source": "confirmed" } ],
+        "stored": [ { "exe-path": "C:\\B\\b.exe", "display-name": "B" } ]
+      },
+      "expected": [ "C:\\B\\b.exe" ]
+    },
+    {
+      "name": "a pathless row is never ticked",
+      "input": {
+        "rows": [ { "displayName": "Corp Client", "exePath": "", "source": "installed-program" } ],
+        "stored": [ { "exe-path": "", "display-name": "Corp Client" } ]
+      },
+      "expected": []
+    },
+    {
+      "name": "a kernel tunnel is never ticked",
+      "input": {
+        "rows": [ { "displayName": "wg-example", "exePath": "/usr/bin/wg", "source": "kernel-tunnel", "interfaceName": "wg-example" } ],
+        "stored": [ { "exe-path": "/usr/bin/wg", "display-name": "wg" } ]
+      },
+      "expected": []
+    },
+    {
+      "name": "two rows of one path tick once",
+      "input": {
+        "rows": [
+          { "displayName": "A", "exePath": "C:\\A\\a.exe", "source": "running-process" },
+          { "displayName": "A again", "exePath": "c:\\a\\a.exe", "source": "installed-program" }
+        ],
+        "stored": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" } ]
+      },
+      "expected": [ "C:\\A\\a.exe" ]
+    },
+    {
+      "name": "no rows, nothing ticked",
+      "input": { "rows": [], "stored": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" } ] },
+      "expected": []
+    }
+  ]
+}

@@ -175,3 +175,14 @@ fn the_effective_window_follows_the_stored_deadline_except_until_restart() {
         TimedWindow::UntilRestart
     );
 }
+
+/// A suspend does not count against a timed wait: sleeping the whole remaining
+/// wait at once would keep a window whose deadline passed in the night open
+/// long after the wake.
+#[test]
+fn a_far_deadline_is_looked_at_again_within_seconds() {
+    let now = 1_800_000_000_000;
+    assert_eq!(expiry_wait(now + 8 * 3_600_000, now), EXPIRY_RECHECK);
+    assert_eq!(expiry_wait(now + 2_000, now), Duration::from_millis(2_000));
+    assert_eq!(expiry_wait(now - 5_000, now), Duration::ZERO);
+}

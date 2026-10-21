@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use nrr_platform_api::adapters::AdapterInfo;
 use nrr_platform_api::route_table::RouteTablePort;
-use nrr_platform_api::{classify_availability, AdapterAvailability, RouteEntry};
+use nrr_platform_api::RouteEntry;
 use nrr_storage::route_bindings::RouteBindingsRepository;
 use rusqlite::Connection;
 
@@ -40,30 +40,16 @@ pub fn resolver_may_arm(signed_in: Flag, present: PresentFn, conn: Arc<Mutex<Con
     Arc::new(move || signed_in() && someone_has_bound(&conn, &present()))
 }
 
-/// The one usable adapter holding a default route of its own in the family —
-/// the machine's uplink by structure, whatever it is called. `None` with none
-/// or with two: then the table cannot say which one is the uplink.
+/// The one link holding a default route of its own in the family — the
+/// machine's uplink by structure, whatever it is called. `None` with none or
+/// with two: then the table cannot say which one is the uplink. Our own fake-IP
+/// adapter never counts.
 pub fn sole_default_route_holder(
     adapters: &[AdapterInfo],
     routes: &[RouteEntry],
     v6: bool,
 ) -> Option<u32> {
-    let mut holders = adapters
-        .iter()
-        .filter(|a| classify_availability(a) == Some(AdapterAvailability::Available))
-        .map(|a| a.index)
-        .filter(|index| {
-            routes.iter().any(|r| {
-                r.interface_index == *index
-                    && r.prefix_length == 0
-                    && !r.is_ours
-                    && r.destination.is_ipv6() == v6
-            })
-        });
-    match (holders.next(), holders.next()) {
-        (Some(only), None) => Some(only),
-        _ => None,
-    }
+    nrr_platform_api::uplink::sole_default_route_holder(adapters, routes, v6, &[])
 }
 
 /// The connection to offer as main to a user who bound none: the sole holder
@@ -214,5 +200,17 @@ mod tests {
             "a default route we installed holds nothing"
         );
         assert_eq!(primary_suggestion(&adapters, &[]), None);
+    }
+
+    #[test]
+    fn our_fake_ip_adapter_is_never_suggested_and_never_spoils_the_count() {
+        let own_tun = link(9, nrr_shared::product_identity::TUN_ADAPTER_NAME);
+        let adapters = [link(3, "Home internet"), own_tun];
+        let routes = [default_route(3, false), default_route(9, false)];
+        assert_eq!(
+            primary_suggestion(&adapters, &routes).as_deref(),
+            Some("Home internet")
+        );
+        assert_eq!(primary_suggestion(&adapters[1..], &routes[1..]), None);
     }
 }

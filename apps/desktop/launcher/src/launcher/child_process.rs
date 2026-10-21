@@ -29,12 +29,17 @@ pub(super) fn apply_no_window(command: &mut Command) -> &mut Command {
 /// the one part of the launcher that must survive a misbehaving child.
 const MAX_CHILD_LINE_BYTES: usize = 4 * 1024 * 1024;
 
+/// How much of a dropped line is kept, enough to find a request's id.
+const OVERSIZED_HEAD_BYTES: usize = 1024;
+
 /// One line of host output, tagged with its stream. Only stdout carries the
 /// protocol: stderr holds Qt's messages and QML `console.log`, which echo text
 /// other processes can shape, so a marker there is never acted on.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ChildLine {
     Stdout(String),
+    /// A stdout line over the cap, dropped; only its start is kept.
+    StdoutOversized(String),
     Stderr(String),
 }
 
@@ -47,6 +52,8 @@ pub(super) enum HostMessage<'a> {
     Rpc(&'a str),
     /// Anything else: written to the log, never interpreted.
     Log(&'a str),
+    /// A line too long to hold was dropped; the start of it.
+    Oversized(&'a str),
 }
 
 /// Markers are anchored at the start of a stdout line: output that merely
@@ -54,6 +61,7 @@ pub(super) enum HostMessage<'a> {
 pub(super) fn host_message(line: &ChildLine) -> HostMessage<'_> {
     match line {
         ChildLine::Stderr(text) => HostMessage::Log(text),
+        ChildLine::StdoutOversized(head) => HostMessage::Oversized(head),
         ChildLine::Stdout(text) => {
             if let Some(rest) = text.strip_prefix(super::PREFS_MARKER) {
                 HostMessage::Prefs(rest.trim())
@@ -71,10 +79,25 @@ where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        pump_lines(BufReader::new(reader), MAX_CHILD_LINE_BYTES, |line| {
-            sender.send(ChildLine::Stdout(line)).is_ok()
-        });
+        let oversized = sender.clone();
+        pump_lines_reporting(
+            BufReader::new(reader),
+            MAX_CHILD_LINE_BYTES,
+            |line| sender.send(ChildLine::Stdout(line)).is_ok(),
+            |head| oversized.send(ChildLine::StdoutOversized(head)).is_ok(),
+        );
     });
+}
+
+/// The `correlation-id` of a request whose line was dropped, read from the
+/// kept start of it. `None` when it is not a request or the id is not there.
+pub(super) fn oversized_request_id(head: &str) -> Option<&str> {
+    const KEY: &str = "\"correlation-id\"";
+    head.strip_prefix(nrr_shared::launcher_rpc::RPC_REQUEST_MARKER)?;
+    let rest = head[head.find(KEY)? + KEY.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let id = &rest[..rest.find('"')?];
+    (!id.is_empty() && id.len() <= 64 && !id.contains(char::from(b'\\'))).then_some(id)
 }
 
 /// Like [`spawn_line_reader`] for stderr, also keeping the last lines in
@@ -96,7 +119,18 @@ pub(super) fn spawn_stderr_reader<R>(
 
 /// Hand every line of `reader` to `deliver` until the stream ends, a read
 /// fails or `deliver` returns `false`. A line longer than `cap` is dropped.
-fn pump_lines<R: BufRead>(mut reader: R, cap: usize, mut deliver: impl FnMut(String) -> bool) {
+fn pump_lines<R: BufRead>(reader: R, cap: usize, deliver: impl FnMut(String) -> bool) {
+    pump_lines_reporting(reader, cap, deliver, |_| true);
+}
+
+/// [`pump_lines`] that also hands the start of every dropped line to
+/// `oversized`, stopping when that returns `false` too.
+fn pump_lines_reporting<R: BufRead>(
+    mut reader: R,
+    cap: usize,
+    mut deliver: impl FnMut(String) -> bool,
+    mut oversized: impl FnMut(String) -> bool,
+) {
     let mut line = Vec::with_capacity(256);
     loop {
         line.clear();
@@ -108,7 +142,8 @@ fn pump_lines<R: BufRead>(mut reader: R, cap: usize, mut deliver: impl FnMut(Str
             Ok(_) => {}
         }
         if line.len() == cap && !line.ends_with(b"\n") {
-            if !skip_past_newline(&mut reader) {
+            let head = String::from_utf8_lossy(&line[..cap.min(OVERSIZED_HEAD_BYTES)]).into_owned();
+            if !oversized(head) || !skip_past_newline(&mut reader) {
                 break;
             }
             continue;
@@ -275,6 +310,50 @@ mod tests {
         assert_eq!(host_message(&rpc), HostMessage::Rpc(&request));
         let echoed = ChildLine::Stdout(format!("rule {marker}{{}}"));
         assert!(matches!(host_message(&echoed), HostMessage::Log(_)));
+    }
+
+    #[test]
+    fn a_dropped_line_reports_its_start_so_its_request_can_be_answered() {
+        let mut stream =
+            b"NRR_IPC_REQUEST:{\"correlation-id\":\"c-7\",\"operation\":\"x\",\"payload\":\""
+                .to_vec();
+        stream.extend(std::iter::repeat_n(b'z', 5000));
+        stream.extend_from_slice(b"\"}\nnext\n");
+        let (mut lines, mut heads) = (Vec::new(), Vec::new());
+        pump_lines_reporting(
+            BufReader::with_capacity(4096, stream.as_slice()),
+            2048,
+            |line| {
+                lines.push(line);
+                true
+            },
+            |head| {
+                heads.push(head);
+                true
+            },
+        );
+        assert_eq!(lines, ["next"]);
+        assert_eq!(heads.len(), 1);
+        assert!(heads[0].len() <= OVERSIZED_HEAD_BYTES);
+        assert_eq!(oversized_request_id(&heads[0]), Some("c-7"));
+    }
+
+    #[test]
+    fn an_id_is_read_only_from_a_request_and_only_when_plain() {
+        assert_eq!(oversized_request_id("noise \"correlation-id\":\"a\""), None);
+        let marker = nrr_shared::launcher_rpc::RPC_REQUEST_MARKER;
+        assert_eq!(
+            oversized_request_id(&format!("{marker}{{\"operation\":\"x\"")),
+            None
+        );
+        assert_eq!(
+            oversized_request_id(&format!("{marker}{{\"correlation-id\":\"a\\\"b\"")),
+            None
+        );
+        assert_eq!(
+            oversized_request_id(&format!("{marker}{{\"correlation-id\":\"\"")),
+            None
+        );
     }
 
     #[test]

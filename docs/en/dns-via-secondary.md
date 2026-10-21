@@ -44,9 +44,21 @@ not connected yet, or dropped — lookups fall back to the main connection
 automatically, so name resolution never stops working. It simply stops being
 protected until the additional connection is back.
 
-The setting works in either enforcement mode. It changes where NetRuleRouter
+The setting works with either routing method. It changes where NetRuleRouter
 asks, not how traffic is enforced, so it can be combined with per-site
 routing over virtual addresses (fake-IP) or used on its own.
+
+## Where the lookups go, and what the provider can still see
+
+Through the additional connection the lookups go to public resolvers: 1.1.1.1
+(Cloudflare), 8.8.8.8 (Google) and 9.9.9.9 (Quad9). Those services see the
+names, instead of your main provider.
+
+A lookup the additional connection does not answer in time is repeated over
+the main connection, so that names keep resolving. For that name your main
+provider can see the lookup and may answer it dishonestly. Sending such
+repeats through the additional connection too is planned for a later
+version.
 
 ## What it does not do
 
@@ -60,6 +72,7 @@ routing over virtual addresses (fake-IP) or used on its own.
 
 ## How to turn it on
 
-Settings → Routing → leak protection group → **Resolve site names through
-the additional connection**. It is off by default; the change takes effect
-immediately and is remembered between runs.
+Settings → Routing behavior → **DNS through the tunnel**. The switch appears
+once an additional connection is chosen. It is off
+by default; the change takes effect immediately and is remembered between
+runs.

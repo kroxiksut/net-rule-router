@@ -198,6 +198,11 @@ pub struct ConnectionTraceRing {
     connection_watch: std::sync::OnceLock<ConnectionWatch>,
     /// Each user's history: every named row is folded in on its way past.
     history: std::sync::OnceLock<Arc<crate::conn_history::ConnHistory>>,
+    /// Programs resolving names past the system, judged from named rows.
+    own_resolver: std::sync::OnceLock<(
+        Arc<crate::own_resolver_watch::OwnResolverWatch>,
+        crate::own_resolver_watch::OwnResolverOfferFn,
+    )>,
 }
 
 /// A cheap look at one connection: `(owner, remote)`.
@@ -214,7 +219,19 @@ impl ConnectionTraceRing {
             outage_blocks: Arc::new(crate::outage_blocks::OutageBlocks::new()),
             connection_watch: std::sync::OnceLock::new(),
             history: std::sync::OnceLock::new(),
+            own_resolver: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Tell `offer` about each program found resolving names on its own. Needs
+    /// a namer: without names every row would look unnamed. The first attached
+    /// stays; `false` says one already was.
+    pub fn attach_own_resolver_offers(
+        &self,
+        watch: Arc<crate::own_resolver_watch::OwnResolverWatch>,
+        offer: crate::own_resolver_watch::OwnResolverOfferFn,
+    ) -> bool {
+        self.own_resolver.set((watch, offer)).is_ok()
     }
 
     /// Keep each user's history of the rows pushed from now on. The first
@@ -281,6 +298,12 @@ impl ConnectionTraceRing {
         }
         if let Some(history) = self.history.get() {
             history.record(&rec, now_unix_ms());
+        }
+        if let (Some((watch, offer)), Some(namer)) = (self.own_resolver.get(), self.namer.get()) {
+            let named_now = |ip: IpAddr| namer.name(ip).is_some();
+            if let Some(found) = watch.observe(&rec, now_unix_ms(), named_now) {
+                offer(&found.sid, &found.program, &found.unnamed);
+            }
         }
         if let (Some(at_ms), Some(sid)) = (outage_at_ms, rec.user_sid.as_deref()) {
             let app = rec
@@ -517,14 +540,14 @@ pub struct ConnectionObservationConsumer {
     /// Label each connection against its OWN user's links rather than the
     /// active user's — where several users each bind links of their own.
     owner_scoped: bool,
+    /// Under [`Self::owner_scoped`], a service account's connection, or one
+    /// whose owner could not be read, still follows the routing user's links:
+    /// that traffic takes the routing user's routes.
+    machine_accounts_follow_active: bool,
     /// Per owner, the outage episode (its start) whose notice went out. Read
     /// only under [`Self::owner_scoped`], where one machine-wide latch would
     /// let one user's outage silence another's.
     outage_announced_for: Mutex<std::collections::HashMap<String, u64>>,
-    /// Classifier for the "no rule covers this host" catch-all, for a platform
-    /// whose drop ids name their role directly. `None` derives the id from the
-    /// codegen hash instead.
-    not_covered_drop_check: Option<KillswitchDropCheckFn>,
     /// Folds a socket-table row into the drop report of the same connection.
     /// `None` where the sources never describe one connection twice.
     drop_pairing: Option<Mutex<drop_pairing::DropSocketPairing>>,
@@ -587,6 +610,10 @@ pub struct ConnectionObservationConsumer {
     /// VPN client and nothing else — no notice, no outage row, no name
     /// learning, no flow reset. `None` treats every drop as a user's.
     service_account_drop_check: Option<KillswitchDropCheckFn>,
+    /// Classifier for the user's own deny rules: `true` when the dropping
+    /// filter is one a Block rule compiled to. The user named that
+    /// destination, so it is never reverse-named. `None` treats no drop as one.
+    rule_block_drop_check: Option<KillswitchDropCheckFn>,
     /// Proactive VPN-client learning — when wired, the OBSERVED
     /// PROCESS PATH of every role-verified kill-switch drop from a VPN-named
     /// process is handed to this sink, which registers the client for an
@@ -596,13 +623,17 @@ pub struct ConnectionObservationConsumer {
     /// [`Self::killswitch_drop_check`] it never fires; `None` keeps the
     /// observer from learning client apps.
     vpn_client_app_learner: Option<VpnClientAppLearnFn>,
+    /// Where a dropped handshake of another VPN goes to become a question.
+    /// `None` asks nothing.
+    vpn_gateway_drop: Option<VpnGatewayDropFn>,
     /// When wired (FCrDNS), each distinct remote
     /// IP of ANY flow OUR enforcement dropped (`blocked_by_nrr == Some(true)`,
     /// routable V4) is handed to this sink, which forward-confirms the name behind
     /// the IP and, if it matches a rule, caches it (see
-    /// [`crate::fcrdns_learner`]). Unlike the VPN learner this grants NO exemption
-    /// — it only feeds the rule-gated cache — so it is safe to enable and is NOT
-    /// gated on the process name. `None` keeps the observer from reverse-learning.
+    /// [`crate::fcrdns_learner`]); a confirmed name no rule matches exempts only
+    /// its confirmed addresses from block-all as known-direct. Never an app-wide
+    /// exemption, so it is NOT gated on the process name. `None` keeps the
+    /// observer from reverse-learning.
     reverse_dns_learner: Option<ReverseDnsLearnFn>,
     /// `(process basename, remote ip, remote port)` triples whose
     /// BLOCK has already been detail-logged this session. The first drop of a
@@ -682,6 +713,9 @@ pub struct ConnectionObservationConsumer {
     /// socket older than the pin keeps its interface until it dies. `None`
     /// leaves the drop standing and the application waiting.
     stale_flow_reset: Option<Arc<dyn StaleFlowReset>>,
+    /// The shared-address census [`flows_to_reset`] spares by. Unwired, it
+    /// spares nothing.
+    flow_reset_census: Option<Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>>,
     /// Is the fail-closed block-all posture armed right now? Under it every
     /// drop of ours has one cause — the additional route is unavailable —
     /// whatever the filter that caught the packet, and telling the user a rule
@@ -781,6 +815,11 @@ fn collateral_pin_owners(
 /// can live behind an `Arc` shared with the supervised task.
 pub type VpnClientAppLearnFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// Sink for a dropped VPN handshake no recognised client made: `(owner,
+/// gateway address, program when one can be named)`. See
+/// [`crate::vpn_gateway_confirm`].
+pub type VpnGatewayDropFn = Arc<dyn Fn(&str, IpAddr, Option<&str>) + Send + Sync>;
+
 /// Role-verification check for a dropping filter's decoded NRR spec id: `true`
 /// when that filter belongs to the kill-switch/fail-closed BLOCK set (see
 /// [`crate::killswitch_drop_registry::KillswitchBlockFilterRegistry`]). The
@@ -796,8 +835,13 @@ pub type FailClosedArmedFn = Arc<dyn Fn() -> bool + Send + Sync>;
 /// forward-confirm + rule-gated cache). `Send + Sync` so the consumer can live
 /// behind an `Arc`. The `bool` is `allow_direct` — see
 /// [`crate::fcrdns_learner::ReverseDnsLearner::learn_scoped`].
+/// The last argument is the connection's owner, so a name learned from one
+/// user's traffic is filed under that user.
 pub type ReverseDnsLearnFn =
-    Arc<dyn Fn(std::net::Ipv4Addr, bool, ReverseLearnOrigin) + Send + Sync>;
+    Arc<dyn Fn(std::net::Ipv4Addr, bool, ReverseLearnOrigin, Option<&str>) + Send + Sync>;
+
+/// One queued reverse lookup: address, `allow_direct`, origin, owner.
+pub type ReverseLearnJob = (std::net::Ipv4Addr, bool, ReverseLearnOrigin, Option<String>);
 
 /// Why an address reached the reverse learner. Both feeds name an address the
 /// resolver never saw, but only one of them is a drop, and a log line that
@@ -845,10 +889,11 @@ pub type AppMainLinkFn =
 pub type AppAdditionalLinkFn = Arc<dyn Fn(Option<&str>, &str) + Send + Sync>;
 
 /// Reports one outbound connection attempt to the navigation measurement:
-/// the initiating image path, the destination's name when it has one, and
-/// when the connection happened. Purely observational — see
-/// [`crate::navigation_registry`].
-pub type NavigationAttemptFn = Arc<dyn Fn(Option<&str>, Option<&str>, u64) + Send + Sync>;
+/// the connection's owner, the initiating image path, the destination's name
+/// when it has one, and when the connection happened. Purely observational —
+/// see [`crate::navigation_registry`].
+pub type NavigationAttemptFn =
+    Arc<dyn Fn(Option<&str>, Option<&str>, Option<&str>, u64) + Send + Sync>;
 
 /// Sink for a censored host somebody actually went to.
 /// Leads with the connection's owner, as [`CompanionInUseFn`].
@@ -882,12 +927,18 @@ mod unanswered;
 
 pub use trace_tee::ConnTraceTee;
 
+pub(crate) use connection_facts::offerable_program;
+
 use connection_facts::{
     block_reason_for, is_learnable_endpoint, process_basename_lower,
     process_is_p2p_fcrdns_suppressed, process_name_matches_vpn,
 };
 
 #[cfg(test)]
+mod deny_drop_tests;
+#[cfg(test)]
 mod owner_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vpn_gateway_drop_tests;

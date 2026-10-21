@@ -113,31 +113,13 @@ impl QtPreferencesPayload {
                 &current.route_shared_ip_policy,
             );
         }
-        if let Some(v) = self.route_kill_switch_block_all {
-            current.route_kill_switch_block_all = v;
-        }
-        if let Some(v) = self.route_kill_switch_fail_closed {
-            current.route_kill_switch_fail_closed = v;
-        }
         if let Some(mask) = self.route_kill_switch_protocols.filter(|&mask| {
             u16::try_from(mask).is_ok_and(nrr_shared::ipc_payloads::is_valid_kill_switch_protocols)
         }) {
             current.route_kill_switch_protocols = mask;
         }
-        if let Some(v) = self.route_kill_switch_enabled {
-            current.route_kill_switch_enabled = v;
-        }
         if let Some(v) = self.route_allow_dns_over_primary {
             current.route_allow_dns_over_primary = v;
-        }
-        // An unknown slug from a divergent QML build keeps the stored value.
-        if let Some(slug) = self.route_mode_a_coverage_strategy.filter(|slug| {
-            matches!(
-                slug.as_str(),
-                "per-ip" | "fail-closed-unknown" | "zone-widening"
-            )
-        }) {
-            current.route_mode_a_coverage_strategy = slug;
         }
         if let Some(v) = self.route_resolve_hosts_bypass {
             current.route_resolve_hosts_bypass = v;

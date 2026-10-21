@@ -40,9 +40,9 @@ NetRuleRouter actually does about them.
 
 | What you want | What actually changes |
 |---|---|
-| A specific site should reach me over a different connection while everything else stays fast and direct | Exactly what a rule does. See [Routing modes](routing-modes.md) |
+| A specific site should reach me over a different connection while everything else stays fast and direct | Exactly what a rule does. See the [Quick start](quickstart.md) |
 | My provider should not see, or interfere with, which sites I look up | Turn on **DNS through the tunnel**. See [DNS through the tunnel](dns-via-secondary.md) |
-| Nothing should ever slip onto the main connection, even briefly | Use the leak-protection mode that sends everything through the additional connection. Per-rule routing is precise, not airtight; the trade-off is spelled out in [Routing modes](routing-modes.md) |
+| Nothing should ever slip onto the main connection, even briefly | Send the default route through the additional connection and set leak protection to **Everything**. Per-rule routing is precise, not airtight; both choices are explained in the [Quick start](quickstart.md#first-setup) |
 | A site should see me as coming from another country | It will see the additional connection's address. Whether that reads as another country depends on that connection, not on NetRuleRouter — and your account and browser still identify you |
 | A site should stop recognising me between visits | NetRuleRouter does not do this. Sign out, clear the site's data, or use a separate browser profile |
 | The operator of the additional connection should not see my traffic | Not something routing can give you. Routed traffic is visible to whoever runs that connection — choose one you are willing to trust |
@@ -77,6 +77,15 @@ user of the computer and comes pre-filled; an administrator can add the suffix
 of your own home network, and the network you join is only ever offered, never
 trusted on its own. A name that one of your rules covers keeps following the
 rule, whatever network you are on.
+
+## A network cannot quietly reroute your traffic
+
+Some networks, public Wi-Fi among them, can hand your computer extra routes
+that steer traffic around a VPN. With leak protection on, traffic your rules
+send through the additional connection is held back rather than sent through
+the main one, even if the network plants such a route. Without leak
+protection this guarantee does not apply, so keep it on for sites that
+matter, especially on networks you do not control.
 
 ## What NetRuleRouter is not
 

@@ -9,6 +9,11 @@ pub const INTRO: Key = key(
     "These addresses were pulled in by sites you route. Adding one sends it through the additional route together with the site that needs it. Anything you leave alone keeps going through the main route.",
 );
 pub const LIST_TITLE: Key = key("rules.suggestions.inbox.nav-label", "Suggested addresses");
+/// The count the tray menu and the window's sidebar show, from the same number.
+pub const LIST_TITLE_COUNTED: Key = key(
+    "tray.menu.suggestions-count",
+    "Suggested addresses ({count})",
+);
 
 pub const MODE: Key = key("label.mode", "Mode");
 pub const MODE_OFF: Key = key("settings.routing.auto-rules.mode-off", "Off");
@@ -113,7 +118,7 @@ pub const AFFINITY: Key = key(
     "tray.auto-rules.detail-affinity",
     "belongs to this site {percent}% of the time",
 );
-pub const SIGNALS: [Key; 6] = [
+pub const SIGNALS: [Key; 7] = [
     key("tray.auto-rules.signal.brand-related", "shares a name with the site"),
     key(
         "tray.auto-rules.signal.delivery-name",
@@ -134,6 +139,10 @@ pub const SIGNALS: [Key; 6] = [
     key(
         "tray.auto-rules.signal.main-link-blocked",
         "connections to it kept failing on the main route and none went through",
+    ),
+    key(
+        "tray.auto-rules.signal.app-own-resolver",
+        "it looks up site names on its own, so rules by site name do not reach it",
     ),
 ];
 
@@ -173,6 +182,45 @@ pub const NOTICE_TITLE: Key = key("tray.auto-rules.title", "Addresses a site nee
 pub const NOTICE_BODY: Key = key(
     "tray.auto-rules.body",
     "Found addresses without which {name} will not work fully.",
+);
+/// Headings of a notice about offers that are not a site's companions, one
+/// per `nrr_client_logic::auto_rules::NoticeKind`, the tray's words.
+pub const NOTICE_TITLE_SITES_BLOCKED: Key = key(
+    "tray.auto-rules.title-blocked",
+    "Sites the main route will not carry",
+);
+pub const NOTICE_BODY_SITES_BLOCKED: Key = key(
+    "tray.auto-rules.body-blocked",
+    "Connections to {name} keep failing on the main route.",
+);
+pub const NOTICE_TITLE_APP_BLOCKED: Key = key(
+    "tray.auto-rules.title-app-blocked",
+    "Programs the main route will not carry",
+);
+pub const NOTICE_BODY_APP_BLOCKED: Key = key(
+    "tray.auto-rules.body-app-blocked",
+    "No connection of {name} goes through on the main route.",
+);
+pub const NOTICE_TITLE_APP_OWN_RESOLVER: Key = key(
+    "tray.auto-rules.title-app-own-resolver",
+    "Programs your site rules do not reach",
+);
+pub const NOTICE_BODY_APP_OWN_RESOLVER: Key = key(
+    "tray.auto-rules.body-app-own-resolver",
+    "{name} looks up site names on its own, so rules by site name do not apply to it. A rule for the program sends all of its connections over the additional route.",
+);
+pub const NOTICE_TITLE_MIXED_BLOCKED: Key = key(
+    "tray.auto-rules.title-mixed-blocked",
+    "Not getting through on the main route",
+);
+pub const NOTICE_BODY_MIXED_BLOCKED: Key = key(
+    "tray.auto-rules.body-mixed-blocked",
+    "The programs and sites below keep failing on the main route.",
+);
+pub const NOTICE_TITLE_ASSORTED: Key = key("tray.auto-rules.title-assorted", "Suggested rules");
+pub const NOTICE_BODY_ASSORTED: Key = key(
+    "tray.auto-rules.body-assorted",
+    "Each item below says why it is offered.",
 );
 pub const NOTICE_SITE_FALLBACK: Key = key("tray.auto-rules.site-fallback", "a site you use");
 pub const NOTICE_OPEN: Key = key(
@@ -306,6 +354,7 @@ pub fn all() -> Vec<Key> {
         TITLE,
         INTRO,
         LIST_TITLE,
+        LIST_TITLE_COUNTED,
         MODE,
         MODE_OFF,
         MODE_SUGGEST,
@@ -349,6 +398,16 @@ pub fn all() -> Vec<Key> {
         AUTO_BODY,
         NOTICE_TITLE,
         NOTICE_BODY,
+        NOTICE_TITLE_SITES_BLOCKED,
+        NOTICE_BODY_SITES_BLOCKED,
+        NOTICE_TITLE_APP_BLOCKED,
+        NOTICE_BODY_APP_BLOCKED,
+        NOTICE_TITLE_APP_OWN_RESOLVER,
+        NOTICE_BODY_APP_OWN_RESOLVER,
+        NOTICE_TITLE_MIXED_BLOCKED,
+        NOTICE_BODY_MIXED_BLOCKED,
+        NOTICE_TITLE_ASSORTED,
+        NOTICE_BODY_ASSORTED,
         NOTICE_SITE_FALLBACK,
         NOTICE_OPEN,
         LOADING,

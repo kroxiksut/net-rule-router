@@ -280,6 +280,23 @@ fn restore_gives_the_catch_all_back_and_removes_the_link() {
     assert!(!redirect.taken_file.exists());
 }
 
+/// A VPN that went away and came back as another interface under the same
+/// name never held the catch-all through us: it is not handed one.
+#[test]
+fn a_link_reusing_a_taken_name_is_not_given_the_catch_all() {
+    let fake = FakeResolved::machine();
+    let (_dir, redirect) = redirect(&fake, "reused-name");
+    let handle = redirect.redirect_to(LISTENER_ADDR).expect("redirects");
+    fake.add("wg0", 9, &["203.0.113.1"], &["~corp.example"]);
+    redirect.restore(&handle).expect("restores");
+    assert_eq!(
+        fake.domains("wg0"),
+        Some(vec!["~corp.example".to_string()]),
+        "another interface under the same name"
+    );
+    assert!(!redirect.indexes_file().exists());
+}
+
 #[test]
 fn a_vpn_that_reclaims_every_name_is_noticed_and_redirected_again() {
     let fake = FakeResolved::machine();
@@ -407,6 +424,37 @@ fn upstream_servers_come_from_the_links_never_from_our_own() {
             (Some(4), Ipv4Addr::new(198, 51, 100, 1)),
             (Some(3), Ipv4Addr::new(192, 0, 2, 1)),
         ]
+    );
+}
+
+/// The tunnel is read first and lists the home router's server too: per link
+/// it stays the home link's as well, so barring the tunnel cannot hide it.
+#[test]
+fn a_server_a_tunnel_and_the_home_link_both_offer_is_listed_for_each_link() {
+    let fake = FakeResolved::default();
+    fake.add("wlp3s0", 3, &["192.0.2.1"], &[]);
+    fake.add("wg0", 4, &["192.0.2.1", "198.51.100.1"], &["~corp.example"]);
+    let servers = ResolvedDnsServers(fake);
+    let home = std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    let corporate = std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+    let per_link: Vec<(Option<u32>, std::net::IpAddr)> = servers
+        .upstream_candidates_per_link()
+        .into_iter()
+        .map(|c| (c.interface_index, c.server))
+        .collect();
+    assert_eq!(
+        per_link,
+        vec![(Some(4), home), (Some(4), corporate), (Some(3), home)]
+    );
+    let plain: Vec<Ipv4Addr> = servers
+        .upstream_candidates_v4()
+        .into_iter()
+        .map(|c| c.server)
+        .collect();
+    assert_eq!(
+        plain,
+        vec![Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(198, 51, 100, 1)],
+        "the plain list still asks each server once"
     );
 }
 

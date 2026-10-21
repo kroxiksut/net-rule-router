@@ -34,6 +34,13 @@ ComboBox {
             return String(item[root.textRole])
         return String(item)
     }
+    // A ListModel with a single role hands its delegate that role's bare value as
+    // `modelData`; resolvers expect the row, so give them `model` instead.
+    function _delegateItem(data, row) {
+        if (data !== undefined && data !== null && typeof data === "object") return data
+        if (root.textRole && row && row[root.textRole] !== undefined) return row
+        return data !== undefined ? data : row
+    }
     function _itemEnabled(item) {
         return typeof itemEnabledResolver === "function" ? !!itemEnabledResolver(item) : true
     }
@@ -78,7 +85,7 @@ ComboBox {
     delegate: ItemDelegate {
         id: themedDelegate
         width: ListView.view ? ListView.view.width : root.popup.width
-        enabled: root._itemEnabled(typeof modelData !== "undefined" ? modelData : model)
+        enabled: root._itemEnabled(root._delegateItem(typeof modelData !== "undefined" ? modelData : undefined, model))
         highlighted: root.highlightedIndex === index
         background: Rectangle {
             color: highlighted ? theme.colorAccent : theme.colorPanel
@@ -88,7 +95,7 @@ ComboBox {
         contentItem: Text {
             leftPadding: theme.spacingSm
             rightPadding: theme.spacingSm
-            text: root._labelFor(typeof modelData !== "undefined" ? modelData : model)
+            text: root._labelFor(root._delegateItem(typeof modelData !== "undefined" ? modelData : undefined, model))
             textFormat: Text.PlainText
             color: highlighted ? theme.colorOnAccent
                 : themedDelegate.enabled ? theme.colorText

@@ -575,3 +575,157 @@ fn only_news_moves_the_change_generation() {
         .expect("census restamp");
     assert_eq!(store.change_generation(), Some(after_census));
 }
+
+// ── clock steps ───────────────────────────────────────────────────────────
+
+fn hours(n: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(n * 3_600)
+}
+
+/// After a step back of 5 h, a row stamped in the future must not stay
+/// "fresh" for those 5 h, and the refresh must pick it up at once.
+#[test]
+fn a_row_stamped_in_the_future_reads_as_now_and_is_due_for_refresh() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+    let now = SystemTime::now();
+    store
+        .upsert_resolution(resolution_at("future.example", ip, now + hours(5)))
+        .expect("upsert");
+
+    let got = store
+        .get_by_hostname(
+            "future.example",
+            &FreshnessThresholds::default_production(),
+            CachePriorityStrategy::default(),
+        )
+        .expect("get");
+    let at = got.resolved_ips[0].resolved_at.expect("stamp");
+    assert!(at <= SystemTime::now(), "the stamp stayed in the future");
+    let snapshot = store.snapshot_resolutions().expect("snapshot");
+    assert!(snapshot.iter().all(|(_, _, at)| *at <= SystemTime::now()));
+
+    let due = store.list_expired_resolutions(now, 10).expect("due");
+    assert!(due.iter().any(|h| h.canonical_hostname == "future.example"));
+}
+
+#[test]
+fn a_negative_entry_from_the_future_is_cleaned_up() {
+    use crate::dto::NegativeCacheReason;
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let now = SystemTime::now();
+    store
+        .upsert_negative_cache(NegativeCacheEntry {
+            input: "stepped.test".to_string(),
+            reason: NegativeCacheReason::NxDomain,
+            created_at: now + hours(5),
+            expires_at: now + hours(5) + std::time::Duration::from_secs(30),
+            source: StorageResolutionSource::Dns,
+        })
+        .expect("neg upsert");
+
+    let summary = store
+        .cleanup_expired(now, &crate::dto::CleanupPolicy::default())
+        .expect("cleanup");
+    assert_eq!(summary.negative_cache_entries_removed, 1);
+}
+
+/// A forward step of more than the backstop makes every row look abandoned;
+/// the last-known-good set stays while nothing in the cache is recent.
+#[test]
+fn a_forward_clock_step_does_not_wipe_the_last_known_good_set() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+    let then = SystemTime::now();
+    store
+        .upsert_resolution(resolution_at("kept.example", ip, then))
+        .expect("upsert");
+
+    let after_step = then + hours(24 * 40);
+    let summary = store
+        .cleanup_expired(after_step, &crate::dto::CleanupPolicy::default())
+        .expect("cleanup");
+    assert_eq!(summary.expired_resolutions_removed, 0);
+
+    // Once the cache is written to again, an old unrefreshed row is abandoned.
+    store
+        .upsert_resolution(resolution_at(
+            "live.example",
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11)),
+            after_step,
+        ))
+        .expect("upsert");
+    let summary = store
+        .cleanup_expired(after_step + hours(1), &crate::dto::CleanupPolicy::default())
+        .expect("cleanup");
+    assert_eq!(summary.expired_resolutions_removed, 1);
+}
+
+#[test]
+fn a_negative_entry_does_not_move_the_change_generation() {
+    use crate::dto::NegativeCacheReason;
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let before = store.change_generation();
+    let now = SystemTime::now();
+    store
+        .upsert_negative_cache(NegativeCacheEntry {
+            input: "quiet.test".to_string(),
+            reason: NegativeCacheReason::ResolveFailed,
+            created_at: now,
+            expires_at: now + std::time::Duration::from_secs(30),
+            source: StorageResolutionSource::Dns,
+        })
+        .expect("neg upsert");
+    assert_eq!(store.change_generation(), before);
+}
+
+// ── refresh candidates ────────────────────────────────────────────────────
+
+/// A host nobody has used for a while is not worth a re-resolution unless a
+/// rule names it, and the refresh itself never makes a host look used.
+#[test]
+fn refresh_candidates_are_named_or_recently_used() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store_short_ttl(&dir);
+    let now = SystemTime::now();
+    let long_ago = now - hours(24 * 20);
+    for (host, last) in [
+        ("named.example", long_ago),
+        ("idle.example", long_ago),
+        ("busy.example", now - hours(1)),
+    ] {
+        store
+            .upsert_resolution(resolution_at(
+                host,
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+                last,
+            ))
+            .expect("seed");
+    }
+    let later = now + hours(1);
+    let used_since = now - hours(24 * 7);
+    let named = vec!["named.example".to_string()];
+
+    let got = store
+        .list_expired_for_refresh(later, 10, used_since, &named)
+        .expect("list");
+    let hosts: Vec<&str> = got.iter().map(|h| h.canonical_hostname.as_str()).collect();
+    assert_eq!(hosts, vec!["busy.example", "named.example"]);
+
+    // A refresh restamps the answer but leaves the last use where it was.
+    store
+        .refresh_resolution(resolution_at(
+            "idle.example",
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+            later,
+        ))
+        .expect("refresh");
+    let still = store
+        .list_expired_for_refresh(later + hours(24 * 30), 10, used_since, &[])
+        .expect("list");
+    assert!(still.iter().all(|h| h.canonical_hostname != "idle.example"));
+}

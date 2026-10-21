@@ -1,0 +1,101 @@
+{
+  "description": "pure.js formRuleValue / nrr_client_logic::rule_form::form_rule_value: a value typed into the rule form as the rule it names",
+  "cases": [
+    {
+      "name": "a program name with spaces in quotes",
+      "input": {
+        "type": "application",
+        "value": "\"Web Content\""
+      },
+      "expected": "Web Content"
+    },
+    {
+      "name": "a path copied with its quotes",
+      "input": {
+        "type": "application",
+        "value": "\"C:\\Program Files\\App\\app.exe\""
+      },
+      "expected": "C:\\Program Files\\App\\app.exe"
+    },
+    {
+      "name": "only one outer pair goes",
+      "input": {
+        "type": "application",
+        "value": "\"\"x\"\""
+      },
+      "expected": "\"x\""
+    },
+    {
+      "name": "spaces inside the quotes are trimmed",
+      "input": {
+        "type": "application",
+        "value": "\" x \""
+      },
+      "expected": "x"
+    },
+    {
+      "name": "a bare program stays as typed",
+      "input": {
+        "type": "application",
+        "value": "chrome.exe"
+      },
+      "expected": "chrome.exe"
+    },
+    {
+      "name": "an empty pair stays",
+      "input": {
+        "type": "application",
+        "value": "\"\""
+      },
+      "expected": "\"\""
+    },
+    {
+      "name": "a pair of only spaces stays",
+      "input": {
+        "type": "application",
+        "value": "\"  \""
+      },
+      "expected": "\"  \""
+    },
+    {
+      "name": "one quote alone stays",
+      "input": {
+        "type": "application",
+        "value": "\""
+      },
+      "expected": "\""
+    },
+    {
+      "name": "an opening quote alone stays",
+      "input": {
+        "type": "application",
+        "value": "\"Web Content"
+      },
+      "expected": "\"Web Content"
+    },
+    {
+      "name": "a host keeps its quotes",
+      "input": {
+        "type": "exact-fqdn",
+        "value": "\"a.example\""
+      },
+      "expected": "\"a.example\""
+    },
+    {
+      "name": "a zone keeps its quotes",
+      "input": {
+        "type": "zone",
+        "value": "\"ru\""
+      },
+      "expected": "\"ru\""
+    },
+    {
+      "name": "an ideographic space is trimmed as the reader trims",
+      "input": {
+        "type": "application",
+        "value": "\"　app　\""
+      },
+      "expected": "app"
+    }
+  ]
+}

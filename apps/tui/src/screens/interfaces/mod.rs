@@ -28,8 +28,11 @@ pub struct InterfacesScreen;
 
 #[derive(Debug, Default)]
 pub struct InterfacesState {
-    /// The chosen row of the adapter list.
+    /// The chosen row of the adapter list, as a position and as the adapter:
+    /// the list re-sorts when a binding or a re-read changes it, and the
+    /// adapter is what the user chose.
     cursor: usize,
+    cursor_key: Option<String>,
     show_bluetooth: bool,
     question: Option<Question>,
     /// The highlighted answer of the question.
@@ -103,10 +106,25 @@ fn rows(app: &AppState) -> Vec<InterfaceRowDto> {
     adapters(app, app.interfaces.show_bluetooth)
 }
 
+/// The chosen row: the chosen adapter wherever it moved to, else the position.
+fn cursor_index(app: &AppState, rows: &[InterfaceRowDto]) -> usize {
+    let last = rows.len().saturating_sub(1);
+    app.interfaces
+        .cursor_key
+        .as_deref()
+        .and_then(|key| rows.iter().position(|row| row_key(row) == key))
+        .unwrap_or_else(|| app.interfaces.cursor.min(last))
+}
+
+fn set_cursor(app: &mut AppState, rows: &[InterfaceRowDto], index: usize) {
+    app.interfaces.cursor = index;
+    app.interfaces.cursor_key = rows.get(index).map(row_key);
+}
+
 fn selected(app: &AppState) -> Option<InterfaceRowDto> {
     let rows = rows(app);
-    let last = rows.len().checked_sub(1)?;
-    rows.into_iter().nth(app.interfaces.cursor.min(last))
+    let index = cursor_index(app, &rows);
+    rows.into_iter().nth(index)
 }
 
 /// Give `key`'s adapter `route`, or take it away when it already holds it.
@@ -133,7 +151,7 @@ fn toggle(app: &mut AppState, key: &str, route: Route) {
             key: key.to_string(),
             change: RoleChange::assign(row, route),
         });
-        app.interfaces.answer = 0;
+        app.interfaces.answer = 1;
         None
     } else {
         start(app, RoleChange::assign(row, route));
@@ -192,8 +210,9 @@ fn answer(app: &mut AppState, index: usize) {
     };
     match question {
         Question::Adapter => {
-            if let Some(row) = rows(app).get(index) {
-                app.interfaces.cursor = index;
+            let rows = rows(app);
+            if let Some(row) = rows.get(index) {
+                set_cursor(app, &rows, index);
                 app.interfaces.question = Some(Question::Role { key: row_key(row) });
                 app.interfaces.answer = 0;
             }
@@ -281,9 +300,10 @@ impl Screen for InterfacesScreen {
                 _ => false,
             };
         }
-        let count = rows(app).len();
-        if let Some(next) = choice::moved(app.interfaces.cursor.min(count), count, key.code) {
-            app.interfaces.cursor = next;
+        let list = rows(app);
+        let count = list.len();
+        if let Some(next) = choice::moved(cursor_index(app, &list), count, key.code) {
+            set_cursor(app, &list, next);
             return true;
         }
         let KeyCode::Char(c) = key.code else {
@@ -389,7 +409,7 @@ fn panels(app: &AppState, texts: &Texts) -> Vec<Panel> {
         texts.get(k::ADAPTERS_TITLE),
         adapter_lines(app, &rows, texts),
     ));
-    if let Some(row) = rows.get(app.interfaces.cursor.min(rows.len().saturating_sub(1))) {
+    if let Some(row) = rows.get(cursor_index(app, &rows)) {
         panels.push(panel(
             texts.fill(k::DETAILS_TITLE, &[("name", display_name(row))]),
             detail_lines(row, texts),
@@ -430,7 +450,7 @@ fn adapter_lines(app: &AppState, rows: &[InterfaceRowDto], texts: &Texts) -> Vec
     if rows.is_empty() {
         return vec![ViewLine::text(texts.get(k::NO_ADAPTERS))];
     }
-    let cursor = app.interfaces.cursor.min(rows.len() - 1);
+    let cursor = cursor_index(app, rows);
     rows.iter()
         .enumerate()
         .map(|(i, row)| {

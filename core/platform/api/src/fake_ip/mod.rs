@@ -52,5 +52,5 @@ pub use stale_flows::{
 };
 pub use tun::{
     MockTunAdapter, MockTunState, NoopTunAdapter, TunAdapterConfig, TunAdapterPort, TunControl,
-    TunDevice, DEFAULT_TUN_MTU, DEFAULT_TUN_RING_CAPACITY_BYTES,
+    TunDevice, DEFAULT_TUN_MTU, DEFAULT_TUN_RING_CAPACITY_BYTES, OWN_TUN_ADAPTER_GUID,
 };

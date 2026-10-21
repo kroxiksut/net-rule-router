@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use nrr_shared::ipc::IpcOperationName;
 
+use crate::boot_clock::BootInstant;
 use crate::ipc::{
     CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcOperationClass,
     IpcRequestContext, IpcRequestEnvelope, Prechecked,
@@ -148,11 +149,10 @@ impl ProductImpactDisableTemporaryHandler {
             ctx.caller_stored(),
             ctx.caller_is_elevated,
         );
-        let now = Instant::now();
         let token = self.token_store.issue(
             IpcOperationName::ProductImpactDisableTemporary,
             stored,
-            now + self.token_ttl,
+            BootInstant::now() + self.token_ttl,
         );
 
         let resp = ProductImpactDisableDryRunResponse {
@@ -207,7 +207,7 @@ impl ProductImpactDisableTemporaryHandler {
                 diagnostics_id: None,
             })?;
 
-        let now = Instant::now();
+        let now = BootInstant::now();
         // An elevated confirm may be an administrator answering a standard
         // account's prompt: it is that account's dry-run, and its routing.
         let stored = self
@@ -562,7 +562,7 @@ mod tests {
                 "",
                 true,
             ),
-            Instant::now() + DEFAULT_MUTATION_TOKEN_TTL,
+            BootInstant::now() + DEFAULT_MUTATION_TOKEN_TTL,
         );
         let err = h
             .handle(

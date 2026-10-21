@@ -23,7 +23,9 @@ Notifications:
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the listed programs as your VPN, so leak protection keeps them working
+  a: allow the listed VPNs to reach their servers, so leak protection lets them connect
   p: confirm the suggested main connection; another one is chosen under Interfaces and routes
+  v: send the blocked site named under the state over the additional route; you are asked first
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Rules
@@ -48,6 +50,9 @@ Commands on this screen:
   m: move the rules that work only on the other route. n: not now
   c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
   v: add a rule for a VPN's gateway
+  g: application and device routes
+  F: compare your linked rules files with the rules in force and merge them
+  C: remove the rules a wildcard rule of the same route already covers
   A: add several rules at once
   T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
   R: recent changes. U: put a deleted rule back
@@ -80,6 +85,9 @@ Commands on this screen:
   m: move the rules that work only on the other route. n: not now
   c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
   v: add a rule for a VPN's gateway
+  g: application and device routes
+  F: compare your linked rules files with the rules in force and merge them
+  C: remove the rules a wildcard rule of the same route already covers
   A: add several rules at once
   T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
   R: recent changes. U: put a deleted rule back
@@ -112,6 +120,9 @@ Commands on this screen:
   m: move the rules that work only on the other route. n: not now
   c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
   v: add a rule for a VPN's gateway
+  g: application and device routes
+  F: compare your linked rules files with the rules in force and merge them
+  C: remove the rules a wildcard rule of the same route already covers
   A: add several rules at once
   T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
   R: recent changes. U: put a deleted rule back
@@ -144,6 +155,9 @@ Commands on this screen:
   m: move the rules that work only on the other route. n: not now
   c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
   v: add a rule for a VPN's gateway
+  g: application and device routes
+  F: compare your linked rules files with the rules in force and merge them
+  C: remove the rules a wildcard rule of the same route already covers
   A: add several rules at once
   T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
   R: recent changes. U: put a deleted rule back

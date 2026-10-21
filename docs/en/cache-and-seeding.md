@@ -17,10 +17,11 @@ and how fresh it is.
 
 Two properties matter for how you think about it:
 
-- **It only ever holds hosts that match your active rules.** The service is
-  not building a general-purpose DNS cache of everything on the machine — a
-  hostname is only worth caching if a rule could route it, so unrelated
-  traffic never ends up in the database.
+- **It is built for the hosts your rules name.** The service is not building
+  a general-purpose DNS cache of everything on the machine. Names of other
+  sites can still appear in it when they share a server address with a routed
+  site, which is why the cache is shared by the computer and its viewer is
+  limited (see below).
 - **It is fully rebuildable.** If the file is ever deleted, corrupted, or you
   simply want a clean slate, the service rebuilds it from scratch the next
   time it runs. Nothing is lost except the need to re-learn mappings, which
@@ -44,7 +45,9 @@ with the sites you actually visit while NetRuleRouter is active.
 If a program reached an address without asking the service for its name first,
 the service can still find out which site that address belongs to, so your
 rules recognise it too. These lookups go only to the DNS server configured for
-your connection; nothing is sent to any third-party service.
+your connection; nothing is sent to any third-party service. They are made only
+while rule suggestions or leak protection are on, and never for a site your
+own deny rule blocks; with both off, none are made.
 
 ### 3. Seeding from browser history (opt-in)
 
@@ -64,8 +67,8 @@ the browsers of the person who asked for it, never another user's history.
 
 Only hostnames are ever extracted. Full URLs, page titles, visit timestamps,
 and visit counts never leave the machine, and hostnames that do not match any
-of your active rules are discarded immediately rather than cached — the
-service cannot reconstruct your browsing history from what it keeps.
+of your active rules are discarded immediately rather than cached by seeding,
+so seeding does not copy your browsing history into the cache.
 
 The name cache is shared by the computer. An ordinary user sees in the cache
 viewer only the names their own rules cover; an administrator sees all of
@@ -138,6 +141,6 @@ connection instead, which the service's DNS observer cannot see or parse —
 so hosts resolved that way never produce a live-observation cache entry. The
 two mitigations above exist largely because of this: browser-history seeding
 pre-fills the cache independently of how the browser resolved a name, and a
-local resolver (mode B) can intercept and observe lookups directly. The
+local DNS resolver (the default routing method) can intercept and observe lookups directly. The
 hostname confirmation described above also recovers many of these cases
 after the fact.

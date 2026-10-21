@@ -335,10 +335,8 @@ fn canonicalize_hostname(input: &str) -> String {
 
 /// Production [`FqdnCacheLookup`] backed by `nrr_fqdn_ip_cache.db`.
 ///
-/// Wraps an `Arc<Mutex<dyn CacheRepository + Send>>` so the same
-/// underlying store can be shared with the existing
-/// [`SqliteCachePort`][crate::adapters::sqlite_cache::SqliteCachePort]
-/// (engine lookup path) and with the DNS refresh task.
+/// Wraps an `Arc<Mutex<dyn CacheRepository + Send>>` so the same store is
+/// shared with the DNS refresh task.
 ///
 /// On storage failures (poisoned mutex, SQL error) the methods
 /// degrade to empty results and log at `warn!` — the codegen will
@@ -704,6 +702,18 @@ impl FqdnCacheSnapshot {
                 .filter(kept)
                 .collect(),
         }
+    }
+}
+
+/// The pass's snapshot when the live lookup could take one, the live lookup
+/// otherwise (mocks).
+pub fn snapshot_or_live<'a>(
+    snapshot: Option<&'a FqdnCacheSnapshot>,
+    live: &'a dyn FqdnCacheLookup,
+) -> &'a dyn FqdnCacheLookup {
+    match snapshot {
+        Some(snapshot) => snapshot,
+        None => live,
     }
 }
 
@@ -1254,6 +1264,31 @@ mod tests {
             adapter.ips_for_hostname("aistudio.search.example"),
             vec![current],
             "the address confirmed today enforces; yesterday's does not"
+        );
+    }
+
+    /// After the clock steps back, a row stamped in the future must age out of
+    /// the window like any other, not stay confirmed for the length of the step.
+    #[test]
+    fn a_future_stamp_ages_out_of_the_window_from_now() {
+        let store = confirmation_store();
+        let now = SystemTime::now();
+        let stamped_ahead = now + Duration::from_secs(5 * 60 * 60);
+        seed(
+            &store,
+            "ahead.example",
+            Ipv4Addr::new(203, 0, 113, 77),
+            stamped_ahead,
+        );
+
+        let cache: Arc<Mutex<dyn CacheRepository + Send>> = Arc::new(Mutex::new(store));
+        let adapter = SqliteFqdnCacheLookup::new(cache, FreshnessThresholds::default_production());
+        let after_window = now + ENFORCEMENT_CONFIRMATION_WINDOW + Duration::from_secs(60);
+        assert!(
+            adapter
+                .ips_confirmed_at("ahead.example", after_window)
+                .is_empty(),
+            "the stamp was trusted past the confirmation window"
         );
     }
 

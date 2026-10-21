@@ -25,16 +25,17 @@ pub fn facts_from_route_table(port: &dyn RouteTablePort) -> NetworkRouteFacts {
     facts_with_servers(port, Vec::new())
 }
 
-/// [`facts_from_route_table`] plus the tunnel servers the planner remembered,
-/// so a network over a server is refused while its tunnel is down. The store
-/// is read once per submission and holds whatever the last pass saw live.
+/// [`facts_from_route_table`] plus the tunnel servers the planner remembered
+/// for the submitting user, so a network over a server is refused while its
+/// tunnel is down. The store is read once per submission and holds whatever
+/// the last pass saw live.
 #[must_use]
 pub fn facts_with_remembered_servers(
     port: Arc<dyn RouteTablePort>,
-    remembered: crate::route_coordinator::ServerIpLoaderFn,
+    remembered: crate::tunnel_server_memory::PrincipalServersLoadFn,
 ) -> LinkFactsFn {
-    Arc::new(move |_| {
-        let servers = remembered().into_iter().map(IpAddr::V4).collect();
+    Arc::new(move |principal| {
+        let servers = remembered(principal).into_iter().map(IpAddr::V4).collect();
         facts_with_servers(port.as_ref(), servers)
     })
 }

@@ -8,6 +8,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "../lib/plurals.js" as Plurals
 
 Dialog {
     id: root
@@ -59,11 +60,14 @@ Dialog {
             Layout.fillWidth: true
             wrapMode: Text.Wrap
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
-            text: root.tr("dialog.empty-service-rules.body",
+            text: Plurals.counted(root.tr, "dialog.empty-service-rules.body.",
+                root.pendingRuleCount,
                 "The background service is currently enforcing 0 rules. Loading "
-                + "its state will remove all {count} rule(s) shown here. Your "
+                + "its state will remove the {count} rule shown here. Your "
+                + "rules files on disk are not touched. Continue?",
+                "The background service is currently enforcing 0 rules. Loading "
+                + "its state will remove all {count} rules shown here. Your "
                 + "rules files on disk are not touched. Continue?")
-                .replace("{count}", String(root.pendingRuleCount))
         }
         // Classic single-row dialog footer (option "Б"): the
         // destructive "Clear the rules" sits alone on the LEFT, a fillWidth

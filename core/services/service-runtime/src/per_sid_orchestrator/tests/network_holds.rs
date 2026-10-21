@@ -86,12 +86,14 @@ fn fail_closed_set(holds: &NetworkHolds) -> Vec<WfpFilterSpec> {
     let (_api, orch, _src, _rules, _audit) = fixture();
     orch.fail_closed_filters(
         SID,
-        RouteBehaviorMode::PreferPrimary,
         &[IpAddr::V4(SECONDARY_HOST)],
         holds,
         &exemptions(),
         KillSwitchProtocols::ALL,
-        FailClosedPosture { block_all: false },
+        FailClosedPosture {
+            block_all: false,
+            machine_has_other_principals: false,
+        },
     )
 }
 
@@ -185,12 +187,14 @@ fn a_main_link_program_cannot_reach_a_held_network_under_a_block_all() {
     let (_api, orch, _src, _rules, _audit) = fixture();
     let filters = orch.fail_closed_filters(
         SID,
-        RouteBehaviorMode::PreferPrimary,
         &[IpAddr::V4(SECONDARY_HOST)],
         &holds,
         &exemptions(),
         KillSwitchProtocols::ALL,
-        FailClosedPosture { block_all: true },
+        FailClosedPosture {
+            block_all: true,
+            machine_has_other_principals: false,
+        },
     );
     let top_of_primary_band = crate::wfp_bands::BASE_PRIMARY + crate::wfp_bands::BAND_WIDTH;
     let hold = filters

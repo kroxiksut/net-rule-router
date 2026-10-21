@@ -61,6 +61,13 @@ impl Link {
     }
 }
 
+/// A window or tray on this account asked for a stop in the last few minutes
+/// (the shared per-user runtime directory; a stop made elsewhere looks
+/// unexpected, which only errs toward telling the user).
+pub fn stop_was_expected() -> bool {
+    nrr_shared::user_paths::expected_stop_was_requested()
+}
+
 /// The console command name, as the user types it.
 pub fn console_command() -> &'static str {
     command_name(BinaryRole::Console)

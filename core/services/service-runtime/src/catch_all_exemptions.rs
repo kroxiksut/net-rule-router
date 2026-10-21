@@ -111,6 +111,48 @@ pub fn collect_exemptions(
     }
 }
 
+/// The tunnels the user runs beside the bound ones, by the name the egress pin
+/// uses, each with the networks its own routes carry. Which links are foreign
+/// is the route coordinator's definition, and so is which links are ours.
+///
+/// `routes` is `None` when the table could not be read. Then nothing is
+/// foreign: without the table the uplink cannot be told from a tunnel by name,
+/// and a PPPoE uplink spared as a "tunnel" is a block-all with a hole in it.
+#[must_use]
+pub fn foreign_tunnel_links(
+    routes: Option<&[RouteEntry]>,
+    adapters: &[AdapterInfo],
+    primary: Option<&crate::per_sid_orchestrator::PerSidBinding>,
+    secondary: Option<&crate::per_sid_orchestrator::PerSidBinding>,
+) -> Vec<crate::enforcement_planner::ForeignTunnelLink> {
+    let Some(routes) = routes else {
+        return Vec::new();
+    };
+    let ours = crate::route_coordinator::own_link_indexes(
+        adapters,
+        &[],
+        primary.into_iter().chain(secondary),
+    );
+    let additional = crate::route_coordinator::own_link_indexes(adapters, &[], secondary);
+    let foreign =
+        crate::route_coordinator::foreign_tunnel_indexes(adapters, &ours, &additional, routes);
+    adapters
+        .iter()
+        .filter(|a| foreign.contains(&a.index))
+        .map(|a| crate::enforcement_planner::ForeignTunnelLink {
+            name: if a.friendly_name.is_empty() {
+                a.adapter_name.clone()
+            } else {
+                a.friendly_name.clone()
+            },
+            networks: crate::route_codegen::network_routes::foreign_tunnel_blocks(
+                routes,
+                &[a.index],
+            ),
+        })
+        .collect()
+}
+
 /// How often one user hears about one too-wide segment: the passes run at
 /// reconcile cadence, and the network does not change its mind between them.
 pub const TOO_WIDE_NOTICE_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
@@ -333,6 +375,118 @@ mod tests {
             ]
         );
         assert!(ex.can_arm());
+    }
+
+    fn bound(name: &str) -> crate::per_sid_orchestrator::PerSidBinding {
+        crate::per_sid_orchestrator::PerSidBinding {
+            stable_id: format!("linux-link:{name}"),
+            display_name: name.to_owned(),
+            user_confirmed: true,
+            known_stable_ids: Vec::new(),
+        }
+    }
+
+    /// `foreign_tunnel_links` for `eth0` bound as the primary and `tun0` as
+    /// the additional route.
+    fn foreign_beside_bound(
+        routes: Option<&[RouteEntry]>,
+        adapters: &[AdapterInfo],
+    ) -> Vec<crate::enforcement_planner::ForeignTunnelLink> {
+        foreign_tunnel_links(routes, adapters, Some(&bound("eth0")), Some(&bound("tun0")))
+    }
+
+    fn route_on(dest: [u8; 4], prefix: u8, ifindex: u32) -> RouteEntry {
+        RouteEntry {
+            destination: IpAddr::V4(Ipv4Addr::from(dest)),
+            prefix_length: prefix,
+            next_hop: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            interface_index: ifindex,
+            metric: 50,
+            is_ours: false,
+            table: RouteTableRef::Main,
+        }
+    }
+
+    /// A corporate tunnel beside the bound ones is named with the networks its
+    /// own routes carry; the bound tunnel and the uplink never are, and a
+    /// redirect pair is no network of the tunnel's.
+    #[test]
+    fn a_tunnel_beside_the_bound_ones_is_named_as_foreign() {
+        let (mut routes, mut adapters) = machine();
+        adapters.push(adapter(7, "OpenVPN corp", Vec::new()));
+        routes.push(route_on([10, 77, 0, 0], 16, 7));
+        routes.push(route_on([0, 0, 0, 0], 1, 7));
+        routes.push(route_on([128, 0, 0, 0], 1, 7));
+
+        let links = foreign_beside_bound(Some(&routes), &adapters);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].name, "OpenVPN corp");
+        assert_eq!(
+            links[0].networks,
+            vec![IpBlock::parse("10.77.0.0/16").expect("block")]
+        );
+    }
+
+    /// An ISP tunnel that also holds a default route beside the uplink is
+    /// foreign, but only the networks it names itself are its own: the default
+    /// route is no network to spare.
+    #[test]
+    fn a_default_holder_beside_the_uplink_is_named_with_its_specific_networks_only() {
+        let (mut routes, mut adapters) = machine();
+        adapters.push(adapter(7, "l2tp-isp", Vec::new()));
+        routes.push(route_on([0, 0, 0, 0], 0, 7));
+        routes.push(route_on([10, 9, 0, 0], 24, 7));
+
+        let links = foreign_beside_bound(Some(&routes), &adapters);
+        assert!(
+            links.iter().any(|l| l.name == "l2tp-isp"),
+            "the tunnel is named: {links:?}"
+        );
+        for link in &links {
+            assert!(link.networks.iter().all(|n| n.prefix_len() > 0), "{link:?}");
+        }
+        assert!(links
+            .iter()
+            .filter(|l| l.name == "l2tp-isp")
+            .all(|l| l.networks == vec![IpBlock::parse("10.9.0.0/24").expect("block")]));
+    }
+
+    /// Without the route table no link can be told apart from the uplink, so
+    /// none is foreign: a PPPoE uplink spared as a tunnel would open the
+    /// block-all.
+    #[test]
+    fn an_unreadable_route_table_names_no_foreign_tunnel() {
+        let (_, mut adapters) = machine();
+        adapters.push(adapter(7, "ppp0", Vec::new()));
+        adapters.push(adapter(8, "OpenVPN corp", Vec::new()));
+
+        assert!(foreign_beside_bound(None, &adapters).is_empty());
+    }
+
+    /// A home uplink delivered over PPP, left unbound, beside our bound full
+    /// tunnel: both hold a default, but ours says nothing about the uplink, so
+    /// `ppp0` is the uplink and no egress is opened on it.
+    #[test]
+    fn an_unbound_ppp_uplink_beside_our_full_tunnel_is_not_foreign() {
+        let gw = Ipv4Addr::new(100, 64, 0, 1);
+        let adapters = vec![adapter(3, "ppp0", vec![gw]), adapter(5, "tun0", Vec::new())];
+        for ours in [
+            vec![route_on([0, 0, 0, 0], 0, 5)],
+            vec![route_on([0, 0, 0, 0], 1, 5), route_on([128, 0, 0, 0], 1, 5)],
+        ] {
+            let mut routes = vec![
+                route(Ipv4Addr::UNSPECIFIED, 0, gw, 3),
+                route(Ipv4Addr::new(203, 0, 113, 7), 32, gw, 3),
+            ];
+            routes.extend(ours);
+            let links = foreign_tunnel_links(Some(&routes), &adapters, None, Some(&bound("tun0")));
+            assert!(links.is_empty(), "{links:?}");
+            // Our tunnel replaced the provider's default: the route to its
+            // server still names `ppp0` the uplink.
+            routes.retain(|r| !(r.interface_index == 3 && r.prefix_length == 0));
+            let links = foreign_tunnel_links(Some(&routes), &adapters, None, Some(&bound("tun0")));
+            assert!(links.is_empty(), "provider default replaced: {links:?}");
+        }
     }
 
     /// A primary with no gateway cannot produce a bootstrap route, and calling

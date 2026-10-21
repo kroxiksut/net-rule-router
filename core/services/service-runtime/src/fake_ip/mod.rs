@@ -29,6 +29,7 @@
 
 use std::sync::Arc;
 
+pub mod apply_queue;
 pub mod dialer;
 pub mod direct;
 pub mod enforcement;
@@ -42,6 +43,7 @@ pub mod self_heal;
 pub mod stack;
 pub mod vpn_client_bypass;
 
+pub use apply_queue::{FakeIpApplyFn, FakeIpApplyQueue, FAKE_IP_APPLY_QUIET};
 pub use dialer::{
     MockRelayDialer, RelayDatagram, RelayDialer, RelayError, RelayNameResolver, RelaySourceAddrs,
     RelaySplit, RelayStream, RelayWriteHalf, SourceBindDecision, StaticSourceAddrs,

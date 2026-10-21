@@ -110,6 +110,14 @@ pub enum IpcClientError {
     SerializationFailed(String),
     /// Internal channel (request/response queue) was closed.
     ClientShutdown,
+    /// Not sent: a change, while the service reads another payload revision
+    /// than this client writes. Reads still go.
+    ContractMismatch {
+        op: nrr_shared::ipc::IpcOperationName,
+        skew: nrr_shared::ipc::ContractSkew,
+        service_revision: u32,
+        client_revision: u32,
+    },
 }
 
 impl std::fmt::Display for IpcClientError {
@@ -128,6 +136,17 @@ impl std::fmt::Display for IpcClientError {
             }
             Self::SerializationFailed(s) => write!(f, "ipc request serialization failed: {s}"),
             Self::ClientShutdown => write!(f, "ipc client is shutting down"),
+            Self::ContractMismatch {
+                op,
+                service_revision,
+                client_revision,
+                ..
+            } => write!(
+                f,
+                "{} not sent: the service reads payload revision {service_revision}, this client \
+                 writes {client_revision}; changes wait until both come from the same build",
+                op.slug()
+            ),
         }
     }
 }
@@ -210,6 +229,19 @@ pub struct NegotiateInfo {
     pub service_version: String,
     /// Opaque session id allocated by the server.
     pub session_id: String,
+    /// Payload revision the service reads; the unstated revision when its
+    /// answer predates the field.
+    pub contract_revision: u32,
+}
+
+impl NegotiateInfo {
+    /// Which side is behind on the payload contract, if either.
+    pub fn contract_skew(&self) -> Option<nrr_shared::ipc::ContractSkew> {
+        nrr_shared::ipc::ContractSkew::between(
+            self.contract_revision,
+            nrr_shared::ipc::IPC_CONTRACT_REVISION,
+        )
+    }
 }
 
 /// Backoff calculator. `attempt` starts at 0 (initial connect) and

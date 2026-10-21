@@ -90,6 +90,9 @@ nrr-platform-linux = { path = "../../../core/platform/linux" }
 embed-resource = "2"
 
 [dev-dependencies]
+# The Rust twin of the rules-file writer, so the import round trip is checked
+# down to the exported bytes.
+nrr-client-logic = { path = "../../../core/client-logic" }
 tempfile = "3"
 
 [lints]

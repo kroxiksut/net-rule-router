@@ -49,7 +49,7 @@ Legacy compatibility note:
 - `a11y`: `a11y.screen.high-contrast.label`, `a11y.screen.enhanced-focus.label`, `a11y.tray.status-text.preview-mode`, `a11y.tray.action-description.safe-rollback`
 - `label`: `label.screen.primary.title`, `label.screen.secondary.title`, `label.dialog.rule-type.title`, `label.screen.version.title`
 - `status`: `status.screen.setup-completed.success`, `status.screen.rule-added.success`, `status.screen.rollback-preview.warning`, `status.screen.disable-impact-preview.warning`
-- `interfaces`: `interfaces.screen.preview-notice.description`, `interfaces.screen.role-explanation.description`, `interfaces.screen.availability.available`, `interfaces.screen.state.fail-closed-conflict`
+- `interfaces`: `interfaces.screen.preview-notice.description`, `interfaces.screen.role-explanation.description`, `interfaces.screen.availability.available`, `interfaces.screen.state.requires-verification`
 - `rules`: `rules.screen.preview-notice.description`, `rules.dialog.type.application`, `rules.dialog.type.exact-fqdn`, `rules.dialog.type.exact-ip`
 - `diagnostics`: `diagnostics.screen.title`, `diagnostics.screen.service-health.label`, `diagnostics.screen.explain.summary`, `diagnostics.screen.refresh.action`
 - `logs`: `logs.screen.title`, `logs.screen.export.action`, `logs.screen.clear.action`, `logs.screen.empty.description`

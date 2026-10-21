@@ -134,28 +134,51 @@ pub struct ClaimedNamespace {
 
 /// Tell the tunnels among the claiming connections from the uplinks.
 ///
-/// Structure first: the sole holder of a default route in its family is the
-/// uplink whatever it is called. After that a connection reads as a tunnel by
-/// its interface type or by its name. A claim whose adapter is not in
-/// `adapters` (Linux's `resolv.conf`, which belongs to no link) is an uplink.
+/// Structure first: a link the route table names the way out is the uplink
+/// whatever it is called ([`crate::uplink::structural_uplinks`], the one the
+/// route coordinator reads). After that a connection reads as a tunnel by its
+/// interface type or by its name. A claim whose adapter is not in `adapters`
+/// (Linux's `resolv.conf`, which belongs to no link) is an uplink.
+///
+/// `ours` are the served users' additional-route links: never somebody else's
+/// tunnel, and their full tunnel's default says nothing about which link is
+/// the uplink. Our fake-IP adapter is never a tunnel of anybody's either.
 #[must_use]
 pub fn classify_claims(
     scopes: Vec<InterfaceDnsScope>,
     adapters: &[AdapterInfo],
     routes: &[RouteEntry],
+    ours: &[u32],
 ) -> Vec<ClaimedNamespace> {
-    let sole_default_holder = |v6: bool| {
-        let mut holders = routes
-            .iter()
-            .filter(|r| r.prefix_length == 0 && !r.is_ours && r.destination.is_ipv6() == v6)
-            .map(|r| r.interface_index);
-        let first = holders.next()?;
-        holders.all(|index| index == first).then_some(first)
-    };
-    let uplinks: Vec<u32> = [sole_default_holder(false), sole_default_holder(true)]
-        .into_iter()
-        .flatten()
-        .collect();
+    classify_with(scopes, adapters, routes, ours, looks_like_tunnel)
+}
+
+/// [`classify_claims`] narrowed to the one thing the route coordinator's
+/// foreign-tunnel set cannot see: a link whose OS interface type is
+/// "tunnel" (DirectAccess IP-HTTPS and the like). Every other claim is an
+/// uplink here; the caller upgrades the ones the coordinator names foreign.
+/// Unreadable `routes` is the caller's to express by passing no adapters:
+/// doubt is "not a tunnel".
+#[must_use]
+pub fn classify_typed_tunnel_claims(
+    scopes: Vec<InterfaceDnsScope>,
+    adapters: &[AdapterInfo],
+    routes: &[RouteEntry],
+    ours: &[u32],
+) -> Vec<ClaimedNamespace> {
+    classify_with(scopes, adapters, routes, ours, |a| {
+        a.interface_type == InterfaceType::Tunnel
+    })
+}
+
+fn classify_with(
+    scopes: Vec<InterfaceDnsScope>,
+    adapters: &[AdapterInfo],
+    routes: &[RouteEntry],
+    ours: &[u32],
+    is_tunnel: impl Fn(&AdapterInfo) -> bool,
+) -> Vec<ClaimedNamespace> {
+    let uplinks = crate::uplink::structural_uplinks(adapters, routes, ours);
     scopes
         .into_iter()
         .map(|scope| {
@@ -163,7 +186,12 @@ pub fn classify_claims(
                 .iter()
                 .find(|a| a.adapter_name.eq_ignore_ascii_case(&scope.adapter_id));
             let link = match adapter {
-                Some(a) if !uplinks.contains(&a.index) && looks_like_tunnel(a) => {
+                Some(a)
+                    if !uplinks.contains(&a.index)
+                        && !ours.contains(&a.index)
+                        && !crate::uplink::is_own_fake_ip_adapter(a)
+                        && is_tunnel(a) =>
+                {
                     ClaimingLink::ForeignTunnel
                 }
                 _ => ClaimingLink::Uplink,
@@ -427,6 +455,7 @@ mod tests {
             ],
             &adapters,
             &routes,
+            &[],
         );
         assert_eq!(claims[0].link, ClaimingLink::Uplink);
         assert_eq!(claims[1].link, ClaimingLink::ForeignTunnel);
@@ -441,6 +470,7 @@ mod tests {
             vec![claim_of("ppp0", "corp.example")],
             &adapters,
             &[default_route(7)],
+            &[],
         );
         assert_eq!(claims[0].link, ClaimingLink::Uplink);
     }
@@ -461,14 +491,104 @@ mod tests {
             ],
             &adapters,
             &routes,
+            &[],
         );
         assert_eq!(claims[0].link, ClaimingLink::Uplink);
         assert_eq!(claims[1].link, ClaimingLink::ForeignTunnel);
     }
 
+    /// Only a link typed "tunnel" by the OS is a tunnel here: a VPN that the
+    /// coordinator names by its description is the coordinator's call, and a
+    /// name alone makes nothing foreign.
+    #[test]
+    fn the_typed_classification_names_only_os_typed_tunnels() {
+        let adapters = [
+            adapter(3, "wlan0", "Intel Wireless", InterfaceType::Wireless),
+            adapter(5, "mine0", "My VPN Adapter", InterfaceType::Ethernet),
+            adapter(7, "da0", "iphttpsinterface", InterfaceType::Tunnel),
+        ];
+        let claims = classify_typed_tunnel_claims(
+            vec![
+                claim_of("wlan0", "a.example"),
+                claim_of("mine0", "b.example"),
+                claim_of("da0", "c.example"),
+            ],
+            &adapters,
+            &[default_route(3)],
+            &[],
+        );
+        assert_eq!(claims[0].link, ClaimingLink::Uplink);
+        assert_eq!(claims[1].link, ClaimingLink::Uplink);
+        assert_eq!(claims[2].link, ClaimingLink::ForeignTunnel);
+    }
+
     #[test]
     fn a_claim_of_no_known_adapter_is_an_uplink() {
-        let claims = classify_claims(vec![claim_of("resolv.conf", "lan")], &[], &[]);
+        let claims = classify_claims(vec![claim_of("resolv.conf", "lan")], &[], &[], &[]);
+        assert_eq!(claims[0].link, ClaimingLink::Uplink);
+    }
+
+    /// The hostile-lease case the route coordinator also guards: a `ppp0`
+    /// uplink beside our bound full tunnel. Counted, our tunnel's default
+    /// would leave the uplink unnamed and its name would hand the provider's
+    /// lease a namespace. Our link's own claim is never a corporate one, and
+    /// neither is our fake-IP adapter's.
+    #[test]
+    fn our_links_are_left_out_of_the_count_and_never_claim_as_a_tunnel() {
+        let adapters = [
+            adapter(3, "ppp0", "ppp0", InterfaceType::Ethernet),
+            adapter(5, "wg0", "WireGuard Tunnel", InterfaceType::Tunnel),
+            adapter(
+                9,
+                nrr_shared::product_identity::TUN_ADAPTER_NAME,
+                "NetRuleRouter Tunnel",
+                InterfaceType::Ethernet,
+            ),
+        ];
+        let routes = [default_route(3), default_route(5)];
+        let scopes = || {
+            vec![
+                claim_of("ppp0", "isp.example"),
+                claim_of("wg0", "vpn.example"),
+                claim_of(
+                    nrr_shared::product_identity::TUN_ADAPTER_NAME,
+                    "ours.example",
+                ),
+            ]
+        };
+        let claims = classify_claims(scopes(), &adapters, &routes, &[5]);
+        assert!(
+            claims.iter().all(|c| c.link == ClaimingLink::Uplink),
+            "{claims:?}"
+        );
+        let unaware = classify_claims(scopes(), &adapters, &routes, &[]);
+        assert_eq!(
+            unaware[0].link,
+            ClaimingLink::ForeignTunnel,
+            "control: without our links only the name is left to decide"
+        );
+        assert_eq!(unaware[2].link, ClaimingLink::Uplink);
+    }
+
+    /// Our tunnel replaced the provider's default: the link carrying the route
+    /// to our server is the uplink, and its lease is only offered.
+    #[test]
+    fn with_no_default_left_the_server_route_names_the_uplink() {
+        let adapters = [
+            adapter(3, "ppp0", "ppp0", InterfaceType::Ethernet),
+            adapter(5, "wg0", "WireGuard Tunnel", InterfaceType::Tunnel),
+        ];
+        let server = RouteEntry {
+            destination: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            prefix_length: 32,
+            ..default_route(3)
+        };
+        let claims = classify_claims(
+            vec![claim_of("ppp0", "isp.example")],
+            &adapters,
+            &[default_route(5), server],
+            &[5],
+        );
         assert_eq!(claims[0].link, ClaimingLink::Uplink);
     }
 

@@ -39,6 +39,9 @@ pub(crate) fn build_supervised_runtime_deps(
             &nrr_platform_windows::protected_places::WindowsProtectedPlaces,
         ),
     );
+    nrr_service_runtime::platform_notices::install_source(
+        nrr_platform_windows::dns_redirect::reported_slugs,
+    );
     // ── Shared HealthAggregator ────────────────────────────────────────
     // Constructed once at the top of the function so that:
     //   * `IpcHandlerDeps.health` (read-side, accessed via the IPC
@@ -61,6 +64,7 @@ pub(crate) fn build_supervised_runtime_deps(
     // lease on it.
     let task_liveness =
         Arc::new(TaskLiveness::new(Arc::clone(&health_agg)).with_event_bus(Arc::clone(&event_bus)));
+    nrr_service_runtime::override_recheck::report_to(Arc::clone(&task_liveness));
 
     // Drained by the resume watchdog; filled by whoever notices a binding worth
     // re-resolving (today the fail-closed posture heartbeat).
@@ -272,6 +276,25 @@ pub(crate) fn build_supervised_runtime_deps(
         })
     };
 
+    // Asked from inside a compute, so the pass runs on a thread of its own;
+    // edges in one pass share the next one through the coalescer.
+    let peer_replan: Arc<dyn Fn() + Send + Sync> = {
+        let later = Arc::clone(&recompute_later);
+        Arc::new(move || {
+            let later = Arc::clone(&later);
+            if let Err(e) = std::thread::Builder::new()
+                .name("nrr-peer-replan".into())
+                .spawn(move || later())
+            {
+                tracing::warn!(
+                    target: "nrr::per_sid_orchestrator",
+                    error = %e,
+                    "could not start the pass another user's block-all change asked for; the periodic full pass will carry it",
+                );
+            }
+        })
+    };
+
     // ── Per-SID apply orchestrator ──────────────────────────────────
     // Lives in `runtime_deps::per_sid_apply`; see that module for why it moved
     // and what crosses the boundary.
@@ -307,13 +330,27 @@ pub(crate) fn build_supervised_runtime_deps(
         event_bus: Arc::clone(&event_bus),
         fake_ip_controller: Arc::clone(&fake_ip_controller),
         health_agg: Arc::clone(&health_agg),
+        full_pass: full_pass.clone(),
         id_generator: Arc::clone(&id_generator),
+        peer_replan,
         liveness_tracker: Arc::clone(&liveness_tracker),
         reachability_probe: Arc::clone(&reachability_probe),
         rebind_requests: Arc::clone(&rebind_requests),
         settings_conn: settings_conn.clone(),
         sid_registry: Arc::clone(&sid_registry),
     });
+
+    // A full reset must empty what these hold in memory, or they write it back.
+    if let Some(engine) = auto_rules_engine.as_ref() {
+        nrr_service_runtime::principal_reset::register(
+            &(engine.clone()
+                as Arc<dyn nrr_service_runtime::principal_reset::PrincipalStateHolder>),
+        );
+    }
+    nrr_service_runtime::principal_reset::register(
+        &(block_notice_center.clone()
+            as Arc<dyn nrr_service_runtime::principal_reset::PrincipalStateHolder>),
+    );
 
     // ── DB-MAC tamper bootstrap ───────────────────────────────────────
     // Lives in `runtime_deps::storage_integrity`.
@@ -439,13 +476,37 @@ pub(crate) fn build_supervised_runtime_deps(
             let refresh_egress = route_coordinator
                 .as_ref()
                 .map(|coord| build_dns_egress_policy(coord, Arc::clone(&refresh_active_sid)));
+            let refresh_served: nrr_service_runtime::dns_resolver_ports::ResolverPrincipalsFn = {
+                let reg = Arc::clone(&sid_registry);
+                let coord = route_coordinator.clone();
+                Arc::new(move || match coord.as_ref() {
+                    Some(c) => c.served_sids(&reg.active_sids()),
+                    None => reg.active_sids(),
+                })
+            };
             let resolver: Arc<dyn nrr_platform_windows::dns::DnsResolverPort> =
                 build_hosts_bypass_resolver(
                     settings_conn.as_ref().map(Arc::clone),
-                    Some(Arc::clone(&refresh_active_sid)),
+                    Some(refresh_served),
                     refresh_egress,
                 );
-            Arc::new(DnsRefreshOrchestrator::new(resolver, Arc::clone(cache_arc)))
+            let mut refresher = DnsRefreshOrchestrator::new(resolver, Arc::clone(cache_arc));
+            // Only hosts a rule names, or that were used lately, are worth
+            // re-resolving; the rest age out.
+            if let (Some(conn), Some(coord)) = (settings_conn.as_ref(), route_coordinator.as_ref())
+            {
+                let rules: Arc<dyn nrr_service_runtime::per_sid_orchestrator::RulesProvider> =
+                    Arc::new(ProductionRulesProvider::new(Arc::clone(conn)));
+                let coord = Arc::clone(coord);
+                let registry = Arc::clone(&sid_registry);
+                let present: nrr_service_runtime::service_tasks::PresentPrincipalsFn =
+                    Arc::new(move || coord.served_sids(&registry.active_sids()));
+                refresher = refresher.with_use_gate(
+                    nrr_service_runtime::dns_refresh::rule_named_hosts(rules, present),
+                    nrr_service_runtime::dns_refresh::REFRESH_USED_WITHIN,
+                );
+            }
+            Arc::new(refresher)
         });
     // Hand the refresher to the apply path (see `with_unresolved_hosts_sink`).
     // Before this point a rule naming an unresolved host simply waits for the
@@ -487,15 +548,34 @@ pub(crate) fn build_supervised_runtime_deps(
     let pass_inputs = {
         use nrr_platform_api::adapters::AdapterEventSource;
         use nrr_service_runtime::pass_inputs::{
-            applying_revision, hashed, rule_overrides, table_writes, verify_verdicts, PassInputs,
-            PLAN_BLIND_STATE_TABLES,
+            applying_revision, change_hashed, hashed, rule_overrides, table_writes,
+            verify_verdicts, PassInputs, PLAN_BLIND_STATE_TABLES,
+        };
+        // The route table and the adapter list are read again only after the OS
+        // says the network moved; a refused subscription leaves them read per call.
+        let net_change = nrr_platform_api::net_change::NetChangeGeneration::new();
+        let net_subscription =
+            net_change.follow(&nrr_platform_windows::network_change::WindowsNetworkChangeObserver);
+        let (routes_cached, routes_fresh) = change_hashed(net_change.clone(), {
+            let api = Arc::clone(&api);
+            move || api.get_ip_forward_table()
+        });
+        // The coordinator reads the adapter list through the same cache, so a
+        // pass and its fingerprint share one enumeration.
+        let adapter_links = match route_coordinator.as_ref() {
+            Some(coord) => coord.adapter_cache(net_change),
+            None => Arc::new(nrr_platform_api::net_change::ChangeCached::new(
+                net_change,
+                {
+                    let adapters = WindowsApiAdapterSource::new(Arc::clone(&api));
+                    move || adapters.enumerate_all().ok()
+                },
+            )),
         };
         let state_db = artifacts.topology.state_db_path.clone();
         let cache = cache_store.clone();
         let observations = nrr_service_runtime::app_observation_lookup::global_app_observations();
         let walks = Arc::clone(&app_walk_generation);
-        let routes_api = Arc::clone(&api);
-        let adapters = WindowsApiAdapterSource::new(Arc::clone(&api));
         let liveness = Arc::clone(&liveness_tracker);
         let known_direct = known_direct_registry.clone();
         let vpn_clients = Arc::clone(&learned_vpn_client_apps);
@@ -534,14 +614,16 @@ pub(crate) fn build_supervised_runtime_deps(
                     "app-walks",
                     Arc::new(move || Some(walks.load(std::sync::atomic::Ordering::Relaxed))),
                 )
-                .with_own_writes_source("routes", hashed(move || routes_api.get_ip_forward_table()))
+                .with_cached_own_writes_source("routes", routes_cached, routes_fresh)
                 // A dead-but-Up tunnel changes the plan without changing the
                 // adapter, so each link's liveness verdict is read with it.
                 .with_source(
                     "adapters",
                     hashed(move || {
-                        let now = std::time::Instant::now();
-                        adapters.enumerate_all().map(|links| {
+                        // Owns the subscription: the feed lives as long as the source.
+                        let _feed = &net_subscription;
+                        let now = nrr_service_runtime::boot_clock::BootInstant::now();
+                        adapter_links.get().ok_or(()).map(|links| {
                             links
                                 .into_iter()
                                 .map(|link| {
@@ -608,7 +690,6 @@ pub(crate) fn build_supervised_runtime_deps(
                 // requests queueing behind it was measured as ONE number, which
                 // says nothing about what to take off the periodic path.
                 let mut timings = nrr_service_runtime::phase_timings::PhaseTimings::start();
-                v6_routes.log_if_changed(v6_api.as_ref(), "network-change");
                 let tray_active = registry.active_sids();
                 // Enforce for the effective routing
                 // user even with NO tray connected (console-session user,
@@ -623,7 +704,12 @@ pub(crate) fn build_supervised_runtime_deps(
                     dns_ctl.tick();
                     return;
                 }
+                // After the settled check: a table that moved unsettles the pass, so a skipped
+                // call has nothing new to log and must not pay a table walk.
+                v6_routes.log_if_changed(v6_api.as_ref(), "network-change");
                 let mut moved = pass_inputs.moved();
+                let network_changed =
+                    nrr_service_runtime::pass_inputs::network_may_have_changed(&moved);
                 if moved.split(',').any(|source| source == "state") {
                     moved = format!("{moved}:{}", state_tables.since_last());
                 }
@@ -722,8 +808,10 @@ pub(crate) fn build_supervised_runtime_deps(
                 // A new link usually means a new resolver. Re-selection probes
                 // each dead server up to a timeout, so it runs beside the pass;
                 // an upstream it finds clears the re-arm backoff and re-ticks
-                // the watchdog at once rather than on the next pass.
-                {
+                // the watchdog at once rather than on the next pass. A pass a
+                // cache or an observation asked for has no new network to ask
+                // about.
+                if network_changed {
                     let dns_ctl = Arc::clone(&dns_ctl);
                     upstream_dns_pool().note_network_change_in_background(move |upstream| {
                         dns_ctl.note_upstream_present(upstream.is_some());
@@ -746,11 +834,28 @@ pub(crate) fn build_supervised_runtime_deps(
     if let Some(hook) = route_recompute_hook.as_ref() {
         let _ = recompute_slot.set(Arc::downgrade(hook));
     }
-    // The resolver waits on this one before it answers: an exemption it just
-    // registered must be installed, not judged unchanged.
+    // The resolver waits on this one only for an exemption it just registered:
+    // that must be installed, not judged unchanged. Every other request it
+    // makes takes the plain hook, which skips a pass nothing moved for.
     let route_recompute_now = route_recompute_hook
         .clone()
         .map(|hook| nrr_service_runtime::pass_inputs::forcing(full_pass.clone(), hook));
+    // Learnt addresses wait a short window and share one pass, unless a leak
+    // guard is blocking: then the pass runs at once.
+    let observation_recompute_hook: Option<
+        nrr_service_runtime::supervised_runtime::RouteRecomputeHook,
+    > =
+        route_recompute_hook.clone().map(|hook| {
+            let orch = per_sid_orchestrator.clone();
+            nrr_service_runtime::recompute_window::gather(
+                hook,
+                Arc::new(move || {
+                    nrr_service_runtime::recompute_window::window_for(orch.as_ref().is_some_and(
+                        |orch| orch.any_block_all_armed() || orch.any_fail_closed_armed(),
+                    ))
+                }),
+            )
+        });
 
     // Fast liveness-probe hook: probes each active user's
     // bound secondary tunnel next-hop and feeds the result to the tracker (a
@@ -770,37 +875,46 @@ pub(crate) fn build_supervised_runtime_deps(
         }) as nrr_service_runtime::supervised_runtime::RouteRecomputeHook
     });
 
-    // External-address notice for the additional link. The link
-    // snapshot comes from the SAME resolution the routing path uses, so the
+    // External-address notice for the additional link, for the users who opted
+    // in. The link comes from the SAME resolution the routing path uses, so the
     // notice can only ever describe a link the product itself considers usable.
     // The probe is `nrr-platform-api`'s source-bound STUN batch of one; it runs
-    // on the announcer's own detached worker, never on the tick.
+    // on the announcer's own detached worker, never on the tick. Without the
+    // state database nobody has opted in, so no task is spawned.
     let secondary_external_address: Option<
         nrr_service_runtime::secondary_external_address::ExternalAddressWiring,
-    > = route_coordinator.as_ref().map(|coord| {
-        let announcer = Arc::new(
-            nrr_service_runtime::secondary_external_address::ExternalAddressAnnouncer::new(
-                Arc::clone(&event_bus),
-                Arc::new(|source| {
-                    nrr_platform_api::probe_external_ipv4_batch(&[source])
-                        .first()
-                        .and_then(|outcome| outcome.address())
-                }),
-            ),
-        );
-        let links: nrr_service_runtime::secondary_external_address::SecondaryLinkSourceFn = {
-            let coord = Arc::clone(coord);
-            let registry = Arc::clone(&sid_registry);
-            Arc::new(move || {
-                coord
-                    .served_sids(&registry.active_sids())
-                    .iter()
-                    .filter_map(|sid| coord.resolve_secondary_link(sid))
-                    .collect()
-            })
-        };
-        nrr_service_runtime::secondary_external_address::ExternalAddressWiring { announcer, links }
-    });
+    > = route_coordinator
+        .as_ref()
+        .zip(settings_conn.as_ref())
+        .map(|(coord, conn)| {
+            let announcer = Arc::new(
+                nrr_service_runtime::secondary_external_address::ExternalAddressAnnouncer::new(
+                    Arc::clone(&event_bus),
+                    Arc::new(|source| {
+                        nrr_platform_api::probe_external_ipv4_batch(&[source])
+                            .first()
+                            .and_then(|outcome| outcome.address())
+                    }),
+                ),
+            );
+            let served: nrr_service_runtime::secondary_external_address::ServedSidsFn = {
+                let coord = Arc::clone(coord);
+                let registry = Arc::clone(&sid_registry);
+                Arc::new(move || coord.served_sids(&registry.active_sids()))
+            };
+            let link_of: nrr_service_runtime::secondary_external_address::SecondaryLinkOfFn = {
+                let coord = Arc::clone(coord);
+                Arc::new(move |sid: &str| coord.resolve_secondary_link(sid))
+            };
+            nrr_service_runtime::secondary_external_address::ExternalAddressWiring {
+                announcer,
+                served,
+                opted_in: nrr_service_runtime::secondary_external_address::stored_opt_in(
+                    Arc::clone(conn),
+                ),
+                link_of,
+            }
+        });
 
     // The stop plan is read at stop time, never a boot snapshot: the reason
     // (service stop or machine shutdown) and the `routing_stop_policy` setting
@@ -1052,6 +1166,12 @@ pub(crate) fn build_supervised_runtime_deps(
                         "DNS-Client ETW observer unavailable; suffix/zone routing will not \
                          observe new sub-hostnames",
                     );
+                    health_agg.record_as(
+                        "dns-observer",
+                        nrr_service_runtime::health::HealthComponent::BackgroundTasks,
+                        nrr_service_runtime::state::ServiceHealthSeverity::Degraded,
+                        "DNS observation unavailable: domain rules will not follow new sub-hostnames",
+                    );
                     None
                 }
             }
@@ -1065,11 +1185,9 @@ pub(crate) fn build_supervised_runtime_deps(
     // DNS-observation consumer exists (it owns the rule-gated cache sink). The
     // conn-trace consumer's drop hook feeds this channel; the worker (below) drains
     // it and does the PTR + forward-confirm off the hot path.
-    let (fcrdns_tx, fcrdns_rx) = std::sync::mpsc::sync_channel::<(
-        std::net::Ipv4Addr,
-        bool,
-        nrr_service_runtime::conn_observation_consumer::ReverseLearnOrigin,
-    )>(256);
+    let (fcrdns_tx, fcrdns_rx) = std::sync::mpsc::sync_channel::<
+        nrr_service_runtime::conn_observation_consumer::ReverseLearnJob,
+    >(256);
     let fcrdns_hook = dns_observation_consumer.as_ref().map(|_| fcrdns_tx.clone());
     // Proactive VPN-client learning: best-effort write-through
     // of a newly-learned client path so the app-scoped exemption survives a
@@ -1145,6 +1263,12 @@ pub(crate) fn build_supervised_runtime_deps(
                 }
                 _ => None,
             },
+            flow_reset_census: cache_store.as_ref().map(|store| {
+                Arc::new(SqliteFqdnCacheLookup::new(
+                    Arc::clone(store),
+                    FreshnessThresholds::default_production(),
+                )) as Arc<dyn FqdnCacheLookup>
+            }),
         },
         VpnLearningDeps {
             killswitch_drop_registry: &killswitch_drop_registry,
@@ -1156,6 +1280,14 @@ pub(crate) fn build_supervised_runtime_deps(
         },
     );
     drop(fcrdns_tx); // the hook holds the only retained sender (if wired)
+    if conn_observation_source.is_none() {
+        health_agg.record_as(
+            "conn-observer",
+            nrr_service_runtime::health::HealthComponent::BackgroundTasks,
+            nrr_service_runtime::state::ServiceHealthSeverity::Degraded,
+            "connection observation unavailable: the trace and application-rule learning are off",
+        );
+    }
     if let Some(dns_consumer) = dns_observation_consumer.as_ref() {
         let companion = match (auto_rules_engine.as_ref(), active_routing_sid.as_ref()) {
             (Some(engine), Some(active_sid)) => {
@@ -1445,8 +1577,23 @@ pub(crate) fn build_supervised_runtime_deps(
     if let (Some(coord), Some(sid)) = (route_coordinator.as_ref(), active_routing_sid.as_ref()) {
         let coord = Arc::clone(coord);
         let sid = Arc::clone(sid);
+        let by_sid = Arc::clone(&sid);
+        let by_coord = Arc::clone(&coord);
         upstream_dns_pool().set_preferred_interface(Arc::new(move || {
             coord.resolve_primary_interface_index(&sid()?)
+        }));
+        // A corporate tunnel's resolver answers for its own names only. The
+        // routing pass publishes the tunnels; reselect runs on the query path,
+        // so the machine is read here only before that first publication.
+        let foreign = nrr_service_runtime::foreign_tunnels::global_foreign_tunnels();
+        let published = Arc::clone(&foreign);
+        upstream_dns_pool().set_published_excluded(Arc::new(move || published.interfaces()));
+        upstream_dns_pool().set_excluded_interfaces(Arc::new(move || {
+            foreign.interfaces().unwrap_or_else(|| {
+                by_sid()
+                    .map(|sid| by_coord.foreign_tunnel_interface_indexes(&sid))
+                    .unwrap_or_default()
+            })
         }));
     }
     // The Mode-B direct-answer steering is not gated on the
@@ -1481,6 +1628,7 @@ pub(crate) fn build_supervised_runtime_deps(
         settings_conn.as_ref(),
         cache_store.as_ref(),
         active_routing_sid.as_ref(),
+        route_recompute_hook.as_ref(),
         route_recompute_now.as_ref(),
         known_direct_registry.as_ref(),
         block_all_armed,
@@ -1626,8 +1774,15 @@ pub(crate) fn build_supervised_runtime_deps(
             let roles: nrr_service_runtime::TrafficRoleResolver = {
                 let conn = Arc::clone(state_conn);
                 let registry = Arc::clone(&sid_registry);
+                let coord = route_coordinator.clone();
                 Arc::new(move || {
-                    let sids = registry.active_sids();
+                    // Served users, not tray connections: counting must not
+                    // stop when no tray is open.
+                    let tray_sids = registry.active_sids();
+                    let sids = match coord.as_ref() {
+                        Some(coord) => coord.served_sids(&tray_sids),
+                        None => tray_sids,
+                    };
                     let Some(sid) = sids.first() else {
                         return (None, None);
                     };
@@ -1690,6 +1845,7 @@ pub(crate) fn build_supervised_runtime_deps(
         revision_watch,
         dns_refresh_orchestrator,
         route_recompute_hook,
+        observation_recompute_hook,
         route_teardown_hook,
         rule_hostname_seeder,
         active_routing_sid,

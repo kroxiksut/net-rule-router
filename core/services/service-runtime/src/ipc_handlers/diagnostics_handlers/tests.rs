@@ -422,7 +422,7 @@ fn sanitize_for_filename_keeps_safe_chars_and_replaces_the_rest() {
 fn unique_archive_path_avoids_collision() {
     let dir = tempfile::tempdir().expect("temp");
     let now_ms = 1_745_000_000_123;
-    let first = unique_archive_path(dir.path(), "0.1.0", now_ms);
+    let first = unique_archive_path(dir.path(), "0.1.0", now_ms, "S-1-5-21-a");
     assert!(first
         .file_name()
         .unwrap()
@@ -430,13 +430,13 @@ fn unique_archive_path_avoids_collision() {
         .starts_with("nrr-diagnostics-v0.1.0-"));
     // Create the first file so the SAME timestamp must pick a new name.
     std::fs::write(&first, b"x").expect("write");
-    let second = unique_archive_path(dir.path(), "0.1.0", now_ms);
+    let second = unique_archive_path(dir.path(), "0.1.0", now_ms, "S-1-5-21-a");
     assert_ne!(first, second, "a taken name must be bumped");
     assert!(second
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .contains("-1.zip"));
+        .contains("-1-"));
 }
 
 #[test]
@@ -458,7 +458,7 @@ fn prune_keeps_newest_archives_and_ignores_foreign_files() {
     let foreign = dir.path().join("keep-me.txt");
     std::fs::write(&foreign, b"f").expect("write foreign");
 
-    prune_old_archives(dir.path(), 5);
+    prune_old_archives(dir.path(), 5, "S-1-5-21-a");
 
     let mut left: Vec<String> = std::fs::read_dir(dir.path())
         .expect("read dir")
@@ -477,6 +477,36 @@ fn prune_keeps_newest_archives_and_ignores_foreign_files() {
             && !left.contains(&"nrr-diagnostics-v0-t-1.zip".to_string()),
         "the two OLDEST archives are pruned"
     );
+}
+
+#[test]
+fn prune_counts_only_the_requesters_own_archives() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mine = Vec::new();
+    for (owner, count) in [("S-1-5-21-a", 4usize), ("S-1-5-21-b", 4usize)] {
+        for i in 0..count {
+            let p = unique_archive_path(dir.path(), "0", 1_745_000_000_000 + i as i64, owner);
+            std::fs::write(&p, b"z").expect("write");
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&p)
+                .expect("open");
+            f.set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(100 - i as u64),
+            )
+            .expect("mtime");
+            if owner == "S-1-5-21-a" {
+                mine.push(p);
+            }
+        }
+    }
+    // 8 archives, 4 each: neither owner is over the cap of 5.
+    prune_old_archives(dir.path(), 5, "S-1-5-21-a");
+    assert_eq!(std::fs::read_dir(dir.path()).expect("read").count(), 8);
+    // Capped at 2, only the requester's two oldest go.
+    prune_old_archives(dir.path(), 2, "S-1-5-21-a");
+    assert_eq!(std::fs::read_dir(dir.path()).expect("read").count(), 6);
+    assert!(!mine[0].exists() && !mine[1].exists() && mine[2].exists());
 }
 
 use crate::ipc::{IpcOperationClass, IpcRequestContext, IpcRequestEnvelope};
@@ -579,12 +609,11 @@ fn explain_synthetic_passes_input_sample() {
     assert_eq!(full["query_kind"], "synthetic");
 }
 
-// The kill-switch verdict rides the compact view: an
-// enabled kill-switch with block-all-unknown coverage marks an uncached
-// hostname as blocked-while-armed even though the rule verdict alone
-// would read "primary"/"none".
+// The leak-protection verdict rides the compact view only where it says
+// something about the host: under `everything` a host no rule names waits
+// while the secondary is down; with protection off there is no caveat.
 #[test]
-fn explain_synthetic_stamps_killswitch_enforcement_verdict() {
+fn explain_synthetic_stamps_leak_protection_enforcement_verdict() {
     use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
 
     struct FixedPolicy(nrr_shared::ipc_payloads::RoutePolicyDto);
@@ -594,27 +623,32 @@ fn explain_synthetic_stamps_killswitch_enforcement_verdict() {
         }
     }
 
-    let dto: nrr_shared::ipc_payloads::RoutePolicyDto = serde_json::from_value(serde_json::json!({
-        "mode": "prefer-primary",
-        "block-secondary-when-unavailable": true,
-        "kill-switch-enabled": true,
-        "mode-a-coverage-strategy": "fail-closed-unknown",
-        "binding-source": "user-assigned"
-    }))
-    .expect("policy dto");
-    let h = ExplainGetHandler::new(facade()).with_enforcement_verdict(
-        Arc::new(FixedPolicy(dto)),
-        Arc::new(MockFqdnCacheLookup::default()),
-        Arc::new(|| Some("S-1-5-21-TEST".to_string())),
-    );
-    // Hostname absent from the (empty) FQDN cache → no permit compiles
-    // while armed → the verdict slug rides along.
-    let payload = serde_json::json!({ "input-sample": { "hostname": "search.example" } });
-    let v = h.handle(&envelope(payload), &ctx()).expect("ok");
-    assert_eq!(
-        v["compact"]["enforcement"],
-        "blocked-unknown-under-block-all"
-    );
+    // A host the rules do not name waits only under `everything`.
+    for (protection, expected) in [
+        ("everything", Some("everything-waits-when-secondary-down")),
+        ("sites", None),
+        ("off", None),
+    ] {
+        let dto: nrr_shared::ipc_payloads::RoutePolicyDto =
+            serde_json::from_value(serde_json::json!({
+                "mode": "prefer-primary",
+                "leak-protection": protection,
+                "binding-source": "user-assigned"
+            }))
+            .expect("policy dto");
+        let h = ExplainGetHandler::new(facade()).with_enforcement_verdict(
+            Arc::new(FixedPolicy(dto)),
+            Arc::new(MockFqdnCacheLookup::default()),
+            Arc::new(|| Some("S-1-5-21-TEST".to_string())),
+        );
+        let payload = serde_json::json!({ "input-sample": { "hostname": "search.example" } });
+        let v = h.handle(&envelope(payload), &ctx()).expect("ok");
+        assert_eq!(
+            v["compact"].get("enforcement").and_then(|e| e.as_str()),
+            expected,
+            "{protection}"
+        );
+    }
 
     // Same probe WITHOUT the deps → field absent (skip_serializing_if).
     let bare = ExplainGetHandler::new(facade());
@@ -1160,15 +1194,11 @@ fn health_json_carries_enrichment_from_providers() {
         primary: None,
         secondary: None,
         mode: BehaviorModeDto::PreferSecondaryWhenAvailable,
-        block_secondary_when_unavailable: false,
-        kill_switch_fail_closed: true,
+        leak_protection: nrr_shared::ipc_payloads::LeakProtectionDto::Off,
         kill_switch_protocols: 127,
-        kill_switch_block_all: false,
-        kill_switch_enabled: false,
         allow_dns_over_primary: false,
         include_subdomains: false,
         shared_ip_policy: "majority-of-ip".into(),
-        mode_a_coverage_strategy: "fail-closed-unknown".into(),
         resolve_hosts_bypass: true,
         secondary_link_provider_apps: Vec::new(),
         doh_lockdown_enabled: false,
@@ -1189,6 +1219,7 @@ fn health_json_carries_enrichment_from_providers() {
         short_name_suffix: String::new(),
         app_rules_take_all_addresses: false,
         forwarded_outage: String::new(),
+        external_address_auto_check: false,
         binding_source: BindingSourceDto::UserAssigned,
     });
 
@@ -1365,6 +1396,9 @@ fn conn_trace_shows_an_ordinary_caller_only_their_own_and_the_machines_rows() {
     ));
     ring.push(row(None, r"\device\hd\nobody.exe".into()));
     ring.push(row(Some("S-1-5-18"), format!(r"\device\hd\{service}")));
+    // A relay row the platform could not attribute is still the service's.
+    let unix_service = nrr_shared::product_identity::BinaryRole::Service.unix_file_name();
+    ring.push(row(None, format!("/usr/libexec/{unix_service}")));
     let handler = ConnTraceEntriesListHandler::new(Arc::clone(&ring));
     let processes = |ctx: IpcRequestContext| -> Vec<String> {
         let resp: ConnTraceEntriesListResponse = serde_json::from_value(call_as(
@@ -1382,7 +1416,13 @@ fn conn_trace_shows_an_ordinary_caller_only_their_own_and_the_machines_rows() {
     );
     assert_eq!(
         processes(ctx_for(Some(me), true)),
-        vec![service, "nobody.exe", "theirs.exe", "mine.exe"],
+        vec![
+            unix_service,
+            service,
+            "nobody.exe",
+            "theirs.exe",
+            "mine.exe"
+        ],
         "positive control: an elevated caller sees the machine"
     );
     assert_eq!(

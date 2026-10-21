@@ -146,35 +146,18 @@ fn valid_config_no_rules_is_accepted_clean() {
     assert!(profile.rule_book.secondary.is_empty());
 }
 
-// ── Missing secondary with StrictFailClosed ───────────────────────────────
+// ── Missing secondary ─────────────────────────────────────────────────────
 
 #[test]
-fn missing_secondary_with_strict_fail_closed_is_warning() {
-    let config = config_with_rules(
-        Some(primary()),
-        None,
-        RouteBehaviorMode::StrictSecondaryFailClosed,
-        vec![],
-        vec![],
-    );
-    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
-    assert!(outcome.is_accepted()); // not rejected
-    assert!(outcome
-        .warnings()
-        .contains(&ValidationWarning::MissingSecondaryWithFailClosed));
-}
-
-#[test]
-fn missing_secondary_with_prefer_primary_is_clean() {
-    let config = config_with_rules(
-        Some(primary()),
-        None,
+fn missing_secondary_is_clean_under_either_default_route() {
+    for mode in [
         RouteBehaviorMode::PreferPrimary,
-        vec![],
-        vec![],
-    );
-    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
-    assert!(outcome.is_clean());
+        RouteBehaviorMode::PreferSecondaryWhenAvailable,
+    ] {
+        let config = config_with_rules(Some(primary()), None, mode, vec![], vec![]);
+        let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
+        assert!(outcome.is_clean(), "{mode}");
+    }
 }
 
 // ── Domain normalization ──────────────────────────────────────────────────
@@ -280,6 +263,32 @@ fn zone_unicode_normalized_to_punycode() {
     assert_eq!(canonical_zone("рф"), "xn--p1ai");
     assert_eq!(canonical_zone("РФ"), "xn--p1ai");
     assert_eq!(canonical_zone("ru"), "ru");
+}
+
+#[test]
+fn a_one_label_suffix_in_the_domains_section_is_a_zone() {
+    let mut rule = domain_rule("r-1", "x");
+    rule.address_match = Some(AddressMatch::SuffixDomain("ru".to_string()));
+    let mut deep = domain_rule("r-2", "x");
+    deep.address_match = Some(AddressMatch::SuffixDomain("example.ru".to_string()));
+    let config = config_with_rules(
+        Some(primary()),
+        Some(secondary()),
+        RouteBehaviorMode::PreferPrimary,
+        vec![rule, deep],
+        vec![],
+    );
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
+    let profile = outcome.profile().expect("profile must be present");
+    let kinds: Vec<_> = profile
+        .rule_book
+        .primary
+        .rules()
+        .iter()
+        .filter_map(|r| r.address_match.clone())
+        .collect();
+    assert!(kinds.contains(&CanonicalAddressMatch::Zone("ru".into())));
+    assert!(kinds.contains(&CanonicalAddressMatch::SuffixDomain("example.ru".into())));
 }
 
 #[test]
@@ -935,7 +944,7 @@ fn canonical_profile_has_correct_binding_and_mode() {
     let config = config_with_rules(
         Some(primary()),
         Some(secondary()),
-        RouteBehaviorMode::StrictSecondaryFailClosed,
+        RouteBehaviorMode::PreferSecondaryWhenAvailable,
         vec![],
         vec![],
     );
@@ -951,7 +960,7 @@ fn canonical_profile_has_correct_binding_and_mode() {
     );
     assert_eq!(
         profile.behavior_mode,
-        RouteBehaviorMode::StrictSecondaryFailClosed
+        RouteBehaviorMode::PreferSecondaryWhenAvailable
     );
 }
 
@@ -1391,6 +1400,15 @@ fn one_network_routed_on_both_routes_is_a_tie_and_a_block_is_not() {
     assert!(networks_on_both_routes(&book(off)).is_empty());
     assert!(
         networks_on_both_routes(&book(network("R-0002", subnet("10.0.0.0/25"), route))).is_empty()
+    );
+    // A piece of a longer range equal to the other route's subnet is a tie too.
+    assert_eq!(
+        networks_on_both_routes(&book(network(
+            "R-0002",
+            range("10.0.0.0-10.0.1.127"),
+            route
+        ))),
+        ["10.0.0.0-10.0.1.127"]
     );
 }
 

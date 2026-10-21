@@ -46,6 +46,9 @@ use crate::verbs::Privilege;
 /// docs.
 pub const RELAY_FLAG: &str = "--elevated-relay";
 
+/// Stands in the relay's SID slot when the asking account is unknown.
+const NO_USER_SID: &str = "-";
+
 // ── What the console decided to do about privilege ───────────────────────────
 
 /// What this invocation may do when a verb turns out to need administrator
@@ -157,6 +160,9 @@ pub fn canonical_argv(command: &Command) -> Vec<String> {
 pub struct RelayRequest {
     /// Where to write the report the unelevated parent is waiting for.
     pub result_path: PathBuf,
+    /// The account that asked, when the elevated copy may run as another one:
+    /// the report goes into that account's folder.
+    pub user_sid: Option<String>,
     /// The command to run, already canonical.
     pub args: Vec<String>,
 }
@@ -169,8 +175,10 @@ pub fn relay_request(args: &[String]) -> Option<RelayRequest> {
         return None;
     }
     let (path, rest) = rest.split_first()?;
+    let (sid, rest) = rest.split_first()?;
     Some(RelayRequest {
         result_path: PathBuf::from(path),
+        user_sid: (sid != NO_USER_SID).then(|| sid.clone()),
         args: rest.to_vec(),
     })
 }
@@ -227,7 +235,10 @@ pub fn run_relay(request: &RelayRequest) -> u8 {
         eprintln!("elevated run: refusing a report path that is not this console's");
         return exit::FAILED;
     }
-    let mut report = match crate::platform::create_relay_report(&request.result_path) {
+    let mut report = match crate::platform::create_relay_report(
+        &request.result_path,
+        request.user_sid.as_deref(),
+    ) {
         Ok(file) => file,
         Err(e) => {
             eprintln!("elevated run: cannot create the report: {e}");
@@ -419,6 +430,7 @@ pub fn retry(
     let mut relay_argv = Vec::with_capacity(argv.len() + 2);
     relay_argv.push(RELAY_FLAG.to_string());
     relay_argv.push(report.to_string_lossy().into_owned());
+    relay_argv.push(crate::platform::current_user_sid().unwrap_or_else(|| NO_USER_SID.to_string()));
     relay_argv.extend(argv);
 
     let outcome = port.relaunch_and_wait(&exe, &relay_argv);
@@ -602,15 +614,24 @@ mod tests {
         let args = vec![
             RELAY_FLAG.to_string(),
             "/tmp/report.json".to_string(),
+            "S-1-5-21-1-2-3-1001".to_string(),
             "stop".to_string(),
         ];
         assert_eq!(
             relay_request(&args),
             Some(RelayRequest {
                 result_path: PathBuf::from("/tmp/report.json"),
+                user_sid: Some("S-1-5-21-1-2-3-1001".to_string()),
                 args: vec!["stop".to_string()],
             })
         );
+        let unknown = vec![
+            RELAY_FLAG.to_string(),
+            "/tmp/report.json".to_string(),
+            NO_USER_SID.to_string(),
+            "stop".to_string(),
+        ];
+        assert_eq!(relay_request(&unknown).and_then(|r| r.user_sid), None);
         // Anywhere else it is not relay mode — it must not become a flag of a
         // verb by being accepted in a verb's position.
         assert_eq!(
@@ -621,6 +642,10 @@ mod tests {
         // The marker without a destination is not a relay request either; it
         // falls through to the parser, which reports an unknown verb.
         assert_eq!(relay_request(&[RELAY_FLAG.to_string()]), None);
+        assert_eq!(
+            relay_request(&[RELAY_FLAG.to_string(), "/tmp/r.json".to_string()]),
+            None
+        );
     }
 
     #[test]
@@ -688,6 +713,7 @@ mod tests {
         let _ = std::fs::remove_file(&target);
         let code = run_relay(&RelayRequest {
             result_path: target.clone(),
+            user_sid: None,
             args: vec!["version".to_string()],
         });
         assert_eq!(code, exit::FAILED);

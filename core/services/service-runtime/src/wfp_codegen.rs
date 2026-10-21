@@ -1,7 +1,7 @@
 //! WFP filter codegen for the 6 canonical rule
 //! kinds.
 //!
-//! Translates a [`CanonicalRuleBook`] + a [`RouteBehaviorMode`] + an
+//! Translates a [`CanonicalRuleBook`] + an
 //! [`FqdnCacheLookup`] snapshot into a deterministic list of
 //! [`WfpFilterSpec`] entries plus a list of
 //! [`CodegenDiagnostic`]s explaining why any rule was skipped or
@@ -18,8 +18,7 @@
 //! | [`Subnet`] / [`IpRange`] | P | one `remote_subnet` filter per piece: the rule's blocks minus the narrower rules inside them (see `enforcement_planner::NetworkCarving`). Never per address. |
 //! | App match (no address) | N | one per resolved exe path — the name/glob is resolved to concrete on-disk paths (`app_pattern` = absolute Win32 path). Unresolved name/glob → 0 + `AppUnresolved` diagnostic. A rule by path: one per program its real place holds for the owner, capped (`AppFolderOverCap`). |
 //! | App match + address | 0 | not enforceable as written: skipped with an `UnsupportedRuleShape` diagnostic, never widened to every application. |
-//! | Default (`StrictSecondaryFailClosed`) | 1 | catch-all `Block` filter at the lowest weight. |
-//! | Default (other modes) | 0 | the OS routing table is the catch-all. |
+//! | Default | 0 | the OS routing table is the catch-all; leak protection is the kill-switch's. |
 //!
 //! [`ExactIp(addr)`]: nrr_domain::canonical::CanonicalAddressMatch::ExactIp
 //! [`ExactFqdn(name)`]: nrr_domain::canonical::CanonicalAddressMatch::ExactFqdn
@@ -38,7 +37,6 @@
 //! | Block rules     | `0x0070_0000 + pos * SLOTS_PER_RULE + fanout_idx` | `RuleAction::Block` rules (hard drop, role-independent, above the kill-switch permit band) |
 //! | Primary rules   | `0x0020_0000 + pos * SLOTS_PER_RULE + fanout_idx` | route rules in `rule_book.primary` |
 //! | Secondary rules | `0x0010_0000 + pos * SLOTS_PER_RULE + fanout_idx` | route rules in `rule_book.secondary` |
-//! | Default catch-all | `0x0000_FFFF` | fail-closed Block filter |
 //!
 //! A `RuleAction::Block` rule emits `FWP_ACTION_BLOCK` filters (hard veto via
 //! `CLEAR_ACTION_RIGHT`) at both the ALE connect layer (TCP/UDP, SID-scoped)
@@ -63,9 +61,8 @@
 //! - `target` for address kinds = the resolved IPv4 as
 //!   `"a.b.c.d"`.
 //! - `target` for app match = the resolved app path string.
-//! - `target` for the default catch-all = `"block-all"`.
 //!
-//! Two re-applies of the same `(rule_book, behavior_mode, cache
+//! Two re-applies of the same `(rule_book, cache
 //! snapshot)` produce **identical** filter ids — that's the
 //! idempotent-reapply contract the apply layer relies on.
 
@@ -81,7 +78,7 @@ use nrr_domain::rule_shape::{
 use nrr_platform_api::enforcement::EnforcementCapabilities;
 use nrr_platform_api::types::{WfpAction, WfpFilterId, WfpFilterSpec, WfpLayerKey};
 use nrr_shared::ip_block::IpBlock;
-use nrr_shared::{RouteBehaviorMode, RouteRole};
+use nrr_shared::RouteRole;
 
 use crate::address_ownership::AppDestinationRefusal;
 use crate::app_observation_lookup::AppObservationLookup;
@@ -91,9 +88,7 @@ use crate::fqdn_cache_lookup::FqdnCacheLookup;
 
 // Weight bands come from `wfp_bands`, which holds the complete order and
 // asserts it. This file emits filters; it does not get to invent a band.
-use crate::wfp_bands::{
-    BAND_WIDTH, BASE_BLOCK, BASE_PRIMARY, BASE_SECONDARY, DEFAULT_BLOCK_WEIGHT,
-};
+use crate::wfp_bands::{BAND_WIDTH, BASE_BLOCK, BASE_PRIMARY, BASE_SECONDARY};
 
 /// Highest rule position a band can hold. `pos` comes from the rule book and
 /// nothing upstream caps it, so without this the 8192nd primary rule would land
@@ -126,6 +121,7 @@ pub use crate::wfp_bands::SLOTS_PER_RULE;
 /// Declared in `nrr-platform-api` because the Windows lowering needs the same
 /// split to recover a rule's own addresses from its app's observed ones.
 pub use nrr_platform_api::enforcement::APP_PATH_FANOUT_CAP;
+use nrr_platform_api::enforcement::DENY_LOOPBACK_SLOT;
 /// Runaway backstop (NOT a product limit) on the number of cached subdomains
 /// [`SuffixDomain`](nrr_domain::canonical::CanonicalAddressMatch::SuffixDomain)
 /// / [`Zone`](nrr_domain::canonical::CanonicalAddressMatch::Zone)
@@ -194,9 +190,6 @@ pub struct CodegenInput<'a> {
     pub sid: &'a str,
     /// Canonical rules from the active revision.
     pub rule_book: &'a CanonicalRuleBook,
-    /// Default routing behaviour when no rule matches. Determines
-    /// whether the catch-all `Block` filter is emitted.
-    pub behavior_mode: RouteBehaviorMode,
     /// FQDN/IP cache snapshot, queried for `ExactFqdn` /
     /// `SuffixDomain` / `Zone` fan-outs.
     pub fqdn_cache: &'a dyn FqdnCacheLookup,
@@ -238,8 +231,7 @@ pub struct CodegenInput<'a> {
 /// Result of one codegen invocation.
 ///
 /// `filters` is in **emission order** — primary rules first (in
-/// canonical-set order), then secondary rules, then the default
-/// catch-all (if any). Tests that assert on filter content can
+/// canonical-set order), then secondary rules. Tests that assert on filter content can
 /// reason about ordering without resorting; production callers feed
 /// the vector straight into `WfpSession::execute_wfp_plan`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -257,8 +249,8 @@ pub struct CodegenOutput {
     pub secondary_dest_ips: Vec<IpAddr>,
     /// the deduplicated destination IPv4
     /// addresses the **primary** (main-link) rules resolved to, in emission
-    /// order. Under an armed fail-closed BLOCK-ALL (Mode-A `FailClosedUnknown`
-    /// or an explicit block-all, secondary down) TCP/UDP to these already
+    /// order. Under an armed block-all (leak protection "everything", secondary
+    /// down) TCP/UDP to these already
     /// escapes at the ALE layer (a primary rule permit at `BASE_PRIMARY`
     /// outranks the catch-all block), but the packet-layer named blocks
     /// (ICMP/IGMP/GRE/ESP) are unconditional, so **ping to a known-primary host
@@ -497,12 +489,6 @@ pub enum CodegenDiagnostic {
     /// A rule by path names a folder in another user's profile: it is not
     /// read for this owner and emitted nothing.
     PathInOtherUsersProfile { rule_id: String },
-    /// Fail-closed catch-all `Block` filter was emitted. Exactly
-    /// one of these appears per codegen output when
-    /// `behavior_mode == StrictSecondaryFailClosed`. Useful for
-    /// risk-scoring: a non-empty diagnostic of this
-    /// kind signals "everything-else-blocked" mode is active.
-    FailClosedDefaultEmitted,
 }
 
 impl CodegenDiagnostic {
@@ -771,7 +757,7 @@ pub fn generate_filters_with_shapes(
         let mut seen = std::collections::HashSet::new();
         out.filters[secondary_filter_start..]
             .iter()
-            .filter(|f| f.action == WfpAction::Permit)
+            .filter(|f| is_whole_app_permit(f))
             .filter_map(|f| f.app_pattern.clone())
             .filter(|p| seen.insert(p.clone()))
             .collect()
@@ -804,7 +790,7 @@ pub fn generate_filters_with_shapes(
         let mut seen = std::collections::HashSet::new();
         out.filters[..secondary_filter_start]
             .iter()
-            .filter(|f| f.action == WfpAction::Permit)
+            .filter(|f| is_whole_app_permit(f))
             .filter_map(|f| f.app_pattern.clone())
             .filter(|p| seen.insert(p.clone()))
             .collect()
@@ -827,22 +813,6 @@ pub fn generate_filters_with_shapes(
         paths.sort_unstable();
         paths
     };
-
-    if matches!(
-        input.behavior_mode,
-        RouteBehaviorMode::StrictSecondaryFailClosed
-    ) {
-        out.filters
-            .push(default_block_spec(input.sid, WfpLayerKey::AleAuthConnectV4));
-        // Strict means "nothing a rule did not name leaves": a v4-only
-        // default let every IPv6 flow to an unnamed host out the main link.
-        if input.families == crate::enforcement_planner::FamilyScope::Both {
-            out.filters
-                .push(default_block_spec(input.sid, WfpLayerKey::AleAuthConnectV6));
-        }
-        out.diagnostics
-            .push(CodegenDiagnostic::FailClosedDefaultEmitted);
-    }
 
     out
 }
@@ -1330,12 +1300,24 @@ fn emit_for_app_match(
                 weight: rule_weight(ctx.base_weight, pos, slot),
                 id,
                 user_sid: Some(sid.to_string()),
-                app_pattern: Some(path_str.into_owned()),
+                app_pattern: Some(path_str.to_string()),
                 local_interface_luid: None,
                 remote_subnet: None,
                 remote_subnet_v6: None,
                 ip_protocol: None,
+                remote_subnet_set: Vec::new(),
             });
+            if ctx.is_block() {
+                out.filters.extend(deny_app_companions(
+                    sid,
+                    role_slug,
+                    rule.id.as_str(),
+                    &app_kind,
+                    &path_str,
+                    rule_weight(ctx.base_weight, pos, slot),
+                    rule_weight(ctx.base_weight, pos, DENY_LOOPBACK_SLOT),
+                ));
+            }
         }
     }
 
@@ -1441,13 +1423,81 @@ fn destination_ips(spec: &WfpFilterSpec) -> impl Iterator<Item = IpAddr> + '_ {
         .chain(spec.remote_ip_set_v6.iter().copied().map(IpAddr::V6))
 }
 
+/// What a program deny adds to its IPv4 connect-layer block: the same block at
+/// the IPv6 layer, and loopback permits (both families) above it, so the
+/// program still reaches local services over either family.
+fn deny_app_companions(
+    sid: &str,
+    role_slug: &str,
+    rule_id: &str,
+    app_kind: &str,
+    path: &str,
+    block_weight: u64,
+    loopback_weight: u64,
+) -> [WfpFilterSpec; 3] {
+    let spec = |layer, action, kind: &str, weight, v4, v6| WfpFilterSpec {
+        layer,
+        action,
+        remote_ip: None,
+        remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
+        remote_port: None,
+        weight,
+        id: filter_id_for(sid, role_slug, rule_id, &format!("{app_kind}-{kind}"), path),
+        user_sid: Some(sid.to_string()),
+        app_pattern: Some(path.to_string()),
+        local_interface_luid: None,
+        remote_subnet: v4,
+        remote_subnet_v6: v6,
+        ip_protocol: None,
+        remote_subnet_set: Vec::new(),
+    };
+    [
+        spec(
+            WfpLayerKey::AleAuthConnectV6,
+            WfpAction::Block,
+            "v6",
+            block_weight,
+            None,
+            None,
+        ),
+        spec(
+            WfpLayerKey::AleAuthConnectV4,
+            WfpAction::Permit,
+            "lo4",
+            loopback_weight,
+            Some((std::net::Ipv4Addr::new(127, 0, 0, 0), 8)),
+            None,
+        ),
+        spec(
+            WfpLayerKey::AleAuthConnectV6,
+            WfpAction::Permit,
+            "lo6",
+            loopback_weight,
+            None,
+            Some((std::net::Ipv6Addr::LOCALHOST, 128)),
+        ),
+    ]
+}
+
+/// An app rule's own route permit. A deny's loopback companion also names the
+/// app but routes nothing, so it must not mark the app as routed.
+fn is_whole_app_permit(f: &WfpFilterSpec) -> bool {
+    f.action == WfpAction::Permit
+        && f.remote_ip.is_none()
+        && f.remote_ip_set.is_empty()
+        && f.remote_ip_set_v6.is_empty()
+        && f.remote_subnet.is_none()
+        && f.remote_subnet_v6.is_none()
+}
+
 /// Every network piece the route filters carry, deduplicated in emission
 /// order. Packet mirrors exist only for Blocks, so the ALE filters suffice.
 fn destination_networks(filters: &[WfpFilterSpec]) -> Vec<IpBlock> {
     let mut seen = std::collections::HashSet::new();
     filters
         .iter()
-        .filter(|f| f.action == WfpAction::Permit)
+        .filter(|f| f.action == WfpAction::Permit && f.app_pattern.is_none())
         .filter_map(|f| {
             f.remote_subnet
                 .and_then(|(net, len)| IpBlock::new(IpAddr::V4(net), len))
@@ -1522,6 +1572,7 @@ fn network_spec(
         remote_subnet,
         remote_subnet_v6,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -1622,6 +1673,7 @@ pub(crate) fn chunk_spec(
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -1648,43 +1700,6 @@ fn push_packed_packet_block_mirror(
         weight,
         id,
     ));
-}
-
-/// The Strict default block at one ALE layer. The v4 id is the one installed
-/// machines already carry; the v6 twin needs its own or the add swallows it.
-fn default_block_spec(sid: &str, layer: WfpLayerKey) -> WfpFilterSpec {
-    let id = filter_id_for(sid, "default", "", "default", default_block_target(layer));
-    WfpFilterSpec {
-        layer,
-        action: WfpAction::Block,
-        remote_ip: None,
-        remote_ip_set: Vec::new(),
-        remote_ip_set_v6: Vec::new(),
-        remote_port: None,
-        weight: DEFAULT_BLOCK_WEIGHT,
-        id,
-        user_sid: Some(sid.to_string()),
-        app_pattern: None,
-        local_interface_luid: None,
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: None,
-    }
-}
-
-/// The id target of the Strict default block at `layer`, shared with the
-/// drop classifier so a v6 drop by the twin reads as "not covered by rules".
-pub fn default_block_target(layer: WfpLayerKey) -> &'static str {
-    match layer {
-        WfpLayerKey::AleAuthConnectV6 => "block-all-v6",
-        _ => "block-all",
-    }
-}
-
-/// The ids of the Strict default block at both ALE layers.
-pub fn default_block_ids(sid: &str) -> [u64; 2] {
-    [WfpLayerKey::AleAuthConnectV4, WfpLayerKey::AleAuthConnectV6]
-        .map(|layer| filter_id_for(sid, "default", "", "default", default_block_target(layer)).raw)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

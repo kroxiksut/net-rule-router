@@ -87,7 +87,7 @@
 
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
@@ -211,6 +211,15 @@ pub fn add_filter(
     // structural errors ("file not found", "malformed SID") even on
     // hosts where the subsequent `FwpmSubLayerAdd0` / `FwpmFilterAdd0`
     // would reject for `ERROR_ACCESS_DENIED`.
+    // A subnet set past the bound is refused, never cut: a truncated Block
+    // would guard less than it was asked to.
+    if spec.remote_subnet_set.len() > crate::types::MAX_REMOTE_SUBNETS {
+        return Err(PlatformError::Win32 {
+            operation: ADD_OP,
+            code: 0x57, // ERROR_INVALID_PARAMETER
+            message: "remote subnet set over the per-filter bound".to_string(),
+        });
+    }
     let app_id_bytes: Option<Vec<u8>> = match &spec.app_pattern {
         Some(path) => Some(super::app_id::app_id_from_path(std::path::Path::new(path))?),
         None => None,
@@ -292,6 +301,23 @@ pub fn add_filter(
         })
         .collect();
 
+    // Subnet set backing: one address-and-mask per member, the OR'd conditions
+    // of a tunnel's networks. Built in full before any pointer is taken.
+    let mut set_v4_masks: Vec<FWP_V4_ADDR_AND_MASK> = Vec::new();
+    let mut set_v6_masks: Vec<FWP_V6_ADDR_AND_MASK> = Vec::new();
+    for (net, prefix_len) in &spec.remote_subnet_set {
+        match net {
+            IpAddr::V4(net) => set_v4_masks.push(FWP_V4_ADDR_AND_MASK {
+                addr: u32::from(*net),
+                mask: prefix_to_mask(*prefix_len),
+            }),
+            IpAddr::V6(net) => set_v6_masks.push(FWP_V6_ADDR_AND_MASK {
+                addr: net.octets(),
+                prefixLength: *prefix_len,
+            }),
+        }
+    }
+
     // --- 5. Condition sub-buffers. -----------------------------------
     let mut app_id_blob: Option<FWP_BYTE_BLOB> = None;
     if let Some(bytes) = app_id_bytes.as_ref() {
@@ -312,8 +338,9 @@ pub fn add_filter(
     // The Vec is the backing storage for `FWPM_FILTER0.filterCondition`.
     // Sub-pointers inside each condition reference variables on this
     // same stack frame; they all outlive the FwpmFilterAdd0 call.
-    let mut conditions: Vec<FWPM_FILTER_CONDITION0> =
-        Vec::with_capacity(8 + spec.remote_ip_set.len() + spec.remote_ip_set_v6.len());
+    let mut conditions: Vec<FWPM_FILTER_CONDITION0> = Vec::with_capacity(
+        8 + spec.remote_ip_set.len() + spec.remote_ip_set_v6.len() + spec.remote_subnet_set.len(),
+    );
 
     if let Some(addr) = spec.remote_ip {
         conditions.push(condition_remote_ip_v4(addr));
@@ -329,6 +356,12 @@ pub fn add_filter(
         conditions.push(condition_remote_subnet_v6(&mut subnet_value_v6));
     }
     for mask in v6_host_masks.iter_mut() {
+        conditions.push(condition_remote_subnet_v6(mask));
+    }
+    for mask in set_v4_masks.iter_mut() {
+        conditions.push(condition_remote_subnet_v4(mask));
+    }
+    for mask in set_v6_masks.iter_mut() {
         conditions.push(condition_remote_subnet_v6(mask));
     }
     if let Some(port) = spec.remote_port {
@@ -727,6 +760,12 @@ fn decode_filter_row(row: &FWPM_FILTER0) -> Option<WfpFilterRecord> {
         1 => (decoded.v6_hosts.first().map(|ip| (*ip, 128)), Vec::new()),
         _ => (decoded.remote_subnet_v6, decoded.v6_hosts),
     };
+    // Subnet conditions read back: one is the single form, several the set.
+    // Both families are in `decoded.subnets` in condition order.
+    let (remote_subnet, remote_subnet_v6, remote_subnet_set) = match decoded.subnets.len() {
+        0 | 1 => (decoded.remote_subnet, remote_subnet_v6, Vec::new()),
+        _ => (None, None, decoded.subnets),
+    };
     Some(WfpFilterRecord {
         id,
         layer,
@@ -739,9 +778,10 @@ fn decode_filter_row(row: &FWPM_FILTER0) -> Option<WfpFilterRecord> {
         user_sid: decoded.user_sid,
         app_pattern: None,
         local_interface_luid: decoded.local_interface_luid,
-        remote_subnet: decoded.remote_subnet,
+        remote_subnet,
         remote_subnet_v6,
         ip_protocol: decoded.ip_protocol,
+        remote_subnet_set,
     })
 }
 
@@ -758,6 +798,9 @@ struct DecodedConditions {
     /// a packed set. A shorter prefix is a real subnet and goes below.
     v6_hosts: Vec<Ipv6Addr>,
     remote_subnet_v6: Option<(Ipv6Addr, u8)>,
+    /// Every real-prefix subnet condition of either family, in condition order;
+    /// two or more are a `remote_subnet_set`.
+    subnets: Vec<(IpAddr, u8)>,
     ip_protocol: Option<u8>,
     /// Per-user reconcile deletes by this; `None` leaves a filter alone.
     user_sid: Option<String>,
@@ -798,7 +841,11 @@ fn decode_conditions(row: &FWPM_FILTER0) -> DecodedConditions {
             if !p.is_null() {
                 // SAFETY: pointer valid per above.
                 let am = unsafe { *p };
-                out.remote_subnet = Some((Ipv4Addr::from(am.addr), mask_to_prefix(am.mask)));
+                let sub = (Ipv4Addr::from(am.addr), mask_to_prefix(am.mask));
+                out.remote_subnet = Some(sub);
+                if out.subnets.len() < crate::types::MAX_REMOTE_SUBNETS {
+                    out.subnets.push((IpAddr::V4(sub.0), sub.1));
+                }
             }
         } else if is_address_key(cond) && cond.conditionValue.r#type == FWP_V6_ADDR_MASK {
             // IPv6 twin of the subnet arm above (catch-all kill-switch). SAFETY:
@@ -813,6 +860,10 @@ fn decode_conditions(row: &FWPM_FILTER0) -> DecodedConditions {
                     out.v6_hosts.push(Ipv6Addr::from(am.addr));
                 } else {
                     out.remote_subnet_v6 = Some((Ipv6Addr::from(am.addr), am.prefixLength));
+                    if out.subnets.len() < crate::types::MAX_REMOTE_SUBNETS {
+                        out.subnets
+                            .push((IpAddr::V6(Ipv6Addr::from(am.addr)), am.prefixLength));
+                    }
                 }
             }
         } else if cond.fieldKey == FWPM_CONDITION_IP_REMOTE_PORT
@@ -1349,6 +1400,7 @@ mod tests {
             remote_subnet: None,
             remote_subnet_v6: None,
             ip_protocol: None,
+            remote_subnet_set: Vec::new(),
         }
     }
 

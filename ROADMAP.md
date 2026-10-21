@@ -31,20 +31,40 @@ priority.
 | Updates to imported rule sets | When a new version adds addresses to a rule set you imported (new addresses of `site.com`, say), the app offers the update and shows what changed. Nothing changes without your consent | medium |
 | DNS rebinding protection | A web page cannot reach your router and home devices through the browser. Names your network legitimately points at local addresses keep working, and anything held back can be allowed with one click | medium |
 | Connections chosen at installation | A silent installation names the main and the additional connection, so identical computers route by your rules right after setup, with nothing to click | medium |
+| Leak protection chosen at installation | A silent installation sets the level of leak protection, so every user of every computer is protected from their first sign-in | low |
 | Package repositories for Linux | Installs and updates the way your distribution does it: `apt` on Ubuntu and Debian, `dnf` on Fedora, RHEL, AlmaLinux and Rocky Linux, `zypper` on openSUSE, the AUR on Arch Linux, then the Astra Linux and RED OS app stores | medium |
 | NetRuleRouter on your VPN server | Installed on a server running WireGuard or AmneziaWG, it routes the traffic of that server's clients by your rules — a phone, a laptop, or a home router connected to the server — with nothing to install on them. We will verify the setup and describe it step by step | medium |
 | Up-to-date libraries | The libraries for checksums, signatures and data encoding move to their current versions, while rules and the audit trail saved by earlier versions keep working unchanged | medium |
 | Installing a program without network access | Start an installer from the window or the terminal interface, and neither it nor anything it starts can reach beyond your computer until the installation ends. The network comes back on its own, and the app offers rules for the program it installed. An Explorer context-menu item will follow if users ask for it | medium |
+| Rules by the account a service runs under | Sites and services that run inside one server program can still go over different connections, by the account each one runs under, such as a separate application pool per site. Needs administrator rights; system accounts stay protected | medium |
+| Same protection on Linux when a connection drops | When the additional connection is down, ordinary sites on Linux stay reachable while the ones your rules protect stay closed, as on Windows | medium |
+| Protection back on its own after a Windows firewall restart | If the Windows firewall service restarts while NetRuleRouter runs, the protection is put back at once and the window tells you, so the computer is never left unprotected | medium |
+| Strict network checks on RHEL-family systems | On RHEL, RED OS, AlmaLinux and similar systems with strict network checks turned on, the sites your rules send over the additional connection keep working for every user of the computer | medium |
+| Pages come back after the VPN returns | A page that could not open while the additional connection was down opens again on its own once the connection is back, with no manual reload | medium |
 | Gateway for home network devices | A computer running NetRuleRouter routes the traffic of a phone, a TV and other devices by the same rules | low |
 | Warning about tampered name answers | A notice when a public Wi-Fi network or the provider tampers with the answers about site names | low |
 | Own route for containers and virtual machines | Docker, Podman and local virtual machines get a route the way a program does, with the same protection if the connection drops | low |
+| Name lookups kept apart for each user | When several people use the computer at the same time, one person's leak protection never changes how another person's programs look up site names | low |
 | Traffic per user of the machine | How much traffic each user of the computer used, not only each connection | low |
+| Containers held as tightly as the computer | With leak protection set to Everything and the additional connection as the default route, WSL, containers and virtual machines are kept to it just as the computer itself is | low |
+| More privacy between users of one computer | What the app tells one user never reveals how busy the other users of the computer are | low |
+| Stronger focus and simpler labels | An optional thicker outline around the focused control and shorter labels in the window, for easier reading | low |
 | Data plan limit warning | A notice when the additional connection's usage nears the limit of a VPN subscription or a mobile plan | low |
 | Suggestions for programs | A program whose connections do not get through on the main connection is offered a move to the additional one, as sites are today | low |
 | Connection check | One button shows whether the VPN connection loses large packets and what to change in the VPN client's settings | low |
 | History of rule changes | Every rule added, removed or changed, with when and from where, and any one change undone on its own | low |
 | Administrator rights from the terminal interface on Windows | When a change made in the terminal interface needs administrator rights, Windows asks for them with its usual prompt, with no need to restart the terminal as administrator | low |
-| Traffic charts by connection | The traffic statistics you can already export, as a chart in the window | low |
+| Traffic charts by connection | The traffic statistics you can already export, as a chart in the window and the terminal interface | low |
+| Name lookups repeated over the same connection | When a lookup of a site name has to be repeated, the repeat goes over the same connection as the first attempt — the one your rules chose for the site | low |
+| Computers under a company domain policy | If the company's domain policy takes over name lookups on the computer, the app notices it and tells you in the window and the terminal interface what is limited and why, instead of working on quietly with weaker protection | low |
+| IPv6 connections follow a rule change at once | After you change a rule, connections already open over IPv6 move to the new route right away, as IPv4 ones do, on Windows and on Linux | low |
+| Warning about a rule that is already covered | When you add a rule for a site or program that another rule already covers, the app names that rule and asks whether to add the new one anyway | low |
+| A leaner window and tray | The window and tray carry only the code they need, so the download is smaller and less code inside them can reach your settings | low |
+| Forged name answers are harder to slip in | A forged answer to a name lookup from a hostile network is much less likely to be taken for the real one | low |
+| Corporate VPN through a chosen connection, kept up to date | When your company changes the addresses of its VPN gateways, the route to them follows on its own, with no rule to edit by hand | low |
+| Warnings for sites sharing one server program | When several sites are served by one web server program, the app tells you that a rule on one site's folder cannot tell them apart, and warns when two folder rules on different connections lead to the same server | low |
+| Installing with winget and Scoop | Install and update NetRuleRouter on Windows with the package managers many people already use, without downloading a file by hand | low |
+| Instant rule changes with very large rule sets | Even with thousands of rules, a change to one of them takes effect at once, without the whole set being worked out again | low |
 | Running on OpenWrt routers | Not researched yet. If you know how NetRuleRouter would fit on a router — memory, storage, the firewall — we will be glad to hear it | — |
 
 macOS comes after Linux; its own plan will appear here once the port starts.

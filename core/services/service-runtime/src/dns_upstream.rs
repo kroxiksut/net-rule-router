@@ -35,6 +35,14 @@ const MIN_REFRESH_GAP: Duration = Duration::from_secs(10);
 /// worker at once.
 const MIN_SWEEP_GAP: Duration = Duration::from_secs(3);
 
+/// Floor between checks of the active server against the published foreign
+/// interfaces on the query path: one lock-free-ish read per second, not per query.
+const EXCLUSION_RECHECK: Duration = Duration::from_secs(1);
+
+/// Foreign resolvers probed to tell "only a corporate resolver is reachable"
+/// from "nothing answers"; bounded because the sweep that asks already failed.
+const FOREIGN_PROBES: usize = 2;
+
 /// Name used to probe a candidate. Reserved by RFC 2606, answered by every
 /// recursive resolver, owned by nobody — and the probe accepts ANY well-formed
 /// reply (NXDOMAIN and REFUSED included), so what is being tested is reachability
@@ -131,6 +139,28 @@ impl UpstreamProbe for AcceptingProbe {
 /// resolvable, which simply leaves the OS enumeration order in charge.
 pub type PreferredInterfaceFn = Arc<dyn Fn() -> Option<u32> + Send + Sync>;
 
+/// The interfaces whose resolvers must never serve as a general upstream:
+/// somebody else's tunnels. Their servers answer for their own namespaces only,
+/// and sending every name there would hand them the machine's whole lookup history.
+pub type ExcludedInterfacesFn = Arc<dyn Fn() -> Vec<u32> + Send + Sync>;
+
+/// The same set as already published, `None` before the first publication.
+/// Never reads the machine, so the query path may ask it.
+pub type PublishedExcludedFn = Arc<dyn Fn() -> Option<Vec<u32>> + Send + Sync>;
+
+/// Whether a server listed on no interface is reached through a foreign tunnel.
+type UnboundBarredFn = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
+
+/// Why no upstream is in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpstreamDarkCause {
+    /// No candidate answered.
+    NothingAnswers,
+    /// Every resolver outside the foreign tunnels is unreachable and a foreign
+    /// tunnel's resolver does answer: a full-tunnel VPN that blocks other DNS.
+    OnlyForeignAnswers,
+}
+
 struct PoolState {
     /// Candidates in preference order, as last enumerated.
     candidates: Vec<UpstreamDnsServer>,
@@ -142,6 +172,9 @@ struct PoolState {
     /// When the last full sweep ended with nothing answering. Gates the probes
     /// themselves, which `last_refresh` does not.
     last_empty_sweep: Option<Instant>,
+    /// Last time the active server was checked against the published foreign
+    /// interfaces on the query path.
+    last_exclusion_check: Option<Instant>,
 }
 
 /// The live choice of upstream DNS server.
@@ -156,6 +189,16 @@ pub struct UpstreamDnsPool {
     /// address ([`Self::fixed`]) differs from the standard port.
     port: u16,
     preferred_interface: OnceLock<PreferredInterfaceFn>,
+    excluded_interfaces: OnceLock<ExcludedInterfacesFn>,
+    published_excluded: OnceLock<PublishedExcludedFn>,
+    unbound_barred: OnceLock<UnboundBarredFn>,
+    /// The excluded set the last background re-selection ran for, sorted;
+    /// see [`Self::note_excluded_change_in_background`].
+    followed_excluded: Mutex<Vec<u32>>,
+    /// The preferred interface as last read; the question reads the machine,
+    /// so it is asked at most once per [`MIN_REFRESH_GAP`] and on a network
+    /// change.
+    preferred_cache: Mutex<Option<(Instant, Option<u32>)>>,
     /// Held for the duration of one sweep. Probing is slow and the answer is
     /// shared, so a second caller takes the current choice rather than running
     /// the same probes beside the first.
@@ -168,6 +211,8 @@ pub struct UpstreamDnsPool {
     /// since. Read by the resolver service, which lifts the redirect while it
     /// holds: every forward would wait out its timeout and fail.
     dark: AtomicBool,
+    /// With `dark`: the foreign tunnel's resolver answers while nothing else does.
+    dark_foreign_only: AtomicBool,
 }
 
 impl UpstreamDnsPool {
@@ -177,6 +222,11 @@ impl UpstreamDnsPool {
             probe,
             port: DNS_PORT,
             preferred_interface: OnceLock::new(),
+            excluded_interfaces: OnceLock::new(),
+            published_excluded: OnceLock::new(),
+            unbound_barred: OnceLock::new(),
+            followed_excluded: Mutex::new(Vec::new()),
+            preferred_cache: Mutex::new(None),
             sweep: Mutex::new(()),
             state: Mutex::new(PoolState {
                 candidates: Vec::new(),
@@ -184,15 +234,29 @@ impl UpstreamDnsPool {
                 failures: 0,
                 last_refresh: None,
                 last_empty_sweep: None,
+                last_exclusion_check: None,
             }),
             background_refresh: AtomicBool::new(false),
             dark: AtomicBool::new(false),
+            dark_foreign_only: AtomicBool::new(false),
         }
     }
 
     /// Whether no upstream is known to answer right now — see [`Self::dark`].
     pub fn upstream_dark(&self) -> bool {
         self.dark.load(Ordering::Relaxed)
+    }
+
+    /// Why the pool is dark; `None` while an upstream answers.
+    pub fn upstream_dark_cause(&self) -> Option<UpstreamDarkCause> {
+        if !self.upstream_dark() {
+            return None;
+        }
+        Some(if self.dark_foreign_only.load(Ordering::Relaxed) {
+            UpstreamDarkCause::OnlyForeignAnswers
+        } else {
+            UpstreamDarkCause::NothingAnswers
+        })
     }
 
     /// Prefer the resolver of the interface this returns.
@@ -214,6 +278,49 @@ impl UpstreamDnsPool {
         let _ = self.preferred_interface.set(preferred);
     }
 
+    /// Keep the resolvers of the interfaces this returns out of the candidate
+    /// list. First writer wins. Asked on every reselect, failures on the query
+    /// path included, so it reads published state rather than the machine.
+    pub fn set_excluded_interfaces(&self, excluded: ExcludedInterfacesFn) {
+        let _ = self.excluded_interfaces.set(excluded);
+    }
+
+    /// The published form of the same set: lets the query path drop an active
+    /// server whose interface turned foreign without waiting for a reselect.
+    pub fn set_published_excluded(&self, published: PublishedExcludedFn) {
+        let _ = self.published_excluded.set(published);
+    }
+
+    /// Both sets from `cell`, for a platform whose routing pass publishes the
+    /// foreign tunnels there and has nothing to ask before it does: until the
+    /// first publication nothing is excluded, since doubt is "not foreign".
+    /// A server whose mechanism names no link is barred only when it is reached
+    /// through a tunnel; elsewhere it may be the user's only resolver.
+    pub fn follow_foreign_tunnels(&self, cell: Arc<crate::foreign_tunnels::ForeignTunnelCell>) {
+        let published = Arc::clone(&cell);
+        self.set_published_excluded(Arc::new(move || published.interfaces()));
+        let carried = Arc::clone(&cell);
+        let _ = self
+            .unbound_barred
+            .set(Arc::new(move |server| match server {
+                IpAddr::V4(v4) => carried.routes_through_tunnel(v4),
+                IpAddr::V6(_) => false,
+            }));
+        self.set_excluded_interfaces(Arc::new(move || cell.interfaces().unwrap_or_default()));
+    }
+
+    /// Barred from general use: listed on an excluded interface, or on none
+    /// while it is reached through a foreign tunnel.
+    fn is_barred(&self, candidate: &UpstreamDnsServer, excluded: &[u32]) -> bool {
+        match candidate.interface_index {
+            Some(index) => excluded.contains(&index),
+            None => self
+                .unbound_barred
+                .get()
+                .is_some_and(|carried| carried(candidate.server)),
+        }
+    }
+
     /// A pool pinned to one server, with no enumeration and no probing. The
     /// shape callers use when the upstream is dictated rather than discovered
     /// (tests, and any caller handed an explicit address).
@@ -230,6 +337,11 @@ impl UpstreamDnsPool {
             probe: Arc::new(AcceptingProbe),
             port: server.port(),
             preferred_interface: OnceLock::new(),
+            excluded_interfaces: OnceLock::new(),
+            published_excluded: OnceLock::new(),
+            unbound_barred: OnceLock::new(),
+            followed_excluded: Mutex::new(Vec::new()),
+            preferred_cache: Mutex::new(None),
             sweep: Mutex::new(()),
             state: Mutex::new(PoolState {
                 candidates: vec![UpstreamDnsServer {
@@ -240,9 +352,11 @@ impl UpstreamDnsPool {
                 failures: 0,
                 last_refresh: Some(Instant::now()),
                 last_empty_sweep: None,
+                last_exclusion_check: None,
             }),
             background_refresh: AtomicBool::new(false),
             dark: AtomicBool::new(false),
+            dark_foreign_only: AtomicBool::new(false),
         }
     }
 
@@ -253,10 +367,86 @@ impl UpstreamDnsPool {
     /// The server to forward to right now, or `None` while no candidate has been
     /// found to answer. `None` means "do not redirect": leaving the OS resolver
     /// alone beats pointing it at a black hole.
-    pub fn current(&self) -> Option<SocketAddr> {
-        self.lock()
+    ///
+    /// When this drops a server whose link turned foreign, a re-selection
+    /// starts in the background: the query that saw the drop goes without, the
+    /// next one finds a server, and none of them waits on a probe.
+    pub fn current(self: &Arc<Self>) -> Option<SocketAddr> {
+        let (active, dropped) = self.current_checked();
+        if dropped {
+            self.in_background(Self::refresh, |_| {});
+        }
+        active
+    }
+
+    /// [`Self::current`] for a caller that would rather wait for a sweep than
+    /// go without: it re-selects in place.
+    pub fn current_or_select(&self) -> Option<SocketAddr> {
+        self.current_checked()
+            .0
+            .or_else(|| self.note_network_change())
+    }
+
+    /// The active server, after dropping it if its link turned foreign; the
+    /// flag says whether it was dropped.
+    fn current_checked(&self) -> (Option<SocketAddr>, bool) {
+        {
+            let mut state = self.lock();
+            let due = self.published_excluded.get().is_some()
+                && state
+                    .last_exclusion_check
+                    .is_none_or(|at| at.elapsed() >= EXCLUSION_RECHECK);
+            if !due {
+                return (
+                    state.active.map(|ip| SocketAddr::from((ip, self.port))),
+                    false,
+                );
+            }
+            state.last_exclusion_check = Some(Instant::now());
+        }
+        let mut dropped = false;
+        if let Some(excluded) = self.published_excluded.get().and_then(|f| f()) {
+            if self.drop_barred_active(&excluded) {
+                dropped = true;
+                // The next caller may re-select at once.
+                let mut state = self.lock();
+                state.last_refresh = None;
+                state.last_empty_sweep = None;
+                tracing::warn!(
+                    target: "nrr::dns-resolver",
+                    msg_key = "dns-upstream-dropped-foreign",
+                    "upstream DNS server dropped: its interface now belongs to another VPN",
+                );
+            }
+        }
+        let active = self
+            .lock()
             .active
-            .map(|ip| SocketAddr::from((ip, self.port)))
+            .map(|ip| SocketAddr::from((ip, self.port)));
+        (active, dropped)
+    }
+
+    /// Forget the active server when every place it is listed is barred.
+    /// Returns whether it did.
+    fn drop_barred_active(&self, excluded: &[u32]) -> bool {
+        let mut state = self.lock();
+        let Some(active) = state.active else {
+            return false;
+        };
+        let (mut here, mut elsewhere) = (false, false);
+        for c in state.candidates.iter().filter(|c| c.server == active) {
+            if self.is_barred(c, excluded) {
+                here = true;
+            } else {
+                elsewhere = true;
+            }
+        }
+        if here && !elsewhere {
+            state.active = None;
+            state.failures = 0;
+            return true;
+        }
+        false
     }
 
     /// A forward succeeded — the active server is good.
@@ -330,6 +520,10 @@ impl UpstreamDnsPool {
     /// [`MIN_REFRESH_GAP`] — this is called from the adapter hook, which fires
     /// on every interface flap, and re-selection shells out to the OS.
     pub fn note_network_change(&self) -> Option<SocketAddr> {
+        *self
+            .preferred_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         let due = {
             let state = self.lock();
             state
@@ -337,7 +531,11 @@ impl UpstreamDnsPool {
                 .is_none_or(|at| at.elapsed() >= MIN_REFRESH_GAP)
         };
         if !due {
-            return self.current();
+            // A server dropped just now is replaced here, not left for later.
+            let (active, dropped) = self.current_checked();
+            if !dropped {
+                return active;
+            }
         }
         self.refresh()
     }
@@ -351,8 +549,48 @@ impl UpstreamDnsPool {
     where
         F: FnOnce(Option<SocketAddr>) + Send + 'static,
     {
+        self.in_background(Self::note_network_change, then);
+    }
+
+    /// A routing pass may have moved the excluded set. When it did, re-select
+    /// at once on a worker thread, past the refresh floor: a tunnel that came
+    /// up bars its resolver, one that went away frees it, and a dropped active
+    /// server would otherwise wait for a failure streak no query reports.
+    /// Reads published state only; returns whether a re-selection started.
+    pub fn note_excluded_change_in_background<F>(self: &Arc<Self>, then: F) -> bool
+    where
+        F: FnOnce(Option<SocketAddr>) + Send + 'static,
+    {
+        let Some(excluded) = self.excluded_interfaces.get() else {
+            return false;
+        };
+        let mut now = excluded();
+        now.sort_unstable();
+        now.dedup();
+        let mut followed = self
+            .followed_excluded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if *followed == now {
+            return false;
+        }
+        // Recorded only once a worker takes it: one that is busy may have read
+        // the set before it moved, and the next pass asks again.
+        let started = self.in_background(Self::refresh, then);
+        if started {
+            *followed = now;
+        }
+        started
+    }
+
+    /// Run `work` on a worker thread and hand its selection to `then`. At most
+    /// one runs at a time; returns whether this call started one.
+    fn in_background<F>(self: &Arc<Self>, work: fn(&Self) -> Option<SocketAddr>, then: F) -> bool
+    where
+        F: FnOnce(Option<SocketAddr>) + Send + 'static,
+    {
         if self.background_refresh.swap(true, Ordering::SeqCst) {
-            return;
+            return false;
         }
         /// Clears the busy flag however the worker ends, a panic included:
         /// left set, it would drop every later re-selection for good.
@@ -367,7 +605,7 @@ impl UpstreamDnsPool {
             .name("nrr-dns-upstream-refresh".into())
             .spawn(move || {
                 let done = RefreshDone(pool);
-                let selected = done.0.note_network_change();
+                let selected = work(&done.0);
                 drop(done);
                 then(selected);
             });
@@ -379,12 +617,35 @@ impl UpstreamDnsPool {
                 error = %e,
                 "could not start the upstream DNS re-selection worker",
             );
+            return false;
+        }
+        true
+    }
+
+    fn preferred_interface_now(&self) -> Option<u32> {
+        let resolve = self.preferred_interface.get()?;
+        let mut cache = self
+            .preferred_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match *cache {
+            Some((at, value)) if at.elapsed() < MIN_REFRESH_GAP => value,
+            _ => {
+                let value = resolve();
+                *cache = Some((Instant::now(), value));
+                value
+            }
         }
     }
 
     /// Pick the first candidate that answers, preferring anything over `avoid`.
     /// Re-enumerates from the OS when the candidate list is stale.
     fn reselect(&self, avoid: Option<IpAddr>) -> Option<IpAddr> {
+        // Before the early returns below, which hand back `active` as is.
+        let excluded = self.excluded_interfaces.get().map(|f| f());
+        if let Some(excluded) = excluded.as_deref() {
+            self.drop_barred_active(excluded);
+        }
         let swept_recently = {
             let state = self.lock();
             state
@@ -406,17 +667,34 @@ impl UpstreamDnsPool {
                 .is_none_or(|at| at.elapsed() >= MIN_REFRESH_GAP)
         };
         if stale {
-            let fresh = self.servers.upstream_candidates();
+            // Per link: a server barred on a foreign tunnel stays usable when
+            // a link of ours offers it too.
+            let fresh = self.servers.upstream_candidates_per_link();
             let mut state = self.lock();
             state.last_refresh = Some(Instant::now());
             if !fresh.is_empty() {
                 state.candidates = fresh;
             }
         }
-        let candidates = self.lock().candidates.clone();
+        let mut candidates = self.lock().candidates.clone();
+        let mut barred: Vec<IpAddr> = Vec::new();
+        if let Some(excluded) = excluded.as_deref() {
+            let is_excluded = |c: &UpstreamDnsServer| self.is_barred(c, excluded);
+            barred = candidates
+                .iter()
+                .filter(|c| is_excluded(c))
+                .map(|c| c.server)
+                .collect();
+            candidates.retain(|c| !is_excluded(c));
+            barred.retain(|ip| !candidates.iter().any(|c| c.server == *ip));
+            barred.sort_unstable();
+            barred.dedup();
+            // The list may have been re-enumerated since the drop above.
+            self.drop_barred_active(excluded);
+        }
         // Preferred interface first, then everything else, and the server we are
         // trying to move off of last.
-        let preferred = self.preferred_interface.get().and_then(|resolve| resolve());
+        let preferred = self.preferred_interface_now();
         let on_preferred =
             |c: &UpstreamDnsServer| preferred.is_some() && c.interface_index == preferred;
         let mut ordered: Vec<&UpstreamDnsServer> = Vec::with_capacity(candidates.len());
@@ -431,13 +709,20 @@ impl UpstreamDnsPool {
                 .filter(|c| Some(c.server) != avoid && !on_preferred(c)),
         );
         ordered.extend(candidates.iter().filter(|c| Some(c.server) == avoid));
+        // A server several links offer is probed once, at its best place.
+        let mut probed: Vec<IpAddr> = Vec::with_capacity(ordered.len());
         for ip in ordered.into_iter().map(|c| c.server) {
+            if probed.contains(&ip) {
+                continue;
+            }
+            probed.push(ip);
             if self.probe.responds(SocketAddr::from((ip, self.port))) {
                 let mut state = self.lock();
                 state.active = Some(ip);
                 state.failures = 0;
                 state.last_empty_sweep = None;
                 self.dark.store(false, Ordering::Relaxed);
+                self.dark_foreign_only.store(false, Ordering::Relaxed);
                 return Some(ip);
             }
         }
@@ -445,6 +730,12 @@ impl UpstreamDnsPool {
         // a machine that is briefly offline has no better server to offer, and
         // dropping the redirect mid-session would be the louder failure. The
         // `dark` flag says so for whoever must act on it.
+        let foreign_answers = barred
+            .iter()
+            .take(FOREIGN_PROBES)
+            .any(|ip| self.probe.responds(SocketAddr::from((*ip, self.port))));
+        self.dark_foreign_only
+            .store(foreign_answers, Ordering::Relaxed);
         self.dark.store(true, Ordering::Relaxed);
         let mut state = self.lock();
         state.last_empty_sweep = Some(Instant::now());
@@ -543,6 +834,370 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_tunnels_resolver_never_becomes_the_upstream() {
+        let corporate = UpstreamDnsCandidate {
+            interface_index: Some(9),
+            server: ip(1),
+        };
+        let home = UpstreamDnsCandidate {
+            interface_index: Some(4),
+            server: ip(2),
+        };
+        let probe = ScriptedProbe::new(vec![ip(1), ip(2)]);
+        let pool = UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::with_interfaces(vec![corporate, home])),
+            probe.clone(),
+        );
+        pool.set_excluded_interfaces(Arc::new(|| vec![9]));
+        assert_eq!(pool.refresh().map(|s| s.ip()), Some(IpAddr::V4(ip(2))));
+        // The home resolver goes quiet: the corporate one answers but is not taken.
+        probe.set_alive(vec![ip(1)]);
+        assert_ne!(pool.reprobe().map(|s| s.ip()), Some(IpAddr::V4(ip(1))));
+    }
+
+    #[test]
+    fn an_active_server_that_turns_out_to_be_a_foreign_tunnels_is_dropped() {
+        let corporate = UpstreamDnsCandidate {
+            interface_index: Some(9),
+            server: ip(1),
+        };
+        let probe = ScriptedProbe::new(vec![ip(1)]);
+        let pool = UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::with_interfaces(vec![corporate])),
+            probe,
+        );
+        assert_eq!(pool.refresh().map(|s| s.ip()), Some(IpAddr::V4(ip(1))));
+        pool.set_excluded_interfaces(Arc::new(|| vec![9]));
+        assert_eq!(pool.reprobe(), None);
+        assert!(pool.upstream_dark());
+    }
+
+    fn corporate_and_home() -> (UpstreamDnsCandidate, UpstreamDnsCandidate) {
+        (
+            UpstreamDnsCandidate::new(Some(9), ip(1)),
+            UpstreamDnsCandidate::new(Some(4), ip(2)),
+        )
+    }
+
+    #[test]
+    fn a_full_tunnel_that_blocks_other_dns_is_told_apart_from_an_offline_machine() {
+        let (corporate, home) = corporate_and_home();
+        let probe = ScriptedProbe::new(vec![ip(1)]);
+        let pool = UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::with_interfaces(vec![corporate, home])),
+            probe.clone(),
+        );
+        pool.set_excluded_interfaces(Arc::new(|| vec![9]));
+        assert_eq!(pool.refresh(), None);
+        assert_eq!(
+            pool.upstream_dark_cause(),
+            Some(UpstreamDarkCause::OnlyForeignAnswers)
+        );
+        probe.set_alive(vec![]);
+        pool.refresh();
+        assert_eq!(
+            pool.upstream_dark_cause(),
+            Some(UpstreamDarkCause::NothingAnswers),
+            "the corporate resolver is gone too"
+        );
+        probe.set_alive(vec![ip(2)]);
+        pool.refresh();
+        assert_eq!(pool.upstream_dark_cause(), None);
+    }
+
+    /// What the pool serves once a re-selection it started has settled.
+    fn current_within(pool: &Arc<UpstreamDnsPool>, limit: Duration) -> Option<IpAddr> {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(server) = pool.current() {
+                return Some(server.ip());
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// No query reports a failure after the drop, so only the pool itself can
+    /// start the re-selection; the query that saw the drop must not wait for it.
+    #[test]
+    fn an_active_server_on_a_link_that_turns_foreign_is_replaced_off_the_query_path() {
+        let (corporate, home) = corporate_and_home();
+        let probe = ParkingProbe::new();
+        let pool = Arc::new(UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::with_interfaces(vec![corporate, home])),
+            Arc::clone(&probe) as Arc<dyn UpstreamProbe>,
+        ));
+        // The corporate resolver was picked before the tunnel was published.
+        {
+            let mut state = pool.lock();
+            state.candidates = vec![corporate.into(), home.into()];
+            state.active = Some(IpAddr::V4(ip(1)));
+            state.last_refresh = Some(Instant::now());
+        }
+        let published = Arc::new(Mutex::new(None::<Vec<u32>>));
+        let read = Arc::clone(&published);
+        pool.set_published_excluded(Arc::new(move || {
+            read.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }));
+        let read = Arc::clone(&published);
+        pool.set_excluded_interfaces(Arc::new(move || {
+            read.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .unwrap_or_default()
+        }));
+        assert_eq!(pool.current().map(|s| s.ip()), Some(IpAddr::V4(ip(1))));
+
+        *published.lock().unwrap_or_else(|p| p.into_inner()) = Some(vec![9]);
+        pool.lock().last_exclusion_check = None;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                let _ = sender.send(pool.current());
+            });
+        }
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the query is not held by the re-selection"),
+            None,
+            "the foreign resolver is not served"
+        );
+
+        probe.wait_until_inside();
+        probe.release();
+        assert_eq!(
+            current_within(&pool, Duration::from_secs(5)),
+            Some(IpAddr::V4(ip(2)))
+        );
+        assert_eq!(
+            probe.calls.load(Ordering::Relaxed),
+            1,
+            "only the home resolver is probed"
+        );
+    }
+
+    #[test]
+    fn a_server_that_is_also_listed_on_a_link_of_ours_survives_the_exclusion() {
+        let shared = [
+            UpstreamDnsCandidate::new(Some(9), ip(1)),
+            UpstreamDnsCandidate::new(Some(4), ip(1)),
+        ];
+        let pool = Arc::new(UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::with_interfaces(shared.to_vec())),
+            ScriptedProbe::new(vec![ip(1)]),
+        ));
+        pool.refresh();
+        pool.set_published_excluded(Arc::new(|| Some(vec![9])));
+        assert_eq!(pool.current().map(|s| s.ip()), Some(IpAddr::V4(ip(1))));
+    }
+
+    /// The shape the Linux mechanisms report: the tunnel, read first, lists
+    /// the home server too. That server stays a general upstream, probed once;
+    /// the one only the tunnel lists never becomes one.
+    #[test]
+    fn a_server_a_link_of_ours_also_offers_survives_a_reselect_and_the_tunnels_own_does_not() {
+        let listed = vec![
+            UpstreamDnsCandidate::new(Some(9), ip(2)),
+            UpstreamDnsCandidate::new(Some(9), ip(1)),
+            UpstreamDnsCandidate::new(Some(4), ip(2)),
+        ];
+        let probe = ScriptedProbe::new(vec![ip(1), ip(2)]);
+        let pool = UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::with_interfaces(listed)),
+            probe.clone(),
+        );
+        pool.set_excluded_interfaces(Arc::new(|| vec![9]));
+        assert_eq!(pool.refresh().map(|s| s.ip()), Some(IpAddr::V4(ip(2))));
+        probe.set_alive(vec![ip(1)]);
+        let before = probe.calls.load(Ordering::Relaxed);
+        assert_ne!(pool.refresh().map(|s| s.ip()), Some(IpAddr::V4(ip(1))));
+        assert_eq!(
+            probe.calls.load(Ordering::Relaxed) - before,
+            2,
+            "the shared server once, then the tunnel's for the dark cause"
+        );
+        assert_eq!(
+            pool.upstream_dark_cause(),
+            Some(UpstreamDarkCause::OnlyForeignAnswers)
+        );
+    }
+
+    fn tunnel_carrying(cidr: &str) -> Arc<crate::foreign_tunnels::ForeignTunnelCell> {
+        let cell = Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new());
+        cell.publish_tunnels(&[], &[], &[9]);
+        cell.publish_networks(vec![
+            nrr_domain::ipv4_network::Ipv4Network::parse(cidr).expect("network")
+        ]);
+        cell
+    }
+
+    /// A plain `resolv.conf` names no interface. Such a server inside a
+    /// foreign tunnel's networks is the tunnel's; one outside them may be the
+    /// user's only resolver.
+    #[test]
+    fn a_resolver_on_no_interface_is_barred_only_inside_the_tunnels_networks() {
+        let (corporate, _) = corporate_and_home();
+        let inside = UpstreamDnsCandidate::new(None, ip(3));
+        let outside = UpstreamDnsCandidate::new(None, ip(5));
+        let probe = ScriptedProbe::new(vec![ip(1), ip(3), ip(5)]);
+        let pool = Arc::new(UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::with_interfaces(vec![
+                corporate, inside, outside,
+            ])),
+            probe.clone(),
+        ));
+        pool.follow_foreign_tunnels(tunnel_carrying("192.168.3.0/24"));
+        assert_eq!(pool.refresh().map(|s| s.ip()), Some(IpAddr::V4(ip(5))));
+        assert_eq!(pool.current().map(|s| s.ip()), Some(IpAddr::V4(ip(5))));
+
+        // The outside one goes quiet: the tunnel's answer but are not taken.
+        probe.set_alive(vec![ip(1), ip(3)]);
+        assert_eq!(
+            pool.refresh().map(|s| s.ip()),
+            Some(IpAddr::V4(ip(5))),
+            "the last good server is kept, not swapped for the tunnel's"
+        );
+        assert_eq!(
+            pool.upstream_dark_cause(),
+            Some(UpstreamDarkCause::OnlyForeignAnswers)
+        );
+    }
+
+    /// The corporate tunnel routes a whole private `/16`, the home LAN is a
+    /// `/24` inside it on our uplink: the home router is reached locally and
+    /// stays usable; an address only the tunnel's range holds does not.
+    #[test]
+    fn a_resolver_on_no_interface_on_our_own_lan_inside_the_tunnels_range_stays_usable() {
+        fn route(dest: [u8; 4], prefix: u8, ifindex: u32) -> nrr_platform_api::RouteEntry {
+            nrr_platform_api::RouteEntry {
+                destination: IpAddr::V4(Ipv4Addr::from(dest)),
+                prefix_length: prefix,
+                next_hop: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                interface_index: ifindex,
+                metric: 10,
+                is_ours: false,
+                table: Default::default(),
+            }
+        }
+        let (tunnel, eth0) = (9, 4);
+        let routes = [
+            route([192, 168, 0, 0], 16, tunnel),
+            route([192, 168, 1, 0], 24, eth0),
+            route([0, 0, 0, 0], 0, eth0),
+        ];
+        let router = Ipv4Addr::new(192, 168, 1, 1);
+        let corporate_only = Ipv4Addr::new(192, 168, 50, 1);
+        let cell = Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new());
+        cell.publish_tunnels(&routes, &[], &[tunnel]);
+        assert!(cell.carries(router), "the tunnel's range holds both");
+
+        let probe = ScriptedProbe::new(vec![router, corporate_only]);
+        let pool = Arc::new(UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::with_interfaces(vec![
+                UpstreamDnsCandidate::new(None, corporate_only),
+                UpstreamDnsCandidate::new(None, router),
+            ])),
+            probe.clone(),
+        ));
+        pool.follow_foreign_tunnels(cell);
+        assert_eq!(
+            pool.refresh().map(|s| s.ip()),
+            Some(IpAddr::V4(router)),
+            "the home router is usable, the tunnel's own address is passed over"
+        );
+        probe.set_alive(vec![corporate_only]);
+        assert_eq!(pool.refresh().map(|s| s.ip()), Some(IpAddr::V4(router)));
+        assert_eq!(
+            pool.upstream_dark_cause(),
+            Some(UpstreamDarkCause::OnlyForeignAnswers),
+            "the address only the tunnel's range holds stays barred"
+        );
+    }
+
+    /// The tunnel comes up under a server picked from `resolv.conf`: it is
+    /// dropped and replaced without a failing query to set it off.
+    #[test]
+    fn an_active_resolver_on_no_interface_that_a_tunnel_takes_over_is_replaced() {
+        let unbound = UpstreamDnsCandidate::new(None, ip(3));
+        let home = UpstreamDnsCandidate::new(Some(4), ip(2));
+        let pool = Arc::new(UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::with_interfaces(vec![unbound, home])),
+            ScriptedProbe::new(vec![ip(2), ip(3)]),
+        ));
+        let cell = Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new());
+        pool.follow_foreign_tunnels(Arc::clone(&cell));
+        assert_eq!(pool.refresh().map(|s| s.ip()), Some(IpAddr::V4(ip(3))));
+
+        cell.publish_tunnels(&[], &[], &[9]);
+        cell.publish_networks(vec![nrr_domain::ipv4_network::Ipv4Network::parse(
+            "192.168.3.0/24",
+        )
+        .expect("network")]);
+        pool.lock().last_exclusion_check = None;
+        assert_eq!(pool.current(), None, "the tunnel's resolver is not served");
+        assert_eq!(
+            current_within(&pool, Duration::from_secs(5)),
+            Some(IpAddr::V4(ip(2)))
+        );
+    }
+
+    fn selection_after(pool: &Arc<UpstreamDnsPool>) -> Option<Option<IpAddr>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        if !pool.note_excluded_change_in_background(move |selected| {
+            let _ = sender.send(selected.map(|s| s.ip()));
+        }) {
+            return None;
+        }
+        Some(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("selection"),
+        )
+    }
+
+    /// The platform without a route coordinator: the routing pass publishes
+    /// the tunnels into the cell, and the pool re-selects when, and only when,
+    /// that set moves.
+    #[test]
+    fn the_exclusion_follows_the_published_tunnel_set() {
+        let (corporate, home) = corporate_and_home();
+        let probe = ScriptedProbe::new(vec![ip(1), ip(2)]);
+        let pool = Arc::new(UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::with_interfaces(vec![corporate, home])),
+            probe.clone(),
+        ));
+        let cell = Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new());
+        pool.follow_foreign_tunnels(Arc::clone(&cell));
+        assert_eq!(
+            pool.refresh().map(|s| s.ip()),
+            Some(IpAddr::V4(ip(1))),
+            "nothing published yet: nothing is foreign"
+        );
+        assert_eq!(selection_after(&pool), None, "no set moved");
+
+        cell.publish_tunnels(&[], &[], &[9]);
+        assert_eq!(selection_after(&pool), Some(Some(IpAddr::V4(ip(2)))));
+        assert_eq!(selection_after(&pool), None, "the same set again");
+        probe.set_alive(vec![ip(1)]);
+        assert_ne!(pool.reprobe().map(|s| s.ip()), Some(IpAddr::V4(ip(1))));
+
+        // The tunnel went away: its resolver is an ordinary candidate again.
+        cell.publish_tunnels(&[], &[], &[]);
+        assert_eq!(selection_after(&pool), Some(Some(IpAddr::V4(ip(1)))));
+    }
+
+    /// Before any wiring there is no set to follow and nothing to re-select.
+    #[test]
+    fn an_unwired_pool_never_re_selects_for_the_tunnel_set() {
+        let pool = Arc::new(pool(vec![ip(1)], ScriptedProbe::new(vec![ip(1)])));
+        assert_eq!(selection_after(&pool), None);
+    }
+
+    #[test]
     fn a_dead_preferred_server_is_skipped_for_one_that_answers() {
         // The boot bug: the disconnected adapter's DNS is enumerated first.
         let probe = ScriptedProbe::new(vec![ip(0)]);
@@ -569,6 +1224,27 @@ mod tests {
         assert_eq!(pool.refresh(), Some(SocketAddr::from((ip(0), 53))));
     }
 
+    /// The question reads the machine: a burst of reselects asks it once, and
+    /// a network change asks it again.
+    #[test]
+    fn the_preferred_interface_is_read_once_per_gap_and_again_after_a_network_change() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let pool = pool(vec![ip(1)], ScriptedProbe::new(vec![ip(1)])).with_preferred_interface(
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Some(17)
+            }),
+        );
+        pool.refresh();
+        pool.reprobe();
+        pool.reprobe();
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        pool.note_network_change();
+        pool.reprobe();
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn a_preferred_interface_that_does_not_answer_is_still_passed_over() {
         let probe = ScriptedProbe::new(vec![ip(1)]);
@@ -588,7 +1264,7 @@ mod tests {
     #[test]
     fn no_candidate_answering_yields_no_upstream() {
         let probe = ScriptedProbe::new(vec![]);
-        let pool = pool(vec![ip(1)], Arc::clone(&probe));
+        let pool = Arc::new(pool(vec![ip(1)], Arc::clone(&probe)));
         assert_eq!(pool.refresh(), None);
         assert_eq!(pool.current(), None, "never commit to an unprobed server");
     }
@@ -596,7 +1272,7 @@ mod tests {
     #[test]
     fn rotation_needs_a_streak_and_then_moves_off_the_dead_server() {
         let probe = ScriptedProbe::new(vec![ip(0), ip(2)]);
-        let pool = pool(vec![ip(0), ip(2)], Arc::clone(&probe));
+        let pool = Arc::new(pool(vec![ip(0), ip(2)], Arc::clone(&probe)));
         assert_eq!(pool.refresh(), Some(SocketAddr::from((ip(0), 53))));
 
         probe.set_alive(vec![ip(2)]); // the active server goes away
@@ -629,7 +1305,7 @@ mod tests {
     #[test]
     fn the_last_good_server_is_kept_when_everything_stops_answering() {
         let probe = ScriptedProbe::new(vec![ip(0)]);
-        let pool = pool(vec![ip(0)], Arc::clone(&probe));
+        let pool = Arc::new(pool(vec![ip(0)], Arc::clone(&probe)));
         pool.refresh();
         probe.set_alive(vec![]);
         pool.refresh();

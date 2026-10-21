@@ -193,12 +193,65 @@ pub fn augment_codegen_for_fake_ip(
         return FakeIpAugmentation::default();
     }
     let plan = plan_fake_ip_enforcement(&ctx.scope, secondary, cache, base_denylist);
-    let extra_filters =
+    let mut extra_filters =
         crate::killswitch_codegen::fake_ip_pool_permit_filters(sid, &ctx.pool, udp_relay_enabled);
+    extra_filters.extend(fake_ip_pool_packet_permits(sid, &ctx.pool));
     FakeIpAugmentation {
         denylist_additions: plan.suppress_ips,
         extra_filters,
     }
+}
+
+/// The pool's permits below ALE, where the blanket postures also block: ICMP
+/// at the transport layer (our stack answers a ping to a virtual address) and
+/// every IPv6 packet into the v6 pool. Their own source, our range only: the
+/// pool is routed to nothing but our adapter, and no rule network may overlap
+/// it. Those layers carry no user, so neither do these.
+#[must_use]
+pub fn fake_ip_pool_packet_permits(sid: &str, pool: &FakeIpPoolConfig) -> Vec<WfpFilterSpec> {
+    use nrr_platform_api::types::{WfpAction, WfpLayerKey};
+    let permit = |layer, weight, family: &str| WfpFilterSpec {
+        layer,
+        action: WfpAction::Permit,
+        remote_ip: None,
+        remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
+        remote_port: None,
+        weight,
+        id: crate::wfp_codegen::filter_id_for(
+            sid,
+            crate::killswitch_codegen::KILLSWITCH_ROLE,
+            "",
+            "ks-fakeip-pool-pkt",
+            family,
+        ),
+        user_sid: None,
+        app_pattern: None,
+        local_interface_luid: None,
+        remote_subnet: None,
+        remote_subnet_v6: None,
+        ip_protocol: None,
+        remote_subnet_set: Vec::new(),
+    };
+    let mut out = vec![WfpFilterSpec {
+        remote_subnet: Some((pool.v4_base, pool.v4_prefix_len)),
+        ..permit(
+            WfpLayerKey::OutboundTransportV4,
+            crate::wfp_bands::PACKET_FAKEIP_POOL_PERMIT_BASE,
+            "v4",
+        )
+    }];
+    if let Some(v6_base) = pool.v6_base {
+        out.push(WfpFilterSpec {
+            remote_subnet_v6: Some((v6_base, pool.v6_prefix_len)),
+            ..permit(
+                WfpLayerKey::OutboundIpPacketV6,
+                crate::wfp_bands::FAKEIP_POOL_PERMIT_BASE,
+                "v6",
+            )
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -522,5 +575,100 @@ mod tests {
             &NoSharedIps,
         );
         assert!(plan.suppress_ips.is_empty());
+    }
+
+    /// What one sub-layer decides for a flow: the heaviest matching filter.
+    fn verdict(
+        filters: &[WfpFilterSpec],
+        layer: nrr_platform_api::types::WfpLayerKey,
+        dst: std::net::IpAddr,
+        proto: u8,
+        egress: u64,
+    ) -> Option<nrr_platform_api::types::WfpAction> {
+        let inside = |net: std::net::IpAddr, prefix: u8| {
+            IpBlock::new(net, prefix).is_some_and(|block| block.contains(dst))
+        };
+        filters
+            .iter()
+            .filter(|f| {
+                f.layer == layer
+                    && f.user_sid.as_deref().is_none_or(|s| s == "S-1-5-21-3")
+                    && f.app_pattern.is_none()
+                    && f.remote_port.is_none()
+                    && f.ip_protocol.is_none_or(|p| p == proto)
+                    && f.local_interface_luid.is_none_or(|l| l == egress)
+                    && f.remote_ip.is_none_or(|ip| std::net::IpAddr::V4(ip) == dst)
+                    && (f.remote_ip_set.is_empty()
+                        || f.remote_ip_set
+                            .iter()
+                            .any(|ip| std::net::IpAddr::V4(*ip) == dst))
+                    && (f.remote_ip_set_v6.is_empty()
+                        || f.remote_ip_set_v6
+                            .iter()
+                            .any(|ip| std::net::IpAddr::V6(*ip) == dst))
+                    && f.remote_subnet
+                        .is_none_or(|(net, p)| inside(std::net::IpAddr::V4(net), p))
+                    && f.remote_subnet_v6
+                        .is_none_or(|(net, p)| inside(std::net::IpAddr::V6(net), p))
+            })
+            .max_by_key(|f| f.weight)
+            .map(|f| f.action)
+    }
+
+    /// Our adapter is nobody's tunnel, so the block-all names no egress through
+    /// it; the pool stays reachable by its own permits on every layer the block
+    /// sits on, and those permits open nothing else.
+    #[test]
+    fn the_pool_is_reachable_under_the_block_all_by_its_own_permits() {
+        use crate::killswitch_codegen::{
+            fail_closed_block_all_filters, FailClosedExemptions, KillSwitchProtocols,
+        };
+        use nrr_platform_api::types::{WfpAction, WfpLayerKey};
+        use std::net::{IpAddr, Ipv6Addr};
+        const SID: &str = "S-1-5-21-3";
+        const TUN: u64 = 0x0001_0000_0000_0009;
+        const UPLINK: u64 = 0x0001_0000_0000_0003;
+        let mut filters = fail_closed_block_all_filters(
+            SID,
+            &FailClosedExemptions::default(),
+            KillSwitchProtocols::ALL,
+        );
+        assert!(filters.iter().all(|f| f.local_interface_luid != Some(TUN)));
+        filters.extend(
+            augment_codegen_for_fake_ip(
+                SID,
+                &ctx(true),
+                &CanonicalRuleSet::from_rules(Vec::new()),
+                &MockFqdnCacheLookup::new(),
+                &HashSet::new(),
+                false,
+            )
+            .extra_filters,
+        );
+        let fake_v4 = IpAddr::V4(ip(198, 18, 0, 5));
+        let fake_v6 = IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 5));
+        for (layer, dst, proto) in [
+            (WfpLayerKey::AleAuthConnectV4, fake_v4, 6),
+            (WfpLayerKey::OutboundTransportV4, fake_v4, 1),
+            (WfpLayerKey::AleAuthConnectV6, fake_v6, 6),
+            (WfpLayerKey::OutboundIpPacketV6, fake_v6, 6),
+        ] {
+            assert_eq!(
+                verdict(&filters, layer, dst, proto, TUN),
+                Some(WfpAction::Permit),
+                "{layer:?} {dst}"
+            );
+        }
+        let real = IpAddr::V4(ip(203, 0, 113, 5));
+        for (layer, proto) in [
+            (WfpLayerKey::AleAuthConnectV4, 6),
+            (WfpLayerKey::OutboundTransportV4, 1),
+        ] {
+            assert_eq!(
+                verdict(&filters, layer, real, proto, UPLINK),
+                Some(WfpAction::Block),
+                "{layer:?}: the pool's permits open nothing beside it"
+            );
+        }
     }
 }

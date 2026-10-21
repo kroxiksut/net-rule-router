@@ -47,6 +47,10 @@ nrr-sqlite-support = { path = "../../sqlite-support" }
 # source address alone does not choose the egress interface on Linux. `all`
 # exposes `bind_device`; the crate is already in the graph via the service.
 socket2 = { version = "0.6", features = ["all"] }
+# The TUN adapter for fake-IP: our fork of `tappers`, vendored until upstream
+# releases the fixes (`third_party/tappers/PROVENANCE.md`). No features: the
+# async back-ends stay out of the build. Windows keeps `wintun-bindings`.
+tappers = { path = "../../../third_party/tappers", version = "0.4.3", default-features = false }
 
 [dev-dependencies]
 # Discovery and inventory tests read their roots from temp dirs.

@@ -9,7 +9,13 @@
 use nrr_platform_api::adapters::AdapterInfo;
 use nrr_platform_api::{PlatformError, RouteEntry};
 
+/// Cloning shares the one reading.
+#[derive(Clone)]
 pub struct MachineReading {
+    readings: std::sync::Arc<Readings>,
+}
+
+struct Readings {
     routes: Result<Vec<RouteEntry>, PlatformError>,
     adapters: Result<Vec<AdapterInfo>, PlatformError>,
 }
@@ -32,36 +38,40 @@ impl MachineReading {
             }
             rows
         });
-        Self { routes, adapters }
+        Self {
+            readings: std::sync::Arc::new(Readings { routes, adapters }),
+        }
     }
 
     /// A machine with nothing on it, for an orchestrator that has no route
     /// mechanism wired.
     pub fn empty() -> Self {
         Self {
-            routes: Ok(Vec::new()),
-            adapters: Ok(Vec::new()),
+            readings: std::sync::Arc::new(Readings {
+                routes: Ok(Vec::new()),
+                adapters: Ok(Vec::new()),
+            }),
         }
     }
 
     /// The route table, or `None` when it could not be read.
     pub fn routes(&self) -> Option<&[RouteEntry]> {
-        self.routes.as_deref().ok()
+        self.readings.routes.as_deref().ok()
     }
 
     /// The route table, or why it could not be read.
     pub fn routes_or_error(&self) -> Result<&[RouteEntry], &PlatformError> {
-        self.routes.as_deref()
+        self.readings.routes.as_deref()
     }
 
     /// The adapters, or `None` when they could not be enumerated.
     pub fn adapters(&self) -> Option<&[AdapterInfo]> {
-        self.adapters.as_deref().ok()
+        self.readings.adapters.as_deref().ok()
     }
 
     /// The adapters, or why they could not be enumerated.
     pub fn adapters_or_error(&self) -> Result<&[AdapterInfo], &PlatformError> {
-        self.adapters.as_deref()
+        self.readings.adapters.as_deref()
     }
 }
 

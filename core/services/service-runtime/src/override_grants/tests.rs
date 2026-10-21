@@ -485,3 +485,24 @@ fn a_clean_stop_keeps_the_confirmations_through_later_restarts() {
     }
     assert_eq!(grants.grants_for(owner).len(), 1);
 }
+
+/// Every cause the audit can carry has words in the window and the TUI.
+#[test]
+fn every_cause_written_is_one_the_clients_word() {
+    let written = [
+        Ending::Revoked.cause(),
+        Ending::Expired.cause(),
+        Ending::FullReset.cause(),
+        Ending::CrashLoop.cause(),
+        Ending::ServicesChanged.cause(),
+        CAUSE_EMERGENCY_RESET,
+        "unsigned",
+        "tampered",
+    ];
+    for cause in written {
+        assert!(
+            nrr_shared::diagnostics_dto::AUDIT_CAUSES.contains(&cause),
+            "{cause} missing from AUDIT_CAUSES"
+        );
+    }
+}

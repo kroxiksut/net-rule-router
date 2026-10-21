@@ -5,7 +5,10 @@ use std::io::{self, Write};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers,
+};
+use nrr_shared::display_text::without_unsafe;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -16,6 +19,7 @@ use crate::backend::{Backend, BackendEvent, Command};
 use crate::elevation_prompt::PromptRequest;
 use crate::i18n::Texts;
 use crate::keys;
+use crate::paste::{self, Input};
 use crate::screens::{connection_lines, menu_step, screen, MenuItem, ScreenId, COMMON_HELP};
 use crate::state::{AppState, Effect, Focus, NoticeLevel};
 use crate::view::{Panel, Tone, ViewLine};
@@ -28,6 +32,9 @@ use palette::Palette;
 const NOTICE_LINE_FOR: Duration = Duration::from_secs(10);
 /// Wait for a key at most this long, so pushes reach the screen promptly.
 const INPUT_POLL: Duration = Duration::from_millis(250);
+/// A quiet screen is still redrawn this often: timed lines (a notice leaving
+/// the bottom line, a clock) change without any event.
+const IDLE_REDRAW: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderOptions {
@@ -44,7 +51,9 @@ pub fn run(
     events: &Receiver<BackendEvent>,
 ) -> io::Result<()> {
     let mut terminal = ratatui::try_init()?;
+    bracketed_paste(true);
     let result = event_loop(&mut terminal, app, texts, options, backend, events);
+    bracketed_paste(false);
     ratatui::restore();
     result
 }
@@ -59,17 +68,24 @@ fn event_loop(
 ) -> io::Result<()> {
     // Replaced when the user picks another language.
     let mut current = texts.clone();
+    // Building the whole screen model is the cost; it is paid when something
+    // happened, not on every wake-up.
+    let mut dirty = true;
+    let mut drawn_at = Instant::now();
     while !app.quit {
         if let Some(language) = app.language_change.take() {
             current = Texts::load(Some(&language), &[]);
             crate::screens::rules::on_texts(app, &current);
+            dirty = true;
         }
         let texts = &current;
         while let Some(request) = backend.take_prompt_request() {
             hand_over_for_password(terminal, request, texts)?;
+            dirty = true;
         }
         let now = Instant::now();
         while let Ok(event) = events.try_recv() {
+            dirty = true;
             for effect in app.apply(event, texts, now) {
                 match effect {
                     Effect::Refresh => backend.send(Command::Refresh),
@@ -78,13 +94,26 @@ fn event_loop(
             }
         }
         backend.send_outbox(&mut app.outbox);
-        terminal.draw(|frame| draw(frame, app, texts, options, now))?;
+        if dirty || now.duration_since(drawn_at) >= IDLE_REDRAW {
+            terminal.draw(|frame| draw(frame, app, texts, options, now))?;
+            dirty = false;
+            drawn_at = now;
+        }
         if event::poll(INPUT_POLL)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    handle_key(app, key, texts);
-                    backend.send_outbox(&mut app.outbox);
+            dirty = true;
+            let mut read = vec![event::read()?];
+            while read.len() < 4096 && event::poll(Duration::ZERO)? {
+                read.push(event::read()?);
+            }
+            // Only a console that cannot report a paste needs the burst guess.
+            let detect =
+                cfg!(windows) && screen(app.screen).text_target(app) != paste::TextTarget::None;
+            for input in paste::group(read, detect) {
+                match input {
+                    Input::Key(key) => handle_key(app, key, texts),
+                    Input::Paste(text) => handle_paste(app, &text, texts),
                 }
+                backend.send_outbox(&mut app.outbox);
             }
         }
     }
@@ -98,13 +127,37 @@ fn hand_over_for_password(
     request: PromptRequest,
     texts: &Texts,
 ) -> io::Result<()> {
+    bracketed_paste(false);
     ratatui::restore();
     println!("{}", texts.get(keys::PASSWORD_PROMPT));
     let _ = request.ready.send(true);
     // Closes when the job is done, however it ended.
     let _ = request.done.recv();
     *terminal = ratatui::try_init()?;
+    bracketed_paste(true);
     terminal.clear()
+}
+
+/// Asks the terminal to report a paste as one event. One that cannot keeps
+/// sending keystrokes, which `paste::group` recognises on Windows.
+fn bracketed_paste(on: bool) {
+    let mut out = io::stdout();
+    let _ = if on {
+        crossterm::execute!(out, EnableBracketedPaste)
+    } else {
+        crossterm::execute!(out, DisableBracketedPaste)
+    };
+}
+
+/// A paste is text for the focused field and nothing else: never a command.
+pub fn handle_paste(app: &mut AppState, text: &str, texts: &Texts) {
+    if app.help_open {
+        return;
+    }
+    let target = screen(app.screen).text_target(app);
+    for key in paste::keys_for(text, target) {
+        handle_key(app, key, texts);
+    }
 }
 
 fn ring_bell() {
@@ -127,7 +180,14 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, texts: &Texts) {
         return;
     }
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.quit = true,
+        // A second Ctrl+C while the question is open leaves for good.
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if crate::screens::rules::quit_question_open(app) {
+                app.quit = true;
+            } else {
+                app.request_quit();
+            }
+        }
         KeyCode::F(1) | KeyCode::Char('?') => app.help_open = !app.help_open,
         KeyCode::Esc => {
             if app.help_open {
@@ -187,7 +247,7 @@ fn styled_line(line: &ViewLine, style: impl Fn(Tone) -> Style) -> Line<'static> 
     Line::from(
         line.segments
             .iter()
-            .map(|s| Span::styled(s.text.clone(), style(s.tone)))
+            .map(|s| Span::styled(without_unsafe(&s.text).into_owned(), style(s.tone)))
             .collect::<Vec<_>>(),
     )
 }
@@ -228,6 +288,7 @@ pub fn menu_lines(app: &AppState, texts: &Texts) -> Vec<Line<'static>> {
                     format!("{marker}     {}", texts.get(category.title()))
                 }
             };
+            let text = without_unsafe(&text).into_owned();
             if current && app.focus == Focus::Menu {
                 Line::styled(text, Palette::focus())
             } else {
@@ -277,7 +338,7 @@ pub fn footer_lines(
         };
         lines.push(Line::from(vec![
             Span::styled(texts.get(word), style_for(tone, options)),
-            Span::raw(format!(": {}", notice.title)),
+            Span::raw(without_unsafe(&format!(": {}", notice.title)).into_owned()),
         ]));
     }
     lines.push(Line::from(texts.get(keys::FOOTER)));
@@ -300,6 +361,16 @@ fn wrapped_rows(lines: &[Line<'_>], width: u16) -> u16 {
                 w.div_ceil(width) + 1
             }
         })
+        .sum();
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// Rows `lines` need at least, whatever the wrapping: never more than are used.
+fn unwrapped_rows(lines: &[Line<'_>], width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let rows: usize = lines
+        .iter()
+        .map(|line| line.width().div_ceil(width).max(1))
         .sum();
     u16::try_from(rows).unwrap_or(u16::MAX)
 }
@@ -372,31 +443,82 @@ pub fn draw(
         .iter()
         .map(|p| p.lines.iter().map(|l| to_line(l, options)).collect())
         .collect();
-    let constraints: Vec<Constraint> = panels
+    let feeds = panels.iter().filter(|p| p.feed).count();
+    let least = frame_rows + 1;
+    let room = content_area
+        .height
+        .saturating_sub(least.saturating_mul(u16::try_from(feeds).unwrap_or(u16::MAX)));
+    let wanted: Vec<u16> = panels
         .iter()
         .zip(&rendered)
-        .map(|(panel, lines)| {
+        .filter(|(panel, _)| !panel.feed)
+        .map(|(_, lines)| wrapped_rows(lines, inner_width) + frame_rows)
+        .collect();
+    let mut fitted = fit_heights(&wanted, room, least).into_iter();
+    let constraints: Vec<Constraint> = panels
+        .iter()
+        .map(|panel| {
             if panel.feed {
-                Constraint::Min(frame_rows + 1)
+                Constraint::Min(least)
             } else {
-                Constraint::Length(wrapped_rows(lines, inner_width) + frame_rows)
+                Constraint::Length(fitted.next().unwrap_or(least))
             }
         })
         .collect();
     let areas = Layout::vertical(constraints).split(content_area);
     for ((panel, lines), &panel_area) in panels.into_iter().zip(rendered).zip(areas.iter()) {
         let focused = panel.feed && app.focus == Focus::Feed;
-        let scroll = if panel.feed { app.scroll } else { 0 };
-        draw_panel(
-            frame,
-            panel_area,
-            panel.title,
-            lines,
-            focused,
-            scroll,
-            options,
-        );
+        let mut title = panel.title;
+        let mut scroll = if panel.feed { app.scroll } else { 0 };
+        if !panel.feed {
+            // A panel that cannot show everything says so and keeps the
+            // cursor row in view.
+            let room = panel_area.height.saturating_sub(frame_rows);
+            let total = wrapped_rows(&lines, inner_width);
+            if total > room {
+                let cursor = panel
+                    .lines
+                    .iter()
+                    .position(|l| l.segments.iter().any(|s| s.tone == Tone::Selected))
+                    .map_or(0, |at| at.min(lines.len().saturating_sub(1)));
+                let through = wrapped_rows(
+                    &lines[..=cursor.min(lines.len().saturating_sub(1))],
+                    inner_width,
+                );
+                // The wrapping estimate runs high, so the cursor row's first
+                // line is held to the count that cannot overshoot.
+                let start = unwrapped_rows(&lines[..cursor], inner_width);
+                scroll = through.saturating_sub(room).min(start).min(total - room);
+                title = format!(
+                    "{title} — {}",
+                    texts.fill(keys::CLIPPED, &[("count", (total - room).to_string())])
+                );
+            }
+        }
+        draw_panel(frame, panel_area, title, lines, focused, scroll, options);
     }
+}
+
+/// Heights for panels that do not scroll: as asked while they fit in `room`,
+/// else the tallest give up a row at a time, none below `least`.
+fn fit_heights(wanted: &[u16], room: u16, least: u16) -> Vec<u16> {
+    let mut heights = wanted.to_vec();
+    let total: u32 = heights.iter().map(|&h| u32::from(h)).sum();
+    let mut over = total.saturating_sub(u32::from(room));
+    while over > 0 {
+        let Some(tallest) = heights
+            .iter()
+            .enumerate()
+            .filter(|(_, &h)| h > least)
+            .max_by_key(|(_, &h)| h)
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        heights[tallest] -= 1;
+        over -= 1;
+    }
+    heights
 }
 
 /// A panel: its title as text (marked `>` and inverted when focused), the
@@ -411,6 +533,7 @@ fn draw_panel(
     options: RenderOptions,
 ) {
     let palette = Palette::new(options);
+    let title = without_unsafe(&title).into_owned();
     let title_line = if focused {
         Line::styled(format!("> {title}"), palette.title(true))
     } else {

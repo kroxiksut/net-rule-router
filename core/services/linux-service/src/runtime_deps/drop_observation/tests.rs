@@ -126,6 +126,7 @@ fn rig(reports_start: bool) -> Rig {
         notice_sink: notice_sink(center),
         log_ndjson: Arc::default(),
         stale_flow_reset: None,
+        flow_reset_census: None,
     };
     let socket_table = Arc::new(MockConnectionObservationSource::new());
     let reports = Arc::new(MockConnectionObservationSource::new());
@@ -251,7 +252,7 @@ fn a_system_drop_raises_no_notice_and_joins_no_list() {
 fn each_role_gets_its_own_reason() {
     let rig = rig(true);
     rig.reports
-        .push(dropped(&bob(), DropTag::user(DropKind::Default), 1));
+        .push(dropped(&bob(), DropTag::user(DropKind::Ipv6Cut), 1));
     rig.reports
         .push(dropped(&bob(), DropTag::user(DropKind::Rule), 2));
     rig.reports
@@ -263,12 +264,12 @@ fn each_role_gets_its_own_reason() {
         vec![
             Some("dns-lockdown"),
             Some("blocked-by-rule"),
-            Some("not-covered-by-rules"),
+            Some("ipv6-blocked"),
         ]
     );
     assert_eq!(
         rig.notices_of(&bob()),
-        vec!["not-covered-by-rules", "blocked-by-rule", "dns-lockdown"]
+        vec!["ipv6-blocked", "blocked-by-rule", "dns-lockdown"]
     );
 }
 
@@ -339,4 +340,18 @@ fn only_the_tunnel_guards_verify_and_every_system_tag_is_a_service_accounts() {
         assert_eq!(system(tag.spec_id()), tag.system, "{tag:?}");
     }
     assert!(!verifies(80_122), "a foreign id verifies nothing");
+}
+
+/// Whatever the NFLOG start answers on this host (unprivileged, it is
+/// refused), the capability profile says the same.
+#[test]
+fn a_refused_drop_report_start_is_listed_as_missing() {
+    use nrr_platform_linux::kernel_capabilities::{missing, KernelCapability};
+    let started = start_nflog();
+    assert_eq!(
+        missing().contains(&KernelCapability::BlockReports),
+        started.is_err(),
+        "{:?}",
+        started.as_ref().err()
+    );
 }

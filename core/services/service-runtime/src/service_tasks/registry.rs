@@ -47,6 +47,7 @@ pub enum ServiceTaskKind {
     FakeIpWatchdog,
     NetChangeDebounce,
     FcrdnsLearner,
+    OverrideRecheck,
 }
 
 /// Who runs the task: the supervisor's own loop, or a thread the task's owner
@@ -77,7 +78,7 @@ const BACKGROUND: TaskHealth = TaskHealth::Reports {
 };
 
 impl ServiceTaskKind {
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::HealthAggregator,
         Self::AdapterMonitor,
         Self::RouteReconcileSafety,
@@ -113,6 +114,7 @@ impl ServiceTaskKind {
         Self::FakeIpWatchdog,
         Self::NetChangeDebounce,
         Self::FcrdnsLearner,
+        Self::OverrideRecheck,
     ];
 
     pub const fn id(self) -> &'static str {
@@ -152,6 +154,7 @@ impl ServiceTaskKind {
             Self::FakeIpWatchdog => "fake-ip-watchdog",
             Self::NetChangeDebounce => "net-change-debounce",
             Self::FcrdnsLearner => "fcrdns-learner",
+            Self::OverrideRecheck => "override-recheck",
         }
     }
 
@@ -165,7 +168,8 @@ impl ServiceTaskKind {
             | Self::FakeIpSelfHeal
             | Self::FakeIpWatchdog
             | Self::NetChangeDebounce
-            | Self::FcrdnsLearner => TaskRunner::OwnThread,
+            | Self::FcrdnsLearner
+            | Self::OverrideRecheck => TaskRunner::OwnThread,
             _ => TaskRunner::Supervisor,
         }
     }
@@ -203,8 +207,8 @@ impl ServiceTaskKind {
             },
             // The local resolver is how domain rules are enforced in resolver
             // mode: with it gone, names resolve past the rules. Its serve loop
-            // restores the system DNS on every exit, and reports `Blocking` on
-            // its own when that restore fails.
+            // restores the system DNS on every exit; a failed restore is still
+            // only `Degraded`, so the repair stays reachable over IPC.
             Self::DnsResolver => TaskHealth::Reports {
                 component: HealthComponent::Apply,
                 severity: ServiceHealthSeverity::Degraded,
@@ -249,7 +253,8 @@ impl ServiceTaskKind {
             | Self::FakeIpSelfHeal
             | Self::FakeIpWatchdog
             | Self::NetChangeDebounce
-            | Self::FcrdnsLearner => BACKGROUND,
+            | Self::FcrdnsLearner
+            | Self::OverrideRecheck => BACKGROUND,
         }
     }
 }
@@ -276,7 +281,7 @@ mod tests {
             .filter(|k| k.runner() == TaskRunner::OwnThread)
             .map(ServiceTaskKind::id)
             .collect();
-        assert_eq!(own.len(), 9, "{own:?}");
+        assert_eq!(own.len(), 10, "{own:?}");
         assert!(own.contains(&"dns-resolver"));
     }
 

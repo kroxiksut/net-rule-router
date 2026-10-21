@@ -26,8 +26,7 @@ fn wire_defaults() -> RoutePolicyDto {
     // Only the keys serde genuinely requires; every probing bound is omitted,
     // which is the case under test.
     serde_json::from_str::<RoutePolicyDto>(
-        r#"{"mode":"prefer-primary","block-secondary-when-unavailable":true,
-            "binding-source":"user-assigned"}"#,
+        r#"{"mode":"prefer-primary","leak-protection":"off","binding-source":"user-assigned"}"#,
     )
     .expect("a policy without probing keys fills them in from the wire defaults")
 }

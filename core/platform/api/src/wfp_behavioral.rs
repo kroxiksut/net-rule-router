@@ -55,6 +55,8 @@ pub struct BehavioralKey {
     pub local_interface_luid: Option<u64>,
     pub remote_subnet: Option<(Ipv4Addr, u8)>,
     pub remote_subnet_v6: Option<(Ipv6Addr, u8)>,
+    /// Canonical (sorted) subnet set, like the host sets above.
+    pub remote_subnet_set: Vec<(std::net::IpAddr, u8)>,
     pub ip_protocol: Option<u8>,
 }
 
@@ -101,6 +103,11 @@ pub fn behavioral_key(f: &WfpFilterSpec) -> BehavioralKey {
         local_interface_luid: f.local_interface_luid,
         remote_subnet: f.remote_subnet,
         remote_subnet_v6: f.remote_subnet_v6,
+        remote_subnet_set: {
+            let mut set = f.remote_subnet_set.clone();
+            set.sort_unstable();
+            set
+        },
         ip_protocol: f.ip_protocol,
     }
 }
@@ -272,6 +279,12 @@ impl BehavioralKey {
                 write!(f, " net6/{len}")?;
             }
         }
+        if !self.remote_subnet_set.is_empty() {
+            write!(f, " nets[{}]", self.remote_subnet_set.len())?;
+            if values {
+                write!(f, "={:?}", self.remote_subnet_set)?;
+            }
+        }
         if let Some(port) = self.remote_port {
             write!(f, " port={port}")?;
         }
@@ -353,6 +366,7 @@ mod tests {
             remote_subnet: None,
             remote_subnet_v6: None,
             ip_protocol: None,
+            remote_subnet_set: Vec::new(),
         }
     }
 
@@ -490,6 +504,31 @@ mod tests {
         let mut any_user = specific.clone();
         any_user.user_sid = None; // system-wide vs per-user is a real difference
         assert!(!behaviorally_equivalent(&[specific], &[any_user]));
+    }
+
+    fn with_nets(nets: &[(u8, u8)]) -> WfpFilterSpec {
+        let mut spec = permit(ip(0, 0, 0, 0), 10, 1);
+        spec.remote_ip = None;
+        spec.remote_subnet_set = nets
+            .iter()
+            .map(|(a, len)| (std::net::IpAddr::V4(ip(*a, 0, 0, 0)), *len))
+            .collect();
+        spec
+    }
+
+    /// A tunnel's networks are one condition set: membership is behaviour, the
+    /// order they were listed in is not.
+    #[test]
+    fn a_subnet_set_is_compared_by_membership() {
+        let a = vec![with_nets(&[(10, 8), (172, 12)])];
+        let reordered = vec![with_nets(&[(172, 12), (10, 8)])];
+        let narrower = vec![with_nets(&[(10, 8)])];
+        assert!(behaviorally_equivalent(&a, &reordered));
+        assert!(!behaviorally_equivalent(&a, &narrower));
+        assert!(behavioral_key(&a[0])
+            .shape()
+            .to_string()
+            .contains("nets[2]"));
     }
 
     /// The default log sees what kind of filter differs, the verbose log sees

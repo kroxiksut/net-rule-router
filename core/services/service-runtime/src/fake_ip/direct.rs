@@ -133,6 +133,7 @@ pub struct ArmedDirectFakeIpAnswerer {
     /// Real addresses the user's networks give the additional link; such a
     /// host keeps its real answer. See [`super::rule_networks`].
     network_owner: Option<Arc<dyn super::rule_networks::AdditionalNetworkOwner>>,
+    foreign_tunnels: Arc<crate::foreign_tunnels::ForeignTunnelCell>,
 }
 
 impl ArmedDirectFakeIpAnswerer {
@@ -151,7 +152,18 @@ impl ArmedDirectFakeIpAnswerer {
             runtime_exclusions: Arc::new(super::self_heal::RuntimeHostExclusions::new()),
             health: Arc::new(super::health::FakeIpHealth::new()),
             network_owner: None,
+            foreign_tunnels: Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new()),
         }
+    }
+
+    /// Keep names and addresses a foreign tunnel owns on their real answers.
+    #[must_use]
+    pub fn with_foreign_tunnels(
+        mut self,
+        cell: Arc<crate::foreign_tunnels::ForeignTunnelCell>,
+    ) -> Self {
+        self.foreign_tunnels = cell;
+        self
     }
 
     /// Share a runtime exclusion set (VPN self-heal): a host it names keeps its
@@ -188,6 +200,15 @@ impl ArmedDirectFakeIpAnswerer {
 impl DirectFakeIpAnswerer for ArmedDirectFakeIpAnswerer {
     fn fake_direct_answer(&self, hostname: &str, real: &[Ipv4Addr]) -> Option<Vec<Ipv4Addr>> {
         if real.is_empty() || !(self.armed)() {
+            return None;
+        }
+        // A corporate name or address keeps its real answer: the relay would
+        // carry it out of our links, not through the tunnel that owns it.
+        if self
+            .foreign_tunnels
+            .snapshot()
+            .is_some_and(|facts| facts.claims_name(hostname) || facts.carries_any(real))
+        {
             return None;
         }
         // Honour a VPN self-heal exclusion: keep the real address.
@@ -366,6 +387,76 @@ mod tests {
         assert!(answerer
             .fake_direct_answer("blog.example", &[ip(203, 0, 113, 68)])
             .is_some());
+    }
+
+    /// A corporate name, or an answer a foreign tunnel's routes carry, must
+    /// never be handed a virtual address.
+    #[test]
+    fn a_corporate_name_or_address_keeps_its_real_answer() {
+        let cell = Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new());
+        cell.claim_namespaces_for_tests(&["corp.example"]);
+        cell.publish_networks(vec![nrr_domain::ipv4_network::Ipv4Network::parse(
+            "192.168.78.0/24",
+        )
+        .expect("net")]);
+        let (answerer, map) = answerer(Arc::new(AtomicBool::new(true)));
+        let answerer = answerer.with_foreign_tunnels(cell);
+        assert_eq!(
+            answerer.fake_direct_answer("rdg.corp.example", &[ip(203, 0, 113, 9)]),
+            None,
+            "a name inside the tunnel's namespace"
+        );
+        assert_eq!(
+            answerer.fake_direct_answer("portal.second.example", &[ip(192, 168, 78, 9)]),
+            None,
+            "an address the tunnel's routes carry"
+        );
+        assert!(map.ips_for("portal.second.example").is_empty());
+        assert!(answerer
+            .fake_direct_answer("blog.example", &[ip(203, 0, 113, 68)])
+            .is_some());
+    }
+
+    /// A flood of new names from one program fills the pool; past it a new
+    /// host keeps its real answer, and nobody else's virtual address moves.
+    #[test]
+    fn a_full_pool_answers_newcomers_with_real_addresses_and_keeps_live_bindings() {
+        let tiny = FakeIpAllocator::new(nrr_platform_api::fake_ip::FakeIpPoolConfig {
+            v4_base: ip(198, 18, 0, 0),
+            v4_prefix_len: 29,
+            v6_base: None,
+            v6_prefix_len: 0,
+        });
+        let map = Arc::new(DirectRealIpMap::new());
+        let answerer = ArmedDirectFakeIpAnswerer::new(
+            FakeIpScope::enabled(Vec::<String>::new()),
+            Arc::new(Mutex::new(tiny)),
+            Arc::clone(&map),
+            Arc::new(|| true),
+        );
+        let real = [ip(203, 0, 113, 68)];
+        let mut given = Vec::new();
+        for i in 0..64 {
+            let host = format!("flood-{i}.example");
+            match answerer.fake_direct_answer(&host, &real) {
+                Some(fake) => given.push((host, fake)),
+                None => break,
+            }
+        }
+        assert!(!given.is_empty() && given.len() < 64, "the pool filled");
+
+        assert_eq!(
+            answerer.fake_direct_answer("newcomer.example", &real),
+            None,
+            "past the pool the real answer goes out"
+        );
+        for (host, fake) in &given {
+            assert_eq!(
+                answerer.fake_direct_answer(host, &real).as_ref(),
+                Some(fake),
+                "{host} kept its virtual address"
+            );
+        }
     }
 
     #[test]

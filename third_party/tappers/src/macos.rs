@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Copyright (c) 2024 Nathaniel Bennett <me[at]nathanielbennett[dotcom]>
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+//! MacOS-specific TUN/TAP interfaces.
+//!
+
+mod feth;
+mod utun;
+
+use std::io;
+
+pub use feth::FethTap;
+pub use utun::Utun;
+
+use std::net::IpAddr;
+#[cfg(not(target_os = "windows"))]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
+
+use crate::{AddAddress, AddressInfo, DeviceState, Interface};
+
+pub(crate) struct TunImpl {
+    tun: Utun,
+}
+
+impl TunImpl {
+    /// Checks to see whether a TUN device of the given name exists.
+    #[inline]
+    pub fn exists(if_name: Interface) -> io::Result<bool> {
+        Utun::exists(if_name)
+    }
+
+    #[inline]
+    pub fn exists_numbered(device_num: u32) -> io::Result<bool> {
+        Utun::exists_numbered(device_num)
+    }
+
+    /// Creates a new, unique TUN device and returns an open handle to it.
+    #[inline]
+    pub fn new() -> io::Result<Self> {
+        Ok(Self { tun: Utun::new()? })
+    }
+
+    #[inline]
+    pub fn new_compat(device_num: u32) -> io::Result<Self> {
+        Ok(Self {
+            tun: Utun::new_compat(device_num)?,
+        })
+    }
+
+    #[inline]
+    pub fn new_numbered(device_num: u32) -> io::Result<Self> {
+        Ok(Self {
+            tun: Utun::new_numbered(device_num)?,
+        })
+    }
+
+    #[inline]
+    pub fn destroy(self) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[inline]
+    pub fn addrs(&self) -> io::Result<Vec<AddressInfo>> {
+        self.tun.addrs()
+    }
+
+    #[inline]
+    pub fn add_addr<A: Into<AddAddress>>(&self, req: A) -> io::Result<()> {
+        self.tun.add_addr(req)
+    }
+
+    #[inline]
+    pub fn remove_addr(&self, addr: IpAddr) -> io::Result<()> {
+        self.tun.remove_addr(addr)
+    }
+
+    #[inline]
+    pub fn name(&self) -> io::Result<Interface> {
+        self.tun.name()
+    }
+
+    #[inline]
+    pub fn set_state(&self, state: DeviceState) -> io::Result<()> {
+        self.tun.set_state(state)
+    }
+
+    #[inline]
+    pub fn state(&self) -> io::Result<DeviceState> {
+        self.tun.state()
+    }
+
+    #[inline]
+    pub fn mtu(&self) -> io::Result<usize> {
+        self.tun.mtu()
+    }
+
+    #[inline]
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.tun.set_nonblocking(nonblocking)
+    }
+
+    #[inline]
+    pub fn nonblocking(&self) -> io::Result<bool> {
+        self.tun.nonblocking()
+    }
+
+    #[inline]
+    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.tun.send(buf)
+    }
+
+    #[inline]
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.tun.recv(buf)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl AsFd for TunImpl {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.tun.as_fd()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl AsRawFd for TunImpl {
+    fn as_raw_fd(&self) -> RawFd {
+        self.tun.as_raw_fd()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl FromRawFd for TunImpl {
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        Self {
+            tun: Utun::from_raw_fd(fd),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl IntoRawFd for TunImpl {
+    fn into_raw_fd(self) -> RawFd {
+        self.tun.into_raw_fd()
+    }
+}
+
+pub(crate) struct TapImpl {
+    tap: FethTap,
+}
+
+impl TapImpl {
+    pub fn destroy(self) -> io::Result<()> {
+        self.tap.destroy()
+    }
+
+    #[inline]
+    pub fn exists(if_name: Interface) -> io::Result<bool> {
+        FethTap::exists(if_name)
+    }
+
+    #[inline]
+    pub fn exists_numbered(device_num: u32) -> io::Result<bool> {
+        FethTap::exists_numbered(device_num)
+    }
+
+    #[inline]
+    pub fn new_compat(device_num: u32) -> io::Result<Self> {
+        Ok(Self {
+            tap: FethTap::new_compat(device_num)?,
+        })
+    }
+
+    #[inline]
+    pub fn addrs(&self) -> io::Result<Vec<AddressInfo>> {
+        self.tap.addrs()
+    }
+
+    #[inline]
+    pub fn add_addr<A: Into<AddAddress>>(&self, req: A) -> io::Result<()> {
+        self.tap.add_addr(req)
+    }
+
+    #[inline]
+    pub fn remove_addr(&self, addr: IpAddr) -> io::Result<()> {
+        self.tap.remove_addr(addr)
+    }
+
+    #[inline]
+    pub fn name(&self) -> io::Result<Interface> {
+        self.tap.name()
+    }
+
+    #[inline]
+    pub fn state(&self) -> io::Result<DeviceState> {
+        self.tap.state()
+    }
+
+    #[inline]
+    pub fn set_state(&self, state: DeviceState) -> io::Result<()> {
+        self.tap.set_state(state)
+    }
+
+    #[inline]
+    pub fn mtu(&self) -> io::Result<usize> {
+        self.tap.mtu()
+    }
+
+    #[inline]
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.tap.set_nonblocking(nonblocking)
+    }
+
+    #[inline]
+    pub fn nonblocking(&self) -> io::Result<bool> {
+        self.tap.nonblocking()
+    }
+
+    #[inline]
+    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.tap.send(buf)
+    }
+
+    #[inline]
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.tap.recv(buf)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl AsFd for TapImpl {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.tap.as_fd()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl AsRawFd for TapImpl {
+    fn as_raw_fd(&self) -> RawFd {
+        self.tap.as_raw_fd()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl FromRawFd for TapImpl {
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        Self {
+            tap: FethTap::from_raw_fd(fd),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl IntoRawFd for TapImpl {
+    fn into_raw_fd(self) -> RawFd {
+        self.tap.into_raw_fd()
+    }
+}

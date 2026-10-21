@@ -719,7 +719,6 @@ fn every_shape_the_codegen_emits_is_one_adoption_recognises() {
     for mode in [
         RouteBehaviorMode::PreferPrimary,
         RouteBehaviorMode::PreferSecondaryWhenAvailable,
-        RouteBehaviorMode::StrictSecondaryFailClosed,
     ] {
         for primary_opt in [None, Some(&primary)] {
             for tunnel in tunnel_sets {
@@ -760,6 +759,54 @@ fn no_tunnel_prefix_yields_an_overlay_half_adoption_misses() {
             );
         }
     }
+}
+
+/// A stranger's /24 at the network-rule metric on a link we never wrote to
+/// survives a crash recovery; our own network route, on a link that also
+/// carries a metric-5 route of ours, is taken back.
+#[test]
+fn a_foreign_route_at_the_network_metric_is_not_adopted() {
+    let row = |dest: [u8; 4], len: u8, ifindex: u32, metric: u32| RouteEntry {
+        destination: IpAddr::V4(ip(dest[0], dest[1], dest[2], dest[3])),
+        prefix_length: len,
+        next_hop: IpAddr::V4(ip(192, 168, 1, 1)),
+        interface_index: ifindex,
+        metric,
+        is_ours: false,
+        table: nrr_platform_api::RouteTableRef::Main,
+    };
+    let foreign = row([172, 16, 5, 0], 24, 3, NETWORK_ROUTE_METRIC);
+    let ours_network = row([10, 0, 0, 0], 8, 9, NETWORK_ROUTE_METRIC);
+    let ours_host = row([198, 51, 100, 1], 32, 9, SECONDARY_ROUTE_METRIC);
+    let kept = adoptable_orphans(
+        vec![foreign.clone(), ours_network.clone(), ours_host.clone()],
+        &[],
+    );
+    assert!(
+        !kept.contains(&foreign),
+        "another program's route stays its own"
+    );
+    assert!(kept.contains(&ours_network) && kept.contains(&ours_host));
+    assert!(adoptable_orphans(vec![ours_network], &[]).is_empty());
+}
+
+/// A book of only subnet rules leaves no metric-5 row: the bound additional
+/// link vouches for its network routes, and only for those.
+#[test]
+fn a_cidr_only_book_is_adopted_through_the_bound_link() {
+    let row = |dest: [u8; 4], ifindex: u32| RouteEntry {
+        destination: IpAddr::V4(ip(dest[0], dest[1], dest[2], dest[3])),
+        prefix_length: 24,
+        next_hop: IpAddr::V4(ip(10, 8, 0, 1)),
+        interface_index: ifindex,
+        metric: NETWORK_ROUTE_METRIC,
+        is_ours: false,
+        table: nrr_platform_api::RouteTableRef::Main,
+    };
+    let ours = row([203, 0, 113, 0], 9);
+    let foreign = row([172, 16, 5, 0], 3);
+    let kept = adoptable_orphans(vec![ours.clone(), foreign.clone()], &[9]);
+    assert_eq!(kept, vec![ours]);
 }
 
 /// The signature is metric AND shape AND the main table: a stranger's route
@@ -1189,7 +1236,7 @@ fn mode_b_without_primary_target_keeps_overlay_and_diagnoses() {
         vec![],
     );
     let out = generate_routes(
-        RouteBehaviorMode::StrictSecondaryFailClosed,
+        RouteBehaviorMode::PreferSecondaryWhenAvailable,
         &rb,
         None,
         &target(),

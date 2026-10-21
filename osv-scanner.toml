@@ -1,5 +1,3 @@
 # Mirrors the advisory ignores in deny.toml for scanners that read OSV
 # (OpenSSF Scorecard); deny.toml stays the authority and holds the reasons.
-[[IgnoredVulns]]
-id = "RUSTSEC-2024-0436"
-reason = "test-only: paste is reached through the boa_engine dev-dependency of nrr-client-logic; nothing shipped links it"
+# Each ignore there is repeated here as an [[IgnoredVulns]] entry; none today.

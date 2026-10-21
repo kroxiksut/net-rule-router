@@ -15,9 +15,7 @@
 //!   `wfp_codegen::generate_filters` — `RouteRule`/`HardBlock` host filters
 //!   (`DstMatch::HostV4`, weight `base + ordinal`, Block adds the packet-layer
 //!   mirror) and `AppScope::Program` app-id filters (`DstMatch::Any`, one per
-//!   exe path; non-handled flows are skipped) — plus the
-//!   [`PrecedenceClass::DefaultCatchAll`] `StrictSecondaryFailClosed` default
-//!   block (`wfp_codegen::default_block_spec`).
+//!   exe path; non-handled flows are skipped).
 //! - [`lower_kill_switch`] covers the per-destination kill-switch of
 //!   `killswitch_codegen::kill_switch_filters` — the ALE `OnlyVia(Secondary)`
 //!   permit-over-block pair plus the packet-layer (`OutboundIpPacketV4`)
@@ -26,14 +24,19 @@
 //!   egress pairs (`app_kill_switch_filters`) and the
 //!   [`PrecedenceClass::KillSwitchBlock`] fail-closed IP/app/packet blocks
 //!   (`fail_closed_block_destinations` / `fail_closed_block_apps`).
-//! - [`lower_catch_all_kill_switch`] covers the catch-all (Mode-B) kill-switch
+//! - [`lower_catch_all_kill_switch`] covers the catch-all kill-switch
 //!   of `killswitch_codegen::catch_all_kill_switch_filters` — the blanket
 //!   egress permit + loopback/link-local/broadcast/server/LAN subnet
 //!   exemptions, the ALE + packet catch-all blocks, and the IPv6 cut (all
 //!   four WFP layers), keyed on `(class, coverage, dst-family, egress)` —
 //!   plus the primary-app exemption (`APP_EXEMPT_BASE`, from
 //!   `primary_app_exempt_filters`), the DNS-over-primary port-53 permits, and
-//!   the Mode-B block-all (`fail_closed_block_all_filters`).
+//!   the fail-closed block-all (`fail_closed_block_all_filters`).
+//! - [`lower_foreign_tunnels`], [`lower_doh_foreign_vetoes`] and
+//!   [`lower_vpn_handshake`] cover somebody else's tunnel and another VPN's
+//!   handshake (`killswitch_codegen::foreign_tunnel_permits`,
+//!   `doh_foreign_vetoes`, `vpn_handshake_filters`, `ike_service_filters`); a
+//!   tunnel's name becomes a LUID through [`EgressLuids::adapters`].
 //! - [`lower_routes`] turns the neutral
 //!   [`RouteIntent`](nrr_platform_api::enforcement::RouteIntent)s into
 //!   route-table entries (`route_codegen::generate_routes`).
@@ -94,7 +97,7 @@ const DOH_BLOCK_BASE: u64 = 0x0028_0000;
 const PACKET_EXEMPT_BASE: u64 = 0x0250_0000;
 const PACKET_PERMIT_BASE: u64 = 0x0140_0000;
 const PACKET_BLOCK_BASE: u64 = 0x0030_0000;
-// Catch-all (Mode-B) kill-switch bands, mirrored from
+// Catch-all kill-switch bands, mirrored from
 // `killswitch_codegen`. The ALE exemptions sit above every rule band and above
 // the per-destination kill-switch bands; the catch-all block sits deliberately
 // BETWEEN the secondary rule band (`0x0010_0000`) and the primary rule band
@@ -107,15 +110,41 @@ const CATCHALL_BLOCK_WEIGHT: u64 = 0x0018_0000;
 // app permit outranks every kill-switch / fail-closed / block-all filter — the
 // VPN-bootstrap fix (a deliberately primary-routed app is never a leak to cut).
 const APP_EXEMPT_BASE: u64 = 0x0060_0000;
-// Fail-closed default catch-all block weight, mirrored from
-// `wfp_codegen::DEFAULT_BLOCK_WEIGHT`. Below every per-rule band so a rule-driven
-// `Permit` always wins over the StrictSecondaryFailClosed default block.
-const DEFAULT_BLOCK_WEIGHT: u64 = 0x0000_FFFF;
+// Somebody else's tunnel and another VPN's handshake, mirrored from
+// `wfp_bands`: above every posture block, below the app exemptions and the
+// user's Blocks. The v6 packet layer reuses the ALE numbers.
+const FOREIGN_TUNNEL_MAX_TUNNELS: usize = 64;
+const FOREIGN_TUNNEL_PIN_VETO_MAX: usize = 0x8000;
+const DOH_FOREIGN_VETO_MAX: usize = 0x2000;
+const FOREIGN_TUNNEL_PERMIT_BASE: u64 = 0x005F_0000;
+const FOREIGN_TUNNEL_PIN_VETO_BASE: u64 =
+    FOREIGN_TUNNEL_PERMIT_BASE + FOREIGN_TUNNEL_MAX_TUNNELS as u64;
+const DOH_FOREIGN_VETO_BASE: u64 =
+    FOREIGN_TUNNEL_PIN_VETO_BASE + FOREIGN_TUNNEL_PIN_VETO_MAX as u64;
+const VPN_HANDSHAKE_PERMIT_BASE: u64 = 0x005F_C000;
+const VPN_HANDSHAKE_SLOTS: u64 = 0x100;
+const PACKET_FOREIGN_TUNNEL_PERMIT_BASE: u64 = 0x012F_0000;
+const PACKET_FOREIGN_TUNNEL_PIN_VETO_BASE: u64 =
+    PACKET_FOREIGN_TUNNEL_PERMIT_BASE + FOREIGN_TUNNEL_MAX_TUNNELS as u64;
+const PACKET_VPN_HANDSHAKE_PERMIT_BASE: u64 = 0x0240_0000;
 
 // Compile-time guard over the mirrored bands: the ordering above is the whole
 // point of mirroring them, and two bands sharing a base silently lose it.
 const _: () = {
     assert!(BASE_BLOCK > APP_EXEMPT_BASE);
+    assert!(APP_EXEMPT_BASE >= VPN_HANDSHAKE_PERMIT_BASE + VPN_HANDSHAKE_SLOTS);
+    assert!(VPN_HANDSHAKE_PERMIT_BASE >= DOH_FOREIGN_VETO_BASE + DOH_FOREIGN_VETO_MAX as u64);
+    assert!(DOH_FOREIGN_VETO_BASE > FOREIGN_TUNNEL_PIN_VETO_BASE);
+    assert!(FOREIGN_TUNNEL_PIN_VETO_BASE > FOREIGN_TUNNEL_PERMIT_BASE);
+    assert!(FOREIGN_TUNNEL_PERMIT_BASE > CATCHALL_EXEMPT_BASE);
+    assert!(PACKET_EXEMPT_BASE > PACKET_VPN_HANDSHAKE_PERMIT_BASE + VPN_HANDSHAKE_SLOTS);
+    assert!(PACKET_VPN_HANDSHAKE_PERMIT_BASE > PACKET_PERMIT_BASE);
+    assert!(
+        PACKET_PERMIT_BASE
+            >= PACKET_FOREIGN_TUNNEL_PIN_VETO_BASE + FOREIGN_TUNNEL_PIN_VETO_MAX as u64
+    );
+    assert!(PACKET_FOREIGN_TUNNEL_PERMIT_BASE > PACKET_BLOCK_BASE);
+    assert!(PACKET_BLOCK_BASE < FOREIGN_TUNNEL_PERMIT_BASE);
     assert!(APP_EXEMPT_BASE > CATCHALL_EXEMPT_BASE);
     assert!(CATCHALL_EXEMPT_BASE > FAKEIP_POOL_PERMIT_BASE);
     assert!(FAKEIP_POOL_PERMIT_BASE > KILLSWITCH_PERMIT_BASE);
@@ -125,7 +154,6 @@ const _: () = {
     assert!(BASE_PRIMARY > APP_KILLSWITCH_BLOCK_BASE);
     assert!(APP_KILLSWITCH_BLOCK_BASE > CATCHALL_BLOCK_WEIGHT);
     assert!(CATCHALL_BLOCK_WEIGHT > BASE_SECONDARY);
-    assert!(BASE_SECONDARY > DEFAULT_BLOCK_WEIGHT);
 };
 
 /// The `ALE_USER_ID` a scope lowers to: none for the machine, the SID for a
@@ -141,6 +169,7 @@ fn user_sid_of(scope: &PrincipalScope) -> Option<String> {
 mod app_and_dns;
 mod catch_all;
 mod flows;
+mod foreign;
 mod ids;
 mod kill_switch;
 mod plan;
@@ -149,6 +178,7 @@ mod route_rules;
 pub use app_and_dns::*;
 pub use catch_all::*;
 use flows::*;
+pub use foreign::*;
 pub use ids::*;
 pub use kill_switch::*;
 pub use plan::*;

@@ -17,9 +17,41 @@ automatically so you don't have to.
 ## A second VPN beside yours
 
 If you also run another VPN — typically a corporate one for work — next to the
-connection you route through, leak protection leaves that VPN's own connection
-alone rather than cutting it off along with everything else. On Windows this
-includes the VPN connections built into the system (L2TP, PPTP, SSTP, IKEv2).
+connection you route through, NetRuleRouter leaves that VPN its own networks
+and its own internal names, on Windows and on Linux. A rule wide enough to
+cover a host inside the corporate network — a whole country domain, say —
+does not pull that host away from the corporate VPN.
+
+What each leak protection choice means for it, on both systems:
+
+- **Off** — nothing is held back, and the corporate VPN works as it would
+  without NetRuleRouter.
+- **Routed sites** — only what your rules send through the additional
+  connection is held back. The corporate VPN connects and works as usual.
+- **Everything** — a connected corporate VPN keeps reaching its networks. One
+  that takes all of your traffic keeps the company's private networks; the
+  rest of the internet waits for the additional connection like everything
+  else. To connect or reconnect, a VPN has to reach its server over the main
+  connection:
+  - the VPNs built into the system — IKEv2 and L2TP on Windows, strongSwan
+    and libreswan on Linux — connect on their own. On Linux, a strongSwan or
+    libreswan connection without a network interface of its own then keeps
+    the company's private networks; this needs Linux 4.20 and nftables 0.9.1
+    or newer;
+  - any other VPN is stopped the first time, and NetRuleRouter asks you once,
+    in the window, the tray and the terminal interface, whether to let it
+    connect. Say yes and that VPN reaches its server while leak protection is
+    on; nothing else is let through to that address. The answer is yours
+    alone: another person on the same computer is asked for theirs. You can
+    take it back under **Settings → Routing behavior → Your VPN client**, in
+    the list of other VPNs you allowed.
+
+  A VPN that has to connect through the additional route instead is set up
+  with the helper in the next section.
+
+On Windows this includes the VPN connections built into the system (L2TP,
+PPTP, SSTP, IKEv2). On Linux it covers WireGuard and OpenVPN connections
+whatever they are named, `wg0` and `tun0` included.
 
 A connection your provider delivers the internet itself over — PPPoE, or a
 mobile-broadband modem — is not someone else's VPN: it is treated as an

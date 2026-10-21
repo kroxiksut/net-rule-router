@@ -1,0 +1,17 @@
+{
+  "description": "pure.js vpnProviderNames: what the 'Your VPN client' line calls each confirmed program",
+  "cases": [
+    { "name": "nothing confirmed", "input": { "apps": [] }, "expected": [] },
+    {
+      "name": "every program named, not only the first",
+      "input": { "apps": [ { "exe-path": "C:\\Example\\example-gui.exe", "display-name": "Example" }, { "exe-path": "C:\\Corp\\corp-client.exe", "display-name": "Corp Client" } ] },
+      "expected": [ "Example", "Corp Client" ]
+    },
+    { "name": "a blank name falls back to the file", "input": { "apps": [ { "exe-path": "C:\\A\\a.exe", "display-name": "  " } ] }, "expected": [ "a.exe" ] },
+    { "name": "a missing name falls back to the file", "input": { "apps": [ { "exe-path": "/opt/example/bin/example-vpn" } ] }, "expected": [ "example-vpn" ] },
+    { "name": "the name is trimmed", "input": { "apps": [ { "exe-path": "C:\\A\\a.exe", "display-name": " A " } ] }, "expected": [ "A" ] },
+    { "name": "forward slashes on Windows", "input": { "apps": [ { "exe-path": "C:/A/b.exe", "display-name": "" } ] }, "expected": [ "b.exe" ] },
+    { "name": "a path with no folder is its own file", "input": { "apps": [ { "exe-path": "client.exe", "display-name": "" } ] }, "expected": [ "client.exe" ] },
+    { "name": "order kept", "input": { "apps": [ { "exe-path": "C:\\B\\b.exe", "display-name": "B" }, { "exe-path": "C:\\A\\a.exe", "display-name": "A" } ] }, "expected": [ "B", "A" ] }
+  ]
+}

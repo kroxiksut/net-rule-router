@@ -254,6 +254,24 @@ impl BlockNoticeCenter {
     }
 }
 
+impl crate::principal_reset::PrincipalStateHolder for BlockNoticeCenter {
+    /// A full reset: the user's open episodes and loaded mutes go; the next
+    /// block starts a fresh ledger that reads the (now empty) stores.
+    fn forget_principal(&self, sid: &str) {
+        self.ledgers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+    }
+
+    fn forget_everyone(&self) {
+        self.ledgers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+}
+
 /// How long one principal's rule book serves the network lookup before a
 /// re-read: a rule edit shows within seconds, a scan costs one read.
 const BLOCKED_BOOK_TTL: Duration = Duration::from_secs(5);
@@ -395,7 +413,7 @@ mod tests {
             host: Some("cdn.example".to_owned()),
             dest: "203.0.113.7".to_owned(),
             app: Some("chrome.exe".to_owned()),
-            reason: BlockReason::NotCoveredByRules,
+            reason: BlockReason::BlockedByRule,
         }
     }
 
@@ -466,6 +484,21 @@ mod tests {
     }
 
     #[test]
+    fn a_full_reset_drops_the_loaded_ledger_and_its_mutes() {
+        use crate::principal_reset::PrincipalStateHolder;
+        let center = BlockNoticeCenter::new()
+            .with_mute_loader(Arc::new(|_sid: &str| vec![Mute::forever(MuteScope::All)]));
+        center.record(ALICE, &attempt());
+        center.record("S-other", &attempt());
+
+        center.forget_principal(ALICE);
+
+        let guard = center.ledgers.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(guard.get(ALICE).is_none());
+        assert!(guard.get("S-other").is_some(), "no one else's state goes");
+    }
+
+    #[test]
     fn a_new_episode_publishes_a_push_event_alongside_the_log_line() {
         let bus = Arc::new(EventBus::new());
         let sub = bus.subscribe_as("test-client".to_string(), Some(ALICE.to_string()), None);
@@ -488,7 +521,7 @@ mod tests {
                 assert_eq!(sid, ALICE);
                 assert_eq!(destination, "cdn.example");
                 assert_eq!(app, "chrome.exe");
-                assert_eq!(reason, "not-covered-by-rules");
+                assert_eq!(reason, "blocked-by-rule");
                 assert_eq!(*attempts, 1);
             }
             other => panic!("expected BlockNoticeRaised, got {other:?}"),
@@ -802,6 +835,49 @@ mod tests {
         assert!(namer
             .network_for("", &blocked_to("198.51.100.10", None))
             .is_none());
+    }
+
+    /// No user's mode is read here because the default route never decides
+    /// which Block rule matched: both modes name the same network.
+    #[test]
+    fn the_default_route_never_changes_which_network_is_named() {
+        let book = CanonicalRuleBook {
+            primary: nrr_domain::canonical::CanonicalRuleSet::from_rules(vec![]),
+            secondary: nrr_domain::canonical::CanonicalRuleSet::from_rules(vec![rule(
+                "n-1",
+                subnet("198.51.100.0/24"),
+                RuleAction::Block,
+            )]),
+        };
+        let inside: IpAddr = "198.51.100.9".parse().expect("ip");
+        for mode in [
+            RouteBehaviorMode::PreferPrimary,
+            RouteBehaviorMode::PreferSecondaryWhenAvailable,
+        ] {
+            let decision = nrr_domain::decision_engine_input::match_sample(
+                &book,
+                None,
+                Some(inside),
+                Some("scanner.exe"),
+                ZonePriorityPolicy::default(),
+                mode,
+            );
+            assert!(
+                matches!(
+                    &decision,
+                    RequestedRouteDecision::MatchedRoute { candidate }
+                        if candidate.rule_id == nrr_domain::RuleId("n-1".into())
+                ),
+                "{mode:?}: {decision:?}"
+            );
+        }
+        let namer = BlockedNetworks::new(Arc::new(FixedRules(book)));
+        assert_eq!(
+            namer
+                .network_for(ALICE, &blocked_to("198.51.100.9", None))
+                .as_deref(),
+            Some("198.51.100.0/24")
+        );
     }
 
     #[test]

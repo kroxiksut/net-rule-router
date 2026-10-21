@@ -6,8 +6,10 @@
 //! dropped ICMP echo (transient loss) never fail-closes a healthy secondary tunnel. A single
 //! success resets the clock.
 //!
-//! Neutral + unit-testable: the caller injects `now: Instant` and the probe
-//! results, so no real time or network is needed to test the hysteresis.
+//! Neutral + unit-testable: the caller injects `now: BootInstant` and the probe
+//! results, so no real time or network is needed to test the hysteresis. The
+//! clock counts sleep: a night in suspend is an unprobeable gap, not a pause
+//! that lets the failing run from before it fail-close the tunnel on resume.
 //!
 //! `window_secs == 0` = feature DISABLED: `is_dead` is always `false`, so the
 //! probe never fail-closes anything. This is the safe default (an ICMP-filtered
@@ -40,9 +42,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// Tracks, per interface index, the `Instant` of the first probe failure in the
+use crate::boot_clock::BootInstant;
+
+/// Tracks, per interface index, the `BootInstant` of the first probe failure in the
 /// current consecutive-failure run. Shared (`Arc`) between the probe tick
 /// (writer via [`record`]) and the route coordinator (reader via [`is_dead`]).
 ///
@@ -58,9 +62,9 @@ pub struct SecondaryLivenessTracker {
 
 #[derive(Default)]
 struct TrackerState {
-    /// `ifindex -> Instant of the FIRST failure in the current failing run`.
+    /// `ifindex -> BootInstant of the FIRST failure in the current failing run`.
     /// Absent = the last probe succeeded (or the adapter was never probed).
-    first_fail: HashMap<u32, Instant>,
+    first_fail: HashMap<u32, BootInstant>,
     /// `ifindex -> consecutive successes still required before the adapter
     /// counts as RECOVERED`. A failing run only ends for the fast signal
     /// ([`SecondaryLivenessTracker::in_failing_run`]) after
@@ -78,11 +82,11 @@ struct TrackerState {
     /// already emitted this failing run, so a silent gateway logs once per run
     /// instead of once per reconcile.
     baseline_hold_logged: HashSet<u32>,
-    /// `ifindex -> Instant of the most recently recorded probe result` (either
+    /// `ifindex -> BootInstant of the most recently recorded probe result` (either
     /// verdict). Backs the evidence-freshness rules (see the module doc):
     /// detects unprobeable gaps in [`SecondaryLivenessTracker::record`] and
     /// vetoes stale verdicts in [`SecondaryLivenessTracker::is_dead`].
-    last_record: HashMap<u32, Instant>,
+    last_record: HashMap<u32, BootInstant>,
 }
 
 /// Consecutive successful probes required to leave a failing run. Failure
@@ -141,7 +145,7 @@ impl SecondaryLivenessTracker {
     /// VPN reconnect, typically): whatever run or baseline was accumulating
     /// belongs to the PREVIOUS tunnel incarnation and is discarded before this
     /// result is applied.
-    pub fn record(&self, ifindex: u32, reachable: bool, now: Instant) {
+    pub fn record(&self, ifindex: u32, reachable: bool, now: BootInstant) {
         let mut state = self.lock();
         let gap = state
             .last_record
@@ -178,7 +182,7 @@ impl SecondaryLivenessTracker {
     /// recent probe result is fresh (recorded within [`MAX_EVIDENCE_GAP`] —
     /// stale evidence from before an unprobeable gap proves nothing about the
     /// tunnel that exists NOW)? Always `false` when disabled (`window == 0`).
-    pub fn is_dead(&self, ifindex: u32, now: Instant) -> bool {
+    pub fn is_dead(&self, ifindex: u32, now: BootInstant) -> bool {
         let window = self.window_secs();
         if window == 0 {
             return false;
@@ -258,7 +262,7 @@ mod tests {
     #[test]
     fn disabled_window_never_declares_dead() {
         let t = SecondaryLivenessTracker::new(0);
-        let t0 = Instant::now();
+        let t0 = BootInstant::now();
         t.record(5, false, t0);
         // Even far in the "future", disabled → never dead.
         assert!(!t.is_dead(5, t0 + Duration::from_secs(10_000)));
@@ -271,7 +275,7 @@ mod tests {
     fn fail_continuously(
         t: &SecondaryLivenessTracker,
         ifindex: u32,
-        t0: Instant,
+        t0: BootInstant,
         from: u64,
         to: u64,
     ) {
@@ -285,7 +289,7 @@ mod tests {
     #[test]
     fn dead_only_after_continuous_failure_reaches_window() {
         let t = SecondaryLivenessTracker::new(60);
-        let t0 = Instant::now();
+        let t0 = BootInstant::now();
         t.record(5, true, t0); // baseline: the peer has answered once
         fail_continuously(&t, 5, t0, 0, 50);
         // Before the window elapses: not dead (hysteresis absorbs it).
@@ -299,7 +303,7 @@ mod tests {
     #[test]
     fn a_single_success_resets_the_failing_run() {
         let t = SecondaryLivenessTracker::new(60);
-        let t0 = Instant::now();
+        let t0 = BootInstant::now();
         t.record(5, false, t0);
         // A success at t0+30 clears the run…
         t.record(5, true, t0 + Duration::from_secs(30));
@@ -314,7 +318,7 @@ mod tests {
     #[test]
     fn repeated_failures_keep_the_earliest_timestamp() {
         let t = SecondaryLivenessTracker::new(60);
-        let t0 = Instant::now();
+        let t0 = BootInstant::now();
         t.record(5, true, t0); // baseline
                                // Later failures must NOT push the first-fail time forward.
         fail_continuously(&t, 5, t0, 0, 60);
@@ -324,7 +328,7 @@ mod tests {
     #[test]
     fn forget_clears_a_pending_dead_verdict() {
         let t = SecondaryLivenessTracker::new(60);
-        let t0 = Instant::now();
+        let t0 = BootInstant::now();
         t.record(5, true, t0); // baseline
         t.record(5, false, t0);
         t.forget(5);
@@ -338,7 +342,7 @@ mod tests {
         // unprobeable, not dead: without a baseline the probe must not tear
         // routes down or fail-close, no matter how long the failures run.
         let t = SecondaryLivenessTracker::new(10);
-        let t0 = Instant::now();
+        let t0 = BootInstant::now();
         t.record(7, false, t0);
         t.record(7, false, t0 + Duration::from_secs(60));
         assert!(
@@ -359,7 +363,7 @@ mod tests {
         // A reused ifindex is a new incarnation: the old baseline must not
         // let a silent-from-birth successor be declared dead.
         let t = SecondaryLivenessTracker::new(10);
-        let t0 = Instant::now();
+        let t0 = BootInstant::now();
         t.record(9, true, t0);
         t.forget(9);
         t.record(9, false, t0 + Duration::from_secs(100));
@@ -372,7 +376,7 @@ mod tests {
     #[test]
     fn recovery_needs_a_stable_success_streak() {
         let t = SecondaryLivenessTracker::new(60);
-        let t0 = Instant::now();
+        let t0 = BootInstant::now();
         assert!(!t.in_failing_run(5), "never probed = not failing");
         t.record(5, false, t0);
         assert!(t.in_failing_run(5));
@@ -400,7 +404,7 @@ mod tests {
     #[test]
     fn window_change_takes_effect_immediately() {
         let t = SecondaryLivenessTracker::new(120);
-        let t0 = Instant::now();
+        let t0 = BootInstant::now();
         t.record(5, true, t0); // baseline
         fail_continuously(&t, 5, t0, 0, 60);
         assert!(!t.is_dead(5, t0 + Duration::from_secs(60)));
@@ -420,7 +424,7 @@ mod tests {
         // back Up is a new incarnation and gets a fresh window AND must
         // re-prove its reachability baseline before any DEAD verdict.
         let t = SecondaryLivenessTracker::new(10);
-        let t0 = Instant::now();
+        let t0 = BootInstant::now();
         t.record(60, true, t0); // baseline (peer answered before the outage)
         t.record(60, false, t0 + Duration::from_secs(5));
         t.record(60, false, t0 + Duration::from_secs(10));
@@ -449,7 +453,7 @@ mod tests {
         // nothing about the present — `is_dead` must decline the verdict even
         // though the window has long elapsed.
         let t = SecondaryLivenessTracker::new(10);
-        let t0 = Instant::now();
+        let t0 = BootInstant::now();
         t.record(60, true, t0);
         t.record(60, false, t0 + Duration::from_secs(5));
         t.record(60, false, t0 + Duration::from_secs(15));

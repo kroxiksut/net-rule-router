@@ -790,7 +790,7 @@ mod tests {
                 },
                 source: BindingSource::UserAssigned,
             }),
-            behavior_mode: RouteBehaviorMode::StrictSecondaryFailClosed,
+            behavior_mode: RouteBehaviorMode::PreferSecondaryWhenAvailable,
             rule_book: CanonicalRuleBook {
                 primary: CanonicalRuleSet::from_rules(primary_rules),
                 secondary: CanonicalRuleSet::from_rules(secondary_rules),
@@ -1045,7 +1045,7 @@ mod tests {
         assert!(diff.behavior_mode_changed);
         assert_eq!(
             diff.prev_behavior_mode,
-            Some(RouteBehaviorMode::StrictSecondaryFailClosed)
+            Some(RouteBehaviorMode::PreferSecondaryWhenAvailable)
         );
         assert_eq!(diff.next_behavior_mode, RouteBehaviorMode::PreferPrimary);
     }

@@ -89,8 +89,8 @@ pub use logs::{
 };
 pub use privacy::{
     redact_adapter_id, redact_hostname, redact_ipv4, redact_ipv4_str, redact_process_path,
-    redact_resolver_source, Redacted, RedactionMode, MARKER_MASKED_IPV4, MARKER_MASKED_PATH,
-    MARKER_PRIVATE_IPV4, MARKER_PUBLIC_IPV4, MARKER_REDACTED,
+    redact_resolver_source, Redacted, RedactionMode, MARKER_MASKED_HOST, MARKER_MASKED_IPV4,
+    MARKER_MASKED_PATH, MARKER_PRIVATE_IPV4, MARKER_PUBLIC_IPV4, MARKER_REDACTED,
 };
 pub use reason::{reason_code_meta, ReasonCode, ReasonCodeMeta, ALL_REASON_CODES};
 pub use redaction::{

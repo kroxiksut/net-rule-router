@@ -1,0 +1,337 @@
+{
+  "description": "pure.js offeredRoutingSettings: the routing settings a window offers, in display order",
+  "cases": [
+    {
+      "name": "leak protection off still offers every routing refinement",
+      "input": {
+        "mode": "resolver",
+        "leak": "off",
+        "bound": true,
+        "fake-ip": true,
+        "supports": {
+          "killSwitch": true,
+          "serviceStabilityConfig": true,
+          "fakeIp": true
+        }
+      },
+      "expected": [
+        "enforcement-mode",
+        "dns-via-secondary",
+        "dns-fast-answers",
+        "fake-ip-enabled",
+        "fake-ip-udp-relay",
+        "fake-ip-instant-rst",
+        "shared-ip-policy",
+        "secondary-liveness-window-secs",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "routed sites adds the protocols and the strict shared addresses",
+      "input": {
+        "mode": "resolver",
+        "leak": "sites",
+        "bound": true,
+        "fake-ip": true,
+        "supports": {
+          "killSwitch": true,
+          "serviceStabilityConfig": true,
+          "fakeIp": true
+        }
+      },
+      "expected": [
+        "kill-switch-protocols",
+        "enforcement-mode",
+        "dns-via-secondary",
+        "dns-fast-answers",
+        "fake-ip-enabled",
+        "fake-ip-udp-relay",
+        "fake-ip-instant-rst",
+        "shared-ip-policy",
+        "kill-switch-strict-shared-ips",
+        "secondary-liveness-window-secs",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "everything adds name resolution over the main connection",
+      "input": {
+        "mode": "resolver",
+        "leak": "everything",
+        "bound": true,
+        "fake-ip": false,
+        "supports": {
+          "killSwitch": true,
+          "serviceStabilityConfig": true,
+          "fakeIp": true
+        }
+      },
+      "expected": [
+        "kill-switch-protocols",
+        "allow-dns-over-primary",
+        "enforcement-mode",
+        "dns-via-secondary",
+        "dns-fast-answers",
+        "fake-ip-enabled",
+        "shared-ip-policy",
+        "kill-switch-strict-shared-ips",
+        "secondary-liveness-window-secs",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "no additional connection bound: nothing about the tunnel",
+      "input": {
+        "mode": "resolver",
+        "leak": "off",
+        "bound": false,
+        "fake-ip": false,
+        "supports": {
+          "killSwitch": true,
+          "serviceStabilityConfig": true,
+          "fakeIp": true
+        }
+      },
+      "expected": [
+        "enforcement-mode",
+        "dns-fast-answers",
+        "fake-ip-enabled",
+        "shared-ip-policy",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "watching system DNS: no resolver rows",
+      "input": {
+        "mode": "reactive",
+        "leak": "off",
+        "bound": true,
+        "fake-ip": true,
+        "supports": {
+          "killSwitch": true,
+          "serviceStabilityConfig": true,
+          "fakeIp": true
+        }
+      },
+      "expected": [
+        "enforcement-mode",
+        "dns-via-secondary",
+        "shared-ip-policy",
+        "secondary-liveness-window-secs",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "fake-IP off hides its own refinements",
+      "input": {
+        "mode": "resolver",
+        "leak": "off",
+        "bound": true,
+        "fake-ip": false,
+        "supports": {
+          "killSwitch": true,
+          "serviceStabilityConfig": true,
+          "fakeIp": true
+        }
+      },
+      "expected": [
+        "enforcement-mode",
+        "dns-via-secondary",
+        "dns-fast-answers",
+        "fake-ip-enabled",
+        "shared-ip-policy",
+        "secondary-liveness-window-secs",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "no TUN adapter: fake-IP is named, not offered",
+      "input": {
+        "mode": "resolver",
+        "leak": "sites",
+        "bound": true,
+        "fake-ip": true,
+        "supports": {
+          "killSwitch": true,
+          "serviceStabilityConfig": true,
+          "fakeIp": false
+        }
+      },
+      "expected": [
+        "kill-switch-protocols",
+        "enforcement-mode",
+        "dns-via-secondary",
+        "dns-fast-answers",
+        "fake-ip-unavailable",
+        "shared-ip-policy",
+        "kill-switch-strict-shared-ips",
+        "secondary-liveness-window-secs",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "no stability row: one note for all of it",
+      "input": {
+        "mode": "resolver",
+        "leak": "everything",
+        "bound": true,
+        "fake-ip": true,
+        "supports": {
+          "killSwitch": true,
+          "serviceStabilityConfig": false,
+          "fakeIp": false
+        }
+      },
+      "expected": [
+        "kill-switch-protocols",
+        "allow-dns-over-primary",
+        "shared-ip-policy",
+        "kill-switch-strict-shared-ips",
+        "service-stability-unavailable",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "no capability map reads as supported",
+      "input": {
+        "mode": "resolver",
+        "leak": "off",
+        "bound": true,
+        "fake-ip": true
+      },
+      "expected": [
+        "enforcement-mode",
+        "dns-via-secondary",
+        "dns-fast-answers",
+        "fake-ip-enabled",
+        "fake-ip-udp-relay",
+        "fake-ip-instant-rst",
+        "shared-ip-policy",
+        "secondary-liveness-window-secs",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "no leak protection on this platform",
+      "input": {
+        "mode": "resolver",
+        "leak": "everything",
+        "bound": false,
+        "fake-ip": false,
+        "supports": {
+          "killSwitch": false
+        }
+      },
+      "expected": [
+        "enforcement-mode",
+        "dns-fast-answers",
+        "fake-ip-enabled",
+        "shared-ip-policy",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "an unknown level reads as off",
+      "input": {
+        "mode": "resolver",
+        "leak": "strict",
+        "bound": false,
+        "fake-ip": false,
+        "supports": {
+          "killSwitch": true,
+          "serviceStabilityConfig": true,
+          "fakeIp": true
+        }
+      },
+      "expected": [
+        "enforcement-mode",
+        "dns-fast-answers",
+        "fake-ip-enabled",
+        "shared-ip-policy",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "an unread mode is not the resolver",
+      "input": {
+        "mode": null,
+        "leak": "off",
+        "bound": true,
+        "fake-ip": true,
+        "supports": {
+          "killSwitch": true,
+          "serviceStabilityConfig": true,
+          "fakeIp": true
+        }
+      },
+      "expected": [
+        "enforcement-mode",
+        "dns-via-secondary",
+        "shared-ip-policy",
+        "secondary-liveness-window-secs",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "a truthy non-boolean is not bound",
+      "input": {
+        "mode": "resolver",
+        "leak": "off",
+        "bound": "yes",
+        "fake-ip": 1,
+        "supports": {
+          "killSwitch": true,
+          "serviceStabilityConfig": true,
+          "fakeIp": true
+        }
+      },
+      "expected": [
+        "enforcement-mode",
+        "dns-fast-answers",
+        "fake-ip-enabled",
+        "shared-ip-policy",
+        "local-networks"
+      ]
+    },
+    {
+      "name": "no local network exceptions on this platform",
+      "input": {
+        "mode": "resolver",
+        "leak": "sites",
+        "bound": false,
+        "fake-ip": false,
+        "supports": {
+          "killSwitch": true,
+          "serviceStabilityConfig": true,
+          "fakeIp": true,
+          "localNetworkExceptions": false
+        }
+      },
+      "expected": [
+        "kill-switch-protocols",
+        "enforcement-mode",
+        "dns-fast-answers",
+        "fake-ip-enabled",
+        "shared-ip-policy",
+        "kill-switch-strict-shared-ips"
+      ]
+    },
+    {
+      "name": "local networks are offered with leak protection off",
+      "input": {
+        "mode": "reactive",
+        "leak": "off",
+        "bound": false,
+        "fake-ip": false,
+        "supports": {
+          "localNetworkExceptions": true
+        }
+      },
+      "expected": [
+        "enforcement-mode",
+        "shared-ip-policy",
+        "local-networks"
+      ]
+    }
+  ]
+}

@@ -23,14 +23,18 @@ GroupBox {
                     : (root.prefs.themeMode === "high-contrast" ? "system" : root.prefs.themeMode)
             })
         }
+        // Enhanced focus and simplified labels change nothing yet: their
+        // stored preferences are kept, the controls wait until they act.
         CheckBox {
             Layout.fillWidth: true
+            visible: false
             text: root.tr("a11y.enhanced-focus", "Enhanced focus")
             checked: root.prefs.enhancedFocus
             onToggled: root.updatePrefs({ enhancedFocus: checked })
         }
         CheckBox {
             Layout.fillWidth: true
+            visible: false
             text: root.tr("a11y.simplified-labels", "Simplified labels")
             checked: root.prefs.simplifiedLabels
             onToggled: root.updatePrefs({ simplifiedLabels: checked })

@@ -174,6 +174,9 @@ pub struct RuleHostnameSeeder {
     /// A [`Self::seed_within`] worker is running. Separate from `pass_gate`,
     /// whose guard cannot cross into the worker's thread.
     worker_busy: Arc<AtomicBool>,
+    /// Whose plan pins or routes IPv6: only they get a rule host's `AAAA`
+    /// asked for as well.
+    ipv6: Arc<crate::ipv6_disposition::Ipv6Dispositions>,
 }
 
 /// How long a recompute waits for the rule-host seed before going ahead with
@@ -214,7 +217,17 @@ impl RuleHostnameSeeder {
             previous_hostnames: Mutex::new(HashMap::new()),
             pass_gate: Mutex::new(()),
             worker_busy: Arc::new(AtomicBool::new(false)),
+            ipv6: crate::ipv6_disposition::learning_ipv6_dispositions(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_ipv6_dispositions(
+        mut self,
+        board: Arc<crate::ipv6_disposition::Ipv6Dispositions>,
+    ) -> Self {
+        self.ipv6 = board;
+        self
     }
 
     /// Read the live leak-guard posture, so retry pacing tightens exactly while
@@ -527,6 +540,7 @@ impl RuleHostnameSeeder {
         // A reloaded rule book invalidates every "this apex has no address"
         // observation — the rules that made parking safe may have changed.
         self.retire_stale_apex_parking(principal, &hostnames);
+        let ask_v6 = self.ipv6.names_ipv6(principal);
 
         for (host, covered_by_suffix) in hostnames {
             // Already cached (any IPs present) → leave it to the DNS
@@ -546,7 +560,7 @@ impl RuleHostnameSeeder {
             if self.retry_suppressed(&host) {
                 continue;
             }
-            match self.resolve_union(&host) {
+            match self.resolve_union(&host, ask_v6) {
                 Ok(SeedResolve {
                     record: Some(mut record),
                     ..
@@ -667,15 +681,20 @@ impl RuleHostnameSeeder {
     ///   `authoritative_negative` says whether that was the name's own verdict.
     /// - `Err(reason)` — the resolver is unsupported on this platform; the caller
     ///   aborts the whole pass.
-    fn resolve_union(&self, host: &str) -> Result<SeedResolve, String> {
+    ///
+    /// With `ask_v6`, one `AAAA` query joins the union: an IPv6 address the
+    /// plan pins or routes is only enforced once the cache knows it.
+    fn resolve_union(&self, host: &str, ask_v6: bool) -> Result<SeedResolve, String> {
         let mut merged: Option<nrr_platform_api::dns::ResolvedRecord> = None;
         let mut seen: BTreeSet<std::net::IpAddr> = BTreeSet::new();
         // Downgraded by the first attempt that either answered or failed for a
         // reason other than the name itself — one timeout in the batch is
         // enough to make the batch inconclusive.
         let mut authoritative_negative = true;
-        for _ in 0..SEED_RESOLVE_ATTEMPTS {
-            match self.resolver.resolve(host, AddressFamily::Ipv4) {
+        let v4_attempts = std::iter::repeat_n(AddressFamily::Ipv4, SEED_RESOLVE_ATTEMPTS);
+        let v6_attempt = ask_v6.then_some(AddressFamily::Ipv6);
+        for family in v4_attempts.chain(v6_attempt) {
+            match self.resolver.resolve(host, family) {
                 Ok(record) => {
                     authoritative_negative = false;
                     match merged.as_mut() {
@@ -755,7 +774,7 @@ struct SeedResolve {
 ///
 /// The flag is what makes parking an address-less apex safe: it says the
 /// subdomains under the name are still enforced without it.
-fn collect_rule_hostnames(set: &CanonicalRuleSet, out: &mut BTreeMap<String, bool>) {
+pub(crate) fn collect_rule_hostnames(set: &CanonicalRuleSet, out: &mut BTreeMap<String, bool>) {
     for rule in set.rules().iter().filter(|r| r.enabled) {
         match &rule.address_match {
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {

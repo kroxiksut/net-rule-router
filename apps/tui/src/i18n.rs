@@ -18,6 +18,23 @@ pub const fn key(id: &'static str, en: &'static str) -> Key {
     Key { id, en }
 }
 
+/// A counted noun: the locale family `<stem>one|few|many|other` and the English
+/// texts used where no file has them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plural {
+    pub stem: &'static str,
+    pub one: &'static str,
+    pub other: &'static str,
+}
+
+impl Plural {
+    /// Every form a locale file may carry; `one` and `other` must exist.
+    #[cfg(test)]
+    pub fn required_ids(self) -> [String; 2] {
+        [format!("{}one", self.stem), format!("{}other", self.stem)]
+    }
+}
+
 /// The resolved strings of one language.
 #[derive(Clone, Debug)]
 pub struct Texts {
@@ -78,6 +95,20 @@ impl Texts {
     /// GUI's own family; `fallback` where no locale has the text.
     pub fn dynamic(&self, id: &str, fallback: &str) -> String {
         translate_or(&self.map, id, fallback)
+    }
+
+    /// "{count} noun" in the form the language's plural rule asks for; a form
+    /// the file lacks falls back to `other`, then to the English text.
+    pub fn counted(&self, plural: Plural, count: usize) -> String {
+        use nrr_client_logic::placeholders::{plural_category, PluralRule};
+        let rule =
+            PluralRule::from_slug(&translate_or(&self.map, "label.plural-rule", "one-other"));
+        let n = i64::try_from(count).unwrap_or(i64::MAX);
+        let form = plural_category(rule, n).as_str();
+        let fallback = if count == 1 { plural.one } else { plural.other };
+        let other = translate_or(&self.map, &format!("{}other", plural.stem), fallback);
+        let text = translate_or(&self.map, &format!("{}{form}", plural.stem), &other);
+        nrr_client_logic::placeholders::fill_placeholders(&text, [("count", count.to_string())])
     }
 
     /// The text with each `{name}` filled.

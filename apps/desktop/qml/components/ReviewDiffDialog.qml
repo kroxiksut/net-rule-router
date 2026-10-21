@@ -6,6 +6,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "../lib/plurals.js" as Plurals
 
 Dialog {
     id: root
@@ -112,6 +113,11 @@ Dialog {
         }
     }
 
+    // White only where it clears 4.5:1; the lighter badges take black.
+    function riskBadgeTextColor() {
+        return riskLevelSlug() === "critical" ? "white" : "black"
+    }
+
     function riskBadgeText() {
         return tr("risk.level." + riskLevelSlug(), riskLevelSlug())
     }
@@ -193,9 +199,9 @@ Dialog {
         // `"reset-to-baseline; discard N rule(s)"`; localise it.
         var rm = raw.match(/^reset-to-baseline;\s*discard\s+(\d+)\s+rule/)
         if (rm) {
-            return tr("dialog.review-diff.reset-summary",
-                "Discard {count} custom rule(s) and restore the baseline rules.")
-                .replace("{count}", rm[1])
+            return Plurals.counted(tr, "dialog.review-diff.reset-summary.", Number(rm[1]),
+                "Discard {count} custom rule and restore the baseline rules.",
+                "Discard {count} custom rules and restore the baseline rules.")
         }
         // The service's apply-plan counters (users, filters) are its own
         // bookkeeping; the user reviews rules, so the line counts rules.
@@ -265,7 +271,6 @@ Dialog {
                         + "apply, the system will ask for administrator approval.")
                 wrapMode: Text.Wrap
                 color: "#664d03"
-                font.pixelSize: 12
                 verticalAlignment: Text.AlignVCenter
                 Accessible.role: Accessible.StaticText
                 Accessible.name: text
@@ -289,9 +294,8 @@ Dialog {
                     id: riskBadgeLabel
                     anchors.centerIn: parent
                     text: root.riskBadgeText()
-                    color: "white"
+                    color: root.riskBadgeTextColor()
                     font.bold: true
-                    font.pixelSize: 14
                 }
             }
 
@@ -299,7 +303,6 @@ Dialog {
                 Layout.fillWidth: true
                 text: root.diffSummaryText()
                 wrapMode: Text.Wrap
-                font.pixelSize: 13
                 color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
             }
         }
@@ -310,7 +313,6 @@ Dialog {
             visible: text !== ""
             text: root.provenanceText()
             wrapMode: Text.Wrap
-            font.pixelSize: 12
             color: root.ownerRoot ? root.ownerRoot.mutedTextColor : palette.text
             Accessible.role: Accessible.StaticText
             Accessible.name: text
@@ -320,7 +322,6 @@ Dialog {
         Label {
             text: root.tr("dialog.review-diff.signals-heading", "Detected signals")
             font.bold: true
-            font.pixelSize: 13
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
             visible: root.signalsList().length > 0
         }
@@ -354,7 +355,6 @@ Dialog {
                     verticalAlignment: Text.AlignVCenter
                     text: "• " + root.renderSignal(modelData)
                     wrapMode: Text.Wrap
-                    font.pixelSize: 12
                     color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
                 }
             }
@@ -369,7 +369,6 @@ Dialog {
             text: root.tr("dialog.review-diff.duplicates-heading",
                 "Rules written into both routes")
             font.bold: true
-            font.pixelSize: 13
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
             visible: root.crossSetDuplicates().length > 0
         }
@@ -379,7 +378,6 @@ Dialog {
             text: root.tr("dialog.review-diff.duplicates-hint",
                 "Each of these is enabled on both routes, so which one carries the traffic is decided by evaluation order rather than by you. Pick the route that should keep it — the other copy stays in your list, switched off.")
             wrapMode: Text.Wrap
-            font.pixelSize: 12
             color: root.ownerRoot ? root.ownerRoot.mutedTextColor : palette.text
         }
         ListView {
@@ -406,7 +404,6 @@ Dialog {
                     Layout.fillWidth: true
                     text: String(modelData["match-summary"] || "")
                     wrapMode: Text.Wrap
-                    font.pixelSize: 12
                     color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
                 }
                 ThemedButton {

@@ -2,12 +2,14 @@
 
 use super::*;
 
-/// Lower the **catch-all (Mode-B) kill-switch** of `plan` —
+/// Lower the **catch-all kill-switch** of `plan` —
 /// `killswitch_codegen::catch_all_kill_switch_filters`: the blanket
-/// "block everything not exempted" for everything-via-secondary.
+/// "block everything not exempted" of leak protection "everything".
 ///
 /// Handles [`PrecedenceClass::CatchAllExempt`] permits and
-/// [`PrecedenceClass::CatchAllBlock`] blocks. The exact WFP layer, weight band and
+/// [`PrecedenceClass::CatchAllBlock`] blocks, save the foreign-tunnel and
+/// handshake permits ([`lower_foreign_tunnels`], [`lower_vpn_handshake`]),
+/// whose layers and bands are their own. The exact WFP layer, weight band and
 /// conditions are reconstructed from the neutral flow:
 ///
 /// - **layer** — IP family from the [`DstMatch`] variant (`SubnetV6`/`HostV6` →
@@ -42,7 +44,9 @@ pub fn lower_catch_all_kill_switch(
         if !matches!(
             flow.precedence.class,
             PrecedenceClass::CatchAllExempt | PrecedenceClass::CatchAllBlock
-        ) {
+        ) || is_foreign_permit(flow)
+            || is_vpn_handshake(flow)
+        {
             continue;
         }
         // Without a tunnel LUID the whole blanket posture is off: its block
@@ -116,6 +120,7 @@ pub fn lower_catch_all_kill_switch(
             remote_subnet: df.remote_subnet,
             remote_subnet_v6: df.remote_subnet_v6,
             ip_protocol,
+            remote_subnet_set: Vec::new(),
         });
     }
     out
@@ -213,7 +218,10 @@ pub(super) fn catch_all_weight(
                 || df.remote_ip.is_some()
                 || df.remote_subnet.is_some()
                 || df.remote_subnet_v6.is_some();
-            if is_exemption {
+            if is_exemption && df.is_v6 {
+                // Below a user Block's packet mirror; the v6 layer holds no pins.
+                CATCHALL_EXEMPT_BASE + ord
+            } else if is_exemption {
                 PACKET_EXEMPT_BASE + ord
             } else {
                 PACKET_PERMIT_BASE + ord

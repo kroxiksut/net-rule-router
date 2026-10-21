@@ -456,14 +456,14 @@ if (-not $SkipBuild) {
     & (Join-Path $PSScriptRoot 'clean-sync-duplicates.ps1')
     $targetNote = if ($archSpec.RustTarget) { " --target $($archSpec.RustTarget)" } else { '' }
     if ($Headless) {
-        Write-Step "cargo build --release$targetNote (service, console, terminal interface)"
-        & cargo build --release @cargoTarget -p nrr-windows-service -p nrr-cli -p nrr-tui
+        Write-Step "cargo build --release --locked$targetNote (service, console, terminal interface)"
+        & cargo build --release --locked @cargoTarget -p nrr-windows-service -p nrr-cli -p nrr-tui
     } else {
-        Write-Step "cargo build --release$targetNote (launcher, service, console, terminal interface)"
-        & cargo build --release @cargoTarget -p nrr-launcher -p nrr-windows-service -p nrr-cli -p nrr-tui
+        Write-Step "cargo build --release --locked$targetNote (launcher, service, console, terminal interface)"
+        & cargo build --release --locked @cargoTarget -p nrr-launcher -p nrr-windows-service -p nrr-cli -p nrr-tui
     }
     if ($LASTEXITCODE -ne 0) {
-        throw 'Release build failed. A running service or open GUI holds its own binary - stop it and retry.'
+        throw 'Release build failed. A running service or open GUI holds its own binary - stop it and retry; or Cargo.lock is out of date (the build runs --locked) - update it in the checkout first.'
     }
 } else {
     Write-Step 'skipping the build, packaging what is already in the target directory'
@@ -637,6 +637,32 @@ if ($Headless) {
     Copy-Payload 'assets\images' (Join-Path $packageRoot 'assets\images')
     Write-Step 'copied the QML, locales, presets, configs, icons, images and user scripts'
 }
+
+# ── Licence texts ────────────────────────────────────────────────────────────
+
+# Wintun and Qt (LGPLv3) are redistributed as binaries, and both licences ask
+# for their text to travel with them. The Qt texts come from the installed Qt's
+# own documentation, so they match the version that is shipped.
+$licensesDir = Join-Path $packageRoot 'licenses'
+New-Item -ItemType Directory -Path $licensesDir -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination (Join-Path $licensesDir 'NetRuleRouter-LICENSE.txt') -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot 'THIRD_PARTY_LICENSES.md') -Destination $licensesDir -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot 'third_party\wintun\LICENSE.txt') -Destination (Join-Path $licensesDir 'Wintun-LICENSE.txt') -Force
+if (-not $Headless) {
+    if ($windeployqt -notmatch '^(?<root>.*\Qt)\(?<version>\d+\.\d+\.\d+)\') {
+        throw "Cannot find the Qt installation root from '$windeployqt' to take the licence texts from."
+    }
+    $qtDocs = Join-Path $Matches['root'] "Docs\Qt-$($Matches['version'])\qtdoc"
+    foreach ($pair in @(@('lgpl.html', 'Qt-LGPL-3.0.html'), @('gpl.html', 'Qt-GPL-3.0.html'))) {
+        $text = Join-Path $qtDocs $pair[0]
+        if (-not (Test-Path -LiteralPath $text)) {
+            throw "Qt licence text '$text' not found; install the Qt documentation component."
+        }
+        Copy-Item -LiteralPath $text -Destination (Join-Path $licensesDir $pair[1]) -Force
+    }
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'third_party\qt\NOTICE.txt') -Destination (Join-Path $licensesDir 'Qt-NOTICE.txt') -Force
+}
+Write-Step 'copied the licence texts'
 
 # ── Build identity ───────────────────────────────────────────────────────────
 

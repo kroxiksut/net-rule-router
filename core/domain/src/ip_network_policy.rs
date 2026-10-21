@@ -129,6 +129,11 @@ pub fn is_private(block: IpBlock) -> bool {
     networks(PRIVATE).any(|net| net.covers(block))
 }
 
+/// The private networks [`is_private`] reads, both families.
+pub fn private_networks() -> impl Iterator<Item = IpBlock> {
+    networks(PRIVATE)
+}
+
 /// Wider than Fail-Closed holds.
 pub fn wider_than_fail_closed(block: IpBlock) -> bool {
     block.prefix_len() < fail_closed_widest_prefix(block.network().is_ipv4())

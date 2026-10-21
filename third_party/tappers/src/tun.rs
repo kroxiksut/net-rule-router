@@ -1,0 +1,742 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Copyright (c) 2024 Nathaniel Bennett <me[at]nathanielbennett[dotcom]>
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+use std::io;
+#[cfg(not(target_os = "windows"))]
+use std::net::IpAddr;
+#[cfg(not(target_os = "windows"))]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
+
+#[cfg(not(target_os = "windows"))]
+use crate::AddAddress;
+use crate::{DeviceState, Interface};
+
+#[cfg(target_os = "linux")]
+use crate::linux::TunImpl;
+#[cfg(target_os = "macos")]
+use crate::macos::TunImpl;
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris"
+))]
+use crate::unix::TunImpl;
+#[cfg(target_os = "windows")]
+use crate::wintun::TunImpl;
+
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::HANDLE;
+
+#[cfg(not(target_os = "windows"))]
+use crate::AddressInfo;
+
+/// A cross-platform TUN interface, suitable for tunnelling network-layer (IPv4/IPv6) packets.
+#[repr(transparent)]
+pub struct Tun {
+    inner: TunImpl,
+}
+
+// * [io::ErrorKind::InvalidInput] (DragonflyBSD only) - the `if_tap` kernel module is not
+//   loaded.
+
+impl Tun {
+    /// Creates a new persistent TUN device, returning its device number.
+    ///
+    /// This function will atomically assign the lowest unused TUN device number to the returned
+    /// device. The created TUN device may subsequently be opened using [`Tun::open`] or
+    /// [`Tun::new_named`]. The created device is persistent until OS reboot unless it is explicitly
+    /// destroyed via a call to [`Tun::destroy`] or [`Tun::destroy_numbered`].
+    ///
+    /// # Errors
+    ///
+    /// On failure, this function will return an error with one of the following [`io::ErrorKind`]s:
+    /// * [io::ErrorKind::PermissionDenied] - the calling application did not have the right
+    ///   privileges to open a TUN device, or else was constrained by an OS-level security policy
+    ///   that forbids creation of TUN devices. Most operating systems require elevated privileges
+    ///   (e.g., `CAP_NET_ADMIN` in Linux) to create, open or otherwise operate on a TUN device.
+    /// * [io::ErrorKind::OutOfMemory] - the operating system ran out of resources to create new
+    ///   TUN devices.
+    /// * [io::ErrorKind::Other] - some other unspecified platform-specific error occurred.
+    ///
+    /// # Portability
+    ///
+    /// MacOS and Windows (wintun) do not implement any kind of persistent TUN device capability;
+    /// as such, TUN devices can only be created via [`Tun::new`] or similar on these platforms.
+    ///
+    /// OpenBSD and NetBSD both support persistent TUN devices, but do not support auto-assigning
+    /// an unused TUN device number. Persistent TUN devices _can_ be created based on a particular
+    /// device number, however, so (non-atomically) mimicking [`Tun::create`] is possible by
+    /// iterating through low to high device numbers and attempting to call [`Tun::create_numbered`]
+    /// for each.
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "windows"
+    )))]
+    #[inline]
+    pub fn create() -> io::Result<u32> {
+        // TODO: this should return u32
+        TunImpl::create()
+    }
+
+    /// Creates a new persistent TUN device of the provided device number.
+    ///
+    /// On success, the created TUN device may subsequently be opened using [`Tun::open`] or
+    /// [`Tun::new_named`]. The created device is persistent until OS reboot unless it is explicitly
+    /// destroyed via a call to [`Tun::destroy`] or [`Tun::destroy_numbered`].
+    ///
+    /// # Errors
+    ///
+    /// On failure, this function will return an error with one of the following [`io::ErrorKind`]s:
+    /// * [io::ErrorKind::PermissionDenied] - the calling application did not have the right
+    ///   privileges to open a TUN device, or else was constrained by an OS-level security policy
+    ///   that forbids creation of TUN devices. Most operating systems require elevated privileges
+    ///   (e.g., `CAP_NET_ADMIN` in Linux) to create, open or otherwise operate on a TUN device.
+    /// * [io::ErrorKind::AlreadyExists] - a TUN device corresponding to the provided device number
+    ///   already exists in the system.
+    /// * [io::ErrorKind::OutOfMemory] - the operating system ran out of resources to create new
+    ///   TUN devices.
+    /// * [io::ErrorKind::Other] - some other unspecified platform-specific error occurred.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[inline]
+    pub fn create_numbered(device_num: u32) -> io::Result<()> {
+        TunImpl::create_numbered(device_num)
+    }
+
+    /// Destroys the provided TUN device from the operating system, freeing up its device number
+    /// for reuse.
+    pub fn destroy(self) -> io::Result<()> {
+        self.inner.destroy()
+    }
+
+    /// Destroys the TUN device specified by the given interface name, freeing up the interface for
+    /// reuse.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    pub fn destroy_named(if_name: Interface) -> io::Result<()> {
+        TunImpl::destroy_named(if_name)
+    }
+
+    /// Destroys the TUN device specified by the given interface number, freeing it up for reuse.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    pub fn destroy_numbered(device_num: u32) -> io::Result<()> {
+        TunImpl::destroy_numbered(device_num)
+    }
+
+    /// Checks to see whether a TUN device of the given name exists.
+    #[inline]
+    pub fn exists(if_name: Interface) -> io::Result<bool> {
+        TunImpl::exists(if_name)
+    }
+
+    /// Checks to see whether a TUN device of the given interface number exists.
+    #[inline]
+    pub fn exists_numbered(device_num: u32) -> io::Result<bool> {
+        TunImpl::exists_numbered(device_num)
+    }
+
+    /// Opens an existing TUN device of the given device number.
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        all(
+            feature = "portable-racy",
+            not(any(target_os = "macos", target_os = "windows"))
+        )
+    ))]
+    #[inline]
+    pub fn open(device_num: u32) -> io::Result<Self> {
+        Ok(Self {
+            inner: TunImpl::open(device_num)?,
+        })
+    }
+
+    /// Creates a new, unique TUN device and returns an open handle to it.
+    ///
+    /// The interface name associated with this TUN device is chosen by the system, and can be
+    /// retrieved via the [`name()`](Self::name) method. The created TUN device is ephemeral,
+    /// meaning that it will be destroyed when the returned `Tun` object goes out of scope.
+    #[cfg(all(
+        not(target_os = "netbsd"),
+        not(target_os = "openbsd"),
+        any(feature = "portable-racy", not(target_os = "windows"))
+    ))]
+    #[inline]
+    pub fn new() -> io::Result<Self> {
+        Ok(Self {
+            inner: TunImpl::new()?,
+        })
+    }
+
+    /// Opens or creates a TUN device of the given device number, returning an open handle to it.
+    ///
+    /// This method is designed to work natively across all platforms; as such, the returned TUN
+    /// device _may_ be either persistent or ephemeral
+    pub fn new_compat(device_num: u32) -> io::Result<Self> {
+        Ok(Self {
+            inner: TunImpl::new_compat(device_num)?,
+        })
+    }
+
+    /// Opens or creates a TUN device of the given device number, returning an open handle to it.
+    ///
+    /// If created, the TUN device is ephemeral, meaning that it will be destroyed when the returned
+    /// `Tun` instance goes out of scope. If opened (which can occur on platforms other than MacOS
+    /// and Windows), the TUN device is persistent and will remain after the `Tun` instance is
+    /// dropped. To guarantee an ephemeral TUN, use [`Tun::new`]; to guarantee a persistent TUN, use
+    /// [`Tun::open`].
+    #[cfg(not(any(target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd")))]
+    #[inline]
+    pub fn new_numbered(device_num: u32) -> io::Result<Self> {
+        Ok(Self {
+            inner: TunImpl::new_numbered(device_num)?,
+        })
+    }
+
+    /// Retrieves the interface name of the TUN device.
+    #[inline]
+    pub fn name(&self) -> io::Result<Interface> {
+        self.inner.name()
+    }
+
+    /// Sets the adapter state of the TUN device.
+    #[inline]
+    pub fn set_state(&self, state: DeviceState) -> io::Result<()> {
+        self.inner.set_state(state)
+    }
+
+    /// Sets the adapter state of the TUN device to `UP`. Equivalent to
+    /// [set_state(DeviceState::Up)](Tun::set_state).
+    pub fn set_up(&self) -> io::Result<()> {
+        self.inner.set_state(DeviceState::Up)
+    }
+
+    /// Sets the adapter state of the TUN device to `DOWN`. Equivalent to
+    /// [set_state(DeviceState::Down)](Tun::set_state).
+    pub fn set_down(&self) -> io::Result<()> {
+        self.inner.set_state(DeviceState::Down)
+    }
+
+    /// Retrieves the current adapter state of the TUN device (i.e., `UP` or `DOWN`).
+    #[inline]
+    pub fn state(&self) -> io::Result<DeviceState> {
+        self.inner.state()
+    }
+
+    /// Retrieves the Maximum Transmission Unit (MTU) of the TUN device.
+    #[inline]
+    pub fn mtu(&self) -> io::Result<usize> {
+        self.inner.mtu()
+    }
+
+    /// Sets the blocking mode of the TUN device for reads/writes.
+    ///
+    /// If `nonblocking` is set to `true`, subsequent calls to [`read()`](io::Read::read)/
+    /// [`recv()`](`Self::recv`) or [`write()`](io::Write::write)/[`send()`](Self::send) will return
+    /// immediately with an error of kind [`io::ErrorKind::WouldBlock`] instead of hanging when
+    /// no packets are available or no buffer space is available to transmit packets, respectively.
+    /// If set to `false`, calls to the above methods will block until completion.
+    #[inline]
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.inner.set_nonblocking(nonblocking)
+    }
+
+    /// Retrieves the blocking mode of the TUN device.
+    ///
+    /// The returned value is `true`, subsequent calls to [`read()`](io::Read::read)/
+    /// [`recv()`](`Self::recv`) or [`write()`](io::Write::write)/[`send()`](Self::send) will return
+    /// immediately with an error of kind [`io::ErrorKind::WouldBlock`] instead of hanging when
+    /// no packets are available or no buffer space is available to transmit packets, respectively.
+    /// If the returned value is `false`, calls to the above methods will block until completion.
+    #[inline]
+    pub fn nonblocking(&self) -> io::Result<bool> {
+        self.inner.nonblocking()
+    }
+
+    /// Retrieves the IP addresses assigned to the interface.
+    ///
+    /// # Portability
+    ///
+    /// In nearly all platforms, no addresses are automatically assigned to TUN interfaces. The
+    /// exception to this is OpenBSD, which automatically assigns a link-layer IPv6 address (in
+    /// addition to the specified IPv6 address) the first time an IPv6 address is assigned to a
+    /// TUN device. As such, portable applications **should not** rely on the assumption that the
+    /// only addresses returned from this method are those that were previously assigned via
+    /// [`add_addr()`](Self::add_addr).
+    #[cfg(not(target_os = "windows"))]
+    #[inline]
+    pub fn addrs(&self) -> io::Result<Vec<AddressInfo>> {
+        self.inner.addrs()
+    }
+
+    /// Assigns an IP address to the interface.
+    ///
+    /// # Portability
+    ///
+    /// MacOS, FreeBSD and DragonFlyBSD all require a destination address when assigning an IPv4
+    /// address to a TUN device. The destination address is optional for other platforms.
+    ///
+    /// Most platforms automatically assign a link-local IPv6 address to a newly created TAP device.
+    /// No platforms assign link-local IPv6 addresses to TUN devices on creation. However, OpenBSD
+    /// **will** assign a link-local IPv6 address (in addition to the specified IPv6 address) the
+    /// first time an IPv6 address is assigned to a TUN device.
+    #[cfg(not(target_os = "windows"))]
+    #[inline]
+    pub fn add_addr<A: Into<AddAddress>>(&self, req: A) -> io::Result<()> {
+        self.inner.add_addr(req)
+    }
+
+    /// Removes the specified network-layer address from the interface.
+    #[cfg(not(target_os = "windows"))]
+    #[inline]
+    pub fn remove_addr(&self, addr: IpAddr) -> io::Result<()> {
+        self.inner.remove_addr(addr)
+    }
+
+    /// Sends a single packet over the TUN device.
+    #[inline]
+    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.send(buf)
+    }
+
+    /// Receives a single packet over the TUN device.
+    #[inline]
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.recv(buf)
+    }
+
+    /// Returns the HANDLE used to poll for incoming packet events in Windows.
+    ///
+    /// # Safety
+    ///
+    /// The returned handle must only be used in thread-safe contexts, and should not be used after
+    /// the `Tun` device is dropped.
+    #[cfg(target_os = "windows")]
+    #[inline]
+    pub unsafe fn read_handle(&self) -> HANDLE {
+        self.inner.read_handle()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl AsRawFd for Tun {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl AsFd for Tun {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl FromRawFd for Tun {
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        Self {
+            inner: TunImpl::from_raw_fd(fd),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl IntoRawFd for Tun {
+    fn into_raw_fd(self) -> RawFd {
+        self.inner.into_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unique_names() {
+        let tun1 = Tun::new_compat(5).unwrap();
+        let tun2 = Tun::new_compat(6).unwrap();
+        let tun3 = Tun::new_compat(7).unwrap();
+
+        let tun1_name = tun1.name().unwrap();
+        let tun2_name = tun2.name().unwrap();
+        let tun3_name = tun3.name().unwrap();
+
+        assert!(tun1_name != tun2_name);
+        assert!(tun1_name != tun3_name);
+        assert!(tun2_name != tun3_name);
+
+        tun1.destroy().unwrap();
+        tun2.destroy().unwrap();
+        tun3.destroy().unwrap();
+    }
+
+    #[test]
+    fn given_number() {
+        let tun = Tun::new_compat(9).unwrap();
+        let tun_iface = tun.name().unwrap();
+
+        let name = tun_iface.name();
+        assert_eq!(
+            name.as_encoded_bytes()[name.as_encoded_bytes().len() - 1],
+            b'9'
+        );
+
+        tun.destroy().unwrap();
+    }
+
+    /*
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn given_name() {
+        use std::ffi::CStr;
+
+        let chosen_name = unsafe { CStr::from_ptr(b"utun24\0".as_ptr() as *const libc::c_char) };
+
+        let iface = Interface::from_cstr(chosen_name).unwrap();
+        let tun = Tun::new_named(iface).unwrap();
+        let tun_iface = tun.name().unwrap();
+
+        assert_eq!(chosen_name, tun_iface.name_cstr());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn given_name() {
+        use std::ffi::OsStr;
+
+        let chosen_name = OsStr::new("tun24");
+
+        let iface = Interface::new(chosen_name).unwrap();
+        let tun = Tun::new_named(iface).unwrap();
+        let tun_iface = tun.name().unwrap();
+
+        assert_eq!(chosen_name, tun_iface.name());
+    }
+    */
+
+    #[test]
+    fn up_down() {
+        let tun1 = Tun::new_compat(6).unwrap();
+
+        tun1.set_up().unwrap();
+        tun1.set_down().unwrap();
+        tun1.destroy().unwrap();
+    }
+
+    #[test]
+    fn exists() {
+        let tun1 = Tun::new_compat(8).unwrap();
+        let tun1_name = tun1.name().unwrap();
+        assert!(Tun::exists(tun1_name).unwrap());
+        tun1.destroy().unwrap();
+    }
+
+    #[test]
+    fn not_exists() {
+        use std::ffi::OsStr;
+        let chosen_name = OsStr::new("tun24");
+        let iface = Interface::new(chosen_name).unwrap();
+        assert!(!iface.exists().unwrap());
+    }
+
+    #[test]
+    fn not_persistent() {
+        let tun1 = Tun::new_compat(6).unwrap();
+
+        let tun1_name = tun1.name().unwrap();
+        tun1.destroy().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!Tun::exists(tun1_name).unwrap());
+    }
+
+    #[test]
+    fn nonblocking_switch() {
+        let tun1 = Tun::new_compat(8).unwrap();
+
+        assert_eq!(tun1.nonblocking().unwrap(), false);
+        tun1.set_nonblocking(true).unwrap();
+        assert_eq!(tun1.nonblocking().unwrap(), true);
+        tun1.set_nonblocking(false).unwrap();
+        assert_eq!(tun1.nonblocking().unwrap(), false);
+
+        tun1.destroy().unwrap();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[cfg(test)]
+mod tests_unix {
+    use crate::AddAddressV4;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::*;
+
+    #[test]
+    fn add_ipv4() {
+        let tun1 = Tun::new_compat(7).unwrap();
+        let ip1 = Ipv4Addr::new(10, 101, 0, 1);
+        let mut ip1_req = AddAddressV4::new(ip1);
+        ip1_req.set_destination(Ipv4Addr::new(10, 101, 0, 2));
+        tun1.add_addr(ip1_req).unwrap();
+        assert!(tun1.addrs().unwrap().iter().any(|a| a.address() == ip1));
+        tun1.destroy().unwrap();
+    }
+
+    #[test]
+    fn add_ipv4_multi() {
+        let tun1 = Tun::new_compat(7).unwrap();
+        let ip1 = Ipv4Addr::new(10, 101, 0, 1);
+        let mut ip1_req = AddAddressV4::new(ip1);
+        ip1_req.set_destination(Ipv4Addr::new(10, 101, 0, 2));
+        let ip2 = Ipv4Addr::new(10, 102, 0, 1);
+        let mut ip2_req = AddAddressV4::new(ip2);
+        ip2_req.set_destination(Ipv4Addr::new(10, 102, 0, 2));
+        tun1.add_addr(ip1_req).unwrap();
+        tun1.add_addr(ip2_req).unwrap();
+
+        let addrs = tun1.addrs().unwrap();
+        assert!(addrs.iter().any(|a| a.address() == ip1));
+        assert!(addrs.iter().any(|a| a.address() == ip2));
+
+        tun1.destroy().unwrap();
+    }
+
+    #[test]
+    fn add_ipv6() {
+        let tun1 = Tun::new_compat(8).unwrap();
+        let ip1 = IpAddr::V6(Ipv6Addr::new(
+            0x0032, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008,
+        ));
+        tun1.add_addr(ip1).unwrap();
+
+        let addrs = tun1.addrs().unwrap();
+        assert!(addrs.iter().any(|a| a.address() == ip1));
+        tun1.destroy().unwrap();
+    }
+
+    #[test]
+    fn add_ipv6_multi() {
+        let tun1 = Tun::new_compat(9).unwrap();
+        let ip1 = Ipv6Addr::new(32, 2, 3, 4, 5, 6, 7, 8);
+        let ip2 = Ipv6Addr::new(32, 5, 3, 4, 5, 6, 7, 8);
+        tun1.add_addr(ip1).unwrap();
+        tun1.add_addr(ip2).unwrap();
+
+        let addrs = tun1.addrs().unwrap();
+        assert!(addrs.iter().any(|a| a.address() == ip1));
+        assert!(addrs.iter().any(|a| a.address() == ip2));
+        tun1.destroy().unwrap();
+    }
+
+    #[test]
+    fn add_ipv4_ipv6_multi() {
+        let tun1 = Tun::new_compat(10).unwrap();
+        let ip1 = Ipv4Addr::new(10, 101, 0, 1);
+        let mut ip1_req = AddAddressV4::new(ip1);
+        ip1_req.set_destination(Ipv4Addr::new(10, 101, 0, 2));
+
+        let ip2 = Ipv4Addr::new(10, 102, 0, 1);
+        let mut ip2_req = AddAddressV4::new(ip2);
+        ip2_req.set_destination(Ipv4Addr::new(10, 102, 0, 2));
+
+        let ip3 = Ipv6Addr::new(32, 2, 3, 4, 5, 6, 7, 8);
+        let ip4 = Ipv6Addr::new(32, 5, 3, 4, 5, 6, 7, 8);
+
+        tun1.add_addr(ip1_req).unwrap();
+        tun1.add_addr(ip2_req).unwrap();
+        tun1.add_addr(ip3).unwrap();
+        tun1.add_addr(ip4).unwrap();
+        let addrs = tun1.addrs().unwrap();
+        assert!(addrs.iter().any(|a| a.address() == ip1));
+        assert!(addrs.iter().any(|a| a.address() == ip2));
+        assert!(addrs.iter().any(|a| a.address() == ip3));
+        assert!(addrs.iter().any(|a| a.address() == ip4));
+
+        tun1.destroy().unwrap();
+    }
+
+    #[test]
+    fn remove_ipv4() {
+        let tun1 = Tun::new_compat(10).unwrap();
+        let ipv4 = Ipv4Addr::new(10, 101, 0, 1);
+        let mut ip1_req = AddAddressV4::new(ipv4);
+        ip1_req.set_destination(Ipv4Addr::new(10, 101, 0, 2));
+        tun1.add_addr(ip1_req).unwrap();
+        tun1.remove_addr(IpAddr::V4(ipv4)).unwrap();
+        let addrs = tun1.addrs().unwrap();
+        assert!(!addrs.iter().any(|a| a.address() == ipv4));
+
+        tun1.destroy().unwrap();
+    }
+
+    #[test]
+    fn remove_ipv4_multi() {
+        let tun1 = Tun::new_compat(11).unwrap();
+        let ip1 = Ipv4Addr::new(10, 101, 0, 1);
+        let mut ip1_req = AddAddressV4::new(ip1);
+        ip1_req.set_destination(Ipv4Addr::new(10, 101, 0, 2));
+        let ip2 = Ipv4Addr::new(10, 102, 0, 1);
+        let mut ip2_req = AddAddressV4::new(ip2);
+        ip2_req.set_destination(Ipv4Addr::new(10, 102, 0, 2));
+        tun1.add_addr(ip1_req).unwrap();
+        tun1.add_addr(ip2_req).unwrap();
+        tun1.remove_addr(IpAddr::V4(ip1)).unwrap();
+        tun1.remove_addr(IpAddr::V4(ip2)).unwrap();
+        let addrs = tun1.addrs().unwrap();
+        assert!(!addrs.iter().any(|a| a.address() == ip1));
+        assert!(!addrs.iter().any(|a| a.address() == ip2));
+
+        tun1.destroy().unwrap();
+    }
+
+    #[test]
+    fn remove_ipv6() {
+        let tun1 = Tun::new_compat(8).unwrap();
+        let ip1 = IpAddr::V6(Ipv6Addr::new(
+            0x0032, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008,
+        ));
+        tun1.add_addr(ip1).unwrap();
+        tun1.remove_addr(ip1).unwrap();
+        let addrs = tun1.addrs().unwrap();
+        assert!(!addrs.iter().any(|a| a.address() == ip1));
+
+        tun1.destroy().unwrap();
+    }
+
+    #[test]
+    fn remove_ipv6_multi() {
+        let tun1 = Tun::new_compat(6).unwrap();
+        let ip1 = Ipv6Addr::new(32, 2, 3, 4, 5, 6, 7, 8);
+        let ip2 = Ipv6Addr::new(32, 5, 3, 4, 5, 6, 7, 8);
+        tun1.add_addr(ip1).unwrap();
+        tun1.add_addr(ip2).unwrap();
+        tun1.remove_addr(IpAddr::V6(ip1)).unwrap();
+        tun1.remove_addr(IpAddr::V6(ip2)).unwrap();
+        let addrs = tun1.addrs().unwrap();
+        assert!(!addrs.iter().any(|a| a.address() == ip1));
+        assert!(!addrs.iter().any(|a| a.address() == ip2));
+
+        tun1.destroy().unwrap();
+    }
+
+    #[test]
+    fn remove_ipv4_ipv6_multi() {
+        let tun1 = Tun::new_compat(5).unwrap();
+        let ip1 = Ipv4Addr::new(10, 101, 0, 1);
+        let mut ip1_req = AddAddressV4::new(ip1);
+        ip1_req.set_destination(Ipv4Addr::new(10, 101, 0, 2));
+
+        let ip2 = Ipv4Addr::new(10, 102, 0, 1);
+        let mut ip2_req = AddAddressV4::new(ip2);
+        ip2_req.set_destination(Ipv4Addr::new(10, 102, 0, 2));
+
+        let ip3 = Ipv6Addr::new(32, 2, 3, 4, 5, 6, 7, 8);
+
+        let ip4 = Ipv6Addr::new(32, 5, 3, 4, 5, 6, 7, 8);
+
+        tun1.add_addr(ip1_req).unwrap();
+        tun1.add_addr(ip2_req).unwrap();
+        tun1.add_addr(ip3).unwrap();
+        tun1.add_addr(ip4).unwrap();
+
+        tun1.remove_addr(IpAddr::V6(ip3)).unwrap();
+        tun1.remove_addr(IpAddr::V4(ip1)).unwrap();
+        tun1.remove_addr(IpAddr::V6(ip4)).unwrap();
+        tun1.remove_addr(IpAddr::V4(ip2)).unwrap();
+
+        let addrs = tun1.addrs().unwrap();
+        assert!(!addrs.iter().any(|a| a.address() == ip1));
+        assert!(!addrs.iter().any(|a| a.address() == ip2));
+        assert!(!addrs.iter().any(|a| a.address() == ip3));
+        assert!(!addrs.iter().any(|a| a.address() == ip4));
+
+        tun1.destroy().unwrap();
+    }
+
+    /*
+    #[test]
+    fn send_ipv4() {
+        let mut tun1 = Tun::new().unwrap();
+        let tun_ip = IpAddr::V4(Ipv4Addr::new(10, 100, 0, 1));
+        let udp_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        tun1.add_addr(tun_ip).unwrap();
+        tun1.set_up().unwrap();
+
+        let udp = UdpSocket::bind((udp_ip, 5354)).unwrap();
+
+        // IPv4 packet
+        let send_pkt: [u8; 76] = [
+            0x45, 0x00, 0x00, 0x4c, 0xd5, 0x06, 0x00, 0x00,
+            0x40, 0x11, 0x1c, 0x35, 0x0a, 0x64, 0x00, 0x01,
+            0x7f, 0x00, 0x00, 0x01, 0xd5, 0x88, 0x35, 0x36,
+            0x00, 0x38, 0x84, 0x62, 0x39, 0x86, 0x01, 0x20,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x01, 0x31, 0x01, 0x31, 0x01, 0x31, 0x01, 0x31,
+            0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x29,
+            0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c,
+            0x00, 0x0a, 0x00, 0x08, 0xb4, 0xb1, 0xb9, 0xaf,
+            0xa7, 0xfa, 0x8a, 0x17,
+        ];
+        assert_eq!(tun1.send(&send_pkt).unwrap(), 76);
+
+        let mut pkt = [0u8; 48];
+        let (recv_len, addr) = udp.recv_from(&mut pkt).unwrap();
+        assert_eq!(recv_len, 48);
+        assert_eq!(&send_pkt[76 - 48..], pkt.as_slice());
+    }
+
+    #[test]
+    fn recv_ipv4() {
+        let mut tun1 = Tun::new().unwrap();
+        let tun_ip = IpAddr::V4(Ipv4Addr::new(10, 100, 0, 1));
+        let udp_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        tun1.add_addr(tun_ip).unwrap();
+        tun1.set_up().unwrap();
+
+        let udp = UdpSocket::bind((udp_ip, 5454)).unwrap();
+
+        let dns_req: [u8; 48] = [
+            0x39, 0x86, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x01, 0x31, 0x01, 0x31,
+            0x01, 0x31, 0x01, 0x31, 0x00, 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x0c, 0x00, 0x0a, 0x00, 0x08,
+            0xb4, 0xb1, 0xb9, 0xaf, 0xa7, 0xfa, 0x8a, 0x17,
+        ];
+
+        let req: [u8; 2] = [0x00, 0x46];
+        let mut buf = [0u8; 100];
+
+        tun1.set_nonblocking(true).unwrap();
+        while let Ok(_) = tun1.recv(&mut buf) {} // Clear TUN of traffic
+        tun1.set_nonblocking(false).unwrap();
+
+        assert_eq!(udp.send_to(&req, (tun_ip, 5354)).unwrap(), 2);
+
+        let mut recv_len = 0;
+        loop {
+            recv_len = tun1.recv(&mut buf).unwrap();
+            if buf[0] >> 4 == 0x06 {
+                continue
+            }
+            break
+        }
+        assert_eq!(recv_len, 30);
+        assert_eq!(&buf[28..30], &dns_req);
+    }
+    */
+}

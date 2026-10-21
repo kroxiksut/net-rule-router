@@ -182,12 +182,82 @@ impl AutoRulesEngine {
         stalled: &[std::net::IpAddr],
         now: SystemTime,
     ) -> bool {
-        use nrr_shared::ipc_payloads::{
-            AUTO_RULE_MATCH_KIND_APPLICATION, AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED,
+        use nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED;
+        let Some(gate) = self.app_offer_gate(sid, program) else {
+            return false;
         };
+        tracing::info!(
+            target: "nrr::auto-rules",
+            msg_key = "autorules-intake-app-offer-stalled",
+            sid = %sid,
+            program = %gate.program,
+            stalled = stalled.len(),
+            "offering to move a program onto the additional route: none of its connections completed on the main link",
+        );
+        self.park_app_offer(
+            sid,
+            gate,
+            AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED,
+            primary_behavior_slug(PrimaryBehavior::Stalls),
+            stalled,
+            now,
+        )
+    }
+
+    /// Parks an offer for a program that looks names up past the system
+    /// resolver (see [`nrr_domain::own_resolver`]): rules by name never see
+    /// where it goes, so only a rule naming the program reaches it. Offered
+    /// only while the additional route has rules by name to miss, and never
+    /// over an offer already standing for the same program.
+    pub fn note_app_own_resolver(
+        &self,
+        sid: &str,
+        program: &str,
+        unnamed: &[std::net::IpAddr],
+        now: SystemTime,
+    ) -> bool {
+        use nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_APP_OWN_RESOLVER;
+        let Some(gate) = self.app_offer_gate(sid, program) else {
+            return false;
+        };
+        if !gate.secondary_names_sites {
+            return false;
+        }
+        let standing = self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(sid)
+            .is_some_and(|entry| entry.iter().any(|c| c.dto.id == gate.id));
+        if standing {
+            return false;
+        }
+        tracing::info!(
+            target: "nrr::auto-rules",
+            msg_key = "autorules-intake-app-offer-own-resolver",
+            sid = %sid,
+            program = %gate.program,
+            unnamed = unnamed.len(),
+            "offering a program rule: the program looks names up on its own, so rules by name do not reach it",
+        );
+        self.park_app_offer(
+            sid,
+            gate,
+            AUTO_RULE_SIGNAL_APP_OWN_RESOLVER,
+            "",
+            unnamed,
+            now,
+        )
+    }
+
+    /// What every whole-program offer must pass: discovery on, a rule book to
+    /// compare against, the main route as the default, no rule naming the
+    /// program yet, not a tunnel client, not refused before.
+    fn app_offer_gate(&self, sid: &str, program: &str) -> Option<AppOfferGate> {
+        use nrr_shared::ipc_payloads::AUTO_RULE_MATCH_KIND_APPLICATION;
         let program = program.trim().to_ascii_lowercase();
         if program.is_empty() || self.mode(sid) == AutoRulesMode::Off {
-            return false;
+            return None;
         }
         let Some(snapshot) = self.rules.active_rules_for(sid) else {
             tracing::debug!(
@@ -196,21 +266,20 @@ impl AutoRulesEngine {
                 sid = %sid,
                 "not offered: this principal has no active rules to compare against",
             );
-            return false;
+            return None;
         };
         if self.default_route_role(sid) == RouteRole::Secondary
             || app_covered(&snapshot.rule_book, &program)
         {
-            return false;
+            return None;
         }
         // A tunnel client dialling its own servers fails on the main link by
         // design; routing it through the tunnel it is building is a loop.
         if crate::vpn_client_registry::global_confirmed_vpn_clients()
             .matches_image_for(Some(sid), &program)
         {
-            return false;
+            return None;
         }
-        let now_ms = unix_ms(now);
         let id = candidate_id(sid, AUTO_RULE_MATCH_KIND_APPLICATION, &program);
         if self.suppressed_ids(sid).contains(&id) {
             tracing::debug!(
@@ -218,33 +287,43 @@ impl AutoRulesEngine {
                 program = %program,
                 "not offered: the user has refused this one before",
             );
-            return false;
+            return None;
         }
-        tracing::info!(
-            target: "nrr::auto-rules",
-            msg_key = "autorules-intake-app-offer-stalled",
-            sid = %sid,
-            program = %program,
-            stalled = stalled.len(),
-            "offering to move a program onto the additional route: none of its connections completed on the main link",
-        );
+        Some(AppOfferGate {
+            secondary_names_sites: names_sites(&snapshot.rule_book.secondary),
+            program,
+            id,
+        })
+    }
+
+    fn park_app_offer(
+        &self,
+        sid: &str,
+        gate: AppOfferGate,
+        signal: &str,
+        primary_behavior: &str,
+        seen: &[std::net::IpAddr],
+        now: SystemTime,
+    ) -> bool {
+        use nrr_shared::ipc_payloads::AUTO_RULE_MATCH_KIND_APPLICATION;
+        let now_ms = unix_ms(now);
         let candidate = PendingCandidate {
             dto: AutoRuleCandidateDto {
-                id,
-                anchor: program.clone(),
-                proposed_match: program,
+                id: gate.id,
+                anchor: gate.program.clone(),
+                proposed_match: gate.program,
                 match_kind: AUTO_RULE_MATCH_KIND_APPLICATION.to_string(),
                 route: RouteRole::Secondary.slug().to_string(),
                 affinity: 0.0,
                 observations: None,
                 first_seen_unix_ms: now_ms,
                 last_seen_unix_ms: now_ms,
-                signal: AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED.to_string(),
+                signal: signal.to_string(),
                 consumers: Vec::new(),
                 consumers_changed_unix_ms: 0,
-                primary_behavior: primary_behavior_slug(PrimaryBehavior::Stalls).to_string(),
+                primary_behavior: primary_behavior.to_string(),
                 anchor_refuses_main_link: false,
-                observed_members: stalled.iter().map(ToString::to_string).collect(),
+                observed_members: seen.iter().map(ToString::to_string).collect(),
                 served_by_main_link: false,
                 third_party: None,
                 secondary_reach: None,
@@ -564,4 +643,27 @@ impl AutoRulesEngine {
         }
         true
     }
+}
+
+/// A program that passed [`AutoRulesEngine::app_offer_gate`].
+struct AppOfferGate {
+    program: String,
+    id: String,
+    /// The additional route has an enabled rule by name — something a program
+    /// resolving on its own would miss.
+    secondary_names_sites: bool,
+}
+
+fn names_sites(set: &nrr_domain::canonical::CanonicalRuleSet) -> bool {
+    set.rules().iter().any(|r| {
+        r.enabled
+            && matches!(
+                r.address_match,
+                Some(
+                    CanonicalAddressMatch::ExactFqdn(_)
+                        | CanonicalAddressMatch::SuffixDomain(_)
+                        | CanonicalAddressMatch::Zone(_)
+                )
+            )
+    })
 }

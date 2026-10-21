@@ -622,9 +622,6 @@ impl Drop for MutationGuard<'_> {
 
 // ── Router ───────────────────────────────────────────────────────────────────
 
-/// The thing the transport calls per-request. Validates envelope,
-/// enforces authorization, claims a mutation slot when needed, runs
-/// the audit hook, dispatches to the registered handler.
 /// What the authority check concluded, with the refusal already worded for the
 /// person who has to act on it.
 enum AuthorizationOutcome {
@@ -634,12 +631,15 @@ enum AuthorizationOutcome {
 
 /// `MutationQueue` slot count for a production router.
 ///
-/// Bounds how many mutating requests run at once; this covers the GUI's
-/// worst-case burst of mass-toggle clicks without hoarding memory. Declared here rather than in one platform's wiring:
-/// Windows passed 32 and Linux passed a literal 1, so the same burst that
-/// queued on one OS was refused as a conflict on the other.
+/// Bounds how many mutating requests run at once; covers the GUI's worst-case
+/// burst of mass-toggle clicks without hoarding memory. Declared here, not in
+/// one platform's wiring: Windows passed 32 and Linux a literal 1, so the same
+/// burst queued on one OS and was refused as a conflict on the other.
 pub const MUTATION_QUEUE_CAPACITY: usize = 32;
 
+/// The thing the transport calls per-request. Validates the envelope,
+/// enforces authorization, claims a mutation slot when needed, runs the audit
+/// hook, dispatches to the registered handler.
 pub struct IpcRouter {
     registry: IpcHandlerRegistry,
     audit: Arc<dyn IpcAuditEmitter>,
@@ -1734,7 +1734,7 @@ mod tests {
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn enforces_max_message_size_constant_is_reasonable() {
-        // Guardrail: set to 1 MiB so preset bytes fit. Lower bound pins
+        // Guardrail: sized so a full rule book list fits. Lower bound pins
         // the constant against accidental shrinking;
         // upper bound ensures we don't allow runaway-payload DoS.
         assert!(IPC_MAX_MESSAGE_BYTES >= 1024 * 1024);

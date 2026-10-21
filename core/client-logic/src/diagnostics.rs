@@ -1,6 +1,7 @@
 //! How the diagnostics page reads the service's answers: whether a
-//! `snapshot.diagnostics.get` status carries a usable alert list, and whether
-//! an acknowledgement took.
+//! `snapshot.diagnostics.get` status carries a usable alert list, whether an
+//! acknowledgement took, and when the user hears their saved rules do not
+//! read.
 
 use serde_json::Value;
 
@@ -28,6 +29,33 @@ fn member_text(value: &Value, key: &str) -> String {
 
 fn is_true(value: &Value, key: &str) -> bool {
     value.get(key) == Some(&Value::Bool(true))
+}
+
+/// What the service's `policy` health message opens with while a stored rule
+/// book cannot be read (`RULES_BOOK_UNREADABLE` in `nrr-shared`).
+pub const RULES_BOOK_UNREADABLE: &str = nrr_shared::ipc_payloads::RULES_BOOK_UNREADABLE;
+
+/// Whether a health answer says a stored rule book could not be read, so the
+/// last applied rules stay in force (`rulesBookUnreadable`).
+pub fn rules_book_unreadable(health: &Value) -> bool {
+    let Some(Value::Array(components)) = health.get("components") else {
+        return false;
+    };
+    components.iter().any(|component| {
+        component.get("component") == Some(&Value::String("policy".to_owned()))
+            && component
+                .get("message")
+                .filter(|m| js::is_truthy(m))
+                .is_some_and(|m| js::to_display_string(m).starts_with(RULES_BOOK_UNREADABLE))
+    })
+}
+
+/// One reading of whether the user's own stored rule book cannot be read,
+/// from its push or the snapshot: raise the notice when the state appears;
+/// while it lasts, a dismissed notice stays down; once the book reads again,
+/// the next occurrence is news (`rulesBookNoticeStep`).
+pub fn rules_book_notice_step(was_raised: bool, unreadable: bool) -> crate::system_dns::NoticeStep {
+    crate::system_dns::notice_step(was_raised, unreadable)
 }
 
 /// Whether the status is the service saying it could not read its alert store

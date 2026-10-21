@@ -10,11 +10,13 @@
 use super::*;
 
 /// What SHAPE a fail-closed set takes: cut everything, or only the enumerated
-/// destinations. IPv6 is no longer a second switch — a rule host's v6
-/// addresses are enumerated alongside its v4 ones and blocked by name.
+/// destinations (a rule host's v6 addresses among them, blocked by name).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FailClosedPosture {
     pub(super) block_all: bool,
+    /// Another principal also holds a block-all, so the machine-wide IPv6
+    /// packet block is left out rather than cutting that principal too.
+    pub(super) machine_has_other_principals: bool,
 }
 
 /// Filters the orchestrator currently has installed for one SID.
@@ -143,6 +145,16 @@ pub(super) fn collect_block_ids(specs: &[WfpFilterSpec], into: &mut KillswitchBl
     }
 }
 
+/// The BLOCK ids of the rule codegen's own output: every one is a deny rule
+/// the user wrote, since the codegen emits Block for nothing else.
+pub(super) fn rule_block_ids(specs: &[WfpFilterSpec]) -> HashSet<u64> {
+    specs
+        .iter()
+        .filter(|s| s.action == WfpAction::Block)
+        .map(|s| s.id.raw)
+        .collect()
+}
+
 /// [`collect_block_ids`] for the service-account twins: role-verifying like the
 /// owner's (a tunnel client's drop still teaches its endpoint), and marked so
 /// every other drop observer can leave them out.
@@ -169,7 +181,8 @@ pub(super) fn is_destination_block(spec: &WfpFilterSpec) -> bool {
         && (spec.remote_ip.is_some()
             || !spec.remote_ip_set.is_empty()
             || spec.remote_subnet.is_some()
-            || spec.remote_subnet_v6.is_some())
+            || spec.remote_subnet_v6.is_some()
+            || !spec.remote_subnet_set.is_empty())
 }
 
 /// True when `spec` is a BLOCK that scopes to an application only (an ALE
@@ -185,6 +198,7 @@ pub(super) fn is_app_only_block(spec: &WfpFilterSpec) -> bool {
         && spec.remote_ip_set.is_empty()
         && spec.remote_subnet.is_none()
         && spec.remote_subnet_v6.is_none()
+        && spec.remote_subnet_set.is_empty()
 }
 
 /// Whether a spec carries any destination condition at all.
@@ -194,6 +208,7 @@ fn names_a_destination(spec: &WfpFilterSpec) -> bool {
         || !spec.remote_ip_set_v6.is_empty()
         || spec.remote_subnet.is_some()
         || spec.remote_subnet_v6.is_some()
+        || !spec.remote_subnet_set.is_empty()
 }
 
 /// The IPv4 half of a mixed-family address list, in order.
@@ -209,26 +224,20 @@ pub(crate) fn only_v4_of(ips: &[std::net::IpAddr]) -> Vec<std::net::Ipv4Addr> {
         .collect()
 }
 
-/// Whether `ip` sits in any of `subnets`, given as `(network, prefix_len)`.
-pub(super) fn in_any_subnet(ip: std::net::Ipv4Addr, subnets: &[(std::net::Ipv4Addr, u8)]) -> bool {
-    let addr = u32::from(ip);
-    subnets.iter().any(|(net, prefix)| {
-        if *prefix == 0 {
-            return true;
-        }
-        if *prefix > 32 {
-            return false;
-        }
-        let mask = u32::MAX << (32 - u32::from(*prefix));
-        (addr & mask) == (u32::from(*net) & mask)
-    })
-}
-
 /// The behaviour mode a principal is planned under, on every OS: the per-user
 /// policy's `mode`. The rules snapshot carries only a placeholder default, so
 /// a planner that reads the mode from there plans everyone as prefer-main.
 pub(crate) fn behavior_mode_for_codegen(policy: &PerSidPolicySnapshot) -> RouteBehaviorMode {
     behavior_mode_of_snapshot(policy)
+}
+
+/// Whether the level in force is "everything": a stored "routed sites" under
+/// the additional default route means it too.
+pub(crate) fn protects_everything(policy: &PerSidPolicySnapshot) -> bool {
+    policy
+        .leak_protection
+        .effective(behavior_mode_of_snapshot(policy))
+        == nrr_domain::LeakProtection::Everything
 }
 
 /// `principal`'s mode from its stored policy; a principal with no policy row
@@ -251,9 +260,6 @@ fn behavior_mode_of_snapshot(policy: &PerSidPolicySnapshot) -> RouteBehaviorMode
         PerSidBehaviorMode::PreferPrimary => RouteBehaviorMode::PreferPrimary,
         PerSidBehaviorMode::PreferSecondaryWhenAvailable => {
             RouteBehaviorMode::PreferSecondaryWhenAvailable
-        }
-        PerSidBehaviorMode::StrictSecondaryFailClosed => {
-            RouteBehaviorMode::StrictSecondaryFailClosed
         }
     }
 }

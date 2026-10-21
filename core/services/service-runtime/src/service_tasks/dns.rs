@@ -64,9 +64,8 @@ pub fn build_dns_refresh_task(
 /// IPs become routes. Without this nothing ever populates the cache from
 /// the rule book, so domain rules would never route.
 ///
-/// `present` returns everyone whose rules are in force right now — one console
-/// user on Windows, however many are logged in on Linux. Empty → nothing to
-/// seed. Off the mutation path: DNS resolution runs on the supervisor's
+/// `present` returns everyone whose rules are in force right now. Empty →
+/// nothing to seed. Off the mutation path: DNS resolution runs on the supervisor's
 /// background tick, never blocking an apply.
 pub fn build_rule_hostname_seed_task(
     seeder: Arc<crate::rule_hostname_seeder::RuleHostnameSeeder>,
@@ -110,10 +109,8 @@ pub fn build_rule_hostname_seed_task(
 
 /// Everyone whose rules are in force at this moment.
 ///
-/// A list rather than an Option because "the active user" is a Windows-shaped
-/// idea: there is one console session there, and any number of logged-in users
-/// on Linux. A task that seeds only the first of them leaves the others' domain
-/// rules resolving to nothing.
+/// A list rather than an Option: a task that seeds only the first user leaves
+/// the others' domain rules resolving to nothing.
 pub type PresentPrincipalsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 
 /// Application-destination write-back.

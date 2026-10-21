@@ -495,7 +495,8 @@ pub fn egress_sources_from(
         Some(name) => named(name),
         None => {
             let ours: Vec<u32> = secondary_link.map(|l| l.index).into_iter().collect();
-            let foreign = crate::route_coordinator::foreign_tunnel_indexes(links, &ours, routes);
+            let foreign =
+                crate::route_coordinator::foreign_tunnel_indexes(links, &ours, &ours, routes);
             crate::route_coordinator::derive_primary_target(
                 routes,
                 secondary_link.map_or(0, |l| l.index),

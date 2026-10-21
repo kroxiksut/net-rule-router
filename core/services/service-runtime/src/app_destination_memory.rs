@@ -236,6 +236,9 @@ impl AppDestinationMemory {
     /// time. Cheap and self-limiting: a rule book with no such application does
     /// one snapshot read and returns.
     pub fn flush(&self, now: SystemTime) -> FlushSummary {
+        // Before anything is written back: a pair a tunnel now carries must not
+        // be re-confirmed, and its stored row then ages out on its own.
+        self.observations.shed_foreign();
         let mut summary = FlushSummary::default();
         let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
         for sid in (self.present)() {

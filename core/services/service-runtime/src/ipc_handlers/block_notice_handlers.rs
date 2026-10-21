@@ -72,7 +72,23 @@ fn serialize(context: &str, value: impl serde::Serialize) -> HandlerOutcome {
     })
 }
 
+/// The longest host or image name a mute stores. Every row lands in the
+/// machine's state database, and nothing a notice names comes near it.
+const MAX_MUTE_NAME_BYTES: usize = 1024;
+
 fn scope_from_dto(dto: BlockNoticeMuteScopeDto) -> Result<MuteScope, IpcError> {
+    let name = match &dto {
+        BlockNoticeMuteScopeDto::Host { host } => host.len(),
+        BlockNoticeMuteScopeDto::App { app } => app.len(),
+        _ => 0,
+    };
+    if name > MAX_MUTE_NAME_BYTES {
+        return Err(IpcError {
+            code: IpcErrorCode::MalformedRequest,
+            message: format!("a mute names at most {MAX_MUTE_NAME_BYTES} bytes"),
+            diagnostics_id: None,
+        });
+    }
     match dto {
         BlockNoticeMuteScopeDto::Host { host } if !host.trim().is_empty() => {
             Ok(MuteScope::Host(host))
@@ -579,7 +595,7 @@ mod tests {
             host: Some(host.to_string()),
             dest: "203.0.113.7".to_string(),
             app: Some("chrome.exe".to_string()),
-            reason: nrr_domain::block_notice::BlockReason::NotCoveredByRules,
+            reason: nrr_domain::block_notice::BlockReason::BlockedByRule,
         };
         // A block from an unrelated host creates S-A's ledger — proving the
         // mute set below reaches an ALREADY-LIVE ledger, not just a fresh one
@@ -637,7 +653,7 @@ mod tests {
         let notice = nrr_domain::block_notice::BlockNotice {
             destination: "cdn.example".to_string(),
             app: "chrome.exe".to_string(),
-            reason: nrr_domain::block_notice::BlockReason::NotCoveredByRules,
+            reason: nrr_domain::block_notice::BlockReason::BlockedByRule,
             first_attempt_ms: 10,
             attempts: 4,
             launched_by: vec!["cmd.exe".to_string()],
@@ -715,6 +731,29 @@ mod tests {
             )
             .expect_err("empty host");
         assert_eq!(err.code, IpcErrorCode::MalformedRequest);
+    }
+
+    #[test]
+    fn a_mute_naming_more_than_any_host_or_image_is_refused() {
+        let (store, center) = wired();
+        let set = BlockNoticeMutesSetHandler::new(Arc::clone(&store), center);
+        let long = "a".repeat(MAX_MUTE_NAME_BYTES + 1);
+        for scope in [
+            serde_json::json!({ "kind": "host", "host": long }),
+            serde_json::json!({ "kind": "app", "app": long }),
+        ] {
+            let err = set
+                .handle(
+                    &req(
+                        IpcOperationName::BlockNoticeMutesSet,
+                        serde_json::json!({ "scope": scope }),
+                    ),
+                    &ctx(Some("S-A")),
+                )
+                .expect_err("oversized name");
+            assert_eq!(err.code, IpcErrorCode::MalformedRequest);
+        }
+        assert!(active_mutes(store.as_ref(), "S-A").is_empty());
     }
 
     #[test]
@@ -948,7 +987,7 @@ mod tests {
             host: Some("cdn.example".to_string()),
             dest: "203.0.113.7".to_string(),
             app: Some("chrome.exe".to_string()),
-            reason: nrr_domain::block_notice::BlockReason::NotCoveredByRules,
+            reason: nrr_domain::block_notice::BlockReason::BlockedByRule,
         };
         center.record("S-A", &attempt);
         assert_eq!(bus.peek_pending_for(&sub.subscription_id, 10).len(), 1);

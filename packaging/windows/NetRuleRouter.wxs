@@ -45,6 +45,15 @@
                   DowngradeErrorMessage="A newer version of NetRuleRouter is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
+    <!-- The EXE installs into the same folder; over it, files of an equal version
+         would stay as they are. Its uninstall key is the EXE's AppId plus "_is1". -->
+    <Property Id="NRR_EXE_INSTALLED">
+      <RegistrySearch Id="NrrExeInstalled" Root="HKLM" Type="raw" Name="UninstallString"
+                      Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{A7629E15-413C-4ACE-BD45-FE227D6CDEA1}_is1" />
+    </Property>
+    <Launch Condition="Installed OR NOT NRR_EXE_INSTALLED"
+            Message="NetRuleRouter is already installed by its EXE setup into the same folder. Remove that installation first (removing only the program keeps settings and rules), then run this package again." />
+
     <Icon Id="AppIcon" SourceFile="!(bindpath.pkg)\assets\icons\app\app.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
     <Property Id="ARPCOMMENTS" Value="Version $(var.DisplayVersion)" />

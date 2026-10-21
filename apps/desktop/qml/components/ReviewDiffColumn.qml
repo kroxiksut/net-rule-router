@@ -49,7 +49,6 @@ ColumnLayout {
         Layout.fillWidth: true
         text: root.title + " (" + String(root.items.length) + ")"
         font.bold: true
-        font.pixelSize: 12
         color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
     }
 
@@ -134,7 +133,6 @@ ColumnLayout {
                         return String(modelData)
                     }
                     wrapMode: Text.Wrap
-                    font.pixelSize: 11
                     font.italic: !diffRow.entryEnabled
                     color: diffRow.entryEnabled
                         ? (root.ownerRoot ? root.ownerRoot.textColor : palette.text)
@@ -148,7 +146,6 @@ ColumnLayout {
             visible: root.items.length === 0
             text: root.emptyText
             font.italic: true
-            font.pixelSize: 12
             color: root.ownerRoot ? root.ownerRoot.mutedTextColor : palette.mid
         }
     }

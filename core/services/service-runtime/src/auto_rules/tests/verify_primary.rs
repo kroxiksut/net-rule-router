@@ -192,6 +192,7 @@ fn setup_over(
     engine.attach_author(Arc::clone(&author) as Arc<dyn AutoRuleAuthor>);
     let reapplied = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&reapplied);
+    engine.verify_runner.run_inline();
     engine.attach_verify_primary(crate::auto_rules::VerifyPrimaryWiring {
         probe: Arc::clone(&probe) as Arc<dyn PathProbe>,
         egress,
@@ -303,6 +304,83 @@ fn a_main_route_rule_that_does_not_open_there_gets_a_verdict_not_a_rewrite() {
     assert_eq!(moved_ids(sid), ["primary:*.proton.example"]);
     assert_eq!(s.reapplied(), 1, "the move takes effect now");
     assert_eq!(s.pushed_counts(), [1]);
+}
+
+/// A probe that blocks until released: the tick must not wait for it.
+struct HeldProbe {
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl PathProbe for HeldProbe {
+    fn probe(&self, _: Ipv4Addr, _: u16, _: Option<Ipv4Addr>, _: Duration) -> PathVerdict {
+        PathVerdict::Indeterminate
+    }
+
+    fn probe_tls(
+        &self,
+        _: Ipv4Addr,
+        _: &str,
+        source: Option<Ipv4Addr>,
+        _: Duration,
+    ) -> PathVerdict {
+        let _ = self
+            .release
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .recv_timeout(Duration::from_secs(10));
+        if source == Some(MAIN) {
+            PathVerdict::Silent
+        } else {
+            PathVerdict::Answered
+        }
+    }
+}
+
+#[test]
+fn a_slow_check_runs_off_the_tick_and_reaches_the_same_verdict() {
+    let sid = "S-verify-worker";
+    let (release, wait) = std::sync::mpsc::channel();
+    let held = Arc::new(HeldProbe {
+        release: Mutex::new(wait),
+    });
+    let book = main_route_book();
+    let engine = AutoRulesEngine::new(
+        Arc::clone(&book) as Arc<dyn RulesProvider>,
+        mode_fn(AutoRulesMode::Off),
+        Arc::new(InMemoryDismissalStore::new()),
+        Arc::new(InMemoryPendingStore::new()),
+        SystemTime::UNIX_EPOCH,
+    );
+    engine.attach_verify_primary(crate::auto_rules::VerifyPrimaryWiring {
+        probe: held as Arc<dyn PathProbe>,
+        egress: Arc::new(BothLinks),
+        include_subdomains: Arc::new(|_: &str| true),
+        reapply: None,
+    });
+    engine.tick(sid, later());
+    engine.note_verify_candidate(sid, "mail.proton.example", &[HOST_IP]);
+
+    let started = std::time::Instant::now();
+    engine.tick(sid, later());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the tick handed the check over instead of waiting for the probe"
+    );
+    assert!(engine.verify_verdicts(sid).is_empty());
+
+    // Two silent checks on the written link, then the control: let them all go.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while engine.verify_verdicts(sid).is_empty() && std::time::Instant::now() < deadline {
+        let _ = release.send(());
+        std::thread::sleep(Duration::from_millis(20));
+        engine.tick(sid, later());
+    }
+    assert_eq!(
+        engine.verify_verdicts(sid).len(),
+        1,
+        "the verdict is the one a synchronous check would have reached"
+    );
+    crate::verify_overlay::set(sid, std::collections::HashSet::new());
 }
 
 #[test]
@@ -471,6 +549,7 @@ fn a_query_before_the_rules_are_read_still_counts() {
     );
     engine.attach_author(RecordingAuthor::new(Arc::clone(&rules)) as Arc<dyn AutoRuleAuthor>);
     let probe = LinkProbe::new(PathVerdict::Answered, PathVerdict::Answered);
+    engine.verify_runner.run_inline();
     engine.attach_verify_primary(crate::auto_rules::VerifyPrimaryWiring {
         probe: Arc::clone(&probe) as Arc<dyn PathProbe>,
         egress: Arc::new(BothLinks),
@@ -986,4 +1065,36 @@ fn without_the_additional_link_nothing_is_probed() {
     s.engine.tick(SID, after(2));
     assert_eq!(links.reads(), 1, "read while the host waited");
     assert!(s.probe.calls().is_empty(), "no check could conclude");
+}
+
+/// A narrower ordinary rule owns its host: `pay.example.com` goes where its own
+/// rule says, so its refusal on the written link says nothing about the `?`
+/// rule's other hosts.
+#[test]
+fn a_host_owned_by_a_narrower_ordinary_rule_is_not_judged_by_the_wider_question_rule() {
+    let sid = "S-verify-narrower-owner";
+    let s = setup(
+        sid,
+        book_with(
+            vec![verify_rule("example.com")],
+            vec![exact_rule("pay.example.com")],
+        ),
+        PathVerdict::Silent,
+        PathVerdict::Answered,
+    );
+    s.engine
+        .note_verify_candidate(sid, "pay.example.com", &[HOST_IP]);
+    s.engine.tick(sid, after(1));
+    s.engine.tick(sid, after(2));
+    assert!(s.probe.calls().is_empty(), "pay.example.com is not checked");
+    assert!(s.engine.verify_verdicts(sid).is_empty());
+
+    s.engine
+        .note_verify_candidate(sid, "www.example.com", &[HOST_IP]);
+    s.engine.tick(sid, after(3));
+    assert_eq!(
+        s.probe.calls(),
+        vec![("www.example.com".to_string(), MAIN)],
+        "a host the question rule owns is still checked"
+    );
 }

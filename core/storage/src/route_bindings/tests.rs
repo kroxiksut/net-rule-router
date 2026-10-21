@@ -128,14 +128,45 @@ fn any_leak_guard_armed_sees_one_user_among_many() {
     assert!(!repo.any_leak_guard_armed().expect("empty"));
 
     let mut off = sample_record(BindingSource::UserAssigned);
-    off.kill_switch_enabled = false;
+    off.leak_protection = LeakProtection::Off;
     repo.update_for_sid("S-1-5-21-A", &off, 1).expect("off");
     assert!(!repo.any_leak_guard_armed().expect("one off"));
 
-    let mut on = off.clone();
-    on.kill_switch_enabled = true;
-    repo.update_for_sid("S-1-5-21-B", &on, 1).expect("on");
-    assert!(repo.any_leak_guard_armed().expect("one on"));
+    for (sid, protection) in [
+        ("S-1-5-21-B", LeakProtection::Sites),
+        ("S-1-5-21-C", LeakProtection::Everything),
+    ] {
+        let (_dir, conn) = fresh_db();
+        let repo = RouteBindingsRepository::new(&conn);
+        repo.update_for_sid("S-1-5-21-A", &off, 1).expect("off");
+        let on = RoutePolicyRecord {
+            leak_protection: protection,
+            ..off.clone()
+        };
+        repo.update_for_sid(sid, &on, 1).expect("on");
+        assert!(repo.any_leak_guard_armed().expect("one on"), "{protection}");
+    }
+}
+
+/// A slug the CHECK should have kept out is a read error, never a quiet
+/// default: the value decides what may leak.
+#[test]
+fn an_unknown_stored_leak_protection_is_a_storage_error() {
+    let (_dir, conn) = fresh_db();
+    let repo = RouteBindingsRepository::new(&conn);
+    repo.update_for_sid("S", &sample_record(BindingSource::UserAssigned), 1)
+        .expect("update");
+    // The CHECK keeps such a value out; lift it to plant one.
+    conn.execute_batch(
+        "PRAGMA ignore_check_constraints = ON;
+         UPDATE secondary_block_policy SET leak_protection = 'on' WHERE sid = 'S';
+         PRAGMA ignore_check_constraints = OFF;",
+    )
+    .expect("plant an unknown slug");
+    let err = repo
+        .load_for_sid("S")
+        .expect_err("unknown slug must not load");
+    assert!(format!("{err}").contains("leak_protection"), "{err}");
 }
 
 fn sample_record(source: BindingSource) -> RoutePolicyRecord {
@@ -154,29 +185,17 @@ fn sample_record(source: BindingSource) -> RoutePolicyRecord {
             user_confirmed: false,
             known_stable_ids: vec!["TAP".into()],
         }),
-        mode: BehaviorMode::StrictSecondaryFailClosed,
-        block_secondary_when_unavailable: true,
-        // Non-default (default is `true`) so the round-trip test proves
-        // the v15 column actually persists rather than reading the default.
-        kill_switch_fail_closed: false,
+        mode: BehaviorMode::PreferSecondaryWhenAvailable,
+        // Non-default (default is off) — proves the column round-trips.
+        leak_protection: LeakProtection::Everything,
         // Non-default (default is all = 127) so the round-trip test proves
         // the v16 column persists rather than reading the default.
         kill_switch_protocols: 0x05, // TCP + ICMP only
-        // Non-default (default is false) — proves the v23 column round-trips.
-        kill_switch_block_all: true,
-        // Non-default (default is `false`) — proves the v26 master-toggle
-        // column persists rather than reading the default.
-        kill_switch_enabled: true,
-        // Non-default — proves the v27 DNS-over-primary column round-trips.
         allow_dns_over_primary: true,
         // Non-default (default is `true`) so the round-trip test proves
         // the v20 column persists rather than reading the default.
         include_subdomains: false,
         shared_ip_policy: SharedIpPolicy::MajorityOfRules,
-        // Non-default (default is fail-closed-unknown) — proves the v28
-        // Mode-A coverage column round-trips rather than reading the
-        // default.
-        mode_a_coverage_strategy: ModeACoverageStrategy::ZoneWidening,
         // Non-default (default is `true`) — proves the v28 hosts-bypass column
         // persists rather than reading the default.
         resolve_hosts_bypass: false,
@@ -211,6 +230,8 @@ fn sample_record(source: BindingSource) -> RoutePolicyRecord {
         app_rules_take_all_addresses: true,
         // Non-default (default is "") — proves the v73 column round-trips.
         forwarded_outage: "unprotected".to_string(),
+        // Non-default (default is `false`) — proves the v81 column round-trips.
+        external_address_auto_check: true,
         binding_source: source,
     }
 }
@@ -227,12 +248,15 @@ fn slugs_roundtrip_for_all_known_variants() {
     for m in [
         BehaviorMode::PreferPrimary,
         BehaviorMode::PreferSecondaryWhenAvailable,
-        BehaviorMode::StrictSecondaryFailClosed,
     ] {
         assert_eq!(BehaviorMode::from_slug(m.slug()), Some(m));
     }
     assert_eq!(BindingSource::from_slug("garbage"), None);
     assert_eq!(BehaviorMode::from_slug("garbage"), None);
+    assert_eq!(
+        BehaviorMode::from_slug("strict-secondary-fail-closed"),
+        None
+    );
 }
 
 #[test]
@@ -243,19 +267,12 @@ fn empty_sid_load_returns_default_record() {
     assert!(r.primary.is_none());
     assert!(r.secondary.is_none());
     assert_eq!(r.mode, BehaviorMode::PreferPrimary);
-    assert!(
-        r.block_secondary_when_unavailable,
-        "leak-guard must default ON so an un-configured \
-             SID never leaks secondary-bound traffic to the primary link"
-    );
-    assert!(
-        r.kill_switch_fail_closed,
-        "kill-switch posture must default to fail-closed"
-    );
+    assert_eq!(r.leak_protection, LeakProtection::default());
+    assert_eq!(r, RoutePolicyRecord::empty(BindingSource::UserAssigned));
     assert!(
         r.allow_dns_over_primary,
-        "DNS-over-primary must default ON — a \
-             DNS-cut block-all is a total blackout and the FQDN cache never fills"
+        "DNS-over-primary must default ON — blocking everything with DNS cut \
+             is a total blackout and the FQDN cache never fills"
     );
     assert_eq!(r.binding_source, BindingSource::UserAssigned);
 }
@@ -266,14 +283,15 @@ fn a_policy_without_bindings_is_still_a_policy() {
     let repo = RouteBindingsRepository::new(&conn);
     assert!(!repo.has_policy_for_sid("S-1-5-21-A").expect("probe"));
     let mut rec = RoutePolicyRecord::empty(BindingSource::UserAssigned);
-    rec.kill_switch_enabled = true;
+    rec.leak_protection = LeakProtection::Sites;
     repo.update_for_sid("S-1-5-21-A", &rec, 1_700_000_000)
         .expect("update");
     assert!(repo.has_policy_for_sid("S-1-5-21-A").expect("probe"));
-    assert!(
+    assert_eq!(
         repo.load_for_sid("S-1-5-21-A")
             .expect("load")
-            .kill_switch_enabled
+            .leak_protection,
+        LeakProtection::Sites
     );
     assert!(!repo.has_policy_for_sid("S-1-5-21-B").expect("probe"));
 }
@@ -396,7 +414,6 @@ fn update_isolates_state_per_sid() {
     });
     b.secondary = None;
     b.mode = BehaviorMode::PreferPrimary;
-    b.block_secondary_when_unavailable = false;
     repo.update_for_sid("A", &a, 1).expect("a");
     repo.update_for_sid("B", &b, 2).expect("b");
     assert_eq!(repo.load_for_sid("A").unwrap(), a);
@@ -419,16 +436,18 @@ fn update_rejects_primary_equals_secondary() {
     assert!(msg.contains("same adapter"), "msg = {msg}");
 }
 
+/// The first-run wizard saves the protection before the additional
+/// connection is bound; the choice must be kept for when it is.
 #[test]
-fn update_rejects_strict_mode_without_secondary() {
+fn the_additional_default_route_is_kept_before_its_connection_is_bound() {
     let (_dir, conn) = fresh_db();
     let repo = RouteBindingsRepository::new(&conn);
     let mut rec = sample_record(BindingSource::UserAssigned);
     rec.secondary = None;
-    rec.mode = BehaviorMode::StrictSecondaryFailClosed;
-    let err = repo.update_for_sid("S", &rec, 1).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("strict"), "msg = {msg}");
+    rec.mode = BehaviorMode::PreferSecondaryWhenAvailable;
+    rec.leak_protection = LeakProtection::Everything;
+    repo.update_for_sid("S", &rec, 1).expect("update");
+    assert_eq!(repo.load_for_sid("S").expect("load"), rec);
 }
 
 #[test]
@@ -652,28 +671,16 @@ fn mark_migration_per_sid_is_independent() {
 /// Every wire key whose default this row owns, paired with the row's value
 /// rendered the way the wire renders it.
 ///
-/// Two keys are deliberately absent. `mode` is not a block-policy field at
-/// all, and `block-secondary-when-unavailable` has no wire default (the
-/// request always carries it), so the GUI's entry for it is a fallback for
-/// an empty snapshot rather than a mirror of this row.
+/// `mode` is deliberately absent: it is not a block-policy field.
 fn row_defaults_as_wire() -> Vec<(&'static str, serde_json::Value)> {
     use serde_json::json;
     let row = BlockPolicyRow::default();
     vec![
-        (
-            "kill-switch-fail-closed",
-            json!(row.kill_switch_fail_closed),
-        ),
+        ("leak-protection", json!(row.leak_protection.as_slug())),
         ("kill-switch-protocols", json!(row.kill_switch_protocols)),
-        ("kill-switch-block-all", json!(row.kill_switch_block_all)),
-        ("kill-switch-enabled", json!(row.kill_switch_enabled)),
         ("allow-dns-over-primary", json!(row.allow_dns_over_primary)),
         ("include-subdomains", json!(row.include_subdomains)),
         ("shared-ip-policy", json!(row.shared_ip_policy.as_slug())),
-        (
-            "mode-a-coverage-strategy",
-            json!(row.mode_a_coverage_strategy.as_slug()),
-        ),
         ("resolve-hosts-bypass", json!(row.resolve_hosts_bypass)),
         ("doh-lockdown-enabled", json!(row.doh_lockdown_enabled)),
         (
@@ -719,6 +726,10 @@ fn row_defaults_as_wire() -> Vec<(&'static str, serde_json::Value)> {
             json!(row.app_rules_take_all_addresses),
         ),
         ("forwarded-outage", json!(row.forwarded_outage)),
+        (
+            "external-address-auto-check",
+            json!(row.external_address_auto_check),
+        ),
     ]
 }
 

@@ -71,10 +71,10 @@ pub fn announce(app: &mut AppState, texts: &Texts, now: std::time::Instant) -> V
     let Some(summary) = app.block_backlog.unannounced.take() else {
         return Vec::new();
     };
-    let mut body = texts.fill(
-        keys::BLOCK_NOTICE_BACKLOG_BODY,
-        &[("count", summary.count.to_string())],
-    );
+    if crate::notice_mutes::muted(app, "block-notice-backlog") {
+        return Vec::new();
+    }
+    let mut body = texts.counted(keys::BLOCK_NOTICE_BACKLOG_COUNTED, summary.count);
     if !summary.shown.is_empty() {
         let shown: Vec<_> = summary.shown.iter().map(|d| display_text(d)).collect();
         let mut list = shown.join(", ");
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(told[0].level, NoticeLevel::Warning);
         assert_eq!(
             told[0].body,
-            "The service blocked 3 connection(s) while NetRuleRouter was not open. \
+            "The service blocked 3 connections while NetRuleRouter was not open. \
              Destinations: 203.0.113.7, cdn.example."
         );
         assert_eq!(

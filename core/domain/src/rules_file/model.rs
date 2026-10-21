@@ -281,6 +281,10 @@ pub struct RulesFileEntry {
     /// rule to apply although the protection of system programs and folders
     /// refuses it. A request only; the service applies it once confirmed.
     pub override_requested: bool,
+    /// `true` when a program line carried `+children`: the owner wants the
+    /// rule to cover the program's child processes too. Read in program
+    /// sections only; elsewhere the flag is dropped.
+    pub children_requested: bool,
     /// Provenance of an app-authored entry, parsed from the structured
     /// `auto:… anchor:… added:…` prefix of the inline comment.
     ///
@@ -301,6 +305,7 @@ impl RulesFileEntry {
             blocked: false,
             verify_primary: false,
             override_requested: false,
+            children_requested: false,
             origin: None,
         }
     }
@@ -317,6 +322,7 @@ impl RulesFileEntry {
             blocked: false,
             verify_primary: false,
             override_requested: false,
+            children_requested: false,
             origin: None,
         }
     }
@@ -330,6 +336,7 @@ impl RulesFileEntry {
             blocked: false,
             verify_primary: false,
             override_requested: false,
+            children_requested: false,
             origin: None,
         }
     }
@@ -344,6 +351,7 @@ impl RulesFileEntry {
             blocked: false,
             verify_primary: false,
             override_requested: false,
+            children_requested: false,
             origin: Some(origin),
         }
     }

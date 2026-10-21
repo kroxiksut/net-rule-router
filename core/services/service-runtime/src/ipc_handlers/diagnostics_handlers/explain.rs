@@ -5,6 +5,25 @@
 
 use super::*;
 
+/// The slug and counts when some of a secondary-routed name's addresses are
+/// kept off the tunnel (an attached network, a foreign tunnel's route).
+fn kept_direct_verdict(
+    ips: &[std::net::IpAddr],
+    reason: impl Fn(std::net::IpAddr) -> Option<crate::route_codegen::network_routes::KeptDirect>,
+) -> Option<(String, u32, u32)> {
+    use crate::route_codegen::network_routes::KeptDirect;
+    let reasons: Vec<KeptDirect> = ips.iter().filter_map(|ip| reason(*ip)).collect();
+    // A foreign tunnel's claim is the one that can break a work session.
+    let slug = if reasons.contains(&KeptDirect::ForeignTunnel) {
+        "kept-direct-foreign-tunnel"
+    } else if !reasons.is_empty() {
+        "kept-direct-local-network"
+    } else {
+        return None;
+    };
+    Some((slug.to_string(), reasons.len() as u32, ips.len() as u32))
+}
+
 // ── ExplainGetHandler ────────────────────────────────────────────────────────
 
 /// Dependency triple for the kill-switch enforcement
@@ -54,15 +73,14 @@ impl ExplainGetHandler {
         self
     }
 
-    /// The kill-switch verdict for a SYNTHETIC hostname probe, on top of the
-    /// rule verdict (`route`). Config-based — deliberately independent of the
-    /// live armed/disarmed runtime state, so the answer explains what the
-    /// CURRENT SETTINGS do to this host whenever the switch arms:
-    /// - kill-switch ON + coverage `fail-closed-unknown` (block-all) + the
-    ///   hostname has NO cached IPs → no permit can compile → while armed the
-    ///   catch-all drops it, even though the rule verdict says primary/none;
-    /// - secondary-routed host + kill-switch ON → while the secondary is down
+    /// The leak-protection verdict for a SYNTHETIC hostname probe, on top of
+    /// the rule verdict (`route`). Config-based — deliberately independent of
+    /// the live armed/disarmed runtime state, so the answer explains what the
+    /// CURRENT SETTINGS do to this host whenever protection blocks:
+    /// - secondary-routed host + protection on → while the secondary is down
     ///   the fail-closed block holds it (never leaks via primary);
+    /// - a host no rule names + protection `everything` → while the secondary
+    ///   is down it waits, under either default route;
     /// - a primary/default host whose cached IPs the shared-IP census flags
     ///   (shared with secondary rules): under the strict policy those IPs are
     ///   pinned/blocked, under smart they are exempted (host works, leak
@@ -71,12 +89,18 @@ impl ExplainGetHandler {
     ///
     /// Judged by `viewer`'s own settings (the routing user's when empty):
     /// another user's switch says nothing about the viewer's traffic.
-    fn enforcement_verdict(&self, viewer: &str, hostname: &str, route: &str) -> (String, u32, u32) {
+    fn enforcement_verdict(
+        &self,
+        viewer: &str,
+        hostname: &str,
+        route: &str,
+        unmatched: bool,
+    ) -> (String, u32, u32) {
         let none = (String::new(), 0, 0);
         let Some((policy, fqdn, active_sid)) = self.enforcement.as_ref() else {
             return none;
         };
-        // A blocked host has no kill-switch caveat: nothing reaches any link.
+        // A blocked host has no leak-protection caveat: nothing reaches any link.
         if hostname.is_empty() || route == "blocked" {
             return none;
         }
@@ -91,17 +115,30 @@ impl ExplainGetHandler {
         let Some(dto) = policy.get_for_sid(&sid) else {
             return none;
         };
-        if !dto.kill_switch_enabled {
+        // Independent of leak protection: where the traffic goes, not what
+        // happens when the link is down.
+        if route == "secondary" {
+            let cached_ips = fqdn.ips_for_hostname(hostname);
+            if let Some(kept) =
+                kept_direct_verdict(&cached_ips, |ip| crate::kept_direct::reason(&sid, ip))
+            {
+                return kept;
+            }
+        }
+        if dto.leak_protection == nrr_shared::ipc_payloads::LeakProtectionDto::Off {
             return none;
+        }
+        // Main-connection rule hosts stay open under `everything`; traffic no
+        // rule names does not, whichever default route carries it.
+        if unmatched
+            && dto.leak_protection == nrr_shared::ipc_payloads::LeakProtectionDto::Everything
+        {
+            return ("everything-waits-when-secondary-down".to_string(), 0, 0);
         }
         if route == "secondary" {
             return ("fail-closed-when-secondary-down".to_string(), 0, 0);
         }
         let cached_ips = fqdn.ips_for_hostname(hostname);
-        let block_all_unknown = dto.mode_a_coverage_strategy == "fail-closed-unknown";
-        if block_all_unknown && cached_ips.is_empty() {
-            return ("blocked-unknown-under-block-all".to_string(), 0, 0);
-        }
         // Shared-IP collateral for a primary/default host. The census
         // holds exactly the IPs that are BOTH secondary-owned and seen on a
         // direct host, so an intersection with this host's cached IPs is the
@@ -203,12 +240,14 @@ impl IpcHandler for ExplainGetHandler {
             .map_err(|e| internal(OP, format!("facade.get_explain: {e}")))?;
 
         let mut compact = compact_view(&response);
-        // Synthetic hostname probes additionally carry the kill-switch
-        // verdict, so "primary" never hides "but block-all will drop this".
+        // Synthetic hostname probes additionally carry the leak-protection
+        // verdict, so "primary" never hides "but it waits while the tunnel is down".
         if let ExplainQuery::Synthetic { input_sample } = &query {
             if let Some(host) = input_sample.hostname.as_deref() {
+                let unmatched = compact.route == "none"
+                    || compact.reason_key == "diag.explain.reason.no-rule-match";
                 let (slug, shared, total) =
-                    self.enforcement_verdict(ctx.caller_stored(), host, &compact.route);
+                    self.enforcement_verdict(ctx.caller_stored(), host, &compact.route, unmatched);
                 compact.enforcement = slug;
                 compact.enforcement_shared_ips = shared;
                 compact.enforcement_total_ips = total;
@@ -226,14 +265,7 @@ impl IpcHandler for ExplainGetHandler {
         let full = serde_json::to_value(&response)
             .map_err(|e| internal(OP, format!("explain response serialise: {e}")))?;
 
-        let wire = ExplainGetResponse {
-            compact,
-            full,
-            // diagnostic_ids enrichment via audit-log lookup is not yet
-            // wired. The wire field stays — empty vector serialises as an
-            // omitted field thanks to `skip_serializing_if = "Vec::is_empty"`.
-            diagnostic_ids: Vec::new(),
-        };
+        let wire = ExplainGetResponse { compact, full };
         serialise(OP, &wire)
     }
 }
@@ -297,5 +329,48 @@ fn compact_view(response: &ExplainResponse) -> ExplainCompactViewDto {
         enforcement_shared_ips: 0,
         enforcement_total_ips: 0,
         fake_ip: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod kept_direct_tests {
+    use super::kept_direct_verdict;
+    use crate::route_codegen::network_routes::KeptDirect;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("ip")
+    }
+
+    fn reason(addr: IpAddr) -> Option<KeptDirect> {
+        match addr.to_string().as_str() {
+            "192.168.1.5" => Some(KeptDirect::LocalNetwork),
+            "10.20.0.7" => Some(KeptDirect::ForeignTunnel),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_name_reaching_an_attached_network_says_so() {
+        let ips = [ip("192.168.1.5"), ip("203.0.113.5")];
+        assert_eq!(
+            kept_direct_verdict(&ips, reason),
+            Some(("kept-direct-local-network".to_string(), 1, 2))
+        );
+    }
+
+    #[test]
+    fn a_foreign_tunnel_claim_outranks_the_local_network_note() {
+        let ips = [ip("192.168.1.5"), ip("10.20.0.7")];
+        assert_eq!(
+            kept_direct_verdict(&ips, reason),
+            Some(("kept-direct-foreign-tunnel".to_string(), 2, 2))
+        );
+    }
+
+    #[test]
+    fn public_addresses_add_no_note() {
+        assert_eq!(kept_direct_verdict(&[ip("203.0.113.5")], reason), None);
+        assert_eq!(kept_direct_verdict(&[], reason), None);
     }
 }

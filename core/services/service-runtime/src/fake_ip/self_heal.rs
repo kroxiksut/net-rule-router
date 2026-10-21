@@ -304,62 +304,73 @@ impl VpnSelfHealObserver {
         liveness: Option<Arc<TaskLiveness>>,
     ) -> Self {
         let (tx, rx) = sync_channel::<HealJob>(Self::QUEUE_DEPTH);
-        std::thread::spawn(move || {
-            let lease = liveness.as_ref().map(|l| {
-                l.lease(
-                    ServiceTaskKind::FakeIpSelfHeal,
-                    None,
-                    Watch::Work(Self::PROBE_WORK_DEADLINE),
-                )
-            });
-            // Per-hostname probe ledger for this stack lifetime. A host is
-            // retired the moment a probe DECIDES it (healed, or provably not a
-            // VPN client's); an inconclusive probe — the owner could not be
-            // named — leaves it eligible, because the very first flow to a host
-            // is the one most likely to race the connection table.
-            let mut attempts: HashMap<String, u8> = HashMap::new();
-            while let Ok(job) = rx.recv() {
-                let _probe = lease.as_ref().map(ThreadLease::work);
-                let key = normalize_hostname(&job.hostname);
-                if key.is_empty() {
-                    continue;
-                }
-                if attempts.len() >= Self::LEDGER_CAPACITY {
-                    attempts.clear();
-                }
-                match attempts.get(&key) {
-                    Some(&count) if count >= Self::MAX_INCONCLUSIVE_PROBES => continue,
-                    _ => {}
-                }
-                let verdict = probe_and_heal(
-                    owner_lookup.as_ref(),
-                    confirmed.as_ref(),
-                    exclusions.as_ref(),
-                    flush.as_ref(),
-                    job.client,
-                    job.fake,
-                    &job.hostname,
-                );
-                match verdict {
-                    HealVerdict::Excluded => {
-                        attempts.insert(key, Self::MAX_INCONCLUSIVE_PROBES);
-                        if let Some(persist) = persist.as_ref() {
-                            persist(&job.hostname);
+        // A refused thread leaves the observer without a worker: its sends see a
+        // closed queue and are dropped, and the stack runs on without self-heal.
+        let spawned = std::thread::Builder::new()
+            .name("nrr-fakeip-self-heal".into())
+            .spawn(move || {
+                let lease = liveness.as_ref().map(|l| {
+                    l.lease(
+                        ServiceTaskKind::FakeIpSelfHeal,
+                        None,
+                        Watch::Work(Self::PROBE_WORK_DEADLINE),
+                    )
+                });
+                // Per-hostname probe ledger for this stack lifetime. A host is
+                // retired the moment a probe DECIDES it (healed, or provably not a
+                // VPN client's); an inconclusive probe — the owner could not be
+                // named — leaves it eligible, because the very first flow to a host
+                // is the one most likely to race the connection table.
+                let mut attempts: HashMap<String, u8> = HashMap::new();
+                while let Ok(job) = rx.recv() {
+                    let _probe = lease.as_ref().map(ThreadLease::work);
+                    let key = normalize_hostname(&job.hostname);
+                    if key.is_empty() {
+                        continue;
+                    }
+                    if attempts.len() >= Self::LEDGER_CAPACITY {
+                        attempts.clear();
+                    }
+                    match attempts.get(&key) {
+                        Some(&count) if count >= Self::MAX_INCONCLUSIVE_PROBES => continue,
+                        _ => {}
+                    }
+                    let verdict = probe_and_heal(
+                        owner_lookup.as_ref(),
+                        confirmed.as_ref(),
+                        exclusions.as_ref(),
+                        flush.as_ref(),
+                        job.client,
+                        job.fake,
+                        &job.hostname,
+                    );
+                    match verdict {
+                        HealVerdict::Excluded => {
+                            attempts.insert(key, Self::MAX_INCONCLUSIVE_PROBES);
+                            if let Some(persist) = persist.as_ref() {
+                                persist(&job.hostname);
+                            }
+                        }
+                        HealVerdict::Settled => {
+                            attempts.insert(key, Self::MAX_INCONCLUSIVE_PROBES);
+                        }
+                        HealVerdict::Inconclusive => {
+                            let entry = attempts.entry(key).or_insert(0);
+                            *entry = entry.saturating_add(1);
                         }
                     }
-                    HealVerdict::Settled => {
-                        attempts.insert(key, Self::MAX_INCONCLUSIVE_PROBES);
-                    }
-                    HealVerdict::Inconclusive => {
-                        let entry = attempts.entry(key).or_insert(0);
-                        *entry = entry.saturating_add(1);
-                    }
                 }
-            }
-            if let Some(lease) = lease {
-                lease.finish(ThreadExit::Stopped);
-            }
-        });
+                if let Some(lease) = lease {
+                    lease.finish(ThreadExit::Stopped);
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                target: "nrr::fake-ip",
+                error = %e,
+                "could not start the VPN self-heal worker; self-heal is off until the stack restarts",
+            );
+        }
         Self { tx }
     }
 }

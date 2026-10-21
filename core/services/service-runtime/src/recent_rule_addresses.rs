@@ -28,7 +28,8 @@
 //!
 //! ## Bounds
 //!
-//! In-memory, per service run, capped and time-limited: an entry older than
+//! In-memory, per service run, capped and time-limited (on a clock that counts
+//! sleep, so a night in suspend ages it): an entry older than
 //! [`ENTRY_TTL`] is ignored (the pool has moved on), and the map never exceeds
 //! [`MAX_ENTRIES`] — the oldest entries are evicted first. Nothing here is
 //! persisted: a restart re-learns from the first resolution.
@@ -36,7 +37,9 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::boot_clock::BootInstant;
 
 /// How long a remembered address stays usable. Long enough to cover a browser
 /// cycling through a pool it cached minutes ago, short enough that a pool the
@@ -49,7 +52,7 @@ pub const MAX_ENTRIES: usize = 4096;
 
 struct Entry {
     hostname: String,
-    seen_at: Instant,
+    seen_at: BootInstant,
 }
 
 /// Address → the rule hostname that most recently resolved to it.
@@ -81,7 +84,7 @@ impl RecentRuleAddressIndex {
         if hostname.is_empty() || addresses.is_empty() {
             return None;
         }
-        let now = Instant::now();
+        let now = BootInstant::now();
         let Ok(mut map) = self.inner.lock() else {
             return None;
         };
@@ -109,7 +112,7 @@ impl RecentRuleAddressIndex {
         if map.len() > MAX_ENTRIES {
             // Drop the stalest half in one pass rather than sorting the whole
             // map on every insert past the cap.
-            let mut ages: Vec<(Ipv4Addr, Instant)> =
+            let mut ages: Vec<(Ipv4Addr, BootInstant)> =
                 map.iter().map(|(ip, e)| (*ip, e.seen_at)).collect();
             ages.sort_by_key(|(_, at)| *at);
             for (ip, _) in ages.into_iter().take(MAX_ENTRIES / 2) {
@@ -134,7 +137,7 @@ impl RecentRuleAddressIndex {
             return Vec::new();
         };
         let suffix = format!(".{name}");
-        let mut found: Vec<(Ipv4Addr, Instant)> = map
+        let mut found: Vec<(Ipv4Addr, BootInstant)> = map
             .iter()
             .filter(|(_, e)| {
                 e.seen_at.elapsed() < ENTRY_TTL

@@ -2,7 +2,7 @@
 //! GUI's keys, so one wording serves both surfaces; only what exists in the
 //! terminal alone lives under `tui.*`.
 
-use crate::i18n::{key, Key};
+use crate::i18n::{key, Key, Plural};
 
 // ── Screens ──────────────────────────────────────────────────────────────────
 
@@ -10,6 +10,7 @@ pub const SCREEN_STATUS: Key = key("tui.screen.status", "Status");
 pub const SCREEN_WIZARD: Key = key("dialog.first-run.title", "First run");
 pub const SCREEN_INTERFACES: Key = key("section.interfaces-routes", "Interfaces and routes");
 pub const SCREEN_RULES: Key = key("section.rules", "Rules");
+pub const SCREEN_APP_GROUPS: Key = key("app-groups.title", "Application and device routes");
 pub const SCREEN_OVERLAPS: Key = key("rules.overlaps.nav-label", "Overlaps");
 pub const SCREEN_SUGGESTIONS: Key = key("rules.suggestions.inbox.nav-label", "Suggested addresses");
 pub const SCREEN_TRACE: Key = key("diag.conn-trace.title", "Connection trace");
@@ -87,6 +88,14 @@ pub const BANNER_MISMATCH: Key = key(
 pub const BANNER_REFUSED: Key = key(
     "connection.banner.refused",
     "The background service refused this connection",
+);
+pub const CONTRACT_SERVICE_OLDER: Key = key(
+    "status.contract-skew.service-older",
+    "The background service is older than this window. Changes are off until both match: update or restart the service.",
+);
+pub const CONTRACT_CLIENT_OLDER: Key = key(
+    "status.contract-skew.client-older",
+    "This window is from a different build than the background service. Changes are off until both match: restart the window or update the app.",
 );
 pub const FIX_INSTALL: Key = key(
     "tui.connection.fix-install",
@@ -298,9 +307,42 @@ pub const NOTICES_TITLE: Key = key("notifications.title", "Notifications");
 pub const NOTICES_EMPTY: Key = key("notifications.empty", "No notifications.");
 pub const LEVEL_WARNING: Key = key("settings.logs.level.option-warning", "Warning");
 pub const LEVEL_INFO: Key = key("settings.logs.level.option-info", "Info");
+pub const SERVICE_LOST_TITLE: Key = key("notifications.service-lost.title", "The service stopped");
+pub const SERVICE_LOST_BODY: Key = key(
+    "notifications.service-lost.body-start-only",
+    "The NetRuleRouter service stopped unexpectedly, so your rules are not applied.",
+);
+pub const BANNER_LOST: Key = key(
+    "connection.banner.service-lost",
+    "The NetRuleRouter service stopped unexpectedly, so your rules are not applied",
+);
 pub const SYSTEM_DNS_TITLE: Key = key(
     "notifications.system-dns-not-restored.title",
     "Sites may not open by name",
+);
+pub const RULES_BOOK_TITLE: Key = key(
+    "notifications.rules-book-unreadable.title",
+    "Your saved rules cannot be read",
+);
+pub const RULES_BOOK_BODY: Key = key(
+    "notifications.rules-book-unreadable.body",
+    "Your saved rules cannot be read; the last applied rules stay in force. Changes will not apply until this is fixed.",
+);
+pub const RULES_BOOK_CLEARED: Key = key(
+    "notifications.rules-book-unreadable.cleared",
+    "Your saved rules can be read again; changes apply again.",
+);
+pub const SEE_DIAGNOSTICS_HINT: Key = key(
+    "tui.see-diagnostics",
+    "Details are on the Diagnostics and logs screen (9).",
+);
+pub const DNS_FOREIGN_TITLE: Key = key(
+    "notifications.dns-foreign-only.title",
+    "Name handling is paused by your VPN",
+);
+pub const DNS_FOREIGN_BODY: Key = key(
+    "notifications.dns-foreign-only.body",
+    "Your work VPN only lets its own DNS answer, so NetRuleRouter's name handling is paused until another DNS answers. Rules by site name may not apply meanwhile. Disconnect the VPN, or ask its administrator to allow other DNS servers.",
 );
 pub const HOST_UNREACHABLE_TITLE: Key = key(
     "notifications.host-unreachable.title",
@@ -371,10 +413,11 @@ pub const BLOCK_NOTICE_BACKLOG_TITLE: Key = key(
     "notifications.block-notice.backlog.title",
     "Blocked while the app was closed",
 );
-pub const BLOCK_NOTICE_BACKLOG_BODY: Key = key(
-    "notifications.block-notice.backlog.body",
-    "The service blocked {count} connection(s) while NetRuleRouter was not open.",
-);
+pub const BLOCK_NOTICE_BACKLOG_COUNTED: Plural = Plural {
+    stem: "notifications.block-notice.backlog.counted.",
+    one: "The service blocked {count} connection while NetRuleRouter was not open.",
+    other: "The service blocked {count} connections while NetRuleRouter was not open.",
+};
 pub const BLOCK_NOTICE_BACKLOG_DESTINATIONS: Key = key(
     "notifications.block-notice.backlog.destinations",
     "Destinations: {list}.",
@@ -382,6 +425,30 @@ pub const BLOCK_NOTICE_BACKLOG_DESTINATIONS: Key = key(
 pub const BLOCK_NOTICE_BACKLOG_MORE: Key = key(
     "notifications.block-notice.backlog.more",
     "and {count} more",
+);
+pub const SETTINGS_UNREADABLE_TITLE: Key = key(
+    "notifications.settings-unreadable.title",
+    "Your settings could not be read",
+);
+pub const SETTINGS_UNREADABLE_BODY: Key = key(
+    "notifications.settings-unreadable.body",
+    "This session uses default settings and will not save changes, so your saved settings stay as they are. Close the app and open it again; if the file is locked by another program, free it first.",
+);
+pub const DELIVERY_TITLE: Key = key(
+    "notifications.delivery-incomplete.title",
+    "The installation is incomplete",
+);
+pub const DELIVERY_BODY: Key = key(
+    "notifications.delivery-incomplete.body",
+    "This copy of the program lacks {parts}. Everything else keeps working. Reinstall the program to restore what is missing.",
+);
+pub const DELIVERY_PRESETS: Key = key(
+    "notifications.delivery-incomplete.part.presets",
+    "the ready-made rule sets",
+);
+pub const DELIVERY_LOCALES: Key = key(
+    "notifications.delivery-incomplete.part.locales",
+    "the interface languages, so the program is shown in English",
 );
 pub const UNASSIGNED_TUNNEL_TITLE: Key = key(
     "notifications.unassigned-tunnel.title",
@@ -421,7 +488,11 @@ pub const PROTECTION_COVERAGE_TITLE: Key = key(
 );
 pub const PROTECTION_BLANKET_BLOCK_NOT_ARMED: Key = key(
     "status.protection.blanket-block-not-armed",
-    "Full blocking is not switched on: the address of the additional link is unknown, and blocking everything without it would cut the link itself. Traffic outside your rules is not blocked.",
+    "Leak protection \"Everything\" is not in force yet: the address of the additional connection is unknown, and blocking everything without it would cut that connection too. Traffic outside your rules is not blocked.",
+);
+pub const BLOCK_ALL_ARMED: Key = key(
+    "settings.routing.kill-switch.block-all-active-banner",
+    "Leak protection is holding all traffic: the additional connection can't be found (down, not started, or reinstalled under a new ID). The internet waits until it returns; reconnect the VPN or assign the adapter again.",
 );
 pub const PROTECTION_MACHINE_WIDE_CUT: Key = key(
     "status.protection.machine-wide-cut-by-another-user",
@@ -463,6 +534,8 @@ pub const HELP_STATUS_FEED: Key = key(
     "On this screen, Up and Down scroll the notifications when that panel has the focus.",
 );
 pub const FOOTER: Key = key("tui.footer", "F1: help   q: quit");
+/// Tail of a panel title when the panel is taller than the room it has.
+pub const CLIPPED: Key = key("tui.clipped", "+{count} more rows");
 
 // ── Line mode ────────────────────────────────────────────────────────────────
 
@@ -478,6 +551,10 @@ pub const PLAIN_HELP_ENTER: Key = key(
 );
 pub const PLAIN_HELP_HELP: Key = key("tui.plain.help-help", "h or ?: this help");
 pub const PLAIN_UNKNOWN: Key = key("tui.plain.unknown", "Not understood: {input}");
+pub const PLAIN_INPUT_ENDED_UNAPPLIED: Key = key(
+    "tui.plain.input-ended-unapplied",
+    "Input ended while rule changes were not applied. They were dropped; nothing was sent to the service.",
+);
 pub const PLAIN_COMMANDS: Key = key("tui.plain.commands", "Commands on this screen");
 
 /// Every key above, for the test that holds both locale files to them.
@@ -487,6 +564,7 @@ pub const ALL: &[Key] = &[
     SCREEN_WIZARD,
     SCREEN_INTERFACES,
     SCREEN_RULES,
+    SCREEN_APP_GROUPS,
     SCREEN_OVERLAPS,
     SCREEN_SUGGESTIONS,
     SCREEN_TRACE,
@@ -515,6 +593,8 @@ pub const ALL: &[Key] = &[
     BANNER_NOT_INSTALLED,
     BANNER_MISMATCH,
     BANNER_REFUSED,
+    CONTRACT_SERVICE_OLDER,
+    CONTRACT_CLIENT_OLDER,
     FIX_INSTALL,
     FIX_START,
     FIX_RESTORE_NETWORK,
@@ -586,7 +666,16 @@ pub const ALL: &[Key] = &[
     NOTICES_EMPTY,
     LEVEL_WARNING,
     LEVEL_INFO,
+    SERVICE_LOST_TITLE,
+    SERVICE_LOST_BODY,
+    BANNER_LOST,
     SYSTEM_DNS_TITLE,
+    RULES_BOOK_TITLE,
+    RULES_BOOK_BODY,
+    RULES_BOOK_CLEARED,
+    SEE_DIAGNOSTICS_HINT,
+    DNS_FOREIGN_TITLE,
+    DNS_FOREIGN_BODY,
     HOST_UNREACHABLE_TITLE,
     HOST_UNREACHABLE_BODY,
     EXTERNAL_ADDRESS_TITLE,
@@ -604,7 +693,6 @@ pub const ALL: &[Key] = &[
     BLOCK_NOTICE_APP_UNKNOWN,
     BLOCK_NOTICE_REASON_UNKNOWN,
     BLOCK_NOTICE_BACKLOG_TITLE,
-    BLOCK_NOTICE_BACKLOG_BODY,
     LOCAL_NETWORK_TITLE,
     LOCAL_NETWORK_OFFER,
     LOCAL_NETWORK_OFFER_OPEN,
@@ -614,6 +702,12 @@ pub const ALL: &[Key] = &[
     FORWARDED_BODY,
     BLOCK_NOTICE_BACKLOG_DESTINATIONS,
     BLOCK_NOTICE_BACKLOG_MORE,
+    SETTINGS_UNREADABLE_TITLE,
+    SETTINGS_UNREADABLE_BODY,
+    DELIVERY_TITLE,
+    DELIVERY_BODY,
+    DELIVERY_PRESETS,
+    DELIVERY_LOCALES,
     UNASSIGNED_TUNNEL_TITLE,
     UNASSIGNED_TUNNEL_BODY,
     LOCAL_NETWORK_TOO_WIDE_TITLE,
@@ -624,6 +718,7 @@ pub const ALL: &[Key] = &[
     APP_RULE_LEARNING_BODY,
     PROTECTION_COVERAGE_TITLE,
     PROTECTION_BLANKET_BLOCK_NOT_ARMED,
+    BLOCK_ALL_ARMED,
     PROTECTION_MACHINE_WIDE_CUT,
     HELP_TITLE,
     HELP_SCREENS,
@@ -635,12 +730,14 @@ pub const ALL: &[Key] = &[
     HELP_QUIT,
     HELP_STATUS_FEED,
     FOOTER,
+    CLIPPED,
     PLAIN_SCREEN,
     PLAIN_PROMPT,
     PLAIN_HELP_NUMBER,
     PLAIN_HELP_ENTER,
     PLAIN_HELP_HELP,
     PLAIN_UNKNOWN,
+    PLAIN_INPUT_ENDED_UNAPPLIED,
     PLAIN_COMMANDS,
 ];
 
@@ -648,6 +745,16 @@ pub const ALL: &[Key] = &[
 mod tests {
     use super::ALL;
     use serde_json::Value;
+
+    #[test]
+    fn backlog_plural_family_is_in_both_locale_files() {
+        for language in ["en", "ru"] {
+            let root = locale(language);
+            for id in super::BLOCK_NOTICE_BACKLOG_COUNTED.required_ids() {
+                assert!(lookup(&root, &id).is_some(), "{language}.json lacks {id}");
+            }
+        }
+    }
 
     fn locale(language: &str) -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

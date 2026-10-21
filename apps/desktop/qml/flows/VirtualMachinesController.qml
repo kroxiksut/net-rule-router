@@ -1,4 +1,5 @@
 import QtQuick 2.15
+import "../lib/pure.js" as Pure
 
 // Non-visual controller for VIRTUAL MACHINES (sidebar → Rules → Virtual
 // machines): the launcher's inventory of hypervisors and their machines, and
@@ -126,13 +127,13 @@ QtObject {
         if (!root || names.length === 0) return "primary"
         var routes = []
         for (var n = 0; n < names.length; n += 1) {
-            var wanted = String(names[n]).toLowerCase()
+            var wanted = String(names[n])
             var route = "primary"
             for (var i = 0; i < root.rulesModel.count; i += 1) {
                 var row = root.rulesModel.get(i)
                 if (String(row.ruleType || "") === "application"
                         && row.enabled !== false
-                        && String(row.matchValue || "").toLowerCase() === wanted) {
+                        && Pure.globMatch(String(row.matchValue || ""), wanted)) {
                     route = String(row.targetRoute || "primary")
                     break
                 }

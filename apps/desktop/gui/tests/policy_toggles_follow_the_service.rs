@@ -140,8 +140,8 @@ fn the_panels_never_write_the_policy_on_their_own() {
     }
     let show = function_body(&routing, "_showConfirmedPolicy");
     for key in [
-        "kill-switch-enabled",
-        "kill-switch-block-all",
+        "leak-protection",
+        "kill-switch-protocols",
         "allow-dns-over-primary",
         "include-subdomains",
         "resolve-hosts-bypass",
@@ -173,13 +173,13 @@ fn the_restored_notice_went_with_the_reseed() {
 #[test]
 fn the_mirror_patch_names_only_mirrored_keys_the_write_changed() {
     let Some(out) = run_pure(
-        r#"var req = { "mode": "prefer-secondary", "kill-switch-enabled": true,
+        r#"var req = { "mode": "prefer-secondary", "kill-switch-protocols": 3,
             "doh-lockdown-enabled": true, "include-subdomains": false, "primary": { "stable-id": "a" } };
         console.log(JSON.stringify([
-            routePolicyPrefMirrorPatch(req, ["kill-switch-enabled", "doh-lockdown-enabled", "primary"]),
+            routePolicyPrefMirrorPatch(req, ["kill-switch-protocols", "doh-lockdown-enabled", "primary"]),
             routePolicyPrefMirrorPatch(req, ["mode", "include-subdomains"]),
             routePolicyPrefMirrorPatch(req, []),
-            routePolicyPrefMirrorPatch({}, ["kill-switch-enabled"])
+            routePolicyPrefMirrorPatch({}, ["kill-switch-protocols"])
         ]))"#,
     ) else {
         eprintln!("node not available - skipping the mirror-patch check");
@@ -188,10 +188,35 @@ fn the_mirror_patch_names_only_mirrored_keys_the_write_changed() {
     assert_eq!(
         out,
         json!([
-            { "routeKillSwitchEnabled": true },
+            { "routeKillSwitchProtocols": 3 },
             { "routeBehaviorMode": "prefer-secondary", "routeIncludeSubdomains": false },
             {},
             {}
         ])
     );
+}
+
+/// The routing settings offered follow the additional connection the service
+/// holds, as the terminal client reads it, never the pickers' preference; and
+/// a confirmed write keeps that reading current.
+#[test]
+fn the_routing_settings_read_the_bound_connection_from_the_service() {
+    let panel = repo_file("apps/desktop/qml/sections/settings/RoutingSettings.qml");
+    let bound = panel
+        .split("readonly property bool secondaryBound:")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .expect("the panel's binding reading");
+    assert!(
+        bound.contains("root._servicePolicySecondaryBound"),
+        "{bound}"
+    );
+    assert!(!bound.contains("prefs"), "{bound}");
+
+    let main = repo_file("apps/desktop/qml/Main.qml");
+    let note = function_body(&main, "_noteServicePolicy");
+    assert!(note.contains("_servicePolicySecondaryBound ="), "{note}");
+    let controller = repo_file("apps/desktop/qml/flows/RoutePolicyController.qml");
+    let drain = function_body(&controller, "_drainPolicyWrites");
+    assert!(drain.contains("root._noteServicePolicy(p2"), "{drain}");
 }

@@ -86,3 +86,76 @@ pub fn system_locale() -> Option<Box<dyn SystemLocalePort>> {
 pub fn system_locale() -> Option<Box<dyn SystemLocalePort>> {
     None
 }
+
+/// This OS's answer to "did an administrator place this file", for the
+/// installer's answer sheet under the machine state root.
+pub fn machine_files() -> &'static dyn nrr_platform_api::admin_authored::AdminAuthoredFiles {
+    #[cfg(windows)]
+    {
+        &nrr_platform_windows::trusted_location::WindowsAdminAuthoredFiles
+    }
+    #[cfg(target_os = "linux")]
+    {
+        &nrr_platform_linux::trusted_location::LinuxAdminAuthoredFiles
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        &nrr_platform_api::admin_authored::TrustNothing
+    }
+}
+
+/// What the Application routes screen scans for: programs of known groups on
+/// this machine, run as the user who reads them.
+#[cfg(windows)]
+pub fn app_group_discovery() -> Box<dyn nrr_platform_api::AppGroupDiscoveryPort> {
+    Box::new(nrr_platform_windows::WindowsAppGroupDiscovery::new())
+}
+
+/// What the Application routes screen scans for.
+#[cfg(target_os = "linux")]
+pub fn app_group_discovery() -> Box<dyn nrr_platform_api::AppGroupDiscoveryPort> {
+    Box::new(nrr_platform_linux::app_group_discovery::LinuxAppGroupDiscovery::new())
+}
+
+/// This OS has nothing to scan with: the screen lists nothing.
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn app_group_discovery() -> Box<dyn nrr_platform_api::AppGroupDiscoveryPort> {
+    Box::new(nrr_platform_api::NoopAppGroupDiscovery)
+}
+
+/// What the "Your VPN client" rows scan for: likely VPN programs on this
+/// machine, run as the user who reads them.
+#[cfg(windows)]
+pub fn vpn_discovery() -> Box<dyn nrr_platform_api::VpnDiscoveryPort> {
+    Box::new(nrr_platform_windows::WindowsVpnDiscovery::new())
+}
+
+/// What the "Your VPN client" rows scan for.
+#[cfg(target_os = "linux")]
+pub fn vpn_discovery() -> Box<dyn nrr_platform_api::VpnDiscoveryPort> {
+    Box::new(nrr_platform_linux::vpn_discovery::LinuxVpnDiscovery::new())
+}
+
+/// This OS has nothing to scan with: the rows list nothing.
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn vpn_discovery() -> Box<dyn nrr_platform_api::VpnDiscoveryPort> {
+    Box::new(nrr_platform_api::NoopVpnDiscovery)
+}
+
+/// The hypervisors and their machines, read from the user's own files.
+#[cfg(windows)]
+pub fn vm_inventory() -> Box<dyn nrr_platform_api::VmInventoryPort> {
+    Box::new(nrr_platform_windows::WindowsVmInventory::new())
+}
+
+/// The hypervisors and their machines, read from the user's own files.
+#[cfg(target_os = "linux")]
+pub fn vm_inventory() -> Box<dyn nrr_platform_api::VmInventoryPort> {
+    Box::new(nrr_platform_linux::vm_inventory::LinuxVmInventory::new())
+}
+
+/// No hypervisor this build can read.
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn vm_inventory() -> Box<dyn nrr_platform_api::VmInventoryPort> {
+    Box::new(nrr_platform_api::NoopVmInventory)
+}

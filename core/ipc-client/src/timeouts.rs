@@ -89,8 +89,7 @@ pub fn ipc_operation_timeout(op: IpcOperationName) -> Duration {
         | IpcOperationName::AutostartGet => Duration::from_secs(1),
         IpcOperationName::RetentionSettingsSet
         | IpcOperationName::ApplyFailurePolicySet
-        | IpcOperationName::LogRetentionConfigSet
-        | IpcOperationName::AutostartToggle => Duration::from_secs(1),
+        | IpcOperationName::LogRetentionConfigSet => Duration::from_secs(1),
         IpcOperationName::RoutingPauseToggle => Duration::from_secs(2),
         // Storage scan walks `%ProgramData%`, deliberately on-demand —
         // 5 s covers cold-disk worst-case.
@@ -215,6 +214,8 @@ pub fn ipc_operation_timeout(op: IpcOperationName) -> Duration {
         IpcOperationName::RulesOverrideGrant | IpcOperationName::RulesOverrideRevoke => {
             Duration::from_secs(5)
         }
+        // A few rows replaced; the enforcement pass follows on its own.
+        IpcOperationName::RouteVpnGatewaysSet => Duration::from_secs(5),
     }
 }
 

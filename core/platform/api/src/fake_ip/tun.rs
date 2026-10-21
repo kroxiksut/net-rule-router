@@ -35,6 +35,10 @@ pub const DEFAULT_TUN_MTU: u16 = 1500;
 /// requirement of the Windows backend that costs the others nothing.
 pub const DEFAULT_TUN_RING_CAPACITY_BYTES: u32 = 2 * 1024 * 1024;
 
+/// The fixed adapter GUID our TUN is created with where the OS takes one
+/// (Windows). Its identity survives a rename, so "ours" never rests on a name.
+pub const OWN_TUN_ADAPTER_GUID: u128 = 0x7A3E_1C55_0B6D_4F82_9E14_2D6C_8B0A_5F31;
+
 const MIN_TUN_MTU: u16 = 576;
 const MAX_TUN_MTU: u16 = 9000;
 const MIN_RING_CAPACITY_BYTES: u32 = 128 * 1024;

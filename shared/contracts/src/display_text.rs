@@ -112,6 +112,20 @@ pub fn display_text(raw: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// `raw` with every [`needs_substitute`] character turned into [`SUBSTITUTE`]
+/// and no cut: the last layer before a terminal frame, for text that may
+/// legitimately be long. Borrows when nothing changes.
+#[must_use]
+pub fn without_unsafe(raw: &str) -> Cow<'_, str> {
+    if raw.chars().any(needs_substitute) {
+        let mut out = String::with_capacity(raw.len());
+        push_substituted(&mut out, raw);
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(raw)
+    }
+}
+
 fn push_substituted(out: &mut String, text: &str) {
     for c in text.chars() {
         out.push(if needs_substitute(c) { SUBSTITUTE } else { c });
@@ -140,6 +154,15 @@ mod tests {
                 "{name:?}"
             );
         }
+    }
+
+    #[test]
+    fn without_unsafe_substitutes_but_never_cuts() {
+        let long = format!("{}\u{202E}", "a".repeat(DISPLAY_MAX_CHARS * 2));
+        let shown = without_unsafe(&long);
+        assert_eq!(shown.chars().count(), DISPLAY_MAX_CHARS * 2 + 1);
+        assert!(shown.ends_with(SUBSTITUTE));
+        assert!(matches!(without_unsafe("plain"), Cow::Borrowed("plain")));
     }
 
     #[test]

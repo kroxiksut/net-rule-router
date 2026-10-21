@@ -27,16 +27,25 @@ pub fn stored_auto_probe_cadence(
     Arc::new(move |sid: &str| {
         let guard = state_conn.lock().unwrap_or_else(|p| p.into_inner());
         match nrr_storage::route_bindings::RouteBindingsRepository::new(&guard).load_for_sid(sid) {
-            Ok(record) => AutoProbeCadence {
-                enabled: record.primary_probe_auto,
-                repeat: Duration::from_secs(u64::from(record.primary_probe_repeat_secs)),
-            },
+            Ok(record) => {
+                auto_probe_cadence(record.primary_probe_auto, record.primary_probe_repeat_secs)
+            }
             Err(_) => AutoProbeCadence {
                 enabled: false,
                 repeat: Duration::from_secs(300),
             },
         }
     })
+}
+
+/// The stored window is written by any client unchecked, so it is held to the
+/// probe's own range here: a zero would run the pass on every tick.
+pub(super) fn auto_probe_cadence(enabled: bool, repeat_secs: u32) -> AutoProbeCadence {
+    let (min, max) = crate::path_probe::ProbeLimits::REPEAT_AFTER_RANGE;
+    AutoProbeCadence {
+        enabled,
+        repeat: Duration::from_secs(u64::from(repeat_secs)).clamp(min, max),
+    }
 }
 
 /// The automatic "does it answer on the main link?" pass.
@@ -104,8 +113,7 @@ pub(super) fn auto_probe_should_run(
 type ProbeMarks =
     Mutex<std::collections::HashMap<String, (Instant, std::collections::HashSet<String>)>>;
 
-/// Runs for every present principal: Linux names each logged-in user, Windows
-/// its one console user.
+/// Runs for every present principal, on both platforms.
 pub fn build_auto_rules_task(
     engine: Arc<crate::auto_rules::AutoRulesEngine>,
     present: PresentPrincipalsFn,

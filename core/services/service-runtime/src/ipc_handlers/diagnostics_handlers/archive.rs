@@ -13,9 +13,10 @@ const MAX_EXPLAIN_SAMPLES: usize = 20;
 
 pub struct DiagnosticsExportArchiveHandler {
     diagnostics: Arc<dyn DiagnosticsFacade>,
-    /// Per-user destination directory for the zip archives. Sibling
-    /// of `logs/` and `audit/`, and closed to ordinary users like the rest of
-    /// the tree; `file_handoff` opens the finished file to its requester.
+    /// Destination directory for every requester's zip archives. Sibling of
+    /// `logs/` and `audit/`, and closed to ordinary users like the rest of the
+    /// tree; `file_handoff` opens each finished file to its requester alone.
+    /// A name carries the requester's tag so retention is per requester.
     archives_dir: PathBuf,
     /// App version string baked into the archive manifest.
     app_version: String,
@@ -353,6 +354,7 @@ impl CheckedIpcHandler for DiagnosticsExportArchiveHandler {
             Vec::new()
         };
         let health_enrichment = self.collect_health_enrichment(caller_sid);
+        let machine_wide = matches!(audience, DiagnosticsAudience::Machine);
 
         let now_ms = millis_since_epoch();
         std::fs::create_dir_all(&self.archives_dir)
@@ -360,7 +362,12 @@ impl CheckedIpcHandler for DiagnosticsExportArchiveHandler {
         // Archive filename: app version + UTC timestamp + sub-second millis, made
         // unique against an existing file. The version lets a triager tell
         // builds apart before opening the zip.
-        let dest_path = unique_archive_path(&self.archives_dir, &self.app_version, now_ms);
+        let dest_path = unique_archive_path(
+            &self.archives_dir,
+            &self.app_version,
+            now_ms,
+            ctx.caller_stored(),
+        );
 
         let input = ArchiveInput {
             health,
@@ -371,19 +378,27 @@ impl CheckedIpcHandler for DiagnosticsExportArchiveHandler {
             raw_log_files,
             explain_samples,
             system_info: self.system_info.clone(),
-            service_stderr: self.read_log_tail("nrr_service_stderr.log"),
-            broker_logs: [
-                nrr_platform_api::paths::BROKER_LOG_FILE,
-                nrr_platform_api::paths::BROKER_PREVIOUS_LOG_FILE,
-            ]
-            .into_iter()
-            .filter_map(|name| {
-                self.read_log_tail(name).map(|text| AttachedLog {
-                    name: name.to_string(),
-                    text,
+            // Raw process output and the broker's log are not scoped by owner,
+            // so only a machine-wide requester receives them.
+            service_stderr: machine_wide
+                .then(|| self.read_log_tail("nrr_service_stderr.log"))
+                .flatten(),
+            broker_logs: if machine_wide {
+                [
+                    nrr_platform_api::paths::BROKER_LOG_FILE,
+                    nrr_platform_api::paths::BROKER_PREVIOUS_LOG_FILE,
+                ]
+                .into_iter()
+                .filter_map(|name| {
+                    self.read_log_tail(name).map(|text| AttachedLog {
+                        name: name.to_string(),
+                        text,
+                    })
                 })
-            })
-            .collect(),
+                .collect()
+            } else {
+                Vec::new()
+            },
             request: archive_request,
         };
         let result = ArchiveBuilder::build(input, &dest_path)
@@ -417,7 +432,11 @@ impl CheckedIpcHandler for DiagnosticsExportArchiveHandler {
         // [`ARCHIVE_RETENTION_KEEP`]; the user-owned copy the launcher makes
         // in %TEMP%\NetRuleRouter is theirs to manage. Best-effort — a prune
         // failure never fails the export that just succeeded.
-        prune_old_archives(&self.archives_dir, ARCHIVE_RETENTION_KEEP);
+        prune_old_archives(
+            &self.archives_dir,
+            ARCHIVE_RETENTION_KEEP,
+            ctx.caller_stored(),
+        );
 
         let response = DiagnosticsExportArchiveResponse {
             archive_path: result.path.to_string_lossy().into_owned(),
@@ -429,15 +448,17 @@ impl CheckedIpcHandler for DiagnosticsExportArchiveHandler {
     }
 }
 
-/// How many finished archives the service
-/// keeps in its own `archives/` dir. Newest-first by modification time.
+/// How many finished archives the service keeps per requester in its own
+/// `archives/` dir. Newest-first by modification time.
 const ARCHIVE_RETENTION_KEEP: usize = 5;
 
-/// Delete all but the newest `keep` `nrr-diagnostics-*.zip` files in `dir`.
-/// Only files matching our own naming prefix are ever touched; anything else
-/// in the directory is left alone. Best-effort (I/O errors are logged and
+/// Delete all but the newest `keep` `nrr-diagnostics-*.zip` files `owner`
+/// exported (plus untagged older ones, which belong to nobody in particular).
+/// Another requester's archives neither count nor go; anything not matching
+/// our naming is left alone. Best-effort (I/O errors are logged and
 /// swallowed — retention must never break an export).
-pub(super) fn prune_old_archives(dir: &std::path::Path, keep: usize) {
+pub(super) fn prune_old_archives(dir: &std::path::Path, keep: usize, owner: &str) {
+    let tag = owner_tag(owner);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -447,6 +468,10 @@ pub(super) fn prune_old_archives(dir: &std::path::Path, keep: usize) {
             let name = e.file_name();
             let name = name.to_string_lossy();
             if !(name.starts_with("nrr-diagnostics-") && name.ends_with(".zip")) {
+                return None;
+            }
+            let stem = name.strip_suffix(".zip").unwrap_or(&name);
+            if tag_of(stem).is_some_and(|t| t != tag) {
                 return None;
             }
             let modified = e.metadata().and_then(|m| m.modified()).ok()?;
@@ -487,18 +512,37 @@ pub(super) fn unique_archive_path(
     dir: &std::path::Path,
     app_version: &str,
     now_ms: i64,
+    owner: &str,
 ) -> PathBuf {
+    let tag = owner_tag(owner);
     let ver = sanitize_for_filename(app_version);
     let ts = format_timestamp_for_filename(now_ms);
     let millis = now_ms.rem_euclid(1_000);
     let base = format!("nrr-diagnostics-v{ver}-{ts}-{millis:03}");
-    let mut path = dir.join(format!("{base}.zip"));
+    let mut path = dir.join(format!("{base}-{tag}.zip"));
     let mut n: u32 = 1;
     while path.exists() {
-        path = dir.join(format!("{base}-{n}.zip"));
+        path = dir.join(format!("{base}-{n}-{tag}.zip"));
         n = n.saturating_add(1);
     }
     path
+}
+
+/// A short stable tag of the requester, so a shared directory can tell whose
+/// archive is whose without putting the SID in a file name.
+fn owner_tag(owner: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(owner.as_bytes())[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The owner tag a file stem ends with, if it has one.
+fn tag_of(stem: &str) -> Option<&str> {
+    let last = stem.rsplit('-').next()?;
+    (last.len() == 8 && last.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .then_some(last)
 }
 
 /// Reduce a version string to a filename-safe token (ASCII alphanumerics plus

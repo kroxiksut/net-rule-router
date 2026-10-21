@@ -56,6 +56,7 @@ mod drop_observation;
 
 use nrr_platform_api::enforcement::{EgressBindingSource, PolicyEnforcer};
 use nrr_platform_linux::logind::LogindActivePrincipals;
+use nrr_platform_linux::logind_signals::{LogindLogonSessionObserver, LogindPowerEventObserver};
 use nrr_platform_linux::nft_policy_enforcer::NftPolicyEnforcer;
 use nrr_service_runtime::app_observation_lookup::{AppObservationLookup, AppObservationStore};
 use nrr_service_runtime::dns_observation_consumer::DnsObservationConsumer;
@@ -93,12 +94,19 @@ pub(crate) fn build_runtime_deps(
     dns_observation: Option<DnsObservationWiring>,
     adapter_source: Arc<nrr_platform_linux::adapters::LinuxAdapterSource>,
 ) -> SupervisedRuntimeDeps {
+    nrr_platform_linux::kernel_capabilities::probe_at_start();
+    nrr_service_runtime::platform_notices::install_source(
+        nrr_platform_linux::kernel_capabilities::reported_slugs,
+    );
+    nrr_service_runtime::boot_clock::install_source(nrr_platform_linux::boot_clock::since_boot);
     // The policy layer arrives whole rather than field by field: every piece of
     // it is present or absent together, and splitting it into arguments invited
     // a caller to pass half of one.
     if let Some(stack) = policy.as_ref() {
         stack.rules_provider.set_health(Arc::clone(&health));
     }
+    // The user whose book stops reading is told at once, alone.
+    nrr_service_runtime::rules_book_notice::attach_events(Arc::clone(&event_bus));
     let (
         enforcement,
         app_observations,
@@ -174,8 +182,22 @@ pub(crate) fn build_runtime_deps(
             cycle.tick_if_changed_logged("recompute");
         }) as RouteRecomputeHook
     });
-    // The resolver waits on this one before it answers, so it never settles
-    // for "unchanged".
+    // Learnt addresses wait a short window and share one pass, unless a leak
+    // guard is blocking.
+    let observation_recompute_hook: Option<RouteRecomputeHook> =
+        recompute_hook.clone().map(|hook| {
+            let posture = fail_closed_posture.clone();
+            nrr_service_runtime::recompute_window::gather(
+                hook,
+                Arc::new(move || {
+                    nrr_service_runtime::recompute_window::window_for(
+                        posture.as_ref().is_some_and(|p| p.armed()),
+                    )
+                }),
+            )
+        });
+    // A resolver request that brings a fact no pass input sees (a new
+    // exemption) waits on this one, so it never settles for "unchanged".
     let recompute_now: Option<RouteRecomputeHook> = enforcement.as_ref().map(|cycle| {
         let cycle = Arc::clone(cycle);
         Arc::new(move || {
@@ -258,6 +280,7 @@ pub(crate) fn build_runtime_deps(
         nrr_service_runtime::task_liveness::TaskLiveness::new(Arc::clone(&health))
             .with_event_bus(Arc::clone(&event_bus)),
     );
+    nrr_service_runtime::override_recheck::report_to(Arc::clone(&task_liveness));
     let dns_resolver_controller = match (
         state_conn.as_ref(),
         cache_store.as_ref(),
@@ -270,7 +293,8 @@ pub(crate) fn build_runtime_deps(
                 cache: Arc::clone(cache),
                 active_sid: Arc::clone(&routing_principal),
                 served_sids: served_principals.clone(),
-                recompute_hook: hook.clone(),
+                recompute_hook: recompute_hook.clone().unwrap_or_else(|| hook.clone()),
+                forced_recompute_hook: Some(hook.clone()),
                 known_direct: None,
                 block_all_armed: None,
                 // While the guard holds, a rule host's name is asked only
@@ -319,9 +343,9 @@ pub(crate) fn build_runtime_deps(
     if let Some(cycle) = enforcement.as_ref() {
         cycle.set_health(Arc::clone(&health));
     }
-    // No logind session stream yet: the enforcement pass already asks logind
-    // who is present every few seconds, so a resolver waiting for a sign-in
-    // (and one whose serve thread died) is looked after from there.
+    // Besides logind's user edges, the enforcement pass asks logind who is
+    // present every few seconds: a sign-in missed while the bus was down, and
+    // a resolver whose serve thread died, are looked after from there.
     if let (Some(cycle), Some(controller)) =
         (enforcement.as_ref(), dns_resolver_controller.as_ref())
     {
@@ -329,7 +353,15 @@ pub(crate) fn build_runtime_deps(
         // The tick also asks again while the arm waits: a binding is not a
         // sign-in, and nothing else would arm a resolver held back for one.
         controller.poll_for_sign_in();
-        cycle.set_presence_listener(Arc::new(move || controller.try_tick()));
+        // The pass just published the foreign tunnels the upstream must avoid.
+        let follow_tunnels =
+            crate::dns_stack::upstream_follower(&dns_capture, Arc::clone(&controller));
+        cycle.set_presence_listener(Arc::new(move || {
+            controller.try_tick();
+            if let Some(follow) = follow_tunnels.as_ref() {
+                follow();
+            }
+        }));
     }
     // What the operator saved through the settings page; the IPC surface
     // stores it, and without this read the daemon ran on the factory values.
@@ -380,23 +412,43 @@ pub(crate) fn build_runtime_deps(
         // this the cache never refreshes, and a rule naming a domain enforces
         // whatever addresses happened to be known when they were first learnt.
         dns_refresh_orchestrator: cache_store.zip(service_resolver).map(|(store, resolver)| {
-            Arc::new(
-                nrr_service_runtime::dns_refresh::DnsRefreshOrchestrator::new(
-                    Arc::new(nrr_platform_api::dns_budget::BudgetedDnsResolver::new(
-                        resolver,
-                    )),
-                    store,
+            let refresher = nrr_service_runtime::dns_refresh::DnsRefreshOrchestrator::new(
+                Arc::new(nrr_platform_api::dns_budget::BudgetedDnsResolver::new(
+                    resolver,
+                )),
+                store,
+            );
+            // Only hosts a rule names, or that were used lately, are worth
+            // re-resolving; the rest age out.
+            Arc::new(match rules_provider.clone() {
+                Some(rules) => refresher.with_use_gate(
+                    nrr_service_runtime::dns_refresh::rule_named_hosts(
+                        rules,
+                        Arc::new(|| {
+                            use nrr_platform_api::active_principals::ActivePrincipalSource;
+                            match LogindActivePrincipals.active_principals() {
+                                Ok(principals) => principals
+                                    .iter()
+                                    .map(|p| p.as_stored().to_owned())
+                                    .collect(),
+                                Err(_) => Vec::new(),
+                            }
+                        }),
+                    ),
+                    nrr_service_runtime::dns_refresh::REFRESH_USED_WITHIN,
                 ),
-            )
+                None => refresher,
+            })
         }),
         route_recompute_hook: recompute_hook.clone(),
+        observation_recompute_hook,
         route_teardown_hook: teardown_hook,
         // Both need the per-principal orchestrator's seeding path, which is not
         // ported. `None` skips the task; a stub would have the daemon claim work
         // it does not do.
         rule_hostname_seeder: rule_seeder,
-        // Windows names ONE console user here; on Linux the answer is a list, so
-        // the neutral tasks read `present_principals` below instead.
+        // The answer here is a list, so the neutral tasks read
+        // `present_principals` below instead.
         active_routing_sid: None,
         dns_observation_source: None,
         dns_observation_consumer: None,
@@ -409,7 +461,18 @@ pub(crate) fn build_runtime_deps(
         // tick and anything reading suggestions see one state rather than two.
         auto_rules_engine: auto_rules,
         auto_rule_probe: ipc.auto_probe,
-        secondary_external_address: None,
+        // The connect-time address notice, for the users who opted in.
+        secondary_external_address: match (state_conn.as_ref(), served_principals.clone()) {
+            (Some(conn), Some(served)) => Some(secondary_external_address(
+                &event_bus,
+                conn,
+                served,
+                Arc::clone(&adapter_source)
+                    as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+                liveness.clone(),
+            )),
+            _ => None,
+        },
         // `None` where systemd-resolved does not carry the machine's lookups.
         dns_resolver_controller,
         dns_resolver_mode: nrr_service_runtime::dns_stack::persisted_enforcement_mode(
@@ -436,12 +499,12 @@ pub(crate) fn build_runtime_deps(
             )),
             _ => None,
         },
-        // No Linux suspend/resume mechanism yet. The neutral resume watchdog
-        // below still recovers from a wake — just a few seconds later.
-        power_event_observer: None,
-        // TODO: no logind session-change stream yet — Mode B arms on the next
-        // periodic re-arm instead of on the sign-in edge.
-        logon_session_observer: None,
+        // logind's sleep edge. Where there is no logind the subscription
+        // fails once and the clock-gap watchdog is the only wake signal.
+        power_event_observer: Some(Arc::new(LogindPowerEventObserver)),
+        // logind's user edges: Mode B and the route pass follow a sign-in at
+        // once instead of on the next periodic re-arm.
+        logon_session_observer: Some(Arc::new(LogindLogonSessionObserver)),
         rebind_requests: recompute_hook
             .is_some()
             .then(|| Arc::new(nrr_service_runtime::power_resume::RebindRequests::new())),
@@ -538,6 +601,8 @@ pub(crate) fn build_ipc_server(
                     stack.conn_trace.ring(),
                     stack.app_enforcement.clone(),
                     stack.shared_ip_exemptions.clone(),
+                    Arc::clone(&stack.local_networks)
+                        as Arc<dyn nrr_service_runtime::local_network_source::LocalNetworkSource>,
                     stack.conn_trace_log.clone(),
                     verbosity,
                     // Beside the state database it signs, under the same `0700`.
@@ -556,6 +621,12 @@ pub(crate) fn build_ipc_server(
                     nrr_service_runtime::timed_window::now_ms(),
                 );
                 nrr_service_runtime::override_grants::install(Arc::clone(&surface.override_grants));
+                // The gateways of other VPNs each user let through, and the
+                // question that asks for them.
+                nrr_service_runtime::vpn_gateway_confirm::wire_production(
+                    Arc::clone(&stack.state_conn),
+                    Arc::clone(&event_bus),
+                );
                 // The service accounts a confirmation covers are read again when
                 // the set of units changes, never on an enforcement pass.
                 if let Some(rule_override) = surface.deps.rule_override.as_ref() {
@@ -754,9 +825,65 @@ fn secondary_liveness_hook(
                 continue;
             };
             let reachable = probe.is_reachable(next_hop, LIVENESS_PROBE_TIMEOUT);
-            tracker.record(link.index, reachable, std::time::Instant::now());
+            tracker.record(
+                link.index,
+                reachable,
+                nrr_service_runtime::boot_clock::BootInstant::now(),
+            );
         }
     })
+}
+
+/// The external-address notice for the users who opted in. There is no route
+/// coordinator here, so a user's link is the adapter their binding names, up,
+/// with an IPv4, and not declared dead by the liveness probe.
+fn secondary_external_address(
+    event_bus: &Arc<EventBus>,
+    state_conn: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    served: nrr_service_runtime::secondary_external_address::ServedSidsFn,
+    adapters: Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+    liveness: Option<Arc<SecondaryLivenessTracker>>,
+) -> nrr_service_runtime::secondary_external_address::ExternalAddressWiring {
+    use nrr_service_runtime::secondary_external_address::{
+        bound_secondary_link, stored_opt_in, ExternalAddressAnnouncer, ExternalAddressWiring,
+        SecondaryLinkOfFn,
+    };
+    let announcer = Arc::new(ExternalAddressAnnouncer::new(
+        Arc::clone(event_bus),
+        Arc::new(|source| {
+            nrr_platform_api::probe_external_ipv4_batch(&[source])
+                .first()
+                .and_then(|outcome| outcome.address())
+        }),
+    ));
+    let link_of: SecondaryLinkOfFn = {
+        let conn = Arc::clone(state_conn);
+        Arc::new(move |sid: &str| {
+            let bound = {
+                let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                nrr_storage::RouteBindingsRepository::new(&guard)
+                    .load_for_sid(sid)
+                    .ok()?
+                    .secondary?
+                    .display_name
+            };
+            let links = adapters.enumerate_all().ok()?;
+            let link = bound_secondary_link(sid, &links, &bound)?;
+            let dead = liveness.as_ref().is_some_and(|tracker| {
+                tracker.is_dead(
+                    link.interface_index,
+                    nrr_service_runtime::boot_clock::BootInstant::now(),
+                )
+            });
+            (!dead).then_some(link)
+        })
+    };
+    ExternalAddressWiring {
+        announcer,
+        served,
+        opted_in: stored_opt_in(Arc::clone(state_conn)),
+        link_of,
+    }
 }
 
 /// How long the tunnel's next hop gets to answer. Short: the tick runs every few
@@ -930,6 +1057,9 @@ pub(crate) struct PolicyStack {
     /// The addresses the smart leak-guard spared: the planner writes, the IPC
     /// surface reads.
     pub shared_ip_exemptions: nrr_service_runtime::app_enforcement_status::SharedIpExemptionStatus,
+    /// The networks the user keeps reachable under the guard: the planner
+    /// honours the answers, the IPC surface lists and records them.
+    pub local_networks: Arc<nrr_service_runtime::local_network_source::PolicyLocalNetworkSource>,
     /// Whether the guard holds destinations back: the cycle writes it every
     /// pass, the resolver reads it before answering a rule host.
     pub fail_closed_posture: nrr_service_runtime::app_enforcement_status::FailClosedPostureStatus,
@@ -1059,21 +1189,18 @@ pub(crate) fn build_policy_stack(
     // Whose routes the service accounts follow, recorded by each pass before
     // the enforcer runs; machine-scope filters follow the same user.
     let route_owner = Arc::new(nrr_service_runtime::route_table_owner::RouteTableOwner::default());
-    // The hosts-file bypass follows the route-table owner's setting, as the
-    // active routing user's does on the other platform; nobody signed in, or an
-    // unreadable row, reads as the default (bypass on).
+    // The hosts-file bypass is on while any served user wants it; nobody
+    // served, or an unreadable row, reads as the default (bypass on).
     let hosts_bypass: Arc<dyn Fn() -> bool + Send + Sync> = {
         let owner = Arc::clone(&route_owner);
         let conn = Arc::clone(&state_conn);
         Arc::new(move || {
-            let Some(principal) = owner.current() else {
-                return true;
-            };
-            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-            nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
-                .load_for_sid(principal.as_stored())
-                .map(|record| record.resolve_hosts_bypass)
-                .unwrap_or(true)
+            let users: Vec<String> = owner
+                .served()
+                .iter()
+                .map(|p| p.as_stored().to_owned())
+                .collect();
+            nrr_service_runtime::hosts_bypass::stored_bypass_wanted_by_any(&conn, &users)
         })
     };
     let service_resolver = crate::dns_stack::rule_host_resolver(
@@ -1115,7 +1242,9 @@ pub(crate) fn build_policy_stack(
         NftPolicyEnforcer::new(Arc::clone(&bindings), Arc::clone(&adapter_port))
             .with_liveness({
                 let liveness = Arc::clone(&liveness);
-                Arc::new(move |ifindex| !liveness.is_dead(ifindex, std::time::Instant::now()))
+                Arc::new(move |ifindex| {
+                    !liveness.is_dead(ifindex, nrr_service_runtime::boot_clock::BootInstant::now())
+                })
             })
             // Service accounts follow the route-table owner's address pins.
             .with_service_accounts({
@@ -1261,11 +1390,28 @@ pub(crate) fn build_policy_stack(
     let app_folders = Arc::new(nrr_platform_api::app_folders::ProgramFolderIndex::new(
         Arc::new(nrr_platform_linux::app_folders::LinuxProgramFolders::new()),
     ));
+    // The "Local networks" list and the planner's exemptions read the same
+    // stored answers over the same route table.
+    let local_networks = Arc::new(
+        nrr_service_runtime::local_network_source::PolicyLocalNetworkSource::new(
+            Arc::new(nrr_platform_linux::LinuxApi),
+            Arc::clone(&adapter_port),
+            Arc::clone(&policy),
+            Arc::clone(&rules),
+            Arc::clone(&fqdn_cache),
+            nrr_service_runtime::production_local_networks::stored_local_network_policy(
+                Arc::clone(&state_conn),
+            ),
+        ),
+    );
+    // This planner publishes each principal's disposition, so the DNS path can
+    // tell "first plan pending" from "nothing carries IPv6".
+    nrr_service_runtime::ipv6_disposition::global_ipv6_dispositions().expect_plans();
     let plan_source = Arc::new(
         ProductionPrincipalPlanSource::new(
             rules,
             Arc::clone(&policy),
-            fqdn_cache,
+            Arc::clone(&fqdn_cache),
             Arc::new(
                 nrr_platform_linux::app_path_resolver::LinuxAppPathResolver::with_program_folders(
                     Arc::clone(&app_folders),
@@ -1280,6 +1426,7 @@ pub(crate) fn build_policy_stack(
             Arc::new(nrr_platform_linux::LinuxApi),
             Arc::clone(&adapter_port),
         )
+        .with_local_networks(Arc::clone(&local_networks))
         .with_own_route_tables(Arc::new(|table: &nrr_platform_api::RouteTableRef| {
             matches!(table, nrr_platform_api::RouteTableRef::Tagged(n)
                 if nrr_platform_linux::policy_routing::is_our_table(*n))
@@ -1407,9 +1554,19 @@ pub(crate) fn build_policy_stack(
     let pass_inputs = {
         use nrr_platform_api::route_table::RouteTablePort;
         use nrr_service_runtime::pass_inputs::{
-            applying_revision, hashed, rule_overrides, table_writes, verify_verdicts, PassInputs,
-            PLAN_BLIND_STATE_TABLES,
+            applying_revision, change_hashed, hashed, rule_overrides, table_writes,
+            verify_verdicts, PassInputs, PLAN_BLIND_STATE_TABLES,
         };
+        // Routes and adapters are read again only after the kernel reports a
+        // change; a refused subscription leaves them read per call.
+        let net_change = nrr_platform_api::net_change::NetChangeGeneration::new();
+        let net_subscription = net_change.follow(&LinuxNetworkChangeObserver);
+        let (adapters_cached, _) = change_hashed(net_change.clone(), move || {
+            adapter_port_for_inputs.enumerate_all()
+        });
+        let (routes_cached, routes_fresh) = change_hashed(net_change, || {
+            nrr_platform_linux::LinuxApi.get_ip_forward_table()
+        });
         let cache = Arc::clone(&cache_store);
         let observations = Arc::clone(&app_observations);
         PassInputs::new()
@@ -1432,14 +1589,14 @@ pub(crate) fn build_policy_stack(
                 let folders = Arc::clone(&app_folders);
                 Arc::new(move || Some(folders.generation()))
             })
-            .with_source(
-                "adapters",
-                hashed(move || adapter_port_for_inputs.enumerate_all()),
-            )
-            .with_own_writes_source(
-                "routes",
-                hashed(|| nrr_platform_linux::LinuxApi.get_ip_forward_table()),
-            )
+            .with_source("adapters", {
+                // Owns the subscription: the feed lives as long as the source.
+                Arc::new(move || {
+                    let _feed = &net_subscription;
+                    adapters_cached()
+                })
+            })
+            .with_cached_own_writes_source("routes", routes_cached, routes_fresh)
             // A VPN's rule landing in front of ours moves nothing else a pass
             // reads. Not an own-writes source: a rule landing mid-pass would be
             // absorbed at settle and wait for the next full pass.
@@ -1554,6 +1711,7 @@ pub(crate) fn build_policy_stack(
         stale_flow_reset: Some(Arc::new(
             nrr_platform_linux::stale_flows::LinuxStaleFlowReset::new(),
         )),
+        flow_reset_census: Some(Arc::clone(&fqdn_cache)),
     };
 
     let cycle = Arc::new(
@@ -1569,7 +1727,11 @@ pub(crate) fn build_policy_stack(
             .with_dns_cache_control(dns_cache_control)
             .with_pass_inputs(pass_inputs)
             .with_flow_reset(flow_reset)
-            .with_paused_principals(paused_principals),
+            .with_paused_principals(paused_principals)
+            .with_keep_routes_when_paused({
+                let state_db_path = artifacts.topology.state_db_path.clone();
+                Arc::new(move || keep_rule_routes_on_stop(&state_db_path))
+            }),
     );
     // A program that appeared in a rule's folder is covered without a restart:
     // the index's worker asks for one pass, after the folder went quiet.
@@ -1582,9 +1744,20 @@ pub(crate) fn build_policy_stack(
         })
     });
 
+    // A full reset must empty what these hold in memory, or they write it back.
+    nrr_service_runtime::principal_reset::register(
+        &(auto_rules.clone()
+            as Arc<dyn nrr_service_runtime::principal_reset::PrincipalStateHolder>),
+    );
+    nrr_service_runtime::principal_reset::register(
+        &(block_notice_center.clone()
+            as Arc<dyn nrr_service_runtime::principal_reset::PrincipalStateHolder>),
+    );
+
     Some(PolicyStack {
         app_enforcement,
         shared_ip_exemptions,
+        local_networks,
         fail_closed_posture: fail_closed_posture.clone(),
         drop_observation,
         block_notice_center,

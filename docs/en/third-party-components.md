@@ -18,6 +18,7 @@ checksum, and who signed it.
 |-----------|--------|---------|-----------|----------------|
 | Wintun | WireGuard LLC | Wintun Prebuilt Binaries License | Windows only | Per-site virtual addresses (fake-IP) |
 | Tabler Icons | Tabler | MIT | All | The icons in the interface |
+| Qt | The Qt Company and contributors | LGPLv3 | Windows packages (Linux uses the system's) | The graphical interface |
 
 Nothing else is shipped as a separate file. The Rust libraries the application
 is built from are compiled into its executables and are covered by permissive
@@ -47,6 +48,16 @@ Practical consequences:
 The icons in the interface come from the Tabler set, under the MIT licence,
 which asks only that the authors are credited — which is what the Licenses
 window does. The application's own logo is not part of that set.
+
+### Qt
+
+The graphical interface is built with Qt. The Windows packages carry its
+libraries as ordinary shared libraries, unmodified, under the GNU Lesser General
+Public License version 3. You may replace them with a build of your own from the
+same Qt version; the Qt source code is available from <https://download.qt.io/>.
+The packages include the licence texts and a short notice in the `licenses`
+folder. On Linux the interface uses the Qt of your distribution, and the
+terminal tools and the service do not use Qt at all.
 
 ## Checking that a component is genuine
 
@@ -83,9 +94,16 @@ repository:
 
 - [`THIRD_PARTY_LICENSES.md`](../../THIRD_PARTY_LICENSES.md) — the notice that
   travels with every distribution
+- [`third_party/qt/NOTICE.txt`](../../third_party/qt/NOTICE.txt) — the Qt
+  notice; the Windows packages also carry the full LGPLv3 and GPLv3 texts in
+  their `licenses` folder
 - [`third_party/wintun/LICENSE.txt`](../../third_party/wintun/LICENSE.txt) —
   Wintun, verbatim
 - [`third_party/wintun/PROVENANCE.md`](../../third_party/wintun/PROVENANCE.md) —
   where the files came from, their checksums, and how to re-verify them
+- [`third_party/tappers/`](../../third_party/tappers/PROVENANCE.md) — the
+  `tappers` library by Nathaniel Bennett (MIT or Apache-2.0), compiled into the
+  Linux build for the fake-IP feature and kept in the repository as unmodified
+  source, with its licence texts and where it came from
 - [`assets/icons/THIRD_PARTY.md`](../../assets/icons/THIRD_PARTY.md) — the icon
   set attribution

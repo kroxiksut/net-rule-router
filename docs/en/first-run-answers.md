@@ -1,8 +1,10 @@
 # Answering the setup questions ahead of time
 
+**English** · [Русский](../ru/first-run-answers.md)
+
 The first time NetRuleRouter starts it asks a short set of questions: which
-connections to use, whether to arm the protections, and which rule set to begin
-with. If those answers are already known — an installer collected them, or a
+connections to use, how strongly to protect against leaks, and which rule set
+to begin with. If those answers are already known — an installer collected them, or a
 portable copy is being prepared for several machines — they can be supplied in a
 file, and the setup window does not appear.
 
@@ -10,13 +12,17 @@ file, and the setup window does not appear.
 
 Name it `first-run.json` and put it in either place:
 
-- next to `NetRuleRouter.exe` (portable copy, or an installer's program folder);
-- in the machine data folder, `%ProgramData%\NetRuleRouter\`. Once the service
-  has started for the first time this folder belongs to it and only an
-  administrator can write there, so this placement is for an administrator
-  preparing a machine — put the file beside the executable otherwise.
+- next to the program (`NetRuleRouter.exe` on Windows, `netrulerouter` on
+  Linux): a portable copy, or an installer's program folder;
+- in the machine folder: `%ProgramData%\NetRuleRouter\` on Windows,
+  `/etc/netrulerouter/` on Linux. Only an administrator can write there, so
+  this placement is for an administrator preparing a machine — put the file
+  beside the program otherwise. On Linux the file, its folder and every folder
+  above it must belong to root and be writable by nobody else, which
+  `sudo install -D -m 644 first-run.json /etc/netrulerouter/first-run.json`
+  gives you; a file anyone else could have changed is ignored.
 
-The folder next to the executable wins when both exist.
+The folder next to the program wins when both exist.
 
 ## What it contains
 
@@ -24,7 +30,7 @@ The folder next to the executable wins when both exist.
 {
   "primary-connection": "Ethernet",
   "secondary-connection": "hidemy.name VPN",
-  "kill-switch": true,
+  "leak-protection": "sites",
   "doh-lockdown": true,
   "fake-ip": true,
   "rule-set": "ru/osnovnoy-i-zarubezh",
@@ -36,7 +42,7 @@ The folder next to the executable wins when both exist.
 |---|---|
 | `primary-connection` | Name of the connection everything travels by default. Matched against the connection name Windows shows, or the adapter description. |
 | `secondary-connection` | Name of the additional connection your rules send traffic to. |
-| `kill-switch` | `true` holds traffic rather than letting it leak out the main connection while the additional one is down. |
+| `leak-protection` | What happens while the additional connection is down: `"off"` lets traffic continue over the main connection; `"sites"` keeps what your rules send through the additional connection from going out the main one; `"everything"` holds all traffic except your local network and what your rules send over the main connection. When the additional connection is the default route, `"sites"` is taken as `"everything"`. |
 | `doh-lockdown` | `true` keeps browsers from resolving routed sites past NetRuleRouter. |
 | `fake-ip` | `true` routes sites by name, so an address shared with another site is not dragged along. |
 | `rule-set` | Bundled rule set to start from, as `<country>/<pack>`. Use `"none"` to start with an empty table. |
@@ -47,7 +53,7 @@ than half-applied, so a typo cannot quietly leave a protection off.
 
 ## When the setup window still appears
 
-The window is skipped only when `kill-switch`, `doh-lockdown`, `fake-ip` and
+The window is skipped only when `leak-protection`, `doh-lockdown`, `fake-ip` and
 `rule-set` are all answered. The two connection names are not part of that bar:
 a VPN adapter usually does not exist until its client connects for the first
 time, so an installer cannot name it in advance. A connection named in the file

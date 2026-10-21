@@ -23,7 +23,9 @@ Notifications:
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the listed programs as your VPN, so leak protection keeps them working
+  a: allow the listed VPNs to reach their servers, so leak protection lets them connect
   p: confirm the suggested main connection; another one is chosen under Interfaces and routes
+  v: send the blocked site named under the state over the additional route; you are asked first
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Suggested addresses
@@ -56,7 +58,7 @@ Addresses your sites need:
   Sort: What the main route can't reach first
   Show answered (1): No
   Show ones the main connection already handles (1): No
-Suggested addresses:
+Suggested addresses (3):
   1. example.org — Pending (1)
      Needed by: news.example, shop.example
      *.video.example.org — Pending; connections to it stall on the main route
@@ -90,7 +92,7 @@ Addresses your sites need:
   Sort: What the main route can't reach first
   Show answered (1): No
   Show ones the main connection already handles (1): No
-Suggested addresses:
+Suggested addresses (3):
   1. example.org — Pending (1)
      Needed by: news.example, shop.example
      *.video.example.org — Pending; connections to it stall on the main route
@@ -126,7 +128,7 @@ Addresses your sites need:
   Show answered (1): No
   Show ones the main connection already handles (1): No
   There is no item 9 in the list. Use the number shown before an item.
-Suggested addresses:
+Suggested addresses (3):
   1. example.org — Pending (1)
      Needed by: news.example, shop.example
      *.video.example.org — Pending; connections to it stall on the main route
@@ -163,7 +165,7 @@ Addresses your sites need:
   Turn on “Apply automatically”?
   From now on NetRuleRouter will add suggested addresses to your rules files by itself, without asking. You can undo this anytime by switching back to “Suggest only”.
   y: turn it on and add item 1. n: cancel.
-Suggested addresses:
+Suggested addresses (3):
   1. example.org — Pending (1)
      Needed by: news.example, shop.example
      *.video.example.org — Pending; connections to it stall on the main route
@@ -198,7 +200,7 @@ Addresses your sites need:
   Show answered (1): No
   Show ones the main connection already handles (1): No
   Nothing was changed.
-Suggested addresses:
+Suggested addresses (3):
   1. example.org — Pending (1)
      Needed by: news.example, shop.example
      *.video.example.org — Pending; connections to it stall on the main route
@@ -234,7 +236,7 @@ Addresses your sites need:
   Show ones the main connection already handles (1): No
   Checking...
   Nothing was changed.
-Suggested addresses:
+Suggested addresses (3):
   1. example.org — Pending (1)
      Needed by: news.example, shop.example
      *.video.example.org — Pending; connections to it stall on the main route

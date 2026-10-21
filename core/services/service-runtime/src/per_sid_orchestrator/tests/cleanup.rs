@@ -36,6 +36,7 @@ fn only_permitted_addresses_are_published_as_enforced() {
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     };
     let permitted = Ipv4Addr::new(203, 0, 113, 158);
     let packed = Ipv4Addr::new(203, 0, 113, 142);
@@ -79,6 +80,7 @@ fn seeded_block_permit_block(session: &WfpSession, api: &MockWindowsApi) {
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     };
     let permit = |raw: u64| WfpFilterSpec {
         action: WfpAction::Permit,

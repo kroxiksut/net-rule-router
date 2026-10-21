@@ -58,11 +58,6 @@ pub struct ExplainGetResponse {
     /// fields preserved). May be `null` when the underlying explain is
     /// `Unavailable` and the service decides to short-circuit.
     pub full: serde_json::Value,
-    /// Audit-log diagnostic-id correlations enriched by the service
-    /// AFTER the engine produced the outcome. Empty for synthetic
-    /// queries.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub diagnostic_ids: Vec<String>,
 }
 
 /// Compact 3-field view rendered today by `DiagnosticsSection.qml`.
@@ -78,14 +73,11 @@ pub struct ExplainCompactViewDto {
     pub route: String,
     /// Localisation key for the reason. The GUI resolves via `tr(key)`.
     pub reason_key: String,
-    /// Kill-switch ENFORCEMENT verdict on top of the rule
-    /// verdict, so the probe stops saying "primary" for a host the armed
-    /// block-all would in fact drop. Slug, empty
-    /// when nothing applies: `blocked-unknown-under-block-all` (coverage =
-    /// fail-closed-unknown, kill-switch on, hostname absent from the FQDN
-    /// cache → no permit compiles while armed) |
-    /// `fail-closed-when-secondary-down` (secondary-routed host under an
-    /// enabled fail-closed kill-switch). Also covers the shared-IP
+    /// Leak-protection ENFORCEMENT verdict on top of the rule verdict, so the
+    /// probe does not say "primary" for a host protection would in fact drop.
+    /// Slug, empty when nothing applies:
+    /// `fail-closed-when-secondary-down` (secondary-routed host while leak
+    /// protection is on). Also covers the shared-IP
     /// collateral slugs: `collateral-blocked-strict` (strict policy — the
     /// host's census-shared IPs stay pinned, so it is cut whenever the
     /// secondary is down) | `collateral-smart-exempt` (smart policy — shared
@@ -385,7 +377,7 @@ pub struct ConnTraceEntryDto {
     #[serde(default)]
     pub blocked_by: String,
     /// Which of our filters dropped it — a `BlockReason` slug
-    /// (`route-unavailable`, `not-covered-by-rules`, `blocked-by-rule`,
+    /// (`route-unavailable`, `blocked-by-rule`,
     /// `ipv6-blocked`, `dns-lockdown`, `unattributed`); empty for anything that
     /// is not our drop. The GUI words it the way the block notice does.
     #[serde(default)]

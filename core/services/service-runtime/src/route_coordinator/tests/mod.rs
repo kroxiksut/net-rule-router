@@ -106,6 +106,8 @@ struct FakePolicy {
     secondary_names: Mutex<std::collections::HashMap<String, String>>,
     modes:
         Mutex<std::collections::HashMap<String, crate::per_sid_orchestrator::PerSidBehaviorMode>>,
+    /// How many times a policy was read, to hold a pass to one load.
+    loads: std::sync::atomic::AtomicUsize,
 }
 impl FakePolicy {
     fn new() -> Self {
@@ -114,7 +116,11 @@ impl FakePolicy {
             primary_by_sid: Mutex::new(std::collections::HashMap::new()),
             secondary_names: Mutex::new(std::collections::HashMap::new()),
             modes: Mutex::new(std::collections::HashMap::new()),
+            loads: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+    fn loads(&self) -> usize {
+        self.loads.load(std::sync::atomic::Ordering::SeqCst)
     }
     /// `sid`'s behaviour mode; unset is the default, mode A.
     fn set_mode(&self, sid: &str, mode: crate::per_sid_orchestrator::PerSidBehaviorMode) {
@@ -155,6 +161,7 @@ impl FakePolicy {
 impl RoutePolicySource for FakePolicy {
     fn load_for_sid(&self, sid: &str) -> Option<crate::per_sid_orchestrator::PerSidPolicySnapshot> {
         use crate::per_sid_orchestrator::{PerSidBinding, PerSidPolicySnapshot};
+        self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let stable = self.by_sid.lock().unwrap().get(sid).cloned()?;
         let primary = self
             .primary_by_sid
@@ -175,6 +182,23 @@ impl RoutePolicySource for FakePolicy {
             .get(sid)
             .cloned()
             .unwrap_or_default();
+        let mode = self
+            .modes
+            .lock()
+            .unwrap()
+            .get(sid)
+            .copied()
+            .unwrap_or(crate::per_sid_orchestrator::PerSidBehaviorMode::PreferPrimary);
+        // Protection on, so the tests reach the armed leak-guard path; `sites`
+        // exists only under the main default route.
+        let leak_protection = match mode {
+            crate::per_sid_orchestrator::PerSidBehaviorMode::PreferPrimary => {
+                nrr_domain::LeakProtection::Sites
+            }
+            crate::per_sid_orchestrator::PerSidBehaviorMode::PreferSecondaryWhenAvailable => {
+                nrr_domain::LeakProtection::Everything
+            }
+        };
         Some(PerSidPolicySnapshot {
             primary,
             secondary: (!stable.is_empty()).then(|| PerSidBinding {
@@ -183,25 +207,12 @@ impl RoutePolicySource for FakePolicy {
                 user_confirmed: true,
                 known_stable_ids: Vec::new(),
             }),
-            mode: self
-                .modes
-                .lock()
-                .unwrap()
-                .get(sid)
-                .copied()
-                .unwrap_or(crate::per_sid_orchestrator::PerSidBehaviorMode::PreferPrimary),
-            block_secondary_when_unavailable: false,
-            kill_switch_fail_closed: true,
+            mode,
+            leak_protection,
             kill_switch_protocols: 0x7F,
-            kill_switch_block_all: false,
-            // this fake feeds route-coordinator tests that assert the
-            // armed leak-guard path; keep the master toggle ON so their
-            // expectations hold under the new opt-in gate.
-            kill_switch_enabled: true,
             allow_dns_over_primary: false,
             shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
             kill_switch_strict_shared_ips: true,
-            mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy::default(),
             link_provider_exe_paths: Vec::new(),
             doh_lockdown_enabled: false,
             doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
@@ -289,8 +300,10 @@ fn adapter(stable_seed: &str, idx: u32, up: bool, ipv4: bool, gw: Option<[u8; 4]
 mod binding_identity;
 mod first_contact_and_probe;
 mod foreign_tunnels;
+mod guest_networks;
 mod multi_user;
 mod offers_and_paused;
 mod primary_way_out;
+mod read_counts;
 mod recompute;
 mod sid_and_notices;

@@ -48,3 +48,28 @@ pub fn notice_step(was_raised: bool, not_restored: bool) -> NoticeStep {
         raised: not_restored,
     }
 }
+
+/// What the `adapters` health message opens with when a full-tunnel VPN lets
+/// only its own resolver answer (`DNS_ONLY_FOREIGN_RESOLVER` in `nrr-shared`).
+pub const DNS_ONLY_FOREIGN_RESOLVER: &str = nrr_shared::ipc_payloads::DNS_ONLY_FOREIGN_RESOLVER;
+
+/// Whether a health answer says only another VPN's resolver answers, so the
+/// service's name handling is lifted (`dnsUpstreamForeignOnly`).
+pub fn upstream_foreign_only(health: &Value) -> bool {
+    let Some(Value::Array(components)) = health.get("components") else {
+        return false;
+    };
+    components.iter().any(|component| {
+        component.get("component") == Some(&Value::String("adapters".to_owned()))
+            && component
+                .get("message")
+                .filter(|m| js::is_truthy(m))
+                .is_some_and(|m| js::to_display_string(m).starts_with(DNS_ONLY_FOREIGN_RESOLVER))
+    })
+}
+
+/// Same step as [`notice_step`], for the foreign-resolver state
+/// (`dnsUpstreamForeignNoticeStep`).
+pub fn foreign_only_notice_step(was_raised: bool, foreign_only: bool) -> NoticeStep {
+    notice_step(was_raised, foreign_only)
+}

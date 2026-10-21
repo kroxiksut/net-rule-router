@@ -34,7 +34,7 @@ Frame {
     // Optional enforcement caveat carried on the compact explain
     // response (`enforcement` slug; "" = none). When set, the probe surfaces a
     // second amber line warning that although the route resolved, the flow may
-    // currently be BLOCKED (block-all-unresolved, or fail-closed while the
+    // currently be BLOCKED (leak protection holding it while the
     // additional adapter is down). Cleared on every new probe / error.
     property string _probeEnforcement: ""
     // For the shared-IP collateral slugs: how many of the
@@ -91,7 +91,7 @@ Frame {
             : root.tr("label.secondary", "Additional")
         // Only genuinely-blocking caveats flip the status:
         // the smart-exempt and risk slugs describe a caveat on an ALLOWED flow.
-        var blocking = panel._probeEnforcement === "blocked-unknown-under-block-all"
+        var blocking = panel._probeEnforcement === "everything-waits-when-secondary-down"
             || panel._probeEnforcement === "fail-closed-when-secondary-down"
             || panel._probeEnforcement === "collateral-blocked-strict"
         var statusWord = blocking
@@ -274,7 +274,7 @@ Frame {
             wrapMode: Text.WordWrap
         }
         // Enforcement caveat — the route resolved, but the flow may
-        // currently be BLOCKED (block-all-unresolved, or fail-closed while
+        // currently be BLOCKED (leak protection holding it while
         // the additional adapter is down). Amber, second line under the route.
         Label {
             Layout.fillWidth: true

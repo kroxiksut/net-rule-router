@@ -335,3 +335,27 @@ fn one_address_is_one_offer_however_many_sites_pull_it() {
     f.engine.dismiss(SID, &[candidates[0].id.clone()], later());
     assert_eq!(f.engine.tick(SID, later()).pending, 0);
 }
+
+/// The user declined elevation, so the service keeps running after a reset:
+/// what it learned must go with the rows, or the next tick writes it back.
+#[test]
+fn a_full_reset_while_the_service_runs_is_not_written_back() {
+    use crate::principal_reset::PrincipalStateHolder;
+    let evidence = Arc::new(InMemoryEvidenceStore::new());
+    let f = fixture_with_evidence_store(Arc::clone(&evidence));
+    two_visits(&f.engine, &["cdn.example"]);
+    f.engine.tick(SID, later());
+    assert!(evidence.load(SID).is_some(), "evidence was saved");
+    assert!(f.engine.pending_count(SID) > 0 || !f.engine.candidates(SID).is_empty());
+
+    // The rows are erased, then the holder is told.
+    evidence.clear(SID);
+    f.engine.forget_principal(SID);
+    f.engine.tick(SID, later() + Duration::from_secs(120));
+
+    assert!(
+        evidence.load(SID).is_none(),
+        "the tick must not rewrite what the reset erased"
+    );
+    assert!(f.engine.candidates(SID).is_empty(), "no offer survives");
+}

@@ -26,7 +26,7 @@ ScrollView {
     readonly property var logHealth: diag.logHealth || ({})
     // The service could not be asked: every card is a placeholder, and a
     // placeholder's `false` is not a verdict.
-    readonly property bool statusUnknown: diag.origin === "unavailable"
+    readonly property bool statusUnknown: diag.origin === "unavailable" || diag.origin === "preview"
     readonly property string noDataText: root.tr("diag.status.no-data",
         "No data from the service yet")
 
@@ -189,6 +189,8 @@ ScrollView {
     property string _realActiveRevisionId: ""
     // The service reports it could not hand the system DNS back.
     property bool _dnsNotRestored: false
+    // The service holds the last applied rules: a stored book did not read.
+    property bool _rulesBookUnreadable: false
 
     function _refreshServiceHealth() {
         if (!root.bridgeAvailable
@@ -198,6 +200,7 @@ ScrollView {
             _realServiceState = "unavailable"
             _realActiveRevisionId = ""
             _dnsNotRestored = false
+            _rulesBookUnreadable = false
             return
         }
         _refreshCacheTotal()
@@ -207,9 +210,11 @@ ScrollView {
                 section._realServiceState = "unavailable"
                 section._realActiveRevisionId = ""
                 section._dnsNotRestored = false
+                section._rulesBookUnreadable = false
                 return
             }
             section._dnsNotRestored = Pure.systemDnsNotRestored(payload)
+            section._rulesBookUnreadable = Pure.rulesBookUnreadable(payload)
             section._realServiceState = String(
                 (payload && payload["service-state"])
                 || (payload && payload.service_state) || "unavailable")
@@ -381,7 +386,7 @@ ScrollView {
     Timer {
         id: serviceHealthRepoll
         interval: 5000
-        running: true
+        running: section.visible && Qt.application.state === Qt.ApplicationActive
         repeat: true
         onTriggered: section._refreshServiceHealth()
     }
@@ -591,6 +596,14 @@ ScrollView {
                         "System DNS could not be restored. Use Settings -> Service management -> Restore network.")
                     color: root.uiTheme.colorDanger
                 }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    visible: section._rulesBookUnreadable
+                    text: root.tr("diag.service.rules-book-unreadable",
+                        "The service could not read saved rules. The rules applied last stay in force until it can.")
+                    color: root.uiTheme.colorAccent
+                }
                 // "Did this slow my start-up" is what a background service gets
                 // blamed for, so the card answers with the measurement rather
                 // than with a claim. Hidden when the host cannot tell — an
@@ -600,6 +613,87 @@ ScrollView {
                     wrapMode: Text.WordWrap
                     visible: section._bootTimingText() !== ""
                     text: section._bootTimingText()
+                    color: root.mutedTextColor
+                }
+            }
+        }
+
+        // What this computer cannot do (or a foreign setup blocks): the service
+        // names it, the texts live in the locale files per slug.
+        Frame {
+            id: missingCapabilitiesCard
+            readonly property var slugs: diag.missingCapabilities || []
+            Layout.fillWidth: true
+            visible: slugs.length > 0
+            padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
+            background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
+            Accessible.role: Accessible.Grouping
+            Accessible.name: root.tr("platform.missing.heading", "Not available on this computer")
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: root.uiTheme.spacingSm - root.uiTheme.spacingXxs
+                Label {
+                    text: root.tr("platform.missing.heading", "Not available on this computer")
+                    color: root.textColor
+                    font.bold: true
+                }
+                Repeater {
+                    model: missingCapabilitiesCard.slugs
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: root.uiTheme.spacingXxs
+                        Label {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: root.tr("platform.missing." + modelData + ".title", modelData)
+                            color: root.textColor
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: root.tr("platform.missing." + modelData + ".effect", "")
+                            color: root.mutedTextColor
+                        }
+                    }
+                }
+            }
+        }
+
+        // The provider's resolver gave unusable answers while another one
+        // answered clean: the user learns it is handled, not that it broke.
+        Frame {
+            id: dnsTamperCard
+            readonly property int hosts: Number((diag.dnsTamper || {}).affectedHosts || 0)
+            readonly property var names: (diag.dnsTamper || {}).examples || []
+            Layout.fillWidth: true
+            visible: hosts > 0
+            padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
+            background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
+            Accessible.role: Accessible.Grouping
+            Accessible.name: root.tr("diag.dns-tamper.heading", "Your provider changes some DNS answers")
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: root.uiTheme.spacingXxs
+                Label {
+                    text: root.tr("diag.dns-tamper.heading", "Your provider changes some DNS answers")
+                    color: root.textColor
+                    font.bold: true
+                }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    text: root.tr("diag.dns-tamper.body",
+                        "For {count} sites the provider's name lookup gave an unusable answer. NetRuleRouter asked another resolver and routes those sites correctly anyway.")
+                        .replace("{count}", String(dnsTamperCard.hosts))
+                    color: root.mutedTextColor
+                }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    textFormat: Text.PlainText
+                    visible: dnsTamperCard.names.length > 0
+                    text: root.tr("diag.dns-tamper.examples", "For example: {names}")
+                        .replace("{names}", dnsTamperCard.names.join(", "))
                     color: root.mutedTextColor
                 }
             }

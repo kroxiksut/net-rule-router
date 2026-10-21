@@ -55,6 +55,28 @@ pub const CONFIRM: Key = key(
 );
 pub const MORE_ABOVE: Key = key("tui.settings.more-above", "{count} more lines above");
 
+// The window's confirmation before a level that holds traffic, same keys.
+pub const LEAK_HOLDS_TITLE: Key = key(
+    "dialog.leak-holds-now.title",
+    "The additional connection is not available",
+);
+pub const LEAK_HOLDS_BODY: Key = key(
+    "dialog.leak-holds-now.body",
+    "With leak protection set to Everything, traffic is held right away: the internet stops until the additional connection returns.",
+);
+pub const LEAK_HOLDS_EFFECT: Key = key(
+    "dialog.leak-holds-now.effect",
+    "Your local network and what your rules send over the main connection keep working.",
+);
+pub const LEAK_UNROUTABLE_BODY: Key = key(
+    "dialog.unroutable-secondary.body-kill-switch",
+    "It is currently assigned as your additional route.",
+);
+pub const LEAK_UNROUTABLE_EFFECT: Key = key(
+    "dialog.unroutable-secondary.effect-kill-switch-arming",
+    "Once leak protection is on, those destinations are BLOCKED instead: the sites behind those rules stop loading.",
+);
+
 // ── Keys and line mode ───────────────────────────────────────────────────────
 
 pub const HELP_FOCUS: Key = key(
@@ -177,25 +199,18 @@ pub const UNSUPPORTED: Key = key(
 
 // ── Routing behaviour ────────────────────────────────────────────────────────
 
-pub const DEFAULT_ROUTE: Key = key(
-    "settings.routing.default-route.title",
-    "Default route for unmatched traffic",
-);
+pub const DEFAULT_ROUTE: Key = key("settings.routing.default-route.title", "Default route");
 pub const DEFAULT_ROUTE_NOTE: Key = key(
     "settings.routing.default-route.description",
     "Where traffic that matches no rule is sent. Rules always take priority. Default: primary route.",
 );
 pub const MODE_PREFER_PRIMARY: Key = key(
     "interfaces.mode.prefer-primary",
-    "Selected sites only (via the additional adapter)",
+    "Main connection — selected sites through the additional one",
 );
 pub const MODE_PREFER_SECONDARY: Key = key(
     "interfaces.mode.prefer-secondary-when-available",
-    "Everything via the additional adapter",
-);
-pub const MODE_STRICT_SECONDARY: Key = key(
-    "interfaces.mode.strict-secondary-fail-closed",
-    "Everything via the additional adapter — no leaks",
+    "Additional connection — exceptions through the main one",
 );
 pub const SUBDOMAINS: Key = key(
     "settings.routing-behavior.include-subdomains.label",
@@ -211,30 +226,26 @@ pub const APP_TAKEOVER_NOTE: Key = key(
     "",
 );
 pub const LEAK_TITLE: Key = key("settings.routing.kill-switch.title", "Leak protection");
-pub const LEAK_ENABLE: Key = key(
-    "settings.routing.kill-switch.enable-label",
-    "Enable leak protection (block traffic when the additional adapter is down)",
+pub const LEAK_OFF: Key = key("settings.routing.leak-protection.option-off", "Off");
+pub const LEAK_SITES: Key = key(
+    "settings.routing.leak-protection.option-sites",
+    "Routed sites",
 );
-pub const LEAK_ENABLE_NOTE: Key = key("settings.routing.kill-switch.enable-note", "");
-pub const FAILURE_MODE: Key = key(
-    "settings.routing.kill-switch.failure-mode.label",
-    "If the additional adapter can't be found or is unavailable (offline)",
+pub const LEAK_EVERYTHING: Key = key(
+    "settings.routing.leak-protection.option-everything",
+    "Everything",
 );
-pub const FAIL_CLOSED: Key = key(
-    "settings.routing.kill-switch.failure-mode.option-fail-closed",
-    "Block traffic (recommended)",
+pub const LEAK_OFF_NOTE: Key = key(
+    "settings.routing.leak-protection.note-off",
+    "If the additional connection drops, traffic continues over your main connection.",
 );
-pub const FAIL_OPEN: Key = key(
-    "settings.routing.kill-switch.failure-mode.option-fail-open",
-    "Allow traffic and warn me",
+pub const LEAK_SITES_NOTE: Key = key(
+    "settings.routing.leak-protection.note-sites",
+    "What your rules send through the additional connection never goes out the main one. Everything else keeps working.",
 );
-pub const FAIL_CLOSED_NOTE: Key = key(
-    "settings.routing.kill-switch.failure-mode.desc-fail-closed",
-    "",
-);
-pub const FAIL_OPEN_NOTE: Key = key(
-    "settings.routing.kill-switch.failure-mode.desc-fail-open",
-    "",
+pub const LEAK_EVERYTHING_NOTE: Key = key(
+    "settings.routing.leak-protection.note-everything",
+    "Nothing leaves except through the additional connection, your local network and what your rules send over the main connection. If the additional connection drops, the internet waits until it returns.",
 );
 pub const PROTOCOLS: Key = key(
     "settings.routing.kill-switch.protocols.label",
@@ -248,16 +259,11 @@ pub const PROTOCOL_GRE: Key = key("settings.routing.kill-switch.protocols.gre", 
 pub const PROTOCOL_ESP: Key = key("settings.routing.kill-switch.protocols.esp", "ESP");
 pub const PROTOCOL_LAST: Key = key(
     "settings.routing.kill-switch.protocols.last-one-hint",
-    "To turn leak protection off, use the switch above.",
+    "To turn leak protection off, choose Off above.",
 );
-pub const BLOCK_ALL: Key = key(
-    "settings.routing.kill-switch.block-all-label",
-    "When the additional adapter is unavailable, block ALL traffic, not just its routed sites",
-);
-pub const BLOCK_ALL_NOTE: Key = key("settings.routing.kill-switch.block-all-note", "");
 pub const ALLOW_DNS: Key = key(
     "settings.routing.kill-switch.allow-dns-label",
-    "Allow name resolution over the main link while blocked (keep zones resolving)",
+    "Allow name resolution over the main connection while blocked",
 );
 pub const ALLOW_DNS_NOTE: Key = key("settings.routing.kill-switch.allow-dns-note", "");
 pub const SHARED_STRICT: Key = key(
@@ -282,6 +288,22 @@ pub const SHARED_ANY: Key = key(
     "settings.routing-behavior.shared-ip.option-any-rule-domain",
     "Always route the whole shared IP (aggressive)",
 );
+pub const ROUTING_METHOD: Key = key("settings.routing.routing-method.title", "Routing method");
+pub const ENFORCEMENT: Key = key(
+    "settings.routing.enforcement-mode.label",
+    "How routed traffic is enforced",
+);
+pub const ENFORCEMENT_RESOLVER: Key = key(
+    "settings.routing.enforcement-mode.option-resolver",
+    "Local DNS resolver (default)",
+);
+pub const ENFORCEMENT_REACTIVE: Key = key(
+    "settings.routing.enforcement-mode.option-reactive",
+    "Watching system DNS (legacy)",
+);
+pub const ENFORCEMENT_NOTE: Key = key("settings.routing.enforcement-mode.note", "");
+pub const DNS_FAST_NOTE: Key = key("settings.routing.dns-fast-answers.note", "");
+pub const LIVENESS_NOTE: Key = key("settings.routing.liveness-window.note", "");
 pub const DNS_VIA_SECONDARY: Key = key(
     "settings.routing.dns-via-secondary.label",
     "DNS through the tunnel",
@@ -446,6 +468,12 @@ pub const SHORT_ENABLE: Key = key(
     "Complete short names with this domain",
 );
 pub const SHORT_FIELD: Key = key("settings.routing.short-names.field", "Network domain");
+pub const EXTERNAL_CHECK: Key = key(
+    "settings.routing.vpn-client.external-address-auto",
+    "Check the external address each time the additional route connects",
+);
+pub const EXTERNAL_CHECK_NOTE: Key =
+    key("settings.routing.vpn-client.external-address-auto-note", "");
 pub const AUTO_TITLE: Key = key("settings.routing.auto-rules.title", "Auto-rules");
 pub const PROBE_AUTO: Key = key(
     "settings.routing.primary-probe.auto",
@@ -554,6 +582,60 @@ pub const MODE_ON_LAUNCH: Key = key(
 pub const SERVICE_START: Key = key("settings.service.action.start", "Start service");
 pub const SERVICE_STOP: Key = key("settings.service.action.stop", "Stop service");
 pub const SERVICE_RESTART: Key = key("settings.service.action.restart", "Restart service");
+pub const SERVICE_FIX_UNINSTALL: Key = key(
+    "tui.settings.service.fix-uninstall",
+    "To remove the service, run: {command}",
+);
+pub const SERVICE_FIX_REINSTALL: Key = key(
+    "tui.settings.service.fix-reinstall",
+    "To re-register it from this folder and start it, run: {command}",
+);
+pub const SERVICE_FIX_MODE: Key = key(
+    "tui.settings.service.fix-mode",
+    "To change when it starts, remove it with {uninstall}, then install it again with {install}",
+);
+pub const RULES_PAUSE_TITLE: Key = key("settings.routing.pause.title", "Apply rules");
+pub const RULES_PAUSE_HINT: Key = key(
+    "settings.routing.pause.persistence-hint",
+    "Disabling stops applying rules until you re-enable them. Setting persists across restarts.",
+);
+pub const ROLLBACK_TITLE: Key = key("action.safe-rollback", "Safe rollback");
+pub const ROLLBACK_LOOKUP: Key = key(
+    "tui.settings.rollback-lookup",
+    "Look up the previous version of my rules",
+);
+pub const ROLLBACK_READY: Key = key(
+    "dialog.safe-rollback.body-ready",
+    "Your current rules will be replaced by the ones you applied on {time} ({count} rules), and routing will follow them right away.",
+);
+pub const ROLLBACK_NONE: Key = key(
+    "dialog.safe-rollback.body-none",
+    "There is nothing to roll back to: no earlier version of your rules has been applied.",
+);
+pub const ROLLBACK_RUN: Key = key("dialog.safe-rollback.confirm", "Roll back");
+pub const ROLLBACK_FAILED: Key = key(
+    "tui.settings.rollback-failed",
+    "Safe rollback failed: {error}",
+);
+pub const ROLLBACK_DONE: Key = key(
+    "status.rollback-completed",
+    "Rolled back to the rules you applied on {time}.",
+);
+pub const ROLLBACK_SUBMITTED: Key = key(
+    "status.rollback-submitted",
+    "Safe rollback submitted. The service is restoring the previous configuration.",
+);
+pub const SAFE_DISABLE_NOTE: Key = key(
+    "dialog.safe-disable.body",
+    "Temporarily disable your routing and leak protection: the routes and filters NetRuleRouter keeps for you are removed. Other users of this computer keep theirs. The service stays running; you can re-enable at any time. This action is audited.",
+);
+pub const SAFE_DISABLE_REASON: Key = key("dialog.safe-disable.reason-label", "Reason (required)");
+pub const SAFE_DISABLE_RUN: Key = key("dialog.safe-disable.confirm", "Disable now");
+pub const SAFE_DISABLE_NEED_REASON: Key = key(
+    "dialog.safe-disable.reason-required",
+    "Please describe the reason — it is recorded in the audit trail.",
+);
+pub const SAFE_DISABLE_DONE: Key = key("status.safe-disable.completed", "Safe disable applied");
 pub const SERVICE_NOTE: Key = key(
     "tui.settings.service.note",
     "Starting and stopping the service needs administrator rights, and nrr-tui never asks for them. To use these actions, start nrr-tui as administrator or with sudo.",
@@ -699,6 +781,26 @@ pub const ROLLEDBACK_COUNT: Key = key(
     "settings.revisions.retention.rolledback-count",
     "Maximum rolled-back revisions",
 );
+pub const SUPERSEDED_DAYS_NOTE: Key = key(
+    "settings.revisions.retention.superseded-days-tooltip",
+    "Earlier versions of your rules that you can roll back to. Keep them longer for a longer history, or shorter to save disk space.",
+);
+pub const SUPERSEDED_COUNT_NOTE: Key = key(
+    "settings.revisions.retention.superseded-count-tooltip",
+    "The most earlier versions kept, whatever their age. Once there are more, the oldest go first.",
+);
+pub const REJECTED_DAYS_NOTE: Key = key(
+    "settings.revisions.retention.rejected-days-tooltip",
+    "Rule sets the service refused to apply are kept this long, so the history still shows why they were refused.",
+);
+pub const ROLLEDBACK_DAYS_NOTE: Key = key(
+    "settings.revisions.retention.rolledback-days-tooltip",
+    "Rule sets that were undone, by you or after a failed apply, are kept this long so you can return to them.",
+);
+pub const ROLLEDBACK_COUNT_NOTE: Key = key(
+    "settings.revisions.retention.rolledback-count-tooltip",
+    "The most undone rule sets kept, whatever their age. Once there are more, the oldest go first.",
+);
 pub const PIN_LKG: Key = key(
     "settings.revisions.retention.pin-lkg",
     "Always keep last known-good revision",
@@ -706,6 +808,15 @@ pub const PIN_LKG: Key = key(
 pub const PIN_LKG_NOTE: Key = key(
     "settings.revisions.retention.pin-lkg-hint",
     "The most recent superseded revision is pinned and excluded from age and count limits.",
+);
+pub const REVISIONS_RESET: Key = key("action.reset-defaults", "Reset to defaults");
+pub const LAST_CLEANUP: Key = key(
+    "settings.revisions.retention.last-cleanup",
+    "Last cleanup: {timestamp}",
+);
+pub const LAST_CLEANUP_NEVER: Key = key(
+    "settings.revisions.retention.last-cleanup-never",
+    "Last cleanup: never",
 );
 
 // ── Traffic statistics ───────────────────────────────────────────────────────
@@ -805,6 +916,20 @@ pub const ERRORS: &[(&str, Key)] = &[
     ("confirmation-unknown", key("errors.confirmation-unknown", "Confirmation token unknown")),
     ("service-degraded", key("errors.service-degraded", "Service is degraded")),
     ("recovery-required", key("errors.recovery-required", "Service requires user recovery action")),
+    (
+        "unsupported-operation",
+        key(
+            "errors.unsupported-operation",
+            "The running service is older than this app and does not know this action. Restart the service, or update it, and try again.",
+        ),
+    ),
+    (
+        "response-too-large",
+        key(
+            "errors.response-too-large",
+            "The service's answer was too large to send; the change itself may have been applied — refresh before trying again.",
+        ),
+    ),
     ("internal", key("errors.internal", "Internal service error")),
     ("transport-disconnected", key("errors.transport-disconnected", "Service is offline")),
     ("timeout", key("errors.timeout", "Request timed out")),
@@ -926,19 +1051,17 @@ pub fn all() -> Vec<Key> {
         DEFAULT_ROUTE_NOTE,
         MODE_PREFER_PRIMARY,
         MODE_PREFER_SECONDARY,
-        MODE_STRICT_SECONDARY,
         SUBDOMAINS,
         SUBDOMAINS_NOTE,
         APP_TAKEOVER,
         APP_TAKEOVER_NOTE,
         LEAK_TITLE,
-        LEAK_ENABLE,
-        LEAK_ENABLE_NOTE,
-        FAILURE_MODE,
-        FAIL_CLOSED,
-        FAIL_OPEN,
-        FAIL_CLOSED_NOTE,
-        FAIL_OPEN_NOTE,
+        LEAK_OFF,
+        LEAK_SITES,
+        LEAK_EVERYTHING,
+        LEAK_OFF_NOTE,
+        LEAK_SITES_NOTE,
+        LEAK_EVERYTHING_NOTE,
         PROTOCOLS,
         PROTOCOL_TCP,
         PROTOCOL_UDP,
@@ -947,8 +1070,6 @@ pub fn all() -> Vec<Key> {
         PROTOCOL_GRE,
         PROTOCOL_ESP,
         PROTOCOL_LAST,
-        BLOCK_ALL,
-        BLOCK_ALL_NOTE,
         ALLOW_DNS,
         ALLOW_DNS_NOTE,
         SHARED_STRICT,
@@ -958,6 +1079,13 @@ pub fn all() -> Vec<Key> {
         SHARED_MAJORITY_IP,
         SHARED_MAJORITY_RULES,
         SHARED_ANY,
+        ROUTING_METHOD,
+        ENFORCEMENT,
+        ENFORCEMENT_RESOLVER,
+        ENFORCEMENT_REACTIVE,
+        ENFORCEMENT_NOTE,
+        DNS_FAST_NOTE,
+        LIVENESS_NOTE,
         DNS_VIA_SECONDARY,
         DNS_VIA_SECONDARY_NOTE,
         DNS_FAST,
@@ -1008,6 +1136,8 @@ pub fn all() -> Vec<Key> {
         SHORT_NOTE,
         SHORT_ENABLE,
         SHORT_FIELD,
+        EXTERNAL_CHECK,
+        EXTERNAL_CHECK_NOTE,
         AUTO_TITLE,
         PROBE_AUTO,
         PROBE_TIMEOUT,
@@ -1044,6 +1174,24 @@ pub fn all() -> Vec<Key> {
         SERVICE_START,
         SERVICE_STOP,
         SERVICE_RESTART,
+        RULES_PAUSE_TITLE,
+        RULES_PAUSE_HINT,
+        ROLLBACK_TITLE,
+        ROLLBACK_LOOKUP,
+        ROLLBACK_READY,
+        ROLLBACK_NONE,
+        ROLLBACK_RUN,
+        ROLLBACK_FAILED,
+        ROLLBACK_DONE,
+        ROLLBACK_SUBMITTED,
+        SAFE_DISABLE_NOTE,
+        SAFE_DISABLE_REASON,
+        SAFE_DISABLE_RUN,
+        SAFE_DISABLE_NEED_REASON,
+        SAFE_DISABLE_DONE,
+        SERVICE_FIX_UNINSTALL,
+        SERVICE_FIX_REINSTALL,
+        SERVICE_FIX_MODE,
         SERVICE_NOTE,
         SERVICE_DONE,
         SERVICE_QUERY_FAILED,
@@ -1098,6 +1246,14 @@ pub fn all() -> Vec<Key> {
         ROLLEDBACK_COUNT,
         PIN_LKG,
         PIN_LKG_NOTE,
+        REVISIONS_RESET,
+        LAST_CLEANUP,
+        LAST_CLEANUP_NEVER,
+        SUPERSEDED_DAYS_NOTE,
+        SUPERSEDED_COUNT_NOTE,
+        REJECTED_DAYS_NOTE,
+        ROLLEDBACK_DAYS_NOTE,
+        ROLLEDBACK_COUNT_NOTE,
         TRAFFIC_NOTE,
         TRAFFIC_TODAY,
         TRAFFIC_SESSION,

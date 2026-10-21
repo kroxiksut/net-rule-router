@@ -264,13 +264,26 @@ fn expire_at(shared: &Shared, generation: u64, deadline_ms: i64) {
             shared.kind.log_ended();
             return;
         }
-        // A clock stepped backwards only lengthens the wait; the loop re-reads it.
-        let wait = Duration::from_millis(u64::try_from(deadline_ms - now).unwrap_or(0));
-        slot = match shared.changed.wait_timeout(slot, wait) {
+        slot = match shared
+            .changed
+            .wait_timeout(slot, expiry_wait(deadline_ms, now))
+        {
             Ok((guard, _)) => guard,
             Err(poisoned) => poisoned.into_inner().0,
         };
     }
+}
+
+/// The longest the expiry timer sleeps before reading the wall clock again.
+/// A timed wait does not count suspend, so without the cap a window whose
+/// deadline passed during a sleep stayed open for the rest of its wait.
+const EXPIRY_RECHECK: Duration = Duration::from_secs(15);
+
+/// How long to wait before looking at the deadline again at `now_ms`.
+fn expiry_wait(deadline_ms: i64, now_ms: i64) -> Duration {
+    let left =
+        Duration::from_millis(u64::try_from(deadline_ms.saturating_sub(now_ms)).unwrap_or(0));
+    left.min(EXPIRY_RECHECK)
 }
 
 /// Wall-clock UTC milliseconds: deadlines are stored as absolute times.

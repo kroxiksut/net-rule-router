@@ -18,7 +18,20 @@ impl SecondaryRouteCoordinator {
         &self,
         active_sids: &[String],
     ) -> Result<RouteReconcileDelta, PlatformError> {
+        self.drop_machine_memo();
+        let result = self.recompute_active_pass(active_sids);
+        self.arm_machine_memo();
+        result
+    }
+
+    fn recompute_active_pass(
+        &self,
+        active_sids: &[String],
+    ) -> Result<RouteReconcileDelta, PlatformError> {
         let _pass = self.pass_lock.lock().unwrap_or_else(|p| p.into_inner());
+        // The pass's one reading of the links: everything below, and the
+        // enforcement apply that follows, reads it back.
+        let adapters = self.adapters_for_pass();
         let served = self.served_sids_fresh(active_sids);
         let sid = match served.as_slice() {
             [] => {
@@ -29,6 +42,14 @@ impl SecondaryRouteCoordinator {
                     "no routing user to enforce (no tray, and either app-driven scope or nobody signed in) — tearing down secondary routes",
                 );
                 self.publish_served_nobody();
+                let mut known: Vec<String> = active_sids.to_vec();
+                known.extend(
+                    self.api
+                        .interactive_user_sign_ins()
+                        .into_iter()
+                        .map(|(sid, _)| sid),
+                );
+                self.publish_no_machine_facts(&known);
                 return self.reconciler.clear();
             }
             [sid] => sid.clone(),
@@ -59,6 +80,7 @@ impl SecondaryRouteCoordinator {
                         "routing paused for this user (teardown policy) — tearing down secondary routes",
                     );
                     self.publish_served_nobody();
+                    self.publish_no_machine_facts(std::slice::from_ref(&sid));
                     return self.reconciler.clear();
                 }
                 PausedRouteDisposition::KeepSecondaryHosts => {
@@ -70,6 +92,7 @@ impl SecondaryRouteCoordinator {
                     );
                     // Served alone: nobody else's tunnel carries them.
                     self.note_traffic_carried(&[], &[]);
+                    self.publish_no_machine_facts(std::slice::from_ref(&sid));
                     return self.reconciler.retain_rule_routes();
                 }
             }
@@ -83,8 +106,49 @@ impl SecondaryRouteCoordinator {
             active_count = active_sids.len(),
             "recompute_active for routing user",
         );
-        let resolution = self.resolve(&sid);
-        self.recompute_for(&sid, &resolution)
+        crate::kept_direct::retain_only(std::slice::from_ref(&sid));
+        let resolution = self.resolve_inner(&sid, None, adapters.as_deref().ok());
+        self.recompute_for_with(&sid, &resolution, adapters.ok())
+    }
+
+    /// A pass that returns before reading the machine leaves no foreign tunnel
+    /// or kept-direct segment of the last one standing: doubt is "not foreign".
+    /// The users' own links stay published: a paused user's VPN is still theirs.
+    fn publish_no_machine_facts(&self, sids: &[String]) {
+        let cell = crate::foreign_tunnels::global_foreign_tunnels();
+        let own = self.links_kept_as_ours(cell.own_links(), sids);
+        cell.publish_served(None, &[], &[], &own);
+        crate::kept_direct::forget_all();
+    }
+
+    /// `previous` plus the additional links of `sids`, from what the last
+    /// passes resolved and what the stored bindings name now. Doubt keeps a
+    /// link ours, so a link is only ever added here.
+    pub(super) fn links_kept_as_ours(&self, mut ours: Vec<u32>, sids: &[String]) -> Vec<u32> {
+        ours.extend(
+            self.last_resolution
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .filter_map(|r| r.secondary.map(|t| t.interface_index)),
+        );
+        if let Ok(adapters) = self.adapters_now() {
+            for sid in sids {
+                let policy = self.route_source.load_for_sid(sid);
+                ours.extend(Self::additional_links(
+                    policy.as_ref(),
+                    &RouteResolution {
+                        mode: RouteBehaviorMode::PreferPrimary,
+                        primary: None,
+                        secondary: None,
+                    },
+                    &adapters,
+                ));
+            }
+        }
+        ours.sort_unstable();
+        ours.dedup();
+        ours
     }
 
     /// The longest-served user: the one whose routing never yields to anyone.
@@ -111,6 +175,7 @@ impl SecondaryRouteCoordinator {
     /// service must restore pristine networking in BOTH scopes.
     pub fn teardown(&self) -> Result<RouteReconcileDelta, PlatformError> {
         let _pass = self.pass_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.drop_machine_memo();
         self.reconciler.clear()
     }
 
@@ -119,6 +184,7 @@ impl SecondaryRouteCoordinator {
     /// [`SecondaryRouteReconciler::retain_rule_routes`].
     pub fn teardown_keep_rule_routes(&self) -> Result<RouteReconcileDelta, PlatformError> {
         let _pass = self.pass_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.drop_machine_memo();
         self.reconciler.retain_rule_routes()
     }
 }

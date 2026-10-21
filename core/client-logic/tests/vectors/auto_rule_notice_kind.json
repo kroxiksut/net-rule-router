@@ -1,0 +1,81 @@
+{
+  "description": "pure.js autoRuleNoticeKind and autoRuleIsSelfSigned: what one tray notice over these offers is about, which picks its heading; a claim true of every row, or one that claims nothing when they disagree. Each row is `base-candidate` with its patch laid over it.",
+  "base-candidate": {
+    "id": "c1",
+    "anchor": "site.example",
+    "proposed-match": "cdn.example.com",
+    "match-kind": "suffix",
+    "route": "secondary",
+    "affinity": 0.5,
+    "observations": 3,
+    "first-seen-unix-ms": 1000,
+    "last-seen-unix-ms": 2000
+  },
+  "cases": [
+    {
+      "name": "nothing to show reads as the default heading",
+      "input": { "rows": [] },
+      "expected": { "kind": "companions", "selfSigned": [] }
+    },
+    {
+      "name": "companions of a site",
+      "input": { "rows": [ { "signal": "co-activity" }, { "id": "c2", "signal": "brand-related" } ] },
+      "expected": { "kind": "companions", "selfSigned": [false, false] }
+    },
+    {
+      "name": "sites that fail on the main route",
+      "input": { "rows": [
+        { "anchor": "a.example", "proposed-match": "a.example", "observations": null, "signal": "main-link-blocked" },
+        { "id": "c2", "anchor": "b.example", "proposed-match": "b.example", "observations": null, "signal": "placeholder-answer" }
+      ] },
+      "expected": { "kind": "sites-blocked", "selfSigned": [true, true] }
+    },
+    {
+      "name": "a row that is its own anchor signs itself whatever its slug",
+      "input": { "rows": [ { "anchor": "c.example", "proposed-match": "c.example", "signal": "from-a-newer-build" } ] },
+      "expected": { "kind": "sites-blocked", "selfSigned": [true] }
+    },
+    {
+      "name": "programs the main route does not carry",
+      "input": { "rows": [ { "anchor": "player.exe", "proposed-match": "player.exe", "match-kind": "application", "signal": "app-main-link-blocked" } ] },
+      "expected": { "kind": "programs-blocked", "selfSigned": [true] }
+    },
+    {
+      "name": "a blocked program beside a companion is a mixed notice",
+      "input": { "rows": [
+        { "anchor": "player.exe", "proposed-match": "player.exe", "match-kind": "application", "signal": "app-main-link-blocked" },
+        { "id": "c2", "signal": "co-activity" }
+      ] },
+      "expected": { "kind": "mixed-blocked", "selfSigned": [true, false] }
+    },
+    {
+      "name": "programs that look names up on their own",
+      "input": { "rows": [
+        { "anchor": "fetcher.exe", "proposed-match": "fetcher.exe", "match-kind": "application", "signal": "app-own-resolver" },
+        { "id": "c2", "anchor": "browser.exe", "proposed-match": "browser.exe", "match-kind": "application", "signal": "app-own-resolver" }
+      ] },
+      "expected": { "kind": "programs-own-resolver", "selfSigned": [true, true] }
+    },
+    {
+      "name": "an own-resolver program beside a blocked one claims neither reason",
+      "input": { "rows": [
+        { "anchor": "fetcher.exe", "proposed-match": "fetcher.exe", "match-kind": "application", "signal": "app-own-resolver" },
+        { "id": "c2", "anchor": "player.exe", "proposed-match": "player.exe", "match-kind": "application", "signal": "app-main-link-blocked" }
+      ] },
+      "expected": { "kind": "assorted", "selfSigned": [true, true] }
+    },
+    {
+      "name": "an own-resolver program beside a site's companion is assorted too",
+      "input": { "rows": [
+        { "id": "c2", "signal": "delivery-name" },
+        { "anchor": "fetcher.exe", "proposed-match": "fetcher.exe", "match-kind": "application", "signal": "app-own-resolver" }
+      ] },
+      "expected": { "kind": "assorted", "selfSigned": [false, true] }
+    },
+    {
+      "name": "a row without an anchor is never its own anchor",
+      "input": { "rows": [ { "anchor": "", "proposed-match": "", "signal": "" } ] },
+      "expected": { "kind": "companions", "selfSigned": [false] }
+    }
+  ]
+}

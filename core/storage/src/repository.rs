@@ -92,6 +92,11 @@ pub trait CacheRepository {
     /// Preserves history when the IP set changes for the same hostname.
     fn upsert_resolution(&self, entry: ResolutionEntry) -> StorageResult<()>;
 
+    /// [`Self::upsert_resolution`] for the background refresh: the answer is
+    /// stored the same way, but the hostname's last use (`last_seen_at`) is
+    /// left alone, so only a user's own lookups keep a host looking used.
+    fn refresh_resolution(&self, entry: ResolutionEntry) -> StorageResult<()>;
+
     /// Write a negative cache entry (NXDOMAIN, timeout, or unsupported AF).
     fn upsert_negative_cache(&self, entry: NegativeCacheEntry) -> StorageResult<()>;
 
@@ -127,6 +132,17 @@ pub trait CacheRepository {
         &self,
         now: SystemTime,
         limit: usize,
+    ) -> StorageResult<Vec<ExpiredHostname>>;
+
+    /// [`Self::list_expired_resolutions`] limited to what is worth re-resolving:
+    /// a host in `named` (a rule names it) always, any other host only when it
+    /// was last used at or after `used_since`. Same order, at most `limit` rows.
+    fn list_expired_for_refresh(
+        &self,
+        now: SystemTime,
+        limit: usize,
+        used_since: SystemTime,
+        named: &[String],
     ) -> StorageResult<Vec<ExpiredHostname>>;
 
     /// Every resolution in the cache, both families, as `(canonical_host,

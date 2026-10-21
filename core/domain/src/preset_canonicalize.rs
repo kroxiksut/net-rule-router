@@ -259,19 +259,12 @@ fn extract_rule_set(rule_book: CanonicalRuleBook, route: RouteRole) -> Canonical
     }
 }
 
-/// Retains only rule-level warnings (filters out stub-binding-related warnings
-/// like `MissingSecondaryWithFailClosed` or `UnknownAdapterReference` that
-/// can arise from the synthetic bindings used during preset canonicalization).
+/// Retains only rule-level warnings: `UnknownAdapterReference` can arise from
+/// the synthetic bindings used during preset canonicalization.
 fn filter_rule_warnings(warnings: Vec<ValidationWarning>) -> Vec<ValidationWarning> {
     warnings
         .into_iter()
-        .filter(|w| {
-            !matches!(
-                w,
-                ValidationWarning::MissingSecondaryWithFailClosed
-                    | ValidationWarning::UnknownAdapterReference { .. }
-            )
-        })
+        .filter(|w| !matches!(w, ValidationWarning::UnknownAdapterReference { .. }))
         .collect()
 }
 

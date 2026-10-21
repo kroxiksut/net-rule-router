@@ -184,6 +184,8 @@ fn healthy_status() -> DiagnosticsStatusDto {
         stale: false,
         // Canned content: never let it read as a verdict about this machine.
         origin: DiagnosticsDataOrigin::Preview,
+        missing_capabilities: Vec::new(),
+        dns_tamper: Default::default(),
     }
 }
 
@@ -292,6 +294,7 @@ fn mock_audit_entries(scenario: MockScenario) -> Vec<AuditEntryDto> {
         reason_code: "review.approved".into(),
         revision_id: Some("rev-preview-001".into()),
         has_payload_summary: false,
+        cause: None,
     }];
     if scenario == MockScenario::ActiveTamperAlert {
         entries.push(AuditEntryDto {
@@ -303,6 +306,7 @@ fn mock_audit_entries(scenario: MockScenario) -> Vec<AuditEntryDto> {
             reason_code: "integrity.audit_chain_mismatch".into(),
             revision_id: None,
             has_payload_summary: false,
+            cause: None,
         });
     }
     entries

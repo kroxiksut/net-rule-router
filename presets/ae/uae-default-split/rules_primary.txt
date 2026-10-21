@@ -1,4 +1,4 @@
-﻿# NetRuleRouter preset - version 1
+﻿# NetRuleRouter preset - version 7
 # name: AE UAE Default Split - Primary Route
 # description: Local UAE and regional services routed to primary
 # author: NetRuleRouter contributors

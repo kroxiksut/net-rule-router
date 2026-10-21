@@ -253,12 +253,13 @@ pub fn build_secondary_liveness_task(
 
 /// External-address notice tick.
 ///
-/// Watches the routing-active users' additional links and, once one has settled
-/// after (re)connecting, asks what address the outside world sees behind it and
-/// pushes that to the tray. `Optional`: telling the user their exit address is a
-/// courtesy, never a routing dependency.
+/// Watches the additional links of the routing-active users who opted in and,
+/// once one has settled after (re)connecting, asks what address the outside
+/// world sees behind it and pushes that to the tray. `Optional`: telling the
+/// user their exit address is a courtesy, never a routing dependency.
 ///
-/// The tick itself does no I/O beyond resolving the current link — the probe
+/// The tick itself does no I/O beyond reading the opt-in and resolving the
+/// current link — the probe
 /// runs on a detached worker inside the announcer, so a slow or filtered path
 /// can never hold this task (or the supervisor behind it) open.
 pub fn build_secondary_external_address_task(
@@ -270,7 +271,7 @@ pub fn build_secondary_external_address_task(
         SECONDARY_EXTERNAL_ADDRESS_INTERVAL,
         0,
         move |_stop| {
-            wiring.announcer.tick(&(wiring.links)());
+            wiring.tick();
             TaskOutcome::Continue
         },
     )

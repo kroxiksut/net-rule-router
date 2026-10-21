@@ -256,6 +256,24 @@ jobs:
         working-directory: artifacts
         run: sha256sum -- * > SHA256SUMS
 
+      # Off until the repository variable NRR_SIGN_CHECKSUMS is "true" and the
+      # secret MINISIGN_KEY (an unencrypted minisign secret key) exists; the
+      # public key is then published next to the release notes.
+      - name: Sign the checksums
+        if: ${{ vars.NRR_SIGN_CHECKSUMS == 'true' }}
+        working-directory: artifacts
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+        run: |
+          test -n "$MINISIGN_KEY" || { echo "MINISIGN_KEY is not set"; exit 1; }
+          sudo apt-get install -y --no-install-recommends minisign
+          umask 077
+          key="$RUNNER_TEMP/minisign.key"
+          printf '%s
+' "$MINISIGN_KEY" > "$key"
+          minisign -S -s "$key" -m SHA256SUMS
+          rm -f "$key"
+
       - name: Draft the release
         if: startsWith(github.ref, 'refs/tags/')
         env:

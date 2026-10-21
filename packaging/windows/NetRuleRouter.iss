@@ -7,6 +7,9 @@
 ; Service and data steps run through scripts\setup-actions.ps1, which reuses the
 ; console and the user scripts; nothing here registers or removes anything itself.
 ;
+; Refuses to run over the MSI installation, which shares the folder, or over a
+; newer version.
+;
 ; Unattended install with prepared files (full paths):
 ;   Setup.exe /VERYSILENT /SUPPRESSMSGBOXES /PROVISION=<rules for the main route>
 ;     /PROVISION_SECONDARY=<rules> /PROVISION_SETTINGS=<settings export>
@@ -89,6 +92,10 @@ russian.ConfirmUninstall=Удалить %1 с этого компьютера?
 [CustomMessages]
 english.LaunchApp=Start NetRuleRouter
 russian.LaunchApp=Запустить NetRuleRouter
+english.MsiInstalled=NetRuleRouter is already installed from its MSI package into the same folder. Remove that installation first (removing only the program keeps settings and rules), then run this Setup again.
+russian.MsiInstalled=NetRuleRouter уже установлена из пакета MSI в ту же папку. Сначала удалите эту установку (при удалении только программы настройки и правила сохранятся), затем запустите эту установку снова.
+english.NewerInstalled=A newer version of NetRuleRouter is already installed. To go back to this version, remove the installed one first (removing only the program keeps settings and rules).
+russian.NewerInstalled=Уже установлена более новая версия NetRuleRouter. Чтобы вернуться к этой версии, сначала удалите установленную (при удалении только программы настройки и правила сохранятся).
 english.ServiceStopFailed=The NetRuleRouter background service did not stop, so its files cannot be replaced. Restart Windows and run Setup again.
 russian.ServiceStopFailed=Фоновая служба NetRuleRouter не остановилась, поэтому её файлы нельзя заменить. Перезагрузите Windows и запустите установку снова.
 english.ServiceRegisterFailed=NetRuleRouter is installed, but its background service could not be registered or started. Open NetRuleRouter to see what is wrong, or run "nrr-cli diag doctor" in the installation folder. Details: %1
@@ -140,6 +147,67 @@ var
   RemoveData, RemoveAudit: Boolean;
   { The service binary's code when staging the prepared files failed; 0 otherwise. }
   ProvisionExitCode: Integer;
+
+const
+  { The MSI's UpgradeCode (NetRuleRouter.wxs), and this Setup's uninstall key:
+    its AppId plus "_is1". }
+  MsiUpgradeCode = '{32814437-D697-4AC1-B07C-BD46DE72F89C}';
+  OwnUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{A7629E15-413C-4ACE-BD45-FE227D6CDEA1}_is1';
+
+{ This Setup's numeric version a.b.c.d, split as a file version block holds it. }
+procedure OwnVersionNumbers(var MS, LS: Cardinal);
+var
+  Rest: String;
+  Parts: array[0..3] of Cardinal;
+  I, Dot: Integer;
+begin
+  Rest := '{#VersionNumeric}';
+  for I := 0 to 3 do
+  begin
+    Dot := Pos('.', Rest);
+    if Dot = 0 then
+      Dot := Length(Rest) + 1;
+    Parts[I] := StrToIntDef(Copy(Rest, 1, Dot - 1), 0);
+    Delete(Rest, 1, Dot);
+  end;
+  MS := (Parts[0] shl 16) or Parts[1];
+  LS := (Parts[2] shl 16) or Parts[3];
+end;
+
+{ Whether the installed copy is newer, by its service binary's file version:
+  the binaries carry the same numeric version this Setup does. }
+function InstalledIsNewer(): Boolean;
+var
+  Location: String;
+  InstalledMS, InstalledLS, OwnMS, OwnLS: Cardinal;
+begin
+  Result := False;
+  if not RegQueryStringValue(HKLM64, OwnUninstallKey, 'InstallLocation', Location) then
+    Exit;
+  if not GetVersionNumbers(AddBackslash(Location) + 'nrr-service.exe', InstalledMS, InstalledLS) then
+    Exit;
+  OwnVersionNumbers(OwnMS, OwnLS);
+  Result := (InstalledMS > OwnMS) or ((InstalledMS = OwnMS) and (InstalledLS > OwnLS));
+end;
+
+{ The MSI installs into the same folder, and an older build must not replace a
+  newer one: both end Setup before anything changes. }
+function InitializeSetup(): Boolean;
+var
+  ErrorCode: Cardinal;
+begin
+  Result := True;
+  if IsMsiProductInstalled(MsiUpgradeCode, 0, ErrorCode) then
+  begin
+    SuppressibleMsgBox(CustomMessage('MsiInstalled'), mbError, MB_OK, IDOK);
+    Result := False;
+  end
+  else if InstalledIsNewer() then
+  begin
+    SuppressibleMsgBox(CustomMessage('NewerInstalled'), mbError, MB_OK, IDOK);
+    Result := False;
+  end;
+end;
 
 { /NAME=value from the command line, '' when absent. }
 function SetupParam(const Name: String): String;

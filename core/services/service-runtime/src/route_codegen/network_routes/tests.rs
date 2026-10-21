@@ -410,7 +410,6 @@ fn every_mode_routes_each_network_over_its_own_link() {
     for mode in [
         RouteBehaviorMode::PreferPrimary,
         RouteBehaviorMode::PreferSecondaryWhenAvailable,
-        RouteBehaviorMode::StrictSecondaryFailClosed,
     ] {
         let got = plan(mode, &b, &tunnel_facts(&["10.88.0.0/13"]), &[]);
         assert_eq!(
@@ -895,7 +894,6 @@ fn the_neutral_plan_lowers_to_the_windows_routes() {
     for mode in [
         RouteBehaviorMode::PreferPrimary,
         RouteBehaviorMode::PreferSecondaryWhenAvailable,
-        RouteBehaviorMode::StrictSecondaryFailClosed,
     ] {
         for has_primary in [true, false] {
             let main = main_target();
@@ -984,7 +982,6 @@ fn a_main_zone_host_inside_a_tunnel_network_takes_the_tunnel_in_every_mode() {
     for mode in [
         RouteBehaviorMode::PreferPrimary,
         RouteBehaviorMode::PreferSecondaryWhenAvailable,
-        RouteBehaviorMode::StrictSecondaryFailClosed,
     ] {
         let windows = generate_routes_with(
             mode,
@@ -1042,4 +1039,159 @@ fn a_main_zone_host_inside_a_tunnel_network_takes_the_tunnel_in_every_mode() {
             }
         }
     }
+}
+
+/// A corporate tunnel's narrow routes keep a name's address off our tunnel; its
+/// catch-alls do not, and a literal address is honoured as written.
+#[test]
+fn a_foreign_tunnels_routes_keep_a_name_off_our_tunnel() {
+    let (mut routes, adapters) = machine();
+    routes.push(row("10.20.0.0", 16, "100.64.0.1", 9, 1));
+    routes.push(row("172.16.5.9", 32, "100.64.0.1", 9, 1));
+    // The catch-alls the tunnel installs: a default and a redirect pair.
+    routes.push(row("0.0.0.0", 0, "100.64.0.1", 9, 1));
+    routes.push(row("0.0.0.0", 1, "100.64.0.1", 9, 1));
+    routes.push(row("128.0.0.0", 1, "100.64.0.1", 9, 1));
+    let facts = NetworkRouteFacts::read(&routes, &adapters, Some(7), Vec::new())
+        .with_foreign_tunnels(&routes, &[9]);
+    assert!(facts.foreign_tunnel_routes.contains(&net("10.20.0.0/16")));
+    assert!(facts.foreign_tunnel_routes.contains(&net("172.16.5.9/32")));
+    assert!(
+        facts
+            .foreign_tunnel_routes
+            .iter()
+            .all(|b| b.prefix_len() > 1),
+        "a catch-all is no claim: {:?}",
+        facts.foreign_tunnel_routes
+    );
+    let rules = CanonicalRuleSet::from_rules(vec![rule(
+        "R-literal",
+        CanonicalAddressMatch::ExactIp(addr("10.20.0.8")),
+    )]);
+    assert_eq!(
+        facts.kept_direct_reason(addr("10.20.0.7")),
+        Some(KeptDirect::ForeignTunnel)
+    );
+    assert!(facts.keeps_host_direct(&rules, addr("10.20.0.7")));
+    assert!(!facts.keeps_host_direct(&rules, addr("10.20.0.8")));
+    assert!(!facts.keeps_host_direct(&rules, addr("203.0.113.9")));
+    assert_eq!(
+        facts.kept_direct_reason(addr("192.168.1.9")),
+        Some(KeptDirect::LocalNetwork)
+    );
+}
+
+/// The WireGuard "exclude private IPs" AllowedIPs list: a full tunnel split
+/// around the private ranges.
+const WIREGUARD_EXCLUDE_PRIVATE: &[&str] = &[
+    "0.0.0.0/5",
+    "8.0.0.0/7",
+    "11.0.0.0/8",
+    "12.0.0.0/6",
+    "16.0.0.0/4",
+    "32.0.0.0/3",
+    "64.0.0.0/2",
+    "128.0.0.0/3",
+    "160.0.0.0/5",
+    "168.0.0.0/6",
+    "172.0.0.0/12",
+    "172.32.0.0/11",
+    "172.64.0.0/10",
+    "172.128.0.0/9",
+    "173.0.0.0/8",
+    "174.0.0.0/7",
+    "176.0.0.0/4",
+    "192.0.0.0/9",
+    "192.128.0.0/11",
+    "192.160.0.0/13",
+    "192.169.0.0/16",
+    "192.170.0.0/15",
+    "192.172.0.0/14",
+    "192.176.0.0/12",
+    "192.192.0.0/10",
+    "193.0.0.0/8",
+    "194.0.0.0/7",
+    "196.0.0.0/6",
+    "200.0.0.0/5",
+    "208.0.0.0/4",
+];
+
+fn tunnel_rows(blocks: &[&str], ifx: u32) -> Vec<RouteEntry> {
+    blocks
+        .iter()
+        .map(|text| {
+            let block = net(text);
+            row(
+                &block.network().to_string(),
+                block.prefix_len(),
+                "0.0.0.0",
+                ifx,
+                1,
+            )
+        })
+        .collect()
+}
+
+/// A second, foreign WireGuard full tunnel split around the private ranges
+/// takes the internet: none of its public pieces is a corporate network, and
+/// only what it carries inside the private ranges stays its own.
+#[test]
+fn a_full_tunnel_split_around_the_private_ranges_has_only_its_private_networks() {
+    let mut routes = tunnel_rows(WIREGUARD_EXCLUDE_PRIVATE, 9);
+    routes.extend(tunnel_rows(&["10.77.0.0/16", "100.64.3.0/24"], 9));
+    let blocks = foreign_tunnel_blocks(&routes, &[9]);
+    assert_eq!(blocks, vec![net("10.77.0.0/16"), net("100.64.3.0/24")]);
+    for public in ["193.0.0.10", "173.245.48.1", "11.1.1.1", "192.169.0.1"] {
+        assert!(!blocks.iter().any(|b| b.contains(addr(public))), "{public}");
+    }
+}
+
+/// The same with the wide pieces missing: public routes adding up to sixteen
+/// `/8`s are the internet, not a corporate network.
+#[test]
+fn many_narrow_public_routes_add_up_to_a_full_tunnel() {
+    let eighths: Vec<String> = (1u8..=21)
+        .filter(|first| *first != 10)
+        .map(|first| format!("{first}.0.0.0/8"))
+        .collect();
+    let texts: Vec<&str> = eighths.iter().map(String::as_str).collect();
+    let mut routes = tunnel_rows(&texts, 9);
+    routes.extend(tunnel_rows(&["10.77.0.0/16"], 9));
+    assert_eq!(
+        foreign_tunnel_blocks(&routes, &[9]),
+        vec![net("10.77.0.0/16")]
+    );
+}
+
+/// A split corporate tunnel keeps its public networks, and the full one on
+/// another link does not take them away.
+#[test]
+fn a_split_tunnel_keeps_its_public_networks_beside_a_full_one() {
+    let mut routes = tunnel_rows(&["203.0.113.0/24", "198.51.0.0/16", "10.20.0.0/16"], 7);
+    routes.extend(tunnel_rows(
+        &["0.0.0.0/1", "128.0.0.0/1", "198.18.0.0/24"],
+        9,
+    ));
+    assert_eq!(
+        foreign_tunnel_blocks(&routes, &[7, 9]),
+        vec![
+            net("10.20.0.0/16"),
+            net("198.51.0.0/16"),
+            net("203.0.113.0/24"),
+        ]
+    );
+}
+
+/// Each family is judged on its own: a full IPv6 tunnel keeps its IPv4
+/// corporate networks.
+#[test]
+fn a_full_ipv6_tunnel_keeps_its_ipv4_networks() {
+    let mut routes = tunnel_rows(&["203.0.113.0/24"], 9);
+    routes.push(row("::", 0, "::", 9, 1));
+    routes.push(row("2001:db8:5::", 48, "::", 9, 1));
+    routes.push(row("fd00:5::", 32, "::", 9, 1));
+    assert_eq!(
+        foreign_tunnel_blocks(&routes, &[9]),
+        vec![net("203.0.113.0/24"), net("fd00:5::/32")]
+    );
 }

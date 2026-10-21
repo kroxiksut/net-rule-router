@@ -240,7 +240,44 @@ fn resolved6(ips: &[std::net::Ipv6Addr]) -> ResolvedAddresses {
 }
 
 fn carried(guard: crate::enforcement_planner::Ipv6Guard) -> Ipv6DispositionFn {
-    Arc::new(move || guard)
+    Arc::new(move || Some(guard))
+}
+
+/// Before the routing user's first plan lands (boot, sign-in), nothing routes
+/// or pins a rule host's IPv6: its AAAA is NODATA and the upstream is not
+/// asked, while its A is still answered and enforced. A host no rule names is
+/// forwarded as ever.
+#[test]
+fn a_rule_hosts_aaaa_is_withheld_until_the_first_plan_lands() {
+    let v6: std::net::Ipv6Addr = "2001:db8::7".parse().expect("v6");
+    let unplanned: Ipv6DispositionFn = Arc::new(|| None);
+    let l = listener(&["assistant.example"], Ok(resolved6(&[v6])))
+        .with_fake_ip(std::sync::Arc::new(CarriesOnV4(false)))
+        .with_ipv6_disposition(unplanned);
+    match l.answer_query(&query("assistant.example", QTYPE_AAAA)) {
+        ListenerAction::Respond(bytes) => {
+            assert_eq!(bytes[3] & 0x0f, RCODE_NOERROR, "NOERROR, not NXDOMAIN");
+            assert_eq!(&bytes[6..8], &[0, 0], "no AAAA handed out — NODATA");
+        }
+        other => panic!("expected NODATA before the first plan, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            l.answer_query(&query("other.example", QTYPE_AAAA)),
+            ListenerAction::Forward
+        ),
+        "a host no rule names is none of our business"
+    );
+
+    let a = listener(
+        &["assistant.example"],
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 0, 7)])),
+    )
+    .with_ipv6_disposition(Arc::new(|| None));
+    match a.answer_query(&query("assistant.example", QTYPE_A)) {
+        ListenerAction::Respond(bytes) => assert_eq!(&bytes[6..8], &[0, 1], "the A is answered"),
+        other => panic!("expected an A answer, got {other:?}"),
+    }
 }
 
 /// The tunnel carries IPv6: the rule host's v6 is answered, not suppressed.
@@ -1921,6 +1958,31 @@ fn a_source_past_its_share_is_refused_and_another_is_not() {
     assert!(limiter.buckets.len() <= SOURCE_TABLE_CAP);
 }
 
+/// A table full of live sources admits a newcomer untracked; once those
+/// sources fall quiet, the next newcomer finds room and gets a share of its own.
+#[test]
+fn a_full_source_table_makes_room_once_its_sources_fall_quiet() {
+    let mut limiter = SourceLimiter::default();
+    let now = Instant::now();
+    for port in 1..=(SOURCE_TABLE_CAP as u16) {
+        assert!(limiter.admit(SocketAddr::from((Ipv4Addr::LOCALHOST, port)), now));
+    }
+    let newcomer: SocketAddr = "127.0.0.1:60000".parse().expect("addr");
+    assert!(
+        limiter.admit(newcomer, now),
+        "never refused for a full table"
+    );
+    assert!(!limiter.buckets.contains_key(&newcomer));
+
+    let later = now + SOURCE_IDLE + Duration::from_millis(1);
+    assert!(limiter.admit(newcomer, later));
+    assert!(
+        limiter.buckets.contains_key(&newcomer),
+        "the quiet sources were forgotten and the newcomer is held to its share"
+    );
+    assert_eq!(limiter.buckets.len(), 1);
+}
+
 /// A flood from one socket is answered with failures on the receive thread
 /// and never waits on the network; a query from another socket still gets
 /// through, promptly.
@@ -1952,6 +2014,45 @@ fn a_flood_from_one_program_does_not_stall_another() {
     );
     stop.store(true, Ordering::SeqCst);
     thread.join().expect("serve loop");
+}
+
+/// A receive loop that dies on its own, with no stop asked, still runs the
+/// stop hook (the system's DNS is handed back) and ends every thread it
+/// started, the TCP side included, so its caller sees the end and can report it.
+#[test]
+fn a_receive_loop_that_dies_hands_dns_back_and_ends_the_tcp_side_too() {
+    let l = Arc::new(listener(&[], Ok(resolved(&[]))));
+    let (socket, tcp) = udp_and_tcp_on_one_port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let handed_back = Arc::new(AtomicBool::new(false));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        let handed_back = Arc::clone(&handed_back);
+        move || {
+            let beats = AtomicUsize::new(0);
+            let beat = || {
+                assert!(
+                    beats.fetch_add(1, Ordering::Relaxed) < 2,
+                    "a bug in the receive loop"
+                );
+            };
+            let on_stop = || handed_back.store(true, Ordering::SeqCst);
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                l.serve_observed(&socket, Some(&tcp), &stop, &beat, &on_stop)
+            }));
+            let _ = done_tx.send(unwound.is_err());
+        }
+    });
+    let panicked = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the serve loop ended instead of waiting for a stop nobody sends");
+    assert!(
+        panicked,
+        "the panic reaches the caller, which reports the exit"
+    );
+    assert!(handed_back.load(Ordering::SeqCst), "the stop hook ran");
+    assert!(!stop.load(Ordering::SeqCst));
 }
 
 /// The reply check reads the echoed question as raw labels, so a compressed

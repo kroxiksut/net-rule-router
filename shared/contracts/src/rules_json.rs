@@ -119,6 +119,11 @@ pub struct CanonicalRulesJsonV1 {
 }
 
 /// One rule in the canonical wire form.
+///
+/// An older build ignores a field it does not know and applies the rule
+/// without it, so a new field may only add what is safe to lose (provenance,
+/// display). Anything that changes what a rule matches or does is a new kind
+/// or action, which an older build sets aside instead of applying.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RuleDto {
@@ -463,6 +468,9 @@ pub fn required_schema_version(dto: &CanonicalRulesJsonV1) -> u16 {
             RuleAction::Route | RuleAction::Block => {}
         }
         if let Some(app) = rule.app_match.as_ref() {
+            if matches!(app.pattern, AppPatternDto::Unrecognized(_)) {
+                return RULES_JSON_SCHEMA_VERSION.max(dto.schema_version);
+            }
             if matches!(app.pattern, AppPatternDto::Path { .. }) {
                 needed = needed.max(5);
             }

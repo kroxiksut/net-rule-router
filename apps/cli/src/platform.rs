@@ -107,14 +107,32 @@ pub fn use_machine_environment(_command: &mut std::process::Command) {}
 /// Creates the elevated relay's report: a new file, refused when a link could
 /// redirect the elevated write somewhere else.
 #[cfg(windows)]
-pub fn create_relay_report(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    nrr_platform_windows::elevation::create_relay_report(path)
+pub fn create_relay_report(
+    path: &std::path::Path,
+    user_sid: Option<&str>,
+) -> std::io::Result<std::fs::File> {
+    nrr_platform_windows::elevation::create_relay_report(path, user_sid)
+}
+
+/// The account this console runs as, for the elevated copy to find its folder.
+#[cfg(windows)]
+pub fn current_user_sid() -> Option<String> {
+    nrr_platform_windows::elevation::current_user_sid()
+}
+
+/// Elsewhere the elevated copy keeps the terminal and the same user's paths.
+#[cfg(not(windows))]
+pub fn current_user_sid() -> Option<String> {
+    None
 }
 
 /// Creates the elevated relay's report. Only UAC needs the relay; elsewhere
 /// the terminal is kept, so an exclusive create with no link in the way does.
 #[cfg(not(windows))]
-pub fn create_relay_report(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+pub fn create_relay_report(
+    path: &std::path::Path,
+    _user_sid: Option<&str>,
+) -> std::io::Result<std::fs::File> {
     if let Some(dir) = path.parent() {
         if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
             return Err(std::io::Error::new(

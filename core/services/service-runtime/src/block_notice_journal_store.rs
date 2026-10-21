@@ -146,6 +146,25 @@ impl BlockNoticeJournalStore for SqliteBlockNoticeJournalStore {
     }
 }
 
+/// Ages out every user's backlog, including one who never signs in again and
+/// so never reaches `append`/`list_pending`. Called from the slow storage tick.
+pub fn purge_all_stale(conn: &Mutex<Connection>, now_ms: i64) -> usize {
+    let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+    match nrr_storage::block_notice_journal::BlockNoticeJournalRepository::new(&guard)
+        .purge_all_stale(now_ms)
+    {
+        Ok(removed) => removed,
+        Err(e) => {
+            tracing::debug!(
+                target: "nrr::retention",
+                error = %e,
+                "block-notice backlog sweep failed; retrying next pass",
+            );
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

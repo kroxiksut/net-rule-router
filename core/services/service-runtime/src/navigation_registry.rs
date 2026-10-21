@@ -137,6 +137,9 @@ struct Candidate {
 
 #[derive(Debug)]
 struct ProcState {
+    /// Whose process this is: the key is already scoped by it, the sweep
+    /// needs it to credit the host to the same user.
+    owner: String,
     last_at_ms: u64,
     /// Whether a gap has actually been observed for this process yet. The
     /// first sighting has nothing before it: the process was very likely busy
@@ -222,8 +225,12 @@ impl NavigationRegistry {
 
     /// One outbound connection attempt.
     ///
-    /// `process` is the initiating image path — the only identity both
-    /// observers supply (the WFP net-event source reports `pid: 0` by design).
+    /// `owner` is the connection's user (`None` when unknown); every record is
+    /// keyed by it, so two users running the same program never share a burst
+    /// or a host's counts.
+    ///
+    /// `process` is the initiating image path — the only per-process identity
+    /// both observers supply (the WFP net-event source reports `pid: 0` by design).
     /// An unattributed connection is ignored: without knowing whose burst it
     /// belongs to there is nothing to measure.
     ///
@@ -235,11 +242,13 @@ impl NavigationRegistry {
     /// shape [`crate::primary_stall_registry::PrimaryStallRegistry::note`] has.
     pub fn note_attempt(
         &self,
+        owner: Option<&str>,
         process: Option<&str>,
         hostname: Option<&str>,
         at_ms: u64,
     ) -> Option<Distribution> {
         let process = process.filter(|p| !p.is_empty())?;
+        let owner = owner.unwrap_or_default();
         // A candidate nothing followed is settled by the next connection of
         // ITS process — which for a background process can be a long wait. One
         // pass per burst window catches those without a second sink to wire or
@@ -248,7 +257,8 @@ impl NavigationRegistry {
         let settled = {
             let mut procs = self.procs.lock().unwrap_or_else(|p| p.into_inner());
             Self::expire_procs(&mut procs, at_ms, self.ttl_ms);
-            let entry = procs.entry(process.to_string()).or_insert(ProcState {
+            let entry = procs.entry(scoped(owner, process)).or_insert(ProcState {
+                owner: owner.to_string(),
                 last_at_ms: at_ms,
                 primed: false,
                 candidate: None,
@@ -282,7 +292,7 @@ impl NavigationRegistry {
                     // on its own gap.
                     let outcome = self.settle(&candidate, &mut entry.navigations);
                     if let Some(host) = candidate.hostname.as_deref() {
-                        self.credit(host, outcome, at_ms);
+                        self.credit(owner, host, outcome, at_ms);
                     }
                     settled = self.begin_or_credit(entry, hostname, gap, at_ms);
                 }
@@ -294,7 +304,7 @@ impl NavigationRegistry {
             settled
         };
         if let Some((host, outcome)) = settled {
-            self.credit(&host, outcome, at_ms);
+            self.credit(owner, &host, outcome, at_ms);
         }
         self.due_report(at_ms)
     }
@@ -320,7 +330,7 @@ impl NavigationRegistry {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|_, (_, last)| now_ms.saturating_sub(*last) < self.ttl_ms);
-        let ripe: Vec<(Candidate, Outcome)> = {
+        let ripe: Vec<(String, Candidate, Outcome)> = {
             let mut procs = self.procs.lock().unwrap_or_else(|p| p.into_inner());
             Self::expire_procs(&mut procs, now_ms, self.ttl_ms);
             let mut ripe = Vec::new();
@@ -335,24 +345,25 @@ impl NavigationRegistry {
                     continue;
                 };
                 let outcome = self.settle(&candidate, &mut state.navigations);
-                ripe.push((candidate, outcome));
+                ripe.push((state.owner.clone(), candidate, outcome));
             }
             ripe
         };
-        for (candidate, outcome) in ripe {
+        for (owner, candidate, outcome) in ripe {
             if let Some(host) = candidate.hostname.as_deref() {
-                self.credit(host, outcome, now_ms);
+                self.credit(&owner, host, outcome, now_ms);
             }
         }
     }
 
-    /// What was counted for `hostname`. All zeroes for a host never seen.
+    /// What was counted for `hostname` on `owner`'s connections. All zeroes
+    /// for a host that user was never seen reaching.
     #[must_use]
-    pub fn counts_of(&self, hostname: &str) -> HostCounts {
+    pub fn counts_of(&self, owner: Option<&str>, hostname: &str) -> HostCounts {
         self.hosts
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(hostname)
+            .get(&scoped(owner.unwrap_or_default(), hostname))
             .map(|(counts, _)| *counts)
             .unwrap_or_default()
     }
@@ -364,11 +375,11 @@ impl NavigationRegistry {
     /// touches would read as "the user never went there". A consumer that
     /// suppresses on zero navigations must ask this first.
     #[must_use]
-    pub fn process_ever_navigated(&self, process: &str) -> bool {
+    pub fn process_ever_navigated(&self, owner: Option<&str>, process: &str) -> bool {
         self.procs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(process)
+            .get(&scoped(owner.unwrap_or_default(), process))
             .is_some_and(|state| state.navigations > 0)
     }
 
@@ -424,11 +435,12 @@ impl NavigationRegistry {
         }
     }
 
-    fn credit(&self, hostname: &str, outcome: Outcome, at_ms: u64) {
+    fn credit(&self, owner: &str, hostname: &str, outcome: Outcome, at_ms: u64) {
+        // No TTL scan here: this runs per connection, and the sweep that runs
+        // once per burst window already ages entries out.
         let mut hosts = self.hosts.lock().unwrap_or_else(|p| p.into_inner());
-        hosts.retain(|_, (_, last)| at_ms.saturating_sub(*last) < self.ttl_ms);
         let (counts, last) = hosts
-            .entry(hostname.to_string())
+            .entry(scoped(owner, hostname))
             .or_insert((HostCounts::default(), at_ms));
         *last = (*last).max(at_ms);
         match outcome {
@@ -437,15 +449,19 @@ impl NavigationRegistry {
             Outcome::Solo => counts.solo = counts.solo.saturating_add(1),
             Outcome::Unmeasured => counts.unmeasured = counts.unmeasured.saturating_add(1),
         }
-        while hosts.len() > self.host_cap {
-            let Some(oldest) = hosts
+        if hosts.len() > self.host_cap {
+            // One pass frees a quarter of the cap, so a full table does not
+            // pay a scan for every new host.
+            let keep = (self.host_cap - self.host_cap / 4).max(1);
+            let mut by_age: Vec<(u64, String)> = hosts
                 .iter()
-                .min_by_key(|(_, (_, last))| *last)
-                .map(|(h, _)| h.clone())
-            else {
-                break;
-            };
-            hosts.remove(&oldest);
+                .map(|(h, (_, last))| (*last, h.clone()))
+                .collect();
+            by_age.sort_unstable_by_key(|(last, _)| *last);
+            let drop_n = hosts.len().saturating_sub(keep);
+            for (_, host) in by_age.into_iter().take(drop_n) {
+                hosts.remove(&host);
+            }
         }
     }
 
@@ -499,6 +515,16 @@ impl NavigationRegistry {
             procs.remove(&oldest);
         }
     }
+}
+
+/// Map key that keeps one user's records apart from another's. A SID never
+/// contains NUL, so the pair cannot collide.
+fn scoped(owner: &str, name: &str) -> String {
+    let mut key = String::with_capacity(owner.len() + 1 + name.len());
+    key.push_str(owner);
+    key.push(' ');
+    key.push_str(name);
+    key
 }
 
 /// How one connection turned out.
@@ -564,21 +590,22 @@ mod tests {
     }
 
     const PROC: &str = "C:/apps/browser.exe";
+    const OWNER: Option<&str> = Some("S-1-5-21-1");
 
     /// One connection long before the interesting one. A process's FIRST
     /// sighting has no observed gap in front of it, so every test that means
     /// "quiet, then something" has to establish the process first — exactly as
     /// a running browser establishes itself before the user opens a page.
     fn warm(reg: &NavigationRegistry, at_ms: u64) {
-        reg.note_attempt(Some(PROC), None, at_ms);
+        reg.note_attempt(OWNER, Some(PROC), None, at_ms);
     }
 
     /// A page load: quiet, then the page, then everything the page pulls in.
     fn page_load(reg: &NavigationRegistry, at_ms: u64, page: &str, pulled: &[&str]) {
         warm(reg, at_ms.saturating_sub(10_000));
-        reg.note_attempt(Some(PROC), Some(page), at_ms);
+        reg.note_attempt(OWNER, Some(PROC), Some(page), at_ms);
         for (i, host) in pulled.iter().enumerate() {
-            reg.note_attempt(Some(PROC), Some(host), at_ms + 50 + i as u64 * 10);
+            reg.note_attempt(OWNER, Some(PROC), Some(host), at_ms + 50 + i as u64 * 10);
         }
         reg.sweep(at_ms + 5_000);
     }
@@ -594,7 +621,7 @@ mod tests {
         );
 
         assert_eq!(
-            reg.counts_of("site.example"),
+            reg.counts_of(OWNER, "site.example"),
             HostCounts {
                 navigations: 1,
                 companions: 0,
@@ -606,7 +633,7 @@ mod tests {
         // The positive control that makes the assertion above mean something:
         // the same measurement must NOT call the ad host a navigation.
         assert_eq!(
-            reg.counts_of("ads.tracker.example"),
+            reg.counts_of(OWNER, "ads.tracker.example"),
             HostCounts {
                 navigations: 0,
                 companions: 1,
@@ -623,11 +650,11 @@ mod tests {
     fn a_lone_connection_in_the_quiet_is_not_a_navigation() {
         let reg = registry();
         warm(&reg, 1_000);
-        reg.note_attempt(Some(PROC), Some("ads.tracker.example"), 10_000);
+        reg.note_attempt(OWNER, Some(PROC), Some("ads.tracker.example"), 10_000);
         reg.sweep(20_000);
 
         assert_eq!(
-            reg.counts_of("ads.tracker.example"),
+            reg.counts_of(OWNER, "ads.tracker.example"),
             HostCounts {
                 navigations: 0,
                 companions: 0,
@@ -642,11 +669,11 @@ mod tests {
     fn a_burst_too_small_to_be_a_page_settles_as_solo() {
         let reg = registry();
         warm(&reg, 1_000);
-        reg.note_attempt(Some(PROC), Some("api.example"), 10_000);
-        reg.note_attempt(Some(PROC), Some("api.example"), 10_100);
+        reg.note_attempt(OWNER, Some(PROC), Some("api.example"), 10_000);
+        reg.note_attempt(OWNER, Some(PROC), Some("api.example"), 10_100);
         reg.sweep(20_000);
 
-        let counts = reg.counts_of("api.example");
+        let counts = reg.counts_of(OWNER, "api.example");
         assert_eq!(counts.navigations, 0, "two connections are not a page load");
         assert_eq!(counts.total(), 2, "both connections were still counted");
     }
@@ -659,10 +686,10 @@ mod tests {
         let reg = registry();
         // Continuous chatter: every gap is below the quiet threshold.
         for i in 0..30_u64 {
-            reg.note_attempt(Some(PROC), Some("noisy.example"), 10_000 + i * 100);
+            reg.note_attempt(OWNER, Some(PROC), Some("noisy.example"), 10_000 + i * 100);
         }
         assert!(
-            !reg.process_ever_navigated(PROC),
+            !reg.process_ever_navigated(OWNER, PROC),
             "no quiet was ever observed, so no navigation could be"
         );
         // And the positive control: once it does go quiet and open a page, it says so.
@@ -673,7 +700,7 @@ mod tests {
             &["a.example", "b.example", "c.example"],
         );
         assert!(
-            reg.process_ever_navigated(PROC),
+            reg.process_ever_navigated(OWNER, PROC),
             "a real page load is what makes the answer true"
         );
     }
@@ -685,9 +712,9 @@ mod tests {
     fn a_process_that_never_goes_quiet_leaves_its_hosts_unmeasured() {
         let reg = registry();
         for i in 0..10_u64 {
-            reg.note_attempt(Some(PROC), Some("noisy.example"), 10_000 + i * 100);
+            reg.note_attempt(OWNER, Some(PROC), Some("noisy.example"), 10_000 + i * 100);
         }
-        let counts = reg.counts_of("noisy.example");
+        let counts = reg.counts_of(OWNER, "noisy.example");
         assert_eq!(counts.companions, 0);
         assert_eq!(
             counts.unmeasured, 9,
@@ -707,22 +734,22 @@ mod tests {
             "site.example",
             &["ads.tracker.example", "b.example", "c.example"],
         );
-        assert!(reg.counts_of("ads.tracker.example").only_pulled_in());
-        assert!(!reg.counts_of("site.example").only_pulled_in());
+        assert!(reg.counts_of(OWNER, "ads.tracker.example").only_pulled_in());
+        assert!(!reg.counts_of(OWNER, "site.example").only_pulled_in());
     }
 
     #[test]
     fn an_unnamed_destination_shapes_the_burst_but_credits_no_host() {
         let reg = registry();
         warm(&reg, 1_000);
-        reg.note_attempt(Some(PROC), Some("site.example"), 10_000);
+        reg.note_attempt(OWNER, Some(PROC), Some("site.example"), 10_000);
         for i in 0..3_u64 {
-            reg.note_attempt(Some(PROC), None, 10_050 + i * 10);
+            reg.note_attempt(OWNER, Some(PROC), None, 10_050 + i * 10);
         }
         reg.sweep(20_000);
 
         assert_eq!(
-            reg.counts_of("site.example").navigations,
+            reg.counts_of(OWNER, "site.example").navigations,
             1,
             "connections nobody could name still prove a burst happened"
         );
@@ -737,12 +764,12 @@ mod tests {
     fn an_unattributed_connection_is_ignored() {
         let reg = registry();
         assert!(reg
-            .note_attempt(None, Some("site.example"), 10_000)
+            .note_attempt(OWNER, None, Some("site.example"), 10_000)
             .is_none());
         assert!(reg
-            .note_attempt(Some(""), Some("site.example"), 10_000)
+            .note_attempt(OWNER, Some(""), Some("site.example"), 10_000)
             .is_none());
-        assert_eq!(reg.counts_of("site.example"), HostCounts::default());
+        assert_eq!(reg.counts_of(OWNER, "site.example"), HostCounts::default());
     }
 
     #[test]
@@ -750,18 +777,47 @@ mod tests {
         let reg = registry();
         const OTHER: &str = "C:/apps/updater.exe";
         warm(&reg, 1_000);
-        reg.note_attempt(Some(PROC), Some("site.example"), 10_000);
+        reg.note_attempt(OWNER, Some(PROC), Some("site.example"), 10_000);
         // The other process is busy at the same moment; its traffic must not
         // become the burst that confirms this page.
         for i in 0..5_u64 {
-            reg.note_attempt(Some(OTHER), Some("update.example"), 10_050 + i * 10);
+            reg.note_attempt(OWNER, Some(OTHER), Some("update.example"), 10_050 + i * 10);
         }
         reg.sweep(20_000);
 
         assert_eq!(
-            reg.counts_of("site.example").navigations,
+            reg.counts_of(OWNER, "site.example").navigations,
             0,
             "somebody else's traffic is not this page's burst"
+        );
+    }
+
+    #[test]
+    fn two_users_running_one_program_do_not_share_state() {
+        let reg = registry();
+        const OTHER_USER: Option<&str> = Some("S-1-5-21-2");
+        // The first user opens a page; the second only has a timer-driven refresh.
+        reg.note_attempt(OWNER, Some(PROC), None, 1_000);
+        reg.note_attempt(OTHER_USER, Some(PROC), None, 1_000);
+        reg.note_attempt(OWNER, Some(PROC), Some("site.example"), 10_000);
+        for i in 0..3_u64 {
+            reg.note_attempt(OWNER, Some(PROC), Some("x.example"), 10_050 + i * 10);
+        }
+        // The other user's connection inside the first user's window must not
+        // count as a follower of that page.
+        reg.note_attempt(OTHER_USER, Some(PROC), Some("site.example"), 10_020);
+        reg.sweep(20_000);
+
+        assert_eq!(reg.counts_of(OWNER, "site.example").navigations, 1);
+        assert!(reg.process_ever_navigated(OWNER, PROC));
+        assert!(
+            !reg.process_ever_navigated(OTHER_USER, PROC),
+            "the same image path under another user has its own record"
+        );
+        assert_eq!(
+            reg.counts_of(OTHER_USER, "site.example").navigations,
+            0,
+            "the other user never opened it"
         );
     }
 
@@ -769,17 +825,17 @@ mod tests {
     fn the_distribution_is_reported_once_per_interval() {
         let reg = registry().with_report_interval(1_000);
         assert!(
-            reg.note_attempt(Some(PROC), Some("a.example"), 10_000)
+            reg.note_attempt(OWNER, Some(PROC), Some("a.example"), 10_000)
                 .is_none(),
             "the first observation starts the interval rather than reporting one"
         );
         assert!(reg
-            .note_attempt(Some(PROC), Some("b.example"), 10_500)
+            .note_attempt(OWNER, Some(PROC), Some("b.example"), 10_500)
             .is_none());
-        let reported = reg.note_attempt(Some(PROC), Some("c.example"), 11_200);
+        let reported = reg.note_attempt(OWNER, Some(PROC), Some("c.example"), 11_200);
         assert!(reported.is_some(), "the interval elapsed");
         assert!(
-            reg.note_attempt(Some(PROC), Some("d.example"), 11_300)
+            reg.note_attempt(OWNER, Some(PROC), Some("d.example"), 11_300)
                 .is_none(),
             "and it does not repeat until the next one"
         );
@@ -791,7 +847,7 @@ mod tests {
         for i in 0..6_u64 {
             let host = format!("host{i}.example");
             let proc = format!("C:/apps/p{i}.exe");
-            reg.note_attempt(Some(&proc), Some(&host), 10_000 + i * 100);
+            reg.note_attempt(OWNER, Some(&proc), Some(&host), 10_000 + i * 100);
             reg.sweep(10_000 + i * 100 + 5_000);
         }
         let dist = reg.distribution();
@@ -800,6 +856,24 @@ mod tests {
             dist.processes <= 2,
             "process map stayed capped: {}",
             dist.processes
+        );
+    }
+
+    #[test]
+    fn a_full_host_table_drops_the_oldest_and_keeps_the_newest() {
+        let reg = registry().with_bounds(600_000, 8, 8);
+        for i in 0..20_u64 {
+            reg.credit("", &format!("h{i}.example"), Outcome::Solo, 1_000 + i);
+        }
+        let hosts = reg.hosts.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(hosts.len() <= 8, "capped: {}", hosts.len());
+        assert!(
+            hosts.contains_key(&scoped("", "h19.example")),
+            "the newest stays"
+        );
+        assert!(
+            !hosts.contains_key(&scoped("", "h0.example")),
+            "the oldest goes"
         );
     }
 
@@ -815,12 +889,12 @@ mod tests {
             "site.example",
             &["a.example", "b.example", "c.example"],
         );
-        assert_eq!(reg.counts_of("site.example").navigations, 1);
+        assert_eq!(reg.counts_of(OWNER, "site.example").navigations, 1);
         // Far beyond the TTL: the next observation sweeps the old entries out.
-        reg.note_attempt(Some(PROC), Some("later.example"), 100_000);
+        reg.note_attempt(OWNER, Some(PROC), Some("later.example"), 100_000);
         reg.sweep(100_000);
         assert_eq!(
-            reg.counts_of("site.example"),
+            reg.counts_of(OWNER, "site.example"),
             HostCounts::default(),
             "a verdict built from last week's browsing describes nothing"
         );

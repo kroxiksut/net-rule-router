@@ -24,6 +24,7 @@ const EVENT_ID_STOPPED: u32 = 2;
 const EVENT_ID_DEGRADED: u32 = 3;
 const EVENT_ID_RECOVERY_REQUIRED: u32 = 4;
 const EVENT_ID_DISABLED: u32 = 5;
+const EVENT_ID_GAVE_UP: u32 = 6;
 
 /// The record a state deserves, or `None` when the state is an intention rather
 /// than an outcome.
@@ -67,6 +68,41 @@ pub fn record_for(state: ServiceRuntimeState) -> Option<SystemEventRecord> {
         event_id,
         message: message.to_string(),
     })
+}
+
+/// How the last-resort step after a service that kept crashing ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterCrashResult {
+    /// Filters, routes and the DNS redirect are gone; the network works as before.
+    NetworkRestored,
+    /// Only the DNS redirect went; leak protection keeps its blocks on purpose.
+    DnsHandedBack,
+    /// Something stayed behind and the operator has to act.
+    Incomplete,
+}
+
+/// The record for the after-crash step, which runs in its own short-lived
+/// process with no log of ours: the operator's log is the only trace it leaves.
+pub fn after_crash_record(result: AfterCrashResult) -> SystemEventRecord {
+    let (severity, message) = match result {
+        AfterCrashResult::NetworkRestored => (
+            SystemEventSeverity::Warning,
+            "NetRuleRouter service stopped for good after repeated crashes. Its filters, routes and DNS redirect were removed, so the network works without it.",
+        ),
+        AfterCrashResult::DnsHandedBack => (
+            SystemEventSeverity::Warning,
+            "NetRuleRouter service stopped for good after repeated crashes. Name resolution was handed back; leak protection keeps its blocks until the service runs again.",
+        ),
+        AfterCrashResult::Incomplete => (
+            SystemEventSeverity::Error,
+            "NetRuleRouter service stopped for good after repeated crashes and the network could not be fully restored. Run `nrr-cli reset-network --confirm` as administrator.",
+        ),
+    };
+    SystemEventRecord {
+        severity,
+        event_id: EVENT_ID_GAVE_UP,
+        message: message.to_string(),
+    }
 }
 
 /// Change-suppressing writer around a [`SystemEventLogPort`].
@@ -126,6 +162,19 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    #[test]
+    fn giving_up_after_crashes_is_always_visible_and_an_incomplete_one_is_an_error() {
+        use AfterCrashResult::*;
+        for result in [NetworkRestored, DnsHandedBack] {
+            let record = after_crash_record(result);
+            assert_eq!(record.severity, SystemEventSeverity::Warning);
+            assert_eq!(record.event_id, EVENT_ID_GAVE_UP);
+        }
+        let incomplete = after_crash_record(Incomplete);
+        assert_eq!(incomplete.severity, SystemEventSeverity::Error);
+        assert!(incomplete.message.contains("reset-network"));
     }
 
     #[test]

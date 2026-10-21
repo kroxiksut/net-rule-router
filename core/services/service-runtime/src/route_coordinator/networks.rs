@@ -16,6 +16,26 @@ impl SecondaryRouteCoordinator {
             .publish(self.secondary_local_networks(sid));
     }
 
+    /// The tunnels foreign to every served user, and what they carry, for the
+    /// readers that must keep out of them. `per_user` holds each served user's
+    /// foreign tunnels, named from `table` and `adapters`. A link counts only
+    /// when it is foreign to all of them: another user's additional link is no
+    /// tunnel of this one's, but it is not the corporate network either.
+    ///
+    /// An unreadable table publishes nothing rather than leaving the last
+    /// pass's facts standing: doubt is "not foreign". `own` are the served
+    /// users' additional-route links, which the bindings name either way.
+    pub(super) fn publish_foreign_tunnel_networks(
+        &self,
+        table: Option<&[RouteEntry]>,
+        adapters: &[AdapterInfo],
+        per_user: &[Vec<u32>],
+        own: &[u32],
+    ) {
+        crate::foreign_tunnels::global_foreign_tunnels()
+            .publish_served(table, adapters, per_user, own);
+    }
+
     pub fn secondary_local_networks(&self, sid: &str) -> Vec<Ipv4Network> {
         let Some(secondary) = self.resolve(sid).secondary else {
             return Vec::new();
@@ -64,42 +84,17 @@ impl SecondaryRouteCoordinator {
                 return Vec::new();
             }
         };
-        let Ok(adapters) = self.api.get_adapter_infos() else {
+        let Ok(adapters) = self.adapters_now() else {
             return Vec::new();
         };
-        let name_of = |ifindex: u32| {
-            adapters
-                .iter()
-                .find(|info| info.index == ifindex)
-                .map(|info| preferred_display_name(info).to_string())
-                .unwrap_or_default()
-        };
-        // The exemptible part only: a segment the enforcement refuses must not
-        // be offered as something to keep reachable.
-        let mut out: Vec<(Ipv4Network, String, bool)> = Vec::new();
-        if let Some(primary) = resolution.primary {
-            for (net, prefix) in exemptible_local_subnets(&routes, primary.interface_index).v4 {
-                if let Some(network) = Ipv4Network::new(net, prefix) {
-                    out.push((network, name_of(primary.interface_index), true));
-                }
-            }
-        }
-        for info in adapters
-            .iter()
-            .filter(|info| Some(info.index) != resolution.secondary.map(|s| s.interface_index))
-            .filter(|info| nrr_platform_api::adapters::is_virtual_machine_adapter(info))
-        {
-            for (net, prefix) in exemptible_local_subnets(&routes, info.index).v4 {
-                let Some(network) = Ipv4Network::new(net, prefix) else {
-                    continue;
-                };
-                if out.iter().any(|(found, _, _)| *found == network) {
-                    continue;
-                }
-                out.push((network, preferred_display_name(info).to_string(), false));
-            }
-        }
-        out
+        crate::local_network_source::discovered(
+            &routes,
+            &adapters,
+            crate::local_network_source::BoundLinks {
+                primary: resolution.primary.map(|p| p.interface_index),
+                secondary: resolution.secondary.map(|s| s.interface_index),
+            },
+        )
     }
 
     /// The public IPv6 prefixes the main link carries, each with what is
@@ -117,8 +112,10 @@ impl SecondaryRouteCoordinator {
         primary_ifindex: u32,
         for_display: bool,
     ) -> Vec<PublicV6Network> {
-        let candidates = exemptible_local_subnets(routes, primary_ifindex).public_v6;
-        if candidates.is_empty() {
+        if exemptible_local_subnets(routes, primary_ifindex)
+            .public_v6
+            .is_empty()
+        {
             return Vec::new();
         }
         let answers = self
@@ -126,20 +123,19 @@ impl SecondaryRouteCoordinator {
             .as_ref()
             .map(|read| read(sid).answers_v6)
             .unwrap_or_default();
-        let auto_accept = self
-            .route_source
-            .load_for_sid(sid)
-            .is_some_and(|p| p.local_networks_auto_accept && !p.kill_switch_block_all);
+        let auto_accept = self.route_source.load_for_sid(sid).is_some_and(|p| {
+            p.local_networks_auto_accept && !crate::per_sid_orchestrator::protects_everything(&p)
+        });
         let ownership = std::cell::OnceCell::new();
         let names_rule = |block: nrr_shared::ip_block::IpBlock| {
             ownership
                 .get_or_init(|| {
                     let rules = self.rules_provider.active_rules_for(sid)?;
                     let snapshot = self.fqdn_cache.snapshot_for_compute();
-                    let cache: &dyn FqdnCacheLookup = match snapshot.as_ref() {
-                        Some(snapshot) => snapshot,
-                        None => self.fqdn_cache.as_ref(),
-                    };
+                    let cache = super::liveness::snapshot_or_live(
+                        snapshot.as_ref(),
+                        self.fqdn_cache.as_ref(),
+                    );
                     Some(crate::address_ownership::AddressOwnership::resolve(
                         &rules.rule_book,
                         cache,
@@ -148,23 +144,14 @@ impl SecondaryRouteCoordinator {
                 .as_ref()
                 .is_some_and(|o: &crate::address_ownership::AddressOwnership| o.names_inside(block))
         };
-        candidates
-            .into_iter()
-            .filter_map(|(net, prefix)| {
-                nrr_shared::ip_block::IpBlock::new(std::net::IpAddr::V6(net), prefix)
-            })
-            .map(|block| {
-                let answer = answers.iter().find(|(b, _)| *b == block).map(|(_, a)| *a);
-                let wanted = answer.unwrap_or(auto_accept);
-                let names_rule = (wanted || for_display) && names_rule(block);
-                PublicV6Network {
-                    block,
-                    allowed: wanted && !names_rule,
-                    decided: answer.is_some() || auto_accept,
-                    names_rule,
-                }
-            })
-            .collect()
+        crate::local_network_source::public_v6_networks(
+            routes,
+            primary_ifindex,
+            &answers,
+            auto_accept,
+            for_display,
+            names_rule,
+        )
     }
 
     /// What the settings list shows beyond the exemptible private segments:
@@ -178,22 +165,13 @@ impl SecondaryRouteCoordinator {
         let Ok(routes) = self.api.get_ip_forward_table() else {
             return LocalNetworkCandidates::default();
         };
-        let adapter = self
-            .api
-            .get_adapter_infos()
-            .ok()
-            .and_then(|infos| {
-                infos
-                    .iter()
-                    .find(|info| info.index == primary.interface_index)
-                    .map(|info| preferred_display_name(info).to_string())
-            })
-            .unwrap_or_default();
-        LocalNetworkCandidates {
-            public_v6: self.public_v6_local_networks(sid, &routes, primary.interface_index, true),
-            too_wide: exemptible_local_subnets(&routes, primary.interface_index).too_wide,
-            adapter,
-        }
+        let adapters = self.adapters_now().unwrap_or_default();
+        crate::local_network_source::candidates(
+            &routes,
+            &adapters,
+            primary.interface_index,
+            self.public_v6_local_networks(sid, &routes, primary.interface_index, true),
+        )
     }
 
     /// The opened public prefixes as exemption pairs.
@@ -206,14 +184,24 @@ impl SecondaryRouteCoordinator {
         let Some(primary) = primary_ifindex else {
             return Vec::new();
         };
-        self.public_v6_local_networks(sid, routes, primary, false)
-            .into_iter()
-            .filter(|n| n.allowed)
-            .filter_map(|n| match n.block.network() {
-                std::net::IpAddr::V6(net) => Some((net, n.block.prefix_len())),
-                std::net::IpAddr::V4(_) => None,
-            })
-            .collect()
+        crate::local_network_source::opened_pairs(
+            &self.public_v6_local_networks(sid, routes, primary, false),
+        )
+    }
+
+    /// The link `sid`'s `role` binding resolved to on the last pass that had one.
+    fn last_resolved_link(&self, sid: &str, role: &str) -> Option<u32> {
+        let last = self
+            .last_resolution
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let resolution = last.get(sid)?;
+        let target = if role == "secondary" {
+            resolution.secondary
+        } else {
+            resolution.primary
+        };
+        target.map(|t| t.interface_index)
     }
 
     /// The route table from `reading`, or read live when there is none.
@@ -285,42 +273,7 @@ impl SecondaryRouteCoordinator {
         let Some(policy) = self.local_networks.as_ref().map(|read| read(sid)) else {
             return;
         };
-        // An answer was given about an ADAPTER, so it carries over to whatever
-        // segment that adapter holds now. A refusal outranks a confirmation
-        // through the retain below, which is the direction that never reopens
-        // something the user closed.
-        let mut allowed = policy.allowed.clone();
-        let mut refused = policy.refused.clone();
-        for (adapter, allow) in &policy.adapter_answers {
-            for info in adapters
-                .iter()
-                .filter(|info| preferred_display_name(info) == adapter)
-            {
-                // A "yes" about an adapter never reopens what the enforcement
-                // refuses: the answer carries over to the exemptible part only.
-                for (net, prefix) in exemptible_local_subnets(routes, info.index).v4 {
-                    let Some(network) = Ipv4Network::new(net, prefix) else {
-                        continue;
-                    };
-                    if *allow {
-                        allowed.push(network);
-                    } else {
-                        refused.push(network);
-                    }
-                }
-            }
-        }
-        for network in &allowed {
-            let pair = (network.network(), network.prefix_len());
-            if !out.contains(&pair) {
-                out.push(pair);
-            }
-        }
-        // Compared as NETWORKS, not as pairs: the route table and the user's
-        // text can spell the same network differently.
-        out.retain(|(net, prefix)| {
-            Ipv4Network::new(*net, *prefix).is_none_or(|candidate| !refused.contains(&candidate))
-        });
+        crate::local_network_source::apply_stored_answers(&policy, routes, adapters, out);
     }
 
     /// Tell the user a tunnel is up while nothing is bound to the additional
@@ -456,13 +409,50 @@ impl SecondaryRouteCoordinator {
                 // never silently route through the wrong NIC. Iterator (not a
                 // Vec of borrows) so the chosen `&AdapterInfo` borrows `infos`
                 // directly and outlives this block.
-                let mut healed = infos.iter().filter(|i| {
-                    classify_availability(i) == Some(AdapterAvailability::Available)
-                        && adapter_answers_to_saved_name(i, &binding.display_name)
-                });
+                // A tunnel that is not the user's, matched only by words every
+                // client on the same driver shares, is somebody else's.
+                // Unreadable routes: the uplink cannot be told apart. Doubt keeps
+                // the link this binding resolved to on the last pass as ours, so
+                // a transient read error neither asks the user nor unbinds them;
+                // another tunnel-looking link is still not adopted on a guess.
+                let ours: Vec<u32> = by_id.map(|i| i.index).into_iter().collect();
+                let additional: &[u32] = if role == "secondary" { &ours } else { &[] };
+                let foreign: Vec<u32> = match self.routes_of(reading) {
+                    Some(routes) => {
+                        super::exemptions::foreign_tunnel_indexes(infos, &ours, additional, &routes)
+                    }
+                    None => {
+                        let mut kept = ours.clone();
+                        kept.extend(self.last_resolved_link(sid, role));
+                        super::exemptions::foreign_tunnel_indexes_without_routes(infos, &kept)
+                    }
+                };
+                let named: Vec<&AdapterInfo> = infos
+                    .iter()
+                    .filter(|i| {
+                        classify_availability(i) == Some(AdapterAvailability::Available)
+                            && adapter_answers_to_saved_name(i, &binding.display_name)
+                    })
+                    .collect();
+                let (accepted, refused): (Vec<&AdapterInfo>, Vec<&AdapterInfo>) =
+                    named.into_iter().partition(|i| {
+                        !foreign.contains(&i.index)
+                            || adapter_carries_only_the_saved_brand(i, &binding.display_name)
+                    });
+                let mut healed = accepted.iter().copied();
                 let first = healed.next();
                 let second = healed.next();
                 let ambiguous = second.is_some();
+                // Every name-matching candidate was refused as a foreign tunnel:
+                // the user decides, rather than a silent fail-closed.
+                let refused_only = first.is_none() && !refused.is_empty();
+                if refused_only {
+                    let candidates: Vec<String> = refused
+                        .iter()
+                        .map(|i| preferred_display_name(i).to_string())
+                        .collect();
+                    self.publish_enforcement_status(sid, "adapter-choice-needed", role, candidates);
+                }
                 // Several live adapters answer to the saved name: picking one
                 // would route the user's traffic through an adapter they never
                 // chose, so the choice goes back to them instead of being made
@@ -539,12 +529,14 @@ impl SecondaryRouteCoordinator {
                                 // traffic, and until this push existed the only
                                 // trace was a log line. Deduped inside the
                                 // publisher, so the steady state stays quiet.
-                                self.publish_enforcement_status(
-                                    sid,
-                                    "secondary-down",
-                                    role,
-                                    Vec::new(),
-                                );
+                                if !refused_only {
+                                    self.publish_enforcement_status(
+                                        sid,
+                                        "secondary-down",
+                                        role,
+                                        Vec::new(),
+                                    );
+                                }
                             }
                             None => {
                                 // The user has to hear this one. The bound
@@ -562,7 +554,7 @@ impl SecondaryRouteCoordinator {
                                 // asked above, and publishing both leaves the
                                 // two statuses overwriting each other in the
                                 // per-role latch — an endless alternating push.
-                                if !ambiguous {
+                                if !ambiguous && !refused_only {
                                     // "Removed", "switched off by the user" and
                                     // "its driver will not start" all arrive as
                                     // nothing, yet need different advice. Only

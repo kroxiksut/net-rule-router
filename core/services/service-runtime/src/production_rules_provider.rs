@@ -68,10 +68,21 @@ pub struct ProductionRulesProvider {
     unreadable: Mutex<HashMap<String, String>>,
     /// Where an unreadable book is reported. Set once, after construction.
     health: std::sync::OnceLock<Arc<crate::health::HealthAggregator>>,
+    /// Tells the affected user; shared by every provider of the service.
+    notices: Arc<crate::rules_book_notice::RulesBookNotices>,
 }
 
 /// The health voice an unreadable book speaks with.
 pub const RULES_READ_SOURCE: &str = "rules-read";
+
+/// Every client reads the health answer, so the message counts accounts and
+/// names none; who and why go to the log.
+fn unreadable_health_message(accounts: usize) -> String {
+    format!(
+        "{}; the last applied rules stay in force ({accounts} account(s))",
+        nrr_shared::ipc_payloads::RULES_BOOK_UNREADABLE
+    )
+}
 
 /// What a decoded book was built from; any change forces a fresh decode.
 #[derive(Clone)]
@@ -173,12 +184,14 @@ impl ProductionRulesProvider {
 
     /// Record that `principal`'s book could not be read, and say so once.
     fn unreadable(&self, principal: &str, reason: String) -> RulesRead {
-        let first = self
-            .unreadable
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(principal.to_owned(), reason.clone())
-            .is_none();
+        let (first, accounts) = {
+            let mut map = self
+                .unreadable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let first = map.insert(principal.to_owned(), reason.clone()).is_none();
+            (first, map.len())
+        };
         if first {
             tracing::error!(
                 target: "nrr::rules-provider",
@@ -193,34 +206,55 @@ impl ProductionRulesProvider {
                 RULES_READ_SOURCE,
                 crate::health::HealthComponent::Policy,
                 crate::state::ServiceHealthSeverity::Degraded,
-                format!("rule book unreadable for {principal}: {reason}"),
+                unreadable_health_message(accounts),
             );
         }
         RulesRead::Unreadable(reason)
     }
 
+    /// The stored book itself does not decode (damaged row, newer format):
+    /// unlike a database error, that is the user's news, not only health's.
+    fn undecodable(&self, principal: &str, reason: String) -> RulesRead {
+        // Every time, not on this provider's first: another one may have seen
+        // the book read in between.
+        self.notices.raise(principal);
+        self.unreadable(principal, reason)
+    }
+
     /// A read that reached a verdict clears the record a failed one left.
     fn readable(&self, principal: &str) {
-        let was = self
-            .unreadable
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(principal);
-        if was.is_some() {
-            tracing::info!(
-                target: "nrr::rules-provider",
-                msg_key = "prod-rules-book-readable-again",
-                principal = %principal,
-                "the rule book reads again",
-            );
-            let any_left = !self
+        // Before the early return: the failure may have been another
+        // provider's.
+        self.notices.clear(principal);
+        let (was, left) = {
+            let mut map = self
                 .unreadable
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_empty();
-            if let (Some(health), false) = (self.health.get(), any_left) {
-                health.clear_as(RULES_READ_SOURCE, crate::health::HealthComponent::Policy);
-            }
+                .unwrap_or_else(PoisonError::into_inner);
+            let was = map.remove(principal);
+            (was, map.len())
+        };
+        if was.is_none() {
+            return;
+        }
+        tracing::info!(
+            target: "nrr::rules-provider",
+            msg_key = "prod-rules-book-readable-again",
+            principal = %principal,
+            "the rule book reads again",
+        );
+        let Some(health) = self.health.get() else {
+            return;
+        };
+        if left == 0 {
+            health.clear_as(RULES_READ_SOURCE, crate::health::HealthComponent::Policy);
+        } else {
+            health.record_as(
+                RULES_READ_SOURCE,
+                crate::health::HealthComponent::Policy,
+                crate::state::ServiceHealthSeverity::Degraded,
+                unreadable_health_message(left),
+            );
         }
     }
 
@@ -300,6 +334,11 @@ impl ProductionRulesProvider {
             .get(principal)
             .filter(|d| for_enforcement && d.key == key && d.stale_at_ms.is_none_or(|at| now < at))
         {
+            // A kept decode of the source in place is a good read too; asked
+            // only while someone's book is listed, so a hit stays lock-free.
+            if self.notices.any() {
+                self.readable(principal);
+            }
             return match hit.snapshot.clone() {
                 Some(snapshot) => RulesRead::Rules(snapshot),
                 None => RulesRead::NoPolicy,
@@ -343,7 +382,7 @@ impl ProductionRulesProvider {
         // A book that exists but does not decode: the detail is already in
         // the log, the verdict is what matters here.
         let Some(mut snapshot) = bare else {
-            return self.unreadable(
+            return self.undecodable(
                 principal,
                 "the stored rule book did not decode (newer schema or damaged row)".to_owned(),
             );
@@ -395,7 +434,18 @@ impl ProductionRulesProvider {
             decodes: AtomicU64::new(0),
             unreadable: Mutex::new(HashMap::new()),
             health: std::sync::OnceLock::new(),
+            notices: Arc::clone(crate::rules_book_notice::service()),
         }
+    }
+
+    /// Report to `notices` instead of the service's registry.
+    #[must_use]
+    pub fn with_notices(
+        mut self,
+        notices: Arc<crate::rules_book_notice::RulesBookNotices>,
+    ) -> Self {
+        self.notices = notices;
+        self
     }
 
     #[cfg(test)]
@@ -1100,6 +1150,236 @@ mod tests {
     }
 
     #[test]
+    fn a_book_from_a_newer_build_keeps_its_readable_rules() {
+        // An origin kind, a rule field, an action and an address kind this
+        // build has never heard of must not turn the book into "no rules".
+        let json = serde_json::json!({
+            "schema-version": 1,
+            "primary": [
+                {
+                    "id": "r-known",
+                    "enabled": true,
+                    "address-match": { "kind": "exact-fqdn", "value": "newer-origin.example" },
+                    "comment": "",
+                    "action": "route",
+                    "origin": { "kind": "imported-by-future", "source": "x" },
+                    "added-by-newer-build": { "nested": [1, 2] },
+                },
+                {
+                    "id": "r-action",
+                    "enabled": true,
+                    "address-match": { "kind": "exact-fqdn", "value": "future-action.example" },
+                    "comment": "",
+                    "action": "tarpit",
+                },
+                {
+                    "id": "r-kind",
+                    "enabled": true,
+                    "address-match": { "kind": "port-span", "from": 1, "to": 2 },
+                    "comment": "",
+                    "action": "route",
+                },
+            ],
+            "secondary": [],
+        })
+        .to_string();
+        let conn = make_state_conn();
+        insert_active_revision(&conn, &json);
+        let provider = ProductionRulesProvider::new(conn);
+        let RulesRead::Rules(snap) = provider.rules_read_for(BASELINE_PRINCIPAL) else {
+            panic!("the book must stay readable");
+        };
+        let ids: Vec<_> = snap
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .map(|r| r.id.as_str().to_owned())
+            .collect();
+        assert!(ids.contains(&"r-known".to_owned()), "ids = {ids:?}");
+    }
+
+    #[test]
+    fn a_damaged_book_is_unreadable_not_empty_and_the_last_book_stays_in_force() {
+        let conn = make_state_conn();
+        insert_active_revision(&conn, &single_rule_json("203.0.113.5"));
+        let provider = ProductionRulesProvider::new(Arc::clone(&conn));
+        let before = provider.active_rules().expect("a readable book");
+        assert_eq!(before.rule_book.primary.rules().len(), 1);
+
+        conn.lock()
+            .unwrap()
+            .execute(
+                "UPDATE revisions SET rules_json = '{not json', content_hash = 'damaged'",
+                [],
+            )
+            .expect("damage the row");
+        assert!(matches!(
+            provider.rules_read_for(BASELINE_PRINCIPAL),
+            RulesRead::Unreadable(_)
+        ));
+        let kept = provider
+            .active_rules()
+            .expect("enforcement keeps the last decoded book");
+        assert_eq!(kept.rule_book.primary.rules().len(), 1);
+    }
+
+    /// The user is told: health says a stored book is unreadable and the last
+    /// applied rules hold, without naming whose, and a good read clears it.
+    #[test]
+    fn an_unreadable_book_is_on_the_health_card_until_it_reads_again() {
+        use crate::health::{HealthAggregator, HealthComponent};
+        use crate::state::ServiceHealthSeverity;
+        let policy_card = |health: &HealthAggregator| {
+            health
+                .snapshot()
+                .components
+                .into_iter()
+                .find(|c| c.component == HealthComponent::Policy)
+                .map(|c| (c.severity, c.message))
+        };
+        let conn = make_state_conn();
+        insert_active_revision(&conn, &single_rule_json("203.0.113.5"));
+        let provider = ProductionRulesProvider::new(Arc::clone(&conn));
+        let health = Arc::new(HealthAggregator::new());
+        provider.set_health(Arc::clone(&health));
+        assert!(provider.active_rules().is_some());
+        assert_eq!(policy_card(&health), None);
+
+        let set_rules = |json: &str| {
+            conn.lock()
+                .unwrap()
+                .execute(
+                    "UPDATE revisions SET rules_json = ?1, content_hash = ?2",
+                    rusqlite::params![json, format!("h-{}", json.len())],
+                )
+                .expect("rewrite the row");
+        };
+        set_rules("{not json");
+        assert!(provider.active_rules().is_some(), "the last book holds");
+        let (severity, message) = policy_card(&health).expect("health says so");
+        assert_eq!(severity, ServiceHealthSeverity::Degraded);
+        assert!(
+            message.starts_with(nrr_shared::ipc_payloads::RULES_BOOK_UNREADABLE),
+            "{message}"
+        );
+        assert!(message.contains("stay in force"), "{message}");
+        assert!(!message.contains(BASELINE_PRINCIPAL), "{message}");
+
+        set_rules(&single_rule_json("203.0.113.6"));
+        assert!(provider.active_rules().is_some());
+        assert_eq!(policy_card(&health), None, "a good read clears it");
+    }
+
+    /// A database error is health's alone; a book that does not decode tells
+    /// its owner.
+    #[test]
+    fn a_transient_read_error_tells_nobody_and_a_damaged_book_tells_its_owner() {
+        use crate::rules_book_notice::RulesBookNotices;
+        const MINE: &str = "S-1-5-21-100-2001";
+        let notices = Arc::new(RulesBookNotices::new());
+        let conn = make_state_conn();
+        insert_active_revision_for(&conn, MINE, &single_rule_json("203.0.113.5"));
+        let provider =
+            ProductionRulesProvider::new(Arc::clone(&conn)).with_notices(Arc::clone(&notices));
+        assert!(provider.active_rules_for(MINE).is_some());
+        let run = |sql: &str| {
+            conn.lock().unwrap().execute(sql, []).expect("run");
+        };
+
+        run("ALTER TABLE revisions RENAME TO revisions_away");
+        assert!(matches!(
+            provider.rules_read_for(MINE),
+            RulesRead::Unreadable(_)
+        ));
+        assert!(!notices.any(), "a database error is nobody's notice");
+        run("ALTER TABLE revisions_away RENAME TO revisions");
+
+        run("UPDATE revisions SET rules_json = '{not json', content_hash = 'damaged'");
+        assert!(matches!(
+            provider.rules_read_for(MINE),
+            RulesRead::Unreadable(_)
+        ));
+        assert!(notices.unreadable_for(MINE));
+    }
+
+    /// Only the user whose own book does not read is told: once while it
+    /// lasts, again when it reads, and anew when it breaks again.
+    #[test]
+    fn only_the_user_whose_book_does_not_read_is_told() {
+        use crate::ipc_handlers::event_bus::EventBus;
+        use crate::rules_book_notice::RulesBookNotices;
+        use nrr_shared::ipc_payloads::StatusUpdateEvent;
+        const MINE: &str = "S-1-5-21-100-1001";
+        const OTHER: &str = "S-1-5-21-100-1002";
+        let bus = Arc::new(EventBus::new());
+        let mine = bus
+            .subscribe_as("mine".into(), Some(MINE.into()), None)
+            .subscription_id;
+        let other = bus
+            .subscribe_as("other".into(), Some(OTHER.into()), None)
+            .subscription_id;
+        let told = |sub: &str| -> Vec<bool> {
+            bus.peek_pending_for(sub, 64)
+                .into_iter()
+                .filter_map(|e| match e.event {
+                    StatusUpdateEvent::RulesBookUnreadable { sid, unreadable } => {
+                        assert_eq!(sid, MINE, "nobody else's news");
+                        Some(unreadable)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let notices = Arc::new(RulesBookNotices::new());
+        notices.attach_events(Arc::clone(&bus));
+        let conn = make_state_conn();
+        let original = single_rule_json("203.0.113.5");
+        insert_active_revision_for(&conn, MINE, &original);
+        insert_active_revision_for(&conn, OTHER, &single_rule_json("203.0.113.6"));
+        let provider =
+            ProductionRulesProvider::new(Arc::clone(&conn)).with_notices(Arc::clone(&notices));
+        assert!(provider.active_rules_for(MINE).is_some());
+        assert!(provider.active_rules_for(OTHER).is_some());
+        let set_mine = |json: &str, hash: &str| {
+            conn.lock()
+                .unwrap()
+                .execute(
+                    "UPDATE revisions SET rules_json = ?1, content_hash = ?2 WHERE principal = ?3",
+                    rusqlite::params![json, hash, MINE],
+                )
+                .expect("rewrite the row");
+        };
+
+        set_mine("{not json", "damaged");
+        for _ in 0..3 {
+            assert!(
+                provider.active_rules_for(MINE).is_some(),
+                "the last book holds"
+            );
+        }
+        assert!(provider.active_rules_for(OTHER).is_some());
+        assert_eq!(told(&mine), vec![true], "said once while it lasts");
+        assert!(told(&other).is_empty());
+        assert!(notices.unreadable_for(MINE));
+        assert!(!notices.unreadable_for(OTHER));
+
+        // The very book decoded before: served from the kept decode, and that
+        // is a good read too.
+        set_mine(&original, &format!("hash-{MINE}"));
+        assert!(provider.active_rules_for(MINE).is_some());
+        assert_eq!(told(&mine), vec![true, false]);
+        assert!(!notices.unreadable_for(MINE));
+
+        set_mine("{not json", "damaged-again");
+        assert!(provider.active_rules_for(MINE).is_some());
+        set_mine(&single_rule_json("203.0.113.7"), "fixed");
+        assert!(provider.active_rules_for(MINE).is_some());
+        assert_eq!(told(&mine), vec![true, false, true, false]);
+        assert!(told(&other).is_empty());
+    }
+
+    #[test]
     fn schema_zero_degrades_to_none() {
         let json = r#"{"schema-version":0,"primary":[],"secondary":[]}"#;
         let conn = make_state_conn();
@@ -1174,9 +1454,8 @@ mod tests {
             let g = conn.lock().unwrap();
             g.execute(
                 "INSERT INTO secondary_block_policy
-                    (sid, block_secondary_when_unavailable, kill_switch_fail_closed,
-                     kill_switch_protocols, include_subdomains, updated_at)
-                 VALUES (?1, 1, 1, 127, 0, ?2)",
+                    (sid, kill_switch_protocols, include_subdomains, updated_at)
+                 VALUES (?1, 127, 0, ?2)",
                 rusqlite::params![sid, 1_700_000_000_i64],
             )
             .expect("seed policy");
@@ -1479,9 +1758,8 @@ mod tests {
             let g = conn.lock().unwrap();
             g.execute(
                 "INSERT INTO secondary_block_policy
-                    (sid, block_secondary_when_unavailable, kill_switch_fail_closed,
-                     kill_switch_protocols, include_subdomains, updated_at)
-                 VALUES (?1, 1, 1, 127, 0, 1)",
+                    (sid, kill_switch_protocols, include_subdomains, updated_at)
+                 VALUES (?1, 127, 0, 1)",
                 rusqlite::params![user],
             )
             .expect("seed policy");

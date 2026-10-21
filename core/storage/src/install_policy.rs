@@ -5,6 +5,7 @@
 //! the policy source and the route-policy writer. Machine-wide on purpose: a
 //! per-principal row would be writable by the account the policy restricts.
 
+use nrr_domain::LeakProtection;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{StorageError, StorageResult};
@@ -45,6 +46,9 @@ pub struct InstallPolicy {
     /// The mode a user's first saved policy starts from; `None` leaves the
     /// client's own default.
     pub default_route_mode: Option<BehaviorMode>,
+    /// The weakest leak protection a user's first saved policy may hold; `Off`
+    /// sets no floor.
+    pub default_leak_protection: LeakProtection,
 }
 
 pub struct InstallPolicyRepository<'c> {
@@ -59,16 +63,17 @@ impl<'c> InstallPolicyRepository<'c> {
     /// The stored row, or the default. A value the CHECK should have kept out
     /// is an error, not a silent default: it would decide Fail-Closed.
     pub fn get(&self) -> StorageResult<InstallPolicy> {
-        let row: Option<(String, String)> = self
+        let row: Option<(String, String, String)> = self
             .conn
             .query_row(
-                "SELECT secondary_unset, default_route_mode FROM install_policy WHERE id = 1",
+                "SELECT secondary_unset, default_route_mode, default_leak_protection \
+                 FROM install_policy WHERE id = 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .map_err(|e| StorageError::Internal(format!("install_policy get: {e}")))?;
-        let Some((unset, mode)) = row else {
+        let Some((unset, mode, leak)) = row else {
             return Ok(InstallPolicy::default());
         };
         let secondary_unset = SecondaryUnset::from_slug(&unset).ok_or_else(|| {
@@ -80,9 +85,13 @@ impl<'c> InstallPolicyRepository<'c> {
                 StorageError::Internal(format!("install_policy: unknown mode {slug:?}"))
             })?),
         };
+        let default_leak_protection = leak.parse::<LeakProtection>().map_err(|_| {
+            StorageError::Internal(format!("install_policy: unknown leak protection {leak:?}"))
+        })?;
         Ok(InstallPolicy {
             secondary_unset,
             default_route_mode,
+            default_leak_protection,
         })
     }
 
@@ -90,13 +99,20 @@ impl<'c> InstallPolicyRepository<'c> {
         let mode = policy.default_route_mode.map_or("", BehaviorMode::slug);
         self.conn
             .execute(
-                "INSERT INTO install_policy (id, secondary_unset, default_route_mode, updated_at)
-                 VALUES (1, ?1, ?2, ?3)
+                "INSERT INTO install_policy
+                     (id, secondary_unset, default_route_mode, default_leak_protection, updated_at)
+                 VALUES (1, ?1, ?2, ?3, ?4)
                  ON CONFLICT(id) DO UPDATE SET
                      secondary_unset = excluded.secondary_unset,
                      default_route_mode = excluded.default_route_mode,
+                     default_leak_protection = excluded.default_leak_protection,
                      updated_at = excluded.updated_at",
-                params![policy.secondary_unset.slug(), mode, now_ms],
+                params![
+                    policy.secondary_unset.slug(),
+                    mode,
+                    policy.default_leak_protection.as_slug(),
+                    now_ms
+                ],
             )
             .map_err(|e| StorageError::Internal(format!("install_policy set: {e}")))?;
         Ok(())
@@ -129,10 +145,15 @@ mod tests {
     fn both_values_round_trip() {
         let (_dir, conn) = migrated();
         let repo = InstallPolicyRepository::new(&conn);
-        for unset in [SecondaryUnset::Block, SecondaryUnset::Direct] {
+        for (unset, leak) in [
+            (SecondaryUnset::Block, LeakProtection::Everything),
+            (SecondaryUnset::Direct, LeakProtection::Sites),
+            (SecondaryUnset::Direct, LeakProtection::Off),
+        ] {
             let policy = InstallPolicy {
                 secondary_unset: unset,
                 default_route_mode: Some(BehaviorMode::PreferSecondaryWhenAvailable),
+                default_leak_protection: leak,
             };
             repo.set(&policy, 7).expect("set");
             assert_eq!(repo.get().expect("get"), policy);
@@ -144,6 +165,11 @@ mod tests {
         let (_dir, conn) = migrated();
         let refused = conn.execute(
             "INSERT INTO install_policy (id, secondary_unset, updated_at) VALUES (1, 'leak', 0)",
+            [],
+        );
+        assert!(refused.is_err());
+        let refused = conn.execute(
+            "INSERT INTO install_policy (id, default_leak_protection, updated_at) VALUES (1, 'on', 0)",
             [],
         );
         assert!(refused.is_err());

@@ -40,6 +40,56 @@ pub fn user_temp_root() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other("the shell did not name the local app-data folder"))
 }
 
+/// The temp root of the user `sid`, for an elevated process that runs as a
+/// different administrator than the user who asked: the shell would name the
+/// administrator's folder, not the one the files are exchanged in. The profile
+/// comes from the machine registry, which only administrators write. A SID that
+/// is this process's own, or `None`, is the plain [`user_temp_root`].
+pub fn temp_root_of_user(sid: Option<&str>) -> io::Result<PathBuf> {
+    let Some(sid) = sid else {
+        return user_temp_root();
+    };
+    let well_formed = sid.starts_with("S-1-")
+        && sid.len() <= 184
+        && sid
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'-' || b == b'S');
+    if !well_formed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a security identifier",
+        ));
+    }
+    if crate::win32_ffi::console_session::current_process_user_sid()
+        .is_some_and(|own| own.eq_ignore_ascii_case(sid))
+    {
+        return user_temp_root();
+    }
+    use crate::win32_ffi::registry;
+    let key = format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}");
+    let raw = registry::read_string(
+        windows::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+        &key,
+        Some("ProfileImagePath"),
+    )
+    .ok_or_else(|| io::Error::other("no profile is registered for that user"))?;
+    let profile = registry::unquote(&raw);
+    if profile.is_empty() || profile.contains('%') {
+        return Err(io::Error::other(
+            "the user's profile folder is not a plain path",
+        ));
+    }
+    Ok(PathBuf::from(profile)
+        .join("AppData")
+        .join("Local")
+        .join("Temp"))
+}
+
+/// The user's own SID, as the broker and the console hand it to an elevated copy.
+pub fn current_user_sid() -> Option<String> {
+    crate::win32_ffi::console_session::current_process_user_sid()
+}
+
 /// Where an elevated process and the user who started it exchange files. Not
 /// created here — each operation creates what it needs.
 pub fn handoff_dir() -> io::Result<PathBuf> {
@@ -216,6 +266,27 @@ fn delete_by_handle(file: &File) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn a_user_temp_root_is_asked_for_only_by_a_well_formed_sid() {
+        for bad in [
+            "",
+            r"S-1-5-21-1\..\x",
+            "S-1-5-21-1 ",
+            "alice",
+            "S-1-5-21-%x",
+        ] {
+            assert!(temp_root_of_user(Some(bad)).is_err(), "{bad}");
+        }
+        assert_eq!(
+            temp_root_of_user(None).ok(),
+            user_temp_root().ok(),
+            "no named user means this process's own root"
+        );
+        if let Some(own) = current_user_sid() {
+            assert_eq!(temp_root_of_user(Some(&own)).ok(), user_temp_root().ok());
+        }
+    }
 
     /// `mklink /J` needs no privilege, which is exactly why the attack works.
     fn junction(link: &Path, target: &Path) {

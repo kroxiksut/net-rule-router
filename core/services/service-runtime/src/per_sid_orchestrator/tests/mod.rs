@@ -1,9 +1,5 @@
-//! Unit tests for [`super::PerSidApplyOrchestrator`].
-//!
-//! Half of `per_sid_orchestrator.rs` was this module: 4126 lines of tests under
-//! 4341 lines of code. Moved out verbatim (one level of indentation removed and
-//! nothing else) so the file one reads to understand the orchestrator is the
-//! orchestrator.
+//! Unit tests for [`super::PerSidApplyOrchestrator`], kept out of the file one
+//! reads to understand the orchestrator.
 
 use super::*;
 use std::net::{IpAddr, Ipv4Addr};
@@ -11,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr};
 // a leak-guard-ARMED SID whose secondary is unresolved (the `None`
 // fail-closed branch = VPN down) also gets the built-in VPN-client exemption
 // permits so a VPN can bootstrap through the block. Fixtures built with
-// `snap_full` (secondary bound + kill-switch enabled) hit that path.
+// `snap_full` (secondary bound + leak protection on) hit that path.
 //
 // those exemptions are now the built-in globs RESOLVED
 // to on-disk exe paths via the orchestrator's `AppPathResolver`. These fixtures
@@ -34,15 +30,32 @@ use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
 #[derive(Default)]
 struct ScriptedSource {
     per_sid: Mutex<HashMap<String, PerSidPolicySnapshot>>,
+    unreadable: Mutex<Vec<String>>,
 }
 impl ScriptedSource {
     fn set(&self, sid: &str, snap: PerSidPolicySnapshot) {
         self.per_sid.lock().unwrap().insert(sid.to_string(), snap);
     }
+    /// The store fails to answer for `sid` from now on.
+    fn fail_reads_of(&self, sid: &str) {
+        self.unreadable.lock().unwrap().push(sid.to_string());
+    }
 }
 impl RoutePolicySource for ScriptedSource {
     fn load_for_sid(&self, sid: &str) -> Option<PerSidPolicySnapshot> {
+        if self.read_failure_for(sid).is_some() {
+            return None;
+        }
         self.per_sid.lock().unwrap().get(sid).cloned()
+    }
+
+    fn read_failure_for(&self, sid: &str) -> Option<String> {
+        self.unreadable
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s == sid)
+            .then(|| "disk I/O error".to_owned())
     }
 }
 
@@ -53,6 +66,8 @@ impl RoutePolicySource for ScriptedSource {
 #[derive(Default)]
 struct ScriptedRules {
     snapshot: Mutex<Option<ActiveRulesSnapshot>>,
+    /// Set: the stored book exists but does not read.
+    unreadable: Mutex<Option<String>>,
 }
 impl ScriptedRules {
     fn set(&self, snap: ActiveRulesSnapshot) {
@@ -61,10 +76,23 @@ impl ScriptedRules {
     fn clear(&self) {
         *self.snapshot.lock().unwrap() = None;
     }
+    fn fail_reads(&self, reason: &str) {
+        *self.unreadable.lock().unwrap() = Some(reason.to_owned());
+    }
 }
 impl RulesProvider for ScriptedRules {
     fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
         self.snapshot.lock().unwrap().clone()
+    }
+
+    fn rules_read_for(&self, principal: &str) -> RulesRead {
+        if let Some(reason) = self.unreadable.lock().unwrap().clone() {
+            return RulesRead::Unreadable(reason);
+        }
+        match self.active_rules_for(principal) {
+            Some(snapshot) => RulesRead::Rules(snapshot),
+            None => RulesRead::NoPolicy,
+        }
     }
 }
 
@@ -109,21 +137,13 @@ fn snap_full(primary: &str, secondary: &str) -> PerSidPolicySnapshot {
             known_stable_ids: Vec::new(),
         }),
         mode: PerSidBehaviorMode::PreferPrimary,
-        block_secondary_when_unavailable: false,
-        kill_switch_fail_closed: true,
+        // These fixtures drive the armed leak-guard path; "routed sites" is the
+        // per-destination posture the bulk of the tests were written for.
+        leak_protection: nrr_domain::LeakProtection::Sites,
         kill_switch_protocols: 0x7F,
-        kill_switch_block_all: false,
-        // these fixtures drive the existing kill-switch behaviour
-        // tests, which assert the ARMED leak-guard path; keep the master
-        // toggle ON so those expectations hold under the new opt-in gate.
-        kill_switch_enabled: true,
         allow_dns_over_primary: false,
         shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
         kill_switch_strict_shared_ips: true,
-        // Pinned to the per-IP path these fixtures were written for. This is
-        // once again the product default; the FailClosedUnknown
-        // escalation has its own dedicated tests.
-        mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy::PerIp,
         link_provider_exe_paths: Vec::new(),
         doh_lockdown_enabled: false,
         doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
@@ -151,16 +171,11 @@ fn snap_primary_only(primary: &str) -> PerSidPolicySnapshot {
         }),
         secondary: None,
         mode: PerSidBehaviorMode::PreferPrimary,
-        block_secondary_when_unavailable: false,
-        kill_switch_fail_closed: true,
+        leak_protection: nrr_domain::LeakProtection::Sites,
         kill_switch_protocols: 0x7F,
-        kill_switch_block_all: false,
-        kill_switch_enabled: true,
         allow_dns_over_primary: false,
         shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
         kill_switch_strict_shared_ips: true,
-        // Pinned per-IP for the same reason as `snap_full` above.
-        mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy::PerIp,
         link_provider_exe_paths: Vec::new(),
         doh_lockdown_enabled: false,
         doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
@@ -259,8 +274,8 @@ fn rules_with_one_app(app_name: &str) -> ActiveRulesSnapshot {
 const KS_LUID: u64 = 0xABCD_0000_0000_0001;
 
 /// Orchestrator wired with a scripted kill-switch resolver carrying
-/// just a LUID (no exemptions), so the per-destination (mode A)
-/// kill-switch path can be exercised deterministically.
+/// just a LUID (no exemptions), so the per-destination kill-switch path can
+/// be exercised deterministically.
 #[allow(clippy::type_complexity)]
 fn fixture_with_luid(
     luid: Option<u64>,
@@ -277,7 +292,7 @@ fn fixture_with_luid(
 }
 
 /// Orchestrator wired with a scripted kill-switch resolution (full
-/// control over LUID + exemptions for catch-all / mode-B tests).
+/// control over LUID + exemptions for the blanket postures).
 #[allow(clippy::type_complexity)]
 fn fixture_with_resolution(
     resolution: Option<KillSwitchResolution>,
@@ -400,23 +415,31 @@ fn rules_with_secondary_ip(ip: Ipv4Addr) -> ActiveRulesSnapshot {
 }
 
 fn snap_block(primary: &str, secondary: &str) -> PerSidPolicySnapshot {
-    let mut s = snap_full(primary, secondary);
-    s.block_secondary_when_unavailable = true;
-    s
+    snap_full(primary, secondary)
 }
 
+/// The additional connection as the default route, protecting everything.
 fn snap_block_mode_b(primary: &str, secondary: &str) -> PerSidPolicySnapshot {
-    let mut s = snap_block(primary, secondary);
-    s.mode = PerSidBehaviorMode::PreferSecondaryWhenAvailable;
-    s
+    snap_with(
+        primary,
+        secondary,
+        PerSidBehaviorMode::PreferSecondaryWhenAvailable,
+        nrr_domain::LeakProtection::Everything,
+    )
 }
 
-/// Strict mode with the leak-guard switched OFF.
-fn snap_strict_guard_off(primary: &str, secondary: &str) -> PerSidPolicySnapshot {
-    let mut s = snap_block(primary, secondary);
-    s.mode = PerSidBehaviorMode::StrictSecondaryFailClosed;
-    s.kill_switch_enabled = false;
-    s
+/// One cell of the (default route × leak protection) table.
+fn snap_with(
+    primary: &str,
+    secondary: &str,
+    mode: PerSidBehaviorMode,
+    leak_protection: nrr_domain::LeakProtection,
+) -> PerSidPolicySnapshot {
+    PerSidPolicySnapshot {
+        mode,
+        leak_protection,
+        ..snap_block(primary, secondary)
+    }
 }
 
 fn full_ks_resolution() -> KillSwitchResolution {
@@ -427,6 +450,7 @@ fn full_ks_resolution() -> KillSwitchResolution {
         local_subnets: vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
         local_subnets_v6: Vec::new(),
         foreign_tunnel_luids: Vec::new(),
+        foreign_tunnel_networks: Vec::new(),
     }
 }
 
@@ -472,11 +496,35 @@ fn rules_with_secondary_ips(ips: &[Ipv4Addr]) -> ActiveRulesSnapshot {
     }
 }
 
+/// The mode the suggestion engine plans offers under is the user's own stored
+/// one; a user who never bound a link reads as prefer-main.
+#[test]
+fn the_mode_a_reader_gets_is_the_users_own() {
+    let source = ScriptedSource::default();
+    let mut secondary_first = snap_full("p", "s");
+    secondary_first.mode = PerSidBehaviorMode::PreferSecondaryWhenAvailable;
+    source.set("S-1-5-21-a", secondary_first);
+    source.set("S-1-5-21-b", snap_full("p", "s"));
+    assert_eq!(
+        behavior_mode_of(&source, "S-1-5-21-a"),
+        RouteBehaviorMode::PreferSecondaryWhenAvailable
+    );
+    assert_eq!(
+        behavior_mode_of(&source, "S-1-5-21-b"),
+        RouteBehaviorMode::PreferPrimary
+    );
+    assert_eq!(
+        behavior_mode_of(&source, "S-1-5-21-none"),
+        RouteBehaviorMode::PreferPrimary
+    );
+}
+
 mod apply;
 mod audit;
 mod blocking_scope;
 mod cleanup;
 mod deny_without_policy;
+mod foreign_tunnel;
 mod kill_switch;
 mod machine_reading;
 mod membership;
@@ -485,3 +533,4 @@ mod preview;
 mod route_before_block;
 mod service_accounts;
 mod vpn_exempt;
+mod vpn_handshake;

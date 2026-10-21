@@ -30,6 +30,11 @@ use crate::error::{StorageError, StorageResult};
 use crate::repository::MigrationRunner;
 use crate::schema::CONN_HISTORY_DB_V1_DDL;
 use crate::schema::STATE_DB_V77_DDL;
+use crate::schema::STATE_DB_V78_DDL;
+use crate::schema::STATE_DB_V79_DDL;
+use crate::schema::STATE_DB_V80_DDL;
+use crate::schema::STATE_DB_V81_DDL;
+use crate::schema::STATE_DB_V82_DDL;
 use crate::schema::{
     CACHE_DB_V1_DDL, CACHE_DB_V2_DDL, CACHE_DB_V3_DDL, CACHE_DB_V4_DDL, STATE_DB_V10_DDL,
     STATE_DB_V11_DDL, STATE_DB_V12_DDL, STATE_DB_V13_DDL, STATE_DB_V14_DDL, STATE_DB_V15_DDL,
@@ -188,8 +193,7 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         name: "add_rule_scope_to_service_stability_config",
         stmts: STATE_DB_V14_DDL,
     },
-    // Kill-switch failure posture (fail-closed vs fail-open)
-    // on secondary_block_policy. Default 1 = fail-closed. ALTER ADD COLUMN.
+    // Fail-closed vs fail-open; folded into leak_protection by v80.
     MigrationDef {
         version: 15,
         name: "add_kill_switch_fail_closed_to_secondary_block_policy",
@@ -250,9 +254,7 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         name: "add_known_stable_ids_to_route_bindings",
         stmts: STATE_DB_V22_DDL,
     },
-    // kill_switch_block_all on secondary_block_policy: split
-    // fail-closed blocks ALL egress (catch-all) vs only cached secondary IPs.
-    // Default 0 (OFF). ALTER ADD COLUMN.
+    // Block everything while the tunnel is down; folded into leak_protection by v80.
     MigrationDef {
         version: 23,
         name: "add_kill_switch_block_all_to_secondary_block_policy",
@@ -274,10 +276,7 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         name: "add_secondary_liveness_window_to_service_stability_config",
         stmts: STATE_DB_V25_DDL,
     },
-    // kill_switch_enabled (MASTER toggle) on
-    // secondary_block_policy: full opt-in gate — OFF (default) means NO
-    // fail-closed / leak-guard blocking arms at all. DEV schema; wiped freely.
-    // ALTER ADD COLUMN.
+    // Leak-protection master switch; folded into leak_protection by v80.
     MigrationDef {
         version: 26,
         name: "add_kill_switch_enabled_to_secondary_block_policy",
@@ -290,10 +289,9 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         name: "add_allow_dns_over_primary_to_secondary_block_policy",
         stmts: STATE_DB_V27_DDL,
     },
-    // mode_a_coverage_strategy (Mode-A un-seeded-IP posture) +
+    // mode_a_coverage_strategy (folded into leak_protection by v80) +
     // resolve_hosts_bypass (bypass the OS hosts/adblock file for rule-host
-    // resolution, default ON) on secondary_block_policy. DEV schema; wiped
-    // freely. Two ALTER ADD COLUMN statements.
+    // resolution, default ON) on secondary_block_policy.
     MigrationDef {
         version: 28,
         name: "add_mode_a_coverage_and_hosts_bypass_to_secondary_block_policy",
@@ -667,6 +665,32 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         name: "add_override_grants",
         stmts: STATE_DB_V77_DDL,
     },
+    MigrationDef {
+        version: 78,
+        name: "vpn_bootstrap_endpoints_by_principal",
+        stmts: STATE_DB_V78_DDL,
+    },
+    MigrationDef {
+        version: 79,
+        name: "drop_block_secondary_when_unavailable",
+        stmts: STATE_DB_V79_DDL,
+    },
+    // Mapped from the old settings, never reset: the owner's machine carries them.
+    MigrationDef {
+        version: 80,
+        name: "leak_protection",
+        stmts: STATE_DB_V80_DDL,
+    },
+    MigrationDef {
+        version: 81,
+        name: "add_external_address_auto_check",
+        stmts: STATE_DB_V81_DDL,
+    },
+    MigrationDef {
+        version: 82,
+        name: "add_vpn_gateway_confirmations",
+        stmts: STATE_DB_V82_DDL,
+    },
 ];
 
 // nrr_conn_history.db. Rebuildable and versioned on its own, like the traffic
@@ -776,6 +800,8 @@ const STATE_REQUIRED_TABLES: &[&str] = &[
     // State DB v77 — confirmed overrides of the system-program protection.
     "override_grants",
     "override_revocations_pending",
+    // State DB v82 — the VPN gateways each user let through.
+    "vpn_gateway_confirmations",
 ];
 
 const STATE_REQUIRED_INDEXES: &[&str] = &[

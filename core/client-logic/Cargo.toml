@@ -23,7 +23,7 @@ serde_json = "1"
 [dev-dependencies]
 # An in-process JS engine for the parity harness: the GUI's own pure.js and
 # rules.js run against the vectors, with no node or Qt on the test machine.
-boa_engine = { version = "0.21", default-features = false }
+boa_engine = { version = "0.22", default-features = false }
 
 [lints]
 workspace = true

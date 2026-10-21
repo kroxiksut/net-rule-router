@@ -77,7 +77,6 @@ fn generate_in(
         CodegenInput {
             sid: SID,
             rule_book,
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
             fqdn_cache: cache,
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
@@ -170,7 +169,6 @@ fn the_shape_gate_lets_networks_into_the_service() {
     let out = generate_filters(CodegenInput {
         sid: SID,
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &MockFqdnCacheLookup::new(),
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &NoopAppPathResolver,
@@ -493,7 +491,6 @@ fn only_the_baseline_block_reaches_the_packet_layer() {
             CodegenInput {
                 sid: SID,
                 rule_book: &rb,
-                behavior_mode: RouteBehaviorMode::PreferPrimary,
                 fqdn_cache: &MockFqdnCacheLookup::new(),
                 app_observations: &MockAppObservationLookup::new(),
                 app_resolver: &NoopAppPathResolver,

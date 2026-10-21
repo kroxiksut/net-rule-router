@@ -29,6 +29,7 @@
 #include <QProcess>
 #include <QScreen>
 #include <QSplashScreen>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QStyleHints>

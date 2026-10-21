@@ -42,6 +42,8 @@ pub struct Overlaps {
     /// Pairs over the Rules screen's working copy as of its last change seen
     /// here.
     pairs: Vec<RouteOverlap>,
+    /// The last pass could not compare the rules.
+    pass_failed: bool,
     /// Pair keys the user confirmed this session; a key names both rules and
     /// their routes, so editing either asks again.
     confirmed: BTreeSet<String>,
@@ -90,7 +92,9 @@ impl Overlaps {
 
 /// Find the pairs again; the working copy may have changed.
 pub fn refresh(app: &mut AppState) {
-    app.overlaps.pairs = rules::route_overlaps(app);
+    let found = rules::route_overlaps(app);
+    app.overlaps.pass_failed = found.is_none();
+    app.overlaps.pairs = found.unwrap_or_default();
     app.overlaps.clamp();
 }
 
@@ -319,10 +323,9 @@ fn head_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     let state = &app.overlaps;
     let mut lines = vec![ViewLine::text(texts.get(keys::INTRO))];
     if has_rules(app) {
-        lines.push(ViewLine::new(vec![Segment::strong(texts.fill(
-            keys::PENDING_COUNT,
-            &[("n", state.pending_count().to_string())],
-        ))]));
+        lines.push(ViewLine::new(vec![Segment::strong(
+            texts.counted(keys::PENDING_COUNTED, state.pending_count()),
+        )]));
     }
     lines.push(ViewLine::new(vec![
         Segment::plain(format!("{}: ", texts.get(keys::SHOW_RESOLVED))),
@@ -378,6 +381,11 @@ fn pair_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     }
     let state = &app.overlaps;
     let shown = state.shown();
+    if state.pass_failed {
+        return vec![ViewLine::new(vec![Segment::strong(
+            texts.get(keys::PASS_FAILED),
+        )])];
+    }
     if shown.is_empty() {
         let empty = if state.pairs.is_empty() {
             keys::EMPTY

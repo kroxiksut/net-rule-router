@@ -28,6 +28,47 @@ impl AutoRulesEngine {
         }
     }
 
+    /// [`Self::classify`] for a host the book answers for: when the user wrote
+    /// a rule for it in BOTH sets, the anchor's route is the one the engine
+    /// picks, not "the additional route whenever it has any rule". A winner the
+    /// app added is no anchor. The engine runs only for the contested host, so
+    /// the common path pays nothing.
+    pub(crate) fn classify_in_book(
+        hostname: &str,
+        book: &CanonicalRuleBook,
+        primary: crate::dns_observation_consumer::RuleSetMatch,
+        secondary: crate::dns_observation_consumer::RuleSetMatch,
+    ) -> CoActivityKind {
+        if !(primary.user_authored && secondary.user_authored) {
+            return Self::classify(primary.user_authored, secondary.user_authored);
+        }
+        let decision = nrr_domain::decision_engine_input::match_sample(
+            book,
+            Some(hostname),
+            None,
+            None,
+            nrr_domain::decision_matching::ZonePriorityPolicy::default(),
+            RouteBehaviorMode::PreferPrimary,
+        );
+        let nrr_domain::decision_matching::RequestedRouteDecision::MatchedRoute { candidate } =
+            decision
+        else {
+            return Self::classify(true, true);
+        };
+        let user_wrote_winner = book
+            .set_for(candidate.route_role)
+            .rules()
+            .iter()
+            .any(|r| r.id == candidate.rule_id && r.origin.is_none());
+        if user_wrote_winner {
+            CoActivityKind::Anchor {
+                route: candidate.route_role,
+            }
+        } else {
+            CoActivityKind::Candidate
+        }
+    }
+
     /// An earlier author saved the enforcement view, so the user's stored rules
     /// may hold `<id>+sub` twins they never wrote. Removed once per principal
     /// per run, whatever the mode; a refusal (rules lock, security alert) is
@@ -86,6 +127,18 @@ impl AutoRulesEngine {
     /// answer is stable over a browsing session, so the extra work would produce
     /// the identical list.
     pub fn tick(&self, sid: &str, now: SystemTime) -> TickSummary {
+        let (summary, counted) = self.propose_and_act(sid, now);
+        // A count that fell (expiry, a covering rule, a main-link verdict)
+        // brings no announcement; this is what moves every badge to it.
+        if counted {
+            self.publish_count(sid, summary.pending as u64);
+        }
+        summary
+    }
+
+    /// [`Self::tick`]'s work; `false` when no rules could be read, so the
+    /// summary's count says nothing.
+    fn propose_and_act(&self, sid: &str, now: SystemTime) -> (TickSummary, bool) {
         self.drop_stored_subdomain_twins(sid, now);
         // Whatever the suggestion mode: `?` rules are the user's own.
         self.verify_step(sid, now);
@@ -93,14 +146,14 @@ impl AutoRulesEngine {
         let mode = self.mode(sid);
         if mode == AutoRulesMode::Off {
             self.forget(sid);
-            return summary;
+            return (summary, true);
         }
         // Save what has been learned so far. Rides this tick rather than a
         // timer of its own — the ledger is only worth writing when it has had
         // time to change, and this is the tick that already runs on that scale.
         self.persist_evidence(sid, now);
         let Some(snapshot) = self.rules.active_rules_for(sid) else {
-            return summary;
+            return (summary, false);
         };
         let now_ms = unix_ms(now);
         self.expire_pending(sid, now_ms);
@@ -144,7 +197,7 @@ impl AutoRulesEngine {
         };
         if proposals.is_empty() {
             summary.pending = self.pending_count_under(sid, &snapshot);
-            return summary;
+            return (summary, true);
         }
 
         // A suggestion naming the route unmatched traffic already takes changes
@@ -251,7 +304,7 @@ impl AutoRulesEngine {
             if matches!(mode, AutoRulesMode::Suggest) {
                 summary.published = self.announce_pending(sid, now);
             }
-            return summary;
+            return (summary, true);
         }
 
         match mode {
@@ -287,7 +340,7 @@ impl AutoRulesEngine {
                 summary.published = self.announce_pending(sid, now);
             }
         }
-        summary
+        (summary, true)
     }
 
     /// Announce everything still on offer for `sid` when any of it has not been

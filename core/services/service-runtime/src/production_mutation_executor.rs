@@ -914,6 +914,8 @@ impl MutationExecutor for ProductionMutationExecutor {
                                 StatusUpdateEvent::RoutingPauseStateChanged {
                                     sid: principal.to_string(),
                                     paused: true,
+                                    resumes_at_ms: None,
+                                    until_restart: false,
                                 },
                             );
                         }
@@ -1403,11 +1405,7 @@ fn load_active_rule_book(
 /// Wrap a rule book into the [`CanonicalProfile`] the risk scorer compares.
 ///
 /// The binding and the behaviour mode are read from the caller's stored policy
-/// rather than invented: a fixed placeholder (`PreferPrimary`, one synthetic
-/// adapter) on BOTH sides of the diff would make `FailClosedActivation`
-/// unreachable — a first revision activated while the user is in the strict
-/// fail-closed mode is exactly the case that signal exists for, and it would
-/// read as `PreferPrimary`.
+/// rather than invented, so the scorer sees the user's real default route.
 ///
 /// `DefaultBehaviorChanged` and `UnstableInterfaceBinding` still cannot fire
 /// HERE, and that is correct: editing rules changes neither, so both sides of
@@ -1453,9 +1451,6 @@ fn profile_for(
                 }
                 nrr_storage::route_bindings::BehaviorMode::PreferSecondaryWhenAvailable => {
                     RouteBehaviorMode::PreferSecondaryWhenAvailable
-                }
-                nrr_storage::route_bindings::BehaviorMode::StrictSecondaryFailClosed => {
-                    RouteBehaviorMode::StrictSecondaryFailClosed
                 }
             })
             .unwrap_or(RouteBehaviorMode::PreferPrimary),

@@ -14,13 +14,18 @@
 //! - **Detecting the connection** is not this module's job: it consumes a
 //!   snapshot of the user's currently usable additional link (interface index,
 //!   the adapter's own IPv4 and its description) produced by the route
-//!   coordinator, which is the single place that decides what "usable" means.
+//!   coordinator, which is the single place that decides what "usable" means,
+//!   or where there is none by [`bound_secondary_link`].
 //!   A change of identity — or an appearance after an absence — is a new
 //!   incarnation of the link, i.e. a connection.
 //! - **Deciding whether to speak** is pure and lives in [`ExternalAddressAnnouncer::observe`]
 //!   and [`ExternalAddressAnnouncer::on_probe_result`], both of which take
 //!   `now: Instant` so the whole anti-spam policy is testable without sleeping.
 //! - **Asking the network** happens on a detached thread, never on the caller's.
+//! - **Whether to ask at all** is the user's: the check is opt-in per user
+//!   (`external_address_auto_check`), off by default, because it sends a
+//!   request through the tunnel. A user who has not opted in is never even
+//!   resolved, so the steady state costs them nothing.
 //!
 //! # Cost, and why the probe is detached
 //!
@@ -50,6 +55,14 @@
 //! A probe that comes back empty publishes nothing. "We could not tell you your
 //! address" is a diagnostic (it is in the operational log), not a notification:
 //! it asks the user to act on something they cannot act on.
+//!
+//! # Withdrawal
+//!
+//! An address describes one incarnation of the link. When that incarnation
+//! ends — the link goes down, or comes back under another identity — the users
+//! told about it hear that it no longer holds, so no client keeps showing the
+//! exit of a tunnel that is gone. A reconnect inside the quiet period refills
+//! the value without announcing it.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -97,9 +110,15 @@ const MAX_TRACKED_PRINCIPALS: usize = 8;
 /// probe that answers instantly.
 pub type ExternalAddressProbeFn = Arc<dyn Fn(Ipv4Addr) -> Option<Ipv4Addr> + Send + Sync>;
 
-/// Produces the currently usable additional link of every routing-active user.
-/// Empty while nobody has a usable one.
-pub type SecondaryLinkSourceFn = Arc<dyn Fn() -> Vec<SecondaryLink> + Send + Sync>;
+/// The users the service is routing for right now.
+pub type ServedSidsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// Did this user ask for the automatic check? Read on every tick, so switching
+/// it takes effect without a restart.
+pub type AutoCheckOptInFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// One user's currently usable additional link, `None` while there is none.
+pub type SecondaryLinkOfFn = Arc<dyn Fn(&str) -> Option<SecondaryLink> + Send + Sync>;
 
 // ── Values ───────────────────────────────────────────────────────────────────
 
@@ -125,13 +144,78 @@ impl SecondaryLink {
 
 /// Everything the periodic tick needs, assembled at the composition root.
 ///
-/// One field instead of two on the runtime deps: the announcer and the snapshot
-/// source are useless apart, and pairing them here means a profile that cannot
-/// build one cannot accidentally spawn the tick with the other.
+/// One field on the runtime deps: the parts are useless apart, and pairing them
+/// here means a profile that cannot build one cannot spawn the tick without it.
 #[derive(Clone)]
 pub struct ExternalAddressWiring {
     pub announcer: Arc<ExternalAddressAnnouncer>,
-    pub links: SecondaryLinkSourceFn,
+    pub served: ServedSidsFn,
+    pub opted_in: AutoCheckOptInFn,
+    pub link_of: SecondaryLinkOfFn,
+}
+
+impl ExternalAddressWiring {
+    /// The links of the served users who asked for the check.
+    pub fn watched_links(&self) -> Vec<SecondaryLink> {
+        let mut links = Vec::new();
+        for sid in (self.served)() {
+            if !(self.opted_in)(&sid) {
+                // Dropping out of the snapshot would read as the link going
+                // down and withdraw an address that is still true.
+                self.announcer.forget(&sid);
+                continue;
+            }
+            links.extend((self.link_of)(&sid));
+        }
+        links
+    }
+
+    /// One tick of the task. A user who switched the check off drops out of
+    /// the snapshot, so switching it back on while connected counts as a
+    /// connection and is answered once.
+    pub fn tick(&self) -> Vec<SecondaryLink> {
+        self.tick_at(Instant::now())
+    }
+
+    fn tick_at(&self, now: Instant) -> Vec<SecondaryLink> {
+        self.announcer.tick_at(&self.watched_links(), now)
+    }
+}
+
+/// The opt-in as stored in the user's route policy. A row that cannot be read
+/// reads as off: the check is never sent on a guess.
+pub fn stored_opt_in(state_conn: Arc<Mutex<rusqlite::Connection>>) -> AutoCheckOptInFn {
+    Arc::new(move |sid: &str| {
+        let guard = state_conn.lock().unwrap_or_else(|p| p.into_inner());
+        nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
+            .load_for_sid(sid)
+            .is_ok_and(|record| record.external_address_auto_check)
+    })
+}
+
+/// `sid`'s additional link as `adapters` show it: the adapter its binding
+/// names, up and holding an IPv4. For a platform without a route coordinator to
+/// resolve it.
+pub fn bound_secondary_link(
+    sid: &str,
+    adapters: &[nrr_platform_api::adapters::AdapterInfo],
+    bound_name: &str,
+) -> Option<SecondaryLink> {
+    let adapter = crate::catch_all_exemptions::bound_adapter(adapters, Some(bound_name))?;
+    if !adapter.oper_status.is_up() {
+        return None;
+    }
+    let name = if adapter.friendly_name.is_empty() {
+        &adapter.description
+    } else {
+        &adapter.friendly_name
+    };
+    Some(SecondaryLink {
+        sid: sid.to_string(),
+        interface_index: adapter.index,
+        source_ipv4: adapter.ipv4_addresses.first().copied()?,
+        adapter_name: name.clone(),
+    })
 }
 
 /// What [`ExternalAddressAnnouncer::on_probe_result`] did, for logging and tests.
@@ -167,6 +251,8 @@ struct LinkState {
     announced_at: Option<Instant>,
     /// Last tick that mentioned this principal — the eviction key.
     touched: Instant,
+    /// The user holds an address for the current incarnation.
+    told: bool,
 }
 
 impl LinkState {
@@ -179,7 +265,14 @@ impl LinkState {
             attempts: 0,
             announced_at: None,
             touched: now,
+            told: false,
         }
+    }
+
+    /// The incarnation the user was told about has ended. `true` when they
+    /// hold an address that must now be withdrawn.
+    fn end_incarnation(&mut self) -> bool {
+        std::mem::take(&mut self.told)
     }
 }
 
@@ -223,7 +316,11 @@ impl ExternalAddressAnnouncer {
     /// the flow synchronously (tests) can. Production ignores it — the workers
     /// report back on their own.
     pub fn tick(self: &Arc<Self>, links: &[SecondaryLink]) -> Vec<SecondaryLink> {
-        let due = self.observe(links, Instant::now());
+        self.tick_at(links, Instant::now())
+    }
+
+    fn tick_at(self: &Arc<Self>, links: &[SecondaryLink], now: Instant) -> Vec<SecondaryLink> {
+        let due = self.observe(links, now);
         for link in &due {
             self.spawn_probe(link.clone());
         }
@@ -235,6 +332,7 @@ impl ExternalAddressAnnouncer {
     pub fn observe(&self, links: &[SecondaryLink], now: Instant) -> Vec<SecondaryLink> {
         let mut state = self.lock();
         let mut due = Vec::new();
+        let mut withdrawn = Vec::new();
 
         for link in links {
             let entry = state
@@ -244,8 +342,11 @@ impl ExternalAddressAnnouncer {
             let identity = link.identity();
             if entry.identity != Some(identity) {
                 // A new incarnation: a fresh connection, a re-IP, or a move to
-                // a different adapter. The announced-address memory survives —
-                // it is what suppresses "you reconnected to the same exit".
+                // a different adapter. The announcement time survives — it is
+                // the floor a flapping tunnel is measured against.
+                if entry.end_incarnation() {
+                    withdrawn.push(link.sid.clone());
+                }
                 entry.identity = Some(identity);
                 entry.since = now;
                 entry.probed = false;
@@ -274,12 +375,40 @@ impl ExternalAddressAnnouncer {
             if links.iter().any(|link| &link.sid == sid) {
                 continue;
             }
+            if entry.end_incarnation() {
+                withdrawn.push(sid.clone());
+            }
             entry.identity = None;
             entry.probed = false;
             entry.attempts = 0;
         }
         evict_overflow(&mut state);
+        drop(state);
+        for sid in withdrawn {
+            self.withdraw(sid);
+        }
         due
+    }
+
+    /// Stop tracking `sid` without telling them anything: they switched the
+    /// check off, which ends nothing about the link itself.
+    pub fn forget(&self, sid: &str) {
+        self.lock().remove(sid);
+    }
+
+    fn withdraw(&self, sid: String) {
+        tracing::info!(
+            target: "nrr::interfaces",
+            msg_key = "secext-withdrawn",
+            sid = %sid,
+            "additional route went down or changed — its external address is no longer shown",
+        );
+        if let Some(bus) = self.events.as_ref() {
+            bus.publish_for(
+                sid.clone(),
+                StatusUpdateEvent::SecondaryExternalAddressCleared { sid },
+            );
+        }
     }
 
     /// Fold one probe answer into the state and publish if the anti-spam rules
@@ -328,12 +457,17 @@ impl ExternalAddressAnnouncer {
         let too_soon = entry
             .announced_at
             .is_some_and(|at| now.saturating_duration_since(at) < ANNOUNCE_MIN_INTERVAL);
+        entry.told = true;
         if too_soon {
+            drop(state);
             tracing::debug!(
                 target: "nrr::interfaces",
                 sid = %link.sid,
                 "additional route changed its external address again within the quiet period — notice suppressed",
             );
+            // The previous address was withdrawn when the link went down, so
+            // the value is still owed; only the announcement is held back.
+            self.publish_observed(link, address, true);
             return AnnounceOutcome::SuppressedTooSoon;
         }
 
@@ -347,6 +481,11 @@ impl ExternalAddressAnnouncer {
             adapter = %link.adapter_name,
             "external address of the additional route observed after it connected — telling the user",
         );
+        self.publish_observed(link, address, false);
+        AnnounceOutcome::Announced
+    }
+
+    fn publish_observed(&self, link: &SecondaryLink, address: Ipv4Addr, quiet: bool) {
         if let Some(bus) = self.events.as_ref() {
             bus.publish_for(
                 link.sid.clone(),
@@ -354,10 +493,10 @@ impl ExternalAddressAnnouncer {
                     sid: link.sid.clone(),
                     adapter_name: link.adapter_name.clone(),
                     external_address: address.to_string(),
+                    quiet,
                 },
             );
         }
-        AnnounceOutcome::Announced
     }
 
     /// Run one probe off the caller's thread and report back.
@@ -749,24 +888,341 @@ mod tests {
         a.on_probe_result(&l, Some(addr(10)), t0 + ANNOUNCE_MIN_INTERVAL / 4);
         a.on_probe_result(&l, Some(addr(11)), t0 + ANNOUNCE_MIN_INTERVAL / 2);
 
-        let events = published(&bus);
+        let observed: Vec<(String, bool)> = published(&bus)
+            .into_iter()
+            .map(|event| match event {
+                StatusUpdateEvent::SecondaryExternalAddressObserved {
+                    sid,
+                    adapter_name,
+                    external_address,
+                    quiet,
+                } => {
+                    assert_eq!(sid, SID);
+                    assert_eq!(adapter_name, "Test VPN Adapter");
+                    (external_address, quiet)
+                }
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect();
         assert_eq!(
-            events.len(),
+            observed.iter().filter(|(_, quiet)| !quiet).count(),
             1,
             "one notice per quiet period, whatever the flapping"
         );
-        match &events[0] {
-            StatusUpdateEvent::SecondaryExternalAddressObserved {
-                sid,
-                adapter_name,
+        assert_eq!(observed[0], ("203.0.113.10".to_string(), false));
+        assert_eq!(
+            observed.last(),
+            Some(&("203.0.113.11".to_string(), true)),
+            "the value the clients hold is still the current one"
+        );
+    }
+
+    /// Every event `bus` holds for the test user that withdraws an address.
+    fn withdrawals(bus: &EventBus) -> usize {
+        published(bus)
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    StatusUpdateEvent::SecondaryExternalAddressCleared { sid } if sid == SID
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_link_that_goes_down_withdraws_the_address_it_was_told() {
+        let (a, bus) = announcer_on_bus();
+        let t0 = Instant::now();
+        let l = link(7, [10, 88, 1, 41]);
+        a.observe(std::slice::from_ref(&l), t0);
+        a.observe(std::slice::from_ref(&l), t0 + LINK_SETTLE);
+        a.on_probe_result(&l, Some(addr(10)), t0 + LINK_SETTLE);
+        a.observe(std::slice::from_ref(&l), t0 + LINK_SETTLE * 2);
+        assert_eq!(withdrawals(&bus), 0, "the link is still up");
+
+        a.observe(&[], t0 + LINK_SETTLE * 3);
+        assert_eq!(withdrawals(&bus), 1, "the tunnel is gone, so is its exit");
+        a.observe(&[], t0 + LINK_SETTLE * 4);
+        assert_eq!(withdrawals(&bus), 1, "said once, not once per tick");
+    }
+
+    #[test]
+    fn a_link_that_never_got_an_address_goes_down_silently() {
+        let (a, bus) = announcer_on_bus();
+        let t0 = Instant::now();
+        let l = link(7, [10, 88, 1, 41]);
+        a.observe(std::slice::from_ref(&l), t0);
+        a.observe(std::slice::from_ref(&l), t0 + LINK_SETTLE);
+        a.on_probe_result(&l, None, t0 + LINK_SETTLE);
+        a.observe(&[], t0 + LINK_SETTLE * 2);
+        assert_eq!(
+            bus.buffer_len(),
+            0,
+            "nothing was shown, nothing to take back"
+        );
+    }
+
+    #[test]
+    fn a_re_ip_withdraws_the_old_exit_until_the_new_one_is_known() {
+        let (a, bus) = announcer_on_bus();
+        let t0 = Instant::now();
+        let first = link(7, [10, 88, 1, 41]);
+        a.observe(std::slice::from_ref(&first), t0);
+        a.observe(std::slice::from_ref(&first), t0 + LINK_SETTLE);
+        a.on_probe_result(&first, Some(addr(10)), t0 + LINK_SETTLE);
+
+        let renewed = link(7, [10, 88, 2, 9]);
+        a.observe(std::slice::from_ref(&renewed), t0 + LINK_SETTLE * 2);
+        assert_eq!(withdrawals(&bus), 1);
+    }
+
+    #[test]
+    fn a_quick_reconnect_refills_the_address_without_a_notice() {
+        let (a, bus) = announcer_on_bus();
+        let t0 = Instant::now();
+        let l = link(7, [10, 88, 1, 41]);
+        a.observe(std::slice::from_ref(&l), t0);
+        a.observe(std::slice::from_ref(&l), t0 + LINK_SETTLE);
+        a.on_probe_result(&l, Some(addr(10)), t0 + LINK_SETTLE);
+        let down = t0 + LINK_SETTLE * 2;
+        a.observe(&[], down);
+        a.observe(std::slice::from_ref(&l), down);
+        assert_eq!(
+            a.observe(std::slice::from_ref(&l), down + LINK_SETTLE),
+            vec![l.clone()]
+        );
+        assert_eq!(
+            a.on_probe_result(&l, Some(addr(10)), down + LINK_SETTLE),
+            AnnounceOutcome::SuppressedTooSoon
+        );
+        match published(&bus).last() {
+            Some(StatusUpdateEvent::SecondaryExternalAddressObserved {
                 external_address,
-            } => {
-                assert_eq!(sid, SID);
-                assert_eq!(adapter_name, "Test VPN Adapter");
+                quiet,
+                ..
+            }) => {
                 assert_eq!(external_address, "203.0.113.10");
+                assert!(quiet, "inside the quiet period nothing is announced");
             }
-            other => panic!("unexpected event: {other:?}"),
+            other => panic!("the address was not refilled: {other:?}"),
         }
+        // The refilled value is withdrawn like any other.
+        a.observe(&[], down + LINK_SETTLE * 2);
+        assert_eq!(withdrawals(&bus), 2);
+    }
+
+    #[test]
+    fn switching_the_check_off_withdraws_nothing() {
+        use std::sync::atomic::Ordering;
+        let rig = opt_in_rig(true);
+        let bus = Arc::new(EventBus::new());
+        let announcer = Arc::new(ExternalAddressAnnouncer::new(
+            Arc::clone(&bus),
+            Arc::new(|_| Some(addr(10))),
+        ));
+        let opted_in = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let wiring = ExternalAddressWiring {
+            announcer: Arc::clone(&announcer),
+            served: rig.wiring.served.clone(),
+            opted_in: {
+                let opted_in = Arc::clone(&opted_in);
+                Arc::new(move |_sid: &str| opted_in.load(Ordering::SeqCst))
+            },
+            link_of: rig.wiring.link_of.clone(),
+        };
+        let t0 = Instant::now();
+        let l = link(7, [10, 88, 1, 41]);
+        announcer.observe(std::slice::from_ref(&l), t0);
+        announcer.observe(std::slice::from_ref(&l), t0 + LINK_SETTLE);
+        announcer.on_probe_result(&l, Some(addr(10)), t0 + LINK_SETTLE);
+
+        opted_in.store(false, Ordering::SeqCst);
+        wiring.tick_at(t0 + LINK_SETTLE * 2);
+        wiring.tick_at(t0 + LINK_SETTLE * 3);
+        assert_eq!(
+            withdrawals(&bus),
+            0,
+            "the link is still up, its address still true"
+        );
+    }
+
+    /// A wiring over one user whose link is up while `connected` holds, with a
+    /// probe that answers at once and counts its calls.
+    struct OptInRig {
+        wiring: ExternalAddressWiring,
+        probes: Arc<std::sync::atomic::AtomicUsize>,
+        resolved: Arc<std::sync::atomic::AtomicUsize>,
+        connected: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn opt_in_rig(opted_in: bool) -> OptInRig {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let probes = Arc::new(AtomicUsize::new(0));
+        let resolved = Arc::new(AtomicUsize::new(0));
+        let connected = Arc::new(AtomicBool::new(true));
+        let counter = Arc::clone(&probes);
+        let announcer = Arc::new(ExternalAddressAnnouncer::without_events(Arc::new(
+            move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Some(addr(10))
+            },
+        )));
+        let link_of: SecondaryLinkOfFn = {
+            let resolved = Arc::clone(&resolved);
+            let connected = Arc::clone(&connected);
+            Arc::new(move |_sid: &str| {
+                resolved.fetch_add(1, Ordering::SeqCst);
+                connected
+                    .load(Ordering::SeqCst)
+                    .then(|| link(7, [10, 88, 1, 41]))
+            })
+        };
+        OptInRig {
+            wiring: ExternalAddressWiring {
+                announcer,
+                served: Arc::new(|| vec![SID.to_string()]),
+                opted_in: Arc::new(move |_sid: &str| opted_in),
+                link_of,
+            },
+            probes,
+            resolved,
+            connected,
+        }
+    }
+
+    /// The probe runs on its own thread; give it a moment to report.
+    fn wait_for_probes(rig: &OptInRig, want: usize) -> usize {
+        use std::sync::atomic::Ordering;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rig.probes.load(Ordering::SeqCst) < want && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(20));
+        rig.probes.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn without_the_opt_in_a_connect_sends_nothing() {
+        use std::sync::atomic::Ordering;
+        let rig = opt_in_rig(false);
+        let t0 = Instant::now();
+        for step in 0..6 {
+            assert!(rig.wiring.tick_at(t0 + LINK_SETTLE * step).is_empty());
+        }
+        rig.connected.store(false, Ordering::SeqCst);
+        rig.wiring.tick_at(t0 + LINK_SETTLE * 7);
+        rig.connected.store(true, Ordering::SeqCst);
+        rig.wiring.tick_at(t0 + LINK_SETTLE * 8);
+        rig.wiring.tick_at(t0 + LINK_SETTLE * 10);
+        // Nothing was due, so no worker was ever started to count.
+        assert_eq!(
+            rig.probes.load(Ordering::SeqCst),
+            0,
+            "no request leaves unasked"
+        );
+        assert_eq!(
+            rig.resolved.load(Ordering::SeqCst),
+            0,
+            "a user who did not opt in is never even resolved"
+        );
+    }
+
+    #[test]
+    fn with_the_opt_in_each_connect_is_probed_once() {
+        use std::sync::atomic::Ordering;
+        let rig = opt_in_rig(true);
+        let t0 = Instant::now();
+        assert!(rig.wiring.tick_at(t0).is_empty(), "not settled yet");
+        assert_eq!(rig.wiring.tick_at(t0 + LINK_SETTLE).len(), 1);
+        assert_eq!(wait_for_probes(&rig, 1), 1);
+        for step in 2..6 {
+            assert!(rig.wiring.tick_at(t0 + LINK_SETTLE * step).is_empty());
+        }
+        assert_eq!(
+            rig.probes.load(Ordering::SeqCst),
+            1,
+            "a link that stays up costs nothing"
+        );
+
+        rig.connected.store(false, Ordering::SeqCst);
+        rig.wiring.tick_at(t0 + LINK_SETTLE * 6);
+        rig.connected.store(true, Ordering::SeqCst);
+        rig.wiring.tick_at(t0 + LINK_SETTLE * 7);
+        assert_eq!(rig.wiring.tick_at(t0 + LINK_SETTLE * 8).len(), 1);
+        assert_eq!(
+            wait_for_probes(&rig, 2),
+            2,
+            "a reconnect is a new connection"
+        );
+    }
+
+    #[test]
+    fn the_stored_opt_in_is_off_until_the_user_turns_it_on() {
+        use nrr_storage::repository::MigrationRunner;
+        use nrr_storage::route_bindings::{
+            BindingSource, RouteBindingsRepository, RoutePolicyRecord,
+        };
+        let runner = nrr_storage::SqliteMigrationRunner::for_state_db(
+            rusqlite::Connection::open_in_memory().expect("in-memory state DB"),
+        );
+        runner.run_pending_migrations().expect("state migrations");
+        let conn = Arc::new(Mutex::new(runner.into_connection()));
+        let opted_in = stored_opt_in(Arc::clone(&conn));
+        assert!(!opted_in(SID), "a user with no policy row has not opted in");
+
+        let mut record = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+        {
+            let guard = conn.lock().expect("lock");
+            RouteBindingsRepository::new(&guard)
+                .update_for_sid(SID, &record, 1)
+                .expect("write");
+        }
+        assert!(!opted_in(SID), "the default policy leaves it off");
+
+        record.external_address_auto_check = true;
+        {
+            let guard = conn.lock().expect("lock");
+            RouteBindingsRepository::new(&guard)
+                .update_for_sid(SID, &record, 2)
+                .expect("write");
+        }
+        assert!(opted_in(SID));
+        assert!(!opted_in("S-1-5-21-someone-else"), "the choice is per user");
+    }
+
+    #[test]
+    fn a_bound_link_counts_only_while_it_is_up_with_an_address() {
+        use nrr_platform_api::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
+        let tunnel = AdapterInfo {
+            index: 9,
+            adapter_name: "wg0".into(),
+            description: String::new(),
+            friendly_name: "wg0".into(),
+            mac: None,
+            interface_type: InterfaceType::Ethernet,
+            oper_status: IfOperStatus::Up,
+            ipv4_addresses: vec![Ipv4Addr::new(10, 88, 1, 41)],
+            ipv6_addresses: Vec::new(),
+            gateways: Vec::new(),
+        };
+        let link = bound_secondary_link(SID, std::slice::from_ref(&tunnel), "wg0")
+            .expect("an up tunnel with an address");
+        assert_eq!(link.interface_index, 9);
+        assert_eq!(link.source_ipv4, Ipv4Addr::new(10, 88, 1, 41));
+        assert_eq!(link.adapter_name, "wg0");
+
+        assert!(bound_secondary_link(SID, std::slice::from_ref(&tunnel), "tun1").is_none());
+        let down = AdapterInfo {
+            oper_status: IfOperStatus::Down,
+            ..tunnel.clone()
+        };
+        assert!(bound_secondary_link(SID, &[down], "wg0").is_none());
+        let bare = AdapterInfo {
+            ipv4_addresses: Vec::new(),
+            ..tunnel
+        };
+        assert!(bound_secondary_link(SID, &[bare], "wg0").is_none());
     }
 
     #[test]

@@ -49,11 +49,6 @@ pub struct ClientIdentity {
     pub profile: IpcClientProfile,
     pub caller_is_elevated: bool,
     pub process_id: u32,
-    /// Basename of the connecting client's executable. Retained as part of the
-    /// accepted-connection identity record for audit/diagnostics even though no
-    /// caller reads it on the success path today.
-    #[allow(dead_code)]
-    pub exe_basename: String,
     /// String form of the caller's user SID (`S-1-5-21-...`), used to key
     /// per-SID storage and policy application. Extracted via
     /// `GetTokenInformation(TokenUser) + ConvertSidToStringSidW`.
@@ -173,9 +168,27 @@ pub fn classify_pipe_client(pipe: HANDLE) -> Result<ClientIdentity, ClientReject
         profile,
         caller_is_elevated: elevated,
         process_id: pid,
-        exe_basename: basename,
         caller_sid,
     })
+}
+
+/// Whether `pid` runs in session 0, where services and boot-time tasks live.
+/// A tray there is no person at a screen, so it must not make its account a
+/// routing user (a task under an account that never signs in would otherwise
+/// become the longest-served one).
+pub fn in_service_session(pid: u32) -> bool {
+    let mut session = 0u32;
+    // SAFETY: `session` is a valid out-param for the call's duration.
+    let found = unsafe {
+        windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(pid, &mut session).is_ok()
+    };
+    is_service_session(found.then_some(session))
+}
+
+/// Session 0 only when the lookup succeeded: a process whose session cannot be
+/// read is not assumed to be a service.
+fn is_service_session(session: Option<u32>) -> bool {
+    session == Some(0)
 }
 
 fn client_process_id(pipe: HANDLE) -> Result<u32, ClientRejectReason> {
@@ -415,6 +428,14 @@ impl Drop for HandleGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_confirmed_session_zero_counts_as_the_service_session() {
+        assert!(is_service_session(Some(0)));
+        assert!(!is_service_session(Some(1)));
+        assert!(!is_service_session(Some(3)));
+        assert!(!is_service_session(None));
+    }
 
     #[test]
     fn whitelist_accepts_gui_exe() {

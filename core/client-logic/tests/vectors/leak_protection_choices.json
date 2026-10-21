@@ -1,0 +1,87 @@
+{
+  "description": "pure.js leakProtectionChoices: the levels offered under a default route, weakest first",
+  "cases": [
+    {
+      "name": "main connection offers all three",
+      "input": {
+        "route": "prefer-primary"
+      },
+      "expected": [
+        "off",
+        "sites",
+        "everything"
+      ]
+    },
+    {
+      "name": "additional connection does not offer routed sites",
+      "input": {
+        "route": "prefer-secondary-when-available"
+      },
+      "expected": [
+        "off",
+        "everything"
+      ]
+    },
+    {
+      "name": "an unset route is the main connection",
+      "input": {
+        "route": ""
+      },
+      "expected": [
+        "off",
+        "sites",
+        "everything"
+      ]
+    },
+    {
+      "name": "an unknown route does not offer routed sites",
+      "input": {
+        "route": "strict-secondary-fail-closed"
+      },
+      "expected": [
+        "off",
+        "everything"
+      ]
+    },
+    {
+      "name": "the main route is matched exactly, case included",
+      "input": {
+        "route": "Prefer-Primary"
+      },
+      "expected": [
+        "off",
+        "everything"
+      ]
+    },
+    {
+      "name": "a padded main route is not the main route",
+      "input": {
+        "route": " prefer-primary"
+      },
+      "expected": [
+        "off",
+        "everything"
+      ]
+    },
+    {
+      "name": "a shortened additional route does not offer routed sites",
+      "input": {
+        "route": "prefer-secondary"
+      },
+      "expected": [
+        "off",
+        "everything"
+      ]
+    },
+    {
+      "name": "a level name is not a route",
+      "input": {
+        "route": "sites"
+      },
+      "expected": [
+        "off",
+        "everything"
+      ]
+    }
+  ]
+}

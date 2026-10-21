@@ -237,6 +237,12 @@ pub(crate) fn classify(name: &str, facts: &SysfsFacts) -> Classification {
     let is_wireguard = facts.devtype.as_deref() == Some("wireguard");
     let interface_type = match facts.arphrd {
         Some(ARPHRD_LOOPBACK) => InterfaceType::Loopback,
+        // A raw-IP modem shares ARPHRD_NONE with tunnels, but it is an uplink:
+        // typed a tunnel, an unbound LTE link holding a second default would
+        // be exempted from the kill-switch as somebody else's VPN.
+        Some(class) if class != ARPHRD_ETHER && facts.devtype.as_deref() == Some("wwan") => {
+            InterfaceType::Other(class)
+        }
         Some(ARPHRD_PPP | ARPHRD_TUNNEL | ARPHRD_TUNNEL6 | ARPHRD_SIT | ARPHRD_NONE) => {
             InterfaceType::Tunnel
         }
@@ -378,6 +384,38 @@ Inter-|   Receive                                                |  Transmit
         let class = classify("wg0", &f);
         assert_eq!(class.interface_type, InterfaceType::Tunnel);
         assert!(class.is_tunnel);
+    }
+
+    /// qmi_wwan / iosm in raw-IP mode: `wwan0`, ARPHRD_NONE, `DEVTYPE=wwan`.
+    /// Mobile broadband is an uplink, while a tun and a WireGuard device on
+    /// the same hardware class stay tunnels.
+    #[test]
+    fn a_raw_ip_modem_is_not_a_tunnel_but_a_raw_ip_vpn_still_is() {
+        let mut modem = facts(ARPHRD_NONE);
+        modem.devtype = Some("wwan".to_string());
+        modem.has_device = Some(true);
+        let class = classify("wwan0", &modem);
+        assert_eq!(class.interface_type, InterfaceType::Other(ARPHRD_NONE));
+        assert!(!class.is_tunnel);
+
+        let mut wg = facts(ARPHRD_NONE);
+        wg.devtype = Some("wireguard".to_string());
+        assert_eq!(classify("wg0", &wg).interface_type, InterfaceType::Tunnel);
+
+        let mut tun = facts(ARPHRD_NONE);
+        tun.is_tun_device = true;
+        tun.point_to_point = true;
+        let class = classify("tun0", &tun);
+        assert_eq!(class.interface_type, InterfaceType::Tunnel);
+        assert!(class.is_tunnel);
+
+        // An 802.3-mode modem keeps reading as the Ethernet it presents as.
+        let mut ether_modem = facts(ARPHRD_ETHER);
+        ether_modem.devtype = Some("wwan".to_string());
+        assert_eq!(
+            classify("wwan0", &ether_modem).interface_type,
+            InterfaceType::Ethernet
+        );
     }
 
     #[test]

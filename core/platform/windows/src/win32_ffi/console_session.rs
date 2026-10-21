@@ -1,11 +1,10 @@
-//! Resolve the SID of the signed-in user whose rules the service enforces.
+//! Resolve the SIDs of the signed-in users whose rules the service enforces.
 //!
 //! The service-driven routing scope (`service_stability_config
-//! .rule_scope_service_driven`) enforces a signed-in user's routing policy with
+//! .rule_scope_service_driven`) enforces signed-in users' routing policy with
 //! no GUI or tray connected — from boot, before the app is ever opened. The tray
-//! is a convenience, not the routing agent, so the service asks the OS which
-//! user is at the machine: the console session first, then a remote (RDP)
-//! session.
+//! is a convenience, not the routing agent, so the service asks the OS who is
+//! signed in: the console session first, then remote (RDP) sessions.
 
 #![allow(unsafe_code)]
 
@@ -29,39 +28,21 @@ use windows::Win32::System::Threading::{
 /// me" from "I am a service account".
 const INTERACTIVE_USER_SID_PREFIX: &str = "S-1-5-21-";
 
-/// String SID (`S-1-5-21-…`) of the user whose routing policy this service
-/// enforces when no tray is connected: the console-session user, else the one
-/// user signed in remotely, else — when the service runs as an elevated console
-/// process for debugging — the user running it. `None` when nobody is signed in,
-/// when several users are signed in remotely and none is at the console (Free
-/// enforces one user; a tray picks among them), or the SID cannot be resolved.
-///
-/// Best-effort: every failure path returns `None`, so the routing layer
-/// degrades to "no routing user → clear the table" rather than panicking.
-pub fn interactive_user_sid() -> Option<String> {
-    if let Some(sid) = active_console_user_sid_via_wts() {
-        return Some(sid);
-    }
-    if let Some(sid) = remote_user_sid_cached() {
-        return Some(sid);
-    }
-    // `WTSQueryUserToken` is SYSTEM-only, so a service started as an elevated
-    // console process (the debug run) fails both WTS paths; it then runs AS the
-    // routing user. Under SCM our own SID is a service account, which the guard
-    // filters out, so this can never enforce a service account's empty policy.
-    console_fallback_sid(current_process_user_sid())
-}
-
 /// Every user signed in interactively, console user first, each once: the
 /// console session, then attached remote sessions, then disconnected ones (a
 /// disconnected user's programs keep running and keep needing their routes).
-/// Service accounts never count. Same cost as [`interactive_user_sid`]: the
-/// console lookup is live, the session enumeration answers from a short cache.
+/// Service accounts never count. The console lookup is live, the session
+/// enumeration answers from a short cache. Best-effort: a failed lookup is a
+/// user missing from the list, never a panic.
 pub fn interactive_user_sids() -> Vec<String> {
     let console = active_console_user_sid_via_wts();
     let remote = remote_sessions_cached();
     let mut users = ordered_session_users(console.as_deref(), &remote);
     if users.is_empty() {
+        // `WTSQueryUserToken` is SYSTEM-only, so a service started as an
+        // elevated console process (the debug run) fails both WTS paths; it then
+        // runs AS the routing user. Under SCM our own SID is a service account,
+        // which the guard filters out.
         users.extend(console_fallback_sid(current_process_user_sid()));
     }
     users
@@ -159,12 +140,8 @@ fn filetime_ticks_to_unix_ms(ticks: i64) -> Option<u64> {
 /// second of staleness costs nothing.
 const REMOTE_LOOKUP_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
-fn remote_user_sid_cached() -> Option<String> {
-    sole_session_user(&remote_sessions_cached())
-}
-
 /// The non-console sessions with their users, from one enumeration per
-/// [`REMOTE_LOOKUP_TTL`]: the single-user and the all-users answers share it.
+/// [`REMOTE_LOOKUP_TTL`].
 fn remote_sessions_cached() -> Vec<(SessionState, Option<String>)> {
     use std::sync::Mutex;
     use std::time::Instant;
@@ -226,24 +203,6 @@ fn session_state(state: WTS_CONNECTSTATE_CLASS) -> Option<SessionState> {
     }
 }
 
-/// The one user to enforce for among non-console sessions: the user of the
-/// attached sessions; with none attached, the user whose programs run on
-/// disconnected. Two different users at the same level is ambiguous — Free
-/// enforces one user, and guessing would route another person's traffic.
-fn sole_session_user(sessions: &[(SessionState, Option<String>)]) -> Option<String> {
-    for level in [SessionState::Active, SessionState::Disconnected] {
-        let mut users = sessions
-            .iter()
-            .filter(|(state, _)| *state == level)
-            .filter_map(|(_, sid)| sid.as_deref())
-            .filter(|sid| sid.starts_with(INTERACTIVE_USER_SID_PREFIX));
-        if let Some(first) = users.next() {
-            return users.all(|sid| sid == first).then(|| first.to_string());
-        }
-    }
-    None
-}
-
 /// The console user, then the users of attached sessions, then those of
 /// disconnected ones; each user once, service accounts never.
 fn ordered_session_users(
@@ -297,7 +256,7 @@ fn active_console_user_sid_via_wts() -> Option<String> {
 
 /// The console-mode fallback decision (pure): a resolved own-process SID is
 /// accepted as the routing user only when it is a real interactive user, never
-/// a service account. Split out of [`interactive_user_sid`] so the guard —
+/// a service account. Split out of [`interactive_user_sids`] so the guard —
 /// the load-bearing safety rule that keeps the fallback from ever enforcing a
 /// service account under SCM — is unit-testable without the Win32 calls.
 fn console_fallback_sid(own_process_sid: Option<String>) -> Option<String> {
@@ -363,9 +322,11 @@ unsafe fn token_user_sid_string(token: HANDLE) -> Option<String> {
     if needed == 0 {
         return None;
     }
-    let mut buf = vec![0u8; needed as usize];
-    // SAFETY: `buf` is `needed` bytes; on success GetTokenInformation writes a
-    // TOKEN_USER whose embedded SID points within `buf`.
+    // Words, so the TOKEN_USER (it holds pointers) starts 8-aligned.
+    let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+    // SAFETY: `buf` holds at least `needed` bytes and starts 8-aligned; on
+    // success GetTokenInformation writes a TOKEN_USER whose embedded SID points
+    // within `buf`.
     if GetTokenInformation(
         token,
         TokenUser,
@@ -416,59 +377,30 @@ mod tests {
     }
 
     #[test]
-    fn one_remote_user_is_the_routing_user() {
-        use SessionState::*;
-        assert_eq!(
-            sole_session_user(&[at(Active, ALICE)]).as_deref(),
-            Some(ALICE)
-        );
-        // Two sessions of the same user are still one user.
-        assert_eq!(
-            sole_session_user(&[at(Active, ALICE), at(Disconnected, BOB), at(Active, ALICE)])
-                .as_deref(),
-            Some(ALICE)
-        );
-    }
-
-    #[test]
-    fn an_attached_session_outranks_a_disconnected_one() {
-        use SessionState::*;
-        assert_eq!(
-            sole_session_user(&[at(Disconnected, BOB), at(Active, ALICE)]).as_deref(),
-            Some(ALICE)
-        );
-        assert_eq!(
-            sole_session_user(&[at(Disconnected, BOB)]).as_deref(),
-            Some(BOB)
-        );
-    }
-
-    #[test]
-    fn two_users_at_one_level_are_nobody() {
-        use SessionState::*;
-        assert_eq!(
-            sole_session_user(&[at(Active, ALICE), at(Active, BOB)]),
-            None
-        );
-        // Ambiguity among attached users is not settled by a disconnected one.
-        assert_eq!(
-            sole_session_user(&[at(Active, ALICE), at(Active, BOB), at(Disconnected, BOB)]),
-            None
-        );
-    }
-
-    #[test]
     fn service_accounts_and_unresolved_sessions_never_count() {
         use SessionState::*;
+        assert!(ordered_session_users(None, &[at(Active, "S-1-5-18"), (Active, None)]).is_empty());
         assert_eq!(
-            sole_session_user(&[at(Active, "S-1-5-18"), (Active, None)]),
-            None
+            ordered_session_users(None, &[at(Active, "S-1-5-18"), at(Active, ALICE)]),
+            vec![ALICE.to_string()],
         );
+        assert!(ordered_session_users(None, &[]).is_empty());
+    }
+
+    #[test]
+    fn two_sessions_of_one_user_are_one_user() {
+        use SessionState::*;
         assert_eq!(
-            sole_session_user(&[at(Active, "S-1-5-18"), at(Active, ALICE)]).as_deref(),
-            Some(ALICE)
+            ordered_session_users(
+                None,
+                &[
+                    at(Active, ALICE),
+                    at(Disconnected, ALICE),
+                    at(Active, ALICE)
+                ]
+            ),
+            vec![ALICE.to_string()],
         );
-        assert_eq!(sole_session_user(&[]), None);
     }
 
     #[test]

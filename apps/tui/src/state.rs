@@ -112,6 +112,20 @@ pub struct AppState {
     pub traffic_carried: Option<String>,
     /// The system-DNS notice is up for the state as it stands.
     pub system_dns_notice_raised: bool,
+    /// The notice that this user's saved rules do not read is up.
+    pub rules_book_notice_raised: bool,
+    /// The notice that a work VPN lets only its own DNS answer is up.
+    pub dns_foreign_notice_raised: bool,
+    /// The service has been seen running since this program started.
+    pub service_was_running: bool,
+    /// The service stopped on its own and the notice is up for it.
+    pub service_loss_raised: bool,
+    /// Which side is behind on the wire contract; the client refuses writes across it.
+    pub contract_skew: Option<nrr_shared::ipc::ContractSkew>,
+    /// The user's settings file could not be read: this run is on defaults.
+    pub settings_unreadable: bool,
+    /// Parts of the package this copy lacks (`presets`, `locales`).
+    pub delivery_gaps: Vec<&'static str>,
     /// The newest notices, at most [`FEED_CAPACITY`].
     pub notices: Vec<Notice>,
     /// Notices ever received, the dropped ones included.
@@ -132,6 +146,8 @@ pub struct AppState {
     pub suggestions: crate::screens::suggestions::Suggestions,
     /// The overlaps screen's pairs and confirmations.
     pub overlaps: crate::screens::overlaps::Overlaps,
+    /// The application routes screen's scan and choices.
+    pub app_groups: crate::screens::app_groups::AppGroups,
     pub interfaces: crate::screens::interfaces::InterfacesState,
     pub wizard: crate::screens::wizard::WizardState,
     /// The rules screen's list, edits and apply.
@@ -149,11 +165,17 @@ pub struct AppState {
     /// VPN-named programs leak protection does not trust by place, awaiting
     /// the user's word.
     pub vpn_trust: crate::vpn_trust::VpnTrustState,
+    /// Another VPN's servers leak protection stopped, and those let through.
+    pub vpn_gateway_trust: crate::vpn_gateway_trust::VpnGatewayTrustState,
     pub primary_suggestion: crate::primary_suggestion::PrimarySuggestionState,
     /// Blocks kept while no surface was open, read on connect.
     pub block_backlog: crate::block_backlog::BlockBacklogState,
+    /// Blocked sites offered "To additional route", and the question asked.
+    pub block_route: crate::block_route::BlockRouteState,
     pub local_network_offer: crate::local_network_offer::LocalNetworkOfferState,
     pub forwarded_traffic: crate::forwarded_traffic::ForwardedTrafficState,
+    /// The notice kinds the user silenced on any surface.
+    pub notice_mutes: crate::notice_mutes::NoticeMutesState,
 }
 
 impl AppState {
@@ -166,8 +188,15 @@ impl AppState {
             routes_held: None,
             traffic_carried: None,
             system_dns_notice_raised: false,
+            rules_book_notice_raised: false,
+            dns_foreign_notice_raised: false,
+            service_was_running: false,
+            service_loss_raised: false,
+            contract_skew: None,
             notices: Vec::new(),
             notice_count: 0,
+            settings_unreadable: false,
+            delivery_gaps: Vec::new(),
             last_notice_at: None,
             screen,
             focus: Focus::Menu,
@@ -179,6 +208,7 @@ impl AppState {
             inspect: crate::screens::inspect::Inspect::default(),
             suggestions: Default::default(),
             overlaps: Default::default(),
+            app_groups: Default::default(),
             interfaces: crate::screens::interfaces::InterfacesState::default(),
             wizard: crate::screens::wizard::WizardState::default(),
             rules: crate::screens::rules::RulesState::default(),
@@ -187,10 +217,13 @@ impl AppState {
             restore: crate::restore::RestoreState::default(),
             settings: crate::screens::settings::SettingsState::default(),
             vpn_trust: crate::vpn_trust::VpnTrustState::default(),
+            vpn_gateway_trust: Default::default(),
             primary_suggestion: crate::primary_suggestion::PrimarySuggestionState::default(),
             block_backlog: Default::default(),
+            block_route: Default::default(),
             local_network_offer: Default::default(),
             forwarded_traffic: Default::default(),
+            notice_mutes: Default::default(),
         }
     }
 
@@ -224,6 +257,10 @@ impl AppState {
     }
 
     pub fn open(&mut self, screen: ScreenId) {
+        // The agreement comes before any other screen.
+        if screen != ScreenId::Wizard && self.wizard.licence_pending() {
+            return;
+        }
         if self.screen != screen {
             self.screen = screen;
             self.scroll = 0;
@@ -239,14 +276,17 @@ impl AppState {
             BackendEvent::Link(link) => {
                 let reconnected = link.is_connected() && !self.link.is_connected();
                 self.link = link;
+                let loss = self.service_loss_reading(texts, now);
                 if reconnected {
+                    // Read before the backlog, so its summary meets the mutes.
+                    crate::notice_mutes::load(self);
                     crate::restore::on_connected(self);
                     crate::screens::rules::verdicts::load(self);
                     crate::block_backlog::drain(self);
                     crate::local_network_offer::check(self);
                     crate::screens::screen(self.screen).on_show(self);
                 }
-                Vec::new()
+                loss
             }
             BackendEvent::Reply(reply) => {
                 (reply.0)(self);
@@ -254,9 +294,12 @@ impl AppState {
                 let later = crate::screens::rules::verdicts::announce(self, texts, now)
                     .into_iter()
                     .chain(crate::vpn_trust::announce(self, texts, now))
+                    .chain(crate::vpn_gateway_trust::announce(self, texts, now))
                     .chain(crate::primary_suggestion::announce(self, texts, now))
                     .chain(crate::block_backlog::announce(self, texts, now))
-                    .chain(crate::local_network_offer::announce(self, texts, now));
+                    .chain(crate::block_route::announce(self, texts, now))
+                    .chain(crate::local_network_offer::announce(self, texts, now))
+                    .chain(crate::screens::wizard::announce(self, texts, now));
                 if std::mem::take(&mut self.snapshot_refresh_due) {
                     effects.push(Effect::Refresh);
                 }
@@ -275,7 +318,10 @@ impl AppState {
                     .as_ref()
                     .filter(|report| report.carried)
                     .map(|report| report.link.clone());
+                let rules_book_unreadable = snapshot.rules_book_unreadable;
                 self.vpn_trust.pending = snapshot.pending_vpn_clients.clone();
+                self.vpn_gateway_trust.pending = snapshot.pending_vpn_gateways.clone();
+                self.vpn_gateway_trust.confirmed = snapshot.confirmed_vpn_gateways.clone();
                 self.snapshot = Some(*snapshot);
                 crate::screens::rules::overrides::on_snapshot(self);
                 self.fetch_error = None;
@@ -286,12 +332,21 @@ impl AppState {
                     .as_ref()
                     .and_then(|s| serde_json::to_value(&s.health).ok())
                     .is_some_and(|health| nrr_client_logic::system_dns::not_restored(&health));
+                let dns_foreign_only = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| serde_json::to_value(&s.health).ok())
+                    .is_some_and(|health| {
+                        nrr_client_logic::system_dns::upstream_foreign_only(&health)
+                    });
                 let mut effects = self.apply_standing_enforcement(reports, texts, now);
                 for effect in self
                     .routes_held_changed(held, texts, now)
                     .into_iter()
                     .chain(self.traffic_carried_changed(carried, texts, now))
                     .chain(self.system_dns_reading(dns_not_restored, texts, now))
+                    .chain(self.rules_book_reading(rules_book_unreadable, texts, now))
+                    .chain(self.dns_foreign_reading(dns_foreign_only, texts, now))
                     .chain(crate::forwarded_traffic::reading(self, texts, now))
                 {
                     if !effects.contains(&effect) {
@@ -304,8 +359,23 @@ impl AppState {
                 self.fetch_error = Some(error);
                 Vec::new()
             }
-            BackendEvent::Push(PushEvent::Gap) => vec![Effect::Refresh],
+            BackendEvent::Push(PushEvent::Gap) => {
+                self.reread_after_gap();
+                vec![Effect::Refresh]
+            }
             BackendEvent::Push(PushEvent::Status(event)) => self.apply_push(*event, texts, now),
+        }
+    }
+
+    /// A hole in the push stream: what the lost pushes would have changed is
+    /// read again, beside the snapshot the caller asks for.
+    fn reread_after_gap(&mut self) {
+        crate::screens::rules::on_revision_changed(self);
+        crate::screens::rules::verdicts::load(self);
+        crate::screens::suggestions::reload_if_in_use(self);
+        crate::screens::inspect::diagnostics::reload_alerts(self);
+        if let Some(category) = self.settings.open {
+            crate::screens::settings::reload_if_open(self, category);
         }
     }
 
@@ -354,6 +424,9 @@ impl AppState {
                 self.traffic_carried_changed(carried.then_some(link), texts, now)
             }
             StatusUpdateEvent::SystemDnsNotRestored => self.system_dns_reading(true, texts, now),
+            StatusUpdateEvent::RulesBookUnreadable { unreadable, .. } => {
+                self.rules_book_reading(unreadable, texts, now)
+            }
             StatusUpdateEvent::HostUnreachableOnBothRoutes { host, .. } => {
                 let host = display_text(&host).into_owned();
                 self.notify(
@@ -363,6 +436,10 @@ impl AppState {
                     now,
                 )
             }
+            // A reconnect inside the service's quiet period is not announced.
+            StatusUpdateEvent::SecondaryExternalAddressObserved { quiet: true, .. } => Vec::new(),
+            // The interfaces list reads the address off the rows: re-read them.
+            StatusUpdateEvent::SecondaryExternalAddressCleared { .. } => vec![Effect::Refresh],
             StatusUpdateEvent::SecondaryExternalAddressObserved {
                 adapter_name,
                 external_address,
@@ -379,22 +456,29 @@ impl AppState {
                         &[("name", display_text(&adapter_name))],
                     ));
                 }
+                if crate::notice_mutes::muted(self, "external-address") {
+                    return Vec::new();
+                }
                 self.note_in_feed(
                     NoticeLevel::Info,
                     texts.get(keys::EXTERNAL_ADDRESS_TITLE),
                     body,
                 )
             }
-            StatusUpdateEvent::AdaptersChanged { .. } | StatusUpdateEvent::HealthChanged { .. } => {
-                vec![Effect::Refresh]
-            }
+            StatusUpdateEvent::AdaptersChanged { .. } => vec![Effect::Refresh],
             StatusUpdateEvent::AutoRuleCandidatesChanged {
                 pending_count,
                 top_anchor,
+                announces,
                 ..
             } => {
-                match crate::screens::suggestions::changed(self, pending_count, &top_anchor, texts)
-                {
+                match crate::screens::suggestions::changed(
+                    self,
+                    pending_count,
+                    announces,
+                    &top_anchor,
+                    texts,
+                ) {
                     Some((title, body)) => self.note_in_feed(NoticeLevel::Info, title, body),
                     None => Vec::new(),
                 }
@@ -426,6 +510,7 @@ impl AppState {
                 attempts,
                 ..
             } => {
+                crate::block_route::offer(self, &destination, &reason);
                 let app = if app.is_empty() {
                     texts.get(keys::BLOCK_NOTICE_APP_UNKNOWN)
                 } else {
@@ -449,7 +534,8 @@ impl AppState {
                 )
             }
             StatusUpdateEvent::UnassignedTunnelDetected { adapter_name, .. } => {
-                if adapter_name.is_empty() {
+                if adapter_name.is_empty() || crate::notice_mutes::muted(self, "unassigned-tunnel")
+                {
                     return Vec::new();
                 }
                 let body = texts.fill(
@@ -519,6 +605,22 @@ impl AppState {
                     )
                 }
             }
+            // As above; a withdrawn question may have been answered elsewhere,
+            // so the snapshot read brings the allowed list up to date.
+            StatusUpdateEvent::VpnGatewayAwaitingConfirmation { gateways, .. } => {
+                let sentences = crate::vpn_gateway_trust::sentences(&gateways, texts);
+                self.vpn_gateway_trust.pending = gateways;
+                if sentences.is_empty() {
+                    vec![Effect::Refresh]
+                } else {
+                    self.notify(
+                        NoticeLevel::Warning,
+                        texts.get(crate::vpn_gateway_trust::TITLE),
+                        sentences.join(" "),
+                        now,
+                    )
+                }
+            }
             // A reason this build does not know has no sentence to show; the
             // slug itself is never put on screen.
             StatusUpdateEvent::ProtectionCoverageChanged { reason } => {
@@ -546,6 +648,7 @@ impl AppState {
                 Vec::new()
             }
             StatusUpdateEvent::BlockNoticeMutesChanged { .. } => {
+                crate::notice_mutes::load(self);
                 crate::screens::settings::reload_if_open(self, SettingsCategory::Notifications);
                 Vec::new()
             }
@@ -594,6 +697,44 @@ impl AppState {
         effects
     }
 
+    /// The service stopped though nobody asked for it: said once, with the
+    /// commands that start it and restore the network.
+    fn service_loss_reading(&mut self, texts: &Texts, now: Instant) -> Vec<Effect> {
+        let slug = match self.link {
+            Link::Connected => "running",
+            Link::Stopped => "stopped",
+            _ => "unknown",
+        };
+        if slug == "running" {
+            self.service_was_running = true;
+        }
+        let can_restore = nrr_shared::platform_profile::PlatformProfile::current()
+            .supports
+            .kill_switch;
+        let step = nrr_client_logic::service_loss::step(
+            self.service_loss_raised,
+            slug,
+            self.service_was_running,
+            crate::link::stop_was_expected(),
+            can_restore,
+        );
+        self.service_loss_raised = step.raised;
+        if !step.raise {
+            return Vec::new();
+        }
+        let mut body = texts.get(keys::SERVICE_LOST_BODY);
+        for line in crate::screens::recovery_hints(texts, can_restore) {
+            body.push(' ');
+            body.push_str(&line);
+        }
+        self.notify(
+            NoticeLevel::Warning,
+            texts.get(keys::SERVICE_LOST_TITLE),
+            body,
+            now,
+        )
+    }
+
     /// The system DNS left redirected: said when it appears, with the way out;
     /// not repeated while it lasts.
     fn system_dns_reading(
@@ -616,6 +757,58 @@ impl AppState {
         )
     }
 
+    /// This user's saved rules do not read: said once while it lasts, with
+    /// where the details are; its end is news too.
+    fn rules_book_reading(&mut self, unreadable: bool, texts: &Texts, now: Instant) -> Vec<Effect> {
+        let was_raised = self.rules_book_notice_raised;
+        let step = nrr_client_logic::diagnostics::rules_book_notice_step(was_raised, unreadable);
+        self.rules_book_notice_raised = step.raised;
+        if step.raise {
+            let mut body = texts.get(keys::RULES_BOOK_BODY);
+            body.push(' ');
+            body.push_str(&texts.get(keys::SEE_DIAGNOSTICS_HINT));
+            return self.notify(
+                NoticeLevel::Warning,
+                texts.get(keys::RULES_BOOK_TITLE),
+                body,
+                now,
+            );
+        }
+        if was_raised && !step.raised {
+            return self.notify(
+                NoticeLevel::Info,
+                texts.get(keys::RULES_BOOK_TITLE),
+                texts.get(keys::RULES_BOOK_CLEARED),
+                now,
+            );
+        }
+        Vec::new()
+    }
+
+    /// A work VPN that lets only its own DNS answer: said when it appears, not
+    /// repeated while it lasts.
+    fn dns_foreign_reading(
+        &mut self,
+        foreign_only: bool,
+        texts: &Texts,
+        now: Instant,
+    ) -> Vec<Effect> {
+        let step = nrr_client_logic::system_dns::foreign_only_notice_step(
+            self.dns_foreign_notice_raised,
+            foreign_only,
+        );
+        self.dns_foreign_notice_raised = step.raised;
+        if !step.raise {
+            return Vec::new();
+        }
+        self.notify(
+            NoticeLevel::Warning,
+            texts.get(keys::DNS_FOREIGN_TITLE),
+            texts.get(keys::DNS_FOREIGN_BODY),
+            now,
+        )
+    }
+
     /// Another user's routing holds some of this user's destinations, or
     /// stopped holding them. The snapshot repeats the standing report on every
     /// refresh, so one equal to the state held is not news.
@@ -630,6 +823,9 @@ impl AppState {
         }
         let was_held = self.routes_held.is_some();
         self.routes_held = held.clone();
+        if crate::notice_mutes::muted(self, "routes-held") {
+            return Vec::new();
+        }
         match held {
             Some(held) => {
                 let (title, body) = routes_held_text(&held, texts);
@@ -658,6 +854,9 @@ impl AppState {
         }
         let was_carried = self.traffic_carried.is_some();
         self.traffic_carried = link.clone();
+        if crate::notice_mutes::muted(self, "traffic-carried") {
+            return Vec::new();
+        }
         match link {
             Some(link) => {
                 let (title, body) = traffic_carried_text(&link, texts);
@@ -688,6 +887,7 @@ impl AppState {
                 .enforcement_down
                 .remove(&role)
                 .is_some_and(|down| !down.quiet)
+                && !crate::notice_mutes::muted(self, "enforcement-restored")
             {
                 let mut body = texts.get(keys::ENF_RESTORED_BODY);
                 // What leak protection held back meanwhile has a list of its own.
@@ -707,6 +907,8 @@ impl AppState {
             return Vec::new();
         }
         let (title, body) = enforcement_text(&status, &role, &candidates, texts);
+        // A switched-off tunnel is the one fault here the user may silence.
+        let routine = status == "secondary-down" && role != "primary";
         self.enforcement_down.insert(
             role,
             EnforcementDown {
@@ -715,7 +917,7 @@ impl AppState {
                 quiet,
             },
         );
-        if quiet {
+        if quiet || (routine && crate::notice_mutes::muted(self, "secondary-down")) {
             return Vec::new();
         }
         self.notify(NoticeLevel::Warning, title, body, now)
@@ -1421,6 +1623,97 @@ mod tests {
         assert_eq!(app.notices.len(), 2, "cleared, then back: news again");
     }
 
+    /// This user's unreadable saved rules are one feed line while they last,
+    /// whether the push or a snapshot brings it; reading again is a line too,
+    /// and the next occurrence is news again.
+    #[test]
+    fn an_unreadable_rule_book_is_one_line_per_occurrence() {
+        let t = texts();
+        let mut app = AppState::new(ScreenId::Status, false);
+        app.apply(BackendEvent::Link(Link::Connected), &t, Instant::now());
+        let book = |unreadable: bool| {
+            push(StatusUpdateEvent::RulesBookUnreadable {
+                sid: "S".into(),
+                unreadable,
+            })
+        };
+        let unreadable_snapshot = || {
+            let mut snapshot = Fixture::healthy().snapshot();
+            snapshot.rules_book_unreadable = true;
+            BackendEvent::Snapshot(Box::new(snapshot))
+        };
+
+        app.apply(book(true), &t, Instant::now());
+        app.apply(unreadable_snapshot(), &t, Instant::now());
+        app.apply(book(true), &t, Instant::now());
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.notices[0].level, NoticeLevel::Warning);
+        assert_eq!(app.notices[0].title, "Your saved rules cannot be read");
+        assert!(
+            app.notices[0].body.starts_with(
+                "Your saved rules cannot be read; the last applied rules stay in force."
+            ),
+            "{:?}",
+            app.notices[0]
+        );
+        assert!(
+            app.notices[0].body.contains("Diagnostics and logs"),
+            "{:?}",
+            app.notices[0]
+        );
+
+        app.apply(
+            BackendEvent::Snapshot(Box::new(Fixture::healthy().snapshot())),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 2);
+        assert_eq!(app.notices[1].level, NoticeLevel::Info);
+        assert_eq!(
+            app.notices[1].body,
+            "Your saved rules can be read again; changes apply again."
+        );
+        app.apply(book(false), &t, Instant::now());
+        assert_eq!(app.notices.len(), 2, "the end is said once");
+
+        app.apply(book(true), &t, Instant::now());
+        assert_eq!(app.notices.len(), 3, "read again, then broke: news again");
+    }
+
+    /// A VPN that lets only its own DNS answer is said once while it lasts, and
+    /// again once it clears and comes back.
+    #[test]
+    fn the_foreign_dns_notice_is_raised_once_per_occurrence() {
+        let t = texts();
+        let mut app = AppState::new(ScreenId::Status, false);
+        app.apply(BackendEvent::Link(Link::Connected), &t, Instant::now());
+        let foreign = || {
+            let mut snapshot = Fixture::healthy().snapshot();
+            snapshot.health.components = vec![nrr_shared::ipc_payloads::HealthComponentResponse {
+                component: "adapters".into(),
+                severity: "degraded".into(),
+                message: Some(format!(
+                    "{} (corp0)",
+                    nrr_shared::ipc_payloads::DNS_ONLY_FOREIGN_RESOLVER
+                )),
+            }];
+            BackendEvent::Snapshot(Box::new(snapshot))
+        };
+
+        app.apply(foreign(), &t, Instant::now());
+        app.apply(foreign(), &t, Instant::now());
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.notices[0].level, NoticeLevel::Warning);
+
+        app.apply(
+            BackendEvent::Snapshot(Box::new(Fixture::healthy().snapshot())),
+            &t,
+            Instant::now(),
+        );
+        app.apply(foreign(), &t, Instant::now());
+        assert_eq!(app.notices.len(), 2, "cleared, then back: news again");
+    }
+
     /// A terminal opened after the conflict began learns it from the snapshot.
     #[test]
     fn a_late_terminal_learns_held_destinations_from_the_snapshot() {
@@ -1458,6 +1751,15 @@ mod tests {
         assert_eq!(app.routing_state(), RoutingState::Disconnected);
         assert!(app.snapshot.is_some(), "the last known state is kept");
         assert!(!app.is_fresh(), "and not passed off as fresh");
+    }
+
+    #[test]
+    fn a_service_never_seen_running_is_not_reported_lost() {
+        let t = texts();
+        let mut app = AppState::new(ScreenId::Status, false);
+        app.apply(BackendEvent::Link(Link::Stopped), &t, Instant::now());
+        assert!(!app.service_loss_raised);
+        assert!(app.notices.is_empty());
     }
 
     #[test]

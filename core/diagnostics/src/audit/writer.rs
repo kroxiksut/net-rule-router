@@ -207,11 +207,13 @@ impl AuditWriterInner {
                 reason: format!("cannot create audit dir: {e}"),
             }
         })?;
-        let (file, path) =
-            crate::rotation::open_next_rotation(&self.config.audit_dir, &audit_prefix_today())
-                .map_err(|e| DiagnosticsError::AuditWriteFailed {
-                    reason: format!("cannot open audit file: {e}"),
-                })?;
+        let (file, path) = crate::rotation::open_next_rotation(
+            &self.config.audit_dir,
+            &audit_prefix_for(&self.config.audit_dir),
+        )
+        .map_err(|e| DiagnosticsError::AuditWriteFailed {
+            reason: format!("cannot open audit file: {e}"),
+        })?;
         self.current_size = file.metadata().map(|m| m.len()).unwrap_or(0);
         // prev_hash intentionally NOT reset here — the chain continues
         // across file rotations and service restarts.  Genesis is only set
@@ -662,13 +664,21 @@ fn sorted_audit_files(dir: &Path) -> Vec<PathBuf> {
 
 // ── Filename policy ───────────────────────────────────────────────────────────
 
-/// Returns the path for a new audit file using today's local date.
-///
-/// Format: `<dir>/nrr_audit_YYYYMMDD-N.ndjson`
-/// `N` increments if a file for today already exists.
-/// Prefix of today's audit files, e.g. `nrr_audit_20260830-`.
-fn audit_prefix_today() -> String {
-    format!("nrr_audit_{}-", local_date_string(SystemTime::now()))
+/// Prefix (`nrr_audit_YYYYMMDD-`) for the next audit file. The date never falls behind the newest
+/// file's: after a clock step back or a time-zone change to the west, a file
+/// named for the earlier day would sort before the live chain and fork it.
+fn audit_prefix_for(dir: &Path) -> String {
+    let today = local_date_string(SystemTime::now());
+    let newest = sorted_audit_files(dir).pop().and_then(|p| {
+        let name = p.file_name()?.to_str()?.to_owned();
+        let date = name.strip_prefix("nrr_audit_")?.get(..8)?.to_owned();
+        date.bytes().all(|b| b.is_ascii_digit()).then_some(date)
+    });
+    let date = match newest {
+        Some(newest) if newest > today => newest,
+        _ => today,
+    };
+    format!("nrr_audit_{date}-")
 }
 
 /// Converts a `SystemTime` to a `"YYYYMMDD"` string on the LOCAL calendar —
@@ -999,7 +1009,7 @@ mod tests {
     #[test]
     fn a_freed_rotation_number_is_never_handed_out_again() {
         let dir = tempfile::tempdir().expect("temp");
-        let prefix = audit_prefix_today();
+        let prefix = audit_prefix_for(dir.path());
         // Retention deleted `-1` and `-2`; the next file must be `-4`.
         std::fs::write(dir.path().join(format!("{prefix}3.ndjson")), "").unwrap();
 
@@ -1013,6 +1023,24 @@ mod tests {
         assert_eq!(
             names,
             [format!("{prefix}3.ndjson"), format!("{prefix}4.ndjson")]
+        );
+    }
+
+    #[test]
+    fn a_clock_step_back_does_not_start_a_file_that_sorts_before_the_chain() {
+        let dir = tempfile::tempdir().expect("temp");
+        std::fs::write(dir.path().join("nrr_audit_20991231-5.ndjson"), "").unwrap();
+
+        let writer = AuditWriter::open(AuditWriterConfig::new(dir.path()));
+        writer.append(sample_input("e1")).expect("append");
+
+        let names: Vec<_> = sorted_audit_files(dir.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["nrr_audit_20991231-5.ndjson", "nrr_audit_20991231-6.ndjson"]
         );
     }
 

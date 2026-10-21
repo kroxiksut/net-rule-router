@@ -24,6 +24,7 @@ pub(crate) fn settings_from_preferences(preferences: &UiPreferences) -> UserSett
     let mut settings = UserSettings {
         selected_set: preferences.selected_preset_set.clone(),
         service_intent: intent_object(&preferences.service_intent_json),
+        accepted_eula: preferences.accepted_eula_version,
         ..UserSettings::default()
     };
     let bound = |path: &Option<String>| path.as_deref().unwrap_or_default().to_owned();
@@ -89,6 +90,9 @@ pub(crate) fn overlay(preferences: &mut UiPreferences, settings: &UserSettings) 
     } else {
         Value::Object(settings.service_intent.clone()).to_string()
     };
+    preferences.accepted_eula_version = preferences
+        .accepted_eula_version
+        .max(settings.accepted_eula);
     if is_storable_json_blob(&intent) {
         preferences.service_intent_json = intent;
     }
@@ -340,12 +344,24 @@ pub(crate) fn open_session_in(
     match store.load_or_seed(|| settings_from_preferences(preferences)) {
         Ok(outcome) => {
             if outcome.seeded {
+                // File name only: the directory names the account.
                 eprintln!(
-                    "nrr-launcher: user settings created from the preferences at {}",
-                    store.path().display()
+                    "nrr-launcher: user settings ({}) created from the preferences",
+                    store
+                        .path()
+                        .file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
                 );
             } else {
                 overlay(preferences, &outcome.settings);
+                // An agreement accepted before the file carried it: the
+                // terminal client reads it only from here.
+                let accepted = preferences.accepted_eula_version;
+                if accepted > outcome.settings.accepted_eula {
+                    let _ = store.update(|settings| {
+                        settings.accepted_eula = settings.accepted_eula.max(accepted);
+                    });
+                }
             }
             Some(UserSettingsMirror::new(store, preferences))
         }
@@ -433,6 +449,26 @@ mod tests {
     }
 
     #[test]
+    fn an_agreement_accepted_in_the_terminal_is_not_asked_again() {
+        let mut prefs = preferences();
+        prefs.accepted_eula_version = 0;
+        let settings = UserSettings {
+            accepted_eula: 1,
+            ..settings_from_preferences(&prefs)
+        };
+        overlay(&mut prefs, &settings);
+        assert_eq!(prefs.accepted_eula_version, 1);
+        let older = UserSettings {
+            accepted_eula: 0,
+            ..settings_from_preferences(&prefs)
+        };
+        overlay(&mut prefs, &older);
+        assert_eq!(prefs.accepted_eula_version, 1);
+    }
+
+    // A backslash separates only on Windows; elsewhere it is part of a name.
+    #[cfg(windows)]
+    #[test]
     fn a_path_spelled_with_backslashes_is_the_same_file() {
         let mut prefs = UiPreferences {
             user_presets_dir: "C:\\Sets\\".to_string(),
@@ -462,7 +498,7 @@ mod tests {
             .expect("seed");
         let record = serde_json::json!({
             "namespace": "route-policy",
-            "merge": { "kill-switch-enabled": true }
+            "merge": { "leak-protection": "everything" }
         });
         intent_record_in(&store, &record, true).expect("recorded");
         let mutes = serde_json::json!({ "namespace": "notice-mutes", "value": [] });
@@ -473,7 +509,7 @@ mod tests {
             got["service-intent"],
             serde_json::json!({
                 "stability": { "x": 1 },
-                "route-policy": { "kill-switch-enabled": true },
+                "route-policy": { "leak-protection": "everything" },
                 "notice-mutes": []
             })
         );
@@ -597,5 +633,21 @@ mod tests {
         assert!(mirror.publish(&prefs).expect("second"));
         let on_disk = store_in(&dir).load().expect("load").expect("present");
         assert_eq!(on_disk.rules_folder, "/two");
+    }
+
+    /// The hash of a rules file is stored beside it; a crypto-crate upgrade
+    /// must not change it, or every hand-edit check misfires.
+    #[test]
+    fn the_rules_file_hash_is_pinned() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("rules_primary.txt");
+        std::fs::write(&file, b"abc").expect("write");
+        let hash = rules_file_sha256(file.to_str().expect("utf-8 path"))
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

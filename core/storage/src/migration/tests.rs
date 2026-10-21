@@ -167,7 +167,7 @@ fn run_state_migrations_empty_db() {
     // + v48 (auto_rule_dismissals.dto_json — the refused offer, kept verbatim)
     // + v49 (block_notice_mutes table — durable "do not show" choices)
     // + v50 (isp_block_candidates_enabled on service_stability_config)
-    assert_eq!(s.to_version, 77);
+    assert_eq!(s.to_version, 82);
     assert_eq!(
         s.migrations_applied,
         [
@@ -248,6 +248,11 @@ fn run_state_migrations_empty_db() {
             "app_destinations_by_principal",
             "add_conn_history_prefs",
             "add_override_grants",
+            "vpn_bootstrap_endpoints_by_principal",
+            "drop_block_secondary_when_unavailable",
+            "leak_protection",
+            "add_external_address_auto_check",
+            "add_vpn_gateway_confirmations",
         ]
     );
 }
@@ -259,8 +264,8 @@ fn state_migration_idempotent() {
 
     runner.run_pending_migrations().expect("first run");
     let s = runner.run_pending_migrations().expect("second run");
-    assert_eq!(s.from_version, 77);
-    assert_eq!(s.to_version, 77);
+    assert_eq!(s.from_version, 82);
+    assert_eq!(s.to_version, 82);
     assert!(s.migrations_applied.is_empty());
 }
 
@@ -276,6 +281,35 @@ fn state_runner_stopped_at(dir: &tempfile::TempDir, count: usize) -> SqliteMigra
         required_indexes: STATE_REQUIRED_INDEXES,
         snapshot_first: false,
     }
+}
+
+/// Servers remembered before sets had owners stay machine-wide: the Windows
+/// route coordinator still reads that set, and a per-user planner relearns.
+#[test]
+fn remembered_tunnel_servers_written_before_owners_stay_machine_wide() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let older = state_runner_stopped_at(&dir, 77);
+    older.run_pending_migrations().expect("migrate to v77");
+    older
+        .into_connection()
+        .execute(
+            "INSERT INTO vpn_bootstrap_endpoints (ip, port, protocol, source, learned_at)
+             VALUES ('203.0.113.9', NULL, NULL, 'observed', 5)",
+            [],
+        )
+        .expect("legacy row");
+
+    let current = state_runner(&dir);
+    current.run_pending_migrations().expect("upgrade");
+    let conn = current.into_connection();
+    let owner: String = conn
+        .query_row(
+            "SELECT sid FROM vpn_bootstrap_endpoints WHERE ip = '203.0.113.9'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("row survives");
+    assert_eq!(owner, "");
 }
 
 /// Every version an installed build could have left behind must upgrade to
@@ -358,8 +392,8 @@ fn verify_state_schema_after_migration() {
 
     let v = runner.verify_schema().expect("verify");
     assert!(v.is_ok(), "state schema verification failed: {v:?}");
-    // through v77 (add_override_grants)
-    assert_eq!(v.version, 77);
+    // through v82 (add_vpn_gateway_confirmations)
+    assert_eq!(v.version, 82);
 }
 
 #[test]
@@ -544,6 +578,11 @@ fn shipped_state_checksums_are_unchanged() {
             (75, "dfa2c31391bb2ddf"),
             (76, "855bba352ad44570"),
             (77, "64506a874e24293a"),
+            (78, "55f3628ade558fb9"),
+            (79, "7ec7548be9eae547"),
+            (80, "15846ce1e501ccda"),
+            (81, "9e54f68d848b0092"),
+            (82, "03594f74243f65a7"),
         ],
     );
 }
@@ -994,7 +1033,7 @@ fn upgrade_state_db_from_v1_to_v2() {
 
     let summary = runner.run_pending_migrations().expect("upgrade v1→latest");
     assert_eq!(summary.from_version, 1);
-    assert_eq!(summary.to_version, 77);
+    assert_eq!(summary.to_version, 82);
     assert_eq!(
         summary.migrations_applied,
         [
@@ -1074,6 +1113,11 @@ fn upgrade_state_db_from_v1_to_v2() {
             "app_destinations_by_principal",
             "add_conn_history_prefs",
             "add_override_grants",
+            "vpn_bootstrap_endpoints_by_principal",
+            "drop_block_secondary_when_unavailable",
+            "leak_protection",
+            "add_external_address_auto_check",
+            "add_vpn_gateway_confirmations",
         ]
     );
 
@@ -1111,7 +1155,7 @@ fn upgrade_state_db_from_v2_to_v3() {
 
     let summary = runner.run_pending_migrations().expect("upgrade v2→latest");
     assert_eq!(summary.from_version, 2);
-    assert_eq!(summary.to_version, 77);
+    assert_eq!(summary.to_version, 82);
     assert_eq!(
         summary.migrations_applied,
         [
@@ -1190,6 +1234,11 @@ fn upgrade_state_db_from_v2_to_v3() {
             "app_destinations_by_principal",
             "add_conn_history_prefs",
             "add_override_grants",
+            "vpn_bootstrap_endpoints_by_principal",
+            "drop_block_secondary_when_unavailable",
+            "leak_protection",
+            "add_external_address_auto_check",
+            "add_vpn_gateway_confirmations",
         ]
     );
 
@@ -1248,4 +1297,405 @@ fn remembered_destinations_upgrade_without_an_owner() {
             (String::new(), "chat".into(), "203.0.113.2".into(), 2000),
         ]
     );
+}
+
+/// A v79 database whose policy rows carry the four old leak settings.
+fn state_db_before_leak_protection(dir: &tempfile::TempDir) {
+    let before = STATE_MIGRATIONS
+        .iter()
+        .position(|m| m.name == "leak_protection")
+        .expect("the leak-protection migration is catalogued");
+    let older = state_runner_stopped_at(dir, before);
+    older
+        .run_pending_migrations()
+        .expect("migrate to the previous version");
+}
+
+/// One policy row as an earlier build wrote it: `mode` goes to
+/// `behavior_mode` (`None` = no row), the rest to `secondary_block_policy`.
+struct OldPolicy {
+    sid: &'static str,
+    mode: Option<&'static str>,
+    enabled: i64,
+    fail_closed: i64,
+    block_all: i64,
+    coverage: i64,
+}
+
+fn write_old_policy(conn: &Connection, row: &OldPolicy) {
+    if let Some(mode) = row.mode {
+        conn.execute(
+            "INSERT INTO behavior_mode (sid, mode, updated_at) VALUES (?1, ?2, 1)",
+            rusqlite::params![row.sid, mode],
+        )
+        .expect("old mode row");
+    }
+    conn.execute(
+        "INSERT INTO secondary_block_policy
+            (sid, updated_at, kill_switch_enabled, kill_switch_fail_closed,
+             kill_switch_block_all, mode_a_coverage_strategy, kill_switch_protocols,
+             block_ipv6_when_protected)
+         VALUES (?1, 1, ?2, ?3, ?4, ?5, 5, 0)",
+        rusqlite::params![
+            row.sid,
+            row.enabled,
+            row.fail_closed,
+            row.block_all,
+            row.coverage
+        ],
+    )
+    .expect("old policy row");
+}
+
+/// Every branch of the mapping, on rows shaped like the owner's: the old
+/// settings are carried over, never reset, and the strict mode becomes the
+/// additional default route.
+#[test]
+fn old_leak_settings_map_onto_one_choice() {
+    use crate::route_bindings::{BehaviorMode, RouteBindingsRepository};
+    use nrr_domain::LeakProtection;
+
+    const PRIMARY: &str = "prefer-primary";
+    const SECONDARY: &str = "prefer-secondary-when-available";
+    const STRICT: &str = "strict-secondary-fail-closed";
+    // Coverage codes as stored: 0 per address, 1 every unresolved
+    // destination, 2 zone widening (never implemented).
+    let cases: [(OldPolicy, LeakProtection, BehaviorMode); 11] = [
+        (
+            OldPolicy {
+                sid: "S-off-not-enabled",
+                mode: Some(PRIMARY),
+                enabled: 0,
+                fail_closed: 1,
+                block_all: 1,
+                coverage: 1,
+            },
+            LeakProtection::Off,
+            BehaviorMode::PreferPrimary,
+        ),
+        (
+            OldPolicy {
+                sid: "S-off-fail-open",
+                mode: Some(SECONDARY),
+                enabled: 1,
+                fail_closed: 0,
+                block_all: 1,
+                coverage: 1,
+            },
+            LeakProtection::Off,
+            BehaviorMode::PreferSecondaryWhenAvailable,
+        ),
+        (
+            OldPolicy {
+                sid: "S-everything-full-mode",
+                mode: Some(SECONDARY),
+                enabled: 1,
+                fail_closed: 1,
+                block_all: 0,
+                coverage: 0,
+            },
+            LeakProtection::Everything,
+            BehaviorMode::PreferSecondaryWhenAvailable,
+        ),
+        (
+            OldPolicy {
+                sid: "S-everything-strict",
+                mode: Some(STRICT),
+                enabled: 1,
+                fail_closed: 1,
+                block_all: 0,
+                coverage: 0,
+            },
+            LeakProtection::Everything,
+            BehaviorMode::PreferSecondaryWhenAvailable,
+        ),
+        (
+            OldPolicy {
+                sid: "S-strict-guard-off",
+                mode: Some(STRICT),
+                enabled: 0,
+                fail_closed: 1,
+                block_all: 0,
+                coverage: 0,
+            },
+            // Chosen for "no leaks": the guard switch never weakens it.
+            LeakProtection::Everything,
+            BehaviorMode::PreferSecondaryWhenAvailable,
+        ),
+        (
+            OldPolicy {
+                sid: "S-strict-fail-open",
+                mode: Some(STRICT),
+                enabled: 1,
+                fail_closed: 0,
+                block_all: 0,
+                coverage: 0,
+            },
+            LeakProtection::Everything,
+            BehaviorMode::PreferSecondaryWhenAvailable,
+        ),
+        (
+            OldPolicy {
+                sid: "S-everything-block-all",
+                mode: Some(PRIMARY),
+                enabled: 1,
+                fail_closed: 1,
+                block_all: 1,
+                coverage: 0,
+            },
+            LeakProtection::Everything,
+            BehaviorMode::PreferPrimary,
+        ),
+        (
+            OldPolicy {
+                sid: "S-everything-unresolved",
+                mode: Some(PRIMARY),
+                enabled: 1,
+                fail_closed: 1,
+                block_all: 0,
+                coverage: 1,
+            },
+            LeakProtection::Everything,
+            BehaviorMode::PreferPrimary,
+        ),
+        (
+            OldPolicy {
+                sid: "S-sites",
+                mode: Some(PRIMARY),
+                enabled: 1,
+                fail_closed: 1,
+                block_all: 0,
+                coverage: 0,
+            },
+            LeakProtection::Sites,
+            BehaviorMode::PreferPrimary,
+        ),
+        (
+            OldPolicy {
+                sid: "S-sites-zone-widening",
+                mode: Some(PRIMARY),
+                enabled: 1,
+                fail_closed: 1,
+                block_all: 0,
+                coverage: 2,
+            },
+            LeakProtection::Sites,
+            BehaviorMode::PreferPrimary,
+        ),
+        // A policy saved without a mode row reads as the main default route.
+        (
+            OldPolicy {
+                sid: "S-sites-no-mode-row",
+                mode: None,
+                enabled: 1,
+                fail_closed: 1,
+                block_all: 0,
+                coverage: 0,
+            },
+            LeakProtection::Sites,
+            BehaviorMode::PreferPrimary,
+        ),
+    ];
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    state_db_before_leak_protection(&dir);
+    {
+        let conn = open_connection(&dir.path().join("state.db")).expect("reopen");
+        for (row, _, _) in &cases {
+            write_old_policy(&conn, row);
+        }
+        // A strict mode with no policy row of its own still folds.
+        conn.execute(
+            "INSERT INTO behavior_mode (sid, mode, updated_at) VALUES ('S-mode-only', ?1, 1)",
+            [STRICT],
+        )
+        .expect("mode-only row");
+    }
+
+    let current = state_runner(&dir);
+    current.run_pending_migrations().expect("upgrade");
+    assert!(current.verify_schema().expect("verify").is_ok());
+    let conn = current.into_connection();
+    let repo = RouteBindingsRepository::new(&conn);
+    for (row, protection, mode) in &cases {
+        let loaded = repo.load_for_sid(row.sid).expect("load migrated policy");
+        assert_eq!(loaded.leak_protection, *protection, "{}", row.sid);
+        assert_eq!(loaded.mode, *mode, "{}", row.sid);
+        assert_eq!(
+            loaded.kill_switch_protocols, 5,
+            "{}: refinements survive",
+            row.sid
+        );
+    }
+    let mode_only = repo.load_for_sid("S-mode-only").expect("load");
+    assert_eq!(mode_only.mode, BehaviorMode::PreferSecondaryWhenAvailable);
+    assert_eq!(
+        mode_only.leak_protection,
+        LeakProtection::Everything,
+        "never weaker than the strict mode"
+    );
+    // The row the migration creates carries the app's defaults, not the
+    // columns' older ones.
+    assert!(mode_only.include_subdomains);
+    assert!(mode_only.allow_dns_over_primary);
+
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('secondary_block_policy')")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<rusqlite::Result<_>>()
+        .expect("columns");
+    for gone in [
+        "kill_switch_enabled",
+        "kill_switch_fail_closed",
+        "kill_switch_block_all",
+        "mode_a_coverage_strategy",
+        "block_ipv6_when_protected",
+    ] {
+        assert!(!columns.iter().any(|c| c == gone), "{gone} survived");
+    }
+}
+
+/// The install-time strict mode folds the same way, keeps its guarantee as a
+/// floor of everything, and the other answer of the singleton is kept.
+#[test]
+fn install_time_strict_mode_becomes_the_additional_default_route() {
+    use crate::install_policy::{InstallPolicyRepository, SecondaryUnset};
+    use crate::route_bindings::BehaviorMode;
+    use nrr_domain::LeakProtection;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    state_db_before_leak_protection(&dir);
+    open_connection(&dir.path().join("state.db"))
+        .expect("reopen")
+        .execute(
+            "INSERT INTO install_policy (id, secondary_unset, default_route_mode, updated_at)
+             VALUES (1, 'block', 'strict-secondary-fail-closed', 7)",
+            [],
+        )
+        .expect("old install policy");
+
+    let current = state_runner(&dir);
+    current.run_pending_migrations().expect("upgrade");
+    let conn = current.into_connection();
+    let policy = InstallPolicyRepository::new(&conn).get().expect("get");
+    assert_eq!(policy.secondary_unset, SecondaryUnset::Block);
+    assert_eq!(
+        policy.default_route_mode,
+        Some(BehaviorMode::PreferSecondaryWhenAvailable)
+    );
+    assert_eq!(policy.default_leak_protection, LeakProtection::Everything);
+}
+
+/// Any other install-time mode sets no protection floor.
+#[test]
+fn install_time_other_modes_set_no_protection_floor() {
+    use crate::install_policy::InstallPolicyRepository;
+    use crate::route_bindings::BehaviorMode;
+    use nrr_domain::LeakProtection;
+
+    for (stored, expected) in [
+        ("", None),
+        ("prefer-primary", Some(BehaviorMode::PreferPrimary)),
+        (
+            "prefer-secondary-when-available",
+            Some(BehaviorMode::PreferSecondaryWhenAvailable),
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        state_db_before_leak_protection(&dir);
+        open_connection(&dir.path().join("state.db"))
+            .expect("reopen")
+            .execute(
+                "INSERT INTO install_policy (id, default_route_mode, updated_at) VALUES (1, ?1, 7)",
+                [stored],
+            )
+            .expect("old install policy");
+
+        let current = state_runner(&dir);
+        current.run_pending_migrations().expect("upgrade");
+        let conn = current.into_connection();
+        let policy = InstallPolicyRepository::new(&conn).get().expect("get");
+        assert_eq!(policy.default_route_mode, expected, "{stored:?}");
+        assert_eq!(
+            policy.default_leak_protection,
+            LeakProtection::Off,
+            "{stored:?}"
+        );
+    }
+}
+
+/// The strict mode is gone from the schema, not only from the code.
+#[test]
+fn the_strict_mode_and_unknown_protections_are_refused_by_the_schema() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let runner = state_runner(&dir);
+    runner.run_pending_migrations().expect("migrate");
+    let conn = runner.into_connection();
+    let strict = "strict-secondary-fail-closed";
+    assert!(conn
+        .execute(
+            "INSERT INTO behavior_mode (sid, mode, updated_at) VALUES ('S', ?1, 1)",
+            [strict],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT INTO install_policy (id, default_route_mode, updated_at) VALUES (1, ?1, 1)",
+            [strict],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT INTO secondary_block_policy (sid, updated_at, leak_protection) \
+             VALUES ('S', 1, 'on')",
+            [],
+        )
+        .is_err());
+}
+
+/// A user who never chose the automatic external-address check does not get it
+/// from an upgrade, whatever else their policy row holds.
+#[test]
+fn the_external_address_check_starts_off_for_existing_users() {
+    use crate::route_bindings::RouteBindingsRepository;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let before = STATE_MIGRATIONS
+        .iter()
+        .position(|m| m.name == "add_external_address_auto_check")
+        .expect("the external-address migration is catalogued");
+    {
+        let older = state_runner_stopped_at(&dir, before);
+        older
+            .run_pending_migrations()
+            .expect("migrate to the previous version");
+        let conn = older.into_connection();
+        conn.execute(
+            "INSERT INTO secondary_block_policy (sid, updated_at, leak_protection, primary_probe_auto) \
+             VALUES ('S-1-5-21-existing', 1, 'everything', 1)",
+            [],
+        )
+        .expect("a row an earlier build wrote");
+    }
+
+    let current = state_runner(&dir);
+    current.run_pending_migrations().expect("upgrade");
+    assert!(current.verify_schema().expect("verify").is_ok());
+    let conn = current.into_connection();
+    let record = RouteBindingsRepository::new(&conn)
+        .load_for_sid("S-1-5-21-existing")
+        .expect("load");
+    assert!(!record.external_address_auto_check);
+    assert!(
+        record.primary_probe_auto,
+        "the rest of the row is carried over"
+    );
+    assert!(conn
+        .execute(
+            "UPDATE secondary_block_policy SET external_address_auto_check = 2",
+            [],
+        )
+        .is_err());
 }

@@ -86,6 +86,40 @@ fn every_window_takes_the_count_from_the_service_instead_of_counting_rows() {
     }
 }
 
+/// A push that only moves the count raises no notice, and none is raised or
+/// left standing over an empty inbox. The decision itself is the shared
+/// `autoRuleNoticeDue`, held to its Rust twin by the client-logic vectors.
+#[test]
+fn the_window_notices_only_news_and_never_an_empty_inbox() {
+    let main = repo_file("apps/desktop/qml/Main.qml");
+    let handler = main
+        .split("case \"auto-rule-candidates-changed\":")
+        .nth(1)
+        .unwrap_or_else(|| panic!("Main.qml handles the suggestions push"));
+    let handler = handler
+        .split("\n            case ")
+        .next()
+        .unwrap_or(handler);
+    assert!(
+        handler.contains("Pure.autoRuleNoticeDue(event)"),
+        "the notice follows the shared decision"
+    );
+    assert!(
+        !handler.contains("if (autoRuleSuggestionsController.autoRuleCandidatesPending > 0)"),
+        "a bare count check notices a push that brought no news"
+    );
+    let controller = repo_file("apps/desktop/qml/flows/AutoRuleSuggestionsController.qml");
+    let refresh = controller
+        .split("function refreshAutoRuleCandidates()")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the controller re-reads the list"));
+    let refresh = refresh.split("\n    function ").next().unwrap_or(refresh);
+    assert!(
+        refresh.contains("_dropPushNotice(autoRuleSuggestionsController._autoRuleNoticeId)"),
+        "a list that comes back empty takes the notice down"
+    );
+}
+
 /// Executable half, through the real `pure.js`. Skipped when no `node` is on
 /// PATH — the structural test above stays the unconditional guard.
 #[test]

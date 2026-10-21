@@ -53,8 +53,9 @@ use crate::connection::{
     ConnectionStatus, DropBackoff, IpcClientError, NegotiateInfo, ReconnectBackoff,
 };
 use crate::protocol::{
-    build_contract_negotiate, build_request_envelope, interpret_negotiate_response,
-    new_request_serial, parse_response, NegotiateParse, RequestResponse, CLIENT_PROTOCOL_VERSION,
+    build_contract_negotiate, build_request_envelope, contract_write_refusal,
+    interpret_negotiate_response, new_request_serial, parse_response, NegotiateParse,
+    RequestResponse, CLIENT_PROTOCOL_VERSION,
 };
 use crate::scm_probe::{self, ServiceProbe};
 use crate::transport::{self, PipeIo, SendableHandle};
@@ -159,6 +160,11 @@ impl NamedPipeIpcClient {
     ) -> Result<Value, IpcClientError> {
         if !self.connection_status().is_connected() {
             return Err(IpcClientError::Disconnected);
+        }
+        if let Some(refusal) =
+            contract_write_refusal(operation, &payload, self.negotiate_info().as_ref())
+        {
+            return Err(refusal);
         }
 
         let request_id = format!("req-{}", new_request_serial());

@@ -1047,3 +1047,53 @@ fn a_pass_already_in_flight_does_not_block_the_caller() {
     resolver.release();
     assert_eq!(second_calls.load(Ordering::SeqCst), 0);
 }
+
+/// A rule host's IPv6 is asked for only while the user's plan pins or routes
+/// IPv6, and then lands in the cache beside its IPv4.
+#[test]
+fn the_aaaa_of_a_rule_host_is_seeded_only_while_ipv6_is_enforced() {
+    use crate::enforcement_planner::Ipv6Guard;
+    use crate::ipv6_disposition::Ipv6Dispositions;
+    let v4 = IpAddr::V4(Ipv4Addr::new(100, 64, 1, 4));
+    let v6: IpAddr = "2001:db8::4".parse().expect("v6");
+    let board = Arc::new(Ipv6Dispositions::default());
+    board.expect_plans();
+    for (guard, expect_v6) in [
+        (None, false),
+        (Some(Ipv6Guard::Off), false),
+        (Some(Ipv6Guard::FiltersOnly), true),
+        (Some(Ipv6Guard::FiltersAndRoutes), true),
+    ] {
+        if let Some(guard) = guard {
+            board.set("S-A", guard);
+        }
+        let resolver = Arc::new(MockDnsResolver::new());
+        resolver.set_response(
+            "api.example.com",
+            ResolvedRecord {
+                canonical_hostname: "api.example.com".into(),
+                addresses: vec![v4, v6],
+                ttl_seconds: Some(300),
+            },
+        );
+        let (cache, lookup) = in_memory_cache();
+        let rules = Arc::new(FakeRules::new(
+            empty(),
+            CanonicalRuleSet::from_rules(vec![fqdn_rule("r1", "api.example.com")]),
+        ));
+        let s = seeder(Arc::clone(&resolver), cache, Arc::clone(&lookup), rules)
+            .with_ipv6_dispositions(Arc::clone(&board));
+
+        assert_eq!(s.seed_for_principal("S-A", SystemTime::now()).resolved, 1);
+
+        let cached = lookup.ips_for_hostname("api.example.com");
+        assert!(cached.contains(&v4), "{guard:?}: {cached:?}");
+        assert_eq!(cached.contains(&v6), expect_v6, "{guard:?}: {cached:?}");
+        let extra = usize::from(expect_v6);
+        assert_eq!(
+            resolver.observed_queries().len(),
+            SEED_RESOLVE_ATTEMPTS + extra,
+            "{guard:?}: one AAAA query at most"
+        );
+    }
+}

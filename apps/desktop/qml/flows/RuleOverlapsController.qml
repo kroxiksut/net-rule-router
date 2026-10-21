@@ -16,6 +16,9 @@ QtObject {
 
     /// Pairs from the last `local.rules-overlaps` pass.
     property var overlaps: []
+    /// "none" before the first pass, "ok" or "error" after: an empty list
+    /// means "no overlaps" only when the pass succeeded.
+    property string loadState: "none"
     /// Address conflicts in the applied rules, from the service snapshot.
     readonly property var conflicts: root && root.uiRevision >= 0
         ? (root.routingState.ruleConflicts || []) : []
@@ -34,7 +37,8 @@ QtObject {
 
     /// `fresh` is false for a pass that read the rules before a later edit; it
     /// must not settle that edit's pairs, which it may not have seen.
-    function update(list, fresh) {
+    function update(list, fresh, ok) {
+        loadState = ok === false ? "error" : "ok"
         overlaps = list || []
         if (fresh === false || _ownEdits.length === 0) return
         var settled = Pure.overlapsConfirmedByOwnEdit(overlaps, _ownEdits)

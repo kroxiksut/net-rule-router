@@ -1,0 +1,150 @@
+{
+  "description": "pure.js stabilityPatchChangesNothing: whether a stability write would leave the live row as it is",
+  "cases": [
+    {
+      "name": "the first-run fake-IP answer the row already holds",
+      "input": {
+        "live": {
+          "fake-ip-enabled": true,
+          "enforcement-mode": "resolver"
+        },
+        "partial": {
+          "fake-ip-enabled": true
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "a real change is sent",
+      "input": {
+        "live": {
+          "fake-ip-enabled": false
+        },
+        "partial": {
+          "fake-ip-enabled": true
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "an empty patch is not nothing",
+      "input": {
+        "live": {
+          "fake-ip-enabled": true
+        },
+        "partial": {}
+      },
+      "expected": false
+    },
+    {
+      "name": "a one-shot request is never nothing",
+      "input": {
+        "live": {
+          "verbose-logging-mode": "off"
+        },
+        "partial": {
+          "verbose-logging-change": "off"
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "one changed key among held ones is a change",
+      "input": {
+        "live": {
+          "fake-ip-enabled": true,
+          "dns-fast-answers": true
+        },
+        "partial": {
+          "fake-ip-enabled": true,
+          "dns-fast-answers": false
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "an absent live field reads as its default",
+      "input": {
+        "live": {},
+        "partial": {
+          "dns-fast-answers": true
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "an absent fake-IP field is the wire default, off",
+      "input": {
+        "live": {},
+        "partial": {
+          "fake-ip-enabled": true
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "numbers compare after the service's clamp",
+      "input": {
+        "live": {
+          "secondary-liveness-window-secs": 5
+        },
+        "partial": {
+          "secondary-liveness-window-secs": 2
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "an unknown slug falls back to the default",
+      "input": {
+        "live": {
+          "enforcement-mode": "resolver"
+        },
+        "partial": {
+          "enforcement-mode": "bogus"
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "a structured field is never nothing",
+      "input": {
+        "live": {
+          "ipc-accept-policy": {
+            "kind": "critical"
+          }
+        },
+        "partial": {
+          "ipc-accept-policy": {
+            "kind": "critical"
+          }
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "a key this build does not know is a change",
+      "input": {
+        "live": {
+          "future-field": 1
+        },
+        "partial": {
+          "future-field": 1
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "a non-boolean answer reads as off",
+      "input": {
+        "live": {
+          "fake-ip-enabled": false
+        },
+        "partial": {
+          "fake-ip-enabled": "yes"
+        }
+      },
+      "expected": true
+    }
+  ]
+}

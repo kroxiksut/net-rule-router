@@ -227,6 +227,45 @@ fn rules_this_build_cannot_read_are_counted_on_screen() {
     assert!(!screen_text(&plain, ScreenId::Rules).contains("cannot read"));
 }
 
+/// What an application rule holds on the additional link, with the service's
+/// true count rather than the length of the capped list.
+#[test]
+fn the_chosen_application_rule_lists_the_addresses_it_holds() {
+    let mut entry = rule("r1", "application", "client.exe", "secondary");
+    entry["pinned-destinations"] = json!(["203.0.113.5", "198.51.100.7"]);
+    entry["pinned-destinations-total"] = json!(40);
+    let mut app = on_rules(&service(vec![
+        entry,
+        rule("r2", "domain", "example.com", "secondary"),
+    ]));
+    // The chosen row says the rest; the cursor starts on the first one.
+    app.focus = crate::state::Focus::Feed;
+    let text = screen_text(&app, ScreenId::Rules);
+    assert!(
+        text.contains("holds 40 addresses: 203.0.113.5, 198.51.100.7"),
+        "{text}"
+    );
+    assert!(text.contains("EVERY program on this computer"), "{text}");
+    assert_eq!(text.matches("holds ").count(), 1, "{text}");
+}
+
+/// A hostname the OS hosts file answers is marked on its row, as in the GUI.
+#[test]
+fn a_hostname_the_hosts_file_answers_is_marked() {
+    let mut blocked = rule("r1", "domain", "ads.example.com", "secondary");
+    blocked["hosts-override"] = json!({ "ip": "0.0.0.0", "blocking": true });
+    let mut redirected = rule("r2", "domain", "intranet.example.com", "primary");
+    redirected["hosts-override"] = json!({ "ip": "192.0.2.10", "blocking": false });
+    let app = on_rules(&service(vec![
+        blocked,
+        redirected,
+        rule("r3", "domain", "example.com", "secondary"),
+    ]));
+    let text = screen_text(&app, ScreenId::Rules);
+    assert!(text.contains("Blocked in hosts"), "{text}");
+    assert!(text.contains("Redirected by system → 192.0.2.10"), "{text}");
+}
+
 fn overlaps_text(app: &mut AppState) -> String {
     app.open(ScreenId::Overlaps);
     screen_text(app, ScreenId::Overlaps)
@@ -312,10 +351,7 @@ fn an_exception_saved_from_the_form_is_not_asked_about() {
     answer(&mut app, &["news.example.com", "2", "", "", "1"]);
     assert!(matches!(app.rules.mode, Mode::List), "saved");
     let overlaps = overlaps_text(&mut app);
-    assert!(
-        overlaps.contains("0 overlap(s) not confirmed"),
-        "{overlaps}"
-    );
+    assert!(overlaps.contains("0 overlaps not confirmed"), "{overlaps}");
     assert!(
         overlaps.contains("Every overlap is resolved."),
         "{overlaps}"
@@ -335,10 +371,7 @@ fn a_wide_rule_over_an_older_narrow_one_still_asks() {
     answer(&mut app, &["*.example.com", "1", "", "", "1"]);
     assert!(matches!(app.rules.mode, Mode::List), "saved");
     let overlaps = overlaps_text(&mut app);
-    assert!(
-        overlaps.contains("1 overlap(s) not confirmed"),
-        "{overlaps}"
-    );
+    assert!(overlaps.contains("1 overlap not confirmed"), "{overlaps}");
     assert!(
         overlaps.contains("video.example.com (Domain) goes over Additional"),
         "{overlaps}"
@@ -396,10 +429,7 @@ fn imported_rules_are_not_confirmed_for_the_user() {
     };
     super::import(&mut app, set, "folder".into(), false);
     let overlaps = overlaps_text(&mut app);
-    assert!(
-        overlaps.contains("1 overlap(s) not confirmed"),
-        "{overlaps}"
-    );
+    assert!(overlaps.contains("1 overlap not confirmed"), "{overlaps}");
 }
 
 // ── Discarding edits ─────────────────────────────────────────────────────────
@@ -430,6 +460,18 @@ fn press_key(app: &mut AppState, code: crossterm::event::KeyCode) {
         app,
         crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
     );
+}
+
+/// The destructive answer is never the one Enter takes first.
+#[test]
+fn enter_on_the_delete_question_keeps_the_rule() {
+    let fake = service(vec![rule("1", "domain", "a.example", "secondary")]);
+    let mut app = on_rules(&fake);
+    press_key(&mut app, crossterm::event::KeyCode::Delete);
+    assert!(matches!(app.rules.mode, Mode::Choice(_)));
+    press_key(&mut app, crossterm::event::KeyCode::Enter);
+    assert_eq!(app.rules.table.rows.len(), 1);
+    assert!(!matches!(app.rules.mode, Mode::Choice(_)));
 }
 
 /// A rule added elsewhere lands ahead of the chosen one: the cursor follows
@@ -556,6 +598,12 @@ fn edits_go_on_top_of_the_rules_changed_elsewhere() {
     );
     super::rebase_edits(&mut app);
     drain(&mut app, &fake);
+    assert!(
+        matches!(app.rules.mode, Mode::Merge(_)),
+        "the edits are shown against the rules in force before anything is replaced"
+    );
+    answer(&mut app, &["y"]);
+    drain(&mut app, &fake);
 
     let rules: Vec<(String, bool)> = app
         .rules
@@ -667,6 +715,32 @@ mod main_route {
             "{chosen}"
         );
         assert_snapshot("rules-main-route-80x24", &render(&app, 80, 24));
+    }
+
+    #[test]
+    fn a_verdict_held_under_the_ace_spelling_marks_the_idn_rule() {
+        let mut app = on_rules(&service(vec![rule(
+            "1",
+            "domain",
+            "\u{43f}\u{440}\u{438}\u{43c}\u{435}\u{440}.\u{440}\u{444}",
+            "secondary",
+        )]));
+        let list: nrr_shared::ipc_payloads::RulesListResponse = serde_json::from_value(rules_list(
+            vec![marked(
+                "1",
+                "domain",
+                "xn--e1afmkfd.xn--p1ai",
+                "secondary",
+                "silent",
+            )],
+            0,
+        ))
+        .expect("a rules list");
+        app.rules.table.merge_main_route(&list.rows);
+        assert_eq!(
+            app.rules.table.rows[0].main_route.as_deref(),
+            Some("silent")
+        );
     }
 
     #[test]
@@ -832,6 +906,35 @@ mod main_route {
         assert!(app.rules.main_route.check.is_none());
         assert!(app.outbox.take_delayed().is_empty());
         assert!(note(&app).starts_with("Nothing to check"), "{}", note(&app));
+    }
+
+    #[test]
+    fn a_failed_read_is_tried_again_and_the_polling_is_bounded_as_the_windows_is() {
+        use super::super::apply::Failure;
+        use super::super::main_route::polled;
+        let fake = service(vec![rule("1", "domain", "shop.example", "secondary")]);
+        fake.answer(
+            IpcOperationName::AutoRuleCandidatesProbe,
+            json!({ "accepted": 1 }),
+        );
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["c"]);
+        drain(&mut app, &fake);
+        assert!(app.rules.main_route.check.is_some());
+        app.outbox.take_delayed();
+
+        polled(&mut app, Err(Failure::code("timeout")));
+        assert!(
+            app.rules.main_route.check.is_some(),
+            "one failed read ends nothing"
+        );
+        assert_eq!(app.outbox.take_delayed().len(), 1, "and it is asked again");
+
+        for _ in 0..nrr_client_logic::rules_table::CHECK_MAX_POLLS {
+            polled(&mut app, Err(Failure::code("timeout")));
+        }
+        assert!(app.rules.main_route.check.is_none(), "given up");
+        assert!(note(&app).starts_with("Not done"), "{}", note(&app));
     }
 
     #[test]
@@ -1206,6 +1309,35 @@ mod rules_folder {
             stored.rules_files.primary, "",
             "a route with no file keeps its own"
         );
+    }
+    #[test]
+    fn an_apply_rewrites_the_bound_files() {
+        let dir = Scratch::new("apply-writes-files");
+        let (mut app, sets) = rules_with_settings(&dir, one_rule());
+        let file = app.rules.settings_file.clone().expect("settings file");
+        let set = sets.join("mine");
+        std::fs::create_dir_all(&set).expect("set");
+        super::super::own_settings::bind_written_set(&file, &set, None).expect("bind");
+        let primary = set.join("rules_primary.txt");
+        std::fs::write(
+            &primary,
+            "--- Domains
+old.example
+",
+        )
+        .expect("old file");
+        // Its own earlier write is on record: the file is not hand-edited.
+        super::super::own_settings::note_written(&file, std::slice::from_ref(&primary))
+            .expect("note");
+
+        super::super::finished(
+            &mut app,
+            super::super::apply::Finished::Applied { base: None },
+        );
+
+        let written = std::fs::read_to_string(&primary).expect("bound file");
+        assert!(written.contains("example.com"), "{written}");
+        assert!(!written.contains("old.example"), "{written}");
     }
 }
 
@@ -1669,4 +1801,568 @@ mod recent {
             .sent(IpcOperationName::RulesRecentChangesList)
             .is_empty());
     }
+}
+
+// ── Paste ────────────────────────────────────────────────────────────────────
+
+/// Pasted lines are text, never commands: outside a field they are dropped,
+/// inside one only the first line is typed.
+#[test]
+fn a_paste_never_runs_as_commands() {
+    let fake = service(vec![
+        rule("1", "domain", "a.example", "secondary"),
+        rule("2", "domain", "b.example", "secondary"),
+    ]);
+    let mut app = on_rules(&fake);
+    app.focus = crate::state::Focus::Feed;
+    crate::full::handle_paste(&mut app, "d\n\ny\no\n", &texts_en());
+    assert!(matches!(app.rules.mode, Mode::List), "no question opened");
+    assert_eq!(app.rules.table.rows.len(), 2);
+    assert!(!super::holds_unapplied(&app));
+
+    app.rules.mode = Mode::Input(super::Input {
+        purpose: super::InputPurpose::Search,
+        text: String::new(),
+    });
+    crate::full::handle_paste(&mut app, "first\nsecond\n", &texts_en());
+    match &app.rules.mode {
+        Mode::Input(input) => assert_eq!(input.text, "first"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(app.rules.table.rows.len(), 2);
+}
+
+/// Keys that merely arrive together are typing on a menu, and a Windows
+/// burst of two lines into the search field is text.
+#[test]
+fn fast_keys_are_keys_and_a_burst_in_a_field_is_text() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let k = |c| Event::Key(KeyEvent::new(c, KeyModifiers::NONE));
+    let typed = vec![
+        k(KeyCode::Char('a')),
+        k(KeyCode::Char('b')),
+        k(KeyCode::Char('c')),
+        k(KeyCode::Enter),
+        k(KeyCode::Char('d')),
+    ];
+    assert!(crate::paste::group(typed, false)
+        .iter()
+        .all(|i| matches!(i, crate::paste::Input::Key(_))));
+
+    let burst = vec![
+        k(KeyCode::Char('x')),
+        k(KeyCode::Enter),
+        k(KeyCode::Char('y')),
+        k(KeyCode::Enter),
+    ];
+    let inputs = crate::paste::group(burst, true);
+    assert_eq!(inputs, vec![crate::paste::Input::Paste("x\ny\n".into())]);
+
+    let fake = service(vec![rule("1", "domain", "a.example", "secondary")]);
+    let mut app = on_rules(&fake);
+    app.rules.mode = Mode::Input(super::Input {
+        purpose: super::InputPurpose::Search,
+        text: String::new(),
+    });
+    if let Some(crate::paste::Input::Paste(text)) = inputs.into_iter().next() {
+        crate::full::handle_paste(&mut app, &text, &texts_en());
+    }
+    match &app.rules.mode {
+        Mode::Input(input) => assert_eq!(input.text, "x"),
+        other => panic!("{other:?}"),
+    }
+}
+
+// ── The merge of edits and rules changed elsewhere ───────────────────────────
+
+mod merge {
+    use nrr_shared::ipc::IpcOperationName;
+    use serde_json::json;
+
+    use super::super::Mode;
+    use super::{answer, on_rules, rule, screen_text, service};
+    use crate::screens::suggestions::tests::drain;
+    use crate::screens::ScreenId;
+    use crate::state::AppState;
+    use crate::testing::FakeService;
+
+    /// `a.example` switched off here while it was moved to the main route
+    /// elsewhere, `b.example` deleted here, `mine.example` added here.
+    fn clashing() -> (AppState, FakeService) {
+        let fake = service(vec![
+            rule("1", "domain", "a.example", "secondary"),
+            rule("2", "domain", "b.example", "secondary"),
+        ]);
+        let mut app = on_rules(&fake);
+        app.rules.table.rows[0].rule.enabled = false;
+        app.rules.table.rows.remove(1);
+        app.rules.table.import(
+            vec![nrr_client_logic::rules_table::RuleRow {
+                id: String::new(),
+                enabled: true,
+                rule_type: nrr_client_logic::rules_table::RuleType::from_slug("domain"),
+                match_value: "mine.example".into(),
+                target_route: nrr_client_logic::rules_table::TargetRoute::Secondary,
+                verify: false,
+                comment: String::new(),
+                origin: None,
+            }],
+            false,
+        );
+        fake.answer(
+            IpcOperationName::RulesList,
+            json!({
+                "rows": [
+                    rule("1", "domain", "a.example", "primary"),
+                    rule("2", "domain", "b.example", "secondary"),
+                    rule("3", "domain", "theirs.example", "secondary"),
+                ],
+                "base-revision": "rev-2",
+                "supported-rule-types": ["zone", "domain", "exact-ip", "application"]
+            }),
+        );
+        super::super::rebase_edits(&mut app);
+        drain(&mut app, &fake);
+        (app, fake)
+    }
+
+    fn enabled_and_route(app: &AppState, value: &str) -> Option<(bool, String)> {
+        app.rules
+            .table
+            .rules()
+            .find(|r| r.match_value == value)
+            .map(|r| (r.enabled, r.target_route.as_str().to_owned()))
+    }
+
+    #[test]
+    fn the_buckets_and_the_conflict_are_shown_before_anything_is_replaced() {
+        let (app, _) = clashing();
+        assert!(matches!(app.rules.mode, Mode::Merge(_)));
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("Only in your edits (1)"), "{shown}");
+        assert!(shown.contains("mine.example"), "{shown}");
+        assert!(shown.contains("Deleted by you (1)"), "{shown}");
+        assert!(shown.contains("b.example"), "{shown}");
+        assert!(shown.contains("Conflicts (1)"), "{shown}");
+        assert!(shown.contains("Your edit:"), "{shown}");
+        assert!(shown.contains("In force:"), "{shown}");
+        assert!(
+            shown.contains("stays: Your edit"),
+            "the user's version is the default"
+        );
+        assert_eq!(
+            enabled_and_route(&app, "a.example"),
+            Some((false, "secondary".into())),
+            "the edits are still the list"
+        );
+        assert_eq!(
+            app.rules.base_revision, None,
+            "still standing on the old revision"
+        );
+    }
+
+    #[test]
+    fn merging_with_the_default_pick_keeps_the_users_version() {
+        let (mut app, fake) = clashing();
+        answer(&mut app, &["y"]);
+        drain(&mut app, &fake);
+        // A rule is named by its route too: the move elsewhere made the user's
+        // switched-off rule a separate one, kept beside the rule in force.
+        let on = |route: &str| {
+            app.rules
+                .table
+                .rules()
+                .find(|r| r.match_value == "a.example" && r.target_route.as_str() == route)
+                .map(|r| r.enabled)
+        };
+        assert_eq!(on("secondary"), Some(false), "the user's version is kept");
+        assert_eq!(on("primary"), Some(true), "the rule in force is untouched");
+        assert!(enabled_and_route(&app, "b.example").is_none());
+        assert!(enabled_and_route(&app, "theirs.example").is_some());
+        assert!(enabled_and_route(&app, "mine.example").is_some());
+        assert_eq!(app.rules.base_revision.as_deref(), Some("rev-2"));
+        let sent = fake.sent(IpcOperationName::MutationSubmit);
+        assert!(!sent.is_empty(), "the result goes to the ordinary review");
+        assert!(
+            sent[0].to_string().contains("rev-2"),
+            "built on the revision just read: {}",
+            sent[0]
+        );
+    }
+
+    #[test]
+    fn picking_the_rules_in_force_turns_that_conflict_round() {
+        let (mut app, fake) = clashing();
+        answer(&mut app, &["1"]);
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("stays: In force"), "{shown}");
+        answer(&mut app, &["y"]);
+        drain(&mut app, &fake);
+        assert_eq!(
+            enabled_and_route(&app, "a.example"),
+            Some((true, "primary".into())),
+            "the other side's version stays"
+        );
+        assert!(
+            enabled_and_route(&app, "b.example").is_none(),
+            "the deletion still goes through"
+        );
+    }
+
+    #[test]
+    fn leaving_changes_nothing() {
+        let (mut app, _) = clashing();
+        answer(&mut app, &["n"]);
+        assert!(matches!(app.rules.mode, Mode::List));
+        assert_eq!(
+            enabled_and_route(&app, "a.example"),
+            Some((false, "secondary".into()))
+        );
+        assert!(enabled_and_route(&app, "theirs.example").is_none());
+        assert_eq!(app.rules.base_revision, None);
+        assert!(super::super::holds_unapplied(&app));
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("Nothing was merged"), "{shown}");
+    }
+
+    #[test]
+    fn nothing_to_pick_goes_straight_on() {
+        let fake = service(vec![rule("1", "domain", "a.example", "secondary")]);
+        let mut app = on_rules(&fake);
+        fake.answer(
+            IpcOperationName::RulesList,
+            json!({
+                "rows": [
+                    rule("1", "domain", "a.example", "secondary"),
+                    rule("2", "domain", "theirs.example", "secondary"),
+                ],
+                "base-revision": "rev-3",
+                "supported-rule-types": ["domain"]
+            }),
+        );
+        super::super::rebase_edits(&mut app);
+        drain(&mut app, &fake);
+        assert!(
+            !matches!(app.rules.mode, Mode::Merge(_)),
+            "no edits, nothing to pick"
+        );
+        assert_eq!(app.rules.base_revision.as_deref(), Some("rev-3"));
+        assert!(enabled_and_route(&app, "theirs.example").is_some());
+    }
+
+    #[test]
+    fn the_plain_prompt_names_the_merge_keys() {
+        let (app, _) = clashing();
+        let prompt = crate::screens::screen(ScreenId::Rules)
+            .plain_prompt(&app)
+            .expect("a prompt");
+        assert_eq!(prompt, super::super::text::MERGE_PLAIN_PROMPT);
+    }
+}
+
+// ── The bound files against the rules in force ───────────────────────────────
+
+mod file_merge {
+    use nrr_shared::ipc::IpcOperationName;
+    use nrr_shared::user_settings::{UserSettingsStore, USER_SETTINGS_FILE_NAME};
+    use serde_json::{json, Value};
+
+    use super::super::own_settings::path_text;
+    use super::super::{Busy, Mode};
+    use super::{answer, drain, on_rules, rule, screen_text, service};
+    use crate::screens::ScreenId;
+    use crate::state::AppState;
+    use crate::testing::{FakeService, Scratch};
+
+    const FILE_TEXT: &str = "--- Domains\nonly-file.example\nshared.example\n";
+
+    /// The rules screen with a primary file bound beside the settings file.
+    fn bound(dir: &Scratch, fake: &FakeService) -> AppState {
+        let mut app = on_rules(fake);
+        let file = dir.path().join(USER_SETTINGS_FILE_NAME);
+        app.rules.settings_file = Some(file.clone());
+        let primary = dir.path().join("rules_primary.txt");
+        std::fs::write(&primary, FILE_TEXT).expect("file");
+        UserSettingsStore::at(file)
+            .update(|s| s.rules_files.primary = path_text(&primary))
+            .expect("bind");
+        app
+    }
+
+    fn entry(value: &str) -> Value {
+        json!({
+            "value": value, "type-slug": "domain", "route": "primary", "enabled": true,
+            "action": "route", "comment": "", "origin": "file-only", "was-conflict": false
+        })
+    }
+
+    fn side(route: &str) -> Value {
+        json!({ "route": route, "enabled": true, "action": "route", "comment": "" })
+    }
+
+    fn preview(file_only: Vec<Value>, conflicts: Vec<Value>, merged: &str) -> Value {
+        json!({ "result": {
+            "policy": "union", "noop": false, "unresolved": conflicts.len(),
+            "file-only": file_only, "service-only": [{
+                "value": "only-service.example", "type-slug": "domain", "route": "secondary",
+                "enabled": true, "action": "route", "comment": "", "origin": "service-only",
+                "was-conflict": false
+            }],
+            "conflicts": conflicts, "merged-rules-json": merged
+        } })
+    }
+
+    fn clash() -> Value {
+        json!({
+            "identity-key": "k1", "value": "shared.example", "type-slug": "domain",
+            "file": side("primary"), "service": side("secondary"), "resolved": "unresolved"
+        })
+    }
+
+    fn rules() -> FakeService {
+        service(vec![
+            rule("1", "domain", "shared.example", "secondary"),
+            rule("2", "domain", "only-service.example", "secondary"),
+        ])
+    }
+
+    #[test]
+    fn the_files_text_goes_to_the_service_and_the_buckets_are_shown() {
+        let dir = Scratch::new("file-merge-show");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        fake.answer(
+            IpcOperationName::RulesMergePreview,
+            preview(vec![entry("only-file.example")], vec![clash()], "{}"),
+        );
+        answer(&mut app, &["F"]);
+        assert_eq!(app.rules.busy, Some(Busy::Previewing));
+        drain(&mut app, &fake);
+        let sent = fake.sent(IpcOperationName::RulesMergePreview);
+        assert_eq!(sent[0]["primary-text"], FILE_TEXT, "{sent:?}");
+        assert_eq!(sent[0]["secondary-text"], "");
+        assert_eq!(sent[0]["policy"], "union");
+        assert!(matches!(app.rules.mode, Mode::Merge(_)));
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("Merge file and app rules"), "{shown}");
+        assert!(shown.contains("Only in the file (1)"), "{shown}");
+        assert!(shown.contains("only-file.example"), "{shown}");
+        assert!(shown.contains("Only in the app (1)"), "{shown}");
+        assert!(shown.contains("only-service.example"), "{shown}");
+        assert!(shown.contains("Conflicts (1)"), "{shown}");
+        assert!(shown.contains("File: "), "{shown}");
+        assert!(shown.contains("App: "), "{shown}");
+        assert!(
+            shown.contains("stays: File"),
+            "the file is the default: {shown}"
+        );
+    }
+
+    #[test]
+    fn the_picks_go_back_and_the_merged_rules_go_to_the_review() {
+        let dir = Scratch::new("file-merge-confirm");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        fake.answer(
+            IpcOperationName::RulesMergePreview,
+            preview(
+                vec![entry("only-file.example")],
+                vec![clash()],
+                "{\"merged\":1}",
+            ),
+        );
+        answer(&mut app, &["F"]);
+        drain(&mut app, &fake);
+        answer(&mut app, &["1", "y"]);
+        drain(&mut app, &fake);
+        let sent = fake.sent(IpcOperationName::RulesMergePreview);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(
+            sent[1]["resolutions"],
+            json!([{ "identity-key": "k1", "side": "service" }])
+        );
+        let review = fake.sent(IpcOperationName::MutationSubmit);
+        assert_eq!(review[0]["dry-run"], true, "{review:?}");
+        assert_eq!(review[0]["payload"]["rules-json"], "{\"merged\":1}");
+        // Pinned: the service dedupes on this spelling of the merged bytes.
+        assert_eq!(
+            review[0]["payload"]["content-hash"],
+            "3e704b1a4e1e07560025ab7c8a9efc46cfd7a0203271f8ba00e83c335597f87e"
+        );
+    }
+
+    /// The rows on screen are not what the merge applied: they are read back,
+    /// and the bound files are written from that read, not from the old rows.
+    #[test]
+    fn once_applied_the_rules_are_read_back_and_the_files_follow_them() {
+        let dir = Scratch::new("file-merge-applied");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        app.rules.reload_after_apply = true;
+        super::super::finished(
+            &mut app,
+            super::super::apply::Finished::Applied {
+                base: Some("rev-9".into()),
+            },
+        );
+        drain(&mut app, &fake);
+        assert_eq!(fake.sent(IpcOperationName::RulesList).len(), 2);
+        assert!(!app.rules.reload_after_apply);
+        let written = std::fs::read_to_string(dir.path().join("rules_primary.txt")).expect("file");
+        assert!(!written.contains("only-file.example"), "{written}");
+    }
+
+    fn nothing_to_show() -> Value {
+        json!({ "result": {
+            "policy": "union", "noop": false, "unresolved": 0, "file-only": [],
+            "service-only": [], "conflicts": [], "merged-rules-json": "{}"
+        } })
+    }
+
+    #[test]
+    fn a_file_spelled_otherwise_is_rewritten_when_there_is_nothing_to_merge() {
+        let dir = Scratch::new("file-merge-converge");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        fake.answer(IpcOperationName::RulesMergePreview, nothing_to_show());
+        answer(&mut app, &["F"]);
+        drain(&mut app, &fake);
+        assert!(matches!(app.rules.mode, Mode::List));
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("brought up to date"), "{shown}");
+        let written = std::fs::read_to_string(dir.path().join("rules_primary.txt")).expect("file");
+        assert!(!written.contains("only-file.example"), "{written}");
+    }
+
+    #[test]
+    fn merged_rules_equal_to_the_screen_converge_even_with_buckets_listed() {
+        let dir = Scratch::new("file-merge-equal");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        let own = super::super::apply::pending_from(&app.rules.table, false, None)
+            .expect("book")
+            .rules_json;
+        fake.answer(
+            IpcOperationName::RulesMergePreview,
+            preview(vec![entry("only-file.example")], Vec::new(), &own),
+        );
+        answer(&mut app, &["F"]);
+        drain(&mut app, &fake);
+        assert!(matches!(app.rules.mode, Mode::List));
+        let written = std::fs::read_to_string(dir.path().join("rules_primary.txt")).expect("file");
+        assert!(!written.contains("only-file.example"), "{written}");
+    }
+
+    #[test]
+    fn a_file_already_in_line_is_left_alone_and_the_note_says_they_match() {
+        let dir = Scratch::new("file-merge-match");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        let primary = dir.path().join("rules_primary.txt");
+        let (table, hint) = (&app.rules.table, &app.rules.file_hint);
+        super::super::files::write_route(
+            &primary,
+            nrr_client_logic::Route::Primary,
+            table,
+            hint,
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("write");
+        let before = std::fs::read_to_string(&primary).expect("file");
+        fake.answer(IpcOperationName::RulesMergePreview, nothing_to_show());
+        answer(&mut app, &["F"]);
+        drain(&mut app, &fake);
+        assert_eq!(std::fs::read_to_string(&primary).expect("file"), before);
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("already match"), "{shown}");
+    }
+
+    #[test]
+    fn unapplied_edits_are_asked_about_first() {
+        let dir = Scratch::new("file-merge-dirty");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        app.rules.table.rows.remove(0);
+        answer(&mut app, &["F"]);
+        assert!(fake.sent(IpcOperationName::RulesMergePreview).is_empty());
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("before comparing the files"), "{shown}");
+    }
+
+    #[test]
+    fn without_a_linked_file_there_is_nothing_to_compare() {
+        let fake = rules();
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["F"]);
+        assert!(fake.sent(IpcOperationName::RulesMergePreview).is_empty());
+        assert!(app.rules.busy.is_none());
+    }
+
+    #[test]
+    fn a_hand_edited_file_that_says_something_else_is_pointed_out_after_a_read() {
+        let dir = Scratch::new("file-merge-drift");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        let file = app.rules.settings_file.clone().expect("settings file");
+        let primary = dir.path().join("rules_primary.txt");
+        // This program wrote the file once; what is there now is the user's.
+        super::super::own_settings::note_written(&file, std::slice::from_ref(&primary))
+            .expect("note");
+        std::fs::write(&primary, format!("{FILE_TEXT}another.example\n")).expect("edit");
+        app.rules.note = None;
+        super::super::file_merge::check_drift(&mut app);
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("you can compare and merge them"), "{shown}");
+        assert!(shown.contains("Press F"), "{shown}");
+    }
+}
+
+/// `C` removes the exact rules a wildcard of the same route already covers,
+/// as the window's cleanup does; a host the other route names stays.
+#[test]
+fn c_removes_the_rules_a_wildcard_of_the_same_route_covers() {
+    use crossterm::event::KeyCode;
+    let fake = service(vec![
+        rule("1", "suffix-domain", "example.com", "secondary"),
+        rule("2", "domain", "example.com", "secondary"),
+        rule("3", "domain", "www.example.com", "secondary"),
+        rule("4", "domain", "mail.example.com", "primary"),
+    ]);
+    let mut app = on_rules(&fake);
+    let shown = screen_text(&app, ScreenId::Rules);
+    assert!(shown.contains("C: Remove covered rules (2)"), "{shown}");
+
+    press_key(&mut app, KeyCode::Char('C'));
+    let asked = screen_text(&app, ScreenId::Rules);
+    assert!(
+        asked.contains("www.example.com \u{2014} already covered by *.example.com"),
+        "{asked}"
+    );
+    // The removal is listed first but never preselected.
+    press_key(&mut app, KeyCode::Up);
+    press_key(&mut app, KeyCode::Enter);
+    let left: Vec<&str> = app
+        .rules
+        .table
+        .rows
+        .iter()
+        .map(|r| r.rule.id.as_str())
+        .collect();
+    assert_eq!(left, ["R-0001", "R-0004"]);
+    let note = app
+        .rules
+        .note
+        .as_ref()
+        .map(|n| n.text(&texts_en()))
+        .unwrap_or_default();
+    assert!(
+        note.starts_with("2 rules removed as already covered"),
+        "{note}"
+    );
+    assert!(!screen_text(&app, ScreenId::Rules).contains("Remove covered rules"));
+
+    answer(&mut app, &["C"]);
+    assert!(matches!(app.rules.mode, Mode::List));
+    let note = app.rules.note.as_ref().map(|n| n.text(&texts_en()));
+    assert_eq!(note.as_deref(), Some("Nothing is covered twice right now."));
 }

@@ -4,7 +4,9 @@
 //! One answer for both OSes. The decisions are here and tested once; the
 //! platform layers only carry them out (strip or keep filters, remove routes,
 //! hand DNS back). A cell no test can reach without hardware is listed in
-//! [`LIVE_CHECKS`] rather than left implicit.
+//! [`LIVE_CHECKS`] rather than left implicit. `tests/lifecycle_matrix_rows.rs`
+//! and `tests/lifecycle_matrix_runtime.rs` drive each row through the code
+//! that carries it out and hold the result to [`expected_after`].
 //!
 //! The one rule behind every cell: a failure, a crash or a power-off never
 //! lifts protection someone asked for. Blocks come off only when the service
@@ -39,6 +41,8 @@ pub enum LifecycleEdge {
     RestartsExhausted,
     /// The last signed-in user left.
     LastUserSignedOut,
+    /// A user signed in (console, remote desktop, SSH).
+    UserSignedIn,
     /// A user paused routing or ran safe-disable.
     UserPaused,
     /// The machine woke from sleep.
@@ -49,6 +53,8 @@ pub enum LifecycleEdge {
     ExternalReset,
     /// The service is being removed.
     Uninstall,
+    /// "Restore network": the service is stopped and whatever it left is swept.
+    NetworkReset,
     /// A task or thread of the service panicked.
     TaskPanic,
 }
@@ -97,7 +103,7 @@ pub enum OrphanedBlocks {
 /// The settings the table reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct LifecycleInputs {
-    /// Someone on the machine has leak protection or Fail-Closed on.
+    /// Someone on the machine has leak protection on (`sites` or `everything`).
     pub leak_guard_armed: bool,
     /// The stop setting asks to keep rule routes on the additional link.
     pub keep_rule_routes_on_stop: bool,
@@ -108,7 +114,7 @@ pub struct LifecycleInputs {
 pub struct ExpectedState {
     /// Per-user permit and block filters.
     pub user_filters: Disposition,
-    /// The Fail-Closed and leak-guard blocks.
+    /// The leak-protection blocks.
     pub fail_closed_blocks: Disposition,
     /// Our routes (and the `ip rule` entries on Linux).
     pub routes: Disposition,
@@ -230,6 +236,13 @@ pub fn expected_after(edge: LifecycleEdge, inputs: LifecycleInputs) -> ExpectedS
             routes: Remove,
             dns_redirect: Keep,
         },
+        // Theirs at once, nobody else's touched; DNS is already the machine's.
+        LifecycleEdge::UserSignedIn => ExpectedState {
+            user_filters: Reconcile,
+            fail_closed_blocks: Reconcile,
+            routes: Reconcile,
+            dns_redirect: Keep,
+        },
         LifecycleEdge::UserPaused => ExpectedState {
             user_filters: Remove,
             fail_closed_blocks: Remove,
@@ -243,17 +256,15 @@ pub fn expected_after(edge: LifecycleEdge, inputs: LifecycleInputs) -> ExpectedS
         LifecycleEdge::ResumeFromSleep | LifecycleEdge::ExternalReset => {
             ExpectedState::all(Reconcile)
         }
+        // The next pass re-plans against the dead link: under leak protection
+        // that pass is what blocks the rule hosts (`protection_posture`).
         LifecycleEdge::SecondaryDown => ExpectedState {
             user_filters: Reconcile,
-            fail_closed_blocks: if inputs.leak_guard_armed {
-                Keep
-            } else {
-                Reconcile
-            },
+            fail_closed_blocks: Reconcile,
             routes: Reconcile,
             dns_redirect: Keep,
         },
-        LifecycleEdge::Uninstall => ExpectedState::all(Remove),
+        LifecycleEdge::Uninstall | LifecycleEdge::NetworkReset => ExpectedState::all(Remove),
         LifecycleEdge::TaskPanic => ExpectedState::all(Keep),
     }
 }
@@ -370,9 +381,20 @@ where
 pub const LIVE_CHECKS: &[(LifecycleEdge, &str)] = &[
     (
         LifecycleEdge::Stop(StopReason::MachineShutdown),
-        "reboot a VM with Fail-Closed on and a rule host pinned; during the shutdown the host \
+        "reboot a VM with leak protection on and a rule host held; during the shutdown the host \
          stays blocked (Windows: no `svc-boot-wfp-filters-stripped` line; Linux: nft table \
          present until the unit is gone)",
+    ),
+    (
+        LifecycleEdge::StartAfterCrash,
+        "kill the service hard with leak protection on and the additional link down; the rule \
+         host stays blocked through the restart and after its first pass",
+    ),
+    (
+        LifecycleEdge::BlockedStart,
+        "with a DNS redirect left by a killed instance, start a service whose start is blocked \
+         (damaged state database): names resolve, health says recovery required, the dead \
+         instance's leak-protection blocks stay",
     ),
     (
         LifecycleEdge::ResumeFromSleep,
@@ -381,8 +403,12 @@ pub const LIVE_CHECKS: &[(LifecycleEdge, &str)] = &[
     ),
     (
         LifecycleEdge::LastUserSignedOut,
-        "sign the last user out on Windows; routes and filters go together (39.30.3 is open: \
-         today the filters stay)",
+        "sign the last user out on Windows; routes and filters go together",
+    ),
+    (
+        LifecycleEdge::UserSignedIn,
+        "sign a second user in over remote desktop (Windows) or SSH (Linux); within one pass \
+         their rule host leaves through the additional link, the first user's routing unchanged",
     ),
     (
         LifecycleEdge::ExternalReset,
@@ -392,6 +418,16 @@ pub const LIVE_CHECKS: &[(LifecycleEdge, &str)] = &[
         LifecycleEdge::RestartsExhausted,
         "kill the service past its restart budget; with leak protection on the blocks stay and \
          DNS is handed back, without it the machine is clean",
+    ),
+    (
+        LifecycleEdge::Uninstall,
+        "uninstall with leak protection on, a rule host routed and the rule routes kept on stop; \
+         afterwards no filter, route, DNS redirect or (Linux) `ip rule` of ours is left",
+    ),
+    (
+        LifecycleEdge::NetworkReset,
+        "run Restore network from the window, the terminal UI and `nrr-cli reset-network` with \
+         the service running; it is stopped first, then nothing of ours is left",
     ),
 ];
 
@@ -566,7 +602,7 @@ mod tests {
             ExpectedState::all(Keep)
         );
         let outage = expected_after(LifecycleEdge::SecondaryDown, ARMED);
-        assert_eq!(outage.fail_closed_blocks, Keep);
+        assert_eq!(outage.fail_closed_blocks, Reconcile);
         assert_eq!(outage.dns_redirect, Keep);
         let paused = expected_after(LifecycleEdge::UserPaused, ARMED);
         assert_eq!(paused.fail_closed_blocks, Remove);
@@ -581,8 +617,9 @@ mod tests {
         );
     }
 
-    /// Every edge of the table is either held by a test here or named as a
-    /// live check; an edge that is neither is a row nobody owns.
+    /// Every edge of the table is either held by a test (here or in the
+    /// crate's `lifecycle_matrix_*` tests) or named as a live check; an edge
+    /// that is neither is a row nobody owns.
     #[test]
     fn every_edge_is_tested_or_a_live_check() {
         const TESTED: &[LifecycleEdge] = &[
@@ -590,9 +627,14 @@ mod tests {
             LifecycleEdge::StartAfterCrash,
             LifecycleEdge::BlockedStart,
             LifecycleEdge::Stop(StopReason::ServiceStop),
+            LifecycleEdge::Stop(StopReason::MachineShutdown),
+            LifecycleEdge::RestartsExhausted,
+            LifecycleEdge::LastUserSignedOut,
+            LifecycleEdge::UserSignedIn,
             LifecycleEdge::UserPaused,
+            LifecycleEdge::ResumeFromSleep,
             LifecycleEdge::SecondaryDown,
-            LifecycleEdge::Uninstall,
+            LifecycleEdge::ExternalReset,
             LifecycleEdge::TaskPanic,
         ];
         let all = [
@@ -603,11 +645,13 @@ mod tests {
             LifecycleEdge::Stop(StopReason::MachineShutdown),
             LifecycleEdge::RestartsExhausted,
             LifecycleEdge::LastUserSignedOut,
+            LifecycleEdge::UserSignedIn,
             LifecycleEdge::UserPaused,
             LifecycleEdge::ResumeFromSleep,
             LifecycleEdge::SecondaryDown,
             LifecycleEdge::ExternalReset,
             LifecycleEdge::Uninstall,
+            LifecycleEdge::NetworkReset,
             LifecycleEdge::TaskPanic,
         ];
         for edge in all {

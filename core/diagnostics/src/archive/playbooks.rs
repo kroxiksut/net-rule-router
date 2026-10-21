@@ -103,13 +103,14 @@ fn fail_closed_block_playbook() -> TroubleshootingPlaybook {
             TroubleshootingStep {
                 title: "Check whether the additional connection is up",
                 description: "While it is down, traffic your rules send through it is \
-                              blocked rather than allowed out the main connection. That \
-                              is leak protection working as configured, and it clears by \
-                              itself once the connection returns.",
+                              blocked rather than allowed out the main connection; with \
+                              leak protection set to Everything, all other traffic waits \
+                              too. That is leak protection working as configured, and it \
+                              clears by itself once the connection returns.",
             },
             TroubleshootingStep {
                 title: "Decide whether you want that trade",
-                description: "Leak protection can be switched off in Settings, Routing. \
+                description: "Leak protection can be set to Off in Settings, Routing. \
                               The same traffic then leaves over the main connection while \
                               the additional one is down — reachable, and visible to \
                               whoever can see that link.",

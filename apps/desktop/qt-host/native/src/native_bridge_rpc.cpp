@@ -14,6 +14,11 @@ QString NrrNativeBridge::rpcRouteLinkProviderSet(const QVariantMap &payload) {
                           QJsonObject::fromVariantMap(payload));
 }
 
+QString NrrNativeBridge::rpcRouteVpnGatewaysSet(const QVariantMap &payload) {
+    return emitRpcRequest(QStringLiteral("route.vpn-gateways.set"),
+                          QJsonObject::fromVariantMap(payload));
+}
+
 QString NrrNativeBridge::rpcLocalNetworksGet() {
     return emitRpcRequest(QStringLiteral("settings.local-networks.get"),
                           QJsonObject());
@@ -153,11 +158,12 @@ QString NrrNativeBridge::rpcDohResolversSet(const QString &resolversJson) {
     QJsonParseError parseError{};
     const QJsonDocument doc =
         QJsonDocument::fromJson(resolversJson.toUtf8(), &parseError);
-    QJsonObject obj;
-    if (parseError.error == QJsonParseError::NoError && doc.isObject()) {
-        obj = doc.object();
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        // An empty object would be read as "clear the list".
+        qWarning() << "doh.resolvers.set: unreadable payload, nothing sent";
+        return {};
     }
-    return emitRpcRequest(QStringLiteral("doh.resolvers.set"), obj);
+    return emitRpcRequest(QStringLiteral("doh.resolvers.set"), doc.object());
 }
 
 QString NrrNativeBridge::rpcLocalDnsSuffixesGet() {

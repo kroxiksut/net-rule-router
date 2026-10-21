@@ -205,7 +205,7 @@ pub fn snapshot_json(f: &Fixture) -> Value {
         .collect();
     let mut policy = json!({
         "mode": "prefer-primary",
-        "block-secondary-when-unavailable": true,
+        "leak-protection": "off",
         "binding-source": "user-assigned"
     });
     if let Some(p) = &f.primary {

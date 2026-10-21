@@ -78,10 +78,9 @@ where
 /// Risk level for a request the pre-execution audit can judge from its payload.
 ///
 /// A rule revision gets a full `RiskAssessment` through review; a route-policy
-/// update never goes through review, so the same catalogue's two relevant
-/// signals were computed for nobody. Arming fail-closed or the blanket block is
-/// exactly what `FailClosedActivation` describes (High), and any other change
-/// of behaviour mode is `DefaultBehaviorChanged` (Medium).
+/// update never goes through review, so its risk is judged here. Leak
+/// protection `everything` can hold all of the user's traffic (High); any
+/// other change of behaviour mode is `DefaultBehaviorChanged` (Medium).
 ///
 /// This reads the REQUESTED value, not a diff — a pre-execution entry records
 /// what was asked for, which is what an operator reconstructing the day needs.
@@ -93,17 +92,9 @@ fn risk_of(request: &IpcRequestEnvelope) -> Option<String> {
     }
     let payload = &request.payload;
     let mode = payload.get("mode").and_then(|v| v.as_str());
-    let flag = |name: &str| {
-        payload
-            .get(name)
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    };
+    let protection = payload.get("leak-protection").and_then(|v| v.as_str());
 
-    let level = if mode == Some("strict-secondary-fail-closed")
-        || flag("kill-switch-block-all")
-        || flag("block-secondary-when-unavailable")
-    {
+    let level = if protection == Some("everything") {
         RiskLevel::High
     } else if mode.is_some() {
         RiskLevel::Medium
@@ -230,15 +221,9 @@ mod tests {
 
     #[test]
     fn arming_a_blocking_posture_is_recorded_as_high_risk() {
-        // A route-policy update never goes through review, so the risk
-        // catalogue's two relevant signals were computed for nobody.
         for payload in [
-            serde_json::json!({ "mode": "strict-secondary-fail-closed" }),
-            serde_json::json!({ "mode": "prefer-primary", "kill-switch-block-all": true }),
-            serde_json::json!({
-                "mode": "prefer-primary",
-                "block-secondary-when-unavailable": true
-            }),
+            serde_json::json!({ "mode": "prefer-secondary-when-available", "leak-protection": "everything" }),
+            serde_json::json!({ "mode": "prefer-primary", "leak-protection": "everything" }),
         ] {
             assert_eq!(
                 risk_of(&policy_envelope(payload.clone())).as_deref(),
@@ -253,6 +238,14 @@ mod tests {
         assert_eq!(
             risk_of(&policy_envelope(
                 serde_json::json!({ "mode": "prefer-primary" })
+            ))
+            .as_deref(),
+            Some("medium")
+        );
+        // `sites` holds only what the rules send through the tunnel.
+        assert_eq!(
+            risk_of(&policy_envelope(
+                serde_json::json!({ "mode": "prefer-primary", "leak-protection": "sites" })
             ))
             .as_deref(),
             Some("medium")

@@ -106,11 +106,14 @@ check of the checksums, `SHA256SUMS` comes with the files:
 ## Highlights
 
 - **Two-route model** — a `primary` and an additional route, one active config at a time.
-- **Seven ways to match traffic** — by exact domain, by domain with all its subdomains, by a site in every zone (`bank.*`), by exact IPv4 or IPv6 address, by subnet or address range, by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), or by application (the program's name, or the file or folder it is installed in).
+- **Seven ways to match traffic** — by exact domain, by domain with all its subdomains, by a site in every zone (`bank.*`), by exact IPv4 or IPv6 address, by subnet or address range, by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), or by application (the program's name, or the file or folder it is installed in; on Windows and Linux a folder rule also covers the programs a later update puts there and the scripts kept in it).
 - **Traffic statistics** — how much went through each connection today, during the current session of the additional connection and over every day kept (you choose how many), with a CSV export for any period.
-- **Per-name routing** *(Windows, off by default: Settings → Routing)* — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
-- **Leak protection** — if the additional route goes down, matching traffic is held rather than silently leaking to `primary`.
+- **Per-name routing** *(Windows, on by default for a new installation: Settings → Routing behavior, once leak protection is on)* — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
+- **Leak protection** — one choice: **Off** (the default), **Routed sites** (what your rules send through the additional connection never goes out the main one; everything else keeps working) or **Everything** (nothing leaves except through the additional connection, your local network and what your rules send over the main one; if the additional connection drops, the internet waits until it returns). A corporate VPN beside yours keeps its own networks in every mode.
 - **Deny** — a site, an address, a subnet or a program you deny is not let through any connection: put `!` before it in a rules file, or choose "Deny" when you add a rule in the window, the tray or the terminal interface. A deny by address or subnet does not depend on names; there are no block lists, only the rules you write.
+- **Protected system programs** — a deny or an additional-route rule cannot take what the computer needs to stay on the network (the system folder, `svchost.exe`, the network services, a folder many programs share): the app refuses it before it is saved. When you do mean it, `+override` in the rules file asks for your confirmation, for a time you choose, with administrator approval where it reaches past your own programs; see [`docs/en/rules-file-format.md`](docs/en/rules-file-format.md#116-applying-a-rule-despite-the-protection-override).
+- **Many rules at once, and recent changes** — paste a list of sites, addresses and programs as lines of a rules file and each line is checked before it is added; the *Recent* filter shows what you added, changed or deleted in the last hour, today or 7 days, and puts a deleted rule back in one click. In the window and in the terminal interface alike.
+- **Connection history** — which of your programs connected where, and over which route, kept on this computer for 7 days unless you choose otherwise, grouped by program or by folder. Only you can read yours; it never goes into a diagnostic archive, and you can clear it or switch it off in Settings.
 - **WSL, containers and virtual machines** — you choose whether their programs get the same leak protection as this computer or go unprotected while the additional route is down. Not yet verified on a live setup.
 - **Suggested addresses** — a routed site often pulls in helper domains of its own. The app collects them, shows which of your sites needs each one, and proposes adding them. Nothing is added behind your back, and ignoring a suggestion simply leaves that address on the main route.
 - **Overlaps** — when rules of the two routes cover the same sites (a zone on one route, a site inside it on the other), the narrower rule wins, and the app lists every such pair with the route its sites actually take. Confirm each one, or send those sites over the other route in one click. The same screen points out applied rules that work
@@ -120,9 +123,9 @@ check of the checksums, `SHA256SUMS` comes with the files:
 - **Open, text-based presets** — human-readable rule packs (incl. ready-made country splits) you can diff, edit, and share.
 - **Rules that adapt to your provider** — put `?` before a site or an address (or tick "Unsure" when you add one) and it works over the route you wrote it for. If it does not open there but opens over the other route, the app sends it over the other route and offers to move the rule; until you agree, the move lasts until the computer restarts. The bundled presets use this for services some providers block and others do not, so one pack fits any provider.
 - **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a background service that applies policy at startup. The tray menu and its notices are still being shaped ahead of the first release; what they contain and how they look may change between builds.
-- **Accessibility as a baseline** — screen-reader support, keyboard navigation, scalable fonts, a dedicated high-contrast theme.
+- **Accessibility as a baseline** — screen-reader support, keyboard navigation, scalable fonts, a dedicated high-contrast theme; see [`docs/en/accessibility.md`](docs/en/accessibility.md).
 - **RU / EN out of the box**, with drop-in community locales (no rebuild needed).
-- **Local-first & private** — no mandatory login, telemetry off by default, no hidden background network calls.
+- **Local-first & private** — no mandatory login and no telemetry. The few requests the app makes of its own (looking up the sites your rules name, checking the additional connection and the address it exits from, trying the `?` rules of sites you open, an optional update check) are listed in [SECURITY.md](SECURITY.md), with what each one gives you and how to turn it off where it can be.
 
 ## How routing decisions are made
 
@@ -138,7 +141,7 @@ and stops at the first match:
 | 5 | Subnet (CIDR) or IP range | `10.0.0.0/8`, `192.0.2.10-192.0.2.40` |
 | 6 | Zone (TLD / internal suffix, domain zones) | `.ru`, `.com`, `.intra` |
 | 7 | Application (program name, file or folder) | `chrome.exe` |
-| 8 | Default route | behavior: prefer-primary / prefer-secondary / strict-fail-closed |
+| 8 | Default route | the main connection or the additional one, as chosen in settings |
 
 Notes:
 
@@ -292,7 +295,7 @@ for your own rules. It runs only interactively — scripts use `nrr-cli`. See
 ## Security & privacy
 
 - No mandatory login for core local routing.
-- Telemetry is **off by default**; no hidden background network actions.
+- There is no telemetry. Besides your routed traffic, the app looks up the host names in your rules and keeps their addresses fresh, asks your connection's DNS server which site an address belongs to while rule suggestions or leak protection are on (never for a site your own deny rule blocks), checks that the additional connection is alive and, if you turn it on, asks a public STUN service which address it exits from each time it connects, tries the `?` rules of sites you open, and (after the first release) can check for a newer version. With suggestions and leak protection off there are no such address lookups; the update check can be turned off in Settings. The full list is in [SECURITY.md](SECURITY.md).
 - Privileged policy changes go over a local, DACL-protected named-pipe IPC boundary — there is no localhost HTTP control plane for privileged mutations.
 - Until the first release is published the app does not check for updates at all. From then on, every N days (14 by default, adjustable in Settings) it asks the project's official release page whether a newer version is out and, if so, shows a notice. It never downloads, installs or changes routing, and you can turn the check off in Settings. Help → Check for updates asks the same question on demand, even with the automatic check off.
 
@@ -301,9 +304,9 @@ See [`SECURITY.md`](SECURITY.md) for the full trust model.
 ## Roadmap
 
 **Current:** two-route model, one active config per Windows user over a shared
-administrator baseline, domain / zone / IP / network / app rules, per-name
-routing, presets, explain mode, leak protection, suggested addresses, traffic
-statistics with CSV export, diagnostics archive, administrative console, RU/EN.
+administrator baseline, domain / zone / IP / network / app rules (apps by name,
+file or folder), deny rules, per-name routing, presets, explain mode, leak protection, suggested addresses, traffic
+statistics with CSV export, connection history, diagnostics archive, administrative console, RU/EN.
 
 **In progress:** Linux support (the platform-specific pieces sit behind one
 interface per capability, so the shared decision logic is already OS-neutral),
@@ -339,9 +342,17 @@ The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
 | [`docs/en/known-limitations.md`](docs/en/known-limitations.md) | Gaps this release still has, and what to do about each |
 | [`docs/en/cli.md`](docs/en/cli.md) | The `nrr-cli` console: verbs, exit codes, and what it deliberately does not do |
 | [`docs/en/tui.md`](docs/en/tui.md) | The `nrr-tui` terminal interface: starting it, screens, keys, accessibility, rights |
+| [`docs/en/accessibility.md`](docs/en/accessibility.md) | Using the window from the keyboard, with a screen reader, large text or high contrast |
 | [`docs/en/building-windows.md`](docs/en/building-windows.md) | Building from source on Windows: toolchain, Qt, common failures |
 | [`docs/en/unattended-install.md`](docs/en/unattended-install.md) | Installing from a script with your rules ready for every user, and the exit codes |
 | [`docs/en/packaging-windows.md`](docs/en/packaging-windows.md) | Producing the portable package and the installers for distribution |
+| [`docs/en/building-linux.md`](docs/en/building-linux.md) | Building from source on Linux: toolchain, Qt, common failures |
+| [`docs/en/packaging-linux.md`](docs/en/packaging-linux.md) | Producing the `.deb` and `.rpm` packages for distribution |
+| [`docs/en/dns-via-secondary.md`](docs/en/dns-via-secondary.md) | DNS through the tunnel: which names go where, and what the resolvers see |
+| [`docs/en/fake-ip.md`](docs/en/fake-ip.md) | Per-site routing with virtual addresses: what it buys you and what it needs |
+| [`docs/en/vpn-detection.md`](docs/en/vpn-detection.md) | How a VPN client on the machine is recognised, and what the product does about it |
+| [`docs/en/first-run-answers.md`](docs/en/first-run-answers.md) | Answering the setup questions ahead of time |
+| [`docs/en/third-party-components.md`](docs/en/third-party-components.md) | What third-party components are shipped, under which licences, and how to check them |
 
 ## License
 

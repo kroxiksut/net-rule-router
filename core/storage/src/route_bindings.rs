@@ -34,8 +34,8 @@ use std::collections::BTreeSet;
 use std::sync::{Mutex, PoisonError};
 
 use nrr_domain::is_valid_kill_switch_protocols;
-use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
 use nrr_domain::shared_ip::SharedIpPolicy;
+use nrr_domain::LeakProtection;
 
 use crate::auto_rules::{AutoRulesMode, AUTO_RULES_EAGER_DELIVERY_NAMES_DEFAULT};
 use crate::doh_lockdown::DohLockdownScope;
@@ -86,7 +86,6 @@ impl BindingSource {
 pub enum BehaviorMode {
     PreferPrimary,
     PreferSecondaryWhenAvailable,
-    StrictSecondaryFailClosed,
 }
 
 impl BehaviorMode {
@@ -94,7 +93,6 @@ impl BehaviorMode {
         match self {
             Self::PreferPrimary => "prefer-primary",
             Self::PreferSecondaryWhenAvailable => "prefer-secondary-when-available",
-            Self::StrictSecondaryFailClosed => "strict-secondary-fail-closed",
         }
     }
 
@@ -102,13 +100,12 @@ impl BehaviorMode {
         match s {
             "prefer-primary" => Some(Self::PreferPrimary),
             "prefer-secondary-when-available" => Some(Self::PreferSecondaryWhenAvailable),
-            "strict-secondary-fail-closed" => Some(Self::StrictSecondaryFailClosed),
             _ => None,
         }
     }
 }
 
-/// Bitmask of IP protocols the kill-switch blocks; all of them is the default
+/// Bitmask of IP protocols leak protection blocks; all of them is the default
 /// and the column default.
 pub use nrr_domain::KILL_SWITCH_PROTOCOLS_ALL;
 
@@ -118,48 +115,24 @@ pub const DEFAULT_PRIMARY_PROBE_TIMEOUT_MS: u32 = 1500;
 pub const DEFAULT_PRIMARY_PROBE_MAX_TARGETS: u32 = 8;
 pub const DEFAULT_PRIMARY_PROBE_REPEAT_SECS: u32 = 300;
 
-/// Single (primary, secondary, mode, block-flag) snapshot for one SID.
+/// Single (primary, secondary, mode, protection) snapshot for one SID.
 ///
 /// `primary` and `secondary` are independently optional — a user may have
-/// bound only a primary, or neither. `update_for_sid` validates that
-/// `mode == StrictSecondaryFailClosed` requires `secondary.is_some()`
-/// before writing.
+/// bound only a primary, or neither.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutePolicyRecord {
     pub primary: Option<RouteBindingRecord>,
     pub secondary: Option<RouteBindingRecord>,
     pub mode: BehaviorMode,
-    pub block_secondary_when_unavailable: bool,
-    /// Kill-switch failure posture. When `true` (the
-    /// default), the kill-switch **fails closed**: if the secondary (VPN)
-    /// interface cannot be resolved at apply time, matched/all traffic is
-    /// blocked rather than leaking out the primary link. When `false` it
-    /// **fails open** (traffic allowed; the GUI surfaces a warning banner).
-    /// Only meaningful when `block_secondary_when_unavailable` is on.
-    pub kill_switch_fail_closed: bool,
-    /// Which IP protocols the emergency block cuts, as a
-    /// bitmask ([`KILL_SWITCH_PROTOCOLS_ALL`] = all). Only meaningful when
-    /// `block_secondary_when_unavailable` is on. Backfills to all protocols
-    /// for rows written before the v16 migration.
+    /// What may leave over the main connection when the additional one is
+    /// meant to carry it. Default [`LeakProtection::default`]: protection is
+    /// the user's opt-in.
+    pub leak_protection: LeakProtection,
+    /// Which IP protocols leak protection cuts while it is on, as a bitmask
+    /// ([`KILL_SWITCH_PROTOCOLS_ALL`] = all).
     pub kill_switch_protocols: u16,
-    /// When `true`, the split-mode
-    /// ([`BehaviorMode::PreferPrimary`]) fail-closed emergency block covers ALL
-    /// egress (catch-all) instead of only the enumerated secondary destination
-    /// IPs, so ICMP/ping and rotating/un-cached IPs of secondary-rule hosts
-    /// cannot leak to the primary while the secondary is down. Only meaningful in
-    /// `PreferPrimary` + fail-closed — the other two modes already catch-all.
-    /// Default `false` (the per-IP behaviour).
-    pub kill_switch_block_all: bool,
-    /// MASTER kill-switch toggle. `false` (the default) means
-    /// the kill-switch is OFF, so NO fail-closed / leak-guard blocking arms at all
-    /// (full opt-in — any leak while the secondary is down is then the user's
-    /// explicit choice). The `kill_switch_fail_closed` / `kill_switch_block_all` /
-    /// `kill_switch_protocols` fields above only take effect when this is `true`.
-    pub kill_switch_enabled: bool,
-    /// OPT-IN "allow name resolution over the primary link while
-    /// the kill-switch block-all is engaged" (default `false` = strict; blocks DNS
-    /// too). When `true`, a port-scoped DNS permit lets zones keep resolving while
-    /// everything else is blocked. Only meaningful in the block-all path.
+    /// Keep name resolution over the main link while everything is blocked.
+    /// Matters only under [`LeakProtection::Everything`] with the tunnel down.
     pub allow_dns_over_primary: bool,
     /// May the service check "does this answer on the main link?" on its own,
     /// or only when the user presses Check? Default `false` — a probe is an
@@ -193,6 +166,10 @@ pub struct RoutePolicyRecord {
     /// What WSL gets while the tunnel is down: "" (not answered yet; behaves
     /// as the computer), "as-computer" or "unprotected".
     pub forwarded_outage: String,
+    /// Ask a public server for the additional route's external address each
+    /// time that route connects. Off by default: the request leaves through the
+    /// tunnel unasked. The check the user starts by hand ignores this.
+    pub external_address_auto_check: bool,
     /// "Treat a domain as `domain` + `*.domain`". When `true`, the
     /// enforcement layer expands every bare-domain (`ExactFqdn`) rule with a
     /// `SuffixDomain` sibling so it also covers subdomains (apex kept).
@@ -207,13 +184,6 @@ pub struct RoutePolicyRecord {
     /// [`SharedIpPolicy::MajorityOfIp`] (balanced). Governs only genuinely
     /// shared addresses; single-tenant routing is unaffected.
     pub shared_ip_policy: SharedIpPolicy,
-    /// How Mode A (`PreferPrimary`) treats a routed domain that resolves to
-    /// an IP NOT in the seeded secondary-destination set. Default
-    /// [`ModeACoverageStrategy::PerIp`] (the permissive posture installs no
-    /// catch-all, so default/primary and zone→primary traffic is not
-    /// blocked; `FailClosedUnknown` is the paranoid opt-in that can briefly
-    /// block unmatched browsing while armed).
-    pub mode_a_coverage_strategy: ModeACoverageStrategy,
     /// When `true` (the DEFAULT), rule-host name resolution BYPASSES the
     /// OS hosts / adblock file so a routed host gets its routable public IP
     /// instead of a `127.0.0.1` pin. `false` honours the hosts file.
@@ -226,8 +196,8 @@ pub struct RoutePolicyRecord {
     /// (`doh_resolver_entries`).
     pub doh_lockdown_enabled: bool,
     /// When the lockdown applies:
-    /// [`DohLockdownScope::LeakProtectionOnly`] (default — only while the
-    /// kill-switch / block-all is armed) or [`DohLockdownScope::Always`].
+    /// [`DohLockdownScope::LeakProtectionOnly`] (default — only while leak
+    /// protection is on) or [`DohLockdownScope::Always`].
     pub doh_lockdown_scope: DohLockdownScope,
     /// The lockdown decides itself: on while this user has rules for the
     /// additional route, whatever the two fields above say. Default `true`;
@@ -239,9 +209,9 @@ pub struct RoutePolicyRecord {
     /// history is privacy-sensitive, so the automatic read is an explicit
     /// per-SID opt-in. The manual seed op works regardless of this flag.
     pub browser_history_auto_seed: bool,
-    /// Kill-switch shared-IP strictness. `false` (default, "smart"): an IP
-    /// the shared-IP census has seen on a direct (non-rule) host is
-    /// EXCLUDED from the kill-switch per-IP pin/block set, so blocking a
+    /// Shared-IP strictness while leak protection is on. `false` (default,
+    /// "smart"): an IP the shared-IP census has seen on a direct (non-rule)
+    /// host is EXCLUDED from the per-IP pin/block set, so blocking a
     /// secondary-routed CDN address cannot cut innocent co-tenant sites.
     /// `true` ("strict"): pin/block every secondary-destined IP regardless
     /// of sharing — no leak, accepts the collateral. Routing (`/32` via the
@@ -262,27 +232,21 @@ pub struct RoutePolicyRecord {
 }
 
 impl RoutePolicyRecord {
-    /// Empty record — neither primary nor secondary bound, mode defaults
-    /// to `PreferPrimary`, leak-guard ON (block-when-unavailable — the safe
-    /// privacy default, "Защита от утечки"), kill-switch posture fail-closed,
-    /// subdomain-coverage ON. Used as the default response for SIDs that have
-    /// not yet sent a `RoutePolicyUpdate`.
+    /// Empty record — neither primary nor secondary bound, mode
+    /// `PreferPrimary`, leak protection at its default, subdomain coverage
+    /// ON. Used as the default response for SIDs that have not yet sent a
+    /// `RoutePolicyUpdate`.
     pub fn empty(binding_source: BindingSource) -> Self {
         Self {
             primary: None,
             secondary: None,
             mode: BehaviorMode::PreferPrimary,
-            block_secondary_when_unavailable: true,
-            kill_switch_fail_closed: true,
+            leak_protection: LeakProtection::default(),
             kill_switch_protocols: KILL_SWITCH_PROTOCOLS_ALL,
-            kill_switch_block_all: false,
-            kill_switch_enabled: false,
-            // Default ON: with DNS cut, an armed fail-closed block-all is a
-            // total blackout (nothing resolves, the FQDN cache never fills,
-            // known-primary hosts never earn permits). The strict toggle
-            // remains for users who accept that. The SQL column DEFAULT
-            // stays 0 (checksummed DDL, inert — upserts always bind every
-            // column).
+            // Default ON: with DNS cut, blocking everything is a total
+            // blackout (nothing resolves, the FQDN cache never fills,
+            // known-primary hosts never earn permits). The SQL column DEFAULT
+            // stays 0 (checksummed DDL, inert — upserts bind every column).
             allow_dns_over_primary: true,
             primary_probe_auto: false,
             primary_probe_timeout_ms: DEFAULT_PRIMARY_PROBE_TIMEOUT_MS,
@@ -294,6 +258,7 @@ impl RoutePolicyRecord {
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
             forwarded_outage: String::new(),
+            external_address_auto_check: false,
             // Default ON: adding `site.example` and silently losing
             // `cdn.site.example` to the other route was the surprising outcome.
             // Widening only adds coverage towards the route the rule names, so
@@ -301,7 +266,6 @@ impl RoutePolicyRecord {
             // stays 0 (checksummed DDL, inert — upserts bind every column).
             include_subdomains: true,
             shared_ip_policy: SharedIpPolicy::default(),
-            mode_a_coverage_strategy: ModeACoverageStrategy::default(),
             resolve_hosts_bypass: true,
             doh_lockdown_enabled: false,
             doh_lockdown_scope: DohLockdownScope::default(),
@@ -357,7 +321,6 @@ pub struct LinkProviderAppRecord {
 pub enum RoutePolicyValidationError {
     EmptySid,
     PrimaryEqualsSecondary,
-    StrictModeRequiresSecondary,
 }
 
 impl std::fmt::Display for RoutePolicyValidationError {
@@ -367,10 +330,6 @@ impl std::fmt::Display for RoutePolicyValidationError {
             Self::PrimaryEqualsSecondary => {
                 write!(f, "primary and secondary cannot reference the same adapter")
             }
-            Self::StrictModeRequiresSecondary => write!(
-                f,
-                "strict-secondary-fail-closed mode requires a bound secondary"
-            ),
         }
     }
 }
@@ -391,15 +350,11 @@ pub struct RouteBindingsRepository<'c> {
 /// never-configured answer, which is why the loader can hand a missing row
 /// straight to it.
 struct BlockPolicyRow {
-    block_secondary_when_unavailable: bool,
-    kill_switch_fail_closed: bool,
+    leak_protection: LeakProtection,
     kill_switch_protocols: u16,
-    kill_switch_block_all: bool,
-    kill_switch_enabled: bool,
     allow_dns_over_primary: bool,
     include_subdomains: bool,
     shared_ip_policy: SharedIpPolicy,
-    mode_a_coverage_strategy: ModeACoverageStrategy,
     resolve_hosts_bypass: bool,
     doh_lockdown_enabled: bool,
     doh_lockdown_scope: DohLockdownScope,
@@ -418,20 +373,17 @@ struct BlockPolicyRow {
     short_name_suffix: String,
     app_rules_take_all_addresses: bool,
     forwarded_outage: String,
+    external_address_auto_check: bool,
 }
 
 impl Default for BlockPolicyRow {
     fn default() -> Self {
         Self {
-            block_secondary_when_unavailable: true,
-            kill_switch_fail_closed: true,
+            leak_protection: LeakProtection::default(),
             kill_switch_protocols: KILL_SWITCH_PROTOCOLS_ALL,
-            kill_switch_block_all: false,
-            kill_switch_enabled: false,
             allow_dns_over_primary: true,
             include_subdomains: true,
             shared_ip_policy: SharedIpPolicy::default(),
-            mode_a_coverage_strategy: ModeACoverageStrategy::default(),
             resolve_hosts_bypass: true,
             doh_lockdown_enabled: false,
             doh_lockdown_scope: DohLockdownScope::default(),
@@ -450,6 +402,7 @@ impl Default for BlockPolicyRow {
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
             forwarded_outage: String::new(),
+            external_address_auto_check: false,
         }
     }
 }
@@ -486,12 +439,6 @@ impl<'c> RouteBindingsRepository<'c> {
                 ));
             }
         }
-        if record.mode == BehaviorMode::StrictSecondaryFailClosed && record.secondary.is_none() {
-            return Err(StorageError::Internal(
-                RoutePolicyValidationError::StrictModeRequiresSecondary.to_string(),
-            ));
-        }
-
         let tx = self
             .conn
             .unchecked_transaction()
@@ -550,10 +497,9 @@ impl<'c> RouteBindingsRepository<'c> {
         // Upsert secondary_block_policy.
         tx.execute(
             "INSERT INTO secondary_block_policy
-                (sid, block_secondary_when_unavailable, kill_switch_fail_closed, \
-                 kill_switch_protocols, kill_switch_block_all, kill_switch_enabled, \
+                (sid, leak_protection, kill_switch_protocols, \
                  allow_dns_over_primary, include_subdomains, shared_ip_policy, \
-                 mode_a_coverage_strategy, resolve_hosts_bypass, \
+                 resolve_hosts_bypass, \
                  doh_lockdown_enabled, doh_lockdown_scope, browser_history_auto_seed, \
                  kill_switch_strict_shared_ips, auto_rules_mode, \
                  auto_rules_eager_delivery_names, primary_probe_auto, \
@@ -561,19 +507,15 @@ impl<'c> RouteBindingsRepository<'c> {
                  primary_probe_repeat_secs, local_networks_auto_accept, \
                  zone_priority_over_ip, short_name_completion, short_name_suffix, \
                  app_rules_take_all_addresses, updated_at, doh_lockdown_auto, \
-                 forwarded_outage)
+                 forwarded_outage, external_address_auto_check)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
              ON CONFLICT(sid) DO UPDATE SET
-                block_secondary_when_unavailable = excluded.block_secondary_when_unavailable,
-                kill_switch_fail_closed = excluded.kill_switch_fail_closed,
+                leak_protection = excluded.leak_protection,
                 kill_switch_protocols = excluded.kill_switch_protocols,
-                kill_switch_block_all = excluded.kill_switch_block_all,
-                kill_switch_enabled = excluded.kill_switch_enabled,
                 allow_dns_over_primary = excluded.allow_dns_over_primary,
                 include_subdomains = excluded.include_subdomains,
                 shared_ip_policy = excluded.shared_ip_policy,
-                mode_a_coverage_strategy = excluded.mode_a_coverage_strategy,
                 resolve_hosts_bypass = excluded.resolve_hosts_bypass,
                 doh_lockdown_enabled = excluded.doh_lockdown_enabled,
                 doh_lockdown_scope = excluded.doh_lockdown_scope,
@@ -592,18 +534,15 @@ impl<'c> RouteBindingsRepository<'c> {
                 app_rules_take_all_addresses = excluded.app_rules_take_all_addresses,
                 updated_at = excluded.updated_at,
                 doh_lockdown_auto = excluded.doh_lockdown_auto,
-                forwarded_outage = excluded.forwarded_outage",
+                forwarded_outage = excluded.forwarded_outage,
+                external_address_auto_check = excluded.external_address_auto_check",
             params![
                 sid,
-                record.block_secondary_when_unavailable as i64,
-                record.kill_switch_fail_closed as i64,
+                record.leak_protection.as_slug(),
                 record.kill_switch_protocols as i64,
-                record.kill_switch_block_all as i64,
-                record.kill_switch_enabled as i64,
                 record.allow_dns_over_primary as i64,
                 record.include_subdomains as i64,
                 record.shared_ip_policy.as_code(),
-                record.mode_a_coverage_strategy.as_code(),
                 record.resolve_hosts_bypass as i64,
                 record.doh_lockdown_enabled as i64,
                 record.doh_lockdown_scope.as_code(),
@@ -622,7 +561,8 @@ impl<'c> RouteBindingsRepository<'c> {
                 record.app_rules_take_all_addresses as i64,
                 now_epoch_secs,
                 record.doh_lockdown_auto as i64,
-                forwarded_outage_slug(&record.forwarded_outage)
+                forwarded_outage_slug(&record.forwarded_outage),
+                record.external_address_auto_check as i64
             ],
         )
         .map_err(|e| StorageError::Internal(format!("upsert block policy: {e}")))?;
@@ -764,7 +704,7 @@ impl<'c> RouteBindingsRepository<'c> {
     pub fn any_leak_guard_armed(&self) -> StorageResult<bool> {
         self.conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM secondary_block_policy WHERE kill_switch_enabled = 1)",
+                "SELECT EXISTS(SELECT 1 FROM secondary_block_policy WHERE leak_protection <> 'off')",
                 [],
                 |row| row.get::<_, bool>(0),
             )
@@ -784,15 +724,11 @@ impl<'c> RouteBindingsRepository<'c> {
             primary: primary.map(|(b, _)| b),
             secondary: secondary.map(|(b, _)| b),
             mode,
-            block_secondary_when_unavailable: policy.block_secondary_when_unavailable,
-            kill_switch_fail_closed: policy.kill_switch_fail_closed,
+            leak_protection: policy.leak_protection,
             kill_switch_protocols: policy.kill_switch_protocols,
-            kill_switch_block_all: policy.kill_switch_block_all,
-            kill_switch_enabled: policy.kill_switch_enabled,
             allow_dns_over_primary: policy.allow_dns_over_primary,
             include_subdomains: policy.include_subdomains,
             shared_ip_policy: policy.shared_ip_policy,
-            mode_a_coverage_strategy: policy.mode_a_coverage_strategy,
             resolve_hosts_bypass: policy.resolve_hosts_bypass,
             doh_lockdown_enabled: policy.doh_lockdown_enabled,
             doh_lockdown_scope: policy.doh_lockdown_scope,
@@ -811,6 +747,7 @@ impl<'c> RouteBindingsRepository<'c> {
             short_name_suffix: policy.short_name_suffix,
             app_rules_take_all_addresses: policy.app_rules_take_all_addresses,
             forwarded_outage: policy.forwarded_outage,
+            external_address_auto_check: policy.external_address_auto_check,
             binding_source,
         })
     }
@@ -902,10 +839,9 @@ impl<'c> RouteBindingsRepository<'c> {
         let row: Option<BlockPolicyRow> = self
             .conn
             .query_row(
-                "SELECT block_secondary_when_unavailable, kill_switch_fail_closed, \
-                 kill_switch_protocols, kill_switch_block_all, kill_switch_enabled, \
+                "SELECT leak_protection, kill_switch_protocols, \
                  allow_dns_over_primary, include_subdomains, shared_ip_policy, \
-                 mode_a_coverage_strategy, resolve_hosts_bypass, \
+                 resolve_hosts_bypass, \
                  doh_lockdown_enabled, doh_lockdown_scope, browser_history_auto_seed, \
                  kill_switch_strict_shared_ips, auto_rules_mode, \
                  auto_rules_eager_delivery_names, primary_probe_auto, \
@@ -913,71 +849,59 @@ impl<'c> RouteBindingsRepository<'c> {
                  primary_probe_repeat_secs, \
                  local_networks_auto_accept, zone_priority_over_ip, \
                  short_name_completion, short_name_suffix, app_rules_take_all_addresses, \
-                 doh_lockdown_auto, forwarded_outage
+                 doh_lockdown_auto, forwarded_outage, external_address_auto_check
                  FROM secondary_block_policy WHERE sid = ?1",
                 params![sid],
                 |row| {
-                    let auto_rules_mode: String = row.get(14)?;
+                    let auto_rules_mode: String = row.get(10)?;
                     Ok(BlockPolicyRow {
-                        block_secondary_when_unavailable: row.get::<_, i64>(0)? != 0,
-                        kill_switch_fail_closed: row.get::<_, i64>(1)? != 0,
+                        leak_protection: stored_leak_protection(&row.get::<_, String>(0)?)?,
                         kill_switch_protocols: stored_kill_switch_protocols(
                             sid,
-                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(1)?,
                         ),
-                        kill_switch_block_all: row.get::<_, i64>(3)? != 0,
-                        kill_switch_enabled: row.get::<_, i64>(4)? != 0,
-                        allow_dns_over_primary: row.get::<_, i64>(5)? != 0,
-                        include_subdomains: row.get::<_, i64>(6)? != 0,
+                        allow_dns_over_primary: row.get::<_, i64>(2)? != 0,
+                        include_subdomains: row.get::<_, i64>(3)? != 0,
                         // Unknown code (shouldn't happen — CHECK-constrained) → default.
-                        shared_ip_policy: SharedIpPolicy::from_code(row.get::<_, i64>(7)?)
+                        shared_ip_policy: SharedIpPolicy::from_code(row.get::<_, i64>(4)?)
                             .unwrap_or_default(),
-                        mode_a_coverage_strategy: ModeACoverageStrategy::from_code(
-                            row.get::<_, i64>(8)?,
-                        )
-                        .unwrap_or_default(),
-                        resolve_hosts_bypass: row.get::<_, i64>(9)? != 0,
-                        doh_lockdown_enabled: row.get::<_, i64>(10)? != 0,
-                        doh_lockdown_scope: DohLockdownScope::from_code(row.get::<_, i64>(11)?)
+                        resolve_hosts_bypass: row.get::<_, i64>(5)? != 0,
+                        doh_lockdown_enabled: row.get::<_, i64>(6)? != 0,
+                        doh_lockdown_scope: DohLockdownScope::from_code(row.get::<_, i64>(7)?)
                             .unwrap_or_default(),
-                        browser_history_auto_seed: row.get::<_, i64>(12)? != 0,
-                        kill_switch_strict_shared_ips: row.get::<_, i64>(13)? != 0,
+                        browser_history_auto_seed: row.get::<_, i64>(8)? != 0,
+                        kill_switch_strict_shared_ips: row.get::<_, i64>(9)? != 0,
                         // Unknown slug → the default; never silently promote to
                         // applying rules unattended.
                         auto_rules_mode: AutoRulesMode::from_slug(&auto_rules_mode)
                             .unwrap_or_default(),
-                        auto_rules_eager_delivery_names: row.get::<_, i64>(15)? != 0,
-                        primary_probe_auto: row.get::<_, i64>(16)? != 0,
+                        auto_rules_eager_delivery_names: row.get::<_, i64>(11)? != 0,
+                        primary_probe_auto: row.get::<_, i64>(12)? != 0,
                         // `as u32` wraps modulo 2^32, so a value the schema
                         // cannot reject (INTEGER, no CHECK) turned a huge
                         // timeout into a tiny one — a probe that gives up
                         // instantly reads as "the primary is down". Out of
                         // range falls back to the column default instead.
-                        primary_probe_timeout_ms: u32::try_from(row.get::<_, i64>(17)?)
+                        primary_probe_timeout_ms: u32::try_from(row.get::<_, i64>(13)?)
                             .unwrap_or(DEFAULT_PRIMARY_PROBE_TIMEOUT_MS),
-                        primary_probe_max_targets: u32::try_from(row.get::<_, i64>(18)?)
+                        primary_probe_max_targets: u32::try_from(row.get::<_, i64>(14)?)
                             .unwrap_or(DEFAULT_PRIMARY_PROBE_MAX_TARGETS),
-                        primary_probe_repeat_secs: u32::try_from(row.get::<_, i64>(19)?)
+                        primary_probe_repeat_secs: u32::try_from(row.get::<_, i64>(15)?)
                             .unwrap_or(DEFAULT_PRIMARY_PROBE_REPEAT_SECS),
-                        local_networks_auto_accept: row.get::<_, i64>(20)? != 0,
-                        zone_priority_over_ip: row.get::<_, i64>(21)? != 0,
-                        short_name_completion: row.get::<_, i64>(22)? != 0,
-                        short_name_suffix: row.get(23)?,
-                        app_rules_take_all_addresses: row.get::<_, i64>(24)? != 0,
-                        doh_lockdown_auto: row.get::<_, i64>(25)? != 0,
-                        forwarded_outage: row.get(26)?,
+                        local_networks_auto_accept: row.get::<_, i64>(16)? != 0,
+                        zone_priority_over_ip: row.get::<_, i64>(17)? != 0,
+                        short_name_completion: row.get::<_, i64>(18)? != 0,
+                        short_name_suffix: row.get(19)?,
+                        app_rules_take_all_addresses: row.get::<_, i64>(20)? != 0,
+                        doh_lockdown_auto: row.get::<_, i64>(21)? != 0,
+                        forwarded_outage: row.get(22)?,
+                        external_address_auto_check: row.get::<_, i64>(23)? != 0,
                     })
                 },
             )
             .optional()
             .map_err(|e| StorageError::Internal(format!("load block policy: {e}")))?;
-        // A missing row means the user never sent a policy: leak-guard ON,
-        // fail-closed, all protocols, block-all OFF (per-IP), DNS-over-primary
-        // ON (a DNS-cut block-all would otherwise be a total blackout),
-        // subdomain coverage ON, balanced shared-IP policy, Mode-A default
-        // coverage, hosts-bypass ON, DoH lockdown OFF, history seed OFF,
-        // findings offered but never applied unattended, and probing only when
-        // asked for.
+        // A missing row means the user never sent a policy: the defaults.
         Ok(row.unwrap_or_default())
     }
 
@@ -1157,6 +1081,18 @@ fn insert_binding(
     )
     .map(|_| ())
     .map_err(|e| StorageError::Internal(format!("insert binding {role}: {e}")))
+}
+
+/// A stored leak-protection slug. Anything else is a read error, never a
+/// default: the value decides what may leak.
+fn stored_leak_protection(raw: &str) -> rusqlite::Result<LeakProtection> {
+    raw.parse().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("unknown leak_protection {raw:?}").into(),
+        )
+    })
 }
 
 /// A stored protocol mask, or every protocol when it blocks nothing: the column

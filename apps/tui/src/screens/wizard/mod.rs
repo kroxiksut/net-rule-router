@@ -4,17 +4,26 @@
 //! set, the user's own files, or none. Every step is one numbered list of
 //! answers, the same in both modes.
 
-mod import;
+pub(crate) mod import;
 pub mod keys;
+mod licence;
 mod presets;
+mod stability;
 
 use std::cell::OnceCell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nrr_client_logic::adapters::{display_name, held_other_role, unroutable_reason};
+use nrr_client_logic::route_policy::{
+    coerce_leak_protection, leak_protection_choices_at_least, leak_protection_holds_now,
+    raise_leak_protection,
+};
 use nrr_client_logic::Route;
 use nrr_shared::display_text::display_text;
-use nrr_shared::ipc_payloads::{InterfaceRowDto, SnapshotInitialResponse};
+use nrr_shared::first_run_sheet::ProvisioningAnswers;
+use nrr_shared::ipc_payloads::{
+    BehaviorModeDto, InterfaceRowDto, RoutePolicyDto, SnapshotInitialResponse,
+};
 use nrr_shared::AppSection;
 use serde_json::Value;
 
@@ -36,6 +45,8 @@ pub struct WizardScreen;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Step {
+    /// The agreement, before the first question; not one of the numbered steps.
+    Licence,
     #[default]
     Language,
     Primary,
@@ -52,7 +63,7 @@ const STEP_COUNT: usize = 5;
 impl Step {
     fn number(self) -> usize {
         match self {
-            Self::Language => 1,
+            Self::Licence | Self::Language => 1,
             Self::Primary => 2,
             Self::Secondary => 3,
             Self::Protection => 4,
@@ -62,6 +73,7 @@ impl Step {
 
     fn name(self) -> Key {
         match self {
+            Self::Licence => k::LICENCE_TITLE,
             Self::Language => k::LANGUAGE_TITLE,
             Self::Primary => common::ROLE_PRIMARY,
             Self::Secondary => common::ROLE_SECONDARY,
@@ -72,6 +84,7 @@ impl Step {
 
     fn next(self) -> Self {
         match self {
+            Self::Licence => Self::Language,
             Self::Language => Self::Primary,
             Self::Primary => Self::Secondary,
             Self::Secondary => Self::Protection,
@@ -81,7 +94,7 @@ impl Step {
 
     fn previous(self) -> Self {
         match self {
-            Self::Language | Self::Primary => Self::Language,
+            Self::Licence | Self::Language | Self::Primary => Self::Language,
             Self::Secondary => Self::Primary,
             Self::Protection => Self::Secondary,
             Self::Rules => Self::Protection,
@@ -109,6 +122,7 @@ enum Outcome {
     FileError { path: String, error: ReadError },
     ImportFailed(String),
     NotUnderstood(String),
+    LicenceNotSaved,
 }
 
 /// The files of the starting set, as read, and the payload sent for them.
@@ -124,10 +138,36 @@ pub struct WizardState {
     pub locale: Vec<String>,
     /// The start-up check (open when the user has no connections) has run.
     decided: bool,
+    /// The setup was asked for (`--wizard`), so accepting the agreement goes on
+    /// to its questions rather than back to where the program started.
+    requested: bool,
+    /// The agreement has not been accepted by this user yet: nothing else opens.
+    licence_needed: bool,
+    licence_page: usize,
+    /// The session language the agreement is shown in.
+    licence_language: String,
+    /// What the installer answered ahead of the first launch.
+    pub sheet: Option<ProvisioningAnswers>,
     step: Step,
     cursor: usize,
-    kill_switch: bool,
+    /// The leak-protection level, as its wire slug.
+    leak_protection: &'static str,
     doh_lockdown: bool,
+    /// Route sites by name (fake-IP); the GUI offers it on.
+    fake_ip: bool,
+    /// The window detailed diagnostic logs are written for; `None`: none.
+    diagnostic_logs: Option<&'static str>,
+    /// The machine-wide answers went to the service this run.
+    stability_sent: bool,
+    /// One of them was changed on the protection step.
+    stability_touched: bool,
+    /// What their write left to tell; outlives the run it came from.
+    stability_notice: Option<stability::StabilityNotice>,
+    /// What the service held when the setup opened, when the user was already
+    /// set up; the protection is then sent only if the user changed it.
+    protection_at_start: Option<(&'static str, bool)>,
+    /// The first look at the snapshot has been taken.
+    seeded: bool,
     secondary_deferred: bool,
     protection_sent: bool,
     question: Option<RoleChange>,
@@ -147,12 +187,24 @@ impl Default for WizardState {
         Self {
             locale: Vec::new(),
             decided: false,
+            requested: false,
+            licence_needed: false,
+            licence_page: 0,
+            licence_language: String::new(),
+            sheet: None,
             step: Step::default(),
             cursor: 0,
             // The GUI offers both on: protection helps only if it is on before
             // the first rule applies.
-            kill_switch: true,
+            leak_protection: LEAK_OFFERED,
             doh_lockdown: true,
+            fake_ip: true,
+            diagnostic_logs: None,
+            stability_sent: false,
+            stability_touched: false,
+            stability_notice: None,
+            protection_at_start: None,
+            seeded: false,
             secondary_deferred: false,
             protection_sent: false,
             question: None,
@@ -172,6 +224,28 @@ impl WizardState {
     /// `--wizard`: the user asked for the setup, so start-up does not decide.
     pub fn opened_by_request(&mut self) {
         self.decided = true;
+        self.requested = true;
+    }
+
+    /// The agreement is still to be accepted; every other screen waits.
+    pub fn licence_pending(&self) -> bool {
+        self.licence_needed
+    }
+
+    /// Start-up: what the user's settings say about the agreement, and the
+    /// installer's answers when there are any.
+    pub fn at_startup(
+        &mut self,
+        accepted_eula: u32,
+        language: &str,
+        sheet: Option<ProvisioningAnswers>,
+    ) {
+        self.sheet = sheet;
+        self.licence_language = language.to_string();
+        self.licence_needed = !nrr_shared::eula::is_accepted(accepted_eula);
+        if self.licence_needed {
+            self.step = Step::Licence;
+        }
     }
 
     fn languages(&self) -> &[Language] {
@@ -198,6 +272,8 @@ impl WizardState {
         let fresh = Self {
             locale: std::mem::take(&mut self.locale),
             decided: true,
+            sheet: self.sheet.take(),
+            stability_notice: self.stability_notice.take(),
             languages: std::mem::take(&mut self.languages),
             packs: std::mem::take(&mut self.packs),
             ..Self::default()
@@ -215,9 +291,12 @@ pub fn needs_setup(snapshot: &SnapshotInitialResponse) -> bool {
         .is_none_or(|p| p.primary.is_none() && p.secondary.is_none())
 }
 
+pub use stability::announce;
+
 /// The first snapshot decides, once, whether the setup opens by itself — and
 /// only while the user is still on the screen the program started on.
 pub fn snapshot_arrived(app: &mut AppState) {
+    seed_protection(app);
     if app.wizard.decided || !app.link.is_connected() {
         return;
     }
@@ -240,8 +319,10 @@ enum Action {
     Assign(Route, String),
     Later,
     Refresh,
-    ToggleKillSwitch,
+    LeakProtection(&'static str),
     ToggleDohLockdown,
+    ToggleFakeIp,
+    DiagnosticLogs,
     Pack(usize),
     OtherCountries,
     OwnFiles,
@@ -251,6 +332,10 @@ enum Action {
     Apply,
     Confirm,
     Cancel,
+    PreviousPage,
+    NextPage,
+    Accept,
+    Decline,
 }
 
 fn region(app: &AppState) -> Option<String> {
@@ -275,6 +360,13 @@ fn assigned(app: &AppState, route: Route) -> Option<String> {
         .map(|name| display_text(&name).into_owned())
 }
 
+/// The additional connection the user has bound, as the adapters read shows it.
+fn secondary_row(app: &AppState) -> Option<InterfaceRowDto> {
+    adapters(app, true)
+        .into_iter()
+        .find(|row| holds(row, Route::Secondary))
+}
+
 fn pickable(app: &AppState) -> bool {
     app.link.is_connected() && rows_are_live(app)
 }
@@ -287,6 +379,16 @@ fn actions(app: &AppState) -> Vec<Action> {
     }
     let mut actions = Vec::new();
     match state.step {
+        Step::Licence => {
+            if state.licence_page > 0 {
+                actions.push(Action::PreviousPage);
+            }
+            if state.licence_page + 1 < licence_pages(app).len() {
+                actions.push(Action::NextPage);
+            }
+            actions.extend([Action::Accept, Action::Decline]);
+            return actions;
+        }
         Step::Language => {
             actions.extend(
                 state
@@ -321,12 +423,19 @@ fn actions(app: &AppState) -> Vec<Action> {
             actions.push(Action::Back);
         }
         Step::Protection => {
-            actions.extend([
-                Action::ToggleKillSwitch,
-                Action::ToggleDohLockdown,
-                Action::Next,
-                Action::Back,
-            ]);
+            actions.extend(
+                leak_protection_choices_at_least(default_route(app), leak_floor(app))
+                    .into_iter()
+                    .map(Action::LeakProtection),
+            );
+            actions.push(Action::ToggleDohLockdown);
+            if stability::offers_fake_ip() {
+                actions.push(Action::ToggleFakeIp);
+            }
+            if stability::offers_logs() {
+                actions.push(Action::DiagnosticLogs);
+            }
+            actions.extend([Action::Next, Action::Back]);
         }
         Step::Rules => {
             let regional = regional_indexes(app);
@@ -427,18 +536,40 @@ fn label(action: &Action, app: &AppState, texts: &Texts) -> String {
             .unwrap_or_default(),
         Action::Later => texts.get(k::SECONDARY_LATER),
         Action::Refresh => texts.get(k::REFRESH),
-        Action::ToggleKillSwitch => texts.fill(
-            k::SETTING,
-            &[
-                ("name", texts.get(k::KILL_SWITCH)),
-                ("value", yes_no(state.kill_switch)),
-            ],
-        ),
+        Action::LeakProtection(level) => {
+            let value = texts.get(level_label(level));
+            let value = if *level == shown_level(app) {
+                texts.fill(k::CURRENT, &[("name", value)])
+            } else {
+                value
+            };
+            texts.fill(
+                k::SETTING,
+                &[("name", texts.get(k::LEAK_PROTECTION)), ("value", value)],
+            )
+        }
         Action::ToggleDohLockdown => texts.fill(
             k::SETTING,
             &[
                 ("name", texts.get(k::DOH_LOCKDOWN)),
                 ("value", yes_no(state.doh_lockdown)),
+            ],
+        ),
+        Action::ToggleFakeIp => texts.fill(
+            k::SETTING,
+            &[
+                ("name", texts.get(k::FAKE_IP)),
+                ("value", yes_no(state.fake_ip)),
+            ],
+        ),
+        Action::DiagnosticLogs => texts.fill(
+            k::SETTING,
+            &[
+                ("name", texts.get(k::DIAGNOSTIC_LOGS)),
+                (
+                    "value",
+                    texts.get(stability::log_window_label(state.diagnostic_logs)),
+                ),
             ],
         ),
         Action::Pack(index) => pack_label(state.packs(), *index, texts),
@@ -457,6 +588,10 @@ fn label(action: &Action, app: &AppState, texts: &Texts) -> String {
         Action::Apply => texts.get(k::APPLY),
         Action::Confirm => texts.get(ik::UNROUTABLE_CONFIRM),
         Action::Cancel => texts.get(ik::CANCEL),
+        Action::PreviousPage => texts.get(k::LICENCE_PREVIOUS),
+        Action::NextPage => texts.get(k::LICENCE_NEXT),
+        Action::Accept => texts.get(k::LICENCE_ACCEPT),
+        Action::Decline => texts.get(k::LICENCE_DECLINE),
     }
 }
 
@@ -469,14 +604,27 @@ fn perform(app: &mut AppState, action: Action) {
         Action::Next => {
             if app.wizard.step == Step::Protection {
                 send_protection(app);
+                stability::send(app);
             }
             let next = app.wizard.step.next();
             app.wizard.go(next);
+            preselect(app);
         }
         Action::Back => {
             let previous = app.wizard.step.previous();
             app.wizard.go(previous);
+            preselect(app);
         }
+        Action::PreviousPage => {
+            app.wizard.licence_page = app.wizard.licence_page.saturating_sub(1);
+            app.wizard.cursor = 0;
+        }
+        Action::NextPage => {
+            app.wizard.licence_page += 1;
+            app.wizard.cursor = 0;
+        }
+        Action::Accept => accept_licence(app),
+        Action::Decline => app.quit = true,
         Action::Close | Action::StartEmpty => finish(app, None),
         Action::Assign(route, key) => assign(app, route, &key),
         Action::Later => {
@@ -484,13 +632,27 @@ fn perform(app: &mut AppState, action: Action) {
             app.wizard.cursor = 0;
         }
         Action::Refresh => app.outbox.push(adapters_read(false, |_, _| {})),
-        Action::ToggleKillSwitch => {
-            app.wizard.kill_switch = !app.wizard.kill_switch;
+        Action::LeakProtection(level) => {
+            seed_protection(app);
+            app.wizard.leak_protection = level;
             app.wizard.protection_sent = false;
         }
         Action::ToggleDohLockdown => {
+            seed_protection(app);
             app.wizard.doh_lockdown = !app.wizard.doh_lockdown;
             app.wizard.protection_sent = false;
+        }
+        Action::ToggleFakeIp => {
+            seed_protection(app);
+            app.wizard.fake_ip = !app.wizard.fake_ip;
+            app.wizard.stability_sent = false;
+            app.wizard.stability_touched = true;
+        }
+        Action::DiagnosticLogs => {
+            seed_protection(app);
+            app.wizard.diagnostic_logs = stability::next_log_window(app.wizard.diagnostic_logs);
+            app.wizard.stability_sent = false;
+            app.wizard.stability_touched = true;
         }
         Action::Pack(index) => {
             let Some(pack) = app.wizard.packs().get(index).cloned() else {
@@ -521,6 +683,103 @@ fn perform(app: &mut AppState, action: Action) {
         }
         Action::Cancel => app.wizard.question = None,
     }
+}
+
+/// Records the acceptance where the window reads it, then goes on: to the
+/// questions when the setup was asked for or is due, else back to the screen the
+/// program started on.
+fn accept_licence(app: &mut AppState) {
+    let saved = match app.rules.settings_file.clone() {
+        Some(file) => nrr_shared::user_settings::UserSettingsStore::at(file)
+            .update(|settings| {
+                settings.accepted_eula = settings
+                    .accepted_eula
+                    .max(nrr_shared::eula::CURRENT_EULA_VERSION);
+            })
+            .is_ok(),
+        // Under `sudo` there is no file of the user's own to write.
+        None => false,
+    };
+    app.wizard.licence_needed = false;
+    app.wizard.licence_page = 0;
+    if app.wizard.requested {
+        app.wizard.go(Step::Language);
+        preselect(app);
+    } else {
+        app.wizard.reset();
+        app.wizard.decided = false;
+        app.open(ScreenId::Status);
+        snapshot_arrived(app);
+    }
+    if !saved && app.rules.settings_file.is_some() {
+        app.wizard.outcome = Some(Outcome::LicenceNotSaved);
+    }
+}
+
+fn licence_pages(app: &AppState) -> Vec<Vec<String>> {
+    licence::pages(licence::text(&app.wizard.licence_language))
+}
+
+/// Puts the cursor on the answer the installer's sheet gave for the step just
+/// entered; the user still confirms it.
+fn preselect(app: &mut AppState) {
+    let Some(sheet) = app.wizard.sheet.clone() else {
+        return;
+    };
+    let wanted: Option<Action> = match app.wizard.step {
+        Step::Language => sheet.language.as_deref().and_then(|tag| {
+            let base = tag
+                .split(['-', '_'])
+                .next()
+                .unwrap_or(tag)
+                .to_ascii_lowercase();
+            app.wizard
+                .languages()
+                .iter()
+                .find(|l| l.id.eq_ignore_ascii_case(&base) || l.id.eq_ignore_ascii_case(tag))
+                .map(|l| Action::Language(l.id.clone()))
+        }),
+        Step::Primary | Step::Secondary => {
+            let (route, name) = if app.wizard.step == Step::Primary {
+                (Route::Primary, sheet.primary_connection.as_deref())
+            } else {
+                (Route::Secondary, sheet.secondary_connection.as_deref())
+            };
+            name.and_then(|name| {
+                adapters(app, false)
+                    .iter()
+                    .find(|row| {
+                        row.name == name
+                            || row.adapter_name == name
+                            || row.interface_description == name
+                    })
+                    .map(|row| Action::Assign(route, super::binding::row_key(row)))
+            })
+        }
+        Step::Rules => sheet.rule_set.as_deref().and_then(|set| {
+            if set == "none" {
+                return Some(Action::StartEmpty);
+            }
+            let root = presets::bundled_root()?;
+            app.wizard
+                .packs()
+                .iter()
+                .position(|pack| pack_is_named(pack, &root, set))
+                .map(Action::Pack)
+        }),
+        _ => None,
+    };
+    if let Some(at) = wanted.and_then(|w| actions(app).iter().position(|a| *a == w)) {
+        app.wizard.cursor = at;
+    }
+}
+
+/// Whether the sheet's `<country>/<pack>` names this bundled set.
+fn pack_is_named(pack: &Pack, root: &std::path::Path, named: &str) -> bool {
+    pack.dir.strip_prefix(root).is_ok_and(|relative| {
+        let portable = relative.to_string_lossy().replace('\\', "/");
+        portable == named.trim_matches('/')
+    })
 }
 
 fn assign(app: &mut AppState, route: Route, key: &str) {
@@ -561,10 +820,111 @@ fn start_role(app: &mut AppState, change: RoleChange) {
     }));
 }
 
-/// Kill switch and DNS lockdown as ONE write, so neither is sent over a
+/// What a new user is offered: protection helps only if it is on before the
+/// first rule applies.
+const LEAK_OFFERED: &str = "sites";
+
+/// The default route the service holds, as its wire slug; while there is no
+/// policy yet, the one the first save starts from.
+fn default_route(app: &AppState) -> &'static str {
+    let Some(snapshot) = app.snapshot.as_ref() else {
+        return "prefer-primary";
+    };
+    match (&snapshot.route_policy, &snapshot.first_policy) {
+        (Some(policy), _) => route_slug(policy.mode),
+        (None, Some(first)) => route_slug(first.mode),
+        (None, None) => "prefer-primary",
+    }
+}
+
+/// The weakest level the first save may hold; none once a policy exists.
+fn leak_floor(app: &AppState) -> &'static str {
+    app.snapshot
+        .as_ref()
+        .filter(|s| s.route_policy.is_none())
+        .and_then(|s| s.first_policy.as_ref())
+        .map_or("off", |first| first.leak_protection_at_least.as_slug())
+}
+
+fn route_slug(mode: BehaviorModeDto) -> &'static str {
+    match mode {
+        BehaviorModeDto::PreferPrimary => "prefer-primary",
+        BehaviorModeDto::PreferSecondaryWhenAvailable => "prefer-secondary-when-available",
+    }
+}
+
+/// The level a policy holds, as its default route offers it.
+fn held_level(p: &RoutePolicyDto) -> &'static str {
+    coerce_leak_protection(route_slug(p.mode), p.leak_protection.as_slug())
+}
+
+/// The chosen level as the current default route offers it, never below the
+/// first save's floor.
+fn shown_level(app: &AppState) -> &'static str {
+    raise_leak_protection(
+        default_route(app),
+        app.wizard.leak_protection,
+        leak_floor(app),
+    )
+}
+
+fn level_label(level: &str) -> Key {
+    match level {
+        "sites" => k::LEAK_SITES,
+        "everything" => k::LEAK_EVERYTHING,
+        _ => k::LEAK_OFF,
+    }
+}
+
+fn level_note(level: &str) -> Key {
+    match level {
+        "sites" => k::LEAK_SITES_NOTE,
+        "everything" => k::LEAK_EVERYTHING_NOTE,
+        _ => k::LEAK_OFF_NOTE,
+    }
+}
+
+/// Leak protection and DNS lockdown as ONE write, so neither is sent over a
 /// snapshot the other has not reached yet.
+/// A user already set up starts from what the service holds; a new one from
+/// the offer (both on). Taken once, before anything is changed.
+fn seed_protection(app: &mut AppState) {
+    let state = &app.wizard;
+    if state.seeded {
+        return;
+    }
+    let Some(snapshot) = app.snapshot.as_ref() else {
+        return;
+    };
+    let held = snapshot
+        .route_policy
+        .as_ref()
+        .filter(|_| !needs_setup(snapshot))
+        .map(|p| (held_level(p), p.doh_lockdown_auto || p.doh_lockdown_enabled));
+    let state = &mut app.wizard;
+    state.seeded = true;
+    state.protection_at_start = held;
+    if let Some((level, doh_lockdown)) = held {
+        state.leak_protection = level;
+        state.doh_lockdown = doh_lockdown;
+    } else if let Some(sheet) = &state.sheet {
+        // A new user starts from the installer's answers, else from the offer.
+        if let Some(level) = sheet.leak_protection {
+            state.leak_protection = level.as_slug();
+        }
+        state.doh_lockdown = sheet.doh_lockdown.unwrap_or(state.doh_lockdown);
+        state.fake_ip = sheet.fake_ip.unwrap_or(state.fake_ip);
+    }
+}
+
 fn send_protection(app: &mut AppState) {
+    seed_protection(app);
     if app.wizard.protection_sent {
+        return;
+    }
+    // Nothing changed for a user already set up: nothing to write.
+    let chosen = (shown_level(app), app.wizard.doh_lockdown);
+    if app.wizard.protection_at_start == Some(chosen) {
         return;
     }
     if !app.link.is_connected() {
@@ -572,10 +932,11 @@ fn send_protection(app: &mut AppState) {
         return;
     }
     app.wizard.protection_sent = true;
-    let (kill_switch, doh_lockdown) = (app.wizard.kill_switch, app.wizard.doh_lockdown);
+    let (level, doh_lockdown) = chosen;
     app.outbox.push(policy_write(
         move |request| {
-            request.insert("kill-switch-enabled".into(), Value::Bool(kill_switch));
+            // Settled against the default route the service holds at the write.
+            request.insert("leak-protection".into(), Value::from(level));
             request.insert("doh-lockdown-enabled".into(), Value::Bool(doh_lockdown));
             // "Yes" is the automatic posture; "no" is a choice that holds.
             request.insert("doh-lockdown-auto".into(), Value::Bool(doh_lockdown));
@@ -673,6 +1034,7 @@ fn after_setup() -> ScreenId {
 /// GUI's window does.
 fn finish(app: &mut AppState, imported_rules: Option<usize>) {
     send_protection(app);
+    stability::send(app);
     app.wizard.reset();
     let target = after_setup();
     app.open(target);
@@ -685,14 +1047,18 @@ impl Screen for WizardScreen {
     fn view(&self, app: &AppState, texts: &Texts) -> ScreenView {
         let state = &app.wizard;
         let step = state.step;
-        let heading = texts.fill(
-            k::STEP,
-            &[
-                ("number", step.number().to_string()),
-                ("total", STEP_COUNT.to_string()),
-                ("name", texts.get(step.name())),
-            ],
-        );
+        let heading = if step == Step::Licence {
+            texts.get(k::LICENCE_TITLE)
+        } else {
+            texts.fill(
+                k::STEP,
+                &[
+                    ("number", step.number().to_string()),
+                    ("total", STEP_COUNT.to_string()),
+                    ("name", texts.get(step.name())),
+                ],
+            )
+        };
         let mut panels = vec![Panel {
             title: heading,
             lines: step_lines(app, texts),
@@ -738,6 +1104,12 @@ impl Screen for WizardScreen {
     }
 
     fn on_show(&self, app: &mut AppState) {
+        // A run not begun yet starts from what the service holds now.
+        if app.wizard.step == Step::Language {
+            app.wizard.seeded = false;
+            preselect(app);
+        }
+        seed_protection(app);
         if app.link.is_connected() {
             app.outbox.push(adapters_read(false, |_, _| {}));
         }
@@ -751,6 +1123,14 @@ impl Screen for WizardScreen {
     /// them rather than opening a screen.
     fn captures_keys(&self, _app: &AppState) -> bool {
         true
+    }
+
+    fn text_target(&self, app: &AppState) -> crate::paste::TextTarget {
+        if app.wizard.editing.is_some() {
+            crate::paste::TextTarget::Line
+        } else {
+            crate::paste::TextTarget::None
+        }
     }
 
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
@@ -849,7 +1229,23 @@ fn step_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     let state = &app.wizard;
     let mut lines: Vec<String> = Vec::new();
     match state.step {
-        Step::Language => lines.push(texts.get(k::LANGUAGE_NOTE)),
+        Step::Licence => {
+            let pages = licence_pages(app);
+            lines.extend(pages.get(state.licence_page).cloned().unwrap_or_default());
+            lines.push(texts.fill(
+                k::LICENCE_PAGE,
+                &[
+                    ("number", (state.licence_page + 1).to_string()),
+                    ("total", pages.len().max(1).to_string()),
+                ],
+            ));
+        }
+        Step::Language => {
+            lines.push(texts.get(k::LANGUAGE_NOTE));
+            if state.sheet.is_some() {
+                lines.push(texts.get(k::SHEET_NOTE));
+            }
+        }
         Step::Primary => match assigned(app, Route::Primary) {
             Some(name) => lines.push(texts.fill(k::PRIMARY_ASSIGNED, &[("name", name)])),
             None => {
@@ -874,7 +1270,13 @@ fn step_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
                 }
             }
         },
-        Step::Protection => lines.push(texts.get(k::PROTECTION_DESCRIPTION)),
+        Step::Protection => {
+            lines.push(texts.get(k::PROTECTION_DESCRIPTION));
+            lines.push(texts.get(level_note(shown_level(app))));
+            if leak_protection_holds_now(shown_level(app), secondary_row(app).as_ref()) {
+                lines.push(texts.get(k::LEAK_HOLDS_NOW));
+            }
+        }
         Step::Rules | Step::OtherCountries => {
             lines.push(texts.get(k::RULES_DESCRIPTION));
             if state.step == Step::Rules && regional_indexes(app).is_empty() {
@@ -956,6 +1358,7 @@ fn status_line(app: &AppState, texts: &Texts) -> Option<String> {
         Outcome::ImportFailed(code) => {
             format!("{}{}", texts.get(k::IMPORT_FAILED), error_text(code, texts))
         }
+        Outcome::LicenceNotSaved => texts.get(k::LICENCE_NOT_SAVED),
         Outcome::NotUnderstood(input) => texts.fill(common::PLAIN_UNKNOWN, &[("input", input)]),
     })
 }

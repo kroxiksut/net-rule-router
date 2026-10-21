@@ -7,7 +7,10 @@
 //! "bypass traverse checking" — so the archive directory is raised to `0711`:
 //! traversable, still unlistable, which keeps one user from discovering another
 //! user's exports even though both live there. The file itself is then chowned
-//! to the caller and left `0600`, so only they can read it.
+//! to the caller and left `0400`: only they can read it, and no write bit is
+//! offered. An owner can still chmod their own file; ownership is the closest
+//! a plain-permissions port gets to "read and copy out", and the parent stays
+//! root's, so the file cannot be deleted or replaced by the user.
 //!
 //! Only the ARCHIVE directory is touched; `/var/lib/<product>` and its
 //! databases stay `0700`.
@@ -27,8 +30,8 @@ use nrr_platform_api::error::PlatformError;
 /// Directory mode that lets a user open a known file inside without being able
 /// to list what else is there.
 const TRAVERSABLE_DIR_MODE: u32 = 0o711;
-/// File mode for a handed-off file: its new owner, and nobody else.
-const OWNER_ONLY_FILE_MODE: u32 = 0o600;
+/// File mode for a handed-off file: readable by its new owner, and nobody else.
+const OWNER_ONLY_FILE_MODE: u32 = 0o400;
 
 /// Hands a service-produced file to the caller by making them its owner.
 #[derive(Debug, Default, Clone, Copy)]

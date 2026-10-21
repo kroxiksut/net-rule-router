@@ -140,24 +140,52 @@ type Endpoint = (Ipv4Addr, u16);
 /// owning PID. `None` when the table cannot be read or holds no such row.
 fn owning_pid_v4(local: Endpoint, remote: Endpoint) -> Option<u32> {
     let buffer = read_tcp_owner_pid_table()?;
-    // SAFETY: `read_tcp_owner_pid_table` returns a buffer the API filled with a
-    // valid `MIB_TCPTABLE_OWNER_PID`; its `dwNumEntries` header is followed by
-    // that many contiguous `MIB_TCPROW_OWNER_PID` rows. We only read within
-    // those rows.
-    unsafe {
-        let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
-        let count = (*table).dwNumEntries as usize;
-        let rows = std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>();
-        for i in 0..count {
-            let row = &*rows.add(i);
-            if row_endpoint(row.dwLocalAddr, row.dwLocalPort) == local
+    tcp_rows(&buffer)
+        .iter()
+        .find(|row| {
+            row_endpoint(row.dwLocalAddr, row.dwLocalPort) == local
                 && row_endpoint(row.dwRemoteAddr, row.dwRemotePort) == remote
-            {
-                return Some(row.dwOwningPid);
-            }
-        }
+        })
+        .map(|row| row.dwOwningPid)
+}
+
+/// The rows of a table [`read_tcp_owner_pid_table`] returned. The count in the
+/// header is clamped to what the buffer holds, so a header that overstates it
+/// cannot send a read past the end.
+pub(crate) fn tcp_rows(buffer: &[u8]) -> &[MIB_TCPROW_OWNER_PID] {
+    // SAFETY: the table header and rows are plain integers, so any bytes are a
+    // valid value; `owner_rows` checks alignment and clamps the count.
+    owner_rows::<MIB_TCPTABLE_OWNER_PID, MIB_TCPROW_OWNER_PID>(buffer, |table| unsafe {
+        (
+            (*table).dwNumEntries,
+            std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>(),
+        )
+    })
+}
+
+/// The IPv6 twin of [`tcp_rows`].
+pub(crate) fn tcp6_rows(buffer: &[u8]) -> &[MIB_TCP6ROW_OWNER_PID] {
+    // SAFETY: as in `tcp_rows`.
+    owner_rows::<MIB_TCP6TABLE_OWNER_PID, MIB_TCP6ROW_OWNER_PID>(buffer, |table| unsafe {
+        (
+            (*table).dwNumEntries,
+            std::ptr::addr_of!((*table).table).cast::<MIB_TCP6ROW_OWNER_PID>(),
+        )
+    })
+}
+
+/// `locate` reads the declared row count and the first row's address off the
+/// table header, which `buffer` is checked to hold and to be aligned for.
+fn owner_rows<T, R>(buffer: &[u8], locate: impl FnOnce(*const T) -> (u32, *const R)) -> &[R] {
+    let header = std::mem::size_of::<T>().saturating_sub(std::mem::size_of::<R>());
+    if buffer.len() < header || buffer.as_ptr().align_offset(std::mem::align_of::<T>()) != 0 {
+        return &[];
     }
-    None
+    let (declared, first) = locate(buffer.as_ptr().cast::<T>());
+    let fits = (buffer.len() - header) / std::mem::size_of::<R>();
+    // SAFETY: `first` lies `header` bytes into `buffer` and `count` rows of `R`
+    // fit in what follows.
+    unsafe { std::slice::from_raw_parts(first, (declared as usize).min(fits)) }
 }
 
 /// Decode a table row's address+port pair into a host-order [`Endpoint`].

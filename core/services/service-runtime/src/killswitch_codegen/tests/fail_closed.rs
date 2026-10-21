@@ -131,7 +131,7 @@ fn fail_closed_allow_dns_over_primary_permits_port_53_to_the_system_resolvers_on
     let resolvers = [ip(192, 0, 2, 53), ip(192, 0, 2, 54)];
     let ex = FailClosedExemptions {
         allow_dns_over_primary: true,
-        dns_servers: resolvers.to_vec(),
+        dns_servers: resolvers.iter().copied().map(IpAddr::V4).collect(),
         ..FailClosedExemptions::default()
     };
     let out = fail_closed_block_all_filters("S", &ex, KillSwitchProtocols::ALL);
@@ -156,6 +156,114 @@ fn fail_closed_allow_dns_over_primary_permits_port_53_to_the_system_resolvers_on
     assert!(dns.iter().all(|f| f.remote_ip.is_some()));
     let ids: std::collections::HashSet<_> = dns.iter().map(|f| f.id).collect();
     assert_eq!(ids.len(), 4, "one id per resolver and protocol");
+}
+
+/// On a network whose only resolvers are IPv6 the port-53 permit must name
+/// them at the v6 ALE layer, and at the v6 packet layer too: that layer has no
+/// port condition and blocks every packet it does not exempt.
+#[test]
+fn an_ipv6_only_network_keeps_its_resolver_reachable_under_the_block_all() {
+    let resolver: Ipv6Addr = "2001:db8:53::1".parse().unwrap();
+    let ex = FailClosedExemptions {
+        allow_dns_over_primary: true,
+        dns_servers: vec![IpAddr::V6(resolver)],
+        ..FailClosedExemptions::default()
+    };
+    let out = fail_closed_block_all_filters("S", &ex, KillSwitchProtocols::ALL);
+    let ale: Vec<_> = out
+        .iter()
+        .filter(|f| {
+            f.layer == WfpLayerKey::AleAuthConnectV6
+                && f.action == WfpAction::Permit
+                && f.remote_port == Some(53)
+        })
+        .collect();
+    assert_eq!(ale.len(), 2, "UDP-53 and TCP-53 for the one resolver");
+    for f in &ale {
+        assert_eq!(f.remote_subnet_v6, Some((resolver, 128)));
+        assert_eq!(f.user_sid.as_deref(), Some("S"));
+    }
+    assert!(ale.iter().any(|f| f.ip_protocol == Some(17)));
+    assert!(ale.iter().any(|f| f.ip_protocol == Some(6)));
+    assert!(
+        out.iter()
+            .any(|f| f.layer == WfpLayerKey::OutboundIpPacketV6
+                && f.action == WfpAction::Permit
+                && f.remote_subnet_v6 == Some((resolver, 128))),
+        "the v6 packet block would still eat the query"
+    );
+    // Only the resolver: no v6 permit for any host on port 53, and nothing v4.
+    assert!(out
+        .iter()
+        .filter(|f| f.remote_port == Some(53))
+        .all(|f| f.layer == WfpLayerKey::AleAuthConnectV6));
+    // Without the opt-in, no resolver permit at all.
+    let strict = fail_closed_block_all_filters(
+        "S",
+        &FailClosedExemptions {
+            dns_servers: vec![IpAddr::V6(resolver)],
+            ..FailClosedExemptions::default()
+        },
+        KillSwitchProtocols::ALL,
+    );
+    assert!(!strict
+        .iter()
+        .any(|f| f.remote_subnet_v6 == Some((resolver, 128))));
+}
+
+#[test]
+fn a_dual_stack_network_permits_both_families_and_never_a_link_local_resolver() {
+    let v4 = ip(192, 0, 2, 53);
+    let v6: Ipv6Addr = "2001:db8:53::1".parse().unwrap();
+    let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
+    let ex = FailClosedExemptions {
+        allow_dns_over_primary: true,
+        dns_servers: vec![IpAddr::V4(v4), IpAddr::V6(v6), IpAddr::V6(link_local)],
+        ..FailClosedExemptions::default()
+    };
+    let out = fail_closed_block_all_filters("S", &ex, KillSwitchProtocols::ALL);
+    let port53: Vec<_> = out.iter().filter(|f| f.remote_port == Some(53)).collect();
+    assert_eq!(
+        port53.len(),
+        4,
+        "UDP and TCP for the v4 and the v6 resolver"
+    );
+    assert!(port53
+        .iter()
+        .any(|f| f.layer == WfpLayerKey::AleAuthConnectV4 && f.remote_ip == Some(v4)));
+    assert!(
+        port53
+            .iter()
+            .any(|f| f.layer == WfpLayerKey::AleAuthConnectV6
+                && f.remote_subnet_v6 == Some((v6, 128)))
+    );
+    assert!(!out
+        .iter()
+        .any(|f| f.remote_subnet_v6 == Some((link_local, 128))));
+    let ids: std::collections::HashSet<_> = out.iter().map(|f| f.id).collect();
+    assert_eq!(ids.len(), out.len(), "every filter has its own id");
+}
+
+/// With another principal on the machine the v6 packet block is gone, so the
+/// resolver's packet permit has nothing to answer.
+#[test]
+fn the_v6_resolver_packet_permit_follows_the_packet_block() {
+    let resolver: Ipv6Addr = "2001:db8:53::1".parse().unwrap();
+    let ex = FailClosedExemptions {
+        allow_dns_over_primary: true,
+        dns_servers: vec![IpAddr::V6(resolver)],
+        ..FailClosedExemptions::default()
+    };
+    let out = fail_closed_block_all_filters_for("S", &ex, KillSwitchProtocols::ALL, true);
+    assert!(out
+        .iter()
+        .all(|f| f.layer != WfpLayerKey::OutboundIpPacketV6));
+    assert_eq!(
+        out.iter()
+            .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV6 && f.remote_port == Some(53))
+            .count(),
+        2
+    );
 }
 
 #[test]

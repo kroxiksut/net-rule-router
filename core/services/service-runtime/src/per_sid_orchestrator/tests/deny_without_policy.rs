@@ -107,3 +107,59 @@ fn losing_the_connections_keeps_only_the_deny() {
     assert!(!after.is_empty());
     assert!(after.iter().all(|a| *a == WfpAction::Block));
 }
+
+/// A policy store that fails to answer is not a user with no connections: what
+/// is installed stays, protection included.
+#[test]
+fn an_unreadable_policy_keeps_the_installed_set() {
+    let (api, orch, src, rules, _audit) = fixture();
+    rules.set(rules_with_n_primary_ips(2));
+    src.set(SID, snap_full("Wi-Fi", "TAP"));
+    let installed = orch.install_for_sid(SID).unwrap();
+    assert!(installed > 0);
+    let before = api.wfp_filters.lock().unwrap().len();
+
+    src.fail_reads_of(SID);
+    assert!(matches!(
+        orch.recompile_for_sid(SID),
+        Err(OrchestratorError::PolicyUnreadable(_))
+    ));
+    assert_eq!(api.wfp_filters.lock().unwrap().len(), before);
+    assert_eq!(orch.filter_count_for(SID), installed);
+}
+
+/// A rule book that does not read is not "no rules": what is installed stays.
+#[test]
+fn an_unreadable_rule_book_keeps_the_installed_set() {
+    let (api, orch, src, rules, _audit) = fixture();
+    rules.set(rules_with_n_primary_ips(2));
+    src.set(SID, snap_full("Wi-Fi", "TAP"));
+    let installed = orch.install_for_sid(SID).unwrap();
+    assert!(installed > 0);
+    let before = api.wfp_filters.lock().unwrap().len();
+
+    rules.fail_reads("damaged row");
+    assert!(matches!(
+        orch.recompile_for_sid(SID),
+        Err(OrchestratorError::RulesUnreadable(_))
+    ));
+    assert_eq!(api.wfp_filters.lock().unwrap().len(), before);
+    assert_eq!(orch.filter_count_for(SID), installed);
+}
+
+/// A user with rules but no policy row has nothing routing or pinning their
+/// IPv6, so the board reads `Off` for them, never "first plan pending": the
+/// DNS path would otherwise withhold every AAAA of their rule hosts.
+#[test]
+fn a_user_without_a_policy_row_reads_ipv6_off_on_the_board() {
+    const NO_ROW: &str = "S-1-5-21-NOROW-V6";
+    let board = crate::ipv6_disposition::global_ipv6_dispositions();
+    board.set(NO_ROW, crate::enforcement_planner::Ipv6Guard::FiltersOnly);
+    let (_api, orch, _src, rules, _audit) = fixture();
+    rules.set(rules_with_n_primary_ips(2));
+    orch.install_for_sid(NO_ROW).unwrap();
+    assert_eq!(
+        board.of(NO_ROW),
+        Some(crate::enforcement_planner::Ipv6Guard::Off)
+    );
+}

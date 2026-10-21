@@ -1,26 +1,10 @@
-//! End-user license agreement (EULA) versioning — the single source of truth
-//! for which agreement revision the app currently requires the user to accept.
-//!
-//! The agreement text itself lives outside the code (`docs/legal/eula.<lang>.md`)
-//! and is loaded into the QML context at launch. Only the *version number* is
-//! a compiled constant, because two independent layers must agree on it:
-//!
-//! - the GUI first-run gate compares the persisted
-//!   `UiPreferences.accepted_eula_version` against [`CURRENT_EULA_VERSION`] and
-//!   re-shows the agreement whenever the persisted value is lower (the behaviour
-//!   the agreement's own "Изменение условий" clause promises);
-//! - the context emitter stamps [`CURRENT_EULA_VERSION`] into the QML context so
-//!   the QML side records the right number on acceptance.
-//!
-//! Bumping the agreement text in `docs/legal/` is only legally meaningful if
-//! this constant is bumped in the same change — otherwise previously-accepted
-//! users are never re-prompted. Keep the number in sync with the `Версия N`
-//! header line of `docs/legal/eula.ru.md`.
+//! The agreement revision the app requires. The text lives in
+//! `docs/legal/eula.<lang>.md`; only the number is compiled in, because the
+//! first-run gate and the QML context must agree on it.
 
-/// The EULA revision the current build requires. Starts at `1`. Bump in lockstep
-/// with the `Версия N` header of `docs/legal/eula.ru.md` whenever the terms
-/// change in a way that requires re-acceptance. `0` is reserved as the
-/// "never accepted" sentinel for `UiPreferences.accepted_eula_version`.
+/// Bump together with the `Редакция соглашения N` header of
+/// `docs/legal/eula.ru.md` when the terms change, or users who accepted an
+/// older text are never asked again. `0` is the "never accepted" sentinel.
 pub const CURRENT_EULA_VERSION: u32 = 1;
 
 /// The sentinel persisted for a user who has never accepted any agreement.

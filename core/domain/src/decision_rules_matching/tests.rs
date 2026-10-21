@@ -1304,10 +1304,13 @@ fn default_carries_behavior_mode() {
         &empty_lookup(),
         &rb,
         default_zone_policy(),
-        RouteBehaviorMode::StrictSecondaryFailClosed,
+        RouteBehaviorMode::PreferSecondaryWhenAvailable,
     );
     if let RequestedRouteDecision::DefaultRoute { behavior_mode, .. } = d {
-        assert_eq!(behavior_mode, RouteBehaviorMode::StrictSecondaryFailClosed);
+        assert_eq!(
+            behavior_mode,
+            RouteBehaviorMode::PreferSecondaryWhenAvailable
+        );
     } else {
         panic!("expected DefaultRoute");
     }
@@ -1527,6 +1530,38 @@ fn a_literal_ip_block_vetoes_a_narrower_name_rule_on_either_set() {
         );
         assert_eq!(matched_rule_id(&d), Some("r-exact"));
     }
+}
+
+/// A name with no observed address whose cached address is blocked literally:
+/// the probe answers as enforcement does, not with the name rule.
+#[test]
+fn a_literal_ip_block_on_the_cached_address_vetoes_a_name_probe() {
+    let rb = book(
+        vec![rule("r-exact", Some(exact_fqdn("a.example")), None)],
+        vec![blocking("b-ip", exact_ip(192, 0, 2, 10))],
+    );
+    let d = match_rules(
+        &input_hostname("a.example"),
+        &lookup_fresh_ip(192, 0, 2, 10),
+        &rb,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    assert_eq!(matched_rule_id(&d), Some("b-ip"));
+    assert_eq!(
+        matched_action(&d),
+        Some(crate::canonical::RuleAction::Block)
+    );
+
+    // A cached address nobody blocked leaves the name rule in charge.
+    let d = match_rules(
+        &input_hostname("a.example"),
+        &lookup_fresh_ip(192, 0, 2, 11),
+        &rb,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    assert_eq!(matched_rule_id(&d), Some("r-exact"));
 }
 
 /// The veto is about Blocks only: a literal ROUTE on the address still waits

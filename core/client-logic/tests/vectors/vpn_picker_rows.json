@@ -1,0 +1,97 @@
+{
+  "description": "pure.js vpnPickerRows: the picker lists what discovery found, then each stored program it did not find",
+  "cases": [
+    { "name": "nothing found, nothing stored", "input": { "found": [], "stored": [] }, "expected": [] },
+    {
+      "name": "found rows kept in order, path trimmed",
+      "input": {
+        "found": [
+          { "displayName": "example-gui.exe", "exePath": " C:\\Example\\example-gui.exe ", "running": true, "source": "running-process" },
+          { "displayName": "Corp Client", "exePath": "", "running": false, "source": "installed-program" }
+        ],
+        "stored": []
+      },
+      "expected": [
+        { "displayName": "example-gui.exe", "exePath": "C:\\Example\\example-gui.exe", "running": true, "source": "running-process", "interfaceName": "" },
+        { "displayName": "Corp Client", "exePath": "", "running": false, "source": "installed-program", "interfaceName": "" }
+      ]
+    },
+    {
+      "name": "a stored program discovery found is not repeated",
+      "input": {
+        "found": [ { "displayName": "example-gui.exe", "exePath": "C:\\Example\\example-gui.exe", "running": true, "source": "running-process" } ],
+        "stored": [ { "exe-path": "c:\\example\\EXAMPLE-GUI.exe", "display-name": "Example" } ]
+      },
+      "expected": [
+        { "displayName": "example-gui.exe", "exePath": "C:\\Example\\example-gui.exe", "running": true, "source": "running-process", "interfaceName": "" }
+      ]
+    },
+    {
+      "name": "a stored program discovery missed is listed as confirmed",
+      "input": {
+        "found": [ { "displayName": "example-gui.exe", "exePath": "C:\\Example\\example-gui.exe", "running": true, "source": "running-process" } ],
+        "stored": [ { "exe-path": "C:\\Corp\\corp-client.exe", "display-name": "Corp Client" } ]
+      },
+      "expected": [
+        { "displayName": "example-gui.exe", "exePath": "C:\\Example\\example-gui.exe", "running": true, "source": "running-process", "interfaceName": "" },
+        { "displayName": "Corp Client", "exePath": "C:\\Corp\\corp-client.exe", "running": false, "source": "confirmed", "interfaceName": "" }
+      ]
+    },
+    {
+      "name": "a stored program without a name is called by its file",
+      "input": { "found": [], "stored": [ { "exe-path": "/opt/example/bin/example-vpn", "display-name": "  " } ] },
+      "expected": [
+        { "displayName": "example-vpn", "exePath": "/opt/example/bin/example-vpn", "running": false, "source": "confirmed", "interfaceName": "" }
+      ]
+    },
+    {
+      "name": "a scan that failed still shows the whole stored set",
+      "input": {
+        "found": [],
+        "stored": [
+          { "exe-path": "C:\\A\\a.exe", "display-name": "A" },
+          { "exe-path": "C:\\B\\b.exe", "display-name": "B" }
+        ]
+      },
+      "expected": [
+        { "displayName": "A", "exePath": "C:\\A\\a.exe", "running": false, "source": "confirmed", "interfaceName": "" },
+        { "displayName": "B", "exePath": "C:\\B\\b.exe", "running": false, "source": "confirmed", "interfaceName": "" }
+      ]
+    },
+    {
+      "name": "stored repeats and blank paths are folded",
+      "input": {
+        "found": [],
+        "stored": [
+          { "exe-path": "C:\\A\\a.exe", "display-name": "A" },
+          { "exe-path": "c:\\a\\A.EXE", "display-name": "again" },
+          { "exe-path": "   ", "display-name": "blank" }
+        ]
+      },
+      "expected": [
+        { "displayName": "A", "exePath": "C:\\A\\a.exe", "running": false, "source": "confirmed", "interfaceName": "" }
+      ]
+    },
+    {
+      "name": "a pathless found row does not hide a stored program of the same name",
+      "input": {
+        "found": [ { "displayName": "Corp Client", "exePath": "", "running": false, "source": "installed-program" } ],
+        "stored": [ { "exe-path": "C:\\Corp\\corp-client.exe", "display-name": "Corp Client" } ]
+      },
+      "expected": [
+        { "displayName": "Corp Client", "exePath": "", "running": false, "source": "installed-program", "interfaceName": "" },
+        { "displayName": "Corp Client", "exePath": "C:\\Corp\\corp-client.exe", "running": false, "source": "confirmed", "interfaceName": "" }
+      ]
+    },
+    {
+      "name": "a kernel tunnel keeps its link",
+      "input": {
+        "found": [ { "displayName": "wg-example", "exePath": "", "running": true, "source": "kernel-tunnel", "interfaceName": "wg-example" } ],
+        "stored": []
+      },
+      "expected": [
+        { "displayName": "wg-example", "exePath": "", "running": true, "source": "kernel-tunnel", "interfaceName": "wg-example" }
+      ]
+    }
+  ]
+}

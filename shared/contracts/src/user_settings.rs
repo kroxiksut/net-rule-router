@@ -18,7 +18,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
@@ -42,14 +42,13 @@ const MAX_FILE_BYTES: u64 = 256 * 1024;
 /// stuck, and the caller reports that rather than hanging a UI.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 const LOCK_RETRY: Duration = Duration::from_millis(15);
-/// A lock this old was left by a process that died mid-write.
-const LOCK_STALE: Duration = Duration::from_secs(10);
 
 const KEY_FORMAT: &str = "format";
 const KEY_RULES_FOLDER: &str = "rules-folder";
 const KEY_RULES_FILES: &str = "rules-files";
 const KEY_SELECTED_SET: &str = "selected-set";
 const KEY_SERVICE_INTENT: &str = "service-intent";
+const KEY_ACCEPTED_EULA: &str = "accepted-eula";
 const KEY_PRIMARY: &str = "primary";
 const KEY_SECONDARY: &str = "secondary";
 const KEY_WRITTEN: &str = "written";
@@ -88,6 +87,9 @@ pub struct UserSettings {
     pub selected_set: String,
     /// What the user decided the service-owned settings should be.
     pub service_intent: Map<String, Value>,
+    /// The agreement revision this user accepted in either client;
+    /// `eula::EULA_NOT_ACCEPTED` (0) when none.
+    pub accepted_eula: u32,
     /// Top-level keys this build does not know, written back unchanged.
     pub other: Map<String, Value>,
 }
@@ -100,16 +102,26 @@ impl Default for UserSettings {
             rules_files: RulesFiles::default(),
             selected_set: String::new(),
             service_intent: Map::new(),
+            accepted_eula: crate::eula::EULA_NOT_ACCEPTED,
             other: Map::new(),
         }
     }
 }
 
-/// A path as the file stores it: `/` separators on every OS, so two clients
-/// spell one folder alike (Windows accepts `/`), and no trailing separator
-/// except on a root (`/`, `C:/`).
+/// A path as the file stores it: `/` separators, so two clients spell one
+/// folder alike (Windows accepts `/`), and no trailing separator except on a
+/// root (`/`, `C:/`). `\` is a separator only on Windows; elsewhere it is a
+/// legal character of a file name and is kept.
 pub fn portable_path(path: &str) -> String {
-    let path = path.replace('\\', "/");
+    portable_path_on(path, cfg!(windows))
+}
+
+fn portable_path_on(path: &str, backslash_separates: bool) -> String {
+    let path = if backslash_separates {
+        path.replace('\\', "/")
+    } else {
+        path.to_owned()
+    };
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         return if path.is_empty() {
@@ -218,6 +230,12 @@ impl UserSettings {
             &mine.service_intent,
             2,
         );
+        // Acceptance only moves forward: a client that never saw the newer
+        // agreement must not take it back.
+        if mine.accepted_eula != base.accepted_eula && mine.accepted_eula > self.accepted_eula {
+            self.accepted_eula = mine.accepted_eula;
+            changed = true;
+        }
         changed
     }
 
@@ -334,12 +352,20 @@ pub fn parse_user_settings(text: &str) -> Result<UserSettings, String> {
         Some(Value::Object(intent)) => intent,
         Some(_) => return Err(wrong_type(KEY_SERVICE_INTENT, "an object")),
     };
+    let accepted_eula = match object.remove(KEY_ACCEPTED_EULA) {
+        None | Some(Value::Null) => crate::eula::EULA_NOT_ACCEPTED,
+        Some(value) => value
+            .as_u64()
+            .and_then(|version| u32::try_from(version).ok())
+            .ok_or_else(|| wrong_type(KEY_ACCEPTED_EULA, "a whole number"))?,
+    };
     Ok(UserSettings {
         format,
         rules_folder,
         rules_files,
         selected_set,
         service_intent,
+        accepted_eula,
         other: object,
     })
 }
@@ -385,6 +411,12 @@ pub fn format_user_settings(settings: &UserSettings) -> serde_json::Result<Strin
         KEY_SERVICE_INTENT.to_string(),
         Value::Object(settings.service_intent.clone()),
     );
+    if settings.accepted_eula != crate::eula::EULA_NOT_ACCEPTED {
+        object.insert(
+            KEY_ACCEPTED_EULA.to_string(),
+            Value::from(settings.accepted_eula),
+        );
+    }
     // A known key wins over a same-named entry a caller put among the others.
     for (key, value) in &settings.other {
         object.entry(key.clone()).or_insert_with(|| value.clone());
@@ -511,7 +543,7 @@ pub struct SeedOutcome {
 enum FileState {
     Absent,
     Husk,
-    Settings(UserSettings),
+    Settings(Box<UserSettings>),
 }
 
 pub struct UserSettingsStore {
@@ -555,12 +587,12 @@ impl UserSettingsStore {
     /// `None` when there is no file yet.
     pub fn load(&self) -> Result<Option<UserSettings>, UserSettingsError> {
         match self.read_file(&self.path)? {
-            FileState::Settings(settings) => Ok(Some(settings)),
+            FileState::Settings(settings) => Ok(Some(*settings)),
             FileState::Absent => Ok(None),
             // A deliberately deleted file is not brought back from the backup;
             // only a gutted one is.
             FileState::Husk => match self.read_file(&self.backup_path()) {
-                Ok(FileState::Settings(settings)) => Ok(Some(settings)),
+                Ok(FileState::Settings(settings)) => Ok(Some(*settings)),
                 _ => Ok(None),
             },
         }
@@ -657,15 +689,17 @@ impl UserSettingsStore {
             return Ok(FileState::Husk);
         }
         parse_user_settings(&text)
-            .map(FileState::Settings)
+            .map(|settings| FileState::Settings(Box::new(settings)))
             .map_err(|reason| UserSettingsError::Damaged {
                 path: path.to_path_buf(),
                 reason,
             })
     }
 
-    /// Exclusive creation of `<file>.lock` is the lock; dropping the guard
-    /// removes it.
+    /// An OS lock on `<file>.lock`. The OS releases it when its holder exits
+    /// or dies, so a lock is never judged stale by age (a clock step makes
+    /// that guess wrong both ways), never taken over from a live holder, and
+    /// the file is never deleted from under one.
     fn lock(&self) -> Result<LockGuard, UserSettingsError> {
         let path = self.sibling(".lock");
         if let Some(parent) = path.parent() {
@@ -676,38 +710,26 @@ impl UserSettingsStore {
         }
         let started = Instant::now();
         loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    // The holder's pid, for whoever finds a lock left behind.
-                    let _ = write!(file, "{}", std::process::id());
-                    return Ok(LockGuard { path });
-                }
-                Err(error) => {
-                    let held = error.kind() == io::ErrorKind::AlreadyExists;
-                    if held && lock_is_stale(&path) {
-                        let _ = fs::remove_file(&path);
-                        continue;
+            let denied = match open_lock_file(&path) {
+                Ok(file) => match file.try_lock() {
+                    Ok(()) => return Ok(LockGuard::holding(file)),
+                    Err(fs::TryLockError::WouldBlock) => None,
+                    Err(fs::TryLockError::Error(source)) => {
+                        return Err(UserSettingsError::Io { path, source })
                     }
-                    // Windows answers "access denied" while a just-released
-                    // lock is still being deleted, so that is waited out too.
-                    let contended = held || error.kind() == io::ErrorKind::PermissionDenied;
-                    if !contended || started.elapsed() >= LOCK_WAIT {
-                        return Err(if held {
-                            UserSettingsError::Busy { path }
-                        } else {
-                            UserSettingsError::Io {
-                                path,
-                                source: error,
-                            }
-                        });
-                    }
-                    std::thread::sleep(LOCK_RETRY);
-                }
+                },
+                // Windows answers "access denied" while another process
+                // deletes the file, so that is waited out too.
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Some(error),
+                Err(source) => return Err(UserSettingsError::Io { path, source }),
+            };
+            if started.elapsed() >= LOCK_WAIT {
+                return Err(match denied {
+                    Some(source) => UserSettingsError::Io { path, source },
+                    None => UserSettingsError::Busy { path },
+                });
             }
+            std::thread::sleep(LOCK_RETRY);
         }
     }
 
@@ -757,22 +779,37 @@ impl UserSettingsStore {
     }
 }
 
+/// Holds the OS lock; dropping it releases the lock and leaves the file.
 struct LockGuard {
-    path: PathBuf,
+    file: fs::File,
+}
+
+impl LockGuard {
+    fn holding(mut file: fs::File) -> Self {
+        // The holder's pid, for whoever looks; rewriting it also dates the
+        // file now, which a client that judges the lock by its age respects.
+        let _ = file
+            .set_len(0)
+            .and_then(|()| write!(file, "{}", std::process::id()));
+        Self { file }
+    }
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = self.file.unlock();
     }
 }
 
-fn lock_is_stale(path: &Path) -> bool {
-    fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age >= LOCK_STALE)
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// Creates `path` fresh (owner-only on Unix: it names the user's folders and
@@ -801,6 +838,7 @@ fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::SystemTime;
 
     fn sample() -> UserSettings {
         UserSettings {
@@ -840,6 +878,41 @@ mod tests {
     }
 
     #[test]
+    fn the_accepted_agreement_round_trips_and_is_absent_until_accepted() {
+        let none = rewritten(&UserSettings::default());
+        assert!(none.get("accepted-eula").is_none());
+        let accepted = UserSettings {
+            accepted_eula: 2,
+            ..UserSettings::default()
+        };
+        let text = format_user_settings(&accepted).expect("format");
+        assert_eq!(parse_user_settings(&text).expect("parse").accepted_eula, 2);
+        assert!(parse_user_settings(r#"{"accepted-eula":"yes"}"#).is_err());
+        assert!(parse_user_settings(r#"{"accepted-eula":-1}"#).is_err());
+    }
+
+    #[test]
+    fn acceptance_adopted_from_a_client_never_lowers_a_newer_one() {
+        let base = UserSettings::default();
+        let mut file = UserSettings {
+            accepted_eula: 3,
+            ..UserSettings::default()
+        };
+        let stale = UserSettings {
+            accepted_eula: 1,
+            ..UserSettings::default()
+        };
+        assert!(!file.adopt_changes(&base, &stale));
+        assert_eq!(file.accepted_eula, 3);
+        let newer = UserSettings {
+            accepted_eula: 4,
+            ..UserSettings::default()
+        };
+        assert!(file.adopt_changes(&base, &newer));
+        assert_eq!(file.accepted_eula, 4);
+    }
+
+    #[test]
     fn the_file_is_the_documented_shape() {
         let text = format_user_settings(&sample()).expect("format");
         let value: Value = serde_json::from_str(&text).expect("json");
@@ -857,10 +930,9 @@ mod tests {
     }
 
     #[test]
-    fn paths_are_stored_with_forward_slashes() {
+    fn windows_paths_are_stored_with_forward_slashes() {
         for (given, stored) in [
             ("C:\\Users\\u\\Sets\\", "C:/Users/u/Sets"),
-            ("/home/u/sets/", "/home/u/sets"),
             ("/", "/"),
             ("C:\\", "C:/"),
             ("C:", "C:"),
@@ -871,16 +943,35 @@ mod tests {
             ),
             ("\\\\server\\share\\sets", "//server/share/sets"),
         ] {
-            assert_eq!(portable_path(given), stored, "{given}");
+            assert_eq!(portable_path_on(given, true), stored, "{given}");
         }
+    }
+
+    #[test]
+    fn a_backslash_is_part_of_a_name_where_it_is_not_a_separator() {
+        for (given, stored) in [
+            ("/home/u/sets/", "/home/u/sets"),
+            ("/home/u/a\\b/rules.txt", "/home/u/a\\b/rules.txt"),
+            ("/home/u/trailing\\", "/home/u/trailing\\"),
+            ("/", "/"),
+            ("", ""),
+        ] {
+            assert_eq!(portable_path_on(given, false), stored, "{given}");
+        }
+    }
+
+    #[test]
+    fn setters_store_this_platforms_spelling() {
         let mut settings = UserSettings::default();
-        settings.set_rules_folder("C:\\Sets\\");
-        settings.set_secondary_file("C:\\Sets\\a\\rules_secondary.txt");
-        assert_eq!(settings.rules_folder, "C:/Sets");
-        assert_eq!(
-            settings.rules_files.secondary,
-            "C:/Sets/a/rules_secondary.txt"
-        );
+        settings.set_rules_folder("/home/u/Sets/");
+        settings.set_secondary_file("/home/u/Sets/a\\b/rules_secondary.txt");
+        assert_eq!(settings.rules_folder, "/home/u/Sets");
+        let expected = if cfg!(windows) {
+            "/home/u/Sets/a/b/rules_secondary.txt"
+        } else {
+            "/home/u/Sets/a\\b/rules_secondary.txt"
+        };
+        assert_eq!(settings.rules_files.secondary, expected);
     }
 
     #[test]
@@ -976,7 +1067,7 @@ mod tests {
         let mut on_disk = base.clone();
         on_disk.merge_intent(
             INTENT_ROUTE_POLICY,
-            json!({ "kill-switch-enabled": true })
+            json!({ "leak-protection": "everything" })
                 .as_object()
                 .expect("object"),
         );
@@ -995,7 +1086,7 @@ mod tests {
             Value::Object(on_disk.service_intent.clone()),
             json!({
                 "stability": { "verbose-logging": false },
-                "route-policy": { "mode": "prefer-primary", "kill-switch-enabled": true },
+                "route-policy": { "mode": "prefer-primary", "leak-protection": "everything" },
                 "notice-mutes": [{ "scope": { "kind": "all" } }]
             })
         );
@@ -1022,7 +1113,8 @@ mod tests {
     #[test]
     fn a_rules_file_changed_since_the_program_wrote_it_was_edited_by_hand() {
         let mut settings = sample();
-        let path = r"C:\Sets\home\rules_primary.txt";
+        let sep = std::path::MAIN_SEPARATOR;
+        let path = &format!("C:{sep}Sets{sep}home{sep}rules_primary.txt");
         assert!(
             !settings.rules_file_hand_edited(path, Some("00")),
             "never written by the program: nothing to differ from"
@@ -1090,7 +1182,7 @@ mod tests {
             .expect("update");
         assert_eq!(written.rules_folder, "/r");
         assert_eq!(store.load().expect("load"), Some(written));
-        assert!(!store.sibling(".lock").exists(), "the lock is released");
+        drop(store.lock().expect("the lock is released"));
     }
 
     #[test]
@@ -1167,21 +1259,74 @@ mod tests {
         assert_eq!(second.settings, sample());
     }
 
+    fn date_file(path: &Path, when: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(when))
+            .expect("date lock file");
+    }
+
     #[test]
-    fn a_stale_lock_does_not_block_forever() {
+    fn a_lock_file_left_by_a_dead_writer_does_not_block_whatever_its_date() {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = store_in(&dir);
         let lock = store.sibling(".lock");
-        fs::write(&lock, "999999").expect("plant lock");
-        let old = SystemTime::now() - LOCK_STALE - Duration::from_secs(1);
-        fs::File::options()
-            .write(true)
-            .open(&lock)
-            .and_then(|file| file.set_modified(old))
-            .expect("age lock");
+        let day = Duration::from_secs(86_400);
+        // Just written, long ago, and after a clock step back: in the future.
+        for when in [
+            SystemTime::now(),
+            SystemTime::now() - day,
+            SystemTime::now() + day,
+        ] {
+            fs::write(&lock, "999999").expect("plant lock");
+            date_file(&lock, when);
+            store
+                .update(|s| s.selected_set.push('a'))
+                .expect("update through a lock nobody holds");
+        }
+        assert_eq!(
+            store.load().expect("load").expect("present").selected_set,
+            "aaa"
+        );
+    }
+
+    #[test]
+    fn a_held_lock_is_never_taken_over_however_old_it_looks() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store_in(&dir);
+        let held = store.lock().expect("first holder");
+        date_file(
+            &store.sibling(".lock"),
+            SystemTime::now() - Duration::from_secs(86_400),
+        );
+        assert!(matches!(
+            store.update(|s| s.selected_set = "user:b".to_string()),
+            Err(UserSettingsError::Busy { .. })
+        ));
+        assert!(store.sibling(".lock").exists(), "the holder's file stays");
+        drop(held);
         store
-            .update(|s| s.selected_set = "user:a".to_string())
-            .expect("update through a stale lock");
+            .update(|s| s.selected_set = "user:b".to_string())
+            .expect("free once released");
+    }
+
+    #[test]
+    fn a_writer_that_gave_up_leaves_the_holders_lock_in_place() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let holder = store_in(&dir);
+        let held = holder.lock().expect("holder");
+        let (first, second) = (store_in(&dir), store_in(&dir));
+        for rival in [&first, &second] {
+            assert!(matches!(
+                rival.update(|s| s.selected_set = "user:c".to_string()),
+                Err(UserSettingsError::Busy { .. })
+            ));
+        }
+        drop(held);
+        second
+            .update(|s| s.selected_set = "user:c".to_string())
+            .expect("free once released");
     }
 
     #[test]

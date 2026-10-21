@@ -95,7 +95,14 @@ impl NflogDropObserver {
         let reader_stop = Arc::clone(&stop);
         std::thread::Builder::new()
             .name("nrr-nflog".to_owned())
-            .spawn(move || read_loop(&socket, &sender, &reader_stats, &reader_stop))
+            .spawn(move || {
+                read_loop(
+                    |buffer| socket.receive(buffer),
+                    &sender,
+                    &reader_stats,
+                    &reader_stop,
+                );
+            })
             .map_err(|e| PlatformError::Transient {
                 operation: "start the drop-report reader",
                 detail: e.to_string(),
@@ -171,15 +178,34 @@ fn observation(packet: DroppedPacket, owner: Option<Owner>) -> ConnectionObserva
     }
 }
 
+/// Held by the reader for its whole life. A reader that ends without being
+/// asked to, by an error or a panic, takes the block reports with it, and the
+/// capability profile must stop claiming them.
+struct ReaderLife<'a> {
+    stop: &'a AtomicBool,
+}
+
+impl Drop for ReaderLife<'_> {
+    fn drop(&mut self) {
+        if !self.stop.load(Ordering::Relaxed) {
+            crate::kernel_capabilities::record(
+                crate::kernel_capabilities::KernelCapability::BlockReports,
+                false,
+            );
+        }
+    }
+}
+
 fn read_loop(
-    socket: &NflogSocket,
+    mut receive: impl FnMut(&mut [u8]) -> Result<Received, i32>,
     sender: &SyncSender<DroppedPacket>,
     stats: &NflogStats,
     stop: &AtomicBool,
 ) {
+    let _life = ReaderLife { stop };
     let mut buffer = vec![0u8; READ_BUFFER_BYTES];
     while !stop.load(Ordering::Relaxed) {
-        let read = match socket.receive(&mut buffer) {
+        let read = match receive(&mut buffer) {
             Ok(Received::Kernel(read)) => read,
             Ok(Received::Forged) => {
                 stats.forged.fetch_add(1, Ordering::Relaxed);
@@ -799,5 +825,42 @@ mod tests {
         );
         assert_eq!(obs.pid, 0);
         assert_eq!(obs.process_path, None);
+    }
+
+    /// A reader the socket fails under takes the block reports with it; one
+    /// told to stop leaves them claimed.
+    #[test]
+    fn a_reader_that_dies_mid_run_is_listed_as_missing_block_reports() {
+        use crate::kernel_capabilities::{is_available, record, KernelCapability};
+        let _held = crate::kernel_capabilities::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let stats = NflogStats::default();
+        record(KernelCapability::BlockReports, true);
+
+        let stop = AtomicBool::new(false);
+        let mut reads = 0;
+        read_loop(
+            |_| {
+                reads += 1;
+                if reads > 1 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                Err(libc::EAGAIN)
+            },
+            &sender,
+            &stats,
+            &stop,
+        );
+        assert!(
+            is_available(KernelCapability::BlockReports),
+            "asked to stop"
+        );
+
+        let running = AtomicBool::new(false);
+        read_loop(|_| Err(libc::EBADF), &sender, &stats, &running);
+        assert!(crate::kernel_capabilities::missing().contains(&KernelCapability::BlockReports));
+        record(KernelCapability::BlockReports, true);
     }
 }

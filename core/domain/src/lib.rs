@@ -43,9 +43,10 @@ pub mod extension_channel;
 pub mod import;
 pub mod ip_network_policy;
 pub mod ipv4_network;
+pub mod leak_protection;
 pub mod linked_source;
 pub mod merge;
-pub mod mode_a_coverage;
+pub mod own_resolver;
 pub mod preset_canonicalize;
 pub mod preset_contract;
 pub mod preset_ux;
@@ -74,6 +75,7 @@ use core::fmt;
 // `RouteRole` and `BindingSource` are defined in `nrr-shared` so they can be
 // shared between domain, IPC contracts, and DTO layers without duplication.
 pub use canonical::RuleAction;
+pub use leak_protection::{protection_posture, LeakProtection, ProtectionPosture};
 // Rule provenance is declared once in `nrr-shared` — the rules-file parser,
 // the GUI preset parser, and the canonical wire DTO all read the same slugs,
 // so a mirrored domain copy would only add a way for them to drift.
@@ -118,7 +120,6 @@ pub struct AdapterIdentity {
 /// - `RouteSelectionState` (current availability — observed at runtime)
 /// - `advisory_confidence` (heuristic hint — derived, not policy)
 /// - `connectivity_state`, `external_ip` (observed facts)
-/// - `RouteSelectionState::FailClosedConflict` (computed at apply time)
 ///
 /// See also: [`RouteRuntimeStatus`] for the full runtime/derived boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -446,8 +447,7 @@ pub struct ActiveConfiguration {
     pub secondary: Option<RouteBinding>,
     /// Default routing behavior when no rule matches.
     ///
-    /// Determines whether traffic defaults to `primary`, `secondary`, or
-    /// follows the Fail-Closed policy when `secondary` is unavailable.
+    /// Whether unmatched traffic defaults to `primary` or `secondary`.
     pub behavior_mode: RouteBehaviorMode,
     /// All routing rules, split into per-route sets.
     ///
@@ -526,13 +526,11 @@ impl FreeEditionConstraints {
 /// source of truth:
 ///
 /// - `RouteSelectionState` — current availability (selected / unavailable /
-///   requires-verification / fail-closed-conflict)
+///   requires-verification)
 /// - `advisory_confidence` — heuristic recommendation confidence; a UI hint
 ///   that reflects the last scan, not a stable policy property
 /// - `connectivity_state` — live connectivity probe result
 /// - `external_ip` — current external IP as observed via probe
-/// - `RouteSelectionState::FailClosedConflict` — computed at apply time
-///   when `StrictSecondaryFailClosed` is active and secondary is down
 ///
 /// # Serializable policy fields (see [`RouteBinding`] and [`ActiveConfiguration`])
 ///
@@ -731,14 +729,6 @@ mod tests {
         assert_eq!(
             RouteBehaviorMode::default_when_secondary_unbound(),
             RouteBehaviorMode::PreferPrimary
-        );
-    }
-
-    #[test]
-    fn recommended_mode_when_secondary_bound_is_strict_fail_closed() {
-        assert_eq!(
-            RouteBehaviorMode::recommended_when_secondary_bound(),
-            RouteBehaviorMode::StrictSecondaryFailClosed
         );
     }
 

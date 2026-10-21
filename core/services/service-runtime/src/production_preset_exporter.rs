@@ -657,6 +657,39 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// The hash crosses IPC and the importer compares it: a hash-crate upgrade
+    /// that changed its spelling must fail here, not in the field. The bytes
+    /// are asserted first, so a writer change is told apart from a hash change.
+    #[test]
+    fn the_export_hash_is_pinned() {
+        let conn = open_state_db_in_memory();
+        seed_active_revision(
+            &conn,
+            RulesRevisionContent::new(CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(vec![rule(
+                    "r-1",
+                    CanonicalAddressMatch::ExactFqdn("example.com".to_string()),
+                    "",
+                )]),
+                secondary: CanonicalRuleSet::default(),
+            }),
+        );
+        let out = ProductionPresetExporter::new(Arc::clone(&conn))
+            .with_host_app_section(RulesFileSection::Windows)
+            .export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Primary,
+                false,
+                &Default::default(),
+            )
+            .expect("export");
+        assert_eq!(out.file_bytes_utf8, "--- Domains\nexample.com\n");
+        assert_eq!(
+            out.content_hash_hex,
+            "5467d880d845fa70bfc796eab313bdec9d2c3839f779d1b3b01c345275f82784"
+        );
+    }
+
     #[test]
     fn encode_file_bytes_b64_round_trips_via_standard_alphabet() {
         let original = "--- Domains\nexample.com\n";

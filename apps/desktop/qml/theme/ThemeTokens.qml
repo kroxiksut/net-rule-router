@@ -18,11 +18,11 @@ QtObject {
     readonly property color colorText: isHighContrast ? "#ffffff" : isDark ? "#f5f7fa" : "#1f2933"
     readonly property color colorTextMuted: isHighContrast ? "#d7d7d7" : isDark ? "#c9d1d9" : "#52606d"
     readonly property color colorBorder: isHighContrast ? "#ffffff" : isDark ? "#47515f" : "#cbd2d9"
-    readonly property color colorAccent: isHighContrast ? "#ffd24d" : "#2f6feb"
-    readonly property color colorWarning: isHighContrast ? "#ffb020" : "#d97706"
-    readonly property color colorDanger: isHighContrast ? "#ff6b6b" : isDark ? "#f14c4c" : "#c92a2a"
-    readonly property color colorSuccess: isHighContrast ? "#9be58f" : "#2e8b57"
-    readonly property color colorOnAccent: isHighContrast ? "#000000" : "#ffffff"
+    readonly property color colorAccent: isHighContrast ? "#ffd24d" : isDark ? "#6c9bff" : "#2f6feb"
+    readonly property color colorWarning: isHighContrast ? "#ffb020" : isDark ? "#f0a030" : "#d97706"
+    readonly property color colorDanger: isHighContrast ? "#ff6b6b" : isDark ? "#ff6b6b" : "#c92a2a"
+    readonly property color colorSuccess: isHighContrast ? "#9be58f" : isDark ? "#4cc38a" : "#2e8b57"
+    readonly property color colorOnAccent: isHighContrast ? "#000000" : isDark ? "#0b1020" : "#ffffff"
     readonly property color colorFocusRing: isHighContrast ? "#ffd24d" : colorAccent
     readonly property color colorSelection: isHighContrast ? "#ffd24d" : Qt.tint(colorBase, Qt.rgba(colorAccent.r, colorAccent.g, colorAccent.b, 0.35))
 

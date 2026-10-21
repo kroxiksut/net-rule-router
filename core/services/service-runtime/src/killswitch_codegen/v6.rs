@@ -16,8 +16,9 @@ use nrr_platform_api::types::{WfpAction, WfpFilterSpec, WfpLayerKey};
 
 use super::{
     permit_luid_seg, CATCHALL_BLOCK_WEIGHT, CATCHALL_EXEMPT_BASE, KILLSWITCH_ROLE,
-    PACKET_BLOCK_BASE, PACKET_EXEMPT_BASE,
+    PACKET_BLOCK_BASE,
 };
+use crate::wfp_bands::PACKET_V6_EXEMPT_BASE;
 use crate::wfp_codegen::filter_id_for;
 
 /// IPv6 loopback `::1/128` — exempt (local IPC / stub resolvers over v6).
@@ -46,11 +47,18 @@ const V6_LINK_LOCAL_MULTICAST: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0
 /// IPv6 could never dial out from under its own guard; without the subnets, the
 /// v6 LAN — the printer, the NAS, the router's own management address — dies
 /// with the tunnel it never used.
+///
+/// The packet layer cannot be scoped to a user, so its block cuts every other
+/// principal's IPv6 too. With `machine_has_other_principals` the whole packet
+/// half (block, exemptions, egress permit) is left out and the per-SID ALE
+/// filters carry the cut alone: ICMPv6 and other non-TCP/UDP v6 go unguarded,
+/// the price of not breaking the other users' networking.
 pub fn catch_all_v6_filters(
     sid: &str,
     secondary_luid: u64,
     server_ips: &[Ipv6Addr],
     local_subnets: &[(Ipv6Addr, u8)],
+    machine_has_other_principals: bool,
 ) -> Vec<WfpFilterSpec> {
     let mut out = Vec::new();
     // Anything leaving through the tunnel survives the cut. Without this the v6
@@ -59,11 +67,17 @@ pub fn catch_all_v6_filters(
     // avoid via the server exemption. `0` means the tunnel is unresolved and
     // there is no egress to permit.
     if secondary_luid != 0 {
-        for layer in [
+        out.push(egress_permit_v6(
+            sid,
             WfpLayerKey::AleAuthConnectV6,
-            WfpLayerKey::OutboundIpPacketV6,
-        ] {
-            out.push(egress_permit_v6(sid, layer, secondary_luid));
+            secondary_luid,
+        ));
+        if !machine_has_other_principals {
+            out.push(egress_permit_v6(
+                sid,
+                WfpLayerKey::OutboundIpPacketV6,
+                secondary_luid,
+            ));
         }
     }
     out.extend([
@@ -90,30 +104,23 @@ pub fn catch_all_v6_filters(
             CATCHALL_EXEMPT_BASE + 2,
         ),
         block_all_v6(sid, WfpLayerKey::AleAuthConnectV6),
-        // ── V6 packet layer (ICMPv6 / everything else) ──
-        exempt_subnet_v6(
-            sid,
-            WfpLayerKey::OutboundIpPacketV6,
-            V6_LOOPBACK,
-            128,
-            PACKET_EXEMPT_BASE,
-        ),
-        exempt_subnet_v6(
-            sid,
-            WfpLayerKey::OutboundIpPacketV6,
-            V6_LINK_LOCAL,
-            10,
-            PACKET_EXEMPT_BASE + 1,
-        ),
-        exempt_subnet_v6(
-            sid,
-            WfpLayerKey::OutboundIpPacketV6,
-            V6_LINK_LOCAL_MULTICAST,
-            16,
-            PACKET_EXEMPT_BASE + 2,
-        ),
-        block_all_v6(sid, WfpLayerKey::OutboundIpPacketV6),
     ]);
+    if !machine_has_other_principals {
+        for (net, prefix, weight) in [
+            (V6_LOOPBACK, 128u8, PACKET_V6_EXEMPT_BASE),
+            (V6_LINK_LOCAL, 10, PACKET_V6_EXEMPT_BASE + 1),
+            (V6_LINK_LOCAL_MULTICAST, 16, PACKET_V6_EXEMPT_BASE + 2),
+        ] {
+            out.push(exempt_subnet_v6(
+                sid,
+                WfpLayerKey::OutboundIpPacketV6,
+                net,
+                prefix,
+                weight,
+            ));
+        }
+        out.push(block_all_v6(sid, WfpLayerKey::OutboundIpPacketV6));
+    }
     // The address-scoped exemptions continue the band after the three
     // link-scope ones above, at both layers.
     let scoped = server_ips
@@ -129,20 +136,22 @@ pub fn catch_all_v6_filters(
             prefix,
             CATCHALL_EXEMPT_BASE + 3 + e,
         ));
-        out.push(exempt_subnet_v6(
-            sid,
-            WfpLayerKey::OutboundIpPacketV6,
-            net,
-            prefix,
-            PACKET_EXEMPT_BASE + 3 + e,
-        ));
+        if !machine_has_other_principals {
+            out.push(exempt_subnet_v6(
+                sid,
+                WfpLayerKey::OutboundIpPacketV6,
+                net,
+                prefix,
+                PACKET_V6_EXEMPT_BASE + 3 + e,
+            ));
+        }
     }
     out
 }
 
-/// The v6 twin of `default_block_exemptions`: what the Strict default block's
-/// IPv6 half must let through. ALE only — that block has no packet half.
-pub fn default_block_exemptions_v6(
+/// The v6 twin of `destination_less_floor`: ALE only, the layer the per-app
+/// blocks sit at. Same ids and weights as [`catch_all_v6_filters`]' ALE half.
+pub fn destination_less_floor_v6(
     sid: &str,
     server_ips: &[Ipv6Addr],
     local_subnets: &[(Ipv6Addr, u8)],
@@ -160,36 +169,6 @@ pub fn default_block_exemptions_v6(
         .enumerate()
         .map(|(e, (net, prefix))| {
             exempt_subnet_v6(sid, ALE, net, prefix, CATCHALL_EXEMPT_BASE + e as u64)
-        })
-        .collect()
-}
-
-/// The v6 permits for somebody else's tunnels — the twin of the v4
-/// `foreign_tunnel_egress`. `packet` adds the packet-layer half, which only a
-/// blanket cut has a block at.
-#[must_use]
-pub fn foreign_tunnel_egress_v6(
-    sid: &str,
-    luids: &[u64],
-    own: u64,
-    packet: bool,
-) -> Vec<WfpFilterSpec> {
-    let layers: &[WfpLayerKey] = if packet {
-        &[
-            WfpLayerKey::AleAuthConnectV6,
-            WfpLayerKey::OutboundIpPacketV6,
-        ]
-    } else {
-        &[WfpLayerKey::AleAuthConnectV6]
-    };
-    luids
-        .iter()
-        .copied()
-        .filter(|luid| *luid != 0 && *luid != own)
-        .flat_map(|luid| {
-            layers
-                .iter()
-                .map(move |layer| egress_permit_v6(sid, *layer, luid))
         })
         .collect()
 }
@@ -229,6 +208,7 @@ fn egress_permit_v6(sid: &str, layer: WfpLayerKey, secondary_luid: u64) -> WfpFi
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -275,6 +255,7 @@ fn exempt_subnet_v6(
         remote_subnet: None,
         remote_subnet_v6: Some((net, prefix_len)),
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
@@ -307,5 +288,6 @@ fn block_all_v6(sid: &str, layer: WfpLayerKey) -> WfpFilterSpec {
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }

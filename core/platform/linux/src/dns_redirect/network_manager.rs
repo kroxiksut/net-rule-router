@@ -10,7 +10,9 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use nrr_platform_api::dns::{SystemDnsServersPort, UpstreamDnsCandidate};
+use nrr_platform_api::dns::{
+    once_per_link, once_per_server, SystemDnsServersPort, UpstreamDnsCandidate,
+};
 use nrr_platform_api::dns_redirect::{RedirectHandle, RedirectState, SystemDnsRedirectPort};
 use nrr_platform_api::dns_scope::{InterfaceDnsScope, InterfaceDnsScopePort};
 use nrr_platform_api::error::PlatformError;
@@ -241,19 +243,29 @@ pub(crate) fn clear_network_manager_redirect(
 /// The devices' own servers, which the global setting does not touch.
 pub struct NetworkManagerDnsServers<C: DnsCommands>(pub C);
 
-impl<C: DnsCommands> SystemDnsServersPort for NetworkManagerDnsServers<C> {
-    fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
+impl<C: DnsCommands> NetworkManagerDnsServers<C> {
+    /// Every device's servers, a server repeated for each device that lists it.
+    fn per_link_pairs(&self) -> Vec<UpstreamDnsCandidate> {
         let mut out: Vec<UpstreamDnsCandidate> = Vec::new();
         for device in devices(&self.0) {
             let index = super::link_index(&device.name);
-            for server in forwardable(device.dns) {
-                if out.iter().any(|c| c.server == server) {
-                    continue;
-                }
-                out.push(UpstreamDnsCandidate::new(index, server));
-            }
+            out.extend(
+                forwardable(device.dns)
+                    .into_iter()
+                    .map(|server| UpstreamDnsCandidate::new(index, server)),
+            );
         }
         out
+    }
+}
+
+impl<C: DnsCommands> SystemDnsServersPort for NetworkManagerDnsServers<C> {
+    fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
+        once_per_server(self.per_link_pairs(), |c| c.server)
+    }
+
+    fn upstream_candidates_v4_per_link(&self) -> Vec<UpstreamDnsCandidate> {
+        once_per_link(self.per_link_pairs())
     }
 }
 

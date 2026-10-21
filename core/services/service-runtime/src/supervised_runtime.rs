@@ -250,6 +250,10 @@ pub struct SupervisedRuntimeDeps {
     /// coordinator isn't available (no WFP/orchestrator). Built by the
     /// wiring layer as a closure over the coordinator + active-SID registry.
     pub route_recompute_hook: Option<RouteRecomputeHook>,
+    /// The same pass for requests that follow what the observation ticks
+    /// learnt: they may wait for a window and share one pass. `None` falls
+    /// back to `route_recompute_hook`.
+    pub observation_recompute_hook: Option<RouteRecomputeHook>,
     /// Run on graceful service stop to tear down ALL
     /// NRR-owned routes (secondary `/32`s + the mode-A `/2` counter-overlay) so
     /// stopping the service restores pristine networking instead of leaving
@@ -303,9 +307,9 @@ pub struct SupervisedRuntimeDeps {
     /// Each user's connection history, written back once a minute. `None`
     /// when no trace feeds it; the tick is then not spawned.
     pub conn_history: Option<Arc<crate::conn_history::ConnHistory>>,
-    /// External-address notice for the additional link. `None` when
-    /// the route path isn't available (nothing to resolve a link from) or no
-    /// event bus is wired; the tick is then not spawned.
+    /// External-address notice for the additional link, for the users who
+    /// opted in. `None` when the route path or the state database isn't
+    /// available; the tick is then not spawned.
     pub secondary_external_address:
         Option<crate::secondary_external_address::ExternalAddressWiring>,
     /// The runtime controller that starts/stops the local DNS resolver on
@@ -411,13 +415,42 @@ struct HealthFailureSink {
     health: Arc<HealthAggregator>,
     /// Tasks currently not running → why.
     down: Mutex<BTreeMap<String, String>>,
+    /// Tasks gone for good that report on a component of their own → what they
+    /// said. Kept apart from the component's other writers so a task that comes
+    /// back takes back only its own verdict.
+    retired: Mutex<BTreeMap<String, RetiredVerdict>>,
 }
+
+/// The aggregator voice of tasks that ended and may yet return.
+const RETIRED_SOURCE: &str = "task-retired";
+
+type RetiredVerdict = (HealthComponent, ServiceHealthSeverity, String);
 
 impl HealthFailureSink {
     fn new(health: Arc<HealthAggregator>) -> Self {
         Self {
             health,
             down: Mutex::new(BTreeMap::new()),
+            retired: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Say the worst of what retired tasks hold on `component`, or nothing.
+    fn publish_retired(
+        &self,
+        retired: &BTreeMap<String, RetiredVerdict>,
+        component: HealthComponent,
+    ) {
+        let worst = retired
+            .values()
+            .filter(|(c, _, _)| *c == component)
+            .max_by_key(|(_, severity, _)| *severity);
+        match worst {
+            Some((_, severity, message)) => {
+                self.health
+                    .record_as(RETIRED_SOURCE, component, *severity, message.clone());
+            }
+            None => self.health.clear_as(RETIRED_SOURCE, component),
         }
     }
 
@@ -458,9 +491,14 @@ impl HealthFailureSink {
             Some(TaskHealth::Reports {
                 component,
                 severity,
-            }) => self
-                .health
-                .record(component, severity, format!("task '{}' {why}", id.0)),
+            }) => {
+                let mut retired = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+                retired.insert(
+                    id.0.clone(),
+                    (component, severity, format!("task '{}' {why}", id.0)),
+                );
+                self.publish_retired(&retired, component);
+            }
         }
     }
 }
@@ -509,12 +547,17 @@ impl TaskFailureSink for HealthFailureSink {
             task = id.0.as_str(),
             "task running again after restart",
         );
-        if class != TaskClass::Optional {
+        if class == TaskClass::Critical {
             return;
         }
         let mut down = self.down.lock().unwrap_or_else(|p| p.into_inner());
         if down.remove(&id.0).is_some() {
             self.record_background(&down);
+        }
+        drop(down);
+        let mut retired = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((component, _, _)) = retired.remove(&id.0) {
+            self.publish_retired(&retired, component);
         }
     }
 
@@ -697,8 +740,10 @@ pub fn run_supervised_runtime(
         if let Some(observer) = deps.network_change_observer.as_ref() {
             let monitor = Arc::clone(&deps.adapter_monitor);
             let hook = deps.route_recompute_hook.clone();
+            let revive = supervisor.revive_signal();
             let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                 monitor.note_os_change();
+                revive.revive();
                 if let Some(hook) = &hook {
                     hook();
                 }
@@ -735,11 +780,13 @@ pub fn run_supervised_runtime(
             deps.power_event_observer.as_ref(),
             deps.route_recompute_hook.as_ref(),
         ) {
-            match crate::power_resume::PowerResumeRearm::start_observed(
+            // Shares the wake latch with the clock-gap watchdog: one wake, one re-arm.
+            match crate::power_resume::PowerResumeRearm::start_deduped(
                 observer.as_ref(),
-                Arc::clone(hook),
+                reviving(&supervisor, Arc::clone(hook)),
                 crate::power_resume::RESUME_DEBOUNCE,
                 Some(Arc::clone(&liveness)),
+                deps.rebind_requests.clone(),
             ) {
                 Ok(rearm) => {
                     tracing::info!(
@@ -1003,6 +1050,9 @@ pub fn run_supervised_runtime(
         teardown_done.store(true, Ordering::Relaxed);
     });
 
+    // Before `Stopped`: once SCM sees it the process may be killed at any moment,
+    // and a mark written afterwards is lost.
+    crate::crash_series::end_run(&artifacts.topology.data_dir);
     controller.report(ServiceRuntimeState::Stopped);
     crate::lifecycle::clear_recovery_required();
     tracing::info!(
@@ -1040,6 +1090,13 @@ fn on_signed_in(
             gate.fire();
         }
     })
+}
+
+/// The pass hook for the observation ticks: the gathering one when wired.
+fn observation_hook(deps: &SupervisedRuntimeDeps) -> Option<RouteRecomputeHook> {
+    deps.observation_recompute_hook
+        .clone()
+        .or_else(|| deps.route_recompute_hook.clone())
 }
 
 /// Everyone whose rules are in force, from whichever source this platform has.
@@ -1081,6 +1138,19 @@ fn present_principals_fn(
 /// health component is set to `Blocking` — but we keep going, because a
 /// failed-to-spawn task is not worse than a healthy task that retires
 /// later.
+/// `hook`, also retrying retired tasks: a wake or a rebind is the likeliest
+/// thing to have cleared what retired them.
+fn reviving(
+    supervisor: &ServiceSupervisor,
+    hook: Arc<dyn Fn() + Send + Sync>,
+) -> Arc<dyn Fn() + Send + Sync> {
+    let revive = supervisor.revive_signal();
+    Arc::new(move || {
+        revive.revive();
+        hook();
+    })
+}
+
 fn spawn_production_tasks(
     supervisor: &ServiceSupervisor,
     deps: &SupervisedRuntimeDeps,
@@ -1145,7 +1215,8 @@ fn spawn_production_tasks(
         deps.rebind_requests.clone(),
     ) {
         if let Err(e) = supervisor.spawn(crate::power_resume::build_resume_watchdog_task(
-            requests, hook,
+            requests,
+            reviving(supervisor, hook),
         )) {
             tracing::warn!(
                 target: "nrr::supervisor",
@@ -1161,7 +1232,7 @@ fn spawn_production_tasks(
     if let Some(wiring) = deps.app_observation.clone() {
         if let Err(e) = supervisor.spawn(crate::service_tasks::build_app_observation_task(
             wiring,
-            deps.route_recompute_hook.clone(),
+            observation_hook(deps),
         )) {
             tracing::warn!(
                 target: "nrr::supervisor",
@@ -1394,7 +1465,7 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
     if let Some(orch) = deps.dns_refresh_orchestrator.as_ref() {
         if let Err(e) = supervisor.spawn(crate::service_tasks::build_dns_refresh_task(
             Arc::clone(orch),
-            deps.route_recompute_hook.clone(),
+            observation_hook(deps),
         )) {
             tracing::warn!(
                 target: "nrr::supervisor",
@@ -1438,7 +1509,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         if let Err(e) = supervisor.spawn(crate::service_tasks::build_dns_observe_task(
             Arc::clone(source),
             Arc::clone(consumer),
-            deps.route_recompute_hook.clone(),
+            observation_hook(deps),
+            Some(Arc::clone(&deps.health)),
         )) {
             tracing::warn!(
                 target: "nrr::supervisor",
@@ -1457,10 +1529,11 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         deps.conn_observation_source.as_ref(),
         deps.conn_observation_consumer.as_ref(),
     ) {
-        if let Err(e) = supervisor.spawn(crate::service_tasks::build_conn_observe_task(
+        if let Err(e) = supervisor.spawn(crate::service_tasks::build_conn_observe_task_reporting(
             Arc::clone(source),
             Arc::clone(consumer),
-            deps.route_recompute_hook.clone(),
+            observation_hook(deps),
+            Some(Arc::clone(&deps.health)),
         )) {
             tracing::warn!(
                 target: "nrr::supervisor",

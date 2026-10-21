@@ -50,27 +50,35 @@ const ALLOWED_TOP_LEVEL_DOMAINS: &[&str] = &[
     // Block-notification reason slugs, resolved by name from the tray and the
     // per-reason mute settings.
     "block-reason",
+    // Capabilities this OS lacks, resolved by the slugs the service reports
+    // (`platform.missing.<slug>.*`).
+    "platform",
     // Texts only the terminal interface (`nrr-tui`) shows; shared concepts
     // reuse the families above.
     "tui",
 ];
 
-/// Rust files that resolve locale keys at runtime. QML is NOT listed here: the
-/// whole tree is walked instead — naming files by hand meant `Main.qml` alone
-/// stood for a tree where it holds about a tenth of the keys, and every section,
-/// component, flow and `Tray.qml` went unchecked.
+/// Desktop Rust files that resolve locale keys at runtime. The QML and TUI
+/// trees are walked instead: a hand-picked file stood for a tree that holds
+/// most of its keys elsewhere.
 const RUNTIME_KEY_SOURCE_FILES: &[&str] = &[
     "apps/desktop/gui/src/ui_surface.rs",
     // lib.rs because nrr-desktop-tray is a lib-only crate consumed by the launcher.
     "apps/desktop/tray/src/lib.rs",
-    // The terminal interface's one key table.
-    "apps/tui/src/keys.rs",
     // The launcher's own notice when the Qt host cannot load its libraries.
     "apps/desktop/launcher/src/launcher/host_start_failure/mod.rs",
 ];
 
-/// Root of the QML tree, walked recursively for `tr()` keys.
-const RUNTIME_KEY_QML_ROOT: &str = "apps/desktop/qml";
+/// Trees walked recursively for keys, with the extensions read in each: the
+/// QML files and their JavaScript libraries, and every terminal-interface module.
+const RUNTIME_KEY_TREES: [(&str, &[&str]); 2] = [
+    ("apps/desktop/qml", &["qml", "js"]),
+    ("apps/tui/src", &["rs"]),
+];
+
+/// Every tree with crates that log: a tagged line outside `core/` reaches the
+/// Logs view all the same.
+const LOG_SOURCE_ROOTS: [&str; 3] = ["apps", "core", "shared"];
 
 #[test]
 fn locale_files_have_no_namespace_conflicts_or_invalid_leaf_types() {
@@ -229,14 +237,27 @@ fn every_path_error_is_worded() {
     }
 }
 
+/// Both clients show an audit entry's cause through a key built from its slug.
+#[test]
+fn every_audit_cause_is_worded() {
+    for locale in BASELINE_LOCALES {
+        let map = raw_locale_map(locale);
+        for slug in nrr_shared::diagnostics_dto::AUDIT_CAUSES {
+            let key = format!("audit.cause.{slug}");
+            assert!(
+                map.get(&key).is_some_and(|text| !text.is_empty()),
+                "locale '{locale}' lacks {key}"
+            );
+        }
+    }
+}
+
 /// A service line tagged `msg_key = "<id>"` is shown in the Logs view as
 /// `diag.event.<id>`; a tag with no translation would show English in RU.
 #[test]
 fn every_service_message_key_is_translated() {
-    let mut sources = Vec::new();
-    collect_files_with_extension(&workspace_root().join("core"), "rs", &mut sources);
     let mut tags = BTreeSet::new();
-    for content in &sources {
+    for content in &log_sources() {
         for line in content.lines() {
             let line = line.trim_start();
             if line.starts_with("//") {
@@ -253,7 +274,7 @@ fn every_service_message_key_is_translated() {
     }
     assert!(
         tags.len() >= 10,
-        "found only {} msg_key tags under core/ — the scan is not seeing the call sites",
+        "found only {} msg_key tags — the scan is not seeing the call sites",
         tags.len()
     );
 
@@ -277,8 +298,7 @@ fn every_service_message_key_is_translated() {
 /// has a `{error}` slot to land in.
 #[test]
 fn a_translated_log_line_keeps_its_values() {
-    let mut sources = Vec::new();
-    collect_files_with_extension(&workspace_root().join("core"), "rs", &mut sources);
+    let sources = log_sources();
     let english = raw_locale_map("en");
     let mut sites = 0;
     let mut spliced = Vec::new();
@@ -297,7 +317,7 @@ fn a_translated_log_line_keeps_its_values() {
     }
     assert!(
         sites >= 400,
-        "found only {sites} tagged log calls under core/ — the scan is not seeing them"
+        "found only {sites} tagged log calls — the scan is not seeing them"
     );
     assert!(
         spliced.is_empty(),
@@ -677,7 +697,9 @@ fn raw_locale_map(locale: &str) -> BTreeMap<String, String> {
     map
 }
 
-fn collect_files_with_extension(dir: &Path, extension: &str, out: &mut Vec<String>) {
+/// Files under `dir` with one of `extensions`, as (path, contents), skipping
+/// build output.
+fn collect_files_with_extension(dir: &Path, extensions: &[&str], out: &mut Vec<(PathBuf, String)>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -685,61 +707,112 @@ fn collect_files_with_extension(dir: &Path, extension: &str, out: &mut Vec<Strin
         let path = entry.path();
         if path.is_dir() {
             if path.file_name().and_then(|n| n.to_str()) != Some("target") {
-                collect_files_with_extension(&path, extension, out);
+                collect_files_with_extension(&path, extensions, out);
             }
-        } else if path.extension().and_then(|s| s.to_str()) == Some(extension) {
+        } else if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| extensions.contains(&ext))
+        {
             if let Ok(contents) = fs::read_to_string(&path) {
-                out.push(contents);
+                out.push((path, contents));
             }
         }
     }
+}
+
+/// Rust sources of every crate that can log, minus this file, whose fixtures
+/// are not call sites.
+fn log_sources() -> Vec<String> {
+    let mut sources = Vec::new();
+    for root in LOG_SOURCE_ROOTS {
+        collect_files_with_extension(&workspace_root().join(root), &["rs"], &mut sources);
+    }
+    sources
+        .into_iter()
+        .filter(|(path, _)| !path.ends_with("shared/contracts/tests/localization_keys.rs"))
+        .map(|(_, contents)| contents)
+        .collect()
 }
 
 fn is_allowed_runtime_dynamic_key(key: &str) -> bool {
     key.starts_with("action.") && key.ends_with(".description")
 }
 
+fn harvest_keys(content: &str, keys: &mut BTreeSet<String>) {
+    for literal in extract_quoted_strings(content) {
+        if looks_like_locale_key(&literal) {
+            keys.insert(literal);
+        }
+    }
+}
+
+/// The files of one walked tree, failing loudly on a tree that moved.
+fn runtime_key_tree_files(root: &str, extensions: &[&str]) -> Vec<(PathBuf, String)> {
+    let mut files = Vec::new();
+    collect_files_with_extension(&workspace_root().join(root), extensions, &mut files);
+    assert!(
+        !files.is_empty(),
+        "no {extensions:?} files under '{root}' — the walk found nothing to check"
+    );
+    files
+}
+
 fn collect_runtime_locale_keys() -> Vec<String> {
     let mut keys = BTreeSet::new();
-    let mut harvest = |content: &str| {
-        for literal in extract_quoted_strings(content) {
-            if looks_like_locale_key(&literal) {
-                keys.insert(literal);
-            }
-        }
-    };
     for relative_path in RUNTIME_KEY_SOURCE_FILES {
         let path = workspace_root().join(relative_path);
         let content = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read '{}': {error}", path.display()));
-        harvest(&content);
+        harvest_keys(&content, &mut keys);
     }
-    let mut qml = Vec::new();
-    collect_qml_files(&workspace_root().join(RUNTIME_KEY_QML_ROOT), &mut qml);
-    assert!(
-        !qml.is_empty(),
-        "no .qml files under '{RUNTIME_KEY_QML_ROOT}' — the walk found nothing to check"
-    );
-    for content in &qml {
-        harvest(content);
+    for (root, extensions) in RUNTIME_KEY_TREES {
+        for (_, content) in runtime_key_tree_files(root, extensions) {
+            harvest_keys(&content, &mut keys);
+        }
     }
     keys.into_iter().collect::<Vec<_>>()
 }
 
-fn collect_qml_files(dir: &std::path::Path, out: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_qml_files(&path, out);
-        } else if path.extension().and_then(|s| s.to_str()) == Some("qml") {
-            if let Ok(contents) = fs::read_to_string(&path) {
-                out.push(contents);
+/// The QML libraries and the TUI screens name keys of their own; a walk that
+/// stopped at `.qml` files or at the TUI's central table would pass blind.
+#[test]
+fn the_key_scan_reads_qml_libraries_and_every_tui_module() {
+    fn keys_from(
+        root: &str,
+        extensions: &[&str],
+        pick: impl Fn(&Path) -> bool,
+    ) -> BTreeSet<String> {
+        let mut keys = BTreeSet::new();
+        for (path, content) in runtime_key_tree_files(root, extensions) {
+            if pick(&path) {
+                harvest_keys(&content, &mut keys);
             }
         }
+        keys
     }
+    let from_js = keys_from("apps/desktop/qml", &["qml", "js"], |path| {
+        path.extension().and_then(|e| e.to_str()) == Some("js")
+    });
+    assert!(
+        !from_js.is_empty(),
+        "no keys found in the QML JavaScript libraries"
+    );
+    let from_tui_screens = keys_from("apps/tui/src", &["rs"], |path| {
+        !path.ends_with("apps/tui/src/keys.rs")
+    });
+    assert!(
+        !from_tui_screens.is_empty(),
+        "no keys found in TUI modules other than keys.rs"
+    );
+}
+
+/// A file name such as the TUI's `tui.json` starts with a key family.
+#[test]
+fn a_file_name_is_not_taken_for_a_key() {
+    assert!(!looks_like_locale_key("tui.json"));
+    assert!(!looks_like_locale_key("rules.txt"));
+    assert!(looks_like_locale_key("tui.settings.title"));
 }
 
 /// Is this string SHAPED like a locale key?
@@ -773,8 +846,14 @@ fn looks_like_locale_key(value: &str) -> bool {
         return false;
     }
 
-    tail.into_iter().all(is_valid_key_segment)
+    let names_a_file = tail
+        .last()
+        .is_some_and(|last| FILE_EXTENSIONS.contains(last));
+    !names_a_file && tail.into_iter().all(is_valid_key_segment)
 }
+
+/// Extensions of files the code names; no locale key ends in one.
+const FILE_EXTENSIONS: [&str; 8] = ["json", "md", "txt", "toml", "log", "ndjson", "qml", "js"];
 
 /// Root families declared by the shipped locale files, unioned with the
 /// allowlist so a family that exists only in code is still recognised — and

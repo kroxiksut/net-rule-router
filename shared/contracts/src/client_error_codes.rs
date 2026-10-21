@@ -16,6 +16,8 @@ pub const TIMEOUT: &str = "timeout";
 pub const BAD_RESPONSE: &str = "bad-response";
 pub const SERIALIZATION_FAILED: &str = "serialization-failed";
 pub const CLIENT_SHUTDOWN: &str = "client-shutdown";
+/// A change the client held back: the service reads another payload revision.
+pub const SERVICE_CONTRACT_MISMATCH: &str = "service-contract-mismatch";
 
 // The launcher's refusals of the window's own requests.
 pub const UNKNOWN_OPERATION: &str = "unknown-operation";
@@ -56,6 +58,8 @@ pub const CLIENT_ERROR_CODES: &[&str] = &[
     IpcErrorCode::ConfirmationUnknown.client_slug(),
     IpcErrorCode::ServiceDegraded.client_slug(),
     IpcErrorCode::RecoveryRequired.client_slug(),
+    IpcErrorCode::UnsupportedOperation.client_slug(),
+    IpcErrorCode::ResponseTooLarge.client_slug(),
     IpcErrorCode::Internal.client_slug(),
     // Transport.
     TRANSPORT_DISCONNECTED,
@@ -63,6 +67,7 @@ pub const CLIENT_ERROR_CODES: &[&str] = &[
     BAD_RESPONSE,
     SERIALIZATION_FAILED,
     CLIENT_SHUTDOWN,
+    SERVICE_CONTRACT_MISMATCH,
     // A refused or failed change, from the service's mutation executor.
     "malformed-payload",
     "rule-cap-exceeded",
@@ -96,6 +101,8 @@ pub const CLIENT_ERROR_CODES: &[&str] = &[
     "revision-integrity-rejected",
     "rules-changed-elsewhere",
     "not-implemented",
+    // A refused route-policy write.
+    "route-policy-sites-needs-main-route",
     // Rule-file import.
     "payload-too-large",
     "file-encoding",

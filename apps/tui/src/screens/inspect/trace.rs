@@ -270,7 +270,7 @@ fn folder_rule_at(items: &[Item], at: usize) -> Option<String> {
     })?
 }
 
-/// "C:\Apps  ·  2 program(s)  ·  5 connection(s):" — a heading, by its colon.
+/// "C:\Apps  ·  2 programs  ·  5 connections:" — a heading, by its colon.
 fn header_text(texts: &Texts, group: &TraceGroup) -> String {
     format!(
         "{}  ·  {}:",
@@ -287,16 +287,13 @@ fn group_label(texts: &Texts, group: &TraceGroup) -> String {
 }
 
 fn group_counts(texts: &Texts, group: &TraceGroup) -> String {
-    let rows = group.rows.len().to_string();
+    let connections = texts.counted(keys::TRACE_GROUP_CONNECTIONS, group.rows.len());
     match group.kind {
-        TraceGroupKind::Program => format!("{rows} {}", texts.get(keys::TRACE_GROUP_COUNT)),
-        TraceGroupKind::Folder | TraceGroupKind::NoPath => {
-            let programs = group.programs.to_string();
-            fill_numbered(
-                &texts.get(keys::TRACE_GROUP_FOLDER_COUNTS),
-                &[&programs, &rows],
-            )
-        }
+        TraceGroupKind::Program => connections,
+        TraceGroupKind::Folder | TraceGroupKind::NoPath => format!(
+            "{}  ·  {connections}",
+            texts.counted(keys::TRACE_GROUP_PROGRAMS, group.programs)
+        ),
     }
 }
 
@@ -346,6 +343,36 @@ fn rule_for_selected_folder(app: &mut AppState) -> bool {
         return false;
     };
     crate::screens::rules::add_prefilled(app, RuleType::Application, value)
+}
+
+/// "Rule for this address…": the add form holding the chosen connection's
+/// IPv4 address, as the GUI offers it.
+fn rule_for_selected_address(app: &mut AppState) -> bool {
+    let Some(e) = app.inspect.trace.selected_entry() else {
+        return false;
+    };
+    // A kept row carries the address alone.
+    let address = if app.inspect.trace.history {
+        e.remote.as_str()
+    } else {
+        remote_address(&e.remote)
+    };
+    let Ok(ip) = address.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    crate::screens::rules::add_prefilled(app, RuleType::ExactIp, ip.to_string())
+}
+
+/// "Rule for this application…": application rules match the program's file
+/// name, which is what the trace names.
+fn rule_for_selected_program(app: &mut AppState) -> bool {
+    let Some(e) = app.inspect.trace.selected_entry() else {
+        return false;
+    };
+    if e.process.is_empty() || e.process == "?" {
+        return false;
+    }
+    crate::screens::rules::add_prefilled(app, RuleType::Application, e.process)
 }
 
 struct Drained {
@@ -707,6 +734,7 @@ impl Screen for TraceScreen {
             keys::TRACE_HELP_OUTAGE,
             keys::TRACE_HELP_HISTORY,
             keys::TRACE_HELP_GROUPING,
+            keys::TRACE_HELP_RULE,
             keys::TRACE_SUBTITLE,
             keys::TRACE_VERDICT_NOTE,
         ]
@@ -724,6 +752,7 @@ impl Screen for TraceScreen {
             keys::TRACE_HELP_OUTAGE,
             keys::TRACE_PLAIN_HISTORY,
             keys::TRACE_PLAIN_GROUPING,
+            keys::TRACE_PLAIN_RULE,
         ]
     }
 
@@ -740,6 +769,14 @@ impl Screen for TraceScreen {
 
     fn captures_keys(&self, app: &AppState) -> bool {
         app.inspect.trace.typing.is_some()
+    }
+
+    fn text_target(&self, app: &AppState) -> crate::paste::TextTarget {
+        if app.inspect.trace.typing.is_some() {
+            crate::paste::TextTarget::Line
+        } else {
+            crate::paste::TextTarget::None
+        }
     }
 
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
@@ -774,6 +811,12 @@ impl Screen for TraceScreen {
             }
             KeyCode::Char('f') => {
                 rule_for_selected_folder(app);
+            }
+            KeyCode::Char('i') => {
+                rule_for_selected_address(app);
+            }
+            KeyCode::Char('a') => {
+                rule_for_selected_program(app);
             }
             KeyCode::Char('c') => {
                 check_selected(app);
@@ -831,6 +874,20 @@ impl Screen for TraceScreen {
                     return false;
                 }
                 return rule_for_selected_folder(app);
+            }
+            ("i", "") => return rule_for_selected_address(app),
+            ("a", "") => return rule_for_selected_program(app),
+            ("i", number) => {
+                if !state.pager.pick(number, len) {
+                    return false;
+                }
+                return rule_for_selected_address(app);
+            }
+            ("a", number) => {
+                if !state.pager.pick(number, len) {
+                    return false;
+                }
+                return rule_for_selected_program(app);
             }
             ("d", number) => return state.pager.pick(number, len),
             ("c", number) => {

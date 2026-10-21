@@ -148,6 +148,18 @@ A line starting with `#` where the rest is not a valid rule value (e.g.
 `# this is a note`) is treated as a free comment — it is not shown as a
 disabled rule in the GUI.
 
+In an application section, a program written in double quotes is always a
+rule, on or off, and the quotes are not part of its name. The app writes a
+disabled program this way when its name would otherwise read as a note, so
+turning it off never loses it:
+
+```
+# "Web Content" +children   # note
+```
+
+Removing the `#` by hand turns such a rule on; the quotes may stay. A `!` goes
+before the opening quote, and `+children` or `+override` after the closing one.
+
 #### Check where it works
 
 ```
@@ -157,7 +169,7 @@ disabled rule in the GUI.
 # ?old.example.com
 ```
 
-A `?` written immediately before a domain value or a single IP address, in
+A `?` written immediately before a domain value or a single IPv4 address, in
 either file, asks the app to check that the site opens through that file's
 route (§1.15). It goes after the `#` of a disabled rule, never before it.
 
@@ -181,8 +193,18 @@ after the `#` of a disabled rule, and it is never combined with `?`.
 ```
 
 Standalone comment lines (where the content after `#` is not a recognizable
-rule value) are preserved in the file but ignored by the rule engine. They
-are not shown in the GUI rule list.
+rule value) are ignored by the rule engine and are not shown in the GUI rule
+list.
+
+They are **not kept** when the app writes the file. Saving rules from the
+window, the tray or the terminal interface writes the file anew from the rules
+list, and a free comment is not part of that list. A note you want to keep
+belongs on the rule's own line (`example.com  # why it is here`): it is the
+rule's comment and is written back with the rule, unless you export with
+"Include rule comments" turned off. Sections for other operating systems are
+written back as they were. A file you edited by hand after the app last saved
+it is not overwritten: the app leaves it as it is and offers to compare it
+with the rules in force.
 
 #### Syntax hint
 
@@ -287,8 +309,8 @@ both files are evaluated together:
    the platform-appropriate section is evaluated. The destinations an
    application rule teaches the router (§1.10) are evaluated at this tier too,
    so an address rule for the same address wins.
-8. **Default route** — set by the routing mode (see
-   [Routing modes](routing-modes.md)).
+8. **Default route** — the setting of that name: the main or the additional
+   connection (see [Quick start](quickstart.md#first-setup)).
 
 Name rules (tiers 1, 2, 3 and 6) apply only when the destination's name is known.
 
@@ -468,8 +490,8 @@ dash are accepted when reading; the file is written without them.
   server, a network the computer is connected to, or the address pool the app
   uses for name-based routing. The message names what it covers.
 - A network wider than /16 (IPv4) or /48 (IPv6) is routed, but while the
-  additional connection is down Fail-Closed does not block it, and the app
-  warns you about this when you save the rule.
+  additional connection is down leak protection set to **Routed sites** does
+  not hold it back, and the app warns you about this when you save the rule.
 
 The Overlaps tab on the Rules screen shows when an address named for the main
 connection lies inside a network named for the additional one: that address
@@ -500,6 +522,11 @@ with one (`\` or `/` on Windows, `/` on Linux and macOS) is a path.
 A folder rule suits a program that keeps several executables of its own next
 to each other or in subfolders (helpers, updaters, a new version folder after
 each update): one rule covers all of them.
+
+A folder rule does not separate websites that one shared server runs, such as
+`php-fpm`, IIS or a Node.js process manager: their connections come from the
+server, not from the files in each site's folder, so every site of that server
+follows the server's route.
 
 Name patterns:
 
@@ -855,8 +882,9 @@ Key properties:
   never checked.
 - **Domain and single-address rules.** The prefix is read in `--- Domains`
   (and in `--- Auto`, which shares its grammar, §1.13), on exact hosts and on
-  `*.` suffix rules alike, and in `--- IP`. On an IPv6 address the `?` is kept
-  but never leads to a move. On `example.*` the `?` is dropped with a warning
+  `*.` suffix rules alike, and, on a single IPv4 address, in `--- IP`. On an
+  IPv6 address the `?` is dropped with a warning and the rule routes without a
+  check. On `example.*` the `?` is dropped with a warning
   and the rule routes without a check: the check needs one host. In any other
   section the `?` is part of the value, which makes it invalid.
 - **Not together with a deny.** "Check where it works" and "never send it"
@@ -899,7 +927,9 @@ Key properties:
   confirmation back with one action. A new critical process under the rule
   asks for a confirmation again.
 - **Undone by an emergency network reset.** Restoring the network revokes
-  every confirmation.
+  every confirmation. So does a run of service failures in a row, and you are
+  told: an allowed rule that keeps bringing the service or the network down is
+  not put back at every restart.
 - **Never for everything.** The root of a disk and the app's own programs
   cannot be confirmed; `+override` there changes nothing.
 - **Program rules only.** On any other line the flag means nothing and is

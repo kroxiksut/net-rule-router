@@ -14,7 +14,6 @@ const SYSTEM: &str = "u-system";
 
 const PIN: u64 = 0x10;
 const RULE: u64 = 0x20;
-const DEFAULT: u64 = 0x30;
 const SYSTEM_PIN: u64 = 0x110;
 
 const ETH: u32 = 2;
@@ -63,7 +62,6 @@ fn fixture() -> Fixture {
             .with_owner_scoped_egress()
             .with_drop_pairing()
             .with_trace_ring(Arc::clone(&ring))
-            .with_not_covered_drop_check(Arc::new(|id: u64| id == DEFAULT))
             .with_service_account_drop_check(Arc::new(|id: u64| id == SYSTEM_PIN))
             .with_killswitch_drop_check(Arc::new(|id: u64| id == PIN || id == SYSTEM_PIN))
             .with_block_notice(
@@ -188,25 +186,13 @@ fn a_system_drop_reaches_nobodys_notice_or_outage_list() {
 }
 
 #[test]
-fn a_catch_all_drop_reads_not_covered_and_a_rule_drop_reads_as_a_rule() {
+fn a_rule_drop_reads_as_a_rule() {
     let f = fixture();
-    f.consumer.consume(
-        &[
-            drop_by(BOB, DEFAULT, 1, 1_000),
-            drop_by(BOB, RULE, 2, 1_000),
-        ],
-        at(1_500),
-    );
+    f.consumer
+        .consume(&[drop_by(BOB, RULE, 2, 1_000)], at(1_500));
     let (rows, _) = f.ring.snapshot(0, 8);
-    assert_eq!(rows[1].nrr_block_reason, Some("not-covered-by-rules"));
     assert_eq!(rows[0].nrr_block_reason, Some("blocked-by-rule"));
-    assert_eq!(
-        notices(&f),
-        vec![
-            (BOB.to_owned(), "not-covered-by-rules"),
-            (BOB.to_owned(), "blocked-by-rule"),
-        ]
-    );
+    assert_eq!(notices(&f), vec![(BOB.to_owned(), "blocked-by-rule")]);
 }
 
 #[test]
@@ -260,5 +246,59 @@ fn each_connection_is_labelled_by_its_owners_links() {
         rows[0].egress.role,
         EgressRole::Other,
         "the same link is not Alice's additional route"
+    );
+}
+
+/// Console plus remote session: each connection is judged by its own user's
+/// links, and a connection nobody owns follows the routing user's.
+#[test]
+fn two_users_are_each_labelled_by_their_own_links() {
+    let api = nrr_platform_api::windows_api::MockWindowsApi::new();
+    api.set_adapter_infos(vec![
+        adapter(ETH, "eth0", Ipv4Addr::new(192, 168, 0, 5)),
+        adapter(WG, "wg0", Ipv4Addr::new(10, 8, 0, 2)),
+    ]);
+    let egress: EgressIfindexesFn = Arc::new(|owner: &str| match owner {
+        ALICE => (Some(ETH), None),
+        BOB => (Some(ETH), Some(WG)),
+        _ => (None, None),
+    });
+    let ring = Arc::new(ConnectionTraceRing::new(64));
+    let consumer = ConnectionObservationConsumer::with_egress(
+        Arc::new(api),
+        egress,
+        Arc::new(|| Some(ALICE.to_owned())),
+        false,
+    )
+    .with_owner_scoped_egress()
+    .with_machine_accounts_on_active_links()
+    .with_trace_ring(Arc::clone(&ring));
+    let over = |owner: Option<&str>, local: Ipv4Addr| {
+        let mut o = drop_by(BOB, PIN, 7, 1_000);
+        o.user_sid = owner.map(str::to_owned);
+        o.local = SocketAddr::V4(SocketAddrV4::new(local, 41_000));
+        o.verdict = ConnectionVerdict::Unknown;
+        o.blocked_by_nrr = None;
+        o.nrr_drop_spec_id = None;
+        o
+    };
+    let tunnel = Ipv4Addr::new(10, 8, 0, 2);
+    consumer.consume(&[over(Some(BOB), tunnel), over(None, tunnel)], at(1_500));
+
+    let (rows, _) = ring.snapshot(0, 8);
+    let role_of = |owner: Option<&str>| {
+        rows.iter()
+            .find(|r| r.user_sid.as_deref() == owner)
+            .map(|r| r.egress.role)
+    };
+    assert_eq!(
+        role_of(Some(BOB)),
+        Some(EgressRole::Secondary),
+        "Bob's tunnel is Bob's additional link"
+    );
+    assert_ne!(
+        role_of(None),
+        Some(EgressRole::Secondary),
+        "an unowned connection is judged by Alice's links, where that tunnel is no link of hers"
     );
 }

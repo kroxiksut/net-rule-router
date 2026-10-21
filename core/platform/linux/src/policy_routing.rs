@@ -115,6 +115,25 @@ pub(crate) fn displaced_rules(rules: &[RawFibRule]) -> Vec<(usize, u32)> {
     out
 }
 
+/// Somebody else's rules far in front of our band that send every address to a
+/// table of their own (`ipv6`, priority, table): a VPN's exit-node rule lands
+/// here, and it takes the traffic before any user's table is looked up. They
+/// are not moved — a number that far ahead was chosen — only reported.
+pub(crate) fn catch_all_rules_ahead(rules: &[RawFibRule]) -> Vec<(bool, u32, u32)> {
+    const STANDARD_TABLES: [u32; 3] = [253, 254, 255];
+    let mut found: Vec<(bool, u32, u32)> = rules
+        .iter()
+        .filter(|r| !r.ours && r.priority > 0 && r.priority < USER_PRIORITY)
+        .filter_map(|r| {
+            r.catch_all_table
+                .filter(|t| !STANDARD_TABLES.contains(t))
+                .map(|t| (r.ipv6, r.priority, t))
+        })
+        .collect();
+    found.sort_unstable();
+    found
+}
+
 /// Every rule [`displaced_rules`] would move, whole: empty once ours are in
 /// front. A pass input, so a VPN coming up wakes a pass that would otherwise
 /// see nothing it reads move; the body, so one rule replacing another at the
@@ -144,11 +163,34 @@ pub fn installed_selectors_fingerprint() -> Result<u64, PlatformError> {
     Ok(hasher.finish())
 }
 
+/// Say so when the set of catch-all foreign rules ahead of our band changes.
+#[cfg(target_os = "linux")]
+fn report_catch_all_ahead(found: &[(bool, u32, u32)]) {
+    static LAST: std::sync::Mutex<Vec<(bool, u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    if last.as_slice() == found {
+        return;
+    }
+    *last = found.to_vec();
+    crate::kernel_capabilities::set_foreign_rule_ahead(!found.is_empty());
+    for (ipv6, priority, table) in found {
+        tracing::warn!(
+            target: "nrr::routes",
+            msg_key = "linux-foreign-rule-ahead",
+            priority,
+            table,
+            ipv6,
+            "a routing rule far in front of ours sends all traffic to another table; it is looked up before any user's own routes",
+        );
+    }
+}
+
 /// Move what [`displaced_rules`] finds. One refused move does not hold back
 /// the others; the first refusal is returned after all were tried.
 #[cfg(target_os = "linux")]
 fn keep_ours_in_front() -> Result<usize, PlatformError> {
     let rules = crate::route_table::get_raw_fib_rules()?;
+    report_catch_all_ahead(&catch_all_rules_ahead(&rules));
     let mut moved = 0;
     let mut first_error = None;
     for (i, to) in displaced_rules(&rules) {
@@ -381,17 +423,18 @@ impl PrincipalRoutingPort for LinuxPrincipalRouting {
         // Adds before deletes: a range that moves (a user signing in carves
         // their uid out of the service accounts') is never left unselected.
         for rule in &add {
-            match crate::route_table::add_fib_rule(rule) {
-                Ok(()) => delta.added += 1,
-                Err(e) if rule.ipv6 && errno_is(&e, libc::EAFNOSUPPORT) => {
-                    self.ipv6_refused.store(true, Ordering::Release);
-                }
-                Err(e) if refuses_uid_range(&e) => {
+            let Err(e) = crate::route_table::add_fib_rule(rule) else {
+                delta.added += 1;
+                continue;
+            };
+            match note_add_refusal(rule.ipv6, &e) {
+                AddRefusal::Ipv6Off => self.ipv6_refused.store(true, Ordering::Release),
+                AddRefusal::NoUidRange => {
                     self.clear_selectors()?;
                     return Err(PlatformError::NotSupported { reason: OLD_KERNEL });
                 }
-                Err(e) if e.classify() == nrr_platform_api::error::ErrorClass::Conflict => {}
-                Err(e) => return Err(e),
+                AddRefusal::AlreadyThere => {}
+                AddRefusal::Failed => return Err(e),
             }
         }
         for rule in &delete {
@@ -404,8 +447,18 @@ impl PrincipalRoutingPort for LinuxPrincipalRouting {
         // Whatever of ours stood uid-less before was deleted above; one now is
         // a rule just added whose range the kernel dropped.
         if delta.added > 0 && uid_range_ignored(&crate::route_table::get_fib_rules()?) {
+            crate::kernel_capabilities::record(
+                crate::kernel_capabilities::KernelCapability::UserRoutes,
+                false,
+            );
             self.clear_selectors()?;
             return Err(PlatformError::NotSupported { reason: OLD_KERNEL });
+        }
+        if delta.added > 0 {
+            crate::kernel_capabilities::record(
+                crate::kernel_capabilities::KernelCapability::UserRoutes,
+                true,
+            );
         }
         // Ours already stand; a move refused now is retried by the next pass.
         if let Err(e) = keep_ours_in_front() {
@@ -455,6 +508,17 @@ pub fn sweep_selectors() -> Result<usize, PlatformError> {
     Ok(removed)
 }
 
+/// Remove every route of ours, with or without a service running: our
+/// signature in `main`, and anything in a table only we write. Returns how
+/// many went.
+#[cfg(target_os = "linux")]
+pub fn sweep_routes() -> Result<usize, nrr_platform_api::route_signature::RouteSweepError> {
+    nrr_platform_api::route_signature::sweep_owned_routes_with(
+        std::sync::Arc::new(crate::LinuxApi),
+        &|r: &nrr_platform_api::RouteEntry| matches!(r.table, RouteTableRef::Tagged(n) if is_our_table(n)),
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn errno_is(error: &PlatformError, errno: i32) -> bool {
     matches!(error, PlatformError::Errno { code, .. } if *code == errno)
@@ -464,6 +528,38 @@ fn errno_is(error: &PlatformError, errno: i32) -> bool {
 #[cfg(target_os = "linux")]
 fn refuses_uid_range(error: &PlatformError) -> bool {
     errno_is(error, libc::EINVAL) || errno_is(error, libc::EOPNOTSUPP)
+}
+
+/// What one refused selector add means for the pass.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum AddRefusal {
+    /// IPv6 is disabled at boot: the IPv4 rules carry on alone.
+    Ipv6Off,
+    /// The kernel does not know the uid range: per-user routing is gone.
+    NoUidRange,
+    AlreadyThere,
+    Failed,
+}
+
+/// Classify a refused add, recording a uid range the kernel refuses as a
+/// missing capability: the profile must not keep claiming per-user routes.
+#[cfg(target_os = "linux")]
+fn note_add_refusal(ipv6: bool, error: &PlatformError) -> AddRefusal {
+    if ipv6 && errno_is(error, libc::EAFNOSUPPORT) {
+        return AddRefusal::Ipv6Off;
+    }
+    if refuses_uid_range(error) {
+        crate::kernel_capabilities::record(
+            crate::kernel_capabilities::KernelCapability::UserRoutes,
+            false,
+        );
+        return AddRefusal::NoUidRange;
+    }
+    if error.classify() == nrr_platform_api::error::ErrorClass::Conflict {
+        return AddRefusal::AlreadyThere;
+    }
+    AddRefusal::Failed
 }
 
 #[cfg(test)]
@@ -747,8 +843,26 @@ mod tests {
             priority,
             goto_target: None,
             ours,
+            catch_all_table: None,
             body: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_foreign_catch_all_far_ahead_is_found_and_ours_and_standard_tables_are_not() {
+        let with_table = |priority, ours, table: Option<u32>| RawFibRule {
+            catch_all_table: table,
+            ..raw(false, priority, ours)
+        };
+        let rules = [
+            with_table(0, false, Some(255)),
+            with_table(5_270, false, Some(52)),
+            with_table(5_250, false, None),
+            with_table(100, false, Some(254)),
+            with_table(USER_PRIORITY, true, Some(0x8000_03E8)),
+            with_table(32_764, false, Some(51_820)),
+        ];
+        assert_eq!(catch_all_rules_ahead(&rules), [(false, 5_270, 52)]);
     }
 
     /// `wg-quick` brought up after the service: its pair landed at 30098/30099
@@ -851,17 +965,54 @@ mod tests {
         assert!(release_selects_by_uid(""));
     }
 
-    /// The reset script removes our rules by hand; its copy of the band and of
-    /// the first table must match.
+    /// A kernel that refuses the uid range at add is listed as missing per-user
+    /// routes; IPv6 being off or a rule already standing says nothing of it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_uid_range_is_listed_as_missing() {
+        use crate::kernel_capabilities::{is_available, missing, record, KernelCapability};
+        let _held = crate::kernel_capabilities::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let errno = |code| PlatformError::Errno {
+            operation: "add a routing rule",
+            code,
+            message: String::new(),
+        };
+        record(KernelCapability::UserRoutes, true);
+        assert_eq!(
+            note_add_refusal(true, &errno(libc::EAFNOSUPPORT)),
+            AddRefusal::Ipv6Off
+        );
+        assert_eq!(
+            note_add_refusal(false, &errno(libc::EEXIST)),
+            AddRefusal::AlreadyThere
+        );
+        assert!(is_available(KernelCapability::UserRoutes));
+
+        assert_eq!(
+            note_add_refusal(false, &errno(libc::EINVAL)),
+            AddRefusal::NoUidRange
+        );
+        assert!(missing().contains(&KernelCapability::UserRoutes));
+        record(KernelCapability::UserRoutes, true);
+    }
+
+    /// The reset script and the AUR removal fallback remove our rules by hand;
+    /// their copies of the band and of the first table must match.
     #[test]
     fn the_reset_script_mirrors_the_band_and_the_tables() {
-        let script = include_str!("../../../../scripts/reset-network.sh");
-        for line in [
-            format!("rule_priority_first={}", PRIORITY_BAND.start()),
-            format!("rule_priority_last={}", PRIORITY_BAND.end()),
-            format!("our_table_first={SYSTEM_TABLE}"),
-        ] {
-            assert!(script.lines().any(|l| l == line), "{line}");
+        let reset = include_str!("../../../../scripts/reset-network.sh");
+        let aur =
+            include_str!("../../../../packaging/linux/aur/netrulerouter-bin/netrulerouter.install");
+        for (script, prefix) in [(reset, ""), (aur, "_nrr_")] {
+            for line in [
+                format!("{prefix}rule_priority_first={}", PRIORITY_BAND.start()),
+                format!("{prefix}rule_priority_last={}", PRIORITY_BAND.end()),
+                format!("{prefix}our_table_first={SYSTEM_TABLE}"),
+            ] {
+                assert!(script.lines().any(|l| l == line), "{line}");
+            }
         }
     }
 

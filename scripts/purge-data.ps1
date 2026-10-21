@@ -85,6 +85,7 @@ if ($Yes -and -not $isAdmin -and -not $UserOnly) {
     Write-Host "Re-run as administrator:" -ForegroundColor Yellow
     $again = "powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Yes"
     if ($PurgeAudit) { $again += ' -PurgeAudit' }
+    if ($Profile -ne 'auto') { $again += " -Profile $Profile" }
     Write-Host "  $again"
     exit 3
 }

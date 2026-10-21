@@ -318,17 +318,19 @@ impl PerSidApplyOrchestrator {
         // Route before block — same ordering invariant the reconcile enforces
         // (see `reconcile_to_desired`). A cold install lands the whole pin set
         // at once, so every destination it covers must already be routed.
-        if let Some(route_sync) = self
-            .route_sync
-            .as_ref()
-            .filter(|_| filters.iter().any(is_destination_block))
-        {
-            route_sync();
-        }
+        self.sync_routes_before_pins(sid, &filters);
         // The compute above can run for seconds; the latch may have flipped
         // inside it.
         if self.adds_refused(sid, "install-apply") {
             return Ok(0);
+        }
+        // Journal before the commit: a batch the engine accepted before a later
+        // one failed, or a process killed mid-commit, is otherwise tracked by
+        // nobody. Ids are derived from identity, so an id that never landed is
+        // an idempotent delete at the next reap.
+        if let Some(ledger) = self.ledger.as_ref() {
+            let planned: Vec<WfpFilterId> = filters.iter().map(|s| s.id).collect();
+            ledger.record(&planned);
         }
         let mode = (self.failure_mode)();
         // MAKE before BREAK inside the session, as in `reconcile_to_desired`:
@@ -370,10 +372,6 @@ impl PerSidApplyOrchestrator {
         // not the frequent coverage-reconcile tick, so the cost is one
         // enumeration per policy change.
         self.verify_installed_filters_live(sid, &installed_ids, count);
-        // Persist the ids so a hard-kill's orphans can be reaped by id.
-        if let Some(ledger) = self.ledger.as_ref() {
-            ledger.record(&installed_ids);
-        }
         // Destinations this set scopes to, deduplicated. Compared against the
         // previous install BEFORE the state is replaced.
         let (destinations, secondary_resolved) = Self::coverage_of(&filters);
@@ -429,6 +427,51 @@ impl PerSidApplyOrchestrator {
         Ok(count)
     }
 
+    /// Wire the narrow route sync tried before the full one; see
+    /// [`ScopedRouteSyncHook`].
+    #[must_use]
+    pub fn with_scoped_route_sync(mut self, hook: ScopedRouteSyncHook) -> Self {
+        self.scoped_route_sync = Some(hook);
+        self
+    }
+
+    /// Route before block for the destination blocks among `adds`. A few new
+    /// host pins route just their own addresses; a network pin, a large batch
+    /// or an address the narrow plan declined falls back to the full route
+    /// pass, which the routes phase of the same tick has usually just run.
+    fn sync_routes_before_pins(&self, sid: &str, adds: &[WfpFilterSpec]) {
+        let Some(full) = self.route_sync.as_ref() else {
+            return;
+        };
+        let mut pins = adds.iter().filter(|spec| is_destination_block(spec));
+        let Some(first) = pins.next() else {
+            return;
+        };
+        if let Some(scoped) = self.scoped_route_sync.as_ref() {
+            let pins: Vec<&WfpFilterSpec> = std::iter::once(first).chain(pins).collect();
+            let hosts_only = pins.iter().all(|spec| {
+                spec.remote_subnet.is_none()
+                    && spec.remote_subnet_v6.is_none()
+                    && spec.remote_subnet_set.is_empty()
+            });
+            if hosts_only {
+                let mut seen = std::collections::HashSet::new();
+                let hosts: Vec<std::net::IpAddr> = pins
+                    .iter()
+                    .flat_map(|spec| Self::hosts_of(spec))
+                    .filter(|ip| seen.insert(*ip))
+                    .collect();
+                if !hosts.is_empty()
+                    && hosts.len() <= SCOPED_ROUTE_SYNC_MAX_HOSTS
+                    && scoped(sid, &hosts)
+                {
+                    return;
+                }
+            }
+        }
+        run_route_sync(full);
+    }
+
     /// Window-free, make-before-break reconcile of the per-SID filter set
     /// against the freshly-resolved secondary LUID: grows coverage
     /// additively (newly observed secondary IPs) and reaps tracked filters
@@ -453,7 +496,7 @@ impl PerSidApplyOrchestrator {
     /// id set lacks.
     ///
     /// Correct across every secondary adapter transition (reconnect,
-    /// up→down fail-closed/fail-open, down→up re-arm) because the diff
+    /// up→down fail-closed, down→up re-arm) because the diff
     /// drives it. A no-op when desired == tracked. Only acts on an
     /// already-installed SID — [`Self::reconcile`] owns an inactive one.
     /// Returns the count of filters added.
@@ -554,13 +597,7 @@ impl PerSidApplyOrchestrator {
         // and the BREAK below is unchanged). No lock is held at this point.
         // Costs nothing in steady state: an unchanged coverage set adds no
         // destination block and never reaches this call.
-        if let Some(route_sync) = self
-            .route_sync
-            .as_ref()
-            .filter(|_| to_add.iter().any(is_destination_block))
-        {
-            route_sync();
-        }
+        self.sync_routes_before_pins(sid, &to_add);
 
         // MAKE then BREAK, both inside the session so a batch boundary cannot
         // reorder them: every add commits before the first delete. A pure LUID
@@ -571,6 +608,11 @@ impl PerSidApplyOrchestrator {
         // block materialises, never a leak. An app-only block with an absent
         // exe covers no destination and does not hold it, or stale permits
         // would pile up forever behind a missing program.
+        // Journalled before the commit, as in the install path.
+        if let Some(ledger) = self.ledger.as_ref() {
+            let planned: Vec<WfpFilterId> = to_add.iter().map(|s| s.id).collect();
+            ledger.record(&planned);
+        }
         let mode = (self.failure_mode)();
         let replaced = match self.session.execute_replacement(&to_add, &to_remove, mode) {
             Ok(o) => o,
@@ -587,11 +629,6 @@ impl PerSidApplyOrchestrator {
             .map(|s| s.id)
             .filter(|id| !skipped.contains(&id.raw))
             .collect();
-        if !to_add.is_empty() {
-            if let Some(ledger) = self.ledger.as_ref() {
-                ledger.record(&installed_ids);
-            }
-        }
         // Anything not retired stays tracked: a filter nobody tracks is one
         // `cleanup_wfp` cannot delete by id, and a retry of a delete that
         // already happened is idempotent.
@@ -1630,5 +1667,22 @@ impl PerSidApplyOrchestrator {
                 "tore down connections that predate the route now in force (a tunnel that just came up, or destinations this activation started enforcing) — the application reconnects over that route instead of finishing on the old link",
             );
         }
+    }
+}
+
+/// Past this many new host pins one table plan is cheaper than as many scoped
+/// ones, and a batch that large is a rule change, not a learnt address.
+const SCOPED_ROUTE_SYNC_MAX_HOSTS: usize = 32;
+
+/// Run the route-before-block hook. A failure does not hold the block back:
+/// an unrouted pin is over-coverage until the retry its builder scheduled.
+fn run_route_sync(route_sync: &RouteSyncHook) {
+    if let Err(error) = route_sync() {
+        tracing::warn!(
+            target: "nrr::route-coordinator",
+            msg_key = "svc-persid-route-sync-before-pin-failed",
+            error = %error,
+            "route sync before installing new destination pins failed",
+        );
     }
 }

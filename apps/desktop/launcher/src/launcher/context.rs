@@ -1,11 +1,9 @@
 // QML context emission for both surfaces, cold-start section resolution, and
 // the temp-file lifecycle (path generation, stale-leftover sweep) it rides on.
 
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use nrr_application::mock_backend::rules::RulesScreenRequest;
 use nrr_desktop_gui::app_shell::LaunchRequest;
 use nrr_desktop_gui::ui_surface::write_qt_context_file_at;
 use nrr_desktop_tray::{write_qt_tray_context_file, TrayContextUrls};
@@ -24,9 +22,12 @@ pub(super) fn emit_context(
     backend_bundle: &crate::backend_factory::BackendBundle,
     request: &LaunchRequest,
     tray_status: Option<TrayStatusKind>,
+    preferences_unreadable: bool,
 ) -> Result<PathBuf, String> {
     match surface {
-        LauncherSurface::MainGui => emit_main_gui_context(preferences, backend_bundle, request),
+        LauncherSurface::MainGui => {
+            emit_main_gui_context(preferences, backend_bundle, request, preferences_unreadable)
+        }
         LauncherSurface::Tray => emit_tray_context(preferences, backend_bundle, tray_status),
     }
 }
@@ -54,6 +55,7 @@ fn emit_main_gui_context(
     preferences: &UiPreferences,
     backend_bundle: &crate::backend_factory::BackendBundle,
     request: &LaunchRequest,
+    preferences_unreadable: bool,
 ) -> Result<PathBuf, String> {
     let shell = gui_shell_v1();
 
@@ -72,7 +74,7 @@ fn emit_main_gui_context(
 
     let first_run = first_run_flow_snapshot(&shell);
 
-    let context_path = generate_temp_path("nrr-qt-context");
+    let context_path = generate_temp_path("nrr-qt-context")?;
     write_qt_context_file_at(
         &context_path,
         &shell,
@@ -83,6 +85,7 @@ fn emit_main_gui_context(
         backend_bundle.facade.as_ref(),
         &backend_bundle.status,
         backend_bundle.service_started,
+        preferences_unreadable,
         &crate::rpc_dispatcher::host_answer_deadlines(),
         machine_files(),
     )?;
@@ -133,18 +136,14 @@ fn emit_tray_context(
         logs_folder_url: nrr_desktop_gui::ui_surface::logs_folder_url(),
     };
 
-    // The window's add-rule form takes its types from this snapshot; the tray's
-    // copy of the form must offer the same ones.
-    let rules = backend_bundle
-        .facade
-        .rules_snapshot(RulesScreenRequest::default());
+    // The tray's copy of the add-rule form offers the window's types.
     write_qt_tray_context_file(
         &runtime,
         &preferences.language,
         preferences,
         urls,
         crate::rpc_dispatcher::host_answer_deadlines(),
-        rules.supported_rule_types,
+        &nrr_shared::FreeRuleType::ALL,
     )
 }
 
@@ -161,30 +160,23 @@ pub fn cold_start_section(request: &LaunchRequest, preferences: &UiPreferences) 
     }
 }
 
-/// A path for one run's context file, inside the coordination directory.
-///
-/// Not the shared temp root: on Unix that is `/tmp`, writable by every local
-/// user, and this file carries the user's settings into the Qt host. Falls back
-/// to the temp root only when the guarded directory cannot be prepared, which
-/// is also the case where the launcher is about to fail anyway.
-fn generate_temp_path(prefix: &str) -> PathBuf {
+/// A path for one run's context file, inside the private coordination
+/// directory. This file carries the user's settings into the Qt host, so a
+/// directory that is not ours is an error, never a fall back to the shared temp.
+fn generate_temp_path(prefix: &str) -> Result<PathBuf, String> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let name = format!("{prefix}-{}-{timestamp}.json", std::process::id());
-    match nrr_platform_api::paths::ensure_user_runtime_dir() {
-        Ok(dir) => dir.join(name),
-        Err(_) => env::temp_dir().join(name),
-    }
+    nrr_platform_api::paths::ensure_user_runtime_dir()
+        .map(|dir| dir.join(name))
+        .map_err(|error| format!("runtime directory is not usable: {error}"))
 }
 
-/// Sweep `%TEMP%` for stale `nrr-*-context-*.json` files left behind when a
-/// previous run was killed (kill-9, crash, fast machine shutdown). Graceful
-/// exit already removes its own context file via `fs::remove_file(&context_file)`
-/// in `run_primary`, but a force-killed process never gets there. Files older
-/// than `LEFTOVER_MAX_AGE` are considered safely abandoned and deleted on
-/// startup so `%TEMP%` does not grow unbounded over time.
+/// Sweep the runtime directory for `nrr-*-context-*.json` files a killed run
+/// left behind (a graceful exit removes its own). Files older than
+/// `LEFTOVER_MAX_AGE` are abandoned and deleted so the directory does not grow.
 pub(super) fn cleanup_temp_leftovers() {
     const LEFTOVER_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
     let Ok(dir) = nrr_platform_api::paths::ensure_user_runtime_dir() else {

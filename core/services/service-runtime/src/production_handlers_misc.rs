@@ -28,10 +28,10 @@ use nrr_storage::route_bindings::{
 use crate::ipc_handlers::mutation_token_store::StoredMutation;
 use crate::ipc_handlers::operation_status_store::OperationError;
 use crate::ipc_handlers::payloads::{
-    BehaviorModeDto, BindingSourceDto, LinkProviderAppDto, MigrationStatusGetResponse,
-    MutationKind, PrincipalDataPurgeResponse, ReviewRiskLevel, ReviewSummaryResponse,
-    RouteBindingDto, RoutePolicyDto, RoutePolicyUpdateRequest, RuleRowEntry, RulesListResponse,
-    RulesRouteFilter, SnapshotInterfacesResponse,
+    BehaviorModeDto, BindingSourceDto, FirstPolicyDto, LinkProviderAppDto,
+    MigrationStatusGetResponse, MutationKind, PrincipalDataPurgeResponse, ReviewRiskLevel,
+    ReviewSummaryResponse, RouteBindingDto, RoutePolicyDto, RoutePolicyUpdateRequest, RuleRowEntry,
+    RulesListResponse, RulesRouteFilter, SnapshotInterfacesResponse,
 };
 use crate::ipc_handlers::providers::{
     AdaptersSnapshotProvider, LinkProviderWriter, MigrationCompletionRecord,
@@ -443,6 +443,9 @@ pub struct ProductionRoutePolicySource {
     fqdn_cache: Option<Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>>,
     /// Set where the platform has no other way to turn browser DoH off.
     doh_lockdown_forced: bool,
+    /// Users whose last read failed, with the reason. A failed read answers
+    /// like an absent policy; this keeps the two apart.
+    failed: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl ProductionRoutePolicySource {
@@ -451,6 +454,7 @@ impl ProductionRoutePolicySource {
             conn,
             fqdn_cache: None,
             doh_lockdown_forced: false,
+            failed: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -499,11 +503,50 @@ impl ProductionRoutePolicySource {
     }
 }
 
+impl ProductionRoutePolicySource {
+    fn note_read(&self, sid: &str, failure: Option<String>) {
+        let mut failed = self.failed.lock().unwrap_or_else(|p| p.into_inner());
+        match failure {
+            Some(reason) => {
+                if failed.insert(sid.to_owned(), reason.clone()).is_none() {
+                    tracing::warn!(
+                        target: "nrr::enforcement",
+                        principal = sid,
+                        reason = %reason,
+                        "the routing policy could not be read: what is applied stays in force",
+                    );
+                }
+            }
+            None => {
+                failed.remove(sid);
+            }
+        }
+    }
+}
+
 impl RoutePolicySource for ProductionRoutePolicySource {
+    fn read_failure_for(&self, sid: &str) -> Option<String> {
+        self.failed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(sid)
+            .cloned()
+    }
+
     fn load_for_sid(&self, sid: &str) -> Option<PerSidPolicySnapshot> {
-        let conn = self.conn.lock().ok()?;
+        let Ok(conn) = self.conn.lock() else {
+            self.note_read(sid, Some("state DB mutex poisoned".to_owned()));
+            return None;
+        };
         let repo = RouteBindingsRepository::new(&conn);
-        let record = repo.load_for_sid(sid).ok()?;
+        let record = match repo.load_for_sid(sid) {
+            Ok(record) => record,
+            Err(e) => {
+                self.note_read(sid, Some(e.to_string()));
+                return None;
+            }
+        };
+        self.note_read(sid, None);
         // Empty record → return None so orchestrator treats SID as
         // unbound. Records with at least one slot bound become a
         // populated snapshot.
@@ -539,15 +582,11 @@ impl RoutePolicySource for ProductionRoutePolicySource {
             primary: record.primary.map(record_binding_to_per_sid),
             secondary: record.secondary.map(record_binding_to_per_sid),
             mode: behavior_mode_to_per_sid(record.mode),
-            block_secondary_when_unavailable: record.block_secondary_when_unavailable,
-            kill_switch_fail_closed: record.kill_switch_fail_closed,
+            leak_protection: record.leak_protection,
             kill_switch_protocols: record.kill_switch_protocols,
-            kill_switch_block_all: record.kill_switch_block_all,
-            kill_switch_enabled: record.kill_switch_enabled,
             allow_dns_over_primary: record.allow_dns_over_primary,
             shared_ip_policy: record.shared_ip_policy,
             kill_switch_strict_shared_ips: record.kill_switch_strict_shared_ips,
-            mode_a_coverage_strategy: record.mode_a_coverage_strategy,
             link_provider_exe_paths,
             doh_lockdown_enabled,
             doh_lockdown_scope,
@@ -585,19 +624,16 @@ fn secondary_unset_blocks(conn: &Connection, record: &RoutePolicyRecord) -> bool
     }
 }
 
-/// The leak guard in its narrowest form: the addresses the additional-route
-/// rules name are blocked, everything else goes out as it would. A guard the
-/// user already turned on keeps their own posture.
+/// Leak protection in its narrowest form, `sites`: the addresses the
+/// additional-route rules name are blocked, everything else goes out as it
+/// would. Protection the user already turned on keeps their own choice.
 fn refuse_unbound_secondary_rules(snapshot: &mut PerSidPolicySnapshot) {
-    if snapshot.kill_switch_enabled && snapshot.kill_switch_fail_closed {
+    if snapshot.leak_protection.is_on() {
         return;
     }
-    snapshot.kill_switch_enabled = true;
-    snapshot.kill_switch_fail_closed = true;
-    snapshot.block_secondary_when_unavailable = true;
-    snapshot.kill_switch_block_all = false;
-    snapshot.mode_a_coverage_strategy = nrr_domain::mode_a_coverage::ModeACoverageStrategy::PerIp;
-    // Without an additional connection there is nothing to prefer.
+    snapshot.leak_protection = nrr_domain::LeakProtection::Sites;
+    // Without an additional connection there is nothing to prefer, and `sites`
+    // is offered only under the main connection.
     snapshot.mode = PerSidBehaviorMode::PreferPrimary;
 }
 
@@ -686,7 +722,6 @@ fn behavior_mode_to_per_sid(mode: BehaviorMode) -> PerSidBehaviorMode {
         BehaviorMode::PreferSecondaryWhenAvailable => {
             PerSidBehaviorMode::PreferSecondaryWhenAvailable
         }
-        BehaviorMode::StrictSecondaryFailClosed => PerSidBehaviorMode::StrictSecondaryFailClosed,
     }
 }
 
@@ -707,6 +742,25 @@ impl ProductionRoutePolicyProvider {
 impl RoutePolicyProvider for ProductionRoutePolicyProvider {
     fn get_for_sid(&self, sid: &str) -> Option<RoutePolicyDto> {
         stored_policy(&self.conn, sid)
+    }
+
+    /// What [`apply_install_default_mode`] makes of a first save that names
+    /// no route and no protection.
+    fn first_policy(&self) -> Option<FirstPolicyDto> {
+        let guard = self.conn.lock().ok()?;
+        let policy = nrr_storage::install_policy::InstallPolicyRepository::new(&guard)
+            .get()
+            .ok()?;
+        let mode = policy
+            .default_route_mode
+            .unwrap_or(BehaviorMode::PreferPrimary);
+        Some(FirstPolicyDto {
+            mode: storage_mode_to_dto(mode),
+            leak_protection_at_least: policy
+                .default_leak_protection
+                .effective(storage_mode_to_domain(mode))
+                .into(),
+        })
     }
 }
 
@@ -774,11 +828,8 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
             primary: request.primary.as_ref().map(dto_binding_to_record),
             secondary: request.secondary.as_ref().map(dto_binding_to_record),
             mode: dto_mode_to_storage(request.mode),
-            block_secondary_when_unavailable: request.block_secondary_when_unavailable,
-            kill_switch_fail_closed: request.kill_switch_fail_closed,
+            leak_protection: request.leak_protection.into(),
             kill_switch_protocols: request.kill_switch_protocols,
-            kill_switch_block_all: request.kill_switch_block_all,
-            kill_switch_enabled: request.kill_switch_enabled,
             allow_dns_over_primary: request.allow_dns_over_primary,
             include_subdomains: request.include_subdomains,
             // Unknown slug (older/other peer) → the balanced default; never
@@ -787,14 +838,6 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
                 &request.shared_ip_policy,
             )
             .unwrap_or_default(),
-            // Mode-A coverage strategy + hosts-bypass. Unknown slug →
-            // the default (fail-closed-unknown, the stricter, safe
-            // direction); never silently change enforcement beyond the pick.
-            mode_a_coverage_strategy:
-                nrr_domain::mode_a_coverage::ModeACoverageStrategy::from_slug(
-                    &request.mode_a_coverage_strategy,
-                )
-                .unwrap_or_default(),
             resolve_hosts_bypass: request.resolve_hosts_bypass,
             // DoH-lockdown toggle + scope. Unknown scope slug
             // (older peer) → the default (leak-protection-only); never silently
@@ -825,6 +868,7 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
             short_name_suffix,
             app_rules_take_all_addresses: request.app_rules_take_all_addresses,
             forwarded_outage: request.forwarded_outage.clone(),
+            external_address_auto_check: request.external_address_auto_check,
             binding_source: dto_source_to_storage(request.binding_source),
         };
         let (written, providers) = {
@@ -852,12 +896,10 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
 }
 
 /// A user's first saved policy starts from the administrator's install-time
-/// mode unless the request names another one. Strict needs an additional
-/// connection, so without one the request's mode stands.
+/// choices: their default route unless the request names another one, and
+/// leak protection never below their floor. Under the additional default route
+/// `sites` means `everything`, so the protection follows the mode.
 fn apply_install_default_mode(conn: &Connection, sid: &str, record: &mut RoutePolicyRecord) {
-    if record.mode != BehaviorMode::PreferPrimary {
-        return;
-    }
     if RouteBindingsRepository::new(conn)
         .has_policy_for_sid(sid)
         .unwrap_or(true)
@@ -867,11 +909,15 @@ fn apply_install_default_mode(conn: &Connection, sid: &str, record: &mut RoutePo
     let Ok(policy) = nrr_storage::install_policy::InstallPolicyRepository::new(conn).get() else {
         return;
     };
-    match policy.default_route_mode {
-        Some(BehaviorMode::StrictSecondaryFailClosed) if record.secondary.is_none() => {}
-        Some(mode) => record.mode = mode,
-        None => {}
+    if record.mode == BehaviorMode::PreferPrimary {
+        if let Some(mode) = policy.default_route_mode {
+            record.mode = mode;
+        }
     }
+    record.leak_protection = record
+        .leak_protection
+        .at_least(policy.default_leak_protection)
+        .effective(storage_mode_to_domain(record.mode));
 }
 
 impl LinkProviderWriter for ProductionRoutePolicyWriter {
@@ -964,6 +1010,9 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
         if sid.is_empty() {
             return Err(RoutePolicyWriteError::EmptySid);
         }
+        // Before the rows go, so no holder writes them back; again after, for a
+        // tick that ran in between.
+        crate::principal_reset::forget_principal(sid);
         let mut conn = self
             .conn
             .lock()
@@ -978,6 +1027,7 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
             0
         };
         drop(conn);
+        crate::principal_reset::forget_principal(sid);
         self.forget_history(Some(sid));
         crate::override_grants::forget_principal(sid);
         Ok(PrincipalDataPurgeResponse {
@@ -992,6 +1042,7 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
         &self,
         include_rules_history: bool,
     ) -> Result<PrincipalDataPurgeResponse, RoutePolicyWriteError> {
+        crate::principal_reset::forget_everyone();
         let mut conn = self
             .conn
             .lock()
@@ -1011,8 +1062,11 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
                         .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
             }
         }
+        total.rows_deleted += nrr_storage::purge_machine_traces(&mut conn)
+            .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
         total.principals_purged = principals.len() as u32;
         drop(conn);
+        crate::principal_reset::forget_everyone();
         self.forget_history(None);
         for principal in &principals {
             crate::override_grants::forget_principal(principal);
@@ -1047,22 +1101,18 @@ fn record_to_dto(
         rec.doh_lockdown_auto,
         rec.doh_lockdown_enabled,
         rec.doh_lockdown_scope,
-        rec.kill_switch_enabled,
+        rec.leak_protection.is_on(),
         has_secondary_rules,
     );
     RoutePolicyDto {
         primary: rec.primary.map(record_binding_to_dto),
         secondary: rec.secondary.map(record_binding_to_dto),
         mode: storage_mode_to_dto(rec.mode),
-        block_secondary_when_unavailable: rec.block_secondary_when_unavailable,
-        kill_switch_fail_closed: rec.kill_switch_fail_closed,
+        leak_protection: rec.leak_protection.into(),
         kill_switch_protocols: rec.kill_switch_protocols,
-        kill_switch_block_all: rec.kill_switch_block_all,
-        kill_switch_enabled: rec.kill_switch_enabled,
         allow_dns_over_primary: rec.allow_dns_over_primary,
         include_subdomains: rec.include_subdomains,
         shared_ip_policy: rec.shared_ip_policy.as_slug().to_string(),
-        mode_a_coverage_strategy: rec.mode_a_coverage_strategy.as_slug().to_string(),
         resolve_hosts_bypass: rec.resolve_hosts_bypass,
         secondary_link_provider_apps: secondary_link_providers
             .into_iter()
@@ -1086,6 +1136,7 @@ fn record_to_dto(
         short_name_suffix: rec.short_name_suffix,
         app_rules_take_all_addresses: rec.app_rules_take_all_addresses,
         forwarded_outage: rec.forwarded_outage,
+        external_address_auto_check: rec.external_address_auto_check,
         binding_source: storage_source_to_dto(rec.binding_source),
     }
 }
@@ -1118,7 +1169,6 @@ fn storage_mode_to_dto(mode: BehaviorMode) -> BehaviorModeDto {
     match mode {
         BehaviorMode::PreferPrimary => BehaviorModeDto::PreferPrimary,
         BehaviorMode::PreferSecondaryWhenAvailable => BehaviorModeDto::PreferSecondaryWhenAvailable,
-        BehaviorMode::StrictSecondaryFailClosed => BehaviorModeDto::StrictSecondaryFailClosed,
     }
 }
 
@@ -1126,7 +1176,15 @@ fn dto_mode_to_storage(mode: BehaviorModeDto) -> BehaviorMode {
     match mode {
         BehaviorModeDto::PreferPrimary => BehaviorMode::PreferPrimary,
         BehaviorModeDto::PreferSecondaryWhenAvailable => BehaviorMode::PreferSecondaryWhenAvailable,
-        BehaviorModeDto::StrictSecondaryFailClosed => BehaviorMode::StrictSecondaryFailClosed,
+    }
+}
+
+fn storage_mode_to_domain(mode: BehaviorMode) -> nrr_domain::RouteBehaviorMode {
+    match mode {
+        BehaviorMode::PreferPrimary => nrr_domain::RouteBehaviorMode::PreferPrimary,
+        BehaviorMode::PreferSecondaryWhenAvailable => {
+            nrr_domain::RouteBehaviorMode::PreferSecondaryWhenAvailable
+        }
     }
 }
 
@@ -1361,6 +1419,15 @@ struct CachedExternalAddress {
     local_ip: String,
 }
 
+/// The adapter's persistent id, or its name where the OS reports no id.
+fn external_cache_key(row: &nrr_platform_api::InterfaceRouteRow) -> &str {
+    if row.persistent_id.is_empty() {
+        &row.adapter_name
+    } else {
+        &row.persistent_id
+    }
+}
+
 impl MonitoredAdaptersSnapshotProvider {
     pub fn new(
         api: Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
@@ -1387,16 +1454,25 @@ impl MonitoredAdaptersSnapshotProvider {
     /// Learn fresh probe results and replay remembered ones into rows that
     /// have no external address of their own. The replayed note says so —
     /// the row never claims a fresh observation it did not make.
-    fn fold_cached_external(&self, rows: &mut [nrr_platform_api::InterfaceRouteRow]) {
+    ///
+    /// A link that is down, or gone from a `live` enumeration, loses what was
+    /// remembered for it: a tunnel that comes back may leave by another exit,
+    /// so its address is shown again only once it is checked again.
+    fn fold_cached_external(&self, rows: &mut [nrr_platform_api::InterfaceRouteRow], live: bool) {
         let Ok(mut cache) = self.last_external.lock() else {
             return;
         };
+        if live {
+            cache.retain(|key, _| rows.iter().any(|row| external_cache_key(row) == key));
+        }
         for row in rows {
-            let key = if row.persistent_id.is_empty() {
-                row.adapter_name.clone()
-            } else {
-                row.persistent_id.clone()
-            };
+            if row.availability_status == nrr_platform_api::BasicAvailabilityStatus::Unavailable
+                && row.observed_facts.external_ip.is_none()
+            {
+                cache.remove(external_cache_key(row));
+                continue;
+            }
+            let key = external_cache_key(row).to_owned();
             if let Some(ip) = row.observed_facts.external_ip.clone() {
                 cache.insert(
                     key,
@@ -1480,7 +1556,7 @@ impl MonitoredAdaptersSnapshotProvider {
                 "live adapter enumeration produced nothing — answering with the deterministic placeholder dataset, marked as such",
             );
         }
-        self.fold_cached_external(&mut rich_rows);
+        self.fold_cached_external(&mut rich_rows, source.is_live());
         // After the fold: a remembered external address is part of the score.
         nrr_platform_api::interface_rows::assign_recommendations(&mut rich_rows);
         let rows = rich_rows
@@ -1611,15 +1687,9 @@ impl crate::ipc_handlers::providers::FailClosedStateProbe for ProductionFailClos
             None => true,
             Some(a) => !Self::adapter_is_up(a),
         };
-        // The banner mirrors the ACTUAL blocking posture. The
-        // emergency block engages only when the MASTER kill-switch is enabled
-        // (opt-in — mirror of per_sid_orchestrator.rs's `leak_guard_armed` gate)
-        // AND the secondary is offline AND the posture is fail-closed (block). If
-        // the kill-switch is OFF nothing blocks, so the banner stays clear; a
-        // fail-open posture (`kill_switch_fail_closed == false`) likewise lets
-        // traffic ride the primary, so it is not "fail-closed active".
-        let fail_closed_active =
-            policy.kill_switch_enabled && secondary_offline && policy.kill_switch_fail_closed;
+        // The banner mirrors the actual blocking: with protection off nothing
+        // blocks, and the ordinary secondary-down notice is the warning.
+        let fail_closed_active = policy.leak_protection.is_on() && secondary_offline;
         self.emit_transition_if_changed(fail_closed_active);
         Some(crate::ipc_handlers::payloads::SecondaryRouteStateDto { fail_closed_active })
     }
@@ -1795,7 +1865,7 @@ mod route_policy_provider_tests {
         runner.run_pending_migrations().expect("migrate");
         let conn = runner.into_connection();
         let mut policy = RoutePolicyRecord::empty(BindingSource::UserAssigned);
-        policy.kill_switch_enabled = true;
+        policy.leak_protection = nrr_domain::LeakProtection::Everything;
         policy.doh_lockdown_enabled = true;
         RouteBindingsRepository::new(&conn)
             .update_for_sid("S-1-5-21-A", &policy, 0)
@@ -1804,9 +1874,63 @@ mod route_policy_provider_tests {
 
         let dto = provider.get_for_sid("S-1-5-21-A").expect("a stored policy");
         assert!(dto.primary.is_none() && dto.secondary.is_none());
-        assert!(dto.kill_switch_enabled);
+        assert_eq!(
+            dto.leak_protection,
+            nrr_shared::ipc_payloads::LeakProtectionDto::Everything
+        );
         assert!(dto.doh_lockdown_enabled);
         assert!(provider.get_for_sid("S-1-5-21-B").is_none());
+    }
+
+    /// A user with no policy yet is told what the install-time choices make
+    /// of a first save, so the first-run choice is settled against them.
+    #[test]
+    fn the_first_policy_names_the_install_route_and_floor() {
+        use nrr_shared::ipc_payloads::LeakProtectionDto;
+        use nrr_storage::install_policy::{InstallPolicy, InstallPolicyRepository};
+        let runner = nrr_storage::migration::SqliteMigrationRunner::for_state_db(
+            Connection::open_in_memory().expect("in-memory"),
+        );
+        runner.run_pending_migrations().expect("migrate");
+        let conn = Arc::new(Mutex::new(runner.into_connection()));
+        let provider = ProductionRoutePolicyProvider::new(Arc::clone(&conn));
+        assert_eq!(
+            provider.first_policy(),
+            Some(FirstPolicyDto {
+                mode: BehaviorModeDto::PreferPrimary,
+                leak_protection_at_least: LeakProtectionDto::Off,
+            })
+        );
+
+        for (floor, at_least) in [
+            (
+                nrr_domain::LeakProtection::Sites,
+                LeakProtectionDto::Everything,
+            ),
+            (
+                nrr_domain::LeakProtection::Everything,
+                LeakProtectionDto::Everything,
+            ),
+        ] {
+            InstallPolicyRepository::new(&conn.lock().expect("conn"))
+                .set(
+                    &InstallPolicy {
+                        default_route_mode: Some(BehaviorMode::PreferSecondaryWhenAvailable),
+                        default_leak_protection: floor,
+                        ..InstallPolicy::default()
+                    },
+                    1,
+                )
+                .expect("policy");
+            assert_eq!(
+                provider.first_policy(),
+                Some(FirstPolicyDto {
+                    mode: BehaviorModeDto::PreferSecondaryWhenAvailable,
+                    leak_protection_at_least: at_least,
+                }),
+                "{floor}"
+            );
+        }
     }
 }
 
@@ -1980,7 +2104,7 @@ mod install_policy_tests {
             .set(
                 &InstallPolicy {
                     secondary_unset: unset,
-                    default_route_mode: None,
+                    ..InstallPolicy::default()
                 },
                 1,
             )
@@ -2008,23 +2132,48 @@ mod install_policy_tests {
         let snapshot = ProductionRoutePolicySource::new(Arc::clone(&conn))
             .load_for_sid("S-1-5-21-1")
             .expect("policy");
-        assert!(snapshot.kill_switch_enabled && snapshot.kill_switch_fail_closed);
-        assert!(
-            !snapshot.kill_switch_block_all,
+        assert_eq!(
+            snapshot.leak_protection,
+            nrr_domain::LeakProtection::Sites,
             "only those rules, not everything"
         );
-        assert_eq!(
-            snapshot.mode_a_coverage_strategy,
-            nrr_domain::mode_a_coverage::ModeACoverageStrategy::PerIp
-        );
+        assert_eq!(snapshot.mode, PerSidBehaviorMode::PreferPrimary);
 
         store(&conn, "S-1-5-21-1", true, SecondaryUnset::Block);
         let bound = ProductionRoutePolicySource::new(Arc::clone(&conn))
             .load_for_sid("S-1-5-21-1")
             .expect("policy");
-        assert!(
-            !bound.kill_switch_enabled,
+        assert_eq!(
+            bound.leak_protection,
+            nrr_domain::LeakProtection::Off,
             "a bound connection ends the refusal"
+        );
+    }
+
+    /// Protection the user chose stands; the refusal only raises `off`.
+    #[test]
+    fn block_keeps_a_protection_the_user_already_chose() {
+        let conn = conn();
+        store(&conn, "S-1-5-21-1", false, SecondaryUnset::Block);
+        {
+            let guard = conn.lock().expect("conn");
+            let repo = RouteBindingsRepository::new(&guard);
+            let mut record = repo.load_for_sid("S-1-5-21-1").expect("load");
+            record.mode = BehaviorMode::PreferSecondaryWhenAvailable;
+            record.leak_protection = nrr_domain::LeakProtection::Everything;
+            repo.update_for_sid("S-1-5-21-1", &record, 2)
+                .expect("write");
+        }
+        let snapshot = ProductionRoutePolicySource::new(conn)
+            .load_for_sid("S-1-5-21-1")
+            .expect("policy");
+        assert_eq!(
+            snapshot.leak_protection,
+            nrr_domain::LeakProtection::Everything
+        );
+        assert_eq!(
+            snapshot.mode,
+            PerSidBehaviorMode::PreferSecondaryWhenAvailable
         );
     }
 
@@ -2035,7 +2184,7 @@ mod install_policy_tests {
         let snapshot = ProductionRoutePolicySource::new(conn)
             .load_for_sid("S-1-5-21-1")
             .expect("policy");
-        assert!(!snapshot.kill_switch_enabled);
+        assert_eq!(snapshot.leak_protection, nrr_domain::LeakProtection::Off);
     }
 
     #[test]
@@ -2047,6 +2196,7 @@ mod install_policy_tests {
                 &InstallPolicy {
                     secondary_unset: SecondaryUnset::Direct,
                     default_route_mode: Some(BehaviorMode::PreferSecondaryWhenAvailable),
+                    ..InstallPolicy::default()
                 },
                 1,
             )
@@ -2054,6 +2204,16 @@ mod install_policy_tests {
         let mut first = RoutePolicyRecord::empty(BindingSource::UserAssigned);
         apply_install_default_mode(&guard, "S-1-5-21-1", &mut first);
         assert_eq!(first.mode, BehaviorMode::PreferSecondaryWhenAvailable);
+
+        // `sites` is offered only under the main connection; the install mode
+        // turning the route to the additional one widens it.
+        let mut sites = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+        sites.leak_protection = nrr_domain::LeakProtection::Sites;
+        apply_install_default_mode(&guard, "S-1-5-21-3", &mut sites);
+        assert_eq!(
+            sites.leak_protection,
+            nrr_domain::LeakProtection::Everything
+        );
 
         let mut stored = RoutePolicyRecord::empty(BindingSource::UserAssigned);
         stored.primary = Some(binding("main"));
@@ -2067,5 +2227,52 @@ mod install_policy_tests {
             BehaviorMode::PreferPrimary,
             "a stored policy is the user's"
         );
+    }
+
+    /// The install-time strict mode, as the migration folds it, still holds a
+    /// new user's first write at everything, whichever route it names.
+    #[test]
+    fn the_install_floor_raises_a_first_write_and_only_the_first() {
+        let conn = conn();
+        {
+            let guard = conn.lock().expect("conn");
+            InstallPolicyRepository::new(&guard)
+                .set(
+                    &InstallPolicy {
+                        secondary_unset: SecondaryUnset::Direct,
+                        default_route_mode: Some(BehaviorMode::PreferSecondaryWhenAvailable),
+                        default_leak_protection: nrr_domain::LeakProtection::Everything,
+                    },
+                    1,
+                )
+                .expect("policy");
+        }
+        use nrr_shared::ipc_payloads::LeakProtectionDto;
+        let writer = ProductionRoutePolicyWriter::new(Arc::clone(&conn));
+        for mode in [
+            BehaviorModeDto::PreferPrimary,
+            BehaviorModeDto::PreferSecondaryWhenAvailable,
+        ] {
+            let sid = format!("S-1-5-21-{mode:?}");
+            let request: RoutePolicyUpdateRequest = serde_json::from_value(serde_json::json!({
+                "mode": mode,
+                "leak-protection": "off",
+                "doh-lockdown-enabled": false,
+                "kill-switch-strict-shared-ips": false,
+                "binding-source": "user-assigned"
+            }))
+            .expect("request");
+            let first = writer.update_for_sid(&sid, &request).expect("first write");
+            assert_eq!(
+                first.leak_protection,
+                LeakProtectionDto::Everything,
+                "{mode:?}"
+            );
+            assert_eq!(first.mode, BehaviorModeDto::PreferSecondaryWhenAvailable);
+
+            // Lowering it afterwards is the user's own choice.
+            let second = writer.update_for_sid(&sid, &request).expect("second write");
+            assert_eq!(second.leak_protection, LeakProtectionDto::Off, "{mode:?}");
+        }
     }
 }

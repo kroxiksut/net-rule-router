@@ -9,13 +9,18 @@
 //! - Track per-subscription cursors so the transport layer (the
 //!   named-pipe server) knows which events still need to be pushed
 //!   to which subscriber.
-//! - Detect *gap* situations on resubscribe — when the client's
-//!   `last_seen_event_id` is older than the oldest buffered event —
-//!   and signal the client to do a fresh `SnapshotInitialGet`.
+//! - Detect *gap* situations on resubscribe — when the ring has dropped an
+//!   event the client was owed — and signal the client to do a fresh
+//!   `SnapshotInitialGet`.
 //!
-//! A subscriber whose connection cannot take a frame is not counted or
-//! signalled here: the transport closes that connection, and the client's
-//! own reconnect and `push-gap` are the recovery path.
+//! A subscriber whose connection cannot take a frame is not signalled here:
+//! the transport closes that connection, and the client's own reconnect and
+//! `push-gap` are the recovery path. A subscriber that merely lags past the
+//! ring is told by [`EventBus::lost_events_resume_at`] and the transport.
+//!
+//! A loss is judged per audience: another user's events leaving the ring are
+//! no hole in this subscriber's stream, so they neither cost it a re-read nor
+//! tell it that the other user was busy.
 //!
 //! ## What this module *does not* own
 //!
@@ -31,7 +36,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::ipc_handlers::payloads::StatusUpdateEvent;
@@ -52,6 +57,11 @@ pub const MAX_SUBSCRIPTIONS: usize = 64;
 /// connection nobody is on the other end of.
 pub const SUBSCRIPTION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// Most principals whose eviction mark is kept apart. Past it the oldest mark
+/// joins the machine-wide one: everyone may then re-read once for nothing, but
+/// nobody misses a hole.
+pub const MAX_EVICTION_AUDIENCES: usize = 256;
+
 /// Buffered event with its assigned monotonic id.
 #[derive(Clone, Debug)]
 pub struct EventEntry {
@@ -63,6 +73,23 @@ pub struct EventEntry {
     /// additional link's external ADDRESS - all of them facts about one user's
     /// session - were pushed to every logged-in user's GUI.
     pub audience: Option<String>,
+}
+
+/// Called by a publish that concerns the subscriber, so its connection thread
+/// wakes at once instead of polling. Must not block: it runs on the publisher.
+#[derive(Clone)]
+pub struct PushWaker(Arc<dyn Fn() + Send + Sync>);
+
+impl PushWaker {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(wake))
+    }
+}
+
+impl std::fmt::Debug for PushWaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PushWaker")
+    }
 }
 
 /// Per-subscriber state tracked by the bus.
@@ -79,6 +106,8 @@ pub struct SubscriberState {
     /// Last time the transport read or acknowledged anything for this
     /// subscription. What separates a quiet client from a dead one.
     pub last_activity: Instant,
+    /// Set once the transport has a connection to wake.
+    pub waker: Option<PushWaker>,
 }
 
 /// Outcome of a `subscribe` call. The handler echoes
@@ -93,13 +122,62 @@ pub struct SubscribeOutcome {
     pub gap_detected: bool,
 }
 
+/// The most recent events, front = oldest, and what fell off the front.
+#[derive(Default)]
+struct Ring {
+    events: VecDeque<EventEntry>,
+    /// Per audience, the newest event id the ring has dropped; the `None` key
+    /// holds the machine-wide events every subscriber is owed.
+    evicted_through: HashMap<Option<String>, u64>,
+}
+
+impl Ring {
+    fn push(&mut self, entry: EventEntry) {
+        self.events.push_back(entry);
+        while self.events.len() > EVENT_BUFFER_CAPACITY {
+            if let Some(dropped) = self.events.pop_front() {
+                self.mark_evicted(dropped.audience, dropped.event_id);
+            }
+        }
+    }
+
+    fn mark_evicted(&mut self, audience: Option<String>, event_id: u64) {
+        let mark = self.evicted_through.entry(audience).or_insert(0);
+        *mark = (*mark).max(event_id);
+        let principals =
+            self.evicted_through.len() - usize::from(self.evicted_through.contains_key(&None));
+        if principals > MAX_EVICTION_AUDIENCES {
+            let oldest = self
+                .evicted_through
+                .iter()
+                .filter(|(audience, _)| audience.is_some())
+                .min_by_key(|(_, id)| **id)
+                .map(|(audience, id)| (audience.clone(), *id));
+            if let Some((audience, id)) = oldest {
+                self.evicted_through.remove(&audience);
+                let machine = self.evicted_through.entry(None).or_insert(0);
+                *machine = (*machine).max(id);
+            }
+        }
+    }
+
+    /// Newest dropped id a subscriber of `principal` would have been shown;
+    /// `0` when the ring has dropped none of them.
+    fn lost_through(&self, principal: Option<&str>) -> u64 {
+        let machine = self.evicted_through.get(&None).copied().unwrap_or(0);
+        let own = principal
+            .and_then(|p| self.evicted_through.get(&Some(p.to_string())))
+            .copied()
+            .unwrap_or(0);
+        machine.max(own)
+    }
+}
+
 #[derive(Default)]
 pub struct EventBus {
     next_event_id: AtomicU64,
-    /// Ring buffer of the most recent events. Front = oldest, back =
-    /// newest. We trim the front when length exceeds
-    /// [`EVENT_BUFFER_CAPACITY`].
-    buffer: Mutex<VecDeque<EventEntry>>,
+    /// Trimmed to [`EVENT_BUFFER_CAPACITY`] on every publish.
+    buffer: Mutex<Ring>,
     subscribers: Mutex<HashMap<String, SubscriberState>>,
     sub_id_counter: AtomicU64,
 }
@@ -111,7 +189,10 @@ impl EventBus {
     pub fn new() -> Self {
         Self {
             next_event_id: AtomicU64::new(1),
-            buffer: Mutex::new(VecDeque::with_capacity(EVENT_BUFFER_CAPACITY)),
+            buffer: Mutex::new(Ring {
+                events: VecDeque::with_capacity(EVENT_BUFFER_CAPACITY + 1),
+                evicted_through: HashMap::new(),
+            }),
             subscribers: Mutex::new(HashMap::new()),
             sub_id_counter: AtomicU64::new(1),
         }
@@ -143,15 +224,45 @@ impl EventBus {
         // never be pushed the smaller.
         let mut buf = self.buffer.lock().expect("event bus buffer poisoned");
         let id = self.next_event_id.fetch_add(1, Ordering::SeqCst);
-        buf.push_back(EventEntry {
+        buf.push(EventEntry {
             event_id: id,
             event,
-            audience,
+            audience: audience.clone(),
         });
-        while buf.len() > EVENT_BUFFER_CAPACITY {
-            buf.pop_front();
-        }
+        drop(buf);
+        self.wake_subscribers(audience.as_deref());
         id
+    }
+
+    /// Wake the connections an event for `audience` concerns. Run outside both
+    /// locks: a waker is foreign code.
+    fn wake_subscribers(&self, audience: Option<&str>) {
+        let wakers: Vec<PushWaker> = self
+            .subscribers
+            .lock()
+            .expect("subscribers poisoned")
+            .values()
+            .filter(|s| audience.is_none() || s.principal.as_deref() == audience)
+            .filter_map(|s| s.waker.clone())
+            .collect();
+        for waker in wakers {
+            (waker.0)();
+        }
+    }
+
+    /// Attach the wake-up of the connection serving `subscription_id`, and fire
+    /// it once: events published before the connection could be woken (a
+    /// resumed cursor) are already owed.
+    pub fn set_waker(&self, subscription_id: &str, waker: PushWaker) {
+        let attached = {
+            let mut subs = self.subscribers.lock().expect("subscribers poisoned");
+            subs.get_mut(subscription_id)
+                .map(|sub| sub.waker = Some(waker.clone()))
+                .is_some()
+        };
+        if attached {
+            (waker.0)();
+        }
     }
 
     /// Snapshot of the next id that *will* be assigned. A client that
@@ -168,6 +279,7 @@ impl EventBus {
         self.buffer
             .lock()
             .expect("event bus buffer poisoned")
+            .events
             .front()
             .map(|e| e.event_id)
     }
@@ -176,7 +288,7 @@ impl EventBus {
     /// client's resume cursor; `None` means "start from current head".
     ///
     /// Returns the subscription id, the current head, and whether a
-    /// gap was detected (the client's cursor pre-dates the buffer).
+    /// gap was detected (the ring dropped an event this client was owed).
     pub fn subscribe(
         &self,
         client_id: String,
@@ -196,20 +308,22 @@ impl EventBus {
         let n = self.sub_id_counter.fetch_add(1, Ordering::Relaxed);
         let sub_id = format!("sub-{n:016x}");
         let head = self.current_event_id();
-        let oldest = self.oldest_event_id();
+        let lost_through = self
+            .buffer
+            .lock()
+            .expect("event bus buffer poisoned")
+            .lost_through(principal.as_deref());
 
         let (cursor, gap_detected) = match last_seen_event_id {
             None => (head, false),
+            // Client wants events strictly after `seen`. A hole is not replayed
+            // around: the client re-reads the state and follows from the head.
             Some(seen) => {
-                // Client wants events strictly after `seen`.
                 let resume_at = seen.saturating_add(1);
-                match oldest {
-                    Some(oldest_id) if resume_at < oldest_id => {
-                        // Cursor pre-dates the buffer. Clamp to head;
-                        // missed events are not replayed.
-                        (head, true)
-                    }
-                    _ => (resume_at, false),
+                if lost_through >= resume_at {
+                    (head, true)
+                } else {
+                    (resume_at, false)
                 }
             }
         };
@@ -242,6 +356,7 @@ impl EventBus {
                 principal,
                 cursor_event_id: cursor,
                 last_activity: now,
+                waker: None,
             },
         );
 
@@ -282,7 +397,8 @@ impl EventBus {
         drop(subs);
 
         let buf = self.buffer.lock().expect("event bus buffer poisoned");
-        buf.iter()
+        buf.events
+            .iter()
             .filter(|e| e.event_id >= cursor)
             .filter(|e| match (&e.audience, &principal) {
                 // Machine-wide: everybody sees it.
@@ -295,6 +411,23 @@ impl EventBus {
             .take(max_count)
             .cloned()
             .collect()
+    }
+
+    /// When the ring has already dropped an event this subscriber was still
+    /// owed, the id to resume at past the hole. The cursor is left alone: the
+    /// transport tells the client first and then advances past the hole.
+    pub fn lost_events_resume_at(&self, subscription_id: &str) -> Option<u64> {
+        let (cursor, principal) = {
+            let subs = self.subscribers.lock().expect("subscribers poisoned");
+            let sub = subs.get(subscription_id)?;
+            (sub.cursor_event_id, sub.principal.clone())
+        };
+        let lost_through = self
+            .buffer
+            .lock()
+            .expect("event bus buffer poisoned")
+            .lost_through(principal.as_deref());
+        (lost_through > 0 && lost_through >= cursor).then_some(lost_through + 1)
     }
 
     /// Acknowledge delivery up to and including `event_id` for
@@ -329,7 +462,11 @@ impl EventBus {
     }
 
     pub fn buffer_len(&self) -> usize {
-        self.buffer.lock().expect("event bus buffer poisoned").len()
+        self.buffer
+            .lock()
+            .expect("event bus buffer poisoned")
+            .events
+            .len()
     }
 }
 
@@ -344,13 +481,7 @@ mod tests {
         let bus = EventBus::new();
         let victim = bus.subscribe_as("gui-1".into(), Some("S-1-A".into()), None);
         bus.subscribe_as("gui-1".into(), Some("S-1-B".into()), None);
-        bus.publish_for(
-            "S-1-A",
-            StatusUpdateEvent::HealthChanged {
-                service_state: "running".into(),
-                worst_severity: "ok".into(),
-            },
-        );
+        bus.publish_for("S-1-A", adapters("ok"));
         assert_eq!(
             bus.peek_pending_for(&victim.subscription_id, 8).len(),
             1,
@@ -371,8 +502,8 @@ mod tests {
         let alice = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), Some(0));
         let bob = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), Some(0));
 
-        bus.publish_for("S-1-A", health("ok"));
-        bus.publish(health("ok"));
+        bus.publish_for("S-1-A", adapters("ok"));
+        bus.publish(adapters("ok"));
 
         assert_eq!(
             bus.peek_pending_for(&alice.subscription_id, 16).len(),
@@ -392,18 +523,65 @@ mod tests {
     fn an_unnamed_subscriber_sees_only_machine_wide_events() {
         let bus = EventBus::new();
         let anon = bus.subscribe("gui".into(), Some(0));
-        bus.publish_for("S-1-A", health("ok"));
+        bus.publish_for("S-1-A", adapters("ok"));
         assert!(bus.peek_pending_for(&anon.subscription_id, 16).is_empty());
-        bus.publish(health("ok"));
+        bus.publish(adapters("ok"));
         assert_eq!(bus.peek_pending_for(&anon.subscription_id, 16).len(), 1);
     }
     use super::*;
 
-    fn health(severity: &str) -> StatusUpdateEvent {
-        StatusUpdateEvent::HealthChanged {
-            service_state: "running".into(),
-            worst_severity: severity.into(),
+    fn adapters(source: &str) -> StatusUpdateEvent {
+        StatusUpdateEvent::AdaptersChanged {
+            data_source: source.into(),
         }
+    }
+
+    fn counting_waker() -> (PushWaker, Arc<std::sync::atomic::AtomicUsize>) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        let waker = PushWaker::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        (waker, count)
+    }
+
+    /// The connection thread sleeps until the bus wakes it; a publish that
+    /// concerns another user's session must not.
+    #[test]
+    fn a_publish_wakes_only_the_subscribers_it_concerns() {
+        let bus = EventBus::new();
+        let alice = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), None);
+        let bob = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), None);
+        let (alice_waker, alice_wakes) = counting_waker();
+        let (bob_waker, bob_wakes) = counting_waker();
+        bus.set_waker(&alice.subscription_id, alice_waker);
+        bus.set_waker(&bob.subscription_id, bob_waker);
+        // Attaching fires once: events owed since a resumed cursor.
+        assert_eq!(alice_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(bob_wakes.load(Ordering::SeqCst), 1);
+
+        bus.publish_for("S-1-A", adapters("ok"));
+        assert_eq!(alice_wakes.load(Ordering::SeqCst), 2);
+        assert_eq!(bob_wakes.load(Ordering::SeqCst), 1, "not Bob's news");
+
+        bus.publish(adapters("ok"));
+        assert_eq!(alice_wakes.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            bob_wakes.load(Ordering::SeqCst),
+            2,
+            "machine-wide reaches all"
+        );
+    }
+
+    #[test]
+    fn an_unsubscribed_connection_is_never_woken() {
+        let bus = EventBus::new();
+        let sub = bus.subscribe("gui".into(), None);
+        let (waker, wakes) = counting_waker();
+        bus.set_waker(&sub.subscription_id, waker);
+        bus.unsubscribe(&sub.subscription_id);
+        bus.publish(adapters("ok"));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1, "only the attach-time wake");
     }
 
     /// An event that names a principal must reach only that principal, even when
@@ -420,6 +598,8 @@ mod tests {
         bus.publish(StatusUpdateEvent::RoutingPauseStateChanged {
             sid: "S-1-A".to_string(),
             paused: true,
+            resumes_at_ms: None,
+            until_restart: false,
         });
 
         assert_eq!(
@@ -450,8 +630,8 @@ mod tests {
     #[test]
     fn publish_assigns_monotonic_event_ids_starting_at_one() {
         let bus = EventBus::new();
-        let id1 = bus.publish(health("ok"));
-        let id2 = bus.publish(health("warning"));
+        let id1 = bus.publish(adapters("ok"));
+        let id2 = bus.publish(adapters("warning"));
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
         assert_eq!(bus.current_event_id(), 3);
@@ -461,7 +641,7 @@ mod tests {
     fn buffer_caps_at_capacity_and_drops_oldest() {
         let bus = EventBus::new();
         for _ in 0..(EVENT_BUFFER_CAPACITY + 50) {
-            bus.publish(health("ok"));
+            bus.publish(adapters("ok"));
         }
         assert_eq!(bus.buffer_len(), EVENT_BUFFER_CAPACITY);
         assert_eq!(
@@ -473,7 +653,7 @@ mod tests {
     #[test]
     fn subscribe_with_no_cursor_starts_at_head_no_gap() {
         let bus = EventBus::new();
-        bus.publish(health("ok"));
+        bus.publish(adapters("ok"));
         let s = bus.subscribe("client-1".into(), None);
         assert_eq!(s.current_event_id, 2);
         assert!(!s.gap_detected);
@@ -484,9 +664,9 @@ mod tests {
     #[test]
     fn subscribe_within_buffer_replays_missed_events() {
         let bus = EventBus::new();
-        bus.publish(health("ok")); // id=1
-        bus.publish(health("warning")); // id=2
-        bus.publish(health("degraded")); // id=3
+        bus.publish(adapters("ok")); // id=1
+        bus.publish(adapters("warning")); // id=2
+        bus.publish(adapters("degraded")); // id=3
         let s = bus.subscribe("client-1".into(), Some(1));
         assert!(!s.gap_detected);
         let pending = bus.peek_pending_for(&s.subscription_id, 16);
@@ -500,7 +680,7 @@ mod tests {
     fn subscribe_with_pre_buffer_cursor_signals_gap() {
         let bus = EventBus::new();
         for _ in 0..(EVENT_BUFFER_CAPACITY + 5) {
-            bus.publish(health("ok"));
+            bus.publish(adapters("ok"));
         }
         // Oldest in buffer is 6; client claims it last saw id 1.
         let s = bus.subscribe("client-1".into(), Some(1));
@@ -512,13 +692,115 @@ mod tests {
     #[test]
     fn advance_cursor_consumes_pending_events() {
         let bus = EventBus::new();
-        bus.publish(health("ok")); // 1
-        bus.publish(health("ok")); // 2
+        bus.publish(adapters("ok")); // 1
+        bus.publish(adapters("ok")); // 2
         let s = bus.subscribe("client-1".into(), Some(0));
         let pending = bus.peek_pending_for(&s.subscription_id, 16);
         assert_eq!(pending.len(), 2);
         bus.advance_cursor(&s.subscription_id, 2);
         assert!(bus.peek_pending_for(&s.subscription_id, 16).is_empty());
+    }
+
+    #[test]
+    fn a_subscriber_that_lags_past_the_ring_is_owed_a_resync() {
+        let bus = EventBus::new();
+        let s = bus.subscribe("client-1".into(), None);
+        assert_eq!(bus.lost_events_resume_at(&s.subscription_id), None);
+        for _ in 0..(EVENT_BUFFER_CAPACITY + 5) {
+            bus.publish(adapters("ok"));
+        }
+        // Ids 1..=105 published, the ring holds 6..=105.
+        assert_eq!(bus.lost_events_resume_at(&s.subscription_id), Some(6));
+        bus.advance_cursor(&s.subscription_id, 5);
+        assert_eq!(bus.lost_events_resume_at(&s.subscription_id), None);
+        assert_eq!(
+            bus.peek_pending_for(&s.subscription_id, 1)[0].event_id,
+            6,
+            "the events still held are delivered after the marker"
+        );
+    }
+
+    #[test]
+    fn a_subscriber_within_the_ring_or_unknown_is_owed_nothing() {
+        let bus = EventBus::new();
+        let s = bus.subscribe("client-1".into(), None);
+        for _ in 0..EVENT_BUFFER_CAPACITY {
+            bus.publish(adapters("ok"));
+        }
+        assert_eq!(bus.lost_events_resume_at(&s.subscription_id), None);
+        assert_eq!(bus.lost_events_resume_at("no-such-sub"), None);
+    }
+
+    /// Bob is never woken for Alice's events, so his cursor stays where it was
+    /// while her flood runs through the ring. That is no hole in his stream:
+    /// told otherwise he would re-read everything every hundred of her events,
+    /// and learn from it how busy she is.
+    #[test]
+    fn another_users_flood_is_no_loss_for_a_subscriber() {
+        let bus = EventBus::new();
+        let bob = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), None);
+        for _ in 0..(EVENT_BUFFER_CAPACITY * 3) {
+            bus.publish_for("S-1-A", adapters("ok"));
+        }
+        assert_eq!(bus.lost_events_resume_at(&bob.subscription_id), None);
+
+        let resumed = bus.subscribe_as("gui-b2".into(), Some("S-1-B".into()), Some(0));
+        assert!(!resumed.gap_detected, "a resume over her events only");
+        assert!(bus
+            .peek_pending_for(&resumed.subscription_id, 16)
+            .is_empty());
+    }
+
+    /// The other way round: Alice's flood pushing out Bob's OWN event, or a
+    /// machine-wide one, is a hole Bob is told about.
+    #[test]
+    fn a_flood_that_pushes_out_a_subscribers_own_event_is_a_loss() {
+        let bus = EventBus::new();
+        let bob = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), None);
+        let his = bus.publish_for("S-1-B", adapters("ok"));
+        for _ in 0..EVENT_BUFFER_CAPACITY {
+            bus.publish_for("S-1-A", adapters("ok"));
+        }
+        assert_eq!(
+            bus.lost_events_resume_at(&bob.subscription_id),
+            Some(his + 1)
+        );
+        let resumed = bus.subscribe_as("gui-b2".into(), Some("S-1-B".into()), Some(0));
+        assert!(resumed.gap_detected);
+
+        let carol = bus.subscribe_as("gui-c".into(), Some("S-1-C".into()), None);
+        let machine = bus.publish(adapters("ok"));
+        for _ in 0..EVENT_BUFFER_CAPACITY {
+            bus.publish_for("S-1-A", adapters("ok"));
+        }
+        assert_eq!(
+            bus.lost_events_resume_at(&carol.subscription_id),
+            Some(machine + 1)
+        );
+    }
+
+    /// Past the cap of principals tracked apart, a dropped mark is folded into
+    /// the machine-wide one: a needless re-read, never a silent hole.
+    #[test]
+    fn the_eviction_marks_are_bounded_without_losing_a_hole() {
+        let bus = EventBus::new();
+        let first = bus.subscribe_as("gui-0".into(), Some("S-0".into()), Some(0));
+        let own = bus.publish_for("S-0", adapters("ok"));
+        for n in 1..=(MAX_EVICTION_AUDIENCES + EVENT_BUFFER_CAPACITY) {
+            bus.publish_for(format!("S-{n}"), adapters("ok"));
+        }
+        let marks = bus
+            .buffer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .evicted_through
+            .len();
+        assert!(marks <= MAX_EVICTION_AUDIENCES + 1, "marks = {marks}");
+        assert!(
+            bus.lost_events_resume_at(&first.subscription_id)
+                .is_some_and(|resume| resume > own),
+            "the first user's dropped event is still a hole"
+        );
     }
 
     #[test]
@@ -543,7 +825,7 @@ mod tests {
     #[test]
     fn peek_with_zero_max_count_returns_nothing() {
         let bus = EventBus::new();
-        bus.publish(health("ok"));
+        bus.publish(adapters("ok"));
         let s = bus.subscribe("client-1".into(), Some(0));
         assert!(bus.peek_pending_for(&s.subscription_id, 0).is_empty());
     }
@@ -569,7 +851,7 @@ mod tests {
         let second = bus.subscribe("gui-a".into(), None);
         assert_ne!(first.subscription_id, second.subscription_id);
         assert_eq!(bus.subscriber_count(), 1);
-        bus.publish(health("ok"));
+        bus.publish(adapters("ok"));
         assert!(
             bus.peek_pending_for(&first.subscription_id, 8).is_empty(),
             "the superseded subscription is gone, not merely quiet"
@@ -616,7 +898,7 @@ mod tests {
             bus.peek_pending_for(&stale.subscription_id, 1).is_empty(),
             "an untouched subscription is swept"
         );
-        bus.publish(health("ok"));
+        bus.publish(adapters("ok"));
         assert_eq!(
             bus.peek_pending_for(&live.subscription_id, 8).len(),
             1,

@@ -33,25 +33,31 @@ const KEYS_NOT_IN_DEFAULTS_TABLE: [&str; 3] = ["primary", "secondary", "binding-
 /// table's entry for them is a GUI-side fallback for an empty snapshot rather
 /// than a mirror of a Rust value. Presence is pinned; the value is not.
 ///
-/// The four kill-switch/DoH toggles are here on purpose: a field that TURNS
-/// PROTECTION OFF must not be expressible by omission, so the request refuses a
-/// message that leaves one out instead of reading it as "off".
-const KEYS_WITHOUT_WIRE_DEFAULT: [&str; 6] = [
+/// The protection fields are here on purpose: a field that TURNS PROTECTION OFF
+/// must not be expressible by omission, so the request refuses a message that
+/// leaves one out instead of reading it as "off".
+const KEYS_WITHOUT_WIRE_DEFAULT: [&str; 4] = [
     "mode",
-    "block-secondary-when-unavailable",
-    "kill-switch-enabled",
-    "kill-switch-block-all",
+    "leak-protection",
     "kill-switch-strict-shared-ips",
     "doh-lockdown-enabled",
 ];
 
-/// The protection toggles above, each paired with the field name a peer would
-/// have to omit to reach the old silent-disarm behaviour.
-const PROTECTION_TOGGLES: [&str; 4] = [
+/// The protection fields above, each with a value that makes it valid again.
+fn protection_fields() -> [(&'static str, Value); 3] {
+    [
+        ("leak-protection", json!("everything")),
+        ("kill-switch-strict-shared-ips", json!(true)),
+        ("doh-lockdown-enabled", json!(true)),
+    ]
+}
+
+/// Keys a retired peer may still send; they no longer exist on the request.
+const RETIRED_PROTECTION_KEYS: [&str; 4] = [
     "kill-switch-enabled",
+    "kill-switch-fail-closed",
     "kill-switch-block-all",
-    "kill-switch-strict-shared-ips",
-    "doh-lockdown-enabled",
+    "mode-a-coverage-strategy",
 ];
 
 fn qml_pure_js() -> String {
@@ -119,10 +125,8 @@ fn qml_snapshot_only_keys() -> Vec<String> {
 fn request_at_wire_defaults() -> Map<String, Value> {
     let minimal = json!({
         "mode": "prefer-primary",
-        "block-secondary-when-unavailable": false,
         "binding-source": "user-assigned",
-        "kill-switch-enabled": true,
-        "kill-switch-block-all": true,
+        "leak-protection": "everything",
         "kill-switch-strict-shared-ips": true,
         "doh-lockdown-enabled": true,
     });
@@ -137,7 +141,7 @@ fn request_at_wire_defaults() -> Map<String, Value> {
 fn dto_keys() -> Vec<String> {
     let minimal = json!({
         "mode": "prefer-primary",
-        "block-secondary-when-unavailable": false,
+        "leak-protection": "off",
         "binding-source": "user-assigned",
     });
     let parsed: RoutePolicyDto =
@@ -234,13 +238,12 @@ fn qml_binding_source_is_stamped_not_defaulted() {
     );
 }
 
-/// A message that leaves a protection toggle out must be REJECTED, not read as
-/// "the user turned it off". `#[serde(default)]` on these `bool`s meant a peer
-/// that forgot one disarmed the kill switch on the next full replace, silently
-/// and with a success response.
+/// A message that leaves a protection field out must be REJECTED, not read as
+/// "the user turned it off": a full replace that forgot one would otherwise
+/// disarm protection silently and with a success response.
 #[test]
-fn a_request_that_omits_a_protection_toggle_is_refused() {
-    for omitted in PROTECTION_TOGGLES {
+fn a_request_that_omits_a_protection_field_is_refused() {
+    for (omitted, valid) in protection_fields() {
         let mut body = request_at_wire_defaults();
         assert!(
             body.remove(omitted).is_some(),
@@ -250,12 +253,56 @@ fn a_request_that_omits_a_protection_toggle_is_refused() {
             serde_json::from_value(Value::Object(body.clone()));
         assert!(
             parsed.is_err(),
-            "omitting `{omitted}` was accepted — a missing protection toggle must not read as off"
+            "omitting `{omitted}` was accepted — a missing protection field must not read as off"
         );
         // Positive control: the same body WITH the field parses, so the refusal
         // above is about that field and not about a fixture that never parsed.
-        body.insert(omitted.to_string(), Value::Bool(true));
+        body.insert(omitted.to_string(), valid);
         serde_json::from_value::<RoutePolicyUpdateRequest>(Value::Object(body))
             .unwrap_or_else(|e| panic!("restoring `{omitted}` must make the request valid: {e}"));
+    }
+}
+
+/// The old protection keys mean nothing now: a request carrying them alone has
+/// no leak protection and is refused; beside `leak-protection` they are ignored.
+#[test]
+fn the_retired_protection_keys_neither_replace_nor_override_leak_protection() {
+    let mut body = request_at_wire_defaults();
+    body.remove("leak-protection");
+    for key in RETIRED_PROTECTION_KEYS {
+        assert!(!body.contains_key(key), "`{key}` is still a request field");
+    }
+    body.insert("kill-switch-enabled".into(), json!(true));
+    body.insert("kill-switch-fail-closed".into(), json!(true));
+    body.insert("kill-switch-block-all".into(), json!(true));
+    body.insert(
+        "mode-a-coverage-strategy".into(),
+        json!("fail-closed-unknown"),
+    );
+    body.insert("block-secondary-when-unavailable".into(), json!(true));
+    assert!(
+        serde_json::from_value::<RoutePolicyUpdateRequest>(Value::Object(body.clone())).is_err()
+    );
+
+    // Beside leak-protection they are still refused: an old client's keys never
+    // ride along silently.
+    body.insert("leak-protection".into(), json!("off"));
+    assert!(serde_json::from_value::<RoutePolicyUpdateRequest>(Value::Object(body)).is_err());
+}
+
+/// The removed default route is a malformed request, not an alias.
+#[test]
+fn the_removed_strict_mode_is_refused_on_the_wire() {
+    for stray in [
+        "strict-secondary-fail-closed",
+        "strict-secondary",
+        "fail-closed",
+    ] {
+        let mut body = request_at_wire_defaults();
+        body.insert("mode".into(), json!(stray));
+        assert!(
+            serde_json::from_value::<RoutePolicyUpdateRequest>(Value::Object(body)).is_err(),
+            "mode `{stray}` was accepted"
+        );
     }
 }

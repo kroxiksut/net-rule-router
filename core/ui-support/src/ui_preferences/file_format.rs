@@ -219,14 +219,14 @@ pub(super) fn parse_preferences_with(
                     preferences.auto_confirm_adapter_id_change = parsed;
                 }
             }
-            // Block-all banner opt-out. Missing key resolves to the ON
-            // default via `defaults()`.
+            // "Everything is blocked" banner opt-out. Missing key resolves to
+            // the ON default via `defaults()`.
             "warn_kill_switch_block_all" => {
                 if let Some(parsed) = parse_bool(value) {
                     preferences.warn_kill_switch_block_all = parsed;
                 }
             }
-            // Persisted acknowledgement of the block-all banner. Missing key
+            // Persisted acknowledgement of that banner. Missing key
             // (pre-existing file) resolves to the `false` default via `defaults()`.
             "kill_switch_banner_acknowledged" => {
                 if let Some(parsed) = parse_bool(value) {
@@ -354,8 +354,13 @@ pub(super) fn parse_preferences_with(
                     preferences.secondary_role_user_confirmed = parsed;
                 }
             }
+            // The removed strict mode sent everything through the additional
+            // connection; a file written before the removal keeps that route.
             "route_behavior_mode" => {
-                if let Ok(parsed) = value.parse::<RouteBehaviorMode>() {
+                if value == "strict-secondary-fail-closed" {
+                    preferences.route_behavior_mode =
+                        RouteBehaviorMode::PreferSecondaryWhenAvailable;
+                } else if let Ok(parsed) = value.parse::<RouteBehaviorMode>() {
                     preferences.route_behavior_mode = parsed;
                 }
             }
@@ -489,16 +494,6 @@ pub(super) fn parse_preferences_with(
                     &preferences.route_shared_ip_policy,
                 );
             }
-            "route_kill_switch_block_all" => {
-                if let Some(parsed) = parse_bool(value) {
-                    preferences.route_kill_switch_block_all = parsed;
-                }
-            }
-            "route_kill_switch_fail_closed" => {
-                if let Some(parsed) = parse_bool(value) {
-                    preferences.route_kill_switch_fail_closed = parsed;
-                }
-            }
             // A line that blocks nothing keeps the default (every protocol)
             // rather than being masked into a selection nobody made.
             "route_kill_switch_protocols" => match value.parse::<u16>() {
@@ -510,19 +505,9 @@ pub(super) fn parse_preferences_with(
                      reading it as every protocol"
                 ),
             },
-            "route_kill_switch_enabled" => {
-                if let Some(parsed) = parse_bool(value) {
-                    preferences.route_kill_switch_enabled = parsed;
-                }
-            }
             "route_allow_dns_over_primary" => {
                 if let Some(parsed) = parse_bool(value) {
                     preferences.route_allow_dns_over_primary = parsed;
-                }
-            }
-            "route_mode_a_coverage_strategy" => {
-                if matches!(value, "per-ip" | "fail-closed-unknown" | "zone-widening") {
-                    preferences.route_mode_a_coverage_strategy = value.to_string();
                 }
             }
             "route_resolve_hosts_bypass" => {
@@ -738,12 +723,8 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
             "secondary_split_ack_adapter_name={}\n",
             "route_include_subdomains={}\n",
             "route_shared_ip_policy={}\n",
-            "route_kill_switch_block_all={}\n",
-            "route_kill_switch_fail_closed={}\n",
             "route_kill_switch_protocols={}\n",
-            "route_kill_switch_enabled={}\n",
             "route_allow_dns_over_primary={}\n",
-            "route_mode_a_coverage_strategy={}\n",
             "route_resolve_hosts_bypass={}\n",
             "route_enforcement_mode={}\n",
             "route_liveness_window_secs={}\n",
@@ -835,12 +816,8 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
         one_line(&preferences.secondary_split_ack_adapter_name),
         one_line(&preferences.route_include_subdomains),
         one_line(&preferences.route_shared_ip_policy),
-        one_line(&preferences.route_kill_switch_block_all),
-        one_line(&preferences.route_kill_switch_fail_closed),
         one_line(&preferences.route_kill_switch_protocols),
-        one_line(&preferences.route_kill_switch_enabled),
         one_line(&preferences.route_allow_dns_over_primary),
-        one_line(&preferences.route_mode_a_coverage_strategy),
         one_line(&preferences.route_resolve_hosts_bypass),
         one_line(&preferences.route_enforcement_mode),
         one_line(&preferences.route_liveness_window_secs),

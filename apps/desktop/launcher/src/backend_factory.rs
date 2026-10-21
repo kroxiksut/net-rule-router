@@ -1,12 +1,10 @@
 //! Backend selection logic for the launcher.
 //!
-//! The GUI launcher boots in one of three backend modes:
+//! The GUI launcher boots in one of two backend modes:
 //! - `mock` — `MockBackendFacade` (deterministic snapshots, no IPC).
-//! - `preview-local` — `PreviewLocalBackendFacade` (same shape as mock
-//!   today but reserved for future local-only enforcement preview).
 //! - default — the real `IpcBackendFacade` over the named-pipe transport
 //!   to the running service. If the IPC connect probe times out, the
-//!   launcher falls back to `MockBackendFacade` and surfaces the
+//!   launcher serves an "unknown" backend and surfaces the
 //!   degradation through [`BackendConnectionStatus::Disconnected`] so
 //!   the connection banner in QML can paint.
 //!
@@ -26,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nrr_application::backend_facade::{
-    BackendConnectionStatus, BackendFacade, MockBackendFacade, PreviewLocalBackendFacade,
+    BackendConnectionStatus, BackendFacade, MockBackendFacade, UnavailableBackendFacade,
 };
 use nrr_ipc_client::{ConnectionStatus, ServiceIpcClient};
 
@@ -40,7 +38,7 @@ use crate::ipc_backend_facade::IpcBackendFacade;
 /// A running service connects in well under 100ms, so the common case
 /// is unaffected; when the service is OFF this is the only place startup
 /// blocks, so a tight budget keeps the window appearing fast. If the
-/// service is unreachable here, the GUI starts on the mock backend with
+/// service is unreachable here, the GUI starts on the "unknown" backend with
 /// a `Connecting` status and the 3s `backendStatusPoll` upgrades it to
 /// live data once the background client connects.
 pub const IPC_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
@@ -55,16 +53,13 @@ pub const IPC_REPROBE_AFTER_START: Duration = Duration::from_secs(6);
 pub enum BackendChoice {
     /// Hard-coded mock data; no IPC transport spun up.
     Mock,
-    /// Same shape as [`Self::Mock`] today; reserved for the future
-    /// local-only enforcement preview path.
-    PreviewLocal,
     /// Production: try real IPC first, fall back to mock with
     /// `Disconnected` status if the service is unreachable.
     Ipc,
 }
 
 /// Accepted `NRR_BACKEND` slugs, for the diagnostic that names them.
-const BACKEND_SLUGS: &str = "mock | preview-local | ipc";
+const BACKEND_SLUGS: &str = "mock | ipc";
 
 impl BackendChoice {
     /// Reads `NRR_BACKEND` from the process env. Unrecognised /
@@ -114,7 +109,6 @@ impl BackendChoice {
     pub fn from_slug(raw: &str) -> Self {
         match raw.to_ascii_lowercase().as_str() {
             "mock" => Self::Mock,
-            "preview-local" | "preview_local" | "previewlocal" => Self::PreviewLocal,
             _ => Self::Ipc,
         }
     }
@@ -131,7 +125,7 @@ fn backend_choice_notice(raw: &str, choice: BackendChoice) -> Option<String> {
         BackendChoice::Ipc => Some(format!(
             "NRR_BACKEND={raw:?} is not a known mode ({BACKEND_SLUGS}); starting on the REAL service backend"
         )),
-        BackendChoice::Mock | BackendChoice::PreviewLocal => Some(format!(
+        BackendChoice::Mock => Some(format!(
             "NRR_BACKEND={raw:?}: this window shows FABRICATED preview data. Nothing here reflects the running service, and nothing changed here reaches it. Unset the variable for the real backend."
         )),
     }
@@ -149,7 +143,7 @@ pub struct BackendBundle {
 
 /// Construct the backend per `choice`. For [`BackendChoice::Ipc`] this
 /// briefly probes the named-pipe transport; on connect failure the
-/// returned facade is a `MockBackendFacade` and `status` is
+/// returned facade answers "unknown" (never preview data) and `status` is
 /// `Disconnected{...}` so the GUI can paint a banner.
 ///
 /// The IPC client is spun up regardless on the IPC path — the worker
@@ -160,12 +154,6 @@ pub fn create_backend(choice: BackendChoice) -> BackendBundle {
     match choice {
         BackendChoice::Mock => BackendBundle {
             facade: Arc::new(MockBackendFacade::default()) as Arc<dyn BackendFacade>,
-            status: BackendConnectionStatus::Connected,
-            choice,
-            service_started: false,
-        },
-        BackendChoice::PreviewLocal => BackendBundle {
-            facade: Arc::new(PreviewLocalBackendFacade::default()) as Arc<dyn BackendFacade>,
             status: BackendConnectionStatus::Connected,
             choice,
             service_started: false,
@@ -187,7 +175,7 @@ fn build_ipc_bundle() -> BackendBundle {
             },
             Err(e) => {
                 eprintln!(
-                    "nrr-launcher: IPC facade construction failed ({e}); falling back to mock"
+                    "nrr-launcher: IPC facade construction failed ({e}); serving unknown state"
                 );
                 fallback_with_status(BackendConnectionStatus::Disconnected {
                     last_error: format!("ipc facade init failed: {e}"),
@@ -204,7 +192,7 @@ fn build_ipc_bundle() -> BackendBundle {
 /// The service did not answer: serve the mock, and say why.
 fn unreachable_bundle(status: ConnectionStatus) -> BackendBundle {
     let status = ipc_status_to_backend_status(status);
-    eprintln!("nrr-launcher: IPC connect probe failed ({status:?}); using mock backend");
+    eprintln!("nrr-launcher: IPC connect probe failed ({status:?}); serving unknown state");
     fallback_with_status(status)
 }
 
@@ -213,7 +201,7 @@ fn unreachable_bundle(status: ConnectionStatus) -> BackendBundle {
 /// it now (no UAC) and re-probe: started with Windows, the wanted state is
 /// running; started with the app, this is that start. `NotStartable` (not
 /// installed, no grant, mid-transition) → `None`, and the caller falls
-/// through to the mock backend. Returns `Some(bundle)` only when the service
+/// through to the unreachable-service backend. Returns `Some(bundle)` only when the service
 /// started AND the IPC re-probe connected.
 #[cfg(target_os = "windows")]
 fn try_demand_start_on_this_os(client: &Arc<ServiceIpcClient>) -> Option<BackendBundle> {
@@ -237,7 +225,7 @@ fn try_demand_start_on_this_os(client: &Arc<ServiceIpcClient>) -> Option<Backend
             service_started: outcome == DemandStartOutcome::Started,
         }),
         Err(e) => {
-            eprintln!("nrr-launcher: IPC facade init failed after demand-start ({e}); using mock");
+            eprintln!("nrr-launcher: IPC facade init failed after demand-start ({e}); serving unknown state");
             None
         }
     }
@@ -251,9 +239,11 @@ fn try_demand_start_on_this_os(_client: &Arc<ServiceIpcClient>) -> Option<Backen
     None
 }
 
+/// The window still opens, but every service-owned card reads "unknown": the
+/// preview data would read as a healthy service.
 fn fallback_with_status(status: BackendConnectionStatus) -> BackendBundle {
     BackendBundle {
-        facade: Arc::new(MockBackendFacade::default()) as Arc<dyn BackendFacade>,
+        facade: Arc::new(UnavailableBackendFacade::new(status.clone())) as Arc<dyn BackendFacade>,
         status,
         choice: BackendChoice::Ipc,
         service_started: false,
@@ -305,21 +295,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_slug_recognises_mock_and_preview_local_case_insensitive() {
+    fn from_slug_recognises_mock_case_insensitive() {
         assert_eq!(BackendChoice::from_slug("mock"), BackendChoice::Mock);
         assert_eq!(BackendChoice::from_slug("MOCK"), BackendChoice::Mock);
-        assert_eq!(
-            BackendChoice::from_slug("preview-local"),
-            BackendChoice::PreviewLocal
-        );
-        assert_eq!(
-            BackendChoice::from_slug("Preview_Local"),
-            BackendChoice::PreviewLocal
-        );
-        assert_eq!(
-            BackendChoice::from_slug("previewlocal"),
-            BackendChoice::PreviewLocal
-        );
     }
 
     #[test]
@@ -343,6 +321,10 @@ mod tests {
         assert_eq!(BackendChoice::from_slug("ipc"), BackendChoice::Ipc);
         assert_eq!(BackendChoice::from_slug("real"), BackendChoice::Ipc);
         assert_eq!(BackendChoice::from_slug("typo"), BackendChoice::Ipc);
+        // A retired preview slug starts the real backend, and says so.
+        let (choice, notice) = BackendChoice::decide(true, Some("preview-local"));
+        assert_eq!(choice, BackendChoice::Ipc);
+        assert!(notice.is_some_and(|n| n.contains("not a known mode")));
     }
 
     /// Both silences the review named, and they fail in opposite directions:
@@ -363,14 +345,9 @@ mod tests {
             "the line names the alternatives"
         );
 
-        for (raw, choice) in [
-            ("mock", BackendChoice::Mock),
-            ("preview-local", BackendChoice::PreviewLocal),
-        ] {
-            let notice =
-                backend_choice_notice(raw, choice).expect("a preview backend is never silent");
-            assert!(notice.contains("FABRICATED"), "{notice}");
-        }
+        let notice = backend_choice_notice("mock", BackendChoice::Mock)
+            .expect("a preview backend is never silent");
+        assert!(notice.contains("FABRICATED"), "{notice}");
     }
 
     #[test]
@@ -382,18 +359,10 @@ mod tests {
         let _ = bundle.facade.diagnostics_status_snapshot();
     }
 
-    #[test]
-    fn create_backend_preview_local_returns_connected() {
-        let bundle = create_backend(BackendChoice::PreviewLocal);
-        assert_eq!(bundle.choice, BackendChoice::PreviewLocal);
-        assert_eq!(bundle.status, BackendConnectionStatus::Connected);
-        let _ = bundle.facade.diagnostics_status_snapshot();
-    }
-
     /// Tested on the mapping, not on the machine: the live path opens the real
     /// service pipe, and on Windows may even start a DemandStart service.
     #[test]
-    fn an_unreachable_service_falls_back_to_the_mock() {
+    fn an_unreachable_service_serves_unknown_not_preview_data() {
         let bundle = unreachable_bundle(ConnectionStatus::ServiceStopped);
         assert_eq!(bundle.choice, BackendChoice::Ipc);
         assert!(
@@ -401,8 +370,12 @@ mod tests {
             "{:?}",
             bundle.status
         );
-        // Mock fallback must still be callable.
-        let _ = bundle.facade.diagnostics_status_snapshot();
+        let snapshot = bundle.facade.diagnostics_status_snapshot();
+        assert_eq!(
+            snapshot.origin,
+            nrr_shared::diagnostics_dto::DiagnosticsDataOrigin::Unavailable
+        );
+        assert!(!snapshot.overall_healthy);
     }
 
     #[test]

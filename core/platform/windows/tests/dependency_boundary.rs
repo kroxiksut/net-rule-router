@@ -1,7 +1,10 @@
 //! Dependency boundary tests.
 //!
-//! Mirrors the pattern from `nrr-service-runtime/tests/dependency_boundary.rs`.
-//! Reads Cargo.toml at compile time and rejects any forbidden dependency.
+//! The manifest scan catches the obvious case; the resolved graph from
+//! `cargo metadata` catches a crate that arrives through an edge one level down.
+
+#[path = "../../../dependency_graph_gate.rs"]
+mod graph;
 
 const CARGO_TOML: &str = include_str!("../Cargo.toml");
 
@@ -45,5 +48,28 @@ fn no_forbidden_dependencies_in_manifest() {
                 line
             );
         }
+    }
+}
+
+#[test]
+fn the_windows_platform_links_no_ui_or_service_crate_at_any_depth() {
+    let linked = graph::linked_crates(env!("CARGO_MANIFEST_DIR"), "nrr-platform-windows");
+    let leaks = graph::leaks(&linked, FORBIDDEN);
+    assert!(
+        leaks.is_empty(),
+        "nrr-platform-windows links {leaks:?}. Trace with `cargo tree -p nrr-platform-windows -i <crate>`."
+    );
+}
+
+/// A detector that cannot fire proves nothing: the GUI library does link the
+/// UI crates, so the same walk must see them there.
+#[test]
+fn the_detector_sees_ui_crates_where_they_are() {
+    let linked = graph::linked_crates(env!("CARGO_MANIFEST_DIR"), "nrr-desktop-gui");
+    for expected in ["nrr-ui-support", "nrr-mock-backend"] {
+        assert!(
+            linked.contains(expected),
+            "the walk missed {expected} in the GUI library; its verdict here is void"
+        );
     }
 }

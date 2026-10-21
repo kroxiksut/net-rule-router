@@ -111,6 +111,25 @@ fn poison_fallback_leaves_clean_answers_alone() {
 }
 
 #[test]
+fn a_replaced_answer_is_counted_for_the_status_card_and_a_clean_one_is_not() {
+    let inner = FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(203, 0, 113, 7)]);
+    let fallback = FixedUpstream::ok(vec![ip(100, 64, 1, 4)]);
+    let r = PoisonFallbackUpstreamResolver::new(inner as Arc<dyn UpstreamResolver>)
+        .with_fallbacks(vec![fallback as Arc<dyn UpstreamResolver>]);
+    r.resolve("tampered-by-isp.example", AddressFamily::Ipv4)
+        .expect("fallback answers");
+    let clean = PoisonFallbackUpstreamResolver::new(
+        FixedUpstream::ok(vec![ip(100, 64, 0, 9)]) as Arc<dyn UpstreamResolver>
+    );
+    clean
+        .resolve("untouched.example", AddressFamily::Ipv4)
+        .expect("clean");
+    let machine = crate::dns_tamper_summary::current(true);
+    assert!(!machine.examples.iter().any(|h| h == "untouched.example"));
+    assert!(machine.affected_hosts >= 1);
+}
+
+#[test]
 fn the_port_adapter_refuses_to_hand_a_placeholder_to_the_cache() {
     // What the seeder and the DNS refresh write goes straight into the
     // cache the relay dials from, so an unconfirmed placeholder there is a
@@ -1045,6 +1064,60 @@ fn reconciler_installs_when_hook_completes_within_deadline() {
     assert_eq!(ran.load(Ordering::SeqCst), 1);
 }
 
+/// Only a request that brings a fact no pass input sees runs the forced hook;
+/// every other one takes the plain hook, which may skip an unchanged pass.
+#[test]
+fn only_a_forced_request_runs_the_forced_hook() {
+    let plain = Arc::new(AtomicUsize::new(0));
+    let forced = Arc::new(AtomicUsize::new(0));
+    let (p, f) = (Arc::clone(&plain), Arc::clone(&forced));
+    let reconciler = HookSyncReconciler::new(Arc::new(move || {
+        p.fetch_add(1, Ordering::SeqCst);
+    }))
+    .with_forced_hook(Arc::new(move || {
+        f.fetch_add(1, Ordering::SeqCst);
+    }));
+    let wait = Duration::from_secs(5);
+    assert_eq!(reconciler.reconcile_now(wait), ReconcileOutcome::Installed);
+    reconciler.request_reconcile();
+    assert_eq!(forced.load(Ordering::SeqCst), 0, "a plain request forced");
+    assert_eq!(
+        reconciler.reconcile_forced(wait),
+        ReconcileOutcome::Installed
+    );
+    assert_eq!(forced.load(Ordering::SeqCst), 1);
+    // The force is spent by the run that carried it.
+    assert_eq!(reconciler.reconcile_now(wait), ReconcileOutcome::Installed);
+    assert_eq!(forced.load(Ordering::SeqCst), 1);
+}
+
+/// A new exemption must be installed before its answer: the gate forces.
+#[test]
+fn a_new_known_direct_exemption_forces_the_pass_and_a_known_one_does_not() {
+    let forced = Arc::new(AtomicUsize::new(0));
+    let f = Arc::clone(&forced);
+    let reconciler = Arc::new(
+        HookSyncReconciler::new(Arc::new(|| {})).with_forced_hook(Arc::new(move || {
+            f.fetch_add(1, Ordering::SeqCst);
+        })),
+    );
+    let gate = ReconcilingDirectAnswerGate::new(
+        Arc::new(crate::known_direct::KnownDirectRegistry::default()),
+        reconciler,
+        Arc::new(|| true),
+        Duration::from_secs(5),
+    );
+    let addr = [std::net::Ipv4Addr::new(203, 0, 113, 40)];
+    crate::dns_resolver::DirectAnswerGate::gate(&gate, "direct.example", &addr);
+    assert_eq!(forced.load(Ordering::SeqCst), 1);
+    crate::dns_resolver::DirectAnswerGate::gate(&gate, "direct.example", &addr);
+    assert_eq!(
+        forced.load(Ordering::SeqCst),
+        1,
+        "a re-queried exempt host forced another pass"
+    );
+}
+
 /// Each family's first contact reaches its own hook, and a family without
 /// one routes nothing: an AAAA answer never lands in the v4 hook, whose
 /// planner would route nothing for it anyway, and vice versa.
@@ -1268,6 +1341,23 @@ fn direct_udp_resolves_answers_and_ttl_from_fake_server() {
         vec![ip(100, 64, 1, 4), ip(100, 64, 5, 8)]
     );
     assert_eq!(resolved.ttl_seconds, 90);
+}
+
+/// An answer far larger than a classic datagram is read whole, not failed
+/// against the server (which would rotate the machine off a working resolver).
+#[test]
+fn direct_udp_reads_an_oversized_answer_whole() {
+    let addr = spawn_fake_dns(|query| {
+        let mut reply = build_a_response(query, &[ip(100, 64, 1, 4)], 90).expect("resp");
+        // Bytes past the declared sections, as a padding middlebox leaves them.
+        reply.resize(9000, 0);
+        vec![reply]
+    });
+    let r = DirectUdpUpstreamResolver::new(addr, Duration::from_secs(2), 1);
+    let resolved = r
+        .resolve("assistant.example", AddressFamily::Ipv4)
+        .expect("an oversized answer still resolves");
+    assert_eq!(resolved.addresses, vec![ip(100, 64, 1, 4)]);
 }
 
 /// A server that never answers used to cost `attempts x timeout` no matter
@@ -1596,4 +1686,62 @@ fn first_contact_timing_reports_once_a_minute_and_starts_over() {
         None,
         "the next minute starts from nothing"
     );
+}
+
+#[test]
+fn a_host_the_upstream_censors_goes_straight_to_the_fallback_next_time() {
+    let inner = FixedUpstream::ok(vec![ip(127, 0, 0, 1)]);
+    let fallback = FixedUpstream::ok(vec![ip(100, 64, 0, 78)]);
+    let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
+        .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
+    for _ in 0..2 {
+        assert_eq!(
+            r.resolve("Blocked.Example", AddressFamily::Ipv4)
+                .expect("rescued")
+                .addresses,
+            vec![ip(100, 64, 0, 78)]
+        );
+    }
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 1, "primary asked once");
+    assert_eq!(fallback.calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn the_censored_host_memory_expires_and_is_bounded() {
+    let t0 = Instant::now();
+    let mut memory = HostVerdicts::default();
+    memory.remember(
+        "a.example",
+        AddressFamily::Ipv4,
+        HostVerdict::UpstreamUnusable,
+        t0,
+    );
+    assert_eq!(
+        memory.recall(
+            "A.EXAMPLE",
+            AddressFamily::Ipv4,
+            t0 + Duration::from_secs(1)
+        ),
+        Some(HostVerdict::UpstreamUnusable),
+        "case-insensitive"
+    );
+    assert_eq!(
+        memory.recall("a.example", AddressFamily::Ipv6, t0),
+        None,
+        "per family"
+    );
+    assert_eq!(
+        memory.recall("a.example", AddressFamily::Ipv4, t0 + HostVerdicts::TTL),
+        None,
+        "expired"
+    );
+    for i in 0..HostVerdicts::CAPACITY * 2 {
+        memory.remember(
+            &format!("h{i}.example"),
+            AddressFamily::Ipv4,
+            HostVerdict::NothingToPin,
+            t0,
+        );
+    }
+    assert!(memory.entries.len() <= HostVerdicts::CAPACITY);
 }

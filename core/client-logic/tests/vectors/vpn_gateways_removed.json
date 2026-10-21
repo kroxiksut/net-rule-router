@@ -1,0 +1,134 @@
+{
+  "description": "pure.js vpnGatewaysRemoved: the gateway list after one is taken back",
+  "cases": [
+    {
+      "name": "empty list",
+      "input": {
+        "existing": [],
+        "address": "203.0.113.20"
+      },
+      "expected": []
+    },
+    {
+      "name": "others kept in order",
+      "input": {
+        "existing": [
+          {
+            "address": "198.51.100.4",
+            "program": "a"
+          },
+          {
+            "address": "203.0.113.20",
+            "program": ""
+          },
+          {
+            "address": "2001:db8::7",
+            "program": "c"
+          }
+        ],
+        "address": "203.0.113.20"
+      },
+      "expected": [
+        {
+          "address": "198.51.100.4",
+          "program": "a"
+        },
+        {
+          "address": "2001:db8::7",
+          "program": "c"
+        }
+      ]
+    },
+    {
+      "name": "case and spaces ignored",
+      "input": {
+        "existing": [
+          {
+            "address": "2001:db8::7",
+            "program": ""
+          }
+        ],
+        "address": " 2001:DB8::7 "
+      },
+      "expected": []
+    },
+    {
+      "name": "absent address changes nothing",
+      "input": {
+        "existing": [
+          {
+            "address": "198.51.100.4",
+            "program": "a"
+          }
+        ],
+        "address": "203.0.113.99"
+      },
+      "expected": [
+        {
+          "address": "198.51.100.4",
+          "program": "a"
+        }
+      ]
+    },
+    {
+      "name": "missing list reads as empty",
+      "input": {
+        "existing": null,
+        "address": "203.0.113.20"
+      },
+      "expected": []
+    },
+    {
+      "name": "every copy of the address goes",
+      "input": {
+        "existing": [
+          {
+            "address": "203.0.113.20",
+            "program": "a"
+          },
+          {
+            "address": "203.0.113.20",
+            "program": "b"
+          }
+        ],
+        "address": "203.0.113.20"
+      },
+      "expected": []
+    },
+    {
+      "name": "empty address removes only blank entries",
+      "input": {
+        "existing": [
+          {
+            "address": "",
+            "program": "a"
+          },
+          {
+            "address": "198.51.100.4",
+            "program": "b"
+          }
+        ],
+        "address": ""
+      },
+      "expected": [
+        {
+          "address": "198.51.100.4",
+          "program": "b"
+        }
+      ]
+    },
+    {
+      "name": "entry spaces ignored too",
+      "input": {
+        "existing": [
+          {
+            "address": " 198.51.100.4 ",
+            "program": "a"
+          }
+        ],
+        "address": "198.51.100.4"
+      },
+      "expected": []
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+Qt notice
+=========
+
+The graphical interface of NetRuleRouter uses the Qt toolkit (https://www.qt.io/).
+Qt is © The Qt Company Ltd. and other contributors.
+
+Qt is used under the GNU Lesser General Public License, version 3 (LGPLv3).
+The Qt libraries (the Qt6*.dll files, the plugins and the QML modules beside
+them) are shipped unmodified, as shared libraries; NetRuleRouter's own code is
+a separate work that loads them at run time and is not covered by the LGPL.
+
+You may replace the Qt libraries with a build of your own from the same Qt
+version. The Qt source code is available from https://download.qt.io/ and
+https://code.qt.io/. The licence texts that apply are in this folder:
+
+  Qt-LGPL-3.0.html   the GNU Lesser General Public License, version 3
+  Qt-GPL-3.0.html    the GNU General Public License, version 3, which the LGPL
+                     builds on
+
+Some Qt modules carry other licences (for example the BSD-style and MIT-style
+licences of third-party code Qt contains); the list is at
+https://doc.qt.io/qt-6/licenses-used-in-qt.html.

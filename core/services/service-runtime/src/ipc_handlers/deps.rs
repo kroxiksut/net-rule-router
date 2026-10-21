@@ -71,7 +71,6 @@ pub struct IpcHandlerDeps {
     pub routing_pause: Arc<dyn RoutingPauseProvider>,
     pub routing_pause_writer: Arc<dyn RoutingPauseWriter>,
     pub autostart: Arc<dyn AutostartProvider>,
-    pub autostart_writer: Arc<dyn AutostartWriter>,
     /// Security alerts repository. `None` ⇒ the alerts
     /// list handler returns an empty list and ack/resolve mutations
     /// fail with `alerts-store-unavailable`. Wired in `runtime_deps.rs`
@@ -270,7 +269,6 @@ impl IpcHandlerDeps {
         routing_pause: Arc<dyn RoutingPauseProvider>,
         routing_pause_writer: Arc<dyn RoutingPauseWriter>,
         autostart: Arc<dyn AutostartProvider>,
-        autostart_writer: Arc<dyn AutostartWriter>,
     ) -> Self {
         Self {
             audit_emitter,
@@ -297,7 +295,6 @@ impl IpcHandlerDeps {
             routing_pause,
             routing_pause_writer,
             autostart,
-            autostart_writer,
             alerts_repo: None,
             other_principals_hold_revisions: None,
             service_stability_provider: None,

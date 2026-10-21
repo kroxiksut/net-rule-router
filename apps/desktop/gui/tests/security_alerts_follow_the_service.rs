@@ -307,6 +307,8 @@ fn a_live_answer_replaces_every_card_and_a_failed_one_keeps_what_is_shown() {
             "origin": "service", "stale": false, "overallHealthy": true,
             "activeAlerts": [{"alertId": "alt-1"}], "alertsStale": false,
             "alertsUnreadable": false, "explainSample": null,
+            "missingCapabilities": [],
+            "dnsTamper": { "affectedHosts": 0, "examples": [] },
             "serviceHealth": {
                 "state": "running", "activeRevisionId": "rev-7", "pendingChanges": 2,
                 "startRelativeToSignIn": "after", "startSignInGapMs": 1500

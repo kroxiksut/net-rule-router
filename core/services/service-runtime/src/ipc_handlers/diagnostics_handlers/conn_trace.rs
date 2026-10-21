@@ -126,9 +126,10 @@ fn shown_ip(ip: std::net::IpAddr) -> String {
 }
 
 /// Whether `audience` may see a row owned by `owner`. Rows with no owner
-/// belong to the machine. The service's own rows do not: the relay among them
-/// carries every user's traffic, and a row cannot say whose, so only an
-/// administrator sees them. A user still sees their program's leg to the relay.
+/// belong to the machine. The service's own rows do not, whatever owner the
+/// platform stamped: the relay among them carries every user's traffic, and a
+/// row cannot say whose, so only an administrator sees them. A user still sees
+/// their program's leg to the relay.
 fn row_visible_to(
     audience: &DiagnosticsAudience,
     rec: &crate::conn_observation_consumer::ConnectionTraceRecord,
@@ -136,6 +137,9 @@ fn row_visible_to(
     let Some(caller) = audience.principal() else {
         return true;
     };
+    if is_own_service(&exe_name(rec.process_path.as_deref())) {
+        return false;
+    }
     rec.user_sid
         .as_deref()
         .is_none_or(|owner| owner.is_empty() || owner.eq_ignore_ascii_case(caller))

@@ -115,23 +115,17 @@ fn high_contrast_flag_pins_theme_mode() {
 
 #[test]
 fn route_policy_mirrors_round_trip_through_payload() {
-    // The master kill-switch toggle, the DNS-over-primary opt-in, and
-    // subdomain coverage are device-local mirrors that must survive a GUI
-    // restart (and re-seed the service after a state-DB wipe). Regression
-    // guard: `routeKillSwitchEnabled` / `routeAllowDnsOverPrimary` were
-    // absent from the QtPreferencesPayload parse, so QML emitted them but
-    // the launcher silently dropped them and the toggles never persisted.
+    // The DNS-over-primary opt-in and subdomain coverage are device-local
+    // mirrors that must survive a GUI restart. Regression guard:
+    // `routeAllowDnsOverPrimary` was absent from the QtPreferencesPayload
+    // parse, so QML emitted it but the launcher silently dropped it.
     let baseline = UiPreferences::default();
     let mut object: serde_json::Map<String, serde_json::Value> =
         serde_json::from_str(&payload_with_theme("dark", false)).expect("base payload parses");
     // Subdomain coverage defaults ON, so `false` is the non-default value
     // that proves the mirror actually round-trips.
     object.insert("routeIncludeSubdomains".into(), false.into());
-    object.insert("routeKillSwitchEnabled".into(), true.into());
-    object.insert("routeAllowDnsOverPrimary".into(), true.into());
-    object.insert("routeKillSwitchBlockAll".into(), true.into());
-    // Non-default values (defaults: fail-closed-unknown / true).
-    object.insert("routeModeACoverageStrategy".into(), "per-ip".into());
+    object.insert("routeAllowDnsOverPrimary".into(), false.into());
     object.insert("routeResolveHostsBypass".into(), false.into());
     let payload = serde_json::Value::Object(object).to_string();
     let updated =
@@ -141,17 +135,8 @@ fn route_policy_mirrors_round_trip_through_payload() {
         "subdomain coverage must round-trip"
     );
     assert!(
-        updated.route_kill_switch_enabled,
-        "master kill-switch toggle must round-trip"
-    );
-    assert!(
-        updated.route_allow_dns_over_primary,
-        "DNS-over-primary opt-in must round-trip"
-    );
-    assert!(updated.route_kill_switch_block_all);
-    assert_eq!(
-        updated.route_mode_a_coverage_strategy, "per-ip",
-        "Mode-A coverage strategy must round-trip"
+        !updated.route_allow_dns_over_primary,
+        "DNS-over-primary opt-out must round-trip"
     );
     assert!(
         !updated.route_resolve_hosts_bypass,
@@ -173,13 +158,13 @@ fn pending_offline_intents_round_trip_through_payload() {
         serde_json::from_str(&payload_with_theme("dark", false)).expect("base payload parses");
     object.insert(
         "routePendingOfflineJson".into(),
-        serde_json::json!(r#"{"route-policy":{"kill-switch-enabled":true}}"#),
+        serde_json::json!(r#"{"route-policy":{"leak-protection":"everything"}}"#),
     );
     let payload = serde_json::Value::Object(object).to_string();
     let updated = apply_qt_preferences_payload(&baseline, &payload)
         .expect("pending-offline payload must parse");
     assert_eq!(
-        updated.route_pending_offline_json, r#"{"route-policy":{"kill-switch-enabled":true}}"#,
+        updated.route_pending_offline_json, r#"{"route-policy":{"leak-protection":"everything"}}"#,
         "a valid pending-offline blob must round-trip through the launcher parse"
     );
 
@@ -896,7 +881,6 @@ fn a_payload_without_the_key_keeps_every_default_on_setting_and_the_protocol_mas
         warn_kill_switch_block_all: false,
         diagnostics_archive_session_only: false,
         route_include_subdomains: false,
-        route_kill_switch_fail_closed: false,
         route_allow_dns_over_primary: false,
         route_resolve_hosts_bypass: false,
         auto_load_rules_on_launch: false,
@@ -918,7 +902,6 @@ fn a_payload_without_the_key_keeps_every_default_on_setting_and_the_protocol_mas
         assert!(!kept.warn_kill_switch_block_all);
         assert!(!kept.diagnostics_archive_session_only);
         assert!(!kept.route_include_subdomains);
-        assert!(!kept.route_kill_switch_fail_closed);
         assert!(!kept.route_allow_dns_over_primary);
         assert!(!kept.route_resolve_hosts_bypass);
         assert!(!kept.auto_load_rules_on_launch);
@@ -940,7 +923,6 @@ fn a_payload_without_the_key_keeps_every_default_on_setting_and_the_protocol_mas
             ("warnKillSwitchBlockAll", true.into()),
             ("diagnosticsArchiveSessionOnly", true.into()),
             ("routeIncludeSubdomains", true.into()),
-            ("routeKillSwitchFailClosed", true.into()),
             ("routeAllowDnsOverPrimary", true.into()),
             ("routeResolveHostsBypass", true.into()),
             ("autoLoadRulesOnLaunch", true.into()),
@@ -959,7 +941,6 @@ fn a_payload_without_the_key_keeps_every_default_on_setting_and_the_protocol_mas
     assert!(sent.warn_kill_switch_block_all);
     assert!(sent.diagnostics_archive_session_only);
     assert!(sent.route_include_subdomains);
-    assert!(sent.route_kill_switch_fail_closed);
     assert!(sent.route_allow_dns_over_primary);
     assert!(sent.route_resolve_hosts_bypass);
     assert!(sent.auto_load_rules_on_launch);
@@ -970,8 +951,8 @@ fn a_payload_without_the_key_keeps_every_default_on_setting_and_the_protocol_mas
 }
 
 /// A payload that reports nothing changes nothing. Every field used to have a
-/// serde default, so an absent key silently switched off the leak-protection
-/// mirror, forgot banner answers and reset slugs to their defaults.
+/// serde default, so an absent key silently switched off a policy mirror,
+/// forgot banner answers and reset slugs to their defaults.
 #[test]
 fn an_empty_payload_leaves_every_stored_setting_as_it_was() {
     let baseline = UiPreferences {
@@ -994,10 +975,7 @@ fn an_empty_payload_leaves_every_stored_setting_as_it_was() {
         traffic_export_unit: "gb".into(),
         diagnostics_archive_redaction_level: "diagnostics".into(),
         route_shared_ip_policy: "any-rule-domain".into(),
-        route_kill_switch_block_all: true,
-        route_kill_switch_enabled: true,
         route_kill_switch_protocols: 5,
-        route_mode_a_coverage_strategy: "zone-widening".into(),
         route_enforcement_mode: "reactive".into(),
         route_liveness_window_secs: 30,
         route_pending_offline_json: r#"{"route-policy":{}}"#.into(),
@@ -1025,7 +1003,7 @@ fn an_empty_payload_leaves_every_stored_setting_as_it_was() {
     let sent = apply_qt_preferences_payload(
         &baseline,
         &serde_json::json!({
-            "routeKillSwitchEnabled": false,
+            "routeKillSwitchProtocols": 3,
             "trayNoticeOpacityPercent": 80,
             "compatBannerMode": "always",
             "lastSavedPathPrimary": null,
@@ -1034,7 +1012,7 @@ fn an_empty_payload_leaves_every_stored_setting_as_it_was() {
         .to_string(),
     )
     .expect("payload must parse");
-    assert!(!sent.route_kill_switch_enabled);
+    assert_eq!(sent.route_kill_switch_protocols, 3);
     assert_eq!(sent.tray_notice_opacity_percent, 80);
     assert_eq!(sent.compat_banner_mode, "always");
     assert_eq!(sent.last_saved_path_primary, None);

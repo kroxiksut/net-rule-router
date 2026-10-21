@@ -47,9 +47,11 @@ QtObject {
         root.logProgress(root.tr("progress.first-run-provisioned",
             "Setup answers were supplied before launch; applying them."), "progress")
         if (root.routePolicyController) {
+            // An unanswered level is off; the write settles `sites` against
+            // the default route.
             root.routePolicyController.applyFirstRunProtections(
-                provisioning.killSwitch === true, provisioning.dohLockdown === true,
-                "provisioning")
+                String(provisioning.leakProtection || "off"),
+                provisioning.dohLockdown === true, "provisioning")
         }
         applyFirstRunStability({ "fake-ip-enabled": provisioning.fakeIp === true }, "provisioning")
         _applyProvisionedConnections()

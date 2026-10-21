@@ -405,10 +405,13 @@ impl CanonicalRuleSet {
     /// Enforcement-only: apply this to the rule book that drives codegen and
     /// seeding, NEVER to the stored / hashed rule book — the canonical hash must
     /// stay computed over the bare rules or the drift detector would diverge.
-    fn with_subdomain_coverage(&self) -> CanonicalRuleSet {
+    fn with_subdomain_coverage(&self, other: &CanonicalRuleSet) -> CanonicalRuleSet {
+        // A suffix rule of the other route is as explicit as one of this set:
+        // a twin beside it would tie with it and the primary route would win.
         let existing_suffix: std::collections::HashSet<(String, Option<CanonicalAppMatch>)> = self
             .rules
             .iter()
+            .chain(&other.rules)
             .filter_map(|r| match &r.address_match {
                 Some(CanonicalAddressMatch::SuffixDomain(d)) => {
                     Some((d.clone(), r.app_match.clone()))
@@ -541,8 +544,8 @@ impl CanonicalRuleBook {
     /// rules to expand.
     pub fn with_subdomain_coverage(&self) -> CanonicalRuleBook {
         CanonicalRuleBook {
-            primary: self.primary.with_subdomain_coverage(),
-            secondary: self.secondary.with_subdomain_coverage(),
+            primary: self.primary.with_subdomain_coverage(&self.secondary),
+            secondary: self.secondary.with_subdomain_coverage(&self.primary),
         }
     }
 
@@ -1218,6 +1221,18 @@ mod tests {
         );
         let twice = once.with_subdomain_coverage();
         assert_eq!(twice.secondary.rules().len(), 2, "idempotent");
+    }
+
+    #[test]
+    fn subdomain_coverage_adds_no_twin_beside_an_explicit_suffix_of_the_other_route() {
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![exact_fqdn_rule("r1", "example.com")]),
+            secondary: CanonicalRuleSet::from_rules(vec![suffix_rule("r2", "example.com")]),
+        };
+        let expanded = book.with_subdomain_coverage();
+        assert_eq!(expanded.primary.rules().len(), 1, "no tying twin");
+        assert_eq!(expanded.secondary.rules().len(), 1);
+        assert_eq!(expanded.without_subdomain_twins(), None);
     }
 
     #[test]

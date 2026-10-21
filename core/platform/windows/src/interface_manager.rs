@@ -49,32 +49,10 @@ pub fn adapters_snapshot() -> AdaptersSnapshot {
 
 #[cfg(windows)]
 fn collect_windows_adapters() -> Result<Vec<AdapterSnapshotEntry>, String> {
-    let mut adapters = ipconfig::get_adapters()
+    let mut adapters = crate::win32_ffi::adapters::enumerate_adapter_details()
         .map_err(|error| error.to_string())?
-        .into_iter()
-        .map(|adapter| {
-            let adapter_name = adapter.adapter_name().trim().to_string();
-            let normalized_adapter_name = normalize_adapter_name(&adapter_name);
-            let physical_address = format_physical_address(adapter.physical_address());
-            let persistent_id = build_persistent_id(
-                &normalized_adapter_name,
-                adapter.ipv6_if_index(),
-                physical_address.as_deref(),
-            );
-
-            AdapterSnapshotEntry {
-                identity: AdapterIdentity {
-                    persistent_id,
-                    adapter_name,
-                    ipv6_if_index: adapter.ipv6_if_index(),
-                    physical_address,
-                },
-                name: resolve_windows_name(adapter.friendly_name(), adapter.adapter_name().trim()),
-                interface_description: adapter.description().to_string(),
-                interface_type: interface_type_slug(adapter.if_type()).to_string(),
-                oper_status: format!("{:?}", adapter.oper_status()).to_ascii_lowercase(),
-            }
-        })
+        .iter()
+        .map(snapshot_entry)
         .collect::<Vec<_>>();
 
     adapters.sort_by(|left, right| {
@@ -85,17 +63,57 @@ fn collect_windows_adapters() -> Result<Vec<AdapterSnapshotEntry>, String> {
     Ok(adapters)
 }
 
-/// A neutral slug for the adapter type: the GUI localises it, and the OS
-/// enum's own spelling (`EthernetCsmacd`) is no name to show anyone.
 #[cfg(windows)]
-fn interface_type_slug(if_type: ipconfig::IfType) -> &'static str {
+fn snapshot_entry(adapter: &crate::win32_ffi::adapters::AdapterDetails) -> AdapterSnapshotEntry {
+    let adapter_name = adapter.info.adapter_name.trim().to_string();
+    let physical_address = format_physical_address(&adapter.physical_address);
+    let persistent_id = build_persistent_id(
+        &normalize_adapter_name(&adapter_name),
+        adapter.ipv6_if_index,
+        physical_address.as_deref(),
+    );
+
+    AdapterSnapshotEntry {
+        name: resolve_windows_name(&adapter.info.friendly_name, &adapter_name),
+        identity: AdapterIdentity {
+            persistent_id,
+            adapter_name,
+            ipv6_if_index: adapter.ipv6_if_index,
+            physical_address,
+        },
+        interface_description: adapter.info.description.clone(),
+        interface_type: interface_type_slug(adapter.if_type).to_string(),
+        oper_status: oper_status_slug(adapter.info.oper_status).to_string(),
+    }
+}
+
+/// A neutral slug for the IANA `ifType`: the GUI localises it, and the OS
+/// constant's own spelling (`IF_TYPE_ETHERNET_CSMACD`) is no name to show anyone.
+#[cfg(windows)]
+fn interface_type_slug(if_type: u32) -> &'static str {
     match if_type {
-        ipconfig::IfType::EthernetCsmacd => "ethernet",
-        ipconfig::IfType::Ieee80211 => "wireless",
-        ipconfig::IfType::SoftwareLoopback => LOOPBACK_INTERFACE_TYPE,
-        ipconfig::IfType::Tunnel => "tunnel",
-        ipconfig::IfType::Ppp => "ppp",
+        6 => "ethernet",
+        71 => "wireless",
+        24 => LOOPBACK_INTERFACE_TYPE,
+        131 => "tunnel",
+        23 => "ppp",
         _ => "other",
+    }
+}
+
+/// The `IF_OPER_STATUS` constant's name, lower-cased: the spelling the rows
+/// and the placeholder set carry, which the availability judgement reads.
+#[cfg(windows)]
+fn oper_status_slug(status: crate::adapters::IfOperStatus) -> &'static str {
+    use crate::adapters::IfOperStatus;
+    match status {
+        IfOperStatus::Up => "ifoperstatusup",
+        IfOperStatus::Down => "ifoperstatusdown",
+        IfOperStatus::Testing => "ifoperstatustesting",
+        IfOperStatus::Unknown => "ifoperstatusunknown",
+        IfOperStatus::Dormant => "ifoperstatusdormant",
+        IfOperStatus::NotPresent => "ifoperstatusnotpresent",
+        IfOperStatus::LowerLayerDown => "ifoperstatuslowerlayerdown",
     }
 }
 
@@ -167,8 +185,7 @@ fn normalize_adapter_name(value: &str) -> String {
 }
 
 #[cfg(windows)]
-fn format_physical_address(value: Option<&[u8]>) -> Option<String> {
-    let bytes = value?;
+fn format_physical_address(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return None;
     }
@@ -244,5 +261,69 @@ mod tests {
             snapshot.data_source,
             AdapterSnapshotDataSource::WindowsLive | AdapterSnapshotDataSource::FallbackMock
         ));
+    }
+
+    #[cfg(windows)]
+    mod live_mapping {
+        use super::super::{interface_type_slug, snapshot_entry};
+        use crate::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
+        use crate::win32_ffi::adapters::AdapterDetails;
+
+        fn details(friendly_name: &str, physical_address: Vec<u8>) -> AdapterDetails {
+            AdapterDetails {
+                info: AdapterInfo {
+                    index: 7,
+                    adapter_name: " {0000-AAAA} ".to_string(),
+                    description: "Example Wireless Adapter".to_string(),
+                    friendly_name: friendly_name.to_string(),
+                    mac: None,
+                    interface_type: InterfaceType::Ethernet,
+                    oper_status: IfOperStatus::LowerLayerDown,
+                    ipv4_addresses: Vec::new(),
+                    ipv6_addresses: Vec::new(),
+                    gateways: Vec::new(),
+                },
+                ipv6_if_index: 12,
+                physical_address,
+                if_type: 71,
+                gateways: Vec::new(),
+                dns_servers: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn an_entry_keeps_the_identity_and_spellings_the_rows_carry() {
+            let entry = snapshot_entry(&details(" Wi-Fi ", vec![0x02, 0xab, 0, 0, 0, 0x55]));
+            assert_eq!(entry.identity.persistent_id, "win-adapter:{0000-aaaa}");
+            assert_eq!(entry.identity.adapter_name, "{0000-AAAA}");
+            assert_eq!(entry.identity.ipv6_if_index, 12);
+            assert_eq!(
+                entry.identity.physical_address.as_deref(),
+                Some("02-AB-00-00-00-55")
+            );
+            assert_eq!(entry.name, "Wi-Fi");
+            assert_eq!(entry.interface_description, "Example Wireless Adapter");
+            assert_eq!(entry.interface_type, "wireless");
+            assert_eq!(entry.oper_status, "ifoperstatuslowerlayerdown");
+        }
+
+        #[test]
+        fn a_nameless_adapter_is_named_by_its_guid_and_has_no_mac_without_bytes() {
+            let entry = snapshot_entry(&details("  ", Vec::new()));
+            assert_eq!(entry.name, "{0000-AAAA}");
+            assert_eq!(entry.identity.physical_address, None);
+        }
+
+        #[test]
+        fn type_slugs_follow_the_iana_numbers() {
+            let slugs: Vec<&str> = [6, 71, 24, 131, 23, 1, 144]
+                .into_iter()
+                .map(interface_type_slug)
+                .collect();
+            assert_eq!(
+                slugs,
+                ["ethernet", "wireless", "loopback", "tunnel", "ppp", "other", "other"]
+            );
+        }
     }
 }

@@ -9,10 +9,9 @@ pub use nrr_platform_api::interface_rows::*;
 
 use nrr_shared::{RouteBehaviorMode, RouteRole, RouteSelectionState};
 
-const SUPPORTED_ROUTE_BEHAVIOR_MODES: [RouteBehaviorMode; 3] = [
+const SUPPORTED_ROUTE_BEHAVIOR_MODES: [RouteBehaviorMode; 2] = [
     RouteBehaviorMode::PreferPrimary,
     RouteBehaviorMode::PreferSecondaryWhenAvailable,
-    RouteBehaviorMode::StrictSecondaryFailClosed,
 ];
 
 /// The user's saved role bindings. A binding counts only once confirmed.
@@ -139,7 +138,7 @@ fn apply_role_bindings(rows: &mut [InterfaceRouteRow], request: &RouteSelectionR
         .flatten();
     if let Some(index) = secondary_index {
         rows[index].selected_role = Some(RouteRole::Secondary);
-        rows[index].route_state = secondary_state_for_row(&rows[index], request.behavior_mode);
+        rows[index].route_state = secondary_state_for_row(&rows[index]);
     }
 }
 
@@ -154,16 +153,8 @@ fn baseline_route_state(row: &InterfaceRouteRow) -> RouteSelectionState {
     }
 }
 
-fn secondary_state_for_row(
-    row: &InterfaceRouteRow,
-    behavior_mode: RouteBehaviorMode,
-) -> RouteSelectionState {
+fn secondary_state_for_row(row: &InterfaceRouteRow) -> RouteSelectionState {
     match row.availability_status {
-        BasicAvailabilityStatus::Unavailable
-            if behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed =>
-        {
-            RouteSelectionState::FailClosedConflict
-        }
         BasicAvailabilityStatus::Unavailable => RouteSelectionState::Unavailable,
         BasicAvailabilityStatus::RequiresCheck => RouteSelectionState::RequiresVerification,
         BasicAvailabilityStatus::Available if row.local_ip == "-" => {

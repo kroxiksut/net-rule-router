@@ -537,16 +537,7 @@ pub const STATE_DB_V14_DDL: &[&str] = &["ALTER TABLE service_stability_config \
 ADD COLUMN rule_scope_service_driven INTEGER NOT NULL DEFAULT 1 \
 CHECK(rule_scope_service_driven IN (0, 1))"];
 
-/// State DB v15. Adds the
-/// `kill_switch_fail_closed` flag to `secondary_block_policy`, a sibling of the
-/// v5 `block_secondary_when_unavailable` toggle it modifies. It governs what the
-/// kill-switch does when the secondary (VPN) interface cannot be resolved at
-/// apply time (adapter down / GUID stale): `1` (the default) **fails closed** —
-/// matched/all traffic is blocked rather than leaking out the primary link under
-/// the real address; `0` **fails open** — traffic is allowed and the GUI shows a
-/// loud "protection not active" banner. Default `1` so the emergency block lives
-/// up to its name. Same `ALTER TABLE ADD COLUMN` form as v9/v13/v14; existing
-/// rows backfill with the column default (fail-closed).
+/// Fail-closed vs fail-open leak protection; folded into `leak_protection` by v80.
 pub const STATE_DB_V15_DDL: &[&str] = &["ALTER TABLE secondary_block_policy \
 ADD COLUMN kill_switch_fail_closed INTEGER NOT NULL DEFAULT 1 \
 CHECK(kill_switch_fail_closed IN (0, 1))"];
@@ -651,11 +642,7 @@ CHECK(shared_ip_policy IN (0, 1, 2))"];
 pub const STATE_DB_V22_DDL: &[&str] =
     &["ALTER TABLE route_bindings ADD COLUMN known_stable_ids TEXT NOT NULL DEFAULT ''"];
 
-/// `kill_switch_block_all` on `secondary_block_policy`: when
-/// set, split-mode fail-closed blocks ALL egress (catch-all) instead of only the
-/// cached secondary destination IPs, so ICMP/ping and rotating/un-cached IPs of
-/// secondary-rule hosts cannot leak to the primary while the secondary is down. Default
-/// 0 (OFF; the per-IP behavior). ALTER ADD COLUMN, same form as v20/v21.
+/// Block everything while the tunnel is down; folded into `leak_protection` by v80.
 pub const STATE_DB_V23_DDL: &[&str] = &["ALTER TABLE secondary_block_policy \
 ADD COLUMN kill_switch_block_all INTEGER NOT NULL DEFAULT 0 \
 CHECK(kill_switch_block_all IN (0, 1))"];
@@ -686,39 +673,23 @@ pub const STATE_DB_V25_DDL: &[&str] = &["ALTER TABLE service_stability_config \
 ADD COLUMN secondary_liveness_window_secs INTEGER NOT NULL DEFAULT 0 \
 CHECK(secondary_liveness_window_secs BETWEEN 0 AND 3600)"];
 
-/// `kill_switch_enabled` on `secondary_block_policy`: the
-/// MASTER kill-switch toggle. `0` (the default) = kill-switch OFF, so NO
-/// fail-closed / leak-guard blocking arms at all (full opt-in — any leak while
-/// the secondary is down is then the user's explicit choice); `1` = enabled, and
-/// only then do the sibling `kill_switch_fail_closed` / `kill_switch_block_all` /
-/// `kill_switch_protocols` fields take effect. Existing rows backfill to `0`.
-/// DEV schema (v26) — throwaway and wiped freely pre-release.
-/// Same `ALTER TABLE ADD COLUMN` form as v20/v21/v23.
+/// The leak-protection master switch; folded into `leak_protection` by v80.
 pub const STATE_DB_V26_DDL: &[&str] = &["ALTER TABLE secondary_block_policy \
 ADD COLUMN kill_switch_enabled INTEGER NOT NULL DEFAULT 0 \
 CHECK(kill_switch_enabled IN (0, 1))"];
 
-/// `allow_dns_over_primary` on `secondary_block_policy`: OPT-IN
-/// relaxation that keeps name resolution working over the primary link (a
-/// port-scoped UDP/TCP-53 permit) while the kill-switch block-all is engaged. `0`
-/// (default) = strict (blocks DNS too). DEV schema (v27) — throwaway, wiped freely.
-/// Same `ALTER TABLE ADD COLUMN` form as v23/v26.
+/// `allow_dns_over_primary` on `secondary_block_policy`: keep name resolution
+/// over the primary link (a port-scoped DNS permit) while everything else is
+/// blocked. The SQL default is inert; the application default is ON.
 pub const STATE_DB_V27_DDL: &[&str] = &["ALTER TABLE secondary_block_policy \
 ADD COLUMN allow_dns_over_primary INTEGER NOT NULL DEFAULT 0 \
 CHECK(allow_dns_over_primary IN (0, 1))"];
 
-/// Two per-SID leak-protection fields on `secondary_block_policy`:
-/// `mode_a_coverage_strategy` (INTEGER code, [`nrr_domain::mode_a_coverage::ModeACoverageStrategy`]:
-/// 0=per-ip, 1=fail-closed-on-unknown-IP, 2=zone-widening; the SQL `DEFAULT 0`
-/// is inert — upserts always bind the column, and the effective default is the
-/// Rust-side `ModeACoverageStrategy::default()` = per-ip; the DDL string stays
-/// untouched because it is checksummed) — how Mode A
-/// treats a routed domain's un-seeded edge IP; and `resolve_hosts_bypass`
-/// (`1` = DEFAULT = resolve rule hosts bypassing
-/// the OS hosts/adblock file so a routed host gets a routable public IP instead of
-/// a `127.0.0.1` pin; `0` = honour the hosts file). DEV schema (v28) — throwaway,
-/// wiped freely pre-release. Same `ALTER ADD COLUMN`
-/// form as v21/v23/v26/v27.
+/// Two per-SID fields on `secondary_block_policy`: `mode_a_coverage_strategy`
+/// (0 per address, 1 every unresolved destination, 2 zone widening; folded
+/// into `leak_protection` by v80) and `resolve_hosts_bypass` (`1`, the default:
+/// rule hosts resolve past the OS hosts/adblock file, so a routed host gets a
+/// routable address instead of a `127.0.0.1` pin).
 pub const STATE_DB_V28_DDL: &[&str] = &[
     "ALTER TABLE secondary_block_policy \
 ADD COLUMN mode_a_coverage_strategy INTEGER NOT NULL DEFAULT 0 \
@@ -1023,9 +994,9 @@ pub const STATE_DB_V43_DDL: &[&str] = &[
 /// first connection.
 ///
 /// Written only for applications the rule book routes over the additional link,
-/// so the table can never describe an app the user never named. Keyed by the
-/// rule's own app pattern (`app_key`) exactly as the codegen queries it, so a
-/// reload round-trips without re-deriving anything. `learned_at` is the last
+/// so the table can never describe an app the user never named. Keyed here by
+/// the rule's own app pattern (`app_key`) and address, exactly as the codegen
+/// queries it; a later step adds the owning `sid` to the key. `learned_at` is the last
 /// time the address was confirmed in use; the reader admits only rows inside
 /// the enforcement confirmation window, so an address the app stopped using
 /// silently stops being seeded. A bounded per-app cap evicts the oldest rows.
@@ -1575,3 +1546,58 @@ pub const STATE_DB_V77_DDL: &[&str] = &[
     cause      TEXT    NOT NULL
 )",
 ];
+
+/// Remembered tunnel servers get an owner: `sid` is the user whose links showed
+/// the server, '' a machine-wide set that keeps no owner. The key gains it, so
+/// the table is rebuilt; every earlier row was written by a machine-wide
+/// memory and keeps ''.
+pub const STATE_DB_V78_DDL: &[&str] = &[
+    "CREATE TABLE vpn_bootstrap_endpoints_v78 (sid TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL, port INTEGER, protocol TEXT, source TEXT NOT NULL CHECK(source IN ('observed', 'manual')), learned_at INTEGER NOT NULL, PRIMARY KEY (sid, ip, source))",
+    "INSERT INTO vpn_bootstrap_endpoints_v78 (sid, ip, port, protocol, source, learned_at) SELECT '', ip, port, protocol, source, learned_at FROM vpn_bootstrap_endpoints",
+    "DROP TABLE vpn_bootstrap_endpoints",
+    "ALTER TABLE vpn_bootstrap_endpoints_v78 RENAME TO vpn_bootstrap_endpoints",
+];
+
+/// The opt-in block toggle was never read by enforcement (fail-closed arms from
+/// the kill-switch posture alone); its column goes.
+pub const STATE_DB_V79_DDL: &[&str] =
+    &["ALTER TABLE secondary_block_policy DROP COLUMN block_secondary_when_unavailable"];
+
+/// Four leak-protection settings become one choice, mapped from what each user
+/// had and never weaker: everything for the strict mode, whatever its guard
+/// said (the user picked it for "no leaks"); otherwise off unless the guard was
+/// on and failed closed; everything when it also blocked all, blocked
+/// unresolved traffic, or ran under a full default route; otherwise the routed
+/// sites; a strict user with no policy row gets one, with the app's defaults
+/// where the column defaults differ. The mapping reads the old mode, so it runs
+/// before the strict mode folds into the additional default route. An
+/// install-time strict mode becomes the additional route plus a floor of
+/// everything for each new user's first policy. The IPv6 toggle never had a
+/// reader. The mode tables are rebuilt to tighten their CHECKs.
+pub const STATE_DB_V80_DDL: &[&str] = &[
+    "ALTER TABLE secondary_block_policy ADD COLUMN leak_protection TEXT NOT NULL DEFAULT 'off' CHECK(leak_protection IN ('off', 'sites', 'everything'))",
+    "UPDATE secondary_block_policy SET leak_protection = CASE WHEN (SELECT b.mode FROM behavior_mode b WHERE b.sid = secondary_block_policy.sid) = 'strict-secondary-fail-closed' THEN 'everything' WHEN kill_switch_enabled <> 1 OR kill_switch_fail_closed <> 1 THEN 'off' WHEN kill_switch_block_all = 1 OR mode_a_coverage_strategy = 1 OR COALESCE((SELECT b.mode FROM behavior_mode b WHERE b.sid = secondary_block_policy.sid), 'prefer-primary') <> 'prefer-primary' THEN 'everything' ELSE 'sites' END",
+    "INSERT INTO secondary_block_policy (sid, leak_protection, include_subdomains, allow_dns_over_primary, updated_at) SELECT b.sid, 'everything', 1, 1, b.updated_at FROM behavior_mode b WHERE b.mode = 'strict-secondary-fail-closed' AND NOT EXISTS (SELECT 1 FROM secondary_block_policy p WHERE p.sid = b.sid)",
+    "ALTER TABLE secondary_block_policy DROP COLUMN kill_switch_enabled",
+    "ALTER TABLE secondary_block_policy DROP COLUMN kill_switch_fail_closed",
+    "ALTER TABLE secondary_block_policy DROP COLUMN kill_switch_block_all",
+    "ALTER TABLE secondary_block_policy DROP COLUMN mode_a_coverage_strategy",
+    "ALTER TABLE secondary_block_policy DROP COLUMN block_ipv6_when_protected",
+    "CREATE TABLE behavior_mode_v80 (sid TEXT PRIMARY KEY, mode TEXT NOT NULL CHECK(mode IN ('prefer-primary', 'prefer-secondary-when-available')), updated_at INTEGER NOT NULL)",
+    "INSERT INTO behavior_mode_v80 (sid, mode, updated_at) SELECT sid, CASE mode WHEN 'strict-secondary-fail-closed' THEN 'prefer-secondary-when-available' ELSE mode END, updated_at FROM behavior_mode",
+    "DROP TABLE behavior_mode",
+    "ALTER TABLE behavior_mode_v80 RENAME TO behavior_mode",
+    "CREATE TABLE install_policy_v80 (id INTEGER PRIMARY KEY CHECK(id = 1), secondary_unset TEXT NOT NULL DEFAULT 'direct' CHECK(secondary_unset IN ('direct', 'block')), default_route_mode TEXT NOT NULL DEFAULT '' CHECK(default_route_mode IN ('', 'prefer-primary', 'prefer-secondary-when-available')), default_leak_protection TEXT NOT NULL DEFAULT 'off' CHECK(default_leak_protection IN ('off', 'sites', 'everything')), updated_at INTEGER NOT NULL)",
+    "INSERT INTO install_policy_v80 (id, secondary_unset, default_route_mode, default_leak_protection, updated_at) SELECT id, secondary_unset, CASE default_route_mode WHEN 'strict-secondary-fail-closed' THEN 'prefer-secondary-when-available' ELSE default_route_mode END, CASE default_route_mode WHEN 'strict-secondary-fail-closed' THEN 'everything' ELSE 'off' END, updated_at FROM install_policy",
+    "DROP TABLE install_policy",
+    "ALTER TABLE install_policy_v80 RENAME TO install_policy",
+];
+
+/// The automatic external-address check of the additional route becomes an
+/// opt-in. Every existing row starts off: the check sends a request through
+/// the tunnel, and nobody chose it.
+pub const STATE_DB_V81_DDL: &[&str] = &["ALTER TABLE secondary_block_policy ADD COLUMN external_address_auto_check INTEGER NOT NULL DEFAULT 0 CHECK(external_address_auto_check IN (0, 1))"];
+
+/// The gateways of another VPN each user let through leak protection, by
+/// address. Per user: one person's answer never opens a hole for another.
+pub const STATE_DB_V82_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS vpn_gateway_confirmations (sid TEXT NOT NULL, address TEXT NOT NULL, program TEXT NOT NULL DEFAULT '', confirmed_at INTEGER NOT NULL, PRIMARY KEY (sid, address))"];

@@ -521,13 +521,14 @@ impl AuditReader {
         // Hashed with the writer's own function, so "mine" cannot be spelled
         // as somebody else's.
         let mine = audience.principal().map(crate::audit::actor_id_hash);
+        let principal = audience.principal();
         let mut results = Vec::new();
         for path in self.list_files() {
             let events = parse_events_from_file(&path);
             for event in events {
                 let visible = match &mine {
                     None => true,
-                    Some(mine) => event_is_visible_to(&event, mine.as_deref()),
+                    Some(mine) => event_is_visible_to(&event, mine.as_deref(), principal),
                 };
                 if visible && filter.matches(&event) {
                     results.push(event);
@@ -648,16 +649,31 @@ impl AuditReader {
 ///
 /// What the SERVICE did on its own behalf, and events with no actor at all,
 /// are facts about the machine and visible to everyone. Everything else belongs
-/// to whoever performed it.
-fn event_is_visible_to(event: &AuditEvent, my_actor_hash: Option<&str>) -> bool {
+/// to whoever performed it. A service event that names one principal in its
+/// payload (`sid`) is about that principal, not the machine.
+fn event_is_visible_to(
+    event: &AuditEvent,
+    my_actor_hash: Option<&str>,
+    my_principal: Option<&str>,
+) -> bool {
     if event.actor_kind == crate::audit::ActorKind::Service.as_str() {
-        return true;
+        return match named_principal(event) {
+            Some(named) => my_principal == Some(named.as_str()),
+            None => true,
+        };
     }
     match (event.actor_id_hash.as_deref(), my_actor_hash) {
         (None, _) => true,
         (Some(theirs), Some(mine)) => theirs == mine,
         (Some(_), None) => false,
     }
+}
+
+/// The principal an event's payload names, if it names one.
+fn named_principal(event: &AuditEvent) -> Option<String> {
+    let payload = event.payload_summary_json.as_deref()?;
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    value.get("sid")?.as_str().map(str::to_owned)
 }
 
 fn list_audit_files(dir: &Path) -> Vec<PathBuf> {
@@ -926,6 +942,48 @@ mod tests {
             ids(&DiagnosticsAudience::Machine),
             ["mine", "theirs", "service"]
         );
+    }
+
+    /// What the service did about one user is that user's to read, not every
+    /// user's; a service event naming nobody stays machine-level.
+    #[test]
+    fn a_service_event_naming_a_principal_is_visible_to_that_principal_only() {
+        let dir = tempfile::tempdir().expect("temp");
+        let writer = AuditWriter::open(AuditWriterConfig::new(dir.path()));
+        for (id, payload) in [
+            ("about-mine", Some(r#"{"sid":"S-1-5-21-mine"}"#)),
+            ("about-theirs", Some(r#"{"sid":"S-1-5-21-theirs"}"#)),
+            ("machine", None),
+        ] {
+            writer
+                .append(AuditEventInput {
+                    event_id: id.into(),
+                    kind: AuditEventKind::RevisionActivated,
+                    created_at: 1_745_000_000_000,
+                    actor_kind: ActorKind::Service,
+                    actor_id_hash: None,
+                    revision_id: None,
+                    risk_level: None,
+                    result: AuditEventResult::Success,
+                    reason_code: reason::review::APPROVED,
+                    payload_summary_json: payload.map(str::to_owned),
+                })
+                .expect("append");
+        }
+        drop(writer);
+        let reader = AuditReader::new(dir.path());
+        let ids = |audience: &DiagnosticsAudience| -> Vec<String> {
+            reader
+                .scan(&AuditQueryFilter::new(), audience)
+                .into_iter()
+                .map(|e| e.event_id)
+                .collect()
+        };
+        assert_eq!(
+            ids(&DiagnosticsAudience::Principal("S-1-5-21-mine".into())),
+            ["about-mine", "machine"]
+        );
+        assert_eq!(ids(&DiagnosticsAudience::Machine).len(), 3);
     }
 
     /// A chain scoped to one principal cannot be verified, so only the

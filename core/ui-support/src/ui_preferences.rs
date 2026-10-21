@@ -32,7 +32,7 @@ static SAVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// [`UiPreferences::forward_compat`] and written back, and starting an older
 /// build once does not erase it. In an older file it is the residue of a
 /// removed key and is dropped.
-pub const CURRENT_UI_PREFS_SCHEMA_VERSION: u32 = 12;
+pub const CURRENT_UI_PREFS_SCHEMA_VERSION: u32 = 13;
 
 /// Ceiling for the free-form string fields that GROW on their own: the
 /// acknowledgement signatures (a `|`-join of every unenforced app / kept
@@ -251,9 +251,9 @@ pub struct UiPreferences {
     /// auto-heal silently; `false` = show the manual re-confirm banner.
     /// Device-local UI preference.
     pub auto_confirm_adapter_id_change: bool,
-    /// Show the "leak protection is blocking unknown traffic (secondary
-    /// adapter unavailable)" banner while the service
-    /// reports an armed fail-closed block-all. `true` (default) = warn;
+    /// Show the "leak protection is holding all traffic (additional
+    /// connection unavailable)" banner while the service reports that
+    /// everything is blocked. `true` (default) = warn;
     /// `false` = stay silent — deliberately running the service at OS start
     /// with the VPN down is a legitimate setup and must not nag. Pure
     /// device-local display preference (the posture itself is service-owned).
@@ -359,33 +359,14 @@ pub struct UiPreferences {
     /// Mirror of the per-SID service toggle `route_shared_ip_policy`, one of
     /// [`SHARED_IP_POLICIES`]. See the block comment above.
     pub route_shared_ip_policy: String,
-    /// Mirror of the per-SID service toggle `route_kill_switch_block_all`.
-    /// Default `false`. See the block comment above for the seed-on-default
-    /// semantics.
-    pub route_kill_switch_block_all: bool,
-    /// Mirror of the per-SID service toggle `route_kill_switch_fail_closed`
-    /// (leak-protection posture). Default `true` (fail-closed). See the block
-    /// comment above for the seed-on-default semantics.
-    pub route_kill_switch_fail_closed: bool,
     /// Mirror of the per-SID service toggle `route_kill_switch_protocols`
-    /// (IP-protocol bitmask the emergency block cuts), valid per
+    /// (IP-protocol bitmask leak protection cuts), valid per
     /// [`nrr_shared::ipc_payloads::is_valid_kill_switch_protocols`]. Default all.
     pub route_kill_switch_protocols: u32,
-    /// Mirror of the per-SID MASTER toggle `route_kill_switch_enabled`.
-    /// `false` (default) = kill-switch OFF, so NO fail-closed blocking
-    /// happens at all (full opt-in; any leak is then the user's explicit
-    /// choice). The other kill-switch mirrors above are only meaningful when
-    /// this is `true`.
-    pub route_kill_switch_enabled: bool,
     /// Mirror of the per-SID `route_allow_dns_over_primary` toggle (keep DNS
-    /// resolving over the primary link while the kill-switch block-all is
-    /// engaged). Default `true` — DNS-cut block-all is a total blackout;
-    /// strict users opt out.
+    /// resolving over the primary link while leak protection blocks everything).
+    /// Default `true`: with DNS cut as well, the outage is a total blackout.
     pub route_allow_dns_over_primary: bool,
-    /// Mirror of the per-SID Mode-A coverage strategy (slug: `"per-ip"` |
-    /// `"fail-closed-unknown"` (default) | `"zone-widening"`). See the block
-    /// comment above for the seed-on-default semantics.
-    pub route_mode_a_coverage_strategy: String,
     /// Mirror of the per-SID `resolve_hosts_bypass` posture (resolve rule
     /// hosts bypassing the OS hosts/adblock file). Default `true`.
     pub route_resolve_hosts_bypass: bool,

@@ -19,8 +19,8 @@
 //! The trustee is `INTERACTIVE`, not the console user's own SID: a per-SID
 //! grant only ever accumulates — nothing removes it as users come and go — so
 //! every account that has ever sat at the console would keep the right
-//! permanently. The grant still resolves the console user via WTS
-//! ([`console_session_user_sid`]) to retire any such legacy ACE — the
+//! permanently. The grant still resolves every signed-in user via WTS
+//! ([`session_user_sids`]) to retire any such legacy ACE — the
 //! LocalSystem-only `WTSQueryUserToken` path is unusable here because these
 //! verbs run elevated-as-admin, not as SYSTEM, and the session's logged-on
 //! user is also the right principal under over-the-shoulder elevation (the
@@ -46,8 +46,9 @@ use windows::Win32::Security::{
     SID_NAME_USE, WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::System::RemoteDesktop::{
-    WTSDomainName, WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW,
-    WTSUserName, WTS_INFO_CLASS,
+    WTSDomainName, WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+    WTSQuerySessionInformationW, WTSUserName, WTS_CURRENT_SERVER_HANDLE, WTS_INFO_CLASS,
+    WTS_SESSION_INFOW,
 };
 use windows::Win32::System::Services::{
     ChangeServiceConfigW, CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceConfigW,
@@ -294,6 +295,56 @@ fn console_session_user_sid() -> Result<Vec<u8>, StartModeError> {
     lookup_account_sid(&account)
 }
 
+/// Binary SIDs of every user with a session on this machine (console, remote,
+/// disconnected), the console user included. A per-user grant left by an older
+/// install can belong to any of them.
+fn session_user_sids() -> Vec<Vec<u8>> {
+    let mut users: Vec<Vec<u8>> = console_session_user_sid().ok().into_iter().collect();
+    let mut info: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    // SAFETY: both out-params are valid; on success `info` points at `count`
+    // entries allocated by WTS, released below with WTSFreeMemory.
+    if unsafe { WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut info, &mut count) }
+        .is_err()
+        || info.is_null()
+    {
+        return users;
+    }
+    // SAFETY: WTS returned `count` contiguous entries at `info`, alive until freed.
+    let ids: Vec<u32> = unsafe { std::slice::from_raw_parts(info, count as usize) }
+        .iter()
+        .map(|e| e.SessionId)
+        .collect();
+    // SAFETY: `info` came from WTSEnumerateSessionsW and is freed exactly once.
+    unsafe { WTSFreeMemory(info.cast()) };
+    for id in ids {
+        let Some(user) = wts_query_session_string(id, WTSUserName) else {
+            continue;
+        };
+        let domain = wts_query_session_string(id, WTSDomainName).unwrap_or_default();
+        if let Ok(sid) = lookup_account_sid(&account_name(&domain, &user)) {
+            push_unique(&mut users, sid);
+        }
+    }
+    users
+}
+
+/// `DOMAIN\User`, or the bare user name when the session reports no domain.
+fn account_name(domain: &str, user: &str) -> String {
+    if domain.is_empty() {
+        user.to_string()
+    } else {
+        format!("{domain}\\{user}")
+    }
+}
+
+/// One entry per account: the console user is also listed by its own session.
+fn push_unique(users: &mut Vec<Vec<u8>>, sid: Vec<u8>) {
+    if !users.contains(&sid) {
+        users.push(sid);
+    }
+}
+
 /// `LookupAccountNameW` two-call wrapper returning the binary SID for
 /// `account` ("DOMAIN\\User" or "User").
 fn lookup_account_sid(account: &str) -> Result<Vec<u8>, StartModeError> {
@@ -357,8 +408,8 @@ pub fn grant_service_access() -> Result<(), StartModeError> {
     // carries a per-user ACE granting the same right. `REVOKE_ACCESS` drops
     // EVERY entry for that trustee, which is the point — the personal grant is
     // exactly what the well-known group replaces.
-    let legacy_sid = console_session_user_sid().ok();
-    write_service_aces(&sid, &status_sid, legacy_sid.as_ref())
+    let legacy_sids = session_user_sids();
+    write_service_aces(&sid, &status_sid, &legacy_sids)
 }
 
 /// A DACL from `SetEntriesInAclW`, freed on every exit path.
@@ -374,16 +425,16 @@ impl Drop for DaclGuard {
 }
 
 /// `old_dacl` plus `SERVICE_START` and the default rights for `sid`, plus
-/// `SERVICE_QUERY_STATUS` for `status_sid`, minus every entry for `legacy_sid`.
+/// `SERVICE_QUERY_STATUS` for `status_sid`, minus every entry for each of `legacy_sids`.
 /// Pure over its inputs so the merge is testable against a synthetic DACL
 /// without touching the SCM.
 fn merge_service_aces(
     old_dacl: Option<*const ACL>,
     sid: &[u8],
     status_sid: &[u8],
-    legacy_sid: Option<&Vec<u8>>,
+    legacy_sids: &[Vec<u8>],
 ) -> Result<DaclGuard, StartModeError> {
-    // `sid` / `legacy_sid` outlive this function, so the raw pointers stashed
+    // `sid` / `legacy_sids` outlive this function, so the raw pointers stashed
     // in `Trustee.ptstrName` stay valid through the `SetEntriesInAclW` call.
     let mut entries = vec![EXPLICIT_ACCESS_W {
         grfAccessPermissions: SERVICE_START_RIGHT | INTERACTIVE_DEFAULT_RIGHTS,
@@ -416,7 +467,7 @@ fn merge_service_aces(
             ptstrName: PWSTR(status_sid.as_ptr() as *mut u16),
         },
     });
-    if let Some(legacy) = legacy_sid {
+    for legacy in legacy_sids {
         entries.push(EXPLICIT_ACCESS_W {
             grfAccessPermissions: SERVICE_START_RIGHT,
             grfAccessMode: REVOKE_ACCESS,
@@ -426,7 +477,7 @@ fn merge_service_aces(
                 MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
                 TrusteeForm: TRUSTEE_IS_SID,
                 TrusteeType: TRUSTEE_IS_USER,
-                // SAFETY contract: as above; `legacy_sid` outlives the call.
+                // SAFETY contract: as above; `legacy_sids` outlive the call.
                 ptstrName: PWSTR(legacy.as_ptr() as *mut u16),
             },
         });
@@ -447,13 +498,13 @@ fn merge_service_aces(
 
 /// Read the service DACL, add the `SERVICE_START` ACE for `sid` and the
 /// `SERVICE_QUERY_STATUS` ACE for `status_sid`, revoke every entry for
-/// `legacy_sid` if one was resolved, and write it back. All buffers
+/// each of `legacy_sids`, and write it back. All buffers
 /// are held in scope until `SetServiceObjectSecurity` returns, because the old
 /// DACL, the SIDs, and the new DACL are referenced by pointer along the way.
 fn write_service_aces(
     sid: &[u8],
     status_sid: &[u8],
-    legacy_sid: Option<&Vec<u8>>,
+    legacy_sids: &[Vec<u8>],
 ) -> Result<(), StartModeError> {
     let (_scm, svc) = open_service(READ_CONTROL | WRITE_DAC)?;
 
@@ -509,7 +560,7 @@ fn write_service_aces(
         Some(old_dacl as *const ACL)
     };
     // `old_dacl` points into `sd_buf`, which lives to the end of this function.
-    let new_dacl_guard = merge_service_aces(old_dacl_opt, sid, status_sid, legacy_sid)?;
+    let new_dacl_guard = merge_service_aces(old_dacl_opt, sid, status_sid, legacy_sids)?;
     let new_dacl = new_dacl_guard.0;
 
     // ── 4. Build a fresh absolute SD carrying just the new DACL, write it. ──
@@ -531,6 +582,20 @@ fn write_service_aces(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_account_is_domain_qualified_only_when_it_has_a_domain() {
+        assert_eq!(account_name("CORP", "alice"), "CORP\\alice");
+        assert_eq!(account_name("", "alice"), "alice");
+    }
+
+    #[test]
+    fn the_same_account_listed_twice_is_kept_once() {
+        let mut users = vec![vec![1, 2, 3]];
+        push_unique(&mut users, vec![1, 2, 3]);
+        push_unique(&mut users, vec![4, 5]);
+        assert_eq!(users, vec![vec![1, 2, 3], vec![4, 5]]);
+    }
     use windows::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW,
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -603,7 +668,7 @@ mod tests {
     fn the_grant_keeps_interactive_readable_and_adds_start() {
         let sid = interactive_group_sid().expect("interactive sid");
         let (_sd, old) = dacl_of(SCM_DEFAULT);
-        let merged = merge_service_aces(Some(old), &sid, &au(), None).expect("merge");
+        let merged = merge_service_aces(Some(old), &sid, &au(), &[]).expect("merge");
         let text = sddl_of(merged.0);
         // LC (query status) is what the GUI's badge needs; RP is SERVICE_START.
         assert!(text.contains("CCLCSWRPLOCRRC;;;IU)"), "{text}");
@@ -617,7 +682,7 @@ mod tests {
     fn re_running_the_grant_repairs_a_dacl_cut_down_to_start_only() {
         let sid = interactive_group_sid().expect("interactive sid");
         let (_sd, old) = dacl_of("D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;RP;;;IU)");
-        let merged = merge_service_aces(Some(old), &sid, &au(), None).expect("merge");
+        let merged = merge_service_aces(Some(old), &sid, &au(), &[]).expect("merge");
         let text = sddl_of(merged.0);
         assert!(text.contains("CCLCSWRPLOCRRC;;;IU)"), "{text}");
         assert_eq!(text.matches(";;;IU)").count(), 1, "{text}");
@@ -627,7 +692,7 @@ mod tests {
     fn authenticated_users_get_query_status_and_nothing_more() {
         let sid = interactive_group_sid().expect("interactive sid");
         let (_sd, old) = dacl_of(SCM_DEFAULT);
-        let merged = merge_service_aces(Some(old), &sid, &au(), None).expect("merge");
+        let merged = merge_service_aces(Some(old), &sid, &au(), &[]).expect("merge");
         let text = sddl_of(merged.0);
         assert!(text.contains("(A;;LC;;;AU)"), "{text}");
         assert_eq!(text.matches(";;;AU)").count(), 1, "{text}");
@@ -637,7 +702,7 @@ mod tests {
     fn an_administrators_existing_grant_to_authenticated_users_is_kept() {
         let sid = interactive_group_sid().expect("interactive sid");
         let (_sd, old) = dacl_of(&format!("{SCM_DEFAULT}(A;;RC;;;AU)"));
-        let merged = merge_service_aces(Some(old), &sid, &au(), None).expect("merge");
+        let merged = merge_service_aces(Some(old), &sid, &au(), &[]).expect("merge");
         let text = sddl_of(merged.0);
         assert!(text.contains("(A;;LCRC;;;AU)"), "{text}");
         assert_eq!(text.matches(";;;AU)").count(), 1, "{text}");

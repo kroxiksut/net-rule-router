@@ -263,9 +263,8 @@ fn event_bus_publish_subscribe_advance_round_trip() {
     let id1 = bus.publish(StatusUpdateEvent::AdaptersChanged {
         data_source: "wmi".to_string(),
     });
-    let id2 = bus.publish(StatusUpdateEvent::HealthChanged {
-        service_state: "running".to_string(),
-        worst_severity: "ok".to_string(),
+    let id2 = bus.publish(StatusUpdateEvent::AdaptersChanged {
+        data_source: "test".into(),
     });
     let id3 = bus.publish(StatusUpdateEvent::SecurityAlertsChanged);
 

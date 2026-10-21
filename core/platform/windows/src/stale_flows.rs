@@ -28,8 +28,8 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use windows::Win32::NetworkManagement::IpHelper::{
-    SetTcpEntry, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_LH,
-    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB,
+    SetTcpEntry, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_LH, MIB_TCPROW_OWNER_PID,
+    MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB,
 };
 
 use nrr_platform_api::fake_ip::stale_flows::{
@@ -69,18 +69,8 @@ pub fn established_connections_by_process(cap: usize) -> Vec<(String, usize)> {
         return Vec::new();
     };
     let mut by_pid: HashMap<u32, usize> = HashMap::new();
-    // SAFETY: `read_tcp_owner_pid_table` fills the buffer with a valid
-    // `MIB_TCPTABLE_OWNER_PID`; its `dwNumEntries` header is followed by that
-    // many contiguous rows, and only those rows are read.
-    unsafe {
-        let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
-        let count = (*table).dwNumEntries as usize;
-        let rows = std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>();
-        for i in 0..count {
-            let row = &*rows.add(i);
-            if row.dwState != MIB_TCP_STATE_ESTAB.0 as u32 {
-                continue;
-            }
+    for row in crate::flow_owner::tcp_rows(&buffer) {
+        if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32 {
             *by_pid.entry(row.dwOwningPid).or_insert(0) += 1;
         }
     }
@@ -104,23 +94,13 @@ impl StaleFlowReset for WindowsStaleFlowReset {
             return StaleFlowSweep::default();
         };
         let mut sweep = StaleFlowSweep::default();
-        // SAFETY: `read_tcp_owner_pid_table` fills the buffer with a valid
-        // `MIB_TCPTABLE_OWNER_PID`; its `dwNumEntries` header is followed by
-        // that many contiguous `MIB_TCPROW_OWNER_PID` rows. We only read
-        // within those rows.
-        unsafe {
-            let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
-            let count = (*table).dwNumEntries as usize;
-            let rows = std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>();
-            for i in 0..count {
-                let row = &*rows.add(i);
-                if !row_is_established_in_range(row, base, prefix_len) {
-                    continue;
-                }
-                sweep.found += 1;
-                if delete_tcb(&delete_tcb_entry(row)) {
-                    sweep.torn_down += 1;
-                }
+        for row in crate::flow_owner::tcp_rows(&buffer) {
+            if !row_is_established_in_range(row, base, prefix_len) {
+                continue;
+            }
+            sweep.found += 1;
+            if delete_tcb(&delete_tcb_entry(row)) {
+                sweep.torn_down += 1;
             }
         }
         sweep
@@ -140,51 +120,33 @@ impl StaleFlowReset for WindowsStaleFlowReset {
         // for the v6 table.
         if any_v4 {
             if let Some(buffer) = read_tcp_owner_pid_table() {
-                // SAFETY: same invariant as `reset_flows_to` above — the buffer
-                // holds a valid `MIB_TCPTABLE_OWNER_PID` and we read only its
-                // declared rows.
-                unsafe {
-                    let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
-                    let count = (*table).dwNumEntries as usize;
-                    let rows = std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>();
-                    for i in 0..count {
-                        let row = &*rows.add(i);
-                        if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32
-                            && wanted
-                                .matches(IpAddr::V4(Ipv4Addr::from(u32::from_be(row.dwRemoteAddr))))
-                        {
-                            let (local, remote) = row_endpoints(row);
-                            matched.push((
-                                SocketAddr::V4(local),
-                                SocketAddr::V4(remote),
-                                row.dwOwningPid,
-                            ));
-                        }
+                for row in crate::flow_owner::tcp_rows(&buffer) {
+                    if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32
+                        && wanted
+                            .matches(IpAddr::V4(Ipv4Addr::from(u32::from_be(row.dwRemoteAddr))))
+                    {
+                        let (local, remote) = row_endpoints(row);
+                        matched.push((
+                            SocketAddr::V4(local),
+                            SocketAddr::V4(remote),
+                            row.dwOwningPid,
+                        ));
                     }
                 }
             }
         }
         if any_v6 {
             if let Some(buffer) = read_tcp6_owner_pid_table() {
-                // SAFETY: `read_tcp6_owner_pid_table` fills the buffer with a
-                // valid `MIB_TCP6TABLE_OWNER_PID`; its `dwNumEntries` header is
-                // followed by that many contiguous rows, and only those are read.
-                unsafe {
-                    let table = buffer.as_ptr().cast::<MIB_TCP6TABLE_OWNER_PID>();
-                    let count = (*table).dwNumEntries as usize;
-                    let rows = std::ptr::addr_of!((*table).table).cast::<MIB_TCP6ROW_OWNER_PID>();
-                    for i in 0..count {
-                        let row = &*rows.add(i);
-                        if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32
-                            && wanted.matches(IpAddr::V6(Ipv6Addr::from(row.ucRemoteAddr)))
-                        {
-                            let (local, remote) = row6_endpoints(row);
-                            matched.push((
-                                SocketAddr::V6(local),
-                                SocketAddr::V6(remote),
-                                row.dwOwningPid,
-                            ));
-                        }
+                for row in crate::flow_owner::tcp6_rows(&buffer) {
+                    if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32
+                        && wanted.matches(IpAddr::V6(Ipv6Addr::from(row.ucRemoteAddr)))
+                    {
+                        let (local, remote) = row6_endpoints(row);
+                        matched.push((
+                            SocketAddr::V6(local),
+                            SocketAddr::V6(remote),
+                            row.dwOwningPid,
+                        ));
                     }
                 }
             }

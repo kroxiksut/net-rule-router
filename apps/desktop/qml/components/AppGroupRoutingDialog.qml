@@ -263,9 +263,10 @@ Window {
                     wrapMode: Text.WordWrap
                     color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
                     text: root.tr("app-groups.kernel-nat-note",
-                        "Traffic of WSL, Hyper-V, Docker, libvirt and virtual machines on a bridge is handled by the kernel and "
-                        + "does not belong to any process, so it cannot be assigned a "
-                        + "route — it always uses the main route.")
+                        "Traffic of WSL, Hyper-V, Docker, libvirt and other virtual machines does not belong to any "
+                        + "program on this computer, so it cannot be given a route of its own. When it goes out "
+                        + "through this computer, it follows the routes your rules set, as this computer's own "
+                        + "traffic does.")
                 }
             }
 

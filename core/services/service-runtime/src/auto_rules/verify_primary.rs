@@ -7,8 +7,10 @@
 //! Lazy by design. A destination is checked only after the user's own DNS asked
 //! for it (a name rule) or a program connected to it (an address rule); probing
 //! every `?` value at import would leave a trail of attempts to blocked sites
-//! the user never opened. The check rides the auto-rules tick, one destination
-//! and at most two probes per tick, never the data path.
+//! the user never opened. The tick only hands one destination per principal to
+//! a worker thread; the probes (at most two) run there and a later tick applies
+//! the outcome. Never the data path, and never waiting on a dead link inside
+//! the tick that serves everybody.
 //!
 //! "Does not reach" for a name needs the TLS probe ([`PathProbe::probe_tls`]):
 //! filtering by name lets TCP through. For an address the TCP connect is the
@@ -79,6 +81,157 @@ struct Candidate {
     port: Option<u16>,
 }
 
+/// One destination's check, handed to the worker: everything it needs, none
+/// of the engine's state.
+pub(super) struct VerifyCheck {
+    sid: String,
+    host: String,
+    key: VerifyKey,
+    target: Ipv4Addr,
+    port: Option<u16>,
+    written_source: Ipv4Addr,
+    other_source: Ipv4Addr,
+    /// Misses already on the written link: the control probe runs only when
+    /// this one makes the second.
+    misses_before: u8,
+    probe: Arc<dyn PathProbe>,
+}
+
+/// What a check found, applied to the principal's state by a later step.
+pub(super) struct VerifyOutcome {
+    sid: String,
+    host: String,
+    key: VerifyKey,
+    written_source: Ipv4Addr,
+    verdict: PathVerdict,
+    /// The other link's answer; `Some` only after a silent written link that
+    /// made the second miss.
+    control: Option<PathVerdict>,
+}
+
+impl VerifyCheck {
+    fn probe_over(&self, source: Ipv4Addr) -> PathVerdict {
+        match self.port {
+            None => self
+                .probe
+                .probe_tls(self.target, &self.host, Some(source), PROBE_TIMEOUT),
+            Some(port) => {
+                let port = if port == 0 { FALLBACK_PORT } else { port };
+                self.probe
+                    .probe(self.target, port, Some(source), PROBE_TIMEOUT)
+            }
+        }
+    }
+
+    fn outcome(&self, verdict: PathVerdict, control: Option<PathVerdict>) -> VerifyOutcome {
+        VerifyOutcome {
+            sid: self.sid.clone(),
+            host: self.host.clone(),
+            key: self.key.clone(),
+            written_source: self.written_source,
+            verdict,
+            control,
+        }
+    }
+
+    fn run(&self) -> VerifyOutcome {
+        let verdict = self.probe_over(self.written_source);
+        // At most one line per check, and only while a `?` destination waits:
+        // the only trace of why a rule did or did not move.
+        tracing::info!(
+            target: "nrr::auto-rules",
+            sid = %self.sid,
+            host = %self.host,
+            route = self.key.written.slug(),
+            verdict = ?verdict,
+            "? rule destination checked over the route it is written for",
+        );
+        let control = (verdict == PathVerdict::Silent
+            && self.misses_before.saturating_add(1) >= WRITTEN_LINK_MISSES)
+            .then(|| self.probe_over(self.other_source));
+        self.outcome(verdict, control)
+    }
+}
+
+/// Checks queued behind the running one. A principal has at most one in
+/// flight, so this only fills when many wait at once.
+const CHECK_QUEUE: usize = 16;
+/// Finished checks kept for principals whose next step never comes.
+const MAX_FINISHED: usize = 64;
+
+/// Runs `?` checks off the auto-rules tick: a probe waits seconds on a dead
+/// link, and the tick serves every principal.
+#[derive(Default)]
+pub(super) struct VerifyRunner {
+    inline: std::sync::atomic::AtomicBool,
+    worker: OnceLock<Option<std::sync::mpsc::SyncSender<VerifyCheck>>>,
+    finished: Arc<Mutex<Vec<VerifyOutcome>>>,
+}
+
+impl VerifyRunner {
+    /// Run checks on the calling thread, so a test sees the outcome at once.
+    #[cfg(test)]
+    pub(super) fn run_inline(&self) {
+        self.inline.store(true, Ordering::Relaxed);
+    }
+
+    /// `false` when the check could not be queued.
+    fn submit(&self, check: VerifyCheck) -> bool {
+        if self.inline.load(Ordering::Relaxed) {
+            push_finished(&self.finished, check.run());
+            return true;
+        }
+        let queue = self.worker.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<VerifyCheck>(CHECK_QUEUE);
+            let finished = Arc::clone(&self.finished);
+            std::thread::Builder::new()
+                .name("nrr-verify-check".to_owned())
+                .spawn(move || {
+                    for check in rx {
+                        // A panicking probe must not leave its principal
+                        // waiting for an answer forever.
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check.run()))
+                                .unwrap_or_else(|_| {
+                                    check.outcome(PathVerdict::Indeterminate, None)
+                                });
+                        push_finished(&finished, outcome);
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        });
+        queue.as_ref().is_some_and(|tx| tx.try_send(check).is_ok())
+    }
+
+    fn take_finished(&self, sid: &str) -> Vec<VerifyOutcome> {
+        let mut finished = self.finished.lock().unwrap_or_else(|p| p.into_inner());
+        if finished.is_empty() {
+            return Vec::new();
+        }
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *finished)
+            .into_iter()
+            .partition(|o| o.sid == sid);
+        *finished = rest;
+        mine
+    }
+
+    fn forget(&self, sid: &str) {
+        self.finished
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|o| o.sid != sid);
+    }
+}
+
+fn push_finished(finished: &Mutex<Vec<VerifyOutcome>>, outcome: VerifyOutcome) {
+    let mut finished = finished.lock().unwrap_or_else(|p| p.into_inner());
+    if finished.len() >= MAX_FINISHED {
+        finished.remove(0);
+    }
+    finished.push(outcome);
+}
+
 /// "Does not open where it is written, opens on the other link".
 struct Verdict {
     host: String,
@@ -93,6 +246,8 @@ struct Verdict {
 pub(super) struct VerifyState {
     /// The enabled `?` rules as stored.
     rules: Vec<VerifyKey>,
+    /// Enabled ordinary name rules of both sets: a narrower one owns its host.
+    ordinary: Vec<CanonicalAddressMatch>,
     /// The address rules among `rules`, by address: what a connection is
     /// looked up in.
     ips: HashMap<Ipv4Addr, VerifyKey>,
@@ -111,6 +266,8 @@ pub(super) struct VerifyState {
     /// Recent queries the `?` rules as last read did not cover, oldest first.
     recent: VecDeque<(String, Vec<Ipv4Addr>)>,
     verdicts: HashMap<VerifyKey, Verdict>,
+    /// The destination whose check is running off the tick.
+    probing: Option<String>,
 }
 
 impl VerifyState {
@@ -119,12 +276,9 @@ impl VerifyState {
         self.rules_read_at.is_some() && self.rules.is_empty()
     }
 
-    /// The `?` rule that decides `host`: the narrowest one covering it.
+    /// The `?` rule that decides `host`.
     fn rule_for_host(&self, host: &str) -> Option<&VerifyKey> {
-        self.rules
-            .iter()
-            .filter(|r| covers(&r.address, host, self.subdomains))
-            .max_by_key(|r| specificity(&r.address))
+        decider(&self.rules, &self.ordinary, host, self.subdomains)
     }
 
     /// `host`'s check settled nothing at `now`: it waits before the next.
@@ -147,23 +301,39 @@ impl VerifyState {
     }
 }
 
-fn covers(rule: &CanonicalAddressMatch, host: &str, subdomains: bool) -> bool {
+/// How closely `rule` names `host`, as enforcement ranks it: an exact name over
+/// any suffix, a longer suffix over a shorter one. `None`: it does not cover it.
+fn rank(rule: &CanonicalAddressMatch, host: &str, subdomains: bool) -> Option<(u8, usize)> {
     match rule {
-        CanonicalAddressMatch::ExactFqdn(d) => {
-            d == host || (subdomains && match_suffix_domain(host, d))
+        CanonicalAddressMatch::ExactFqdn(d) if d == host => Some((2, d.len())),
+        CanonicalAddressMatch::ExactFqdn(d) if subdomains && match_suffix_domain(host, d) => {
+            Some((1, d.len()))
         }
-        CanonicalAddressMatch::SuffixDomain(d) => match_suffix_domain(host, d),
-        _ => false,
+        CanonicalAddressMatch::SuffixDomain(d) if match_suffix_domain(host, d) => {
+            Some((1, d.len()))
+        }
+        _ => None,
     }
 }
 
-/// The narrower rule wins, as in enforcement: an exact value over any suffix,
-/// a longer suffix over a shorter one.
-fn specificity(rule: &CanonicalAddressMatch) -> (u8, usize) {
-    match rule {
-        CanonicalAddressMatch::SuffixDomain(d) => (0, d.len()),
-        _ => (1, 0),
-    }
+/// The `?` rule whose route `host` takes: the narrowest `?` rule covering it,
+/// unless an ordinary rule is narrower still. Probing a host over a link its
+/// own rule does not assign would pin the wider rule's verdict on it.
+fn decider<'a>(
+    rules: &'a [VerifyKey],
+    ordinary: &[CanonicalAddressMatch],
+    host: &str,
+    subdomains: bool,
+) -> Option<&'a VerifyKey> {
+    let (key, best) = rules
+        .iter()
+        .filter_map(|r| Some((r, rank(&r.address, host, subdomains)?)))
+        .max_by_key(|&(_, rank)| rank)?;
+    let owned_elsewhere = ordinary
+        .iter()
+        .filter_map(|a| rank(a, host, subdomains))
+        .any(|r| r > best);
+    (!owned_elsewhere).then_some(key)
 }
 
 fn other_route(role: RouteRole) -> RouteRole {
@@ -300,12 +470,18 @@ impl AutoRulesEngine {
         let Some(wiring) = self.verify_wiring.get() else {
             return;
         };
+        self.settle_verify_checks(sid, now);
         self.reread_verify_rules(sid, wiring);
         {
             let mut states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = states.get_mut(sid) else {
                 return;
             };
+            // One check per principal at a time; its outcome is applied by a
+            // later step.
+            if state.probing.is_some() {
+                return;
+            }
             let waits = &state.inconclusive;
             let verdicts = &state.verdicts;
             state.pending.retain(|h, c| {
@@ -333,7 +509,7 @@ impl AutoRulesEngine {
             RouteRole::Primary => main,
             RouteRole::Secondary => additional,
         };
-        let next = {
+        let job = {
             let mut states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = states.get_mut(sid) else {
                 return;
@@ -349,44 +525,71 @@ impl AutoRulesEngine {
                         .get(h)
                         .is_none_or(|(from, _)| *from != link(c.key.written))
             });
-            state
-                .pending
-                .iter()
-                .next()
-                .map(|(h, c)| (h.clone(), c.clone()))
+            let Some((host, candidate)) = state.pending.iter().next() else {
+                return;
+            };
+            let Some(&target) = candidate.addresses.first() else {
+                return;
+            };
+            // The link the rule is written for, never the other set's rule of
+            // the same number: a tunnel host must not send its name over the
+            // primary.
+            let written = candidate.key.written;
+            let job = VerifyCheck {
+                sid: sid.to_owned(),
+                host: host.clone(),
+                key: candidate.key.clone(),
+                target,
+                port: candidate.port,
+                written_source: link(written),
+                other_source: link(other_route(written)),
+                misses_before: state.misses.get(host).copied().unwrap_or(0),
+                probe: Arc::clone(&wiring.probe),
+            };
+            state.probing = Some(job.host.clone());
+            job
         };
-        let Some((host, candidate)) = next else {
-            return;
-        };
-        // The link the rule is written for, never the other set's rule of the
-        // same number: a tunnel host must not send its name over the primary.
-        let written = candidate.key.written;
-        let Some(&target) = candidate.addresses.first() else {
-            return;
-        };
-        let check = |source: Ipv4Addr| match candidate.port {
-            None => wiring
-                .probe
-                .probe_tls(target, &host, Some(source), PROBE_TIMEOUT),
-            Some(port) => {
-                let port = if port == 0 { FALLBACK_PORT } else { port };
-                wiring
-                    .probe
-                    .probe(target, port, Some(source), PROBE_TIMEOUT)
+        if !self.verify_runner.submit(job) {
+            // Queue full or no worker: the destination stays pending for a
+            // later step.
+            let mut states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(state) = states.get_mut(sid) {
+                state.probing = None;
             }
-        };
+            return;
+        }
+        // An inline runner (tests) has the outcome ready already.
+        self.settle_verify_checks(sid, now);
+    }
 
-        let verdict = check(link(written));
-        // At most one line per tick, and only while a `?` destination waits:
-        // the only trace of why a rule did or did not move.
-        tracing::info!(
-            target: "nrr::auto-rules",
-            sid = %sid,
-            host = %host,
-            route = written.slug(),
-            verdict = ?verdict,
-            "? rule destination checked over the route it is written for",
-        );
+    /// Apply the checks that finished for `sid` since the last step.
+    fn settle_verify_checks(&self, sid: &str, now: SystemTime) {
+        for outcome in self.verify_runner.take_finished(sid) {
+            self.apply_check_outcome(outcome, now);
+        }
+    }
+
+    fn apply_check_outcome(&self, outcome: VerifyOutcome, now: SystemTime) {
+        let VerifyOutcome {
+            sid,
+            host,
+            key,
+            written_source,
+            verdict,
+            control,
+        } = outcome;
+        let sid = sid.as_str();
+        {
+            let mut states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(state) = states.get_mut(sid) else {
+                return;
+            };
+            // A principal reset while the check ran: its answer is stale.
+            if state.probing.as_deref() != Some(host.as_str()) {
+                return;
+            }
+            state.probing = None;
+        }
         match verdict {
             PathVerdict::Answered => {
                 let mut states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
@@ -394,7 +597,7 @@ impl AutoRulesEngine {
                     state.pending.remove(&host);
                     state.misses.remove(&host);
                     state.inconclusive.remove(&host);
-                    state.reached.insert(host, (link(written), Instant::now()));
+                    state.reached.insert(host, (written_source, Instant::now()));
                 }
             }
             PathVerdict::Indeterminate => {
@@ -406,24 +609,22 @@ impl AutoRulesEngine {
                 }
             }
             PathVerdict::Silent => {
-                let misses = {
+                {
                     let mut states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
                     let Some(state) = states.get_mut(sid) else {
                         return;
                     };
                     let m = state.misses.entry(host.clone()).or_insert(0);
                     *m = m.saturating_add(1);
-                    *m
-                };
+                }
                 // The second miss comes a tick later: one lost attempt is not
                 // a verdict.
-                if misses < WRITTEN_LINK_MISSES {
+                let Some(control) = control else {
                     return;
-                }
-                let control = check(link(other_route(written)));
+                };
                 let proven = control == PathVerdict::Answered;
                 if proven {
-                    self.reach_verdict(sid, &host, &candidate.key, now);
+                    self.reach_verdict(sid, &host, &key, now);
                 } else {
                     tracing::info!(
                         target: "nrr::auto-rules",
@@ -505,6 +706,20 @@ impl AutoRulesEngine {
             if let Some(hook) = self.verify_wiring.get().and_then(|w| w.reapply.as_ref()) {
                 hook(sid);
             }
+        }
+    }
+
+    /// A full reset of `sid`: no `?` rule, check or verdict is remembered.
+    pub(super) fn forget_verify_state(&self, sid: &str) {
+        let watches = {
+            let mut states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
+            states.remove(sid);
+            self.verify_runner.forget(sid);
+            states.values().any(|s| !s.ips.is_empty())
+        };
+        self.verify_watches_ips.store(watches, Ordering::Relaxed);
+        if crate::verify_overlay::set(sid, HashSet::new()) {
+            self.verdicts_changed(sid, true);
         }
     }
 
@@ -657,6 +872,7 @@ impl AutoRulesEngine {
             return;
         }
         let mut rules: Vec<VerifyKey> = Vec::new();
+        let mut ordinary: Vec<CanonicalAddressMatch> = Vec::new();
         if let Some(stored) = self.rules.stored_rules_for(sid) {
             let book = &stored.rule_book;
             for written in [RouteRole::Primary, RouteRole::Secondary] {
@@ -666,6 +882,16 @@ impl AutoRulesEngine {
                         .iter()
                         .filter(|r| r.enabled && r.action == RuleAction::Verify)
                         .filter_map(|r| VerifyKey::of(written, r)),
+                );
+                // Only rules for every program: an app-scoped one owns nothing
+                // by name.
+                ordinary.extend(
+                    book.set_for(written)
+                        .rules()
+                        .iter()
+                        .filter(|r| r.enabled && r.action != RuleAction::Verify)
+                        .filter(|r| r.app_match.is_none())
+                        .filter_map(|r| r.address_match.clone()),
                 );
             }
         }
@@ -690,27 +916,26 @@ impl AutoRulesEngine {
                 })
                 .collect();
             state.rules = rules;
+            state.ordinary = ordinary;
             state.subdomains = subdomains;
             let VerifyState {
                 rules,
+                ordinary,
                 pending,
                 recent,
                 ..
             } = &mut *state;
             pending.retain(|host, c| {
                 rules.contains(&c.key)
-                    && (c.port.is_some() || covers(&c.key.address, host, subdomains))
+                    && (c.port.is_some()
+                        || decider(rules, ordinary, host, subdomains) == Some(&c.key))
             });
             // Queries that came before a rule was read now count for it. With
             // no `?` rule at all they are dropped: such a principal keeps no
             // buffer.
             let earlier = std::mem::take(recent);
             for (host, addresses) in earlier {
-                let key = rules
-                    .iter()
-                    .filter(|r| covers(&r.address, &host, subdomains))
-                    .max_by_key(|r| specificity(&r.address))
-                    .cloned();
+                let key = decider(rules, ordinary, &host, subdomains).cloned();
                 match key {
                     Some(key) if pending.len() < MAX_PENDING => {
                         pending.insert(

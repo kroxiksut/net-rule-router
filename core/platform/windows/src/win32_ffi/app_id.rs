@@ -24,9 +24,11 @@
 //! that case [`app_id_from_path`] falls back to deriving the NT path
 //! without touching the file: the drive letter is mapped to its device
 //! name via `QueryDosDeviceW` and the remainder of the path is appended
-//! lowercased, matching the helper's own output format. The fallback
-//! skips the helper's reparse-point resolution, which is acceptable for
-//! the plainly-installed executables self-defense guards.
+//! lowercased, matching the helper's own output format. The containing
+//! directory is resolved first (links, 8.3 names, folder-mounted volumes),
+//! which needs no access to the executable; a path whose last component is
+//! itself a link, or whose volume has no drive letter, is declined rather
+//! than turned into a blob that would never match.
 
 #![allow(unsafe_code)]
 
@@ -155,7 +157,8 @@ fn app_id_via_helper(path: &Path) -> Result<Vec<u8>, PlatformError> {
 /// test against the live helper). Lowercasing is per-`char`, applied only
 /// when it maps 1:1 so multi-char expansions never distort the path.
 fn app_id_without_opening(path: &Path) -> Option<Vec<u8>> {
-    let mut components = path.components();
+    let resolved = resolve_beside_file(path)?;
+    let mut components = resolved.components();
     let drive = match components.next()? {
         Component::Prefix(p) => match p.kind() {
             Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
@@ -194,6 +197,21 @@ fn app_id_without_opening(path: &Path) -> Option<Vec<u8>> {
     }
     bytes.extend_from_slice(&[0, 0]);
     Some(bytes)
+}
+
+/// `path` with its directory fully resolved, never opening the file itself.
+/// `None` when the directory cannot be resolved or the file is a link.
+fn resolve_beside_file(path: &Path) -> Option<std::path::PathBuf> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let name = path.file_name()?;
+    let directory = std::fs::canonicalize(path.parent()?).ok()?;
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return None;
+        }
+    }
+    Some(directory.join(name))
 }
 
 /// Map a drive letter (`b'C'`) to its NT device name
@@ -378,6 +396,29 @@ mod tests {
     fn fallback_declines_unc_and_relative_paths() {
         assert!(app_id_without_opening(Path::new(r"\\server\share\app.exe")).is_none());
         assert!(app_id_without_opening(Path::new(r"relative\app.exe")).is_none());
+    }
+
+    /// A directory link is resolved to its target, so the blob names the path
+    /// the kernel sees; a link as the file itself is declined.
+    #[test]
+    fn fallback_resolves_a_linked_directory_and_declines_a_linked_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("Real");
+        std::fs::create_dir(&real).expect("mkdir");
+        std::fs::write(real.join("app.exe"), b"x").expect("file");
+        let link = dir.path().join("link");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output();
+        if !matches!(made, Ok(ref o) if o.status.success()) {
+            return;
+        }
+        let via_link = app_id_without_opening(&link.join("app.exe")).expect("derived");
+        let direct = app_id_without_opening(&real.join("app.exe")).expect("derived");
+        assert_eq!(via_link, direct, "a junction must not change the blob");
+        assert!(resolve_beside_file(&real.join("missing-dir").join("a.exe")).is_none());
     }
 
     /// Live round-trip: derive kernel32's NT path via the helper blob, then

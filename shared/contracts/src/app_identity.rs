@@ -79,7 +79,7 @@ pub fn canonical_glob_process_pattern(raw: &str) -> String {
 }
 
 /// The key BOTH sides of an application match are reduced to: file name, lower
-/// case, without the `.exe` spelling.
+/// case (Unicode, as names are stored), without the `.exe` spelling.
 ///
 /// The suffix is how Windows spells a program, not part of its identity: the
 /// same program is `viewer` in `/proc/<pid>/exe` and `viewer.exe` in a
@@ -89,7 +89,7 @@ pub fn canonical_glob_process_pattern(raw: &str) -> String {
 pub fn app_match_key(raw: &str) -> String {
     let trimmed = raw.trim();
     let name = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed);
-    let lowered = name.to_ascii_lowercase();
+    let lowered = name.to_lowercase();
     match lowered.strip_suffix(".exe") {
         // `.exe` alone is a file name, not a suffix on one.
         Some(stem) if !stem.is_empty() => stem.to_string(),
@@ -103,6 +103,19 @@ mod tests {
 
     const WIN: ExecutableNaming = ExecutableNaming::WindowsExe;
     const UNIX: ExecutableNaming = ExecutableNaming::AsNamed;
+
+    #[test]
+    fn non_ascii_capitals_fold_the_way_names_are_stored() {
+        let (stored, _) = canonical_exact_process_name("Программа.EXE", WIN);
+        assert_eq!(stored, "программа.exe");
+        assert_eq!(app_match_key("Программа.EXE"), app_match_key(&stored));
+        assert_eq!(app_match_key("Éditeur"), app_match_key("éditeur.exe"));
+        let glob = canonical_glob_process_pattern("*Éditeur*");
+        assert!(crate::glob::glob_match(
+            &app_match_key(&glob),
+            &app_match_key("MonÉditeur.exe")
+        ));
+    }
 
     #[test]
     fn case_and_path_and_suffix_reduce_to_one_spelling() {

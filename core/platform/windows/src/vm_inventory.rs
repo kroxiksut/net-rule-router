@@ -263,11 +263,11 @@ fn read_settings(path: &Path) -> Option<String> {
 
 /// Every adapter's description, lower-cased, from one enumeration.
 fn adapter_descriptions() -> Vec<String> {
-    ipconfig::get_adapters()
+    crate::win32_ffi::adapters::enumerate_adapters()
         .map(|adapters| {
             adapters
                 .iter()
-                .map(|adapter| adapter.description().to_lowercase())
+                .map(|adapter| adapter.description.to_lowercase())
                 .collect()
         })
         .unwrap_or_default()

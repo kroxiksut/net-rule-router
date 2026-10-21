@@ -1,0 +1,165 @@
+{
+  "description": "pure.js vpnGatewaysConfirmed: the gateway list a yes writes",
+  "cases": [
+    {
+      "name": "first answer",
+      "input": {
+        "existing": [],
+        "offer": {
+          "address": "203.0.113.20",
+          "program": "",
+          "name": ""
+        }
+      },
+      "expected": [
+        {
+          "address": "203.0.113.20",
+          "program": ""
+        }
+      ]
+    },
+    {
+      "name": "added after what is allowed",
+      "input": {
+        "existing": [
+          {
+            "address": "198.51.100.4",
+            "program": "agent.exe"
+          }
+        ],
+        "offer": {
+          "address": "203.0.113.20",
+          "program": "C:\\Corp\\x.exe",
+          "name": "x.exe"
+        }
+      },
+      "expected": [
+        {
+          "address": "198.51.100.4",
+          "program": "agent.exe"
+        },
+        {
+          "address": "203.0.113.20",
+          "program": "C:\\Corp\\x.exe"
+        }
+      ]
+    },
+    {
+      "name": "an address already there keeps its entry",
+      "input": {
+        "existing": [
+          {
+            "address": "2001:db8::7",
+            "program": "first"
+          }
+        ],
+        "offer": {
+          "address": "2001:DB8::7",
+          "program": "second",
+          "name": "second"
+        }
+      },
+      "expected": [
+        {
+          "address": "2001:db8::7",
+          "program": "first"
+        }
+      ]
+    },
+    {
+      "name": "blank entries and repeats in the list are dropped",
+      "input": {
+        "existing": [
+          {
+            "address": " ",
+            "program": "x"
+          },
+          {
+            "address": "198.51.100.4",
+            "program": ""
+          },
+          {
+            "address": " 198.51.100.4",
+            "program": "y"
+          }
+        ],
+        "offer": {
+          "address": "",
+          "program": "",
+          "name": ""
+        }
+      },
+      "expected": [
+        {
+          "address": "198.51.100.4",
+          "program": ""
+        }
+      ]
+    },
+    {
+      "name": "missing list and offer give nothing",
+      "input": {
+        "existing": null,
+        "offer": null
+      },
+      "expected": []
+    },
+    {
+      "name": "missing offer keeps the list",
+      "input": {
+        "existing": [
+          {
+            "address": "198.51.100.4",
+            "program": "a"
+          }
+        ],
+        "offer": null
+      },
+      "expected": [
+        {
+          "address": "198.51.100.4",
+          "program": "a"
+        }
+      ]
+    },
+    {
+      "name": "offer spaces trimmed",
+      "input": {
+        "existing": [],
+        "offer": {
+          "address": " 203.0.113.20 ",
+          "program": " /usr/sbin/charon ",
+          "name": "charon"
+        }
+      },
+      "expected": [
+        {
+          "address": "203.0.113.20",
+          "program": "/usr/sbin/charon"
+        }
+      ]
+    },
+    {
+      "name": "offer repeating a trimmed entry adds nothing",
+      "input": {
+        "existing": [
+          {
+            "address": " 203.0.113.20",
+            "program": "a"
+          }
+        ],
+        "offer": {
+          "address": "203.0.113.20",
+          "program": "b",
+          "name": "b"
+        }
+      },
+      "expected": [
+        {
+          "address": "203.0.113.20",
+          "program": "a"
+        }
+      ]
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 //! `route.policy.update` replaces the whole per-SID row, so a write built on a
 //! read that another write overtook puts the other's fields back. First run
-//! sent the kill switch, the DoH lockdown and both adapter bindings at once,
+//! sent leak protection, the DoH lockdown and both adapter bindings at once,
 //! and the service kept neither protection. The window therefore owns ONE
 //! writer, a queue, and the first-run protections travel as one write.
 
@@ -78,10 +78,10 @@ fn first_run_protections_travel_as_one_write() {
         let text = read(&qml_root().join(file));
         assert!(
             text.contains("applyFirstRunProtections("),
-            "{file} must send the kill switch and the DoH lockdown together"
+            "{file} must send leak protection and the DoH lockdown together"
         );
         assert!(
-            !text.contains("applyKillSwitchEnabled(") && !text.contains("applyDohLockdownEnabled("),
+            !text.contains("applyLeakProtection(") && !text.contains("applyDohLockdownEnabled("),
             "{file} sends a first-run protection as a write of its own"
         );
         assert!(
@@ -97,7 +97,7 @@ fn first_run_protections_travel_as_one_write() {
 #[test]
 fn the_tray_and_the_window_name_what_they_change() {
     let tray = read(&qml_root().join("Tray.qml"));
-    for field in ["auto-rules-mode", "kill-switch-enabled"] {
+    for field in ["auto-rules-mode", "leak-protection"] {
         assert!(
             tray.contains(&format!("req[\"apply-only\"] = [\"{field}\"]")),
             "the tray's `{field}` write restates the whole row"
@@ -124,8 +124,8 @@ fn changed_keys_name_only_what_differs() {
         );
     let program = format!(
         "{pure}\nvar base = {{ mode: 'prefer-primary', primary: {{ 'stable-id': 'a' }}, \
-         'kill-switch-enabled': false, 'binding-source': 'recovery' }};\n\
-         var req = {{ mode: 'prefer-primary', 'kill-switch-enabled': true, \
+         'leak-protection': 'off', 'binding-source': 'recovery' }};\n\
+         var req = {{ mode: 'prefer-primary', 'leak-protection': 'sites', \
          'binding-source': 'user-assigned' }};\n\
          console.log(JSON.stringify(routePolicyChangedKeys(base, req)));\n\
          console.log(JSON.stringify(routePolicyChangedKeys(base, base)));\n"
@@ -133,7 +133,7 @@ fn changed_keys_name_only_what_differs() {
     let Some(output) = run_node(&program) else {
         return;
     };
-    assert_eq!(output.trim(), "[\"kill-switch-enabled\",\"primary\"]\n[]");
+    assert_eq!(output.trim(), "[\"leak-protection\",\"primary\"]\n[]");
 }
 
 /// Feed a program to `node` on stdin. `None` when node is not installed.

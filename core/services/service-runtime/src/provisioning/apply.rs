@@ -154,7 +154,8 @@ fn store_policy(
 ) -> Result<bool, ProvisionRefusal> {
     let unset = checked.options.secondary_unset;
     let mode = checked.settings.and_then(|s| s.route_mode);
-    if unset.is_none() && mode.is_none() {
+    let leak = checked.settings.and_then(|s| s.leak_protection);
+    if unset.is_none() && mode.is_none() && leak.is_none() {
         return Ok(false);
     }
     let failed = |e: String| ProvisionRefusal::new(ProvisionPart::Options, "policy-not-stored", e);
@@ -167,6 +168,7 @@ fn store_policy(
     let next = InstallPolicy {
         secondary_unset: unset.unwrap_or(current.secondary_unset),
         default_route_mode: mode.or(current.default_route_mode),
+        default_leak_protection: leak.unwrap_or(current.default_leak_protection),
     };
     repo.set(&next, applier.now_ms)
         .map_err(|e| failed(e.to_string()))?;

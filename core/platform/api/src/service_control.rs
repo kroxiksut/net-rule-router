@@ -65,9 +65,9 @@ impl ServiceStartMode {
 /// How the OS should recover the service from crashes.
 ///
 /// Wired into SCM failure actions on Windows and `Restart=`/`RestartSec=` on
-/// systemd. The policy avoids infinite restart loops by stopping automatic
-/// recovery after `max_auto_restarts` consecutive failures within the reset
-/// window.
+/// systemd. After the fast restarts the network is handed back once and the
+/// service keeps restarting slowly, so a bad hour never leaves the machine
+/// without it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryPolicy {
     /// Delay (ms) before the first auto-restart after a crash.
@@ -76,19 +76,21 @@ pub struct RecoveryPolicy {
     pub second_restart_delay_ms: u32,
     /// Delay (ms) before every auto-restart after the second.
     pub later_restart_delay_ms: u32,
-    /// Number of consecutive crashes that trigger automatic restart. Crashes
-    /// beyond this leave the service stopped for operator review.
+    /// Number of fast, escalating restarts before the slow tail starts.
     pub max_auto_restarts: u8,
     /// How long (seconds) the crash counter is held before resetting.
     pub reset_period_secs: u32,
     /// Once the restarts are spent, hand the network back: a dead service
     /// still redirecting name resolution leaves the whole machine offline.
     pub release_network_when_exhausted: bool,
+    /// Delay (ms) between restarts once the fast ones are spent; 0 leaves the
+    /// service stopped after them.
+    pub exhausted_restart_delay_ms: u32,
 }
 
 impl RecoveryPolicy {
     /// Default production policy: three restarts with escalating delay within
-    /// an hour, then the network is handed back and the service stays stopped.
+    /// an hour, then the network is handed back and restarts continue slowly.
     pub const fn production() -> Self {
         Self {
             first_restart_delay_ms: 5_000,
@@ -97,6 +99,7 @@ impl RecoveryPolicy {
             max_auto_restarts: 3,
             reset_period_secs: 3_600,
             release_network_when_exhausted: true,
+            exhausted_restart_delay_ms: 300_000,
         }
     }
 
@@ -109,6 +112,7 @@ impl RecoveryPolicy {
             max_auto_restarts: 5,
             reset_period_secs: 3_600,
             release_network_when_exhausted: true,
+            exhausted_restart_delay_ms: 60_000,
         }
     }
 }
@@ -447,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn production_recovery_policy_cannot_loop_forever() {
+    fn production_recovery_policy_cannot_storm() {
         let p = RecoveryPolicy::production();
         assert!(p.max_auto_restarts > 0, "must restart at least once");
         assert!(
@@ -464,6 +468,10 @@ mod tests {
             "the delay must escalate"
         );
         assert!(p.reset_period_secs > 0, "the reset period must be finite");
+        assert!(
+            p.exhausted_restart_delay_ms >= p.later_restart_delay_ms,
+            "the slow tail must not be faster than the fast restarts"
+        );
         assert!(
             p.release_network_when_exhausted,
             "a service that gave up must not keep the machine offline"

@@ -2,8 +2,8 @@ use super::*;
 
 // ── Fail-closed: the failure posture ──────────────────────────────────────────
 
-/// Exemptions for the fail-closed block-all path (mode B) when the secondary
-/// is unresolvable. Loopback / link-local / broadcast are always exempt in the
+/// What the blocking postures spare while the secondary is unresolvable (and,
+/// for the floor, while it is up). Loopback / link-local / broadcast are always exempt in the
 /// codegen; these are the host-specific extras that keep the box manageable and
 /// let the tunnel reconnect.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -44,7 +44,7 @@ pub struct FailClosedExemptions {
     /// and nothing else: a permit for any host on port 53 is a tunnel for
     /// every program that runs its own DNS. Empty when the OS has not listed
     /// them yet, which permits nothing.
-    pub dns_servers: Vec<Ipv4Addr>,
+    pub dns_servers: Vec<IpAddr>,
     /// destinations POSITIVELY established as DIRECT
     /// (non-rule) hosts (see [`crate::known_direct::KnownDirectRegistry`]): a
     /// Mode-B steered direct answer, or an FCrDNS forward-confirmed name that
@@ -59,19 +59,15 @@ pub struct FailClosedExemptions {
     /// here rather than passed alongside because it answers the same question
     /// as every other field: what may still leave.
     pub secondary_luid: u64,
-    /// LUIDs of tunnels the USER runs that are none of our business — a
-    /// corporate VPN beside our own additional route.
-    ///
-    /// Traffic leaving through one of these is not a leak: it goes into
-    /// somebody else's encrypted tunnel, not out of the provider's door,
-    /// which is the thing this block-all exists to stop. Cutting it makes the
-    /// product the reason a working corporate connection dies, and the user
-    /// cannot tell our block from their VPN failing.
-    ///
-    /// Permitted by EGRESS, never by destination: exempting the tunnel's
-    /// address range instead would open that range on every link, including
-    /// the primary — the hole the kill-switch is for.
+    /// LUIDs of tunnels the user runs beside ours (a corporate VPN). Read only
+    /// so the DoH/DoT lockdown follows into them; what they may carry is
+    /// [`Self::foreign_tunnel_networks`].
     pub foreign_tunnel_luids: Vec<u64>,
+    /// The networks those tunnels' own routes carry, each with its link. Every
+    /// posture spares a foreign tunnel only for these, by egress through it:
+    /// one that also holds a default route would otherwise carry the protected
+    /// traffic once ours is down.
+    pub foreign_tunnel_networks: Vec<ForeignTunnelNetwork>,
     /// The secondary tunnel next-hop(s) the liveness probe pings. The probe's
     /// verdict is what DISARMS this very block-all, and its ICMP echo is
     /// kernel-originated — it carries no app-id, so no process exemption can
@@ -82,9 +78,14 @@ pub struct FailClosedExemptions {
     /// their own id kind so a next-hop equal to a bootstrap server IP keeps
     /// distinct filter ids.
     pub probe_target_ips: Vec<Ipv4Addr>,
+    /// LUIDs of the host side of the machine's guest networks (WSL, Hyper-V,
+    /// Docker Desktop), never a way out. Read only by the forwarded blanket:
+    /// what the machine forwards into a guest is its reply, and a refused
+    /// local network must not take the guest's direct sites with it.
+    pub guest_network_luids: Vec<u64>,
 }
 
-/// Fail-closed, mode A (selective). The secondary is unresolvable, so there is
+/// Fail-closed, per destination. The secondary is unresolvable, so there is
 /// no tunnel to permit through — emit a **block** over each protected secondary
 /// destination, narrowed to the selected `protocols`. TCP/UDP are blocked at
 /// the ALE connect layer; ICMP/IGMP/GRE/ESP (and, for "Other", every remaining
@@ -139,7 +140,7 @@ pub fn fail_closed_block_destinations(
     out
 }
 
-/// Fail-closed, mode A, per-**app**. The secondary is unresolvable, so there is
+/// Fail-closed, per-**app**. The secondary is unresolvable, so there is
 /// no tunnel to permit through — block each protected secondary application at
 /// the ALE connect layer (TCP/UDP). ICMP from a specific process is not
 /// matchable at the packet layer (no app context), so it is out of scope here —
@@ -196,19 +197,20 @@ fn ale_block_app(sid: &str, pattern: &str, idx: u64, app_takeover: bool) -> WfpF
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+        remote_subnet_set: Vec::new(),
     }
 }
 
-/// Fail-closed, mode B (everything-via-secondary). The secondary is gone, so
-/// block **all** egress for this user except the safe exemptions. Unlike
+/// Fail-closed block-all. The secondary is gone, so block **all** egress for
+/// this user except the safe exemptions. Unlike
 /// [`catch_all_kill_switch_filters`] this arms WITHOUT a resolvable secondary adapter LUID
 /// (there is none) and WITHOUT requiring server IPs — it is the last-resort
 /// "the secondary adapter is gone, cut everything" path. The filter set, by weight
 /// (high → low):
 /// 1. exemption permits at [`CATCHALL_EXEMPT_BASE`] (loopback, link-local,
 ///    broadcast, any known VPN server, each primary local subnet);
-/// 2. (rule-driven primary permits at `0x0020_0000` still escape — mode-B
-///    exceptions routed via the primary link keep working);
+/// 2. (rule-driven primary permits at `0x0020_0000` still escape — what the
+///    rules send over the main link keeps working);
 /// 3. the catch-all `Block` at [`CATCHALL_BLOCK_WEIGHT`].
 ///
 /// All filters are scoped to `sid` — it never blocks other users / the system.
@@ -217,22 +219,24 @@ pub fn fail_closed_block_all_filters(
     exemptions: &FailClosedExemptions,
     protocols: KillSwitchProtocols,
 ) -> Vec<WfpFilterSpec> {
+    fail_closed_block_all_filters_for(sid, exemptions, protocols, false)
+}
+
+/// [`fail_closed_block_all_filters`] on a machine where other principals also
+/// hold a block: the IPv6 packet block, which no user condition can scope, is
+/// left out so it does not cut them (see [`catch_all_v6_filters`]).
+pub fn fail_closed_block_all_filters_for(
+    sid: &str,
+    exemptions: &FailClosedExemptions,
+    protocols: KillSwitchProtocols,
+    machine_has_other_principals: bool,
+) -> Vec<WfpFilterSpec> {
     if !protocols.any() {
         return Vec::new();
     }
     let mut filters: Vec<WfpFilterSpec> = Vec::new();
     let mut weight = CATCHALL_EXEMPT_BASE;
 
-    // Somebody else's tunnel keeps carrying what it was carrying. See
-    // `FailClosedExemptions::foreign_tunnel_luids` for why this is not a hole:
-    // the permit is on the EGRESS interface, so it covers only packets that
-    // actually leave through that tunnel.
-    filters.extend(foreign_tunnel_egress(
-        sid,
-        &exemptions.foreign_tunnel_luids,
-        exemptions.secondary_luid,
-        &mut weight,
-    ));
     // ── ALE connect layer exemptions (TCP/UDP) ──
     filters.extend(base_ale_exemptions(
         sid,
@@ -272,6 +276,7 @@ pub fn fail_closed_block_all_filters(
             sid,
             &exemptions.dns_servers,
             weight,
+            !machine_has_other_principals,
         ));
     }
     // The catch-all ALE block — TCP/UDP egress this user sends, narrowed to the
@@ -293,12 +298,6 @@ pub fn fail_closed_block_all_filters(
     if protocols.wants_packet_layer() {
         const TR: WfpLayerKey = WfpLayerKey::OutboundTransportV4;
         let mut pw = PACKET_EXEMPT_BASE;
-        filters.extend(foreign_tunnel_packet_egress(
-            sid,
-            &exemptions.foreign_tunnel_luids,
-            exemptions.secondary_luid,
-            &mut pw,
-        ));
         filters.extend(base_packet_exemptions(
             sid,
             TR,
@@ -357,12 +356,7 @@ pub fn fail_closed_block_all_filters(
         exemptions.secondary_luid,
         &exemptions.bootstrap_server_ips_v6,
         &exemptions.local_subnets_v6,
-    ));
-    filters.extend(foreign_tunnel_egress_v6(
-        sid,
-        &exemptions.foreign_tunnel_luids,
-        exemptions.secondary_luid,
-        true,
+        machine_has_other_principals,
     ));
 
     filters

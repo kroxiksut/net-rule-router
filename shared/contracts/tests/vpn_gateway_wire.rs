@@ -91,3 +91,43 @@ fn what_a_peer_leaves_out_reads_as_nothing_to_show() {
     let row = &back.candidates[0];
     assert!(row.hostname.is_empty() && row.ports.is_empty() && row.protocols.is_empty());
 }
+
+/// `route.vpn-gateways.set` — the caller's answer to "let this VPN through".
+/// A per-user write: audited, never elevated, never the console's.
+#[test]
+fn the_confirmation_travels_under_its_slug_as_a_user_write() {
+    use nrr_shared::ipc_payloads::{
+        RouteVpnGatewaysSetRequest, RouteVpnGatewaysSetResponse, VpnGatewayDto,
+    };
+    let op = IpcOperationName::RouteVpnGatewaysSet;
+    assert_eq!(op.slug(), "route.vpn-gateways.set");
+    assert_eq!(IpcOperationName::from_slug(op.slug()), Some(op));
+    let spec = ipc_operation_spec(op).unwrap_or_else(|| panic!("in the catalog"));
+    assert!(!spec
+        .allowed_clients
+        .contains(&IpcClientProfile::AdminConsole));
+    assert_eq!(
+        canonical_operation_class(op, &json!({ "gateways": [] })),
+        IpcOperationClass::UserScopedConfiguration
+    );
+
+    let request = RouteVpnGatewaysSetRequest {
+        gateways: vec![VpnGatewayDto {
+            address: "198.51.100.20".into(),
+            program: String::new(),
+        }],
+    };
+    assert_eq!(
+        serde_json::to_value(&request).unwrap_or_default(),
+        json!({ "gateways": [{ "address": "198.51.100.20", "program": "" }] })
+    );
+    let older: RouteVpnGatewaysSetResponse =
+        serde_json::from_value(json!({})).unwrap_or_else(|e| panic!("{e}"));
+    assert!(older.gateways.is_empty());
+    let bare: VpnGatewayDto = serde_json::from_value(json!({ "address": "2001:db8::7" }))
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        bare.program.is_empty(),
+        "the system itself names no program"
+    );
+}

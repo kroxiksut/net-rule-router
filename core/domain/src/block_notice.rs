@@ -42,8 +42,6 @@ pub const DEFAULT_MAX_EPISODES: usize = 256;
 pub enum BlockReason {
     /// The route this host is pinned to is down, so letting it out would leak.
     RouteUnavailable,
-    /// The application is confined to a route and no rule covers this host.
-    NotCoveredByRules,
     /// A rule says block outright.
     BlockedByRule,
     /// IPv6 is closed for the duration of the protection. The user has a
@@ -72,7 +70,7 @@ pub enum BlockReason {
 /// and an outage routinely outlasts that (a field case ran 79 s), so the same
 /// "waiting for the additional link" arrives again while nothing has changed.
 ///
-/// So the caller latches on the STATE instead: while the block-all stays armed
+/// So the caller latches on the STATE instead: while the outage hold stays armed
 /// the outage is announced once, and the latch clears when it disarms — the
 /// wait is over, and the next one is genuinely news.
 ///
@@ -94,7 +92,6 @@ impl BlockReason {
     pub fn slug(self) -> &'static str {
         match self {
             Self::RouteUnavailable => "route-unavailable",
-            Self::NotCoveredByRules => "not-covered-by-rules",
             Self::BlockedByRule => "blocked-by-rule",
             Self::Ipv6Blocked => "ipv6-blocked",
             Self::DnsLockdown => "dns-lockdown",
@@ -107,7 +104,6 @@ impl BlockReason {
     pub fn from_slug(slug: &str) -> Option<Self> {
         match slug {
             "route-unavailable" => Some(Self::RouteUnavailable),
-            "not-covered-by-rules" => Some(Self::NotCoveredByRules),
             "blocked-by-rule" => Some(Self::BlockedByRule),
             "ipv6-blocked" => Some(Self::Ipv6Blocked),
             "dns-lockdown" => Some(Self::DnsLockdown),
@@ -454,7 +450,7 @@ mod tests {
             host: Some(host.to_owned()),
             dest: "203.0.113.7".to_owned(),
             app: Some(app.to_owned()),
-            reason: BlockReason::NotCoveredByRules,
+            reason: BlockReason::BlockedByRule,
         }
     }
 
@@ -721,7 +717,6 @@ mod tests {
     #[test]
     fn an_actionable_cause_is_never_collapsed_into_the_outage() {
         for reason in [
-            BlockReason::NotCoveredByRules,
             BlockReason::BlockedByRule,
             BlockReason::Ipv6Blocked,
             BlockReason::DnsLockdown,

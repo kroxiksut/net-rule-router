@@ -200,6 +200,54 @@ pub fn rebase_edits(
     out
 }
 
+/// A [`Rebase`] as the merge review lists it (`rebaseMergeView` in `rules.js`):
+/// what the user added, changed and deleted, and the rules both sides touched
+/// as conflicts. A rule that is a conflict is listed there only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MergeView {
+    /// Rules only the user has: added on top of the rules in force.
+    pub added: Vec<RuleRow>,
+    pub changed: Vec<RuleRow>,
+    pub removed: Vec<RuleRow>,
+    pub conflicts: Vec<Conflict>,
+}
+
+impl MergeView {
+    /// The edits already match the rules in force: nothing to review.
+    pub fn is_noop(&self) -> bool {
+        self.added.is_empty()
+            && self.changed.is_empty()
+            && self.removed.is_empty()
+            && self.conflicts.is_empty()
+    }
+}
+
+pub fn merge_view(rebase: &Rebase) -> MergeView {
+    let in_conflict: HashSet<&str> = rebase.conflicts.iter().map(|c| c.key.as_str()).collect();
+    let outside = |rows: &[RuleRow]| -> Vec<RuleRow> {
+        rows.iter()
+            .filter(|row| !in_conflict.contains(row.merge_key().as_str()))
+            .cloned()
+            .collect()
+    };
+    MergeView {
+        added: outside(&rebase.added),
+        changed: outside(&rebase.changed),
+        removed: outside(&rebase.removed),
+        conflicts: rebase.conflicts.clone(),
+    }
+}
+
+/// The keys to pass to [`rebase_edits`] as `keep_theirs`: every conflict whose
+/// pick is the rules in force (`true`).
+pub fn keep_theirs_from_picks(picks: &[(String, bool)]) -> Vec<String> {
+    picks
+        .iter()
+        .filter(|(_, theirs)| *theirs)
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +385,49 @@ mod tests {
         let key = fresh[0].merge_key();
         let out = rebase_edits(&base, &[], &fresh, &[key]);
         assert_eq!(out.rows, fresh);
+    }
+
+    #[test]
+    fn the_review_lists_a_conflicting_rule_once_as_a_conflict() {
+        let base = [rule("R-0001", "a.example"), rule("R-0002", "gone.example")];
+        let edited = [
+            off(rule("R-0001", "a.example")),
+            rule("R-0009", "mine.example"),
+        ];
+        let mut theirs = rule("R-0001", "a.example");
+        theirs.comment = "theirs".into();
+        let out = rebase_edits(
+            &base,
+            &edited,
+            &[theirs, rule("R-0002", "gone.example")],
+            &[],
+        );
+        let view = merge_view(&out);
+        assert_eq!(view.conflicts.len(), 1);
+        assert!(view.changed.is_empty(), "the conflict is not also a change");
+        assert_eq!(values(&view.added), ["mine.example"]);
+        assert_eq!(values(&view.removed), ["gone.example"]);
+        assert!(!view.is_noop());
+    }
+
+    #[test]
+    fn edits_that_match_what_is_in_force_are_a_noop() {
+        let base = [rule("R-0001", "a.example")];
+        let fresh = [
+            rule("R-0001", "a.example"),
+            rule("R-0002", "theirs.example"),
+        ];
+        assert!(merge_view(&rebase_edits(&base, &base, &fresh, &[])).is_noop());
+    }
+
+    #[test]
+    fn only_the_picks_for_the_rules_in_force_are_kept() {
+        let picks = [
+            ("a".to_string(), true),
+            ("b".to_string(), false),
+            ("c".to_string(), true),
+        ];
+        assert_eq!(keep_theirs_from_picks(&picks), ["a", "c"]);
     }
 
     #[test]

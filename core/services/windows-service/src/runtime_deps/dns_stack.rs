@@ -17,6 +17,7 @@ pub(super) fn build_dns_resolver_factory(
     cache_store: Option<&Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>>,
     active_routing_sid: Option<&nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn>,
     route_recompute_hook: Option<&nrr_service_runtime::supervised_runtime::RouteRecomputeHook>,
+    forced_recompute_hook: Option<&nrr_service_runtime::supervised_runtime::RouteRecomputeHook>,
     known_direct: Option<&Arc<nrr_service_runtime::known_direct::KnownDirectRegistry>>,
     block_all_armed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     fail_closed_armed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -36,7 +37,6 @@ pub(super) fn build_dns_resolver_factory(
 ) -> Option<nrr_service_runtime::dns_resolver_service::DnsResolverFactory> {
     use nrr_platform_windows::dns_redirect::{
         NrptDnsRedirect, PowerShellRunner, TransactedNrptStore, WindowsSearchList,
-        WindowsSystemDnsServers,
     };
     use nrr_service_runtime::dns_stack::{DnsStackInputs, DnsStackPlatform};
 
@@ -46,6 +46,7 @@ pub(super) fn build_dns_resolver_factory(
         active_sid: Arc::clone(active_routing_sid?),
         served_sids,
         recompute_hook: route_recompute_hook?.clone(),
+        forced_recompute_hook: forced_recompute_hook.cloned(),
         known_direct: known_direct.map(Arc::clone),
         block_all_armed,
         fail_closed_armed,
@@ -63,14 +64,7 @@ pub(super) fn build_dns_resolver_factory(
         liveness: Some(liveness),
     };
     let platform = DnsStackPlatform {
-        // One enumeration costs a PowerShell run; built once here, so every
-        // arm and every reader shares one list per network change or DNS
-        // settings change (a DHCP lease, a VPN client's own domain).
-        system_dns: nrr_service_runtime::dns_stack::cached_system_dns(
-            Arc::new(WindowsSystemDnsServers),
-            &nrr_platform_windows::network_change::WindowsNetworkChangeObserver,
-            &nrr_platform_windows::dns_config_change::WindowsDnsConfigChangeObserver,
-        ),
+        system_dns: cached_system_dns(),
         upstream_pool: upstream_dns_pool(),
         redirect: Arc::new(
             NrptDnsRedirect::new(PowerShellRunner, TransactedNrptStore)
@@ -338,7 +332,7 @@ pub(super) fn build_fake_ip_stack_factory(
         let names = Arc::new(nrr_service_runtime::fake_ip::ConfirmedNameResolver::new(
             build_hosts_bypass_resolver(
                 Some(Arc::clone(&settings_conn)),
-                Some(Arc::clone(&active_sid)),
+                Some(Arc::clone(&served_principals)),
                 route_coordinator
                     .as_ref()
                     .map(|coord| build_dns_egress_policy(coord, Arc::clone(&active_sid))),
@@ -451,7 +445,7 @@ pub(super) fn build_fake_ip_stack_factory(
 
 /// Build the rule-host resolver used by the seeder and the DNS
 /// refresh: the system port decorated with the hosts-bypass direct-UDP path
-/// (`HostsBypassDnsResolver`). While the active routing user's
+/// (`HostsBypassDnsResolver`). While any served user's
 /// `resolve_hosts_bypass` posture is ON (the default), rule hosts resolve
 /// straight against the captured upstream server over a raw socket — so a
 /// hosts/adblock `127.0.0.1` pin can no
@@ -461,29 +455,20 @@ pub(super) fn build_fake_ip_stack_factory(
 /// (bypass ON).
 pub(super) fn build_hosts_bypass_resolver(
     settings_conn: Option<Arc<Mutex<Connection>>>,
-    active_sid: Option<nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn>,
+    served: Option<nrr_service_runtime::dns_resolver_ports::ResolverPrincipalsFn>,
     egress: Option<Arc<dyn nrr_service_runtime::dns_egress::DnsEgressPolicy>>,
 ) -> Arc<dyn nrr_platform_windows::dns::DnsResolverPort> {
     use std::time::Duration;
 
     let bypass_enabled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
-        let (Some(conn), Some(active_sid)) = (settings_conn.as_ref(), active_sid.as_ref()) else {
+        let (Some(conn), Some(served)) = (settings_conn.as_ref(), served.as_ref()) else {
             return true;
         };
-        let Some(sid) = active_sid() else {
-            return true;
-        };
-        let Ok(guard) = conn.lock() else {
-            return true;
-        };
-        nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
-            .load_for_sid(&sid)
-            .map(|record| record.resolve_hosts_bypass)
-            .unwrap_or(true)
+        nrr_service_runtime::hosts_bypass::stored_bypass_wanted_by_any(conn, &served())
     });
     let pool = upstream_dns_pool();
     let upstream: Arc<dyn Fn() -> Option<std::net::SocketAddr> + Send + Sync> =
-        Arc::new(move || pool.current().or_else(|| pool.note_network_change()));
+        Arc::new(move || pool.current_or_select());
     // `DnsQuery_W` answers when the OS is done with it; on the datapath the
     // caller cannot wait that long, so the system fallback gets a budget.
     let mut resolver = nrr_service_runtime::dns_resolver_ports::HostsBypassDnsResolver::new(
@@ -517,6 +502,22 @@ pub(super) fn build_hosts_bypass_resolver(
     )
 }
 
+/// The machine's DNS servers, enumerated once per network or DNS settings
+/// change (a DHCP lease, a VPN client's own domain). One enumeration costs a
+/// PowerShell run, so every reader — the resolver, the upstream pool — shares
+/// this one list instead of asking the OS on a query's path.
+pub(super) fn cached_system_dns() -> Arc<dyn nrr_platform_api::dns::SystemDnsServersPort> {
+    static SERVERS: std::sync::OnceLock<Arc<dyn nrr_platform_api::dns::SystemDnsServersPort>> =
+        std::sync::OnceLock::new();
+    Arc::clone(SERVERS.get_or_init(|| {
+        nrr_service_runtime::dns_stack::cached_system_dns(
+            Arc::new(nrr_platform_windows::dns_redirect::WindowsSystemDnsServers),
+            &nrr_platform_windows::network_change::WindowsNetworkChangeObserver,
+            &nrr_platform_windows::dns_config_change::WindowsDnsConfigChangeObserver,
+        )
+    }))
+}
+
 /// The process-wide upstream-DNS choice.
 ///
 /// One pool, not one per resolver instance: it must outlive resolver restarts
@@ -527,15 +528,16 @@ pub(super) fn upstream_dns_pool() -> Arc<nrr_service_runtime::dns_upstream::Upst
     static POOL: std::sync::OnceLock<Arc<UpstreamDnsPool>> = std::sync::OnceLock::new();
     Arc::clone(POOL.get_or_init(|| {
         Arc::new(UpstreamDnsPool::new(
-            Arc::new(nrr_platform_windows::dns_redirect::WindowsSystemDnsServers),
+            cached_system_dns(),
             Arc::new(UdpUpstreamProbe::default()),
         ))
     }))
 }
 
 /// The namespaces the connections in use claim, read fresh on every call, with
-/// the kind of link behind each; our own tunnel aside. The neutral stack
-/// decides which ones the redirect honours.
+/// the kind of link behind each; our own links aside, as the route coordinator
+/// last named them. The neutral stack decides which ones the redirect honours.
 fn claimed_namespaces() -> Vec<nrr_platform_api::dns_scope::ClaimedNamespace> {
-    nrr_platform_windows::dns_scope::live_claims()
+    let ours = nrr_service_runtime::foreign_tunnels::global_foreign_tunnels().own_links();
+    nrr_platform_windows::dns_scope::live_claims(&ours)
 }

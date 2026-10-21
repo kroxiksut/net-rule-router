@@ -134,11 +134,8 @@ fn stored_fields() -> Vec<(&'static str, Vec<&'static str>)> {
                 primary,
                 secondary,
                 mode,
-                block_secondary_when_unavailable,
-                kill_switch_fail_closed,
+                leak_protection,
                 kill_switch_protocols,
-                kill_switch_block_all,
-                kill_switch_enabled,
                 allow_dns_over_primary,
                 primary_probe_auto,
                 primary_probe_timeout_ms,
@@ -150,9 +147,9 @@ fn stored_fields() -> Vec<(&'static str, Vec<&'static str>)> {
                 short_name_suffix,
                 app_rules_take_all_addresses,
                 forwarded_outage,
+                external_address_auto_check,
                 include_subdomains,
                 shared_ip_policy,
-                mode_a_coverage_strategy,
                 resolve_hosts_bypass,
                 doh_lockdown_enabled,
                 doh_lockdown_scope,
@@ -169,6 +166,7 @@ fn stored_fields() -> Vec<(&'static str, Vec<&'static str>)> {
             fields_of!(InstallPolicy {
                 secondary_unset,
                 default_route_mode,
+                default_leak_protection,
             }),
         ),
         (
@@ -221,11 +219,10 @@ impl Os {
 enum Cell {
     /// The service reads it on this OS.
     Read(Vec<Link>),
-    /// The write itself puts the effect into the OS, so nothing reads it later.
-    AppliedAtWrite(Vec<Link>),
     /// Hidden on this OS by a `supports` key that is `false` there.
     Unsupported(&'static str),
     /// Stored and offered, yet nothing on this OS acts on it.
+    #[allow(dead_code)] // no such setting today; the next one lands here
     Gap {
         reason: &'static str,
         present: Vec<Link>,
@@ -336,6 +333,7 @@ const LNX_RUNTIME_DEPS: &str = "core/services/linux-service/src/runtime_deps.rs"
 const LNX_DNS_STACK_FILE: &str = "core/services/linux-service/src/dns_stack.rs";
 const WIN_PLAN_FILE: &str = "core/services/service-runtime/src/per_sid_orchestrator/plan.rs";
 const LNX_PLAN_FILE: &str = "core/services/service-runtime/src/production_principal_plan.rs";
+const EXTERNAL_ADDRESS: &str = "core/services/service-runtime/src/secondary_external_address.rs";
 const CONN_TRACE_HANDLER: &str =
     "core/services/service-runtime/src/ipc_handlers/diagnostics_handlers/conn_trace.rs";
 
@@ -589,17 +587,17 @@ fn settings() -> Vec<Setting> {
         Setting {
             store: "AutostartStateRecord",
             field: "enabled",
-            windows: AppliedAtWrite(vec![
+            windows: Read(vec![
                 (
                     "core/services/service-runtime/src/production_settings.rs",
-                    "self.helper.set_enabled(&self.tray_binary_path)",
+                    "enabled: rec.enabled",
                 ),
                 WIN_AUTOSTART,
             ]),
-            linux: AppliedAtWrite(vec![
+            linux: Read(vec![
                 (
                     "core/services/service-runtime/src/production_settings.rs",
-                    "self.helper.set_enabled(&self.tray_binary_path)",
+                    "enabled: rec.enabled",
                 ),
                 LNX_AUTOSTART,
             ]),
@@ -678,16 +676,8 @@ fn settings() -> Vec<Setting> {
             ]),
             linux: Read(vec![(LNX_PLAN_FILE, "behavior_mode_for_codegen"), LNX_PLAN]),
         },
-        Setting {
-            store: "RoutePolicyRecord",
-            field: "block_secondary_when_unavailable",
-            windows: legacy_block_flag(),
-            linux: legacy_block_flag(),
-        },
-        plan_read("kill_switch_fail_closed", "policy.kill_switch_fail_closed"),
+        plan_read("leak_protection", "policy.leak_protection"),
         plan_read("kill_switch_protocols", "policy.kill_switch_protocols"),
-        plan_read("kill_switch_block_all", "policy.kill_switch_block_all"),
-        plan_read("kill_switch_enabled", "policy.kill_switch_enabled"),
         plan_read("allow_dns_over_primary", "policy.allow_dns_over_primary"),
         plan_read("zone_priority_over_ip", "policy.zone_priority_over_ip"),
         plan_read(
@@ -698,17 +688,6 @@ fn settings() -> Vec<Setting> {
         plan_read("doh_lockdown_enabled", "policy.doh_lockdown_enabled"),
         plan_read("doh_lockdown_scope", "policy.doh_lockdown_scope"),
         plan_read("doh_lockdown_auto", "policy.doh_lockdown_auto"),
-        Setting {
-            store: "RoutePolicyRecord",
-            field: "mode_a_coverage_strategy",
-            windows: Read(vec![
-                (WIN_PLAN_FILE, "policy.mode_a_coverage_strategy"),
-                WIN_PLAN,
-            ]),
-            // Only the watching-system-DNS mode consults it, and the mode
-            // selector sits in the stability panel this daemon does not offer.
-            linux: Unsupported(STABILITY_HIDDEN_ON_LINUX),
-        },
         plan_read(
             "kill_switch_strict_shared_ips",
             "policy.kill_switch_strict_shared_ips",
@@ -750,7 +729,16 @@ fn settings() -> Vec<Setting> {
                     "ProductionLocalNetworks::new(",
                 ),
             ]),
-            linux: Unsupported("localNetworkExceptions"),
+            linux: Read(vec![
+                (
+                    "core/services/service-runtime/src/local_network_source.rs",
+                    "policy.local_networks_auto_accept",
+                ),
+                (
+                    "core/services/linux-service/src/ipc_deps.rs",
+                    "ProductionLocalNetworks::new(",
+                ),
+            ]),
         },
         Setting {
             store: "RoutePolicyRecord",
@@ -769,6 +757,21 @@ fn settings() -> Vec<Setting> {
             linux: Read(vec![
                 (LNX_PLAN_FILE, "if policy.guard_forwarded_traffic"),
                 LNX_PLAN,
+            ]),
+        },
+        Setting {
+            store: "RoutePolicyRecord",
+            field: "external_address_auto_check",
+            windows: Read(vec![
+                (EXTERNAL_ADDRESS, "record.external_address_auto_check"),
+                (
+                    "core/services/windows-service/src/runtime_deps/build.rs",
+                    "secondary_external_address::stored_opt_in(",
+                ),
+            ]),
+            linux: Read(vec![
+                (EXTERNAL_ADDRESS, "record.external_address_auto_check"),
+                (LNX_RUNTIME_DEPS, "opted_in: stored_opt_in("),
             ]),
         },
         Setting {
@@ -844,12 +847,22 @@ fn settings() -> Vec<Setting> {
         Setting {
             store: "RoutePolicyRecord",
             field: "resolve_hosts_bypass",
-            windows: Read(vec![(
-                "core/services/windows-service/src/runtime_deps/dns_stack.rs",
-                "record.resolve_hosts_bypass",
-            )]),
+            windows: Read(vec![
+                (
+                    "core/services/service-runtime/src/hosts_bypass.rs",
+                    "record.resolve_hosts_bypass",
+                ),
+                (
+                    "core/services/windows-service/src/runtime_deps/dns_stack.rs",
+                    "stored_bypass_wanted_by_any(",
+                ),
+            ]),
             linux: Read(vec![
-                (LNX_RUNTIME_DEPS, "record.resolve_hosts_bypass"),
+                (
+                    "core/services/service-runtime/src/hosts_bypass.rs",
+                    "record.resolve_hosts_bypass",
+                ),
+                (LNX_RUNTIME_DEPS, "stored_bypass_wanted_by_any("),
                 (LNX_DNS_STACK_FILE, "HostsBypassDnsResolver::new("),
             ]),
         },
@@ -912,6 +925,18 @@ fn settings() -> Vec<Setting> {
         Setting {
             store: "InstallPolicy",
             field: "default_route_mode",
+            windows: Read(vec![
+                (MISC_HANDLERS, "fn apply_install_default_mode("),
+                (WIN_IPC_SURFACE, "ProductionRoutePolicyWriter::new("),
+            ]),
+            linux: Read(vec![
+                (MISC_HANDLERS, "fn apply_install_default_mode("),
+                (LNX_IPC_DEPS, "ProductionRoutePolicyWriter::new("),
+            ]),
+        },
+        Setting {
+            store: "InstallPolicy",
+            field: "default_leak_protection",
             windows: Read(vec![
                 (MISC_HANDLERS, "fn apply_install_default_mode("),
                 (WIN_IPC_SURFACE, "ProductionRoutePolicyWriter::new("),
@@ -992,27 +1017,6 @@ fn plan_read(field: &'static str, needle: &'static str) -> Setting {
         field,
         windows: Cell::Read(vec![(WIN_PLAN_FILE, needle), WIN_PLAN]),
         linux: Cell::Read(vec![(LNX_PLAN_FILE, needle), LNX_PLAN]),
-    }
-}
-
-fn legacy_block_flag() -> Cell {
-    Cell::Gap {
-        reason: "an older leak-guard switch: no client offers it any more and neither \
-                 planner reads it (the master leak-guard toggle replaced it), yet every \
-                 policy write still stores it",
-        present: vec![],
-        absent: vec![
-            (WIN_PLAN_FILE, "policy.block_secondary_when_unavailable"),
-            (LNX_PLAN_FILE, "policy.block_secondary_when_unavailable"),
-            (
-                "core/services/windows-service/src",
-                "block_secondary_when_unavailable",
-            ),
-            (
-                "core/services/linux-service/src",
-                "block_secondary_when_unavailable",
-            ),
-        ],
     }
 }
 
@@ -1152,7 +1156,10 @@ fn capabilities() -> Vec<Capability> {
                 "core/services/windows-service/src/runtime_deps/ipc_surface.rs",
                 "ProductionLocalNetworks::new(",
             )]),
-            linux: NotOffered,
+            linux: Backed(vec![(
+                "core/services/linux-service/src/ipc_deps.rs",
+                "ProductionLocalNetworks::new(",
+            )]),
         },
         Capability {
             key: "forwardedTrafficGuard",
@@ -1161,7 +1168,10 @@ fn capabilities() -> Vec<Capability> {
                 WIN_PLAN,
             ]),
             linux: Backed(vec![
-                (LNX_PLAN_FILE, "plan_forwarded_flows(stored, &guard)"),
+                (
+                    LNX_PLAN_FILE,
+                    "plan_forwarded_flows_with_foreign(stored, &guard, &foreign)",
+                ),
                 LNX_PLAN,
             ]),
         },
@@ -1464,7 +1474,7 @@ fn every_stored_setting_is_read_hidden_or_a_listed_gap_on_every_os() {
         let what = format!("{}.{}", setting.store, setting.field);
         for os in Os::ALL {
             match setting.cell(os) {
-                Cell::Read(chain) | Cell::AppliedAtWrite(chain) => {
+                Cell::Read(chain) => {
                     check_chain(os, &what, chain, &mut problems);
                 }
                 Cell::Unsupported(key) => {
@@ -1562,12 +1572,12 @@ fn every_capability_flag_matches_what_the_service_wires() {
 /// only in a comment or a test module, does not count.
 #[test]
 fn the_scanner_reads_production_code_only() {
-    let body = "fn f() { policy.mode_a_coverage_strategy }\n\
+    let body = "fn f() { policy.mode_selector }\n\
                 // policy.mode in a comment\n\
                 #[cfg(test)]\n\
                 mod tests {\n    fn g() { policy.mode }\n}\n";
     let code = production_code(body);
     assert!(!contains_code(&code, "policy.mode"));
-    assert!(contains_code(&code, "policy.mode_a_coverage_strategy"));
+    assert!(contains_code(&code, "policy.mode_selector"));
     assert!(contains_code("x.f(", "x.f("));
 }

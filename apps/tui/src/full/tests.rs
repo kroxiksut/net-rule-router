@@ -189,6 +189,31 @@ fn a_new_notice_shows_in_the_bottom_line_then_only_in_the_feed() {
     );
 }
 
+/// A foreign name reaches the frame through a notice; whatever the screen
+/// model let through, the buffer holds nothing that executes or reorders.
+#[test]
+fn a_foreign_name_leaves_no_dangerous_character_in_the_frame() {
+    let mut app = limited();
+    let at = Instant::now();
+    app.notices.push(crate::state::Notice {
+        level: NoticeLevel::Warning,
+        title: "gnp\u{202E}.exe \u{1b}]0;x\u{7}".into(),
+        body: String::new(),
+    });
+    app.last_notice_at = Some(at);
+    let buffer = draw_buffer(&app, COLOUR, 80, 40, at);
+    let mut shown = String::new();
+    for y in 0..40 {
+        for x in 0..80 {
+            shown.push_str(buffer[(x, y)].symbol());
+        }
+    }
+    assert!(shown.contains("gnp\u{b7}.exe"), "{shown}");
+    assert!(!shown
+        .chars()
+        .any(nrr_shared::display_text::needs_substitute));
+}
+
 fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
@@ -466,4 +491,45 @@ fn the_settings_sections_open_from_the_menu() {
     press(&mut app, KeyCode::Up);
     assert_eq!(app.settings.open, None, "back on the list of sections");
     assert!(menu(&app).contains(&"> 0 Settings".to_owned()));
+}
+
+#[test]
+fn ctrl_c_asks_before_dropping_unapplied_edits() {
+    use nrr_client_logic::rules_table::{RuleRow, RuleType, TargetRoute};
+    let texts = texts_en();
+    let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+    app.rules.table.import(
+        vec![RuleRow {
+            id: String::new(),
+            enabled: true,
+            rule_type: RuleType::Domain,
+            match_value: "example.org".into(),
+            target_route: TargetRoute::Secondary,
+            verify: false,
+            comment: String::new(),
+            origin: None,
+        }],
+        true,
+    );
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    handle_key(&mut app, ctrl_c, &texts);
+    assert!(!app.quit, "the first Ctrl+C asks");
+    assert!(crate::screens::rules::quit_question_open(&app));
+    handle_key(&mut app, ctrl_c, &texts);
+    assert!(app.quit, "a second one leaves");
+}
+
+#[test]
+fn panels_that_do_not_fit_give_up_rows_from_the_tallest_down() {
+    assert_eq!(
+        fit_heights(&[5, 6], 20, 3),
+        vec![5, 6],
+        "room enough: as asked"
+    );
+    assert_eq!(fit_heights(&[8, 6, 4], 15, 3), vec![6, 5, 4]);
+    assert_eq!(
+        fit_heights(&[8, 8], 4, 3),
+        vec![3, 3],
+        "none goes below a title and a row"
+    );
 }

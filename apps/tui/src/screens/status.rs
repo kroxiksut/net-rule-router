@@ -5,11 +5,14 @@ use nrr_client_logic::adapters::{bound_row_index, display_name};
 use nrr_client_logic::placeholders::list_summary;
 use nrr_client_logic::Route;
 use nrr_shared::display_text::display_text;
+use nrr_shared::ipc::ContractSkew;
 use nrr_shared::ipc_payloads::{InterfaceRowDto, RouteBindingDto};
+use nrr_shared::platform_profile::PlatformProfile;
 
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::{overlaps, Screen};
+use crate::block_route;
 use crate::i18n::{Key, Texts};
 use crate::keys;
 use crate::link::{admin_command, Link};
@@ -17,6 +20,7 @@ use crate::primary_suggestion;
 use crate::restore;
 use crate::state::{enforcement_text, traffic_carried_text, AppState, NoticeLevel, RoutingState};
 use crate::view::{Panel, ScreenView, Segment, StateTone, ViewLine};
+use crate::vpn_gateway_trust;
 use crate::vpn_trust;
 
 pub struct StatusScreen;
@@ -50,7 +54,9 @@ impl Screen for StatusScreen {
             keys::HELP_STATUS_FEED,
             restore::HELP,
             vpn_trust::HELP,
+            vpn_gateway_trust::HELP,
             primary_suggestion::HELP,
+            block_route::HELP,
         ]
     }
 
@@ -58,24 +64,49 @@ impl Screen for StatusScreen {
         &[
             restore::PLAIN_HELP,
             vpn_trust::HELP,
+            vpn_gateway_trust::HELP,
             primary_suggestion::HELP,
+            block_route::HELP,
         ]
     }
 
+    /// The "To additional route" question takes y, n and Esc first.
+    fn captures_keys(&self, app: &AppState) -> bool {
+        block_route::asking(app)
+    }
+
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
+        if block_route::asking(app) {
+            return match key.code {
+                KeyCode::Char('y') => block_route::answer(app, true),
+                KeyCode::Char('n') | KeyCode::Esc => block_route::answer(app, false),
+                _ => false,
+            };
+        }
         match key.code {
             KeyCode::Char('r') => restore::restore(app),
             KeyCode::Char('t') => vpn_trust::trust_pending(app),
+            KeyCode::Char('a') => vpn_gateway_trust::allow_pending(app),
             KeyCode::Char('p') => primary_suggestion::confirm(app),
+            KeyCode::Char('v') => block_route::ask(app),
             _ => false,
         }
     }
 
     fn on_line(&self, app: &mut AppState, line: &str) -> bool {
+        if block_route::asking(app) {
+            return match line {
+                "y" => block_route::answer(app, true),
+                "n" => block_route::answer(app, false),
+                _ => false,
+            };
+        }
         match line {
             "r" => restore::restore(app),
             "t" => vpn_trust::trust_pending(app),
+            "a" => vpn_gateway_trust::allow_pending(app),
             "p" => primary_suggestion::confirm(app),
+            "v" => block_route::ask(app),
             _ => false,
         }
     }
@@ -125,7 +156,11 @@ pub fn connection_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         Link::Stopped => (
             keys::LINK_STOPPED,
             StateTone::Bad,
-            Some(keys::BANNER_STOPPED),
+            Some(if app.service_loss_raised {
+                keys::BANNER_LOST
+            } else {
+                keys::BANNER_STOPPED
+            }),
         ),
         Link::NotInstalled => (
             keys::LINK_NOT_INSTALLED,
@@ -151,6 +186,16 @@ pub fn connection_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         first.push(Segment::plain(format!(" — {}", texts.get(banner))));
     }
     let mut lines = vec![ViewLine::new(first)];
+    if let (Link::Connected, Some(skew)) = (&app.link, app.contract_skew) {
+        let text = match skew {
+            ContractSkew::ServiceOlder => keys::CONTRACT_SERVICE_OLDER,
+            ContractSkew::ClientOlder => keys::CONTRACT_CLIENT_OLDER,
+        };
+        lines.push(ViewLine::new(vec![Segment::state(
+            texts.get(text),
+            StateTone::Bad,
+        )]));
+    }
     match &app.link {
         Link::NotInstalled => {
             lines.push(fix_line(texts, keys::FIX_INSTALL, "install"));
@@ -158,6 +203,13 @@ pub fn connection_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         }
         Link::Stopped => {
             lines.push(fix_line(texts, keys::FIX_START, "start"));
+            if app.service_loss_raised && PlatformProfile::current().supports.kill_switch {
+                lines.push(fix_line(
+                    texts,
+                    keys::FIX_RESTORE_NETWORK,
+                    "reset-network --confirm",
+                ));
+            }
             lines.push(ViewLine::text(texts.get(keys::RETRYING)));
         }
         Link::Offline => lines.push(ViewLine::text(texts.get(keys::RETRYING))),
@@ -174,6 +226,19 @@ pub fn connection_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         _ => {}
     }
     lines
+}
+
+/// The sentences naming the commands that start the service and, where there is
+/// something to undo, restore the network.
+pub fn recovery_hints(texts: &Texts, can_restore: bool) -> Vec<String> {
+    let mut hints = vec![texts.fill(keys::FIX_START, &[("command", &admin_command("start"))])];
+    if can_restore {
+        hints.push(texts.fill(
+            keys::FIX_RESTORE_NETWORK,
+            &[("command", &admin_command("reset-network --confirm"))],
+        ));
+    }
+    hints
 }
 
 /// The command stands on its own segment, so it reads and copies whole.
@@ -223,10 +288,73 @@ fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     if app.restore.offer.is_some() {
         lines.push(ViewLine::text(texts.get(restore::OFFER_LINE)));
     }
+    // Not dismissible here: the terminal keeps no acknowledgement to hide it by.
+    if app.link.is_connected()
+        && app
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.kill_switch_block_all_armed)
+    {
+        lines.push(ViewLine::new(vec![Segment::state(
+            texts.get(keys::BLOCK_ALL_ARMED),
+            StateTone::Bad,
+        )]));
+    }
+    if app.settings_unreadable {
+        lines.push(ViewLine::new(vec![
+            Segment::state(
+                texts.get(keys::SETTINGS_UNREADABLE_TITLE),
+                StateTone::Caution,
+            ),
+            Segment::plain(format!(" {}", texts.get(keys::SETTINGS_UNREADABLE_BODY))),
+        ]));
+    }
+    if let Some(line) = delivery_line(app, texts) {
+        lines.push(line);
+    }
     lines.extend(traffic_carried_lines(app, texts));
     lines.extend(unresolved_app_lines(app, texts));
     lines.extend(pending_vpn_client_lines(app, texts));
+    lines.extend(pending_vpn_gateway_lines(app, texts));
+    lines.extend(block_route_lines(app, texts));
     lines
+}
+
+/// A blocked site a rule can answer: standing until answered, with the key.
+fn block_route_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
+    let sentences = block_route::lines(app, texts);
+    if sentences.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![ViewLine::new(vec![Segment::state(
+        texts.get(keys::BLOCK_NOTICE_TITLE),
+        StateTone::Caution,
+    )])];
+    lines.extend(sentences.into_iter().map(ViewLine::text));
+    lines
+}
+
+/// The package parts this copy lacks, named the way the window names them.
+fn delivery_line(app: &AppState, texts: &Texts) -> Option<ViewLine> {
+    let parts: Vec<String> = app
+        .delivery_gaps
+        .iter()
+        .filter_map(|gap| match *gap {
+            "presets" => Some(texts.get(keys::DELIVERY_PRESETS)),
+            "locales" => Some(texts.get(keys::DELIVERY_LOCALES)),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(ViewLine::new(vec![
+        Segment::state(texts.get(keys::DELIVERY_TITLE), StateTone::Caution),
+        Segment::plain(format!(
+            " {}",
+            texts.fill(keys::DELIVERY_BODY, &[("parts", parts.join("; "))])
+        )),
+    ]))
 }
 
 /// Another signed-in user's tunnel carrying this user's traffic: standing
@@ -261,6 +389,25 @@ fn pending_vpn_client_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         ViewLine::text(texts.fill(keys::VPN_TRUST_BODY, &[("apps", names.join(", "))])),
         ViewLine::text(texts.get(keys::VPN_TRUST_HINT)),
     ]
+}
+
+/// Another VPN stopped on its way to its server: standing, each server named,
+/// with the key that answers.
+fn pending_vpn_gateway_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
+    if !app.link.is_connected() {
+        return Vec::new();
+    }
+    let sentences = vpn_gateway_trust::sentences(&app.vpn_gateway_trust.pending, texts);
+    if sentences.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![ViewLine::new(vec![Segment::state(
+        texts.get(vpn_gateway_trust::TITLE),
+        StateTone::Caution,
+    )])];
+    lines.extend(sentences.into_iter().map(ViewLine::text));
+    lines.push(ViewLine::text(texts.get(vpn_gateway_trust::HINT)));
+    lines
 }
 
 /// The caller's app rules that found no program: standing while it lasts, so
@@ -420,6 +567,25 @@ mod tests {
     use super::*;
     use crate::testing::{app_at, texts_en, Fixture};
 
+    #[test]
+    fn a_contract_skew_is_said_under_the_connection_line() {
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        let lines = |app: &AppState| -> Vec<String> {
+            connection_lines(app, &texts_en())
+                .iter()
+                .map(ViewLine::plain_text)
+                .collect()
+        };
+        assert_eq!(lines(&app).len(), 1);
+        app.contract_skew = Some(ContractSkew::ServiceOlder);
+        let shown = lines(&app);
+        assert!(shown[1].contains("older than this window"), "{shown:?}");
+        app.link = Link::Offline;
+        assert!(!lines(&app)
+            .iter()
+            .any(|l| l.contains("older than this window")));
+    }
+
     fn shown(app: &AppState) -> Vec<String> {
         routing_lines(app, &texts_en())
             .iter()
@@ -450,6 +616,58 @@ mod tests {
         );
         app.link = Link::Offline;
         assert!(!shown(&app).iter().any(|l| l.contains("weren't found")));
+    }
+
+    /// Leak protection holding everything stands under the state while the
+    /// service says so, and not after it went away.
+    #[test]
+    fn leak_protection_holding_all_traffic_stands_under_the_state() {
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        let holding = |app: &AppState| {
+            shown(app)
+                .iter()
+                .any(|l| l.starts_with("Leak protection is holding all traffic"))
+        };
+        assert!(!holding(&app));
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.kill_switch_block_all_armed = true;
+        }
+        assert!(holding(&app), "{:?}", shown(&app));
+        app.link = Link::Offline;
+        assert!(!holding(&app), "a stale snapshot claims nothing");
+    }
+
+    #[test]
+    fn a_package_without_its_rule_sets_says_so() {
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        assert!(!shown(&app)
+            .iter()
+            .any(|l| l.contains("installation is incomplete")));
+        app.delivery_gaps = vec!["presets", "locales"];
+        let lines = shown(&app);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("The installation is incomplete")
+                    && l.contains("ready-made rule sets; the interface languages")
+                    && l.contains("Reinstall")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn unreadable_settings_say_the_run_is_on_defaults() {
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        assert!(!shown(&app).iter().any(|l| l.contains("could not be read")));
+        app.settings_unreadable = true;
+        assert!(
+            shown(&app)
+                .iter()
+                .any(|l| l.starts_with("Your settings could not be read")
+                    && l.contains("default settings")),
+            "{:?}",
+            shown(&app)
+        );
     }
 
     /// A rule refused for its place stands with the reason Overlaps gives, and
@@ -507,6 +725,42 @@ mod tests {
 
         app.link = Link::Offline;
         assert!(!shown(&app).iter().any(|l| l.contains("Is this your VPN?")));
+    }
+
+    /// Another VPN stopped on its way to its server stands under the state,
+    /// with its program and the key that allows it; `a` writes once, and
+    /// nothing is shown while offline.
+    #[test]
+    fn a_pending_vpn_gateway_is_named_with_its_key_and_a_allows_it() {
+        use nrr_shared::ipc_payloads::VpnGatewayDto;
+        let title = "Let this VPN connect?";
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        assert!(!shown(&app).iter().any(|l| l == title));
+        app.vpn_gateway_trust.pending = vec![VpnGatewayDto {
+            address: "203.0.113.20".into(),
+            program: r"C:\Program Files\Corp\corp-vpn.exe".into(),
+        }];
+        let lines = shown(&app);
+        assert!(lines.iter().any(|l| l == title), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("corp-vpn.exe") && l.contains("203.0.113.20")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.starts_with("a: ")), "{lines:?}");
+
+        let a = KeyEvent::new(KeyCode::Char('a'), crossterm::event::KeyModifiers::NONE);
+        assert!(StatusScreen.on_key(&mut app, a), "a sends the answer");
+        assert!(app.vpn_gateway_trust.busy);
+        assert!(
+            !vpn_gateway_trust::allow_pending(&mut app),
+            "a second press while the write is in flight does nothing"
+        );
+        assert_eq!(app.outbox.take().len(), 1);
+
+        app.link = Link::Offline;
+        assert!(!shown(&app).iter().any(|l| l == title));
     }
 
     /// Another user's tunnel carrying this user's traffic stands under the

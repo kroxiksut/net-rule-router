@@ -1,12 +1,9 @@
 use super::*;
 
 #[test]
-fn mock_and_preview_local_are_not_service_backed() {
+fn the_mock_is_not_service_backed() {
     assert!(!backend_provider_is_service_backed(
         BackendProviderKind::Mock
-    ));
-    assert!(!backend_provider_is_service_backed(
-        BackendProviderKind::PreviewLocal
     ));
 }
 

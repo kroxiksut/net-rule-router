@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use nrr_client_logic::rules_table::{RuleType, TargetRoute};
+use nrr_client_logic::rules_table::{RuleType, TargetRoute, CHECK_MAX_POLLS, CHECK_POLL_SECS};
 use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
@@ -23,7 +23,7 @@ use crate::i18n::{Key, Texts};
 use crate::state::AppState;
 
 /// How long the service gets between two reads of its progress.
-pub const POLL: Duration = Duration::from_secs(2);
+pub const POLL: Duration = Duration::from_secs(CHECK_POLL_SECS);
 
 /// A check in progress.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -34,6 +34,8 @@ pub struct Check {
     pub accepted: Option<u32>,
     /// Hosts it has yet to try, as the last read said.
     pub pending: Option<u32>,
+    /// Reads made so far; the window gives up at the same count.
+    pub polls: u32,
 }
 
 #[derive(Debug, Default)]
@@ -166,18 +168,25 @@ fn poll_job() -> Job {
     })
 }
 
-fn polled(app: &mut AppState, result: Result<RulesListResponse, Failure>) {
+pub(super) fn polled(app: &mut AppState, result: Result<RulesListResponse, Failure>) {
     let rules = &mut app.rules;
     if rules.main_route.check.is_none() {
         return;
     }
-    let list = match result {
-        Ok(list) => list,
-        Err(failure) => {
-            rules.main_route.check = None;
-            rules.note = Some(Note::failed(text::CHECK_FAILED, failure));
-            return;
-        }
+    let Some(check) = rules.main_route.check.as_mut() else {
+        return;
+    };
+    check.polls += 1;
+    if check.polls > CHECK_MAX_POLLS {
+        rules.main_route.check = None;
+        rules.note = Some(Note::failed(text::CHECK_FAILED, Failure::code("timeout")));
+        return;
+    }
+    // A read that fails is tried again, as the window does: the check runs
+    // on in the service and the poll is bounded.
+    let Ok(list) = result else {
+        app.outbox.push_after(POLL, poll_job());
+        return;
     };
     rules.table.merge_main_route(&list.rows);
     if list.main_route_pending > 0 {

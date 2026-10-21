@@ -87,6 +87,8 @@ pub mod vpn_bootstrap_endpoints;
 // Learned VPN client apps — persisted exe paths of role-verified
 // VPN client processes; pre-seeds the proactive kill-switch app exemption.
 pub mod vpn_client_apps;
+// The gateways of another VPN each user let through leak protection.
+pub mod vpn_gateway_confirmations;
 pub mod write_ledger;
 
 // Re-export the most commonly used types so callers can write
@@ -117,7 +119,8 @@ pub use policy_settings::{
     VALID_POLICY_SLUGS,
 };
 pub use principal_purge::{
-    principals_with_state, purge_principal_data, purge_principal_rules, PrincipalPurgeSummary,
+    principals_with_state, purge_machine_traces, purge_principal_data, purge_principal_rules,
+    PrincipalPurgeSummary,
 };
 pub use profile::{resolve_storage_topology, StorageProfile, StorageTopology};
 pub use resolution_source::StorageResolutionSource;
@@ -144,6 +147,7 @@ pub use traffic_stats::{
 pub use traffic_stats_settings::{TrafficStatsSettings, TrafficStatsSettingsRepository};
 pub use vpn_bootstrap_endpoints::VpnBootstrapEndpointsRepository;
 pub use vpn_client_apps::VpnClientAppsRepository;
+pub use vpn_gateway_confirmations::{VpnGatewayConfirmation, VpnGatewayConfirmationsRepository};
 
 // Re-export the domain types that appear in our public API so callers do not
 // have to add a separate `nrr-domain` dependency just to construct requests.

@@ -27,7 +27,7 @@
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nrr_platform_linux::daemon_lock::DaemonLock;
 use nrr_platform_linux::systemd::{notify, watchdog_interval, NotifyError, NotifyState};
@@ -44,7 +44,7 @@ use nrr_service_runtime::{
 use nrr_shared::ipc::IpcOperationName;
 use nrr_storage::StorageProfile;
 
-use crate::unix_socket_server::{epoch_secs, SOCKET_PATH};
+use crate::unix_socket_server::SOCKET_PATH;
 
 /// Fallback watchdog ping cadence when `$WATCHDOG_USEC` is absent (i.e. the unit
 /// declared no `WatchdogSec`, or we are not running under systemd).
@@ -72,7 +72,7 @@ pub fn run() -> ExitCode {
     // state + audit, /var/log for operational logs) and opens the DBs + writers.
     // Needs root / the systemd StateDirectory + LogsDirectory; degrades to a
     // report without a log writer when storage is unavailable.
-    let artifacts = run_bootstrap(&BootstrapConfig::new(StorageProfile::ProductionService));
+    let mut artifacts = run_bootstrap(&BootstrapConfig::new(StorageProfile::ProductionService));
 
     // Install the NDJSON tracing subscriber so operational events are persisted
     // (same subscriber the Windows service uses; OS-neutral). The handle goes to
@@ -93,6 +93,22 @@ pub fn run() -> ExitCode {
             None
         }
     };
+
+    // The activation marker the previous run left, if any: audited and cleared
+    // before anything new is applied. A blocking outcome walks the runtime to
+    // `RecoveryRequired`; a stale marker only warns.
+    let recovery = nrr_service_runtime::run_crash_recovery_on_startup(
+        &artifacts.topology.data_dir,
+        artifacts.audit_writer.clone(),
+        Arc::new(nrr_service_runtime::ProductionIdGenerator::new()),
+    );
+    tracing::info!(
+        target: "nrr::recovery",
+        msg_key = "svc-boot-crash-recovery-complete",
+        outcome = ?recovery,
+        "crash recovery probe complete",
+    );
+    recovery.record_in(&mut artifacts.report);
 
     // The IPC server is NOT bound here: the supervised runtime binds it as part
     // of its accept-task bundle, so a bind failure lands in health rather than
@@ -220,9 +236,7 @@ pub fn run() -> ExitCode {
     );
     // READY comes from here, once the runtime reports the socket bound.
     let controller = LogController::new(health, notify);
-    let data_dir = artifacts.topology.data_dir.clone();
     run_supervised_runtime(&controller, &stop, artifacts, deps);
-    nrr_service_runtime::crash_series::end_run(&data_dir);
 
     tracing::info!(
         target: "nrr::lifecycle",
@@ -273,26 +287,18 @@ impl Heartbeats {
 /// withholds the ping when any heartbeat goes stale, or the separation buys
 /// nothing: an unconditional ping says only "the process is scheduled".
 fn spawn_watchdog(interval: Duration, stop: StopToken, beats: Heartbeats) {
-    let window = liveness_window(interval);
+    let window = Duration::from_secs(liveness_window(interval));
     let spawned = std::thread::Builder::new()
         .name("nrr-sd-watchdog".to_owned())
         .spawn(move || {
-            let mut last_look = epoch_secs();
+            let started = Instant::now();
+            let mut ages = BeatAges::default();
             while !stop.is_stop_requested() {
                 // An idle acceptor sits in `accept`; the poke makes a live one
                 // turn once, and refresh its beat, before the next look.
                 let _ = std::os::unix::net::UnixStream::connect(SOCKET_PATH);
                 std::thread::sleep(interval);
-                let now = epoch_secs();
-                let jumped = clock_jumped(last_look, now, interval);
-                last_look = now;
-                // After a sleep every beat reads as old as the nap: the
-                // components get one round to beat again before being judged.
-                if jumped {
-                    let _ = notify(&[NotifyState::Watchdog]);
-                    continue;
-                }
-                let stale = stale_heartbeats(now, window, &beats.readings());
+                let stale = ages.stale(started.elapsed(), window, &beats.readings());
                 if !stale.is_empty() {
                     tracing::error!(
                         target: "nrr::lifecycle",
@@ -326,25 +332,49 @@ fn liveness_window(interval: Duration) -> u64 {
     RUNTIME_LIVENESS_WINDOW_SECS.max(interval.as_secs().saturating_mul(2))
 }
 
-/// Whether the wall clock moved far more than one watchdog sleep between two
-/// looks: the machine slept or the clock was set forward. The watchdog's own
-/// thread does not wedge with the runtime, so only that stretches its sleep.
-fn clock_jumped(previous: u64, now: u64, interval: Duration) -> bool {
-    let sleep = interval.as_secs();
-    now.saturating_sub(previous) > sleep.saturating_mul(2).saturating_add(10)
+/// How long each heartbeat has gone unchanged, on the monotonic clock.
+///
+/// A beat is a wall-clock stamp, so its age read against the wall clock lies:
+/// set back an hour, a wedged loop looks fresh for that hour; after a suspend
+/// every beat looks as old as the nap. Judging "has it moved since" instead
+/// needs no wall clock at all, and `CLOCK_MONOTONIC` stands still in suspend.
+#[derive(Default)]
+struct BeatAges {
+    /// Last value seen per heartbeat, and the monotonic moment it changed.
+    seen: Vec<(&'static str, u64, Duration)>,
 }
 
-/// Names of the heartbeats older than `window` seconds at `now`.
-fn stale_heartbeats(
-    now: u64,
-    window: u64,
-    readings: &[(&'static str, Option<u64>)],
-) -> Vec<&'static str> {
-    readings
-        .iter()
-        .filter(|(_, beat)| beat.is_some_and(|at| now > at.saturating_add(window)))
-        .map(|(name, _)| *name)
-        .collect()
+impl BeatAges {
+    /// Names of the heartbeats unchanged for longer than `window` at `now`
+    /// (monotonic time since the watchdog started).
+    fn stale(
+        &mut self,
+        now: Duration,
+        window: Duration,
+        readings: &[(&'static str, Option<u64>)],
+    ) -> Vec<&'static str> {
+        // A heartbeat with no evidence drops out: when it comes back, its
+        // first value starts a fresh age rather than an inherited one.
+        self.seen
+            .retain(|(name, ..)| readings.iter().any(|(n, beat)| n == name && beat.is_some()));
+        let mut stale = Vec::new();
+        for &(name, beat) in readings {
+            let Some(beat) = beat else { continue };
+            match self.seen.iter_mut().find(|(n, ..)| *n == name) {
+                Some(entry) if entry.1 != beat => {
+                    entry.1 = beat;
+                    entry.2 = now;
+                }
+                Some(entry) => {
+                    if now.saturating_sub(entry.2) > window {
+                        stale.push(name);
+                    }
+                }
+                None => self.seen.push((name, beat, now)),
+            }
+        }
+        stale
+    }
 }
 
 /// Whether systemd may be told the unit is up.
@@ -584,65 +614,108 @@ mod tests {
         }
     }
 
-    /// A wedged enforcement pass or accept loop used to go unnoticed while
-    /// the adapter monitor kept ticking.
-    /// A resume from a 40-minute sleep is a clock jump, not a wedge; an
-    /// ordinary round, a slow one and a clock set back are not jumps.
-    #[test]
-    fn a_sleep_reads_as_a_clock_jump_not_a_stale_heartbeat() {
-        let interval = Duration::from_secs(15);
-        assert!(clock_jumped(1_000, 1_000 + 2_393, interval));
-        assert!(!clock_jumped(1_000, 1_015, interval));
-        assert!(!clock_jumped(1_000, 1_035, interval));
-        assert!(!clock_jumped(1_000, 900, interval));
+    const WINDOW: Duration = Duration::from_secs(RUNTIME_LIVENESS_WINDOW_SECS);
+
+    fn at(secs: u64) -> Duration {
+        Duration::from_secs(secs)
     }
 
+    /// A wedged enforcement pass or accept loop used to go unnoticed while
+    /// the adapter monitor kept ticking.
     #[test]
-    fn any_stale_heartbeat_withholds_the_ping() {
-        let fresh = NOW - 1;
-        let old = NOW - RUNTIME_LIVENESS_WINDOW_SECS - 1;
-        let window = RUNTIME_LIVENESS_WINDOW_SECS;
-        let all_fresh = [
-            ("adapter-monitor", Some(fresh)),
-            ("enforcement", Some(fresh)),
-            ("ipc-accept", Some(fresh)),
-        ];
-        assert!(stale_heartbeats(NOW, window, &all_fresh).is_empty());
-
-        let enforcement_hung = [
-            ("adapter-monitor", Some(fresh)),
-            ("enforcement", Some(old)),
-            ("ipc-accept", Some(fresh)),
-        ];
+    fn any_stuck_heartbeat_withholds_the_ping() {
+        let mut ages = BeatAges::default();
+        let beats = |adapters, enforcement, accept| {
+            [
+                ("adapter-monitor", Some(adapters)),
+                ("enforcement", Some(enforcement)),
+                ("ipc-accept", Some(accept)),
+            ]
+        };
+        assert!(ages.stale(at(0), WINDOW, &beats(NOW, NOW, NOW)).is_empty());
+        // Everything moves except enforcement.
+        assert!(ages
+            .stale(at(30), WINDOW, &beats(NOW + 30, NOW, NOW + 30))
+            .is_empty());
+        assert!(
+            ages.stale(at(60), WINDOW, &beats(NOW + 60, NOW, NOW + 60))
+                .is_empty(),
+            "exactly at the edge is still alive"
+        );
         assert_eq!(
-            stale_heartbeats(NOW, window, &enforcement_hung),
+            ages.stale(at(61), WINDOW, &beats(NOW + 61, NOW, NOW + 61)),
             vec!["enforcement"]
         );
+        // It moves again: vouched for again.
+        assert!(ages
+            .stale(at(62), WINDOW, &beats(NOW + 62, NOW + 62, NOW + 62))
+            .is_empty());
+    }
 
-        let acceptor_dead = [
-            ("adapter-monitor", Some(fresh)),
-            ("enforcement", Some(fresh)),
-            ("ipc-accept", Some(old)),
-        ];
+    /// Read against the wall clock, a step back of an hour makes a wedged
+    /// loop's last stamp look fresh for that hour.
+    #[test]
+    fn a_clock_set_back_does_not_hide_a_stuck_loop() {
+        let mut ages = BeatAges::default();
+        let back = NOW - 3_600;
+        let beats = |adapters, enforcement| {
+            [
+                ("adapter-monitor", Some(adapters)),
+                ("enforcement", Some(enforcement)),
+            ]
+        };
+        assert!(ages.stale(at(0), WINDOW, &beats(NOW, NOW)).is_empty());
+        // The clock steps back; the monitor keeps beating, enforcement is stuck
+        // on its pre-step stamp, which now reads as an hour in the future.
+        assert!(ages.stale(at(15), WINDOW, &beats(back, NOW)).is_empty());
         assert_eq!(
-            stale_heartbeats(NOW, window, &acceptor_dead),
-            vec!["ipc-accept"]
+            ages.stale(at(75), WINDOW, &beats(back + 60, NOW)),
+            vec!["enforcement"]
         );
-        // Exactly at the edge is still alive.
-        let edge = [("adapter-monitor", Some(NOW - window))];
-        assert!(stale_heartbeats(NOW, window, &edge).is_empty());
+    }
+
+    /// A live loop after the clock is set back stamps an older value; that
+    /// is movement, not a wedge.
+    #[test]
+    fn a_beat_that_moves_backwards_is_alive() {
+        let mut ages = BeatAges::default();
+        let one = |beat| [("enforcement", Some(beat))];
+        assert!(ages.stale(at(0), WINDOW, &one(NOW)).is_empty());
+        assert!(ages.stale(at(50), WINDOW, &one(NOW - 3_600)).is_empty());
+        assert!(ages.stale(at(100), WINDOW, &one(NOW - 3_550)).is_empty());
+    }
+
+    /// The monotonic clock stands still in suspend, so a long nap followed by
+    /// a beat in the first round after it never reads as a wedge, however far
+    /// the wall-clock stamps moved meanwhile.
+    #[test]
+    fn a_sleep_is_not_a_stale_heartbeat() {
+        let mut ages = BeatAges::default();
+        let one = |beat| [("adapter-monitor", Some(beat))];
+        assert!(ages.stale(at(0), WINDOW, &one(NOW)).is_empty());
+        assert!(ages.stale(at(15), WINDOW, &one(NOW + 2_400)).is_empty());
     }
 
     /// Missing evidence is not evidence of death: withholding here would have
     /// systemd restart a service that is running fine.
     #[test]
     fn a_missing_heartbeat_keeps_the_ping() {
+        let mut ages = BeatAges::default();
         let none = [
             ("adapter-monitor", None),
             ("enforcement", None),
             ("ipc-accept", None),
         ];
-        assert!(stale_heartbeats(NOW, RUNTIME_LIVENESS_WINDOW_SECS, &none).is_empty());
+        assert!(ages.stale(at(0), WINDOW, &none).is_empty());
+        assert!(ages.stale(at(600), WINDOW, &none).is_empty());
+        // Gone for a while, then back with the same stamp: its age restarts.
+        assert!(ages
+            .stale(at(700), WINDOW, &[("ipc-accept", Some(NOW))])
+            .is_empty());
+        assert!(ages.stale(at(710), WINDOW, &none).is_empty());
+        assert!(ages
+            .stale(at(800), WINDOW, &[("ipc-accept", Some(NOW))])
+            .is_empty());
     }
 
     /// The acceptor is poked once per interval, so a long interval must not

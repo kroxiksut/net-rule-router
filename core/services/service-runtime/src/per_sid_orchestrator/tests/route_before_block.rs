@@ -36,6 +36,7 @@ fn fixture_with_route_sync(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(live);
+            Ok(())
         });
         hook
     };
@@ -132,4 +133,75 @@ fn route_sync_is_skipped_when_a_reconcile_changes_nothing() {
         observed.lock().unwrap().is_empty(),
         "an unchanged reconcile must not drive the route pass",
     );
+}
+
+/// What the two hooks were asked, for the scoped-versus-full tests.
+struct SyncCalls {
+    full: Arc<Mutex<usize>>,
+    scoped: Arc<Mutex<Vec<Vec<std::net::IpAddr>>>>,
+}
+
+fn orch_with_both_hooks(
+    scoped_answer: bool,
+) -> (
+    Arc<PerSidApplyOrchestrator>,
+    Arc<ScriptedSource>,
+    Arc<ScriptedRules>,
+    SyncCalls,
+) {
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let source = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let calls = SyncCalls {
+        full: Arc::new(Mutex::new(0)),
+        scoped: Arc::new(Mutex::new(Vec::new())),
+    };
+    let full = Arc::clone(&calls.full);
+    let scoped = Arc::clone(&calls.scoped);
+    let orch = Arc::new(
+        PerSidApplyOrchestrator::new(
+            session,
+            Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+            Arc::clone(&rules) as Arc<dyn RulesProvider>,
+            Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
+            Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+        )
+        .with_kill_switch_resolver(Arc::new(|_, _| Some(full_ks_resolution())))
+        .with_route_sync(Arc::new(move || {
+            *full.lock().unwrap() += 1;
+            Ok(())
+        }))
+        .with_scoped_route_sync(Arc::new(move |_, hosts| {
+            scoped.lock().unwrap().push(hosts.to_vec());
+            scoped_answer
+        })),
+    );
+    (orch, source, rules, calls)
+}
+
+#[test]
+fn a_few_new_host_pins_route_only_their_own_addresses() {
+    let (orch, src, rules, calls) = orch_with_both_hooks(true);
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 10)));
+    src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+
+    let scoped = calls.scoped.lock().unwrap().clone();
+    assert_eq!(scoped.len(), 1, "the narrow sync ran once");
+    assert!(scoped[0].contains(&std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))));
+    assert_eq!(*calls.full.lock().unwrap(), 0, "no full route plan");
+}
+
+#[test]
+fn a_declined_narrow_sync_falls_back_to_the_full_route_pass() {
+    let (orch, src, rules, calls) = orch_with_both_hooks(false);
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 10)));
+    src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+
+    assert_eq!(calls.scoped.lock().unwrap().len(), 1);
+    assert_eq!(*calls.full.lock().unwrap(), 1);
 }

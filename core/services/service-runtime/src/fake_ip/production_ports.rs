@@ -179,6 +179,15 @@ pub struct FlowActivityObserver {
     dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Whose book a relayed flow teaches: its own owner's, and only an unattributed
+/// flow falls back to the routing user.
+fn notice_principal(
+    owner: Option<String>,
+    routing: &(dyn Fn() -> Option<String> + Send + Sync),
+) -> Option<String> {
+    owner.or_else(routing)
+}
+
 impl FlowActivityObserver {
     #[must_use]
     pub fn new(
@@ -201,9 +210,7 @@ impl FlowActivityObserver {
                 });
                 while let Ok((hostname, owner, at)) = inbox.recv() {
                     let _notice = lease.as_ref().map(ThreadLease::work);
-                    // Another served user's flow teaches their book, not the
-                    // routing user's.
-                    if let Some(sid) = owner.or_else(|| active_sid()) {
+                    if let Some(sid) = notice_principal(owner, active_sid.as_ref()) {
                         engine.note_flow(&sid, &hostname, at);
                     }
                 }
@@ -512,6 +519,19 @@ mod tests {
         assert!(
             observer.dropped.load(Ordering::Relaxed) > 0,
             "a full queue must drop notices, not wait",
+        );
+    }
+
+    #[test]
+    fn a_relayed_flow_teaches_its_owners_book_not_the_routing_users() {
+        let routing = || Some("S-1-5-21-ALICE".to_owned());
+        assert_eq!(
+            notice_principal(Some("S-1-5-21-BOB".to_owned()), &routing).as_deref(),
+            Some("S-1-5-21-BOB"),
+        );
+        assert_eq!(
+            notice_principal(None, &routing).as_deref(),
+            Some("S-1-5-21-ALICE"),
         );
     }
 

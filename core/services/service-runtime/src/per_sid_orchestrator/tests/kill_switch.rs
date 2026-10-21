@@ -36,14 +36,6 @@ fn fixture_with_resolution_and_registry(
     (api, orch, source, rules, registry)
 }
 
-/// Kill-switch on, but posture set to fail-OPEN (legacy behaviour:
-/// allow + warn when the secondary can't be resolved).
-fn snap_block_fail_open(primary: &str, secondary: &str) -> PerSidPolicySnapshot {
-    let mut s = snap_block(primary, secondary);
-    s.kill_switch_fail_closed = false;
-    s
-}
-
 /// The blanket posture blocks the whole of IPv6 too, so what the resolution
 /// says must survive it has to REACH the emitter. It once did not: the
 /// exemptions the orchestrator builds from the resolution dropped the v6
@@ -100,8 +92,8 @@ fn mode_b_arms_catch_all_kill_switch() {
             .iter()
             .filter(|f| f.local_interface_luid == Some(KS_LUID))
             .count(),
-        2,
-        "egress-via-secondary exemption present at both layers"
+        4,
+        "egress-via-secondary exemption at both layers, IPv4 and IPv6"
     );
     assert!(
         filters.iter().filter(|f| f.remote_subnet.is_some()).count() >= 3,
@@ -186,35 +178,66 @@ fn killswitch_registry_clears_when_leak_guard_disarms() {
     }
 }
 
+/// The catch-all cannot arm without a server address or a trusted client: it
+/// would seal the tunnel's own reconnect. With the tunnel UP, what it falls
+/// back to is the pins of "routed sites" — the rule destination may still
+/// leave through the tunnel — never an unconditional block of the rule hosts,
+/// and the user is told the rest is not covered.
 #[test]
-fn mode_b_catch_all_fails_open_without_server_exemption() {
-    let (api, orch, src, rules) = fixture_with_resolution(Some(KillSwitchResolution {
-        bootstrap_server_ips_v6: Vec::new(),
-        secondary_luid: KS_LUID,
-        bootstrap_server_ips: vec![], // unknown server → must not arm
-        local_subnets: vec![],
-        local_subnets_v6: Vec::new(),
-        foreign_tunnel_luids: Vec::new(),
-    }));
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
-    // Fail-OPEN posture: the catch-all refusing to arm without a server
-    // exemption (to avoid a reconnect deadlock) is the fail-open contract.
-    // Under fail-closed the user has explicitly opted to cut everything,
-    // so it DOES arm — that path is covered by
-    // `kill_switch_fail_closed_mode_b_blocks_all_when_unresolved`.
-    let mut s = snap_block_mode_b("Wi-Fi", "TAP");
-    s.kill_switch_fail_closed = false;
-    src.set("S-1-5-21-A", s);
+fn a_catch_all_that_cannot_arm_falls_back_to_pins_on_a_live_tunnel() {
+    use nrr_shared::ipc_payloads::StatusUpdateEvent;
+    let ip = Ipv4Addr::new(198, 51, 100, 8);
+    let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+    let gui = bus.subscribe_as("gui-a".into(), Some("S-1-5-21-A".into()), Some(0));
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let src = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let no_server = KillSwitchResolution {
+        bootstrap_server_ips: Vec::new(),
+        ..full_ks_resolution()
+    };
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&src) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
+        Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_kill_switch_resolver(Arc::new(move |_, _| Some(no_server.clone())))
+    .with_events(Arc::clone(&bus));
+    rules.set(rules_with_secondary_ip(ip));
+    src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
 
-    orch.install_for_sid("S-1-5-21-A").unwrap();
-    let filters = api.wfp_filters.lock().unwrap();
-    assert_eq!(
-        filters
+    let filters = match orch
+        .compute_filters_for_sid("S-1-5-21-A", false, None, ComputeIntent::Apply)
+        .unwrap()
+    {
+        ComputedFilterSet::Install(plan) => plan.filters,
+        _ => panic!("expected an installable filter set"),
+    };
+    assert!(
+        connect_allowed(&filters, ip, KS_LUID),
+        "the rule destination still leaves through the live tunnel"
+    );
+    assert!(
+        !connect_allowed(&filters, ip, PRIMARY_LUID),
+        "and never over the main link"
+    );
+    assert!(
+        connect_allowed(&filters, Ipv4Addr::new(203, 0, 113, 50), PRIMARY_LUID),
+        "nothing pretends to be a blanket"
+    );
+    assert!(!orch.any_block_all_armed());
+    assert!(
+        bus.peek_pending_for(&gui.subscription_id, 8)
             .iter()
-            .filter(|f| f.action == WfpAction::Block)
-            .count(),
-        0,
-        "fail-open + no server exemption → catch-all must not arm (avoid reconnect deadlock)"
+            .any(|e| matches!(
+                &e.event,
+                StatusUpdateEvent::ProtectionCoverageChanged { reason }
+                    if reason == "blanket-block-not-armed"
+            )),
+        "the user hears that everything else is not covered"
     );
 }
 
@@ -392,31 +415,25 @@ fn reconcile_is_noop_for_uninstalled_sid() {
 #[test]
 fn kill_switch_arms_when_secondary_bound_even_without_flag() {
     // binding a secondary adapter is itself the
-    // request to protect its traffic, so the leak-guard now arms on the
-    // bound secondary alone, even with the opt-in
-    // `block_secondary_when_unavailable` toggle OFF. Before 0706 this SID
-    // carried only the bare rule permit and leaked to the primary the
-    // instant the secondary adapter dropped (HW test #2/#8: zero kill-switch codegen
-    // log lines for the whole run because the gate was toggle-only).
+    // request to protect its traffic, so the leak-guard arms on the bound
+    // secondary alone; without it this SID leaked to the primary the instant
+    // the secondary adapter dropped.
     let ip = Ipv4Addr::new(203, 0, 113, 9);
     let (api, orch, src, rules) = fixture_with_luid(Some(KS_LUID));
     rules.set(rules_with_secondary_ip(ip));
-    // block_secondary_when_unavailable is false in snap_full — the bound
-    // secondary must arm the guard regardless of the opt-in toggle.
     let s = snap_full("Wi-Fi", "TAP");
-    assert!(!s.block_secondary_when_unavailable);
     src.set("S-1-5-21-A", s);
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
     let filters = api.wfp_filters.lock().unwrap();
     // The LUID-conditional egress pair (permit-via-secondary + block-off-secondary) is
     // the kill-switch's signature — its presence proves the guard armed off
-    // the bound secondary alone, with the toggle still off.
+    // the bound secondary alone.
     assert!(
         filters
             .iter()
             .any(|f| f.local_interface_luid == Some(KS_LUID)),
-        "a bound secondary must arm the LUID-pinned kill-switch even with the toggle off",
+        "a bound secondary must arm the LUID-pinned kill-switch alone",
     );
     assert!(
         filters.iter().any(|f| f.action == WfpAction::Block),
@@ -424,42 +441,33 @@ fn kill_switch_arms_when_secondary_bound_even_without_flag() {
     );
 }
 
+/// "Routed sites" is not offered under the additional default route, and a
+/// stored one means "everything" there: the catch-all arms.
 #[test]
-fn strict_mode_arms_leak_guard_even_without_explicit_flag() {
-    // regression for the Strict-mode leak.
-    // Choosing StrictSecondaryFailClosed as the default-route mode must
-    // install block filters on its own: the Fail-Closed banner probe
-    // already reports this mode as "protected", so if enforcement gated
-    // only on `block_secondary_when_unavailable` the real IP would leak
-    // while the UI claimed protection.
+fn routed_sites_under_the_additional_default_route_protects_everything() {
     let (api, orch, src, rules) = fixture_with_resolution(Some(full_ks_resolution()));
     rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
-    let mut s = snap_full("Wi-Fi", "TAP");
-    s.mode = PerSidBehaviorMode::StrictSecondaryFailClosed;
-    // The separate toggle stays OFF on purpose — the strict MODE alone
-    // must arm the guard.
-    assert!(!s.block_secondary_when_unavailable);
-    src.set("S-1-5-21-A", s);
+    src.set(
+        "S-1-5-21-A",
+        snap_with(
+            "Wi-Fi",
+            "TAP",
+            PerSidBehaviorMode::PreferSecondaryWhenAvailable,
+            nrr_domain::LeakProtection::Sites,
+        ),
+    );
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
     let filters = api.wfp_filters.lock().unwrap();
-    // The catch-all kill-switch is the only source of an egress-via-secondary
-    // exemption (LUID-conditional permit) and the loopback/link-local/LAN
-    // subnet exemptions — their presence proves the guard armed off the
-    // strict MODE alone (the toggle was off). Before the fix this SID would
-    // carry none of them.
     assert_eq!(
         filters
             .iter()
             .filter(|f| f.local_interface_luid == Some(KS_LUID))
             .count(),
-        2,
-        "strict mode arms the catch-all: egress-via-secondary exemption at both layers (0704 P2)",
+        4,
+        "the catch-all's egress-via-secondary exemption at both layers, both families",
     );
-    assert!(
-        filters.iter().filter(|f| f.remote_subnet.is_some()).count() >= 3,
-        "strict mode arms the catch-all: loopback + link-local + LAN exemptions present",
-    );
+    assert!(orch.any_block_all_armed());
 }
 
 #[test]
@@ -499,9 +507,7 @@ fn reconcile_swaps_block_shape_on_vpn_loss_without_uncovering() {
         })),
     );
     rules.set(rules_with_secondary_ip(ip));
-    let mut s = snap_block("Wi-Fi", "TAP");
-    s.kill_switch_fail_closed = true;
-    source.set("S-1-5-21-A", s);
+    source.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
     assert!(
@@ -675,7 +681,6 @@ fn a_vpn_named_binary_outside_the_program_folders_waits_for_confirmation() {
 /// below the block lane: the catch-all lets it out, the pins do not.
 #[test]
 fn a_main_link_app_cannot_reach_a_tunnel_host_while_the_tunnel_is_down() {
-    use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
     const MAIL: &str = r"C:\Program Files\mail\mail.exe";
     let tunnel_host = Ipv4Addr::new(203, 0, 113, 9);
     for mode_b in [false, true] {
@@ -708,9 +713,12 @@ fn a_main_link_app_cannot_reach_a_tunnel_host_while_the_tunnel_is_down() {
         let snap = if mode_b {
             snap_block_mode_b("Wi-Fi", "TAP")
         } else {
-            let mut s = snap_block("Wi-Fi", "TAP");
-            s.mode_a_coverage_strategy = ModeACoverageStrategy::FailClosedUnknown;
-            s
+            snap_with(
+                "Wi-Fi",
+                "TAP",
+                PerSidBehaviorMode::PreferPrimary,
+                nrr_domain::LeakProtection::Everything,
+            )
         };
         source.set("S-1-5-21-A", snap);
 
@@ -749,7 +757,6 @@ fn a_main_link_app_cannot_reach_a_tunnel_host_while_the_tunnel_is_down() {
 /// program off the tunnel's subnet while the tunnel is down.
 #[test]
 fn a_main_link_app_cannot_reach_a_tunnel_subnet_while_the_tunnel_is_down() {
-    use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
     use nrr_shared::ip_block::IpBlock;
     const MAIL: &str = r"C:\Program Files\mail\mail.exe";
     let subnet = (Ipv4Addr::new(198, 51, 100, 0), 24u8);
@@ -791,9 +798,12 @@ fn a_main_link_app_cannot_reach_a_tunnel_subnet_while_the_tunnel_is_down() {
         let snap = if mode_b {
             snap_block_mode_b("Wi-Fi", "TAP")
         } else {
-            let mut s = snap_block("Wi-Fi", "TAP");
-            s.mode_a_coverage_strategy = ModeACoverageStrategy::FailClosedUnknown;
-            s
+            snap_with(
+                "Wi-Fi",
+                "TAP",
+                PerSidBehaviorMode::PreferPrimary,
+                nrr_domain::LeakProtection::Everything,
+            )
         };
         source.set("S-1-5-21-A", snap);
 
@@ -996,6 +1006,7 @@ fn is_app_only_block_classifies_only_appscoped_dest_less_blocks() {
             remote_subnet: subnet,
             remote_subnet_v6: None,
             ip_protocol: None,
+            remote_subnet_set: Vec::new(),
         }
     }
     let ip = Ipv4Addr::new(203, 0, 113, 9);
@@ -1043,23 +1054,31 @@ fn is_app_only_block_classifies_only_appscoped_dest_less_blocks() {
     )));
 }
 
+/// With leak protection off, a tunnel that is gone leaves the rule permit
+/// alone: no block, no egress condition. The ordinary "additional connection
+/// is down" notice is the warning.
 #[test]
-fn kill_switch_fails_open_when_luid_unresolved_and_posture_is_fail_open() {
+fn protection_off_installs_no_guard_when_the_tunnel_is_unresolved() {
     let ip = Ipv4Addr::new(203, 0, 113, 9);
-    // Flag is ON but posture is fail-OPEN, and the LUID can't resolve.
     let (api, orch, src, rules) = fixture_with_luid(None);
     rules.set(rules_with_secondary_ip(ip));
-    src.set("S-1-5-21-A", snap_block_fail_open("Wi-Fi", "TAP"));
+    src.set(
+        "S-1-5-21-A",
+        snap_with(
+            "Wi-Fi",
+            "TAP",
+            PerSidBehaviorMode::PreferPrimary,
+            nrr_domain::LeakProtection::Off,
+        ),
+    );
 
     let count = orch.install_for_sid("S-1-5-21-A").unwrap();
-    assert_eq!(count, 1, "fail-open → no kill-switch, no black hole");
+    assert_eq!(count, 1, "only the rule permit");
     let filters = api.wfp_filters.lock().unwrap();
-    assert!(
-        filters
-            .iter()
-            .all(|f| f.action == WfpAction::Permit && f.local_interface_luid.is_none()),
-        "fail-open leaves only the rule permit — no block, no egress condition"
-    );
+    assert!(filters
+        .iter()
+        .all(|f| f.action == WfpAction::Permit && f.local_interface_luid.is_none()));
+    assert!(!orch.any_fail_closed_armed());
 }
 
 #[test]
@@ -1317,47 +1336,277 @@ fn a_pinned_app_keeps_loopback_and_the_lan_when_the_pair_cannot_arm() {
     ));
 }
 
-/// Strict's default block is destination-less too. With the catch-all armed
-/// the floor must not land twice; with it unable to arm (no tunnel server to
-/// exempt) the default block must still not stand over an empty floor.
+/// Under the catch-all the pinned app needs no floor of its own (the blanket
+/// carries it); when the catch-all cannot arm, the app pair falls back and
+/// brings the floor. Either way loopback and the LAN stay open, nothing lands
+/// twice, and the app reaches nothing else over the main link.
 #[test]
-fn strict_mode_carries_the_floor_once_in_every_guard_posture() {
-    let mut strict = snap_block("Wi-Fi", "TAP");
-    strict.mode = PerSidBehaviorMode::StrictSecondaryFailClosed;
+fn a_pinned_app_keeps_its_floor_whether_or_not_the_catch_all_arms() {
+    let everything = snap_block_mode_b("Wi-Fi", "TAP");
     let no_server = KillSwitchResolution {
         bootstrap_server_ips: Vec::new(),
         ..full_ks_resolution()
     };
-    // Without an app rule, so the default block alone has to earn the floor.
-    let book = rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 4)).rule_book;
     for resolution in [full_ks_resolution(), no_server] {
-        let filters = filters_for(strict.clone(), resolution.clone(), book.clone());
-        assert!(
-            filters
-                .iter()
-                .any(|f| f.action == WfpAction::Block && f.weight == 0x0000_FFFF),
-            "strict mode must emit its default block"
-        );
+        let filters = pinned_app_filters(everything.clone(), resolution.clone());
         let mut ids = std::collections::HashSet::new();
         assert!(
             filters.iter().all(|f| ids.insert(f.id)),
             "a filter id appears twice (servers: {:?})",
             resolution.bootstrap_server_ips
         );
-        assert!(
-            app_may_connect(&filters, Ipv4Addr::new(127, 0, 0, 1), PRIMARY_LUID),
-            "loopback cut (servers: {:?})",
-            resolution.bootstrap_server_ips
-        );
-        assert!(app_may_connect(
-            &filters,
-            Ipv4Addr::new(192, 168, 1, 20),
-            PRIMARY_LUID
-        ));
-        assert!(!app_may_connect(
-            &filters,
-            Ipv4Addr::new(203, 0, 113, 50),
-            PRIMARY_LUID
-        ));
+        for local in [Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(192, 168, 1, 20)] {
+            assert!(
+                app_may_connect(&filters, local, PRIMARY_LUID),
+                "{local} cut (servers: {:?})",
+                resolution.bootstrap_server_ips
+            );
+        }
+        let remote = Ipv4Addr::new(203, 0, 113, 50);
+        assert!(!app_may_connect(&filters, remote, PRIMARY_LUID));
+        assert!(app_may_connect(&filters, remote, KS_LUID));
     }
+}
+
+/// The ALE connect verdict for a TCP connect by an ordinary program (no app
+/// rule of its own) to `ip` leaving through `egress`.
+fn connect_allowed(filters: &[WfpFilterSpec], ip: Ipv4Addr, egress: u64) -> bool {
+    filters
+        .iter()
+        .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV4)
+        .filter(|f| f.app_pattern.is_none())
+        .filter(|f| f.local_interface_luid.is_none_or(|l| l == egress))
+        .filter(|f| f.remote_port.is_none() && f.ip_protocol.is_none_or(|p| p == 6))
+        .filter(|f| {
+            let names_one = f.remote_ip.is_some() || !f.remote_ip_set.is_empty();
+            let in_set = f.remote_subnet_set.is_empty()
+                || f.remote_subnet_set.iter().any(|(net, prefix)| match net {
+                    IpAddr::V4(v4) => in_subnet(ip, (*v4, *prefix)),
+                    IpAddr::V6(_) => false,
+                });
+            in_set
+                && match f.remote_subnet {
+                    Some(subnet) => in_subnet(ip, subnet),
+                    None if names_one => f.covers_v4(ip),
+                    None => f.remote_subnet_v6.is_none() && f.remote_ip_set_v6.is_empty(),
+                }
+        })
+        .max_by_key(|f| (f.weight, f.action == WfpAction::Block))
+        .is_none_or(|f| f.action == WfpAction::Permit)
+}
+
+// ── The table: default route × leak protection × tunnel up/down ──────────
+
+/// What one cell of the table must do, asked as verdicts rather than filter
+/// counts: a rule destination and an unrouted host, over the main link and
+/// through the tunnel, plus the two latches the DNS gate and the banner read.
+#[test]
+fn every_cell_of_the_protection_table_behaves_as_promised() {
+    use nrr_domain::LeakProtection::{Everything, Off, Sites};
+    use PerSidBehaviorMode::{PreferPrimary as Main, PreferSecondaryWhenAvailable as Additional};
+    const ROUTED: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 8);
+    const UNROUTED: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 50);
+
+    // (mode, protection, tunnel up) → (routed host over main, unrouted over
+    // main, unrouted through the tunnel, a blanket armed, blocking while down)
+    #[allow(clippy::type_complexity)]
+    let table: [(
+        PerSidBehaviorMode,
+        nrr_domain::LeakProtection,
+        bool,
+        (bool, bool, bool, bool, bool),
+    ); 12] = [
+        (Main, Off, true, (true, true, true, false, false)),
+        (Main, Off, false, (true, true, true, false, false)),
+        (Additional, Off, true, (true, true, true, false, false)),
+        (Additional, Off, false, (true, true, true, false, false)),
+        // Pins: the routed host only through the tunnel, the rest untouched.
+        (Main, Sites, true, (false, true, true, false, false)),
+        // Per-destination block: the routed host waits, the rest flows.
+        (Main, Sites, false, (false, true, true, false, true)),
+        // "Everything" under the main default route pins while the tunnel is
+        // up: unmatched traffic belongs on the main link.
+        (Main, Everything, true, (false, true, true, false, false)),
+        (Main, Everything, false, (false, false, false, true, true)),
+        // "Routed sites" means "everything" under the additional route.
+        (Additional, Sites, true, (false, false, true, true, false)),
+        (Additional, Sites, false, (false, false, false, true, true)),
+        (
+            Additional,
+            Everything,
+            true,
+            (false, false, true, true, false),
+        ),
+        (
+            Additional,
+            Everything,
+            false,
+            (false, false, false, true, true),
+        ),
+    ];
+    for (mode, protection, tunnel_up, expected) in table {
+        let (routed_main, unrouted_main, unrouted_tunnel, blanket, waiting) = expected;
+        let cell = format!("{mode:?}/{protection}/tunnel up = {tunnel_up}");
+        let (_api, orch, src, rules) = fixture_with_resolution(tunnel_up.then(full_ks_resolution));
+        rules.set(rules_with_secondary_ip(ROUTED));
+        src.set("S-1-5-21-A", snap_with("Wi-Fi", "TAP", mode, protection));
+        let filters = match orch
+            .compute_filters_for_sid("S-1-5-21-A", false, None, ComputeIntent::Apply)
+            .unwrap()
+        {
+            ComputedFilterSet::Install(plan) => plan.filters,
+            _ => panic!("{cell}: expected an installable filter set"),
+        };
+        assert_eq!(
+            connect_allowed(&filters, ROUTED, PRIMARY_LUID),
+            routed_main,
+            "{cell}: routed host over the main link"
+        );
+        assert_eq!(
+            connect_allowed(&filters, UNROUTED, PRIMARY_LUID),
+            unrouted_main,
+            "{cell}: unrouted host over the main link"
+        );
+        if tunnel_up {
+            assert!(
+                connect_allowed(&filters, ROUTED, KS_LUID),
+                "{cell}: the tunnel always carries the routed host"
+            );
+            assert_eq!(
+                connect_allowed(&filters, UNROUTED, KS_LUID),
+                unrouted_tunnel,
+                "{cell}: unrouted host through the tunnel"
+            );
+        }
+        assert!(
+            connect_allowed(&filters, Ipv4Addr::new(127, 0, 0, 1), PRIMARY_LUID),
+            "{cell}: loopback is never cut"
+        );
+        assert_eq!(orch.any_block_all_armed(), blanket, "{cell}: blanket latch");
+        assert_eq!(
+            orch.any_fail_closed_armed(),
+            waiting,
+            "{cell}: tunnel-down latch"
+        );
+        if !protection.is_on() {
+            assert!(
+                filters.iter().all(|f| f.action == WfpAction::Permit),
+                "{cell}: protection off blocks nothing"
+            );
+        }
+    }
+}
+
+/// A rule address on the main link's own segment keeps its direct route, so
+/// with the tunnel unresolved it is not blocked: the floor's LAN is read even
+/// though no tunnel resolution names it. A host elsewhere is still blocked.
+#[test]
+fn a_rule_address_on_the_home_network_is_not_blocked_while_the_tunnel_is_unresolved() {
+    let nas = Ipv4Addr::new(192, 168, 1, 5);
+    let far = Ipv4Addr::new(198, 51, 100, 8);
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let src = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&src) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(MockFqdnCacheLookup::new()),
+        Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_kill_switch_resolver(Arc::new(|_, _| None))
+    .with_fail_closed_exemptions_resolver(Arc::new(|_, _| {
+        crate::killswitch_codegen::FailClosedExemptions {
+            bootstrap_server_ips: vec![Ipv4Addr::new(203, 0, 113, 7)],
+            local_subnets: vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
+            ..Default::default()
+        }
+    }));
+    rules.set(rules_with_secondary_ips(&[nas, far]));
+    src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    let filters = api.wfp_filters.lock().unwrap();
+    let blocked = |ip: Ipv4Addr| {
+        filters
+            .iter()
+            .any(|f| record_is_destination_block(f) && f.covers_v4(ip))
+    };
+    assert!(blocked(far), "fixture guard: the far host is held");
+    assert!(
+        !blocked(nas),
+        "the home device is cut while the tunnel is down"
+    );
+}
+
+fn deny_ids(api: &MockWindowsApi, denied: Ipv4Addr) -> Vec<u64> {
+    api.wfp_filters
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| {
+            f.action == WfpAction::Block
+                && (f.remote_ip == Some(denied) || f.remote_ip_set.contains(&denied))
+        })
+        .map(|f| f.id.raw)
+        .collect()
+}
+
+fn deny_rule(id: &str, ip: Ipv4Addr) -> CanonicalRule {
+    CanonicalRule {
+        action: nrr_domain::RuleAction::Block,
+        ..primary_ip_rule(id, ip)
+    }
+}
+
+/// A deny's filters are published as the user's own, so its drops are never
+/// reverse-named, and they never pass for the leak guard's.
+#[test]
+fn a_deny_rules_filters_are_published_as_rule_blocks_beside_the_guard() {
+    let denied = Ipv4Addr::new(203, 0, 113, 9);
+    let (api, orch, src, rules, registry) =
+        fixture_with_resolution_and_registry(Some(full_ks_resolution()));
+    let mut book = rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8));
+    book.rule_book.primary = CanonicalRuleSet::from_rules(vec![deny_rule("deny-1", denied)]);
+    rules.set(book);
+    src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+
+    let denies = deny_ids(&api, denied);
+    assert!(!denies.is_empty());
+    for id in &denies {
+        assert!(registry.is_rule_block(*id));
+        assert!(!registry.contains(*id), "a deny never role-verifies");
+    }
+    let guard: Vec<u64> = api
+        .wfp_filters
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| f.action == WfpAction::Block && registry.contains(f.id.raw))
+        .map(|f| f.id.raw)
+        .collect();
+    assert!(!guard.is_empty());
+    assert!(guard.iter().all(|id| !registry.is_rule_block(*id)));
+}
+
+#[test]
+fn a_deny_without_connections_is_published_and_withdrawn_with_its_rule() {
+    let denied = Ipv4Addr::new(203, 0, 113, 9);
+    let (api, orch, _src, rules, registry) = fixture_with_resolution_and_registry(None);
+    rules.set(ActiveRulesSnapshot {
+        rule_book: CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![deny_rule("deny-1", denied)]),
+            secondary: CanonicalRuleSet::default(),
+        },
+    });
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    let denies = deny_ids(&api, denied);
+    assert!(!denies.is_empty());
+    assert!(denies.iter().all(|id| registry.is_rule_block(*id)));
+
+    rules.set(rules_with_n_primary_ips(1));
+    orch.recompile_for_sid("S-1-5-21-A").unwrap();
+    assert!(denies.iter().all(|id| !registry.is_rule_block(*id)));
 }

@@ -40,8 +40,19 @@ fn equivalence_table() {
         ("*é*", "caféx", true),
         ("CHROME.EXE", "chrome.exe", true),
         ("chrome.exe", "CHROME.EXE", true),
-        // Folding is ASCII only, as every caller's own lower-casing is.
-        ("É", "é", false),
+        // Folding is Unicode lowercasing, the fold names are stored with.
+        ("É", "é", true),
+        ("программа.exe", "Программа.EXE", true),
+        ("*Éditeur*", "monéditeur.exe", true),
+        ("é", "e", false),
+        ("é", "ü", false),
+        ("ΣΑΣ", "σας", true),
+        ("σας", "ΣΑΣ", true),
+        ("ß", "SS", false),
+        ("ß", "ẞ", true),
+        ("İ", "i", false),
+        ("İ.exe", "İ.EXE", true),
+        ("k", "\u{212a}", true),
     ];
     for &(pattern, text, expected) in cases {
         assert_eq!(

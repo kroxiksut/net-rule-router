@@ -40,7 +40,7 @@ use nrr_service_runtime::lifecycle_matrix::StopReason;
 use nrr_service_runtime::{
     run_bootstrap, run_supervised_runtime, BootstrapConfig, InstallConfig, InstallOutcome,
     ServiceController, ServiceRuntimeState, StopToken, UninstallConfig, UninstallOutcome,
-    UpdateConfig, UpdateOutcome, SERVICE_NAME,
+    SERVICE_NAME,
 };
 use nrr_storage::StorageProfile;
 use windows_service::{
@@ -183,6 +183,10 @@ fn running_controls() -> ServiceControlAccept {
 fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmError> {
     // Left by a stop that never arrived; it must not speak for a later one.
     let _ = nrr_platform_windows::service_control::take_deliberate_stop_marker();
+    // A deliberate stop takes the recovery actions off; a start puts them back.
+    let recovery_restored = std::env::current_exe()
+        .ok()
+        .map(|binary| nrr_platform_windows::service_control::restore_recovery_if_missing(&binary));
     let stop = StopToken::new();
     let stop_for_handler = stop.clone();
     // Only our own verbs mark a stop as wanted. Any other one — `net stop bfe /y`
@@ -200,9 +204,15 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
                 tracing::info!(target: "nrr::lifecycle", msg_key = "svc-scm-control-received", control = "stop", "SCM control received");
                 if !nrr_platform_windows::service_control::take_deliberate_stop_marker() {
                     unasked_stop_for_handler.store(true, std::sync::atomic::Ordering::SeqCst);
-                    if nrr_platform_windows::service_control::filtering_engine_running()
-                        == Some(false)
-                    {
+                    let engine_down =
+                        nrr_platform_windows::service_control::filtering_engine_running()
+                            == Some(false);
+                    nrr_platform_windows::service_control::note_unasked_stop(if engine_down {
+                        nrr_platform_windows::service_control::UnaskedStop::EngineDown
+                    } else {
+                        nrr_platform_windows::service_control::UnaskedStop::Other
+                    });
+                    if engine_down {
                         tracing::warn!(
                             target: "nrr::lifecycle",
                             msg_key = "svc-scm-stop-with-filtering-engine",
@@ -395,6 +405,19 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
         );
     }
 
+    match &recovery_restored {
+        Some(Ok(true)) => tracing::info!(
+            target: "nrr::boot",
+            "the SCM recovery actions a deliberate stop had removed were restored"
+        ),
+        Some(Err(e)) => tracing::warn!(
+            target: "nrr::boot",
+            error = %e,
+            "the SCM recovery actions could not be checked"
+        ),
+        _ => {}
+    }
+
     // Crash recovery hook (mirrors console mode).
     let recovery_outcome = nrr_service_runtime::run_crash_recovery_on_startup(
         &artifacts.topology.data_dir,
@@ -411,11 +434,29 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
     // A blocking outcome walks the runtime straight to `RecoveryRequired`;
     // a stale marker only adds a warning to the health card.
     recovery_outcome.record_in(&mut artifacts.report);
+    // A restart after a stop nobody asked for says so on the health card: the
+    // machine was unprotected between the stop and now.
+    if let Some(cause) = nrr_platform_windows::service_control::take_unasked_stop_note() {
+        use nrr_platform_windows::service_control::UnaskedStop;
+        let why = match cause {
+            UnaskedStop::EngineDown => "the Windows filtering engine (BFE) restarted",
+            UnaskedStop::Other => "the service was stopped by something other than this program",
+        };
+        tracing::warn!(
+            target: "nrr::boot",
+            msg_key = "svc-boot-restarted-after-unasked-stop",
+            cause = ?cause,
+            "the service started again after a stop nobody asked for; protection was off in between",
+        );
+        artifacts.report.warn(
+            nrr_service_runtime::bootstrap::phases::CRASH_RECOVERY,
+            format!("started again after {why}; protection was off in between"),
+        );
+    }
 
-    // The blocks a hard-killed prior instance left behind: stripped before
-    // deps are built only when nobody has leak protection on; otherwise they
-    // hold until the first pass adopts them (`lifecycle_matrix`). Runs on a
-    // recovery-blocked boot too, where the orchestrator is never built.
+    // A dead instance's blocks are settled inside the deps build, never here:
+    // held for the first pass while anyone has leak protection on
+    // (`lifecycle_matrix::orphaned_blocks_at_start`).
     //
     // Everything this product enforces goes through the filtering engine, so
     // a stopped one explains an otherwise baffling boot before it happens.
@@ -437,9 +478,7 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
     tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "build-deps", "boot stage entered");
     let deps = crate::runtime_deps::build_supervised_runtime_deps(&artifacts, verbosity_handle);
     tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "run-runtime", "boot stage entered");
-    let data_dir = artifacts.topology.data_dir.clone();
     run_supervised_runtime(&controller, &stop, artifacts, deps);
-    nrr_service_runtime::crash_series::end_run(&data_dir);
 
     // Net-event collection is a MACHINE-WIDE Base Filtering Engine setting, not
     // a property of our handle: left on, BFE goes on recording every classify
@@ -465,36 +504,6 @@ pub fn install_service() -> Result<(), ScmError> {
         std::env::current_exe().map_err(|e| ScmError::Manager(format!("current_exe: {e}")))?;
     install_service_with_config(&InstallConfig::production_defaults(binary_path))?;
     Ok(())
-}
-
-/// Stop/drain the service and back up the state DB in preparation for a
-/// binary update. Does NOT replace the binary or restart the service —
-/// those steps are the installer's responsibility.
-pub fn update_service(config: &UpdateConfig) -> Result<UpdateOutcome, ScmError> {
-    control().stop(Duration::from_secs(config.drain_timeout_secs))?;
-
-    let state_db_backup = if config.backup_state_db {
-        let topology = nrr_storage::resolve_storage_topology(&StorageProfile::ProductionService)
-            .map_err(|e| ScmError::Manager(format!("resolve topology: {e}")))?;
-        let src = topology.state_db_path.clone();
-        if src.exists() {
-            let backup = src.with_extension("db.bak");
-            std::fs::copy(&src, &backup)
-                .map_err(|e| ScmError::Manager(format!("backup state DB: {e}")))?;
-            Some(backup)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // The caller (installer) now replaces the binary and starts the service
-    // again; the new binary isn't in place yet, so neither happens here.
-    Ok(UpdateOutcome {
-        state_db_backup,
-        service_restarted: false,
-    })
 }
 
 /// Unregister the service and optionally remove service-owned data.
@@ -529,9 +538,6 @@ pub fn stop_service(timeout_secs: u64) -> Result<(), ScmError> {
 mod tests {
     use super::*;
 
-    /// Every control the handler branches on has to be advertised too — an
-    /// unadvertised one is never delivered, so the branch is dead code that
-    /// looks alive.
     #[test]
     fn a_relocation_failure_keeps_its_own_exit_code() {
         let relocation = ScmError::from(ServiceControlError::Relocation {
@@ -550,6 +556,9 @@ mod tests {
         );
     }
 
+    /// Every control the handler branches on has to be advertised too — an
+    /// unadvertised one is never delivered, so the branch is dead code that
+    /// looks alive.
     #[test]
     fn running_advertises_every_control_the_handler_acts_on() {
         let accepted = running_controls();

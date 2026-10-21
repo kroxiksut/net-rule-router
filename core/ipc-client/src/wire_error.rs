@@ -17,6 +17,9 @@ pub fn ipc_error_to_wire(err: &IpcClientError) -> (&'static str, String) {
         IpcClientError::BadResponse { reason } => (codes::BAD_RESPONSE, reason.clone()),
         IpcClientError::SerializationFailed(s) => (codes::SERIALIZATION_FAILED, s.clone()),
         IpcClientError::ClientShutdown => (codes::CLIENT_SHUTDOWN, err.to_string()),
+        IpcClientError::ContractMismatch { .. } => {
+            (codes::SERVICE_CONTRACT_MISMATCH, err.to_string())
+        }
         // `rules-locked` and `security-alert-unacknowledged` keep their own
         // slugs: the rules section keys its read-only state off the first, and
         // `forbidden` would send the second to the elevated broker, which
@@ -37,6 +40,12 @@ mod tests {
     use super::*;
     use nrr_shared::ipc::IpcOperationName;
     use nrr_shared::ipc_transport::IpcErrorCode;
+
+    #[test]
+    fn an_operation_the_service_does_not_know_keeps_its_own_slug() {
+        let err = server_error(IpcErrorCode::UnsupportedOperation, "any text");
+        assert_eq!(ipc_error_to_wire(&err).0, "unsupported-operation");
+    }
 
     #[test]
     fn forbidden_maps_to_forbidden_slug() {
@@ -116,6 +125,17 @@ mod tests {
             "acknowledge first",
         );
         assert_eq!(ipc_error_to_wire(&e).0, "security-alert-unacknowledged");
+    }
+
+    #[test]
+    fn a_change_held_back_across_a_revision_skew_has_its_own_slug() {
+        let err = IpcClientError::ContractMismatch {
+            op: IpcOperationName::RoutePolicyUpdate,
+            skew: nrr_shared::ipc::ContractSkew::ServiceOlder,
+            service_revision: 1,
+            client_revision: 2,
+        };
+        assert_eq!(ipc_error_to_wire(&err).0, "service-contract-mismatch");
     }
 
     #[test]

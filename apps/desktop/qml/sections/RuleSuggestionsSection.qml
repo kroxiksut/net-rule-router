@@ -528,7 +528,10 @@ ColumnLayout {
                 + "the additional route together with the site that needs it</b> — <i>anything you leave "
                 + "alone keeps going through the main route</i>. A dismissed address <i>only stops being "
                 + "offered</i>; \"Allow again\" lifts that suppression and nothing else.")
-            : (section.dismissedCount > 0 && !section.showDismissed
+            : (root.autoRuleSuggestionsController.autoRuleLoadFailed
+                ? root.tr("rules.suggestions.inbox.load-failed",
+                    "Could not read the suggestions from the service. Try again in a moment.")
+                : section.dismissedCount > 0 && !section.showDismissed
                 ? root.tr("rules.suggestions.inbox.empty-but-answered",
                     "Nothing is waiting for an answer. {n} address(es) you answered earlier are hidden — turn on \"Show answered\" to revisit one.")
                     .replace("{n}", String(section.dismissedCount))

@@ -27,8 +27,9 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::{HANDLE, NO_ERROR};
 #[cfg(target_os = "windows")]
 use windows::Win32::NetworkManagement::IpHelper::{
-    CancelMibChangeNotify2, NotifyIpInterfaceChange, NotifyRouteChange2, MIB_IPFORWARD_ROW2,
-    MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+    CancelMibChangeNotify2, NotifyIpInterfaceChange, NotifyRouteChange2,
+    NotifyUnicastIpAddressChange, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+    MIB_UNICASTIPADDRESS_ROW,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Networking::WinSock::AF_UNSPEC;
@@ -88,6 +89,17 @@ unsafe extern "system" fn route_change_callback(
     fire(caller_context);
 }
 
+/// `NotifyUnicastIpAddressChange` callback: an address added or removed moves
+/// the adapter table without any interface property changing.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn address_change_callback(
+    caller_context: *const c_void,
+    _row: *const MIB_UNICASTIPADDRESS_ROW,
+    _notification_type: MIB_NOTIFICATION_TYPE,
+) {
+    fire(caller_context);
+}
+
 /// Drop guard for a live Windows subscription. Cancels BOTH notifications, then
 /// frees the context — order is load-bearing (free-before-cancel is a
 /// use-after-free, since `CancelMibChangeNotify2` is what guarantees no callback
@@ -96,6 +108,7 @@ unsafe extern "system" fn route_change_callback(
 struct WindowsSubscriptionGuard {
     interface_handle: HANDLE,
     route_handle: HANDLE,
+    address_handle: HANDLE,
     context: *mut ObserverContext,
 }
 
@@ -120,6 +133,9 @@ impl Drop for WindowsSubscriptionGuard {
             }
             if !self.route_handle.is_invalid() {
                 let _ = CancelMibChangeNotify2(self.route_handle);
+            }
+            if !self.address_handle.is_invalid() {
+                let _ = CancelMibChangeNotify2(self.address_handle);
             }
             if !self.context.is_null() {
                 drop(Box::from_raw(self.context));
@@ -146,6 +162,7 @@ impl NetworkChangeObserver for WindowsNetworkChangeObserver {
         let context = Box::into_raw(Box::new(ObserverContext { on_change }));
         let mut interface_handle = HANDLE::default();
         let mut route_handle = HANDLE::default();
+        let mut address_handle = HANDLE::default();
 
         // SAFETY: `context` is a live, non-null Box pointer kept alive in the
         // returned guard until after cancellation; `interface_change_callback`
@@ -196,10 +213,39 @@ impl NetworkChangeObserver for WindowsNetworkChangeObserver {
             });
         }
 
+        // SAFETY: same context/callback/out-pointer validity as above.
+        let address_status = unsafe {
+            NotifyUnicastIpAddressChange(
+                AF_UNSPEC,
+                Some(address_change_callback),
+                Some(context as *const c_void),
+                false,
+                &mut address_handle,
+            )
+        };
+        if address_status != NO_ERROR {
+            // SAFETY: both earlier notifications are live against `context`;
+            // cancel them (quiescing callbacks) THEN free the context.
+            unsafe {
+                let _ = CancelMibChangeNotify2(interface_handle);
+                let _ = CancelMibChangeNotify2(route_handle);
+                drop(Box::from_raw(context));
+            }
+            return Err(PlatformError::Win32 {
+                operation: "NotifyUnicastIpAddressChange",
+                code: address_status.0,
+                message: format!(
+                    "NotifyUnicastIpAddressChange → Win32 error {}",
+                    address_status.0
+                ),
+            });
+        }
+
         Ok(NetworkChangeSubscription::new(Box::new(
             WindowsSubscriptionGuard {
                 interface_handle,
                 route_handle,
+                address_handle,
                 context,
             },
         )))

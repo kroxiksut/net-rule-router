@@ -1,0 +1,92 @@
+{
+  "description": "pure.js leakProtectionChoicesAtLeast: the levels a first save offers under a default route, none weaker than the install-time floor",
+  "cases": [
+    {
+      "name": "no floor offers every level of the main connection",
+      "input": {
+        "route": "prefer-primary",
+        "floor": "off"
+      },
+      "expected": [
+        "off",
+        "sites",
+        "everything"
+      ]
+    },
+    {
+      "name": "an absent floor is no floor",
+      "input": {
+        "route": "prefer-primary"
+      },
+      "expected": [
+        "off",
+        "sites",
+        "everything"
+      ]
+    },
+    {
+      "name": "a floor of routed sites drops off",
+      "input": {
+        "route": "prefer-primary",
+        "floor": "sites"
+      },
+      "expected": [
+        "sites",
+        "everything"
+      ]
+    },
+    {
+      "name": "a floor of everything leaves only everything",
+      "input": {
+        "route": "prefer-primary",
+        "floor": "everything"
+      },
+      "expected": [
+        "everything"
+      ]
+    },
+    {
+      "name": "no floor under the additional connection",
+      "input": {
+        "route": "prefer-secondary-when-available",
+        "floor": "off"
+      },
+      "expected": [
+        "off",
+        "everything"
+      ]
+    },
+    {
+      "name": "routed sites under the additional connection is everything",
+      "input": {
+        "route": "prefer-secondary-when-available",
+        "floor": "sites"
+      },
+      "expected": [
+        "everything"
+      ]
+    },
+    {
+      "name": "the strict install mode as folded",
+      "input": {
+        "route": "prefer-secondary-when-available",
+        "floor": "everything"
+      },
+      "expected": [
+        "everything"
+      ]
+    },
+    {
+      "name": "an unknown floor is no floor",
+      "input": {
+        "route": "",
+        "floor": "on"
+      },
+      "expected": [
+        "off",
+        "sites",
+        "everything"
+      ]
+    }
+  ]
+}

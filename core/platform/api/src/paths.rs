@@ -84,6 +84,25 @@ pub fn production_logs_dir() -> Option<PathBuf> {
     }
 }
 
+/// Where the clients look for an administrator's first-run answer sheet: the
+/// data root on Windows, `/etc/<product>` elsewhere. Not the Linux state root:
+/// it is `0700` and a user's GUI cannot read it. Both are closed to ordinary
+/// accounts; the reader still refuses a sheet anyone else could have written.
+pub fn machine_first_run_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        production_data_root()
+    }
+    #[cfg(all(unix, not(windows)))]
+    {
+        Some(PathBuf::from("/etc").join(product_dir_leaf()))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        None
+    }
+}
+
 /// Where an administrator's install-time files wait for the service's first
 /// start: `<data root>\provision` on Windows, where the installer copies them,
 /// and `/etc/<product>/provision` elsewhere, where a package or a script
@@ -115,31 +134,22 @@ pub const BROKER_LOG_FILE: &str = "nrr-broker.log";
 pub const BROKER_PREVIOUS_LOG_FILE: &str = "nrr-broker.prev.log";
 
 /// Directory the desktop surfaces coordinate through at run time: the
-/// single-instance locks, the activation hand-off, the shutdown flag.
+/// single-instance locks, the activation hand-off, the shutdown flags.
 ///
-/// Windows: `%TEMP%\<product>` — the temp directory is already per-user there.
-/// Unix: `$XDG_RUNTIME_DIR/<product>`, which is per-user, mode 0700, and wiped
-/// at logout — the right lifetime for coordination state. Deliberately NOT
-/// `/tmp`, which is one shared world-writable directory: two users' sessions
-/// would collide on the same lock (the second could not start its GUI at all)
-/// and anyone on the box could plant the shutdown flag. The fallbacks keep the
-/// function total on a session without a runtime dir, still without putting two
-/// users on one path.
+/// One definition with the stop marker, [`nrr_shared::user_paths::runtime_dir`]:
+/// `%TEMP%\<product>` on Windows (per-user already), `$XDG_RUNTIME_DIR/<product>`
+/// or the user config root elsewhere. Never the shared `/tmp`, where another user
+/// could plant a link or a forged hand-off. Only an account with neither gets a
+/// per-user name under the temp root, and [`ensure_user_runtime_dir`] then
+/// accepts it only when it is private to this user.
 pub fn user_runtime_dir() -> PathBuf {
-    #[cfg(windows)]
-    {
-        std::env::temp_dir().join(product_dir_leaf())
+    if let Some(dir) = nrr_shared::user_paths::runtime_dir() {
+        return dir;
     }
-    #[cfg(not(windows))]
-    {
-        let leaf = product_dir_leaf();
-        if let Some(base) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
-            return PathBuf::from(base).join(leaf);
-        }
-        match std::env::var_os("USER").filter(|v| !v.is_empty()) {
-            Some(user) => std::env::temp_dir().join(format!("{leaf}-{}", user.to_string_lossy())),
-            None => std::env::temp_dir().join(leaf),
-        }
+    let leaf = product_dir_leaf();
+    match std::env::var_os("USER").filter(|v| !v.is_empty()) {
+        Some(user) => std::env::temp_dir().join(format!("{leaf}-{}", user.to_string_lossy())),
+        None => std::env::temp_dir().join(leaf),
     }
 }
 
@@ -280,6 +290,18 @@ mod tests {
             leaf.starts_with(product_dir_leaf()),
             "runtime dir {dir:?} must be named after the product",
         );
+    }
+
+    #[test]
+    fn the_first_run_sheet_is_read_where_a_user_session_can_read_it() {
+        let dir = machine_first_run_dir().expect("first-run dir");
+        if cfg!(all(unix, not(windows))) {
+            assert_eq!(dir, PathBuf::from("/etc").join(PRODUCT_NAME_UNIX));
+            let state = production_data_root().expect("production root");
+            assert!(!dir.starts_with(&state), "the state root is 0700");
+        } else {
+            assert_eq!(Some(dir), production_data_root());
+        }
     }
 
     #[test]

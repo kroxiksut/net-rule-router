@@ -9,9 +9,10 @@
 //! ```text
 //! 1. ExactFqdn      — exact hostname; longest label wins within tier
 //! 2. SuffixDomain   — apex + subdomains; longest base domain wins within tier
-//! 3a. ExactIp       — exact IPv4 (default: checked before Zone)
+//! 3a. ExactIp       — exact address (default: checked before Subnet and Zone)
+//! 3a'. Subnet       — subnet or range; the longer prefix wins
 //! 3b. Zone          — TLD / internal domain suffix
-//!    ↑ order of 3a/3b is controlled by ZonePriorityPolicy
+//!    ↑ order of tier 3 is controlled by ZonePriorityPolicy
 //! 4. Application    — process filename / glob (address-less rules only)
 //! 5. Default        — behavior-mode fallback, no rule matched
 //! ```
@@ -419,8 +420,8 @@ pub struct RuleMatchCandidate {
 /// that needs the other route gets its own narrow rule, not a global flip.
 ///
 /// **This setting affects only runtime evaluation order — it has no effect on
-/// canonical storage order** (which is always `ExactFqdn < SuffixDomain <
-/// Zone < ExactIp < Application`).
+/// canonical storage order** (a separate, stable numbering used for hashing;
+/// see `CanonicalRule::sort_key`).
 ///
 /// | `prefer_ip` | Evaluation order of tier 3   |
 /// |-------------|------------------------------|
@@ -767,10 +768,13 @@ mod tests {
     fn requested_route_decision_default_preserves_behavior_mode() {
         let decision = RequestedRouteDecision::DefaultRoute {
             reason: NoMatchReason::EmptyRuleBook,
-            behavior_mode: RouteBehaviorMode::StrictSecondaryFailClosed,
+            behavior_mode: RouteBehaviorMode::PreferSecondaryWhenAvailable,
         };
         if let RequestedRouteDecision::DefaultRoute { behavior_mode, .. } = decision {
-            assert_eq!(behavior_mode, RouteBehaviorMode::StrictSecondaryFailClosed);
+            assert_eq!(
+                behavior_mode,
+                RouteBehaviorMode::PreferSecondaryWhenAvailable
+            );
         } else {
             panic!("expected DefaultRoute");
         }

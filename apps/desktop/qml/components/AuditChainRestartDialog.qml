@@ -4,6 +4,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "../lib/plurals.js" as Plurals
 
 Dialog {
     id: root
@@ -270,9 +271,9 @@ Dialog {
             visible: root.breakCount > 0
             wrapMode: Text.Wrap
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
-            text: root.tr("diag.audit.restart.summary",
-                "The audit trail does not verify in {count} place(s):")
-                .replace("{count}", String(root.breakCount))
+            text: Plurals.counted(root.tr, "diag.audit.restart.summary.", root.breakCount,
+                "The audit trail does not verify in {count} place:",
+                "The audit trail does not verify in {count} places:")
         }
         ListView {
             id: breakList

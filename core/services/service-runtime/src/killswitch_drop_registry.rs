@@ -49,6 +49,8 @@
 //!   verifying (a tunnel client running as a service still teaches its
 //!   endpoint), but no user's drop: notices, the outage list and name learning
 //!   skip it.
+//! - **rule-blocks** — what the user's own Block rules compiled to. Never
+//!   role-verifying; identified so a denied destination is not reverse-named.
 
 use std::collections::HashSet;
 use std::sync::RwLock;
@@ -67,6 +69,8 @@ pub struct ScopedBlockIds {
     pub dns_lockdown: HashSet<u64>,
     /// Subset of `all` scoped to the machine's service accounts.
     pub service_accounts: HashSet<u64>,
+    /// The user's own Block rules; identifiable, never role-verifying.
+    pub rule_blocks: HashSet<u64>,
 }
 
 impl ScopedBlockIds {
@@ -74,7 +78,10 @@ impl ScopedBlockIds {
     /// rather than kept as a stale set.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.all.is_empty() && self.ipv6_cut.is_empty() && self.dns_lockdown.is_empty()
+        self.all.is_empty()
+            && self.ipv6_cut.is_empty()
+            && self.dns_lockdown.is_empty()
+            && self.rule_blocks.is_empty()
     }
 }
 
@@ -163,6 +170,15 @@ impl KillswitchBlockFilterRegistry {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .service_accounts
+            .contains(&id)
+    }
+
+    /// Whether `id` is a filter one of the user's Block rules compiled to.
+    pub fn is_rule_block(&self, id: u64) -> bool {
+        self.blocks
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .rule_blocks
             .contains(&id)
     }
 }
@@ -293,6 +309,27 @@ mod tests {
         }
         .is_empty());
         assert!(ScopedBlockIds::default().is_empty());
+        assert!(!ScopedBlockIds {
+            rule_blocks: HashSet::from([5]),
+            ..ScopedBlockIds::default()
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn rule_block_ids_are_identifiable_without_being_role_verified() {
+        let registry = KillswitchBlockFilterRegistry::new();
+        registry.publish_scoped(ScopedBlockIds {
+            all: HashSet::from([1]),
+            rule_blocks: HashSet::from([5]),
+            ..ScopedBlockIds::default()
+        });
+        assert!(registry.is_rule_block(5));
+        assert!(
+            !registry.contains(5),
+            "a deny must not role-verify a tunnel"
+        );
+        assert!(!registry.is_rule_block(1));
     }
 
     #[test]

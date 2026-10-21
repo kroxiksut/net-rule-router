@@ -1,12 +1,9 @@
 //! The plan: what filters a SID's policy compiles to.
 //!
-//! One method, and it was 1193 lines of the orchestrator — longer than most
-//! files in this crate. It stays a method (it reads a dozen private fields, and
-//! a child module of the defining module still sees them), but it no longer
-//! sits between the builder and the apply path where nobody could scroll past
-//! it.
-//!
-//! Behaviour is unchanged: the body is the same statements in the same order.
+//! One long method. It stays a method (it reads a dozen private fields, and a
+//! child module of the defining module still sees them), in a file of its own
+//! so it does not sit between the builder and the apply path. What leak
+//! protection arms is decided by `nrr_domain::protection_posture`, not here.
 
 use super::*;
 use crate::enforcement_planner::ServiceAccountPosture;
@@ -38,6 +35,11 @@ impl PerSidApplyOrchestrator {
         let policy = match self.policy_source.load_for_sid(sid) {
             Some(s) => s,
             None => {
+                // A store that failed to answer is not "no policy": clearing
+                // here would drop the guard it was keeping.
+                if let Some(reason) = self.policy_source.read_failure_for(sid) {
+                    return Err(OrchestratorError::PolicyUnreadable(reason));
+                }
                 if intent.publishes() {
                     // no enforceable policy → no
                     // app rules are unenforced; clear any stale unresolved-app set so
@@ -51,6 +53,8 @@ impl PerSidApplyOrchestrator {
                     // entry so the registry never role-verifies a drop for a SID
                     // whose leak-guard is no longer armed.
                     self.update_killswitch_registry(sid, KillswitchBlockIds::default());
+                    // Nothing routes or pins this user's IPv6: not "first plan pending".
+                    crate::ipv6_disposition::global_ipv6_dispositions().forget(sid);
                 }
                 // Routing needs connections; a deny does not.
                 return self.compute_deny_filters_without_policy(
@@ -213,7 +217,6 @@ impl PerSidApplyOrchestrator {
         let mut codegen_out = generate_filters(CodegenInput {
             sid,
             rule_book: &rules.rule_book,
-            behavior_mode,
             fqdn_cache,
             app_observations: self.app_observations.as_ref(),
             app_resolver: self.app_resolver.as_ref(),
@@ -237,13 +240,15 @@ impl PerSidApplyOrchestrator {
         #[cfg(windows)]
         let _ = self.shadow_compare_neutral_plan(
             sid,
-            behavior_mode,
             &rules.rule_book,
             fqdn_cache,
             &secondary_ip_denylist,
             policy.app_rules_take_all_addresses,
+            ipv6,
             &codegen_out.filters,
         );
+        // Before the fake-IP blocks join: only what the rules compiled to.
+        let rule_blocks = rule_block_ids(&codegen_out.filters);
         if let Some(aug) = fake_ip_augmentation {
             codegen_out.filters.extend(aug.extra_filters);
         }
@@ -437,17 +442,19 @@ impl PerSidApplyOrchestrator {
         // filter spec id emitted for THIS sid below is collected here (rule
         // filters above are never included), then published to the shared
         // registry at the end of this compute (see `update_killswitch_registry`).
-        let mut killswitch_block_ids = KillswitchBlockIds::default();
-        // The master kill-switch toggle is the whole gate: enabling it IS the
-        // request to block rather than leak, so it arms even with no secondary
-        // adapter bound. A user who turns it on before assigning one — or after
-        // the adapter is uninstalled — gets rules-only egress, which is the
-        // posture they asked for; the fail-OPEN escape hatch stays
-        // `kill_switch_fail_closed = false`, not a disarmed guard.
-        let leak_guard_armed = policy.kill_switch_enabled;
-        // whether THIS compute produced a fail-closed
-        // block-all set (feeds the arming-edge OS resolver-cache flush at the
-        // end of the function; per-IP pinning and fail-open never flush).
+        let mut killswitch_block_ids = KillswitchBlockIds {
+            rule_blocks,
+            ..KillswitchBlockIds::default()
+        };
+        // The user's one choice; `nrr_domain::protection_posture` turns it, the
+        // default route and the tunnel's state into what is armed below. On
+        // means it arms even with no secondary bound: that user gets
+        // rules-only egress, which is what they asked for.
+        let protection = policy.leak_protection;
+        let leak_guard_armed = protection.is_on();
+        // whether THIS compute produced a blanket set (feeds the arming-edge
+        // OS resolver-cache flush at the end of the function; per-destination
+        // pins never flush).
         let mut block_all_armed = false;
         // whether THIS compute left the guard blocking with the additional link
         // unresolved (either posture) — see `note_fail_closed_state`.
@@ -456,35 +463,9 @@ impl PerSidApplyOrchestrator {
         // blanket block does — see `destination_less_block_floor` below.
         let mut app_block_emitted = false;
         if leak_guard_armed {
-            // `fail_closed` (default) → block rather than leak when the leak-proof
-            // kill-switch cannot arm because the secondary is unresolvable.
-            let fail_closed = policy.kill_switch_fail_closed;
             let protocols = crate::killswitch_codegen::KillSwitchProtocols::from_bits(
                 policy.kill_switch_protocols,
             );
-            // the Mode-A coverage strategy decides how a
-            // routed domain's UN-SEEDED edge IP is handled when the secondary is
-            // unresolved (VPN down). `FailClosedUnknown` escalates the fail-closed
-            // block to the catch-all so that un-seeded IP is BLOCKED rather than
-            // leaked to the primary (the  assistant-over-primary leak while
-            // the VPN was closed). This only escalates in PreferPrimary (Mode A) —
-            // the other modes already catch-all — and only in the `None`
-            // (secondary-unresolved) branch below; while the secondary is UP the
-            // per-IP pin is correct and a catch-all would wrongly cut the primary.
-            // `ZoneWidening` is not yet implemented (needs suffix/zone routing) and
-            // falls back to per-IP with a one-line notice; `FailClosedUnknown` is
-            // the product default.
-            use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
-            let mode_a_fail_closed_unknown = behavior_mode == RouteBehaviorMode::PreferPrimary
-                && policy.mode_a_coverage_strategy == ModeACoverageStrategy::FailClosedUnknown;
-            if policy.mode_a_coverage_strategy == ModeACoverageStrategy::ZoneWidening {
-                tracing::warn!(
-                    target: "nrr::per_sid_orchestrator",
-                    msg_key = "persid-plan-zone-widening-unimplemented",
-                    sid,
-                    "mode-A coverage strategy 'zone-widening' selected but not yet enforced — falling back to per-IP pinning",
-                );
-            }
             // The tunnel clients are exempt from the kill-switch by app id, so
             // the handshake that brings the tunnel back is never what the
             // guard drops. Concrete on-disk paths only: the built-in globs are
@@ -589,11 +570,15 @@ impl PerSidApplyOrchestrator {
             // cable. Note this is NOT "skip RFC1918": a corporate tunnel to a
             // 10.x network is a legitimate destination. The distinction is
             // whether the address sits in a subnet the PRIMARY link is
-            // connected to.
-            let local_subnets = kill_switch()
-                .as_ref()
-                .map(|r| r.local_subnets.clone())
-                .unwrap_or_default();
+            // connected to. Read from the fail-closed floor while the tunnel is
+            // unresolved: that is when a block would cut the device.
+            let (local_subnets, local_subnets_v6) = match kill_switch().as_ref() {
+                Some(r) => (r.local_subnets.clone(), r.local_subnets_v6.clone()),
+                None => {
+                    let floor = fail_closed_base();
+                    (floor.local_subnets.clone(), floor.local_subnets_v6.clone())
+                }
+            };
             // An address only an APPLICATION rule brought in is not pinned
             // per-destination: the app's own egress-conditional pair (or its
             // unconditional fail-closed block) already governs every flow of
@@ -626,12 +611,12 @@ impl PerSidApplyOrchestrator {
                 .iter()
                 .copied()
                 .filter(|ip| ownership.may_block(*ip))
-                .filter(|ip| match ip {
-                    // "Sits in a subnet the main link is attached to" is asked
-                    // of the family that has one; the v6 local prefixes reach
-                    // the blanket block's exemptions, not the pin set.
-                    std::net::IpAddr::V4(v4) => !in_any_subnet(*v4, &local_subnets),
-                    std::net::IpAddr::V6(_) => true,
+                .filter(|ip| {
+                    !crate::enforcement_planner::on_attached_segment(
+                        *ip,
+                        &local_subnets,
+                        &local_subnets_v6,
+                    )
                 })
                 .filter(|ip| match ip {
                     std::net::IpAddr::V4(v4) => !app_covered.contains(v4),
@@ -812,6 +797,7 @@ impl PerSidApplyOrchestrator {
                         bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
                         bootstrap_server_ips_v6: resolution.bootstrap_server_ips_v6.clone(),
                         foreign_tunnel_luids: resolution.foreign_tunnel_luids.clone(),
+                        foreign_tunnel_networks: resolution.foreign_tunnel_networks.clone(),
                         local_subnets: resolution.local_subnets.clone(),
                         local_subnets_v6: resolution.local_subnets_v6.clone(),
                         primary_dest_ips: known_primary_dest_ips.clone(),
@@ -833,224 +819,148 @@ impl PerSidApplyOrchestrator {
                         // The catch-all never blocks the tunnel next-hop, so the
                         // liveness probe needs no hole through it.
                         probe_target_ips: Vec::new(),
-                        secondary_luid: 0,
+                        secondary_luid: resolution.secondary_luid,
+                        // Only the forwarded blanket reads it, and it is armed
+                        // only with the tunnel gone.
+                        guest_network_luids: Vec::new(),
                     }
                 };
-            match kill_switch().clone() {
+            // A resolution with no usable LUID has no egress to hold anything
+            // to: that tunnel is down.
+            match kill_switch().clone().filter(|r| r.secondary_luid != 0) {
                 Some(resolution) => {
+                    let posture = nrr_domain::protection_posture(behavior_mode, protection, true);
                     let holds = crate::enforcement_planner::NetworkHolds::for_pass(
                         &ownership,
                         &ks_dest_ips,
                         || resolution.never_blocked_networks(),
                     );
-                    // Mode A (PreferPrimary) protects only the selected secondary
-                    // destinations; mode B arms the catch-all (all off-tunnel).
-                    let ks = match behavior_mode {
-                        RouteBehaviorMode::PreferPrimary => {
-                            let mut ks = crate::killswitch_codegen::kill_switch_filters(
-                                sid,
-                                &ks_dest_ips,
-                                resolution.secondary_luid,
-                                protocols,
-                            );
-                            ks.extend(crate::killswitch_codegen::kill_switch_network_filters(
-                                sid,
-                                &holds,
-                                resolution.secondary_luid,
-                                protocols,
-                            ));
-                            //  — also pin secondary-routed apps to the
-                            // secondary adapter egress (ALE layer only — no per-app ICMP).
-                            // Main-named addresses need no rescue permits: the
-                            // app block sits below the primary rule band, so the
-                            // primary rules' own permits carry them — unless the
-                            // app takes all its addresses, when it outranks them.
-                            let app_pair = crate::killswitch_codegen::app_kill_switch_filters_for(
-                                sid,
-                                &codegen_out.secondary_app_patterns,
-                                resolution.secondary_luid,
-                                protocols,
-                                policy.app_rules_take_all_addresses,
-                            );
-                            app_block_emitted |= !app_pair.is_empty();
-                            ks.extend(app_pair);
-                            ks
-                        }
-                        RouteBehaviorMode::PreferSecondaryWhenAvailable
-                        | RouteBehaviorMode::StrictSecondaryFailClosed => {
-                            let ks = crate::killswitch_codegen::catch_all_kill_switch_filters(
-                                sid,
-                                &resolution,
-                                &shared_exemptions(&resolution),
-                                protocols,
-                            );
-                            // The catch-all IS a block-all: everything not
-                            // leaving through the tunnel is dropped. It was not
-                            // recorded as one, so `any_block_all_armed()`
-                            // answered false while it was live - the DNS gate
-                            // then handed out answers for direct hosts the
-                            // catch-all was cutting, and the transition INTO
-                            // this posture read as a disarm (a needless DNS
-                            // flush, and the GUI banner going out under a live
-                            // block).
-                            block_all_armed = !ks.is_empty();
-                            ks
-                        }
+                    // The catch-all without a server exemption or a trusted
+                    // client would seal the tunnel's own reconnect. The rule
+                    // destinations are then held to the tunnel as under "routed
+                    // sites", never blocked outright on a live tunnel, and the
+                    // user hears that the rest is not covered.
+                    let catch_all_refused = posture
+                        == nrr_domain::ProtectionPosture::CatchAllThroughTunnel
+                        && resolution.bootstrap_server_ips.is_empty()
+                        && tunnel_clients.is_empty();
+                    let ks = if posture == nrr_domain::ProtectionPosture::CatchAllThroughTunnel
+                        && !catch_all_refused
+                    {
+                        let ks = crate::killswitch_codegen::catch_all_kill_switch_filters_for(
+                            sid,
+                            &resolution,
+                            &shared_exemptions(&resolution),
+                            protocols,
+                            !tunnel_clients.is_empty(),
+                            self.other_principals_hold_block_all(sid),
+                        );
+                        // The catch-all IS a block-all: the DNS gate and the
+                        // banner must see it as one.
+                        block_all_armed = !ks.is_empty();
+                        ks
+                    } else {
+                        let mut ks = crate::killswitch_codegen::kill_switch_filters(
+                            sid,
+                            &ks_dest_ips,
+                            resolution.secondary_luid,
+                            protocols,
+                        );
+                        ks.extend(crate::killswitch_codegen::kill_switch_network_filters(
+                            sid,
+                            &holds,
+                            resolution.secondary_luid,
+                            protocols,
+                        ));
+                        // Secondary-routed apps are pinned to the tunnel too (ALE
+                        // only). Main-named addresses need no rescue: the app
+                        // block sits below the primary rule band, unless the app
+                        // takes all its addresses.
+                        let app_pair = crate::killswitch_codegen::app_kill_switch_filters_for(
+                            sid,
+                            &codegen_out.secondary_app_patterns,
+                            resolution.secondary_luid,
+                            protocols,
+                            policy.app_rules_take_all_addresses,
+                        );
+                        app_block_emitted |= !app_pair.is_empty();
+                        ks.extend(app_pair);
+                        ks
                     };
                     // The service accounts get the pins whenever the owner's
-                    // guard holds anything — the address pairs, never the
-                    // blanket the tunnel-default modes give the owner.
-                    if !ks.is_empty() || fail_closed {
-                        let shares = self.owner_shares(
-                            sid,
-                            intent,
-                            OwnerGuard {
-                                posture: ServiceAccountPosture::Pin,
-                                destinations: &ks_dest_ips,
-                                holds: &holds,
-                                tunnel_servers: OwnerGuard::servers_of(
-                                    &resolution.bootstrap_server_ips,
-                                    &resolution.bootstrap_server_ips_v6,
-                                ),
-                                local_subnets: OwnerGuard::subnets_of(
-                                    &resolution.local_subnets,
-                                    &resolution.local_subnets_v6,
-                                ),
-                                secondary_luid: resolution.secondary_luid,
-                                protocols,
-                                guard_forwarded: policy.guard_forwarded_traffic,
-                                block_all: None,
-                            },
-                            &tunnel_clients,
-                        );
-                        collect_service_account_block_ids(
-                            &shares.service,
-                            &mut killswitch_block_ids,
-                        );
-                        filters.extend(shares.service);
-                        filters.extend(shares.forwarded);
-                    }
+                    // guard is on — the address pairs, never the blanket.
+                    let shares = self.owner_shares(
+                        sid,
+                        intent,
+                        OwnerGuard {
+                            posture: ServiceAccountPosture::Pin,
+                            destinations: &ks_dest_ips,
+                            holds: &holds,
+                            tunnel_servers: OwnerGuard::servers_of(
+                                &resolution.bootstrap_server_ips,
+                                &resolution.bootstrap_server_ips_v6,
+                            ),
+                            local_subnets: OwnerGuard::subnets_of(
+                                &resolution.local_subnets,
+                                &resolution.local_subnets_v6,
+                            ),
+                            secondary_luid: resolution.secondary_luid,
+                            protocols,
+                            guard_forwarded: policy.guard_forwarded_traffic,
+                            foreign_networks: &resolution.foreign_tunnel_networks,
+                            block_all: None,
+                            main_networks: &[],
+                        },
+                        &tunnel_clients,
+                    );
+                    collect_service_account_block_ids(&shares.service, &mut killswitch_block_ids);
+                    filters.extend(shares.service);
+                    filters.extend(shares.forwarded);
                     // A blanket block covers every network, so only a
                     // per-destination posture leaves any of them open.
-                    let per_destination = behavior_mode == RouteBehaviorMode::PreferPrimary
-                        || (ks.is_empty() && fail_closed);
                     if intent.publishes() {
                         let blanket = crate::enforcement_planner::NetworkHolds::default();
-                        let in_force = if per_destination { &holds } else { &blanket };
+                        let in_force = if block_all_armed { &blanket } else { &holds };
                         self.network_hold_log.note(sid, in_force);
                     }
+                    let latch = if catch_all_refused {
+                        "catch-all-refused"
+                    } else if ks.is_empty() {
+                        "nothing-to-hold"
+                    } else {
+                        "active"
+                    };
+                    let changed = self.posture_changed_for(intent, sid, latch);
+                    if changed && catch_all_refused {
+                        tracing::warn!(
+                            target: "nrr::per_sid_orchestrator",
+                            msg_key = "persid-plan-blanket-block-refused",
+                            sid,
+                            "the settings ask for a blanket block, but no tunnel-server address could be read and no trusted VPN client is known: arming it would seal the tunnel's own reconnect, so only the rule destinations are held to the tunnel",
+                        );
+                        if let Some(bus) = self.events.as_ref() {
+                            bus.publish_for(
+                                sid,
+                                nrr_shared::ipc_payloads::StatusUpdateEvent::ProtectionCoverageChanged {
+                                    reason: "blanket-block-not-armed".to_string(),
+                                },
+                            );
+                        }
+                    }
                     if ks.is_empty() {
-                        // Leak-proof pair could not arm — honour the failure
-                        // posture instead of silently allowing.
-                        if fail_closed {
-                            // The secondary is UP in this branch, so nothing is
-                            // escalated: the per-IP guard is the whole posture.
-                            block_all_armed = false;
-                            let exemptions = FailClosedExemptions {
-                                bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
-                                bootstrap_server_ips_v6: resolution.bootstrap_server_ips_v6.clone(),
-                                foreign_tunnel_luids: resolution.foreign_tunnel_luids.clone(),
-                                local_subnets: resolution.local_subnets.clone(),
-                                local_subnets_v6: resolution.local_subnets_v6.clone(),
-                                // Inert here — this branch calls fail_closed_filters
-                                // with block_all=false (per-IP path), which ignores
-                                // primary_dest_ips; primary IPs are never blocked
-                                // per-IP. Set for struct completeness only.
-                                primary_dest_ips: known_primary_dest_ips.clone(),
-                                // Secondary is UP here (this is the per-IP path,
-                                // block_all=false below) — DNS-over-primary is a
-                                // block-all-only relaxation, so never set here.
-                                allow_dns_over_primary: false,
-                                dns_servers: Vec::new(),
-                                // per-IP path never blocks direct hosts,
-                                // so there is nothing to exempt.
-                                known_direct_ips: Vec::new(),
-                                // Per-IP path never blocks the tunnel next-hop
-                                // (only enumerated rule destinations), so the
-                                // liveness probe needs no hole here.
-                                probe_target_ips: Vec::new(),
-                                // The v6 cut this path may emit still has to let
-                                // the tunnel itself out.
-                                secondary_luid: resolution.secondary_luid,
-                            };
-                            // review fix — the secondary (VPN) is UP here
-                            // (`Some`); `ks` is empty only because there is nothing
-                            // to pin yet (cold FQDN cache for zone/suffix rules).
-                            // Do NOT escalate to the catch-all block-all in this
-                            // branch — that would cut ALL egress while the secondary adapter is
-                            // healthy (and, with an off-subnet DNS, deadlock the
-                            // cache warm-up so it never lifts). Keep the per-IP
-                            // leak-guard (an empty dest set ⇒ a harmless no-op).
-                            // The catch-all is reserved for the `None` branch,
-                            // where the secondary is genuinely unresolved.
-                            let mut fc = self.fail_closed_filters(
-                                sid,
-                                behavior_mode,
-                                &ks_dest_ips,
-                                &holds,
-                                &exemptions,
-                                protocols,
-                                FailClosedPosture { block_all: false },
-                            );
-                            // App-observed destinations left the per-IP pin set,
-                            // so a secondary-routed app is cut here by its own
-                            // unconditional block instead — same coverage the
-                            // egress pair would give with a usable tunnel.
-                            let app_blocks = crate::killswitch_codegen::fail_closed_block_apps_for(
-                                sid,
-                                &codegen_out.secondary_app_patterns,
-                                protocols,
-                                policy.app_rules_take_all_addresses,
-                            );
-                            app_block_emitted |= !app_blocks.is_empty();
-                            fc.extend(app_blocks);
-                            // full-level only on posture change;
-                            // the ~5 s reconcile re-deriving the same state
-                            // logs at debug (NDJSON flood → archive-cap burn).
-                            if self.posture_changed_for(intent, sid, "pair-empty-fail-closed") {
-                                tracing::warn!(
-                                    target: "nrr::per_sid_orchestrator",
-                                    msg_key = "persid-plan-pair-empty-fail-closed",
-                                    sid,
-                                    mode = ?behavior_mode,
-                                    fail_closed_filters = fc.len(),
-                                    "kill-switch could not arm the leak-proof pair — FAIL-CLOSED (blocking)",
-                                );
-                            } else {
-                                tracing::debug!(
-                                    target: "nrr::per_sid_orchestrator",
-                                    sid,
-                                    mode = ?behavior_mode,
-                                    fail_closed_filters = fc.len(),
-                                    "kill-switch could not arm the leak-proof pair — FAIL-CLOSED (blocking)",
-                                );
-                            }
-                            collect_block_ids(&fc, &mut killswitch_block_ids);
-                            filters.extend(fc);
-                            // This branch blocks too, so the clients ride
-                            // along exactly as in the unresolved branch below.
-                            filters.extend(crate::killswitch_codegen::primary_app_exempt_filters(
-                                sid,
-                                &tunnel_clients,
-                            ));
-                        } else if self.posture_changed_for(intent, sid, "pair-empty-fail-open") {
-                            tracing::warn!(
-                                target: "nrr::per_sid_orchestrator",
-                                msg_key = "persid-plan-pair-empty-fail-open",
-                                sid,
-                                mode = ?behavior_mode,
-                                "kill-switch requested but not armed this cycle (fail-open)",
-                            );
-                        } else {
-                            tracing::debug!(
+                        // A cold cache leaves nothing to pin yet. Nothing is
+                        // blocked in its place: the tunnel is up, and an
+                        // unconditional block would cut what it carries.
+                        if changed {
+                            tracing::info!(
                                 target: "nrr::per_sid_orchestrator",
                                 sid,
                                 mode = ?behavior_mode,
-                                "kill-switch requested but not armed this cycle (fail-open)",
+                                "leak protection on, tunnel up, nothing to hold to it yet",
                             );
                         }
                     } else {
-                        if self.posture_changed_for(intent, sid, "active") {
+                        if changed {
                             tracing::info!(
                                 target: "nrr::per_sid_orchestrator",
                                 msg_key = "persid-plan-kill-switch-active",
@@ -1072,19 +982,11 @@ impl PerSidApplyOrchestrator {
                         }
                         collect_block_ids(&ks, &mut killswitch_block_ids);
                         filters.extend(ks);
-                        //  — the mode-B catch-all blocks EVERY
-                        // off-tunnel flow while the tunnel is UP, and that
-                        // includes the VPN client's own primary-side control
-                        // traffic (server handshake, connectivity checks
-                        // against ROTATING provider IPs — the examplevpn 72 s
-                        // hang-per-drop class). The client's egress IS the
-                        // tunnel's transport, so the app exemption set is
-                        // emitted here too — proactively, at arming — not only
-                        // in the fail-closed branches below. Mode A is
-                        // excluded: its armed set is per-destination pins, no
-                        // catch-all, so an unconditional app permit would only
-                        // weaken the pinned-destination guarantee.
-                        if behavior_mode != RouteBehaviorMode::PreferPrimary {
+                        // The catch-all blocks every off-tunnel flow, the VPN
+                        // client's own control traffic over the main link
+                        // included, so the clients are exempted at arming. The
+                        // pins need no such permit: it would only weaken them.
+                        if block_all_armed {
                             filters.extend(crate::killswitch_codegen::primary_app_exempt_filters(
                                 sid,
                                 &tunnel_clients,
@@ -1096,241 +998,182 @@ impl PerSidApplyOrchestrator {
                     // The secondary (VPN) interface could not be resolved at
                     // all. A boot where the link's client has not started yet
                     // looks exactly like a tunnel that dropped, and both answer
-                    // the same way: the rule destinations wait rather than take
-                    // the main link. The wait is visible — `secondary-down`
+                    // the same way: what protection holds waits rather than
+                    // takes the main link. The wait is visible — `secondary-down`
                     // reaches the window and the tray.
-                    if fail_closed {
-                        let mut exemptions = fail_closed_base().clone();
-                        // opt-in: keep name resolution working over
-                        // the primary link while the block-all is engaged (adds a
-                        // port-scoped UDP/TCP-53 permit). Strict default = blocks DNS too.
-                        exemptions.allow_dns_over_primary = policy.allow_dns_over_primary;
-                        // Port 53 reaches the machine's own resolvers and no other host.
-                        exemptions.dns_servers = self.primary_dns_v4();
-                        // known-primary hosts get a
-                        // packet-layer permit so ping/ICMP to them survives the block-all
-                        // (TCP/UDP already escapes at the ALE rule permit).
-                        exemptions.primary_dest_ips = known_primary_dest_ips.clone();
-                        // known-direct destinations (Mode-B steered
-                        // answers + FCrDNS non-rule confirmations) get an ALE exempt +
-                        // packet permit so plain primary-path sites survive the
-                        // block-all. Subtract the never-exempt secondary set: while
-                        // the secondary is down those IPs must stay blocked, never
-                        // rescued via a direct-host permit (defense in depth — the
-                        // provers already excluded pinned addresses). The base is
-                        // two-mode (see `never_exempt_secondary_ips`): with fake-IP
-                        // effective a census-shared IP the smart kill-switch declined
-                        // to pin stays exemptible (its direct co-tenant remains
-                        // reachable on the primary); with fake-IP off the strict base
-                        // keeps it blocked — this exemption was the exact egress path
-                        // of the  assistant.example leak.
-                        if let Some(registry) = self.known_direct.as_ref() {
-                            exemptions.known_direct_ips = registry
-                                .snapshot()
-                                .into_iter()
-                                .filter(|ip| !never_exempt_secondary_ips.contains(ip))
-                                .collect();
-                        }
-                        // a `FailClosedUnknown` Mode-A strategy
-                        // escalates to the catch-all here (secondary unresolved) so a
-                        // routed domain's un-seeded edge IP is blocked rather than
-                        // leaked to the primary. `kill_switch_block_all` still forces
-                        // it regardless of the strategy.
-                        let effective_block_all =
-                            policy.kill_switch_block_all || mode_a_fail_closed_unknown;
-                        // The secondary is genuinely unresolved here, and in
-                        // the tunnel-default modes everything the user sends is
-                        // supposed to leave through it — so the escalation is
-                        // the mode's own meaning, not an extra setting. Decided
-                        // here rather than inside `fail_closed_filters`, so the
-                        // posture the caller reports and the filters it gets
-                        // cannot say different things.
-                        let effective_block_all = effective_block_all
-                            || behavior_mode != RouteBehaviorMode::PreferPrimary;
-                        block_all_armed = effective_block_all;
-                        // The networks the tunnel's rules name are pinned
-                        // whatever the posture: the blanket sits below the
-                        // main-link rule band, the holds above it, and only
-                        // the holds keep a main-link program off a network the
-                        // tunnel owns. The log still reads "blanket" — nothing
-                        // is too wide or spared under a block-all.
-                        let pinned_holds = crate::enforcement_planner::NetworkHolds::for_pass(
-                            &ownership,
-                            &ks_dest_ips,
-                            || exemptions.never_blocked_networks(),
-                        );
-                        let holds = if effective_block_all {
-                            crate::enforcement_planner::NetworkHolds::default()
-                        } else {
-                            pinned_holds.clone()
-                        };
-                        if intent.publishes() {
-                            self.network_hold_log.note(sid, &holds);
-                        }
-                        // Armed for BOTH shapes: with the default per-IP posture
-                        // the block set covers only the addresses already known,
-                        // which is exactly the state a DNS answer or a seeder
-                        // backoff must not ignore.
-                        fail_closed_armed = true;
-                        let mut fc = self.fail_closed_filters(
-                            sid,
-                            behavior_mode,
-                            &ks_dest_ips,
-                            &pinned_holds,
-                            &exemptions,
-                            protocols,
-                            FailClosedPosture {
-                                block_all: effective_block_all,
-                            },
-                        );
-                        // A secondary-routed app is cut whole while its link is
-                        // unresolved: the per-IP set no longer carries its
-                        // observed destinations, and its UN-observed ones never
-                        // had a block in this branch at all — first contact used
-                        // to egress the primary until the observer caught up.
-                        let app_blocks = crate::killswitch_codegen::fail_closed_block_apps_for(
-                            sid,
-                            &codegen_out.secondary_app_patterns,
-                            protocols,
-                            policy.app_rules_take_all_addresses,
-                        );
-                        app_block_emitted |= !app_blocks.is_empty();
-                        fc.extend(app_blocks);
-                        // Address blocks only for the service accounts, even
-                        // when the owner's posture escalated to a blanket one;
-                        // forwarded traffic takes the blanket with it.
-                        let shares = self.owner_shares(
-                            sid,
-                            intent,
-                            OwnerGuard {
-                                posture: ServiceAccountPosture::Block,
-                                destinations: &ks_dest_ips,
-                                holds: &pinned_holds,
-                                tunnel_servers: OwnerGuard::servers_of(
-                                    &exemptions.bootstrap_server_ips,
-                                    &exemptions.bootstrap_server_ips_v6,
-                                ),
-                                local_subnets: OwnerGuard::subnets_of(
-                                    &exemptions.local_subnets,
-                                    &exemptions.local_subnets_v6,
-                                ),
-                                secondary_luid: 0,
-                                protocols,
-                                guard_forwarded: policy.guard_forwarded_traffic,
-                                block_all: effective_block_all.then_some(&exemptions),
-                            },
-                            &tunnel_clients,
-                        );
-                        collect_service_account_block_ids(
-                            &shares.service,
-                            &mut killswitch_block_ids,
-                        );
-                        filters.extend(shares.service);
-                        filters.extend(shares.forwarded);
-                        // Full-level only on a posture change or a heartbeat (the
-                        // block-all/per-IP split is part of the posture, so a
-                        // coverage escalation still re-logs immediately); steady
-                        // ~5 s re-derivations in between drop to debug (this line
-                        // alone fired 1000+ times in a single 26-minute block-all
-                        // session — logging every one would burn the archive log
-                        // cap, but a multi-minute block-all with zero warns after
-                        // the opening line is not distinguishable from "silently
-                        // stuck", hence the periodic heartbeat).
-                        let posture = if effective_block_all {
-                            "unresolved-fail-closed-block-all"
-                        } else {
-                            "unresolved-fail-closed-per-ip"
-                        };
-                        match self.posture_log_event_for(intent, sid, posture) {
-                            PostureLogEvent::Transition => {
-                                tracing::warn!(
-                                    target: "nrr::per_sid_orchestrator",
-                                    msg_key = "persid-plan-secondary-unresolved-fail-closed",
-                                    sid,
-                                    mode = ?behavior_mode,
-                                    block_all = effective_block_all,
-                                    mode_a_fail_closed_unknown,
-                                    fail_closed_filters = fc.len(),
-                                    "secondary interface unresolved — kill-switch FAIL-CLOSED (blocking)",
-                                );
-                                // Ask for the re-resolve HERE, on the arming
-                                // edge — not only on the heartbeat a minute
-                                // later. The common cause is a tunnel adapter
-                                // that was just recreated with a new GUID: the
-                                // name heal finds it immediately, and every
-                                // second spent waiting is a second the user
-                                // spends with their traffic blocked for no
-                                // remaining reason.
-                                if let Some(requests) =
-                                    self.rebind_requests.as_ref().filter(|_| intent.publishes())
-                                {
-                                    requests.request("fail-closed-armed");
-                                }
-                            }
-                            PostureLogEvent::Heartbeat { elapsed } => {
-                                tracing::warn!(
-                                    target: "nrr::per_sid_orchestrator",
-                                    msg_key = "persid-plan-secondary-unresolved-heartbeat",
-                                    sid,
-                                    mode = ?behavior_mode,
-                                    block_all = effective_block_all,
-                                    mode_a_fail_closed_unknown,
-                                    fail_closed_filters = fc.len(),
-                                    elapsed_minutes = elapsed.as_secs() / 60,
-                                    "secondary interface still unresolved — kill-switch FAIL-CLOSED still blocking (heartbeat)",
-                                );
-                                // Announcing is not enough: after a resume the
-                                // binding can stay unresolvable until something
-                                // re-runs the name heal against live adapters.
-                                if let Some(requests) =
-                                    self.rebind_requests.as_ref().filter(|_| intent.publishes())
-                                {
-                                    requests.request("fail-closed-heartbeat");
-                                }
-                            }
-                            PostureLogEvent::Steady => {
-                                tracing::debug!(
-                                    target: "nrr::per_sid_orchestrator",
-                                    sid,
-                                    mode = ?behavior_mode,
-                                    block_all = effective_block_all,
-                                    mode_a_fail_closed_unknown,
-                                    fail_closed_filters = fc.len(),
-                                    "secondary interface unresolved — kill-switch FAIL-CLOSED (blocking)",
-                                );
-                            }
-                        }
-                        collect_block_ids(&fc, &mut killswitch_block_ids);
-                        filters.extend(fc);
-                        // The secondary (VPN) is DOWN here, so a VPN client is
-                        // bootstrapping over the primary; permit it through the block
-                        // so the tunnel can establish (else fail-closed deadlocks it).
-                        filters.extend(crate::killswitch_codegen::primary_app_exempt_filters(
-                            sid,
-                            &tunnel_clients,
-                        ));
-                    } else if self.posture_changed_for(intent, sid, "unresolved-fail-open") {
-                        tracing::warn!(
-                            target: "nrr::per_sid_orchestrator",
-                            msg_key = "persid-plan-secondary-unresolved-fail-open",
-                            sid,
-                            "kill-switch requested but secondary interface unresolved — leaving it off (fail-open)",
-                        );
-                    } else {
-                        tracing::debug!(
-                            target: "nrr::per_sid_orchestrator",
-                            sid,
-                            "kill-switch requested but secondary interface unresolved — leaving it off (fail-open)",
-                        );
+                    let effective_block_all =
+                        nrr_domain::protection_posture(behavior_mode, protection, false)
+                            == nrr_domain::ProtectionPosture::BlockAll;
+                    let mut exemptions = fail_closed_base().clone();
+                    // opt-in: keep name resolution working over the primary link
+                    // while the block-all is engaged (port-scoped UDP/TCP 53).
+                    exemptions.allow_dns_over_primary = policy.allow_dns_over_primary;
+                    // Port 53 reaches the machine's own resolvers and no other host.
+                    exemptions.dns_servers = self.primary_dns();
+                    // known-primary hosts get a packet-layer permit so ping/ICMP
+                    // to them survives the block-all (TCP/UDP already escapes at
+                    // the ALE rule permit).
+                    exemptions.primary_dest_ips = known_primary_dest_ips.clone();
+                    // known-direct destinations get an ALE exempt + packet permit
+                    // so plain primary-path sites survive the block-all, minus
+                    // the never-exempt secondary set (see
+                    // `never_exempt_secondary_ips` for its two modes).
+                    if let Some(registry) = self.known_direct.as_ref() {
+                        exemptions.known_direct_ips = registry
+                            .snapshot()
+                            .into_iter()
+                            .filter(|ip| !never_exempt_secondary_ips.contains(ip))
+                            .collect();
                     }
+                    block_all_armed = effective_block_all;
+                    // The networks the tunnel's rules name are pinned whatever
+                    // the posture: the blanket sits below the main-link rule
+                    // band, the holds above it, and only the holds keep a
+                    // main-link program off a network the tunnel owns. The log
+                    // still reads "blanket" — nothing is too wide or spared
+                    // under a block-all.
+                    let pinned_holds = crate::enforcement_planner::NetworkHolds::for_pass(
+                        &ownership,
+                        &ks_dest_ips,
+                        || exemptions.never_blocked_networks(),
+                    );
+                    let holds = if effective_block_all {
+                        crate::enforcement_planner::NetworkHolds::default()
+                    } else {
+                        pinned_holds.clone()
+                    };
+                    if intent.publishes() {
+                        self.network_hold_log.note(sid, &holds);
+                    }
+                    // Armed for BOTH shapes: the per-destination one covers only
+                    // the addresses already known, which is exactly the state a
+                    // DNS answer or a seeder backoff must not ignore.
+                    fail_closed_armed = true;
+                    let mut fc = self.fail_closed_filters(
+                        sid,
+                        &ks_dest_ips,
+                        &pinned_holds,
+                        &exemptions,
+                        protocols,
+                        FailClosedPosture {
+                            block_all: effective_block_all,
+                            machine_has_other_principals: self.other_principals_hold_block_all(sid),
+                        },
+                    );
+                    // A secondary-routed app is cut whole while its link is
+                    // unresolved: the per-IP set no longer carries its observed
+                    // destinations, and its unobserved ones would otherwise
+                    // egress the primary until the observer caught up.
+                    let app_blocks = crate::killswitch_codegen::fail_closed_block_apps_for(
+                        sid,
+                        &codegen_out.secondary_app_patterns,
+                        protocols,
+                        policy.app_rules_take_all_addresses,
+                    );
+                    app_block_emitted |= !app_blocks.is_empty();
+                    fc.extend(app_blocks);
+                    // Address blocks only for the service accounts, even when
+                    // the owner's posture is a blanket; forwarded traffic takes
+                    // the blanket with it.
+                    let shares = self.owner_shares(
+                        sid,
+                        intent,
+                        OwnerGuard {
+                            posture: ServiceAccountPosture::Block,
+                            destinations: &ks_dest_ips,
+                            holds: &pinned_holds,
+                            tunnel_servers: OwnerGuard::servers_of(
+                                &exemptions.bootstrap_server_ips,
+                                &exemptions.bootstrap_server_ips_v6,
+                            ),
+                            local_subnets: OwnerGuard::subnets_of(
+                                &exemptions.local_subnets,
+                                &exemptions.local_subnets_v6,
+                            ),
+                            secondary_luid: 0,
+                            protocols,
+                            guard_forwarded: policy.guard_forwarded_traffic,
+                            foreign_networks: &exemptions.foreign_tunnel_networks,
+                            block_all: effective_block_all.then_some(&exemptions),
+                            main_networks: &codegen_out.primary_dest_networks,
+                        },
+                        &tunnel_clients,
+                    );
+                    collect_service_account_block_ids(&shares.service, &mut killswitch_block_ids);
+                    filters.extend(shares.service);
+                    filters.extend(shares.forwarded);
+                    // Full level on a posture change or a heartbeat (the shape is
+                    // part of the posture); the ~5 s re-derivations in between
+                    // drop to debug — a long block-all with no line after the
+                    // first reads as "silently stuck", hence the heartbeat.
+                    let posture = if effective_block_all {
+                        "unresolved-fail-closed-block-all"
+                    } else {
+                        "unresolved-fail-closed-per-ip"
+                    };
+                    match self.posture_log_event_for(intent, sid, posture) {
+                        PostureLogEvent::Transition => {
+                            tracing::warn!(
+                                target: "nrr::per_sid_orchestrator",
+                                msg_key = "persid-plan-secondary-unresolved-fail-closed",
+                                sid,
+                                mode = ?behavior_mode,
+                                block_all = effective_block_all,
+                                fail_closed_filters = fc.len(),
+                                "secondary interface unresolved — leak protection holds traffic",
+                            );
+                            // Ask for the re-resolve on the arming edge: the
+                            // common cause is a tunnel adapter just recreated with
+                            // a new GUID, which the name heal finds at once.
+                            if let Some(requests) =
+                                self.rebind_requests.as_ref().filter(|_| intent.publishes())
+                            {
+                                requests.request("fail-closed-armed");
+                            }
+                        }
+                        PostureLogEvent::Heartbeat { elapsed } => {
+                            tracing::warn!(
+                                target: "nrr::per_sid_orchestrator",
+                                msg_key = "persid-plan-secondary-unresolved-heartbeat",
+                                sid,
+                                mode = ?behavior_mode,
+                                block_all = effective_block_all,
+                                fail_closed_filters = fc.len(),
+                                elapsed_minutes = elapsed.as_secs() / 60,
+                                "secondary interface still unresolved — leak protection still holds traffic (heartbeat)",
+                            );
+                            // After a resume the binding can stay unresolvable
+                            // until something re-runs the name heal.
+                            if let Some(requests) =
+                                self.rebind_requests.as_ref().filter(|_| intent.publishes())
+                            {
+                                requests.request("fail-closed-heartbeat");
+                            }
+                        }
+                        PostureLogEvent::Steady => {
+                            tracing::debug!(
+                                target: "nrr::per_sid_orchestrator",
+                                sid,
+                                mode = ?behavior_mode,
+                                block_all = effective_block_all,
+                                fail_closed_filters = fc.len(),
+                                "secondary interface unresolved — leak protection holds traffic",
+                            );
+                        }
+                    }
+                    collect_block_ids(&fc, &mut killswitch_block_ids);
+                    filters.extend(fc);
+                    // The secondary is DOWN here, so a VPN client is
+                    // bootstrapping over the primary; permit it through the
+                    // block so the tunnel can establish.
+                    filters.extend(crate::killswitch_codegen::primary_app_exempt_filters(
+                        sid,
+                        &tunnel_clients,
+                    ));
                 }
             }
         }
-        // Strict's default block is destination-less too, and while the guard
-        // is on only the blanket postures used to carry its floor.
-        if app_block_emitted
-            || (leak_guard_armed && behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed)
-        {
+        if app_block_emitted {
             let floor = self.destination_less_block_floor(
                 sid,
                 &filters,
@@ -1344,36 +1187,6 @@ impl PerSidApplyOrchestrator {
         // leak-guard disarmed ⇒ reset the posture latch so a
         // later re-arm logs at full level again (recorded silently).
         if !leak_guard_armed {
-            // Strict still emits its default block (that is the mode, not the
-            // guard), so it still needs the exemptions the guard used to carry.
-            if behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed {
-                if let Some(resolution) = kill_switch().clone() {
-                    let exemptions = FailClosedExemptions {
-                        bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
-                        bootstrap_server_ips_v6: resolution.bootstrap_server_ips_v6.clone(),
-                        foreign_tunnel_luids: resolution.foreign_tunnel_luids.clone(),
-                        local_subnets: resolution.local_subnets.clone(),
-                        local_subnets_v6: resolution.local_subnets_v6.clone(),
-                        primary_dest_ips: Vec::new(),
-                        allow_dns_over_primary: false,
-                        dns_servers: Vec::new(),
-                        known_direct_ips: Vec::new(),
-                        probe_target_ips: Vec::new(),
-                        secondary_luid: resolution.secondary_luid,
-                    };
-                    filters.extend(crate::killswitch_codegen::default_block_exemptions(
-                        sid,
-                        &exemptions,
-                    ));
-                    if ipv6.families() == crate::enforcement_planner::FamilyScope::Both {
-                        filters.extend(crate::killswitch_codegen::default_block_exemptions_v6(
-                            sid,
-                            &exemptions.bootstrap_server_ips_v6,
-                            &exemptions.local_subnets_v6,
-                        ));
-                    }
-                }
-            }
             let _ = self.posture_changed_for(intent, sid, "off");
             // Nothing is pinned while disarmed, so no shared-IP
             // exclusions either; clear the GUI warning.
@@ -1385,12 +1198,46 @@ impl PerSidApplyOrchestrator {
                 status.set(&[]);
             }
         }
+        // Whatever posture blocked above, a corporate tunnel beside ours keeps
+        // the networks it carries.
+        if crate::killswitch_codegen::has_posture_block(&filters) {
+            let (networks, own_luid) = match kill_switch() {
+                Some(resolution) => (
+                    resolution.foreign_tunnel_networks.clone(),
+                    resolution.secondary_luid,
+                ),
+                None => (fail_closed_base().foreign_tunnel_networks.clone(), 0),
+            };
+            if !networks.is_empty() {
+                let present: std::collections::HashSet<nrr_platform_api::types::WfpFilterId> =
+                    filters.iter().map(|f| f.id).collect();
+                let counted = crate::killswitch_codegen::foreign_tunnel_permits_counted(
+                    sid, &filters, &networks, own_luid,
+                );
+                if intent.publishes() {
+                    self.note_foreign_networks_cut(sid, counted.cut);
+                }
+                filters.extend(
+                    counted
+                        .filters
+                        .into_iter()
+                        .filter(|f| !present.contains(&f.id)),
+                );
+            }
+        }
+        // Another VPN's handshake, through a blanket only: the per-destination
+        // guard cuts nothing but rule hosts.
+        if block_all_armed {
+            filters.extend(crate::killswitch_codegen::vpn_handshake_filters(
+                sid,
+                &crate::vpn_gateway_confirm::global_vpn_gateways().confirmed_addresses(sid),
+            ));
+        }
         // DoH/DoT lockdown. Independent of the kill-switch pins
         // above: block browser DNS-over-HTTPS to the resolver set (443/IP) + DNS-
         // over-TLS globally (853) so the observer sees plaintext DNS again (the
         // plaintext-DNS blind-spot class). Applied when enabled AND in scope — always,
-        // or (the default) only while the kill-switch master toggle is on ("only
-        // under leak protection"). The blocks sit in their own weight band above
+        // or (the default) only while leak protection is on. The blocks sit in their own weight band above
         // rule permits but below the exemptions, so they never break the tunnel or
         // a primary-routed app. The resolver IPs are already resolved by the
         // composition root (host entries via the FQDN cache).
@@ -1398,7 +1245,7 @@ impl PerSidApplyOrchestrator {
             policy.doh_lockdown_auto,
             policy.doh_lockdown_enabled,
             policy.doh_lockdown_scope,
-            policy.kill_switch_enabled,
+            protection.is_on(),
             crate::rule_book_facts::has_secondary_rules(&rules.rule_book),
         ) {
             let doh = crate::killswitch_codegen::doh_dot_block_filters(
@@ -1423,7 +1270,33 @@ impl PerSidApplyOrchestrator {
                         .filter(|s| s.action == WfpAction::Block)
                         .map(|s| s.id.raw),
                 );
+                // The lockdown is the user's own protection: it also binds what
+                // leaves through a corporate tunnel, whose permits would
+                // otherwise outrank it for a resolver that tunnel routes.
+                let (tunnels, own_luid) = match kill_switch() {
+                    Some(resolution) => (
+                        crate::killswitch_codegen::foreign_luids_of(
+                            &resolution.foreign_tunnel_luids,
+                            &resolution.foreign_tunnel_networks,
+                        ),
+                        resolution.secondary_luid,
+                    ),
+                    None => (
+                        crate::killswitch_codegen::foreign_luids_of(
+                            &fail_closed_base().foreign_tunnel_luids,
+                            &fail_closed_base().foreign_tunnel_networks,
+                        ),
+                        0,
+                    ),
+                };
+                let vetoes = crate::killswitch_codegen::doh_foreign_vetoes(
+                    sid, &doh, &filters, &tunnels, own_luid,
+                );
+                killswitch_block_ids
+                    .dns_lockdown
+                    .extend(vetoes.iter().map(|s| s.id.raw));
                 filters.extend(doh);
+                filters.extend(vetoes);
             }
         }
         // Standing-volume watchdog. Four 0xEF crashes established that the BFE
@@ -1522,6 +1395,30 @@ impl PerSidApplyOrchestrator {
         }))
     }
 
+    /// Says, once per change, that networks of other tunnels passed the cap and
+    /// stay cut: a silent cut reads as a dead corporate network.
+    fn note_foreign_networks_cut(&self, sid: &str, cut: (usize, usize)) {
+        let mut seen = self
+            .foreign_cut_seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Principals are few; the bound only guards a pathological churn.
+        if seen.len() >= 256 && !seen.contains_key(sid) {
+            seen.clear();
+        }
+        let previous = seen.insert(sid.to_string(), cut);
+        if cut != (0, 0) && previous != Some(cut) {
+            tracing::warn!(
+                target: "nrr::per_sid_orchestrator",
+                msg_key = "foreign-tunnel-networks-over-cap",
+                sid,
+                count = cut.0 + cut.1,
+                cap = crate::wfp_bands::FOREIGN_TUNNEL_MAX_NETWORKS,
+                "networks of other tunnels past the per-tunnel cap stay under the guard",
+            );
+        }
+    }
+
     /// The loopback / link-local / LAN / tunnel-server floor for a block with no
     /// destination condition, minus what a blanket posture already emitted.
     ///
@@ -1550,9 +1447,9 @@ impl PerSidApplyOrchestrator {
         };
         let present: std::collections::HashSet<nrr_platform_api::types::WfpFilterId> =
             emitted.iter().map(|f| f.id).collect();
-        let mut floor = crate::killswitch_codegen::default_block_exemptions(sid, &exemptions);
+        let mut floor = crate::killswitch_codegen::destination_less_floor(sid, &exemptions);
         if ipv6 {
-            floor.extend(crate::killswitch_codegen::default_block_exemptions_v6(
+            floor.extend(crate::killswitch_codegen::destination_less_floor_v6(
                 sid,
                 &exemptions.bootstrap_server_ips_v6,
                 &exemptions.local_subnets_v6,

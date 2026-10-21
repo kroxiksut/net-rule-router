@@ -185,6 +185,42 @@ pub(super) fn description_matches_display_name(description: &str, display_name: 
             .any(|t| live.contains(t) && !GENERIC_NAME_TOKENS.contains(&t.as_str()))
 }
 
+/// Words every client on a stock tunnel driver shares. Two clients on the same
+/// driver agree on these, so agreeing on them alone says nothing about whose
+/// tunnel it is.
+const STOCK_DRIVER_TOKENS: &[&str] = &[
+    "windows",
+    "openvpn",
+    "wireguard",
+    "ndis",
+    "tun",
+    "ovpn",
+    "dco",
+    "userspace",
+    "miniport",
+];
+
+/// For a tunnel that is foreign by structure: one of its names must match by a
+/// vendor word (neither a category nor a stock-driver word) AND add no
+/// vendor word the saved name lacks. "Cisco AnyConnect Secure Mobility …" is not
+/// the connection saved as "AnyConnect"; "acme.name_VPN" is the one saved as
+/// "acme.name VPN 3.0 OpenVPN Adapter".
+pub(super) fn adapter_carries_only_the_saved_brand(info: &AdapterInfo, display_name: &str) -> bool {
+    let is_vendor = |t: &String| {
+        !GENERIC_NAME_TOKENS.contains(&t.as_str()) && !STOCK_DRIVER_TOKENS.contains(&t.as_str())
+    };
+    let saved: Vec<String> = core_tokens(display_name)
+        .into_iter()
+        .filter(is_vendor)
+        .collect();
+    [&info.description, &info.friendly_name].iter().any(|name| {
+        let live: Vec<String> = core_tokens(name).into_iter().filter(is_vendor).collect();
+        description_matches_display_name(name, display_name)
+            && live.iter().any(|t| saved.contains(t))
+            && live.iter().all(|t| saved.contains(t))
+    })
+}
+
 /// Does `info` still answer to the name the binding was saved under?
 ///
 /// The saved name is whatever the GUI showed, which is the CONNECTION name

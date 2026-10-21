@@ -21,6 +21,7 @@ fn route_flow(role: RouteRole, ordinal: u32, ip: Ipv4Addr) -> FlowRule {
         app: AppScope::Any,
         egress: EgressConstraint::Any,
         coverage: Coverage::ConnectOnly,
+        observed_by_program: false,
     }
 }
 
@@ -49,6 +50,7 @@ fn block_flow(ordinal: u32, ip: Ipv4Addr) -> FlowRule {
         app: AppScope::Any,
         egress: EgressConstraint::Any,
         coverage: Coverage::AllPackets,
+        observed_by_program: false,
     }
 }
 
@@ -153,6 +155,7 @@ fn fail_closed_ale_groups_per_protocol_get_distinct_ids() {
         app: AppScope::Any,
         egress: EgressConstraint::Any,
         coverage: Coverage::ConnectOnly,
+        observed_by_program: false,
     };
     let out = lower_kill_switch(
         &plan(vec![
@@ -189,6 +192,7 @@ fn network_flow(class: PrecedenceClass, ordinal: u32, dst: DstMatch) -> FlowRule
         } else {
             Coverage::ConnectOnly
         },
+        observed_by_program: false,
     }
 }
 
@@ -283,6 +287,7 @@ fn pin_flow(principal: PrincipalScope, ordinal: u32, ip: Ipv4Addr) -> FlowRule {
         app: AppScope::Any,
         egress: EgressConstraint::OnlyVia(EgressRef::Secondary),
         coverage: Coverage::ConnectOnly,
+        observed_by_program: false,
     }
 }
 
@@ -321,4 +326,78 @@ fn service_account_pins_lower_apart_from_the_owners() {
     for f in &owners {
         assert!(f.covers_v4(mine) && !f.covers_v4(theirs), "{f:?}");
     }
+}
+
+fn program_flow(class: PrecedenceClass, verdict: Verdict, ordinal: u32) -> FlowRule {
+    FlowRule {
+        verdict,
+        precedence: Precedence { class, ordinal },
+        flow: FlowMatch {
+            dst: DstMatch::Any,
+            dst_port: None,
+            protocol: None,
+        },
+        principal: PrincipalScope::from_user(UserPrincipal::from_windows_sid("S-1-5-21-A").ok()),
+        app: AppScope::Program {
+            key: "evil.exe".into(),
+            exe_paths: vec![std::path::PathBuf::from(r"C:\Apps\evil.exe")],
+        },
+        egress: EgressConstraint::Any,
+        coverage: Coverage::ConnectOnly,
+        observed_by_program: false,
+    }
+}
+
+#[test]
+fn a_program_deny_lowers_to_both_families_plus_loopback_permits() {
+    let ordinal = 2 * nrr_platform_api::enforcement::SLOTS_PER_RULE as u32 + 3;
+    let out = lower_route_rules(&plan(vec![program_flow(
+        PrecedenceClass::HardBlock,
+        Verdict::Block,
+        ordinal,
+    )]));
+    assert_eq!(out.len(), 4, "{out:?}");
+    let blocks: Vec<_> = out
+        .iter()
+        .filter(|f| f.action == WfpAction::Block)
+        .collect();
+    assert_eq!(blocks.len(), 2);
+    assert!(blocks
+        .iter()
+        .any(|f| f.layer == WfpLayerKey::AleAuthConnectV4));
+    assert!(blocks
+        .iter()
+        .any(|f| f.layer == WfpLayerKey::AleAuthConnectV6));
+    assert!(blocks
+        .iter()
+        .all(|f| f.weight == BASE_BLOCK + u64::from(ordinal)));
+    let lo: Vec<_> = out
+        .iter()
+        .filter(|f| f.action == WfpAction::Permit)
+        .collect();
+    assert_eq!(lo.len(), 2);
+    let top = BASE_BLOCK
+        + 2 * nrr_platform_api::enforcement::SLOTS_PER_RULE
+        + nrr_platform_api::enforcement::DENY_LOOPBACK_SLOT;
+    assert!(lo
+        .iter()
+        .all(|f| f.weight == top && f.app_pattern.is_some()));
+    assert!(lo
+        .iter()
+        .any(|f| f.remote_subnet == Some((Ipv4Addr::new(127, 0, 0, 0), 8))));
+    assert!(lo
+        .iter()
+        .any(|f| f.remote_subnet_v6 == Some((Ipv6Addr::LOCALHOST, 128))));
+    let ids: std::collections::HashSet<_> = out.iter().map(|f| f.id.raw).collect();
+    assert_eq!(ids.len(), 4, "ids are distinct");
+}
+
+#[test]
+fn a_program_route_permit_lowers_to_one_filter() {
+    let out = lower_route_rules(&plan(vec![program_flow(
+        PrecedenceClass::RouteRule(RouteRole::Secondary),
+        Verdict::Permit,
+        0,
+    )]));
+    assert_eq!(out.len(), 1);
 }

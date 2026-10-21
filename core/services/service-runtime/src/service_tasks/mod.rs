@@ -182,9 +182,10 @@ pub const TASK_ID_SECONDARY_EXTERNAL_ADDRESS: &str = "secondary-external-address
 /// Two ticks make up
 /// [`crate::secondary_external_address::LINK_SETTLE`], so the notice lands
 /// within roughly half a minute of the additional link coming up — prompt
-/// enough to read as "it just connected". The steady-state cost is one route
-/// resolution plus an adapter enumeration; the network probe happens once per
-/// connection, on its own thread, never on this one.
+/// enough to read as "it just connected". The steady-state cost is one policy
+/// read per routed user, plus a route resolution for each who opted in; the
+/// network probe happens once per connection, on its own thread, never on this
+/// one.
 pub const SECONDARY_EXTERNAL_ADDRESS_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Cadence the rule-hostname seed task runs at. Matches the DNS refresh

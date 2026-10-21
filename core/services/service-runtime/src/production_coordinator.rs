@@ -1079,9 +1079,12 @@ pub enum CrashRecoveryOutcome {
     /// to `Running`. The supervisor can route this to the bootstrap
     /// blocker path.
     ManualActionRequired { reason: String },
-    /// Audit or marker IO failed; recovery is incomplete. Service
-    /// should treat as `ManualActionRequired` to be safe.
+    /// The marker could not be cleared mid-recovery; the start is held.
     Aborted { reason: String },
+    /// The audit trail would not take the recovery record. Nothing was changed
+    /// and the marker stays, so the next start tries again; holding the start
+    /// for it would turn a full disk into an unprotected machine.
+    Deferred { reason: String },
     /// Audit writer was unavailable; we deliberately do nothing
     /// (mutating recovery without audit violates the audit-before-act
     /// invariant). Caller logs the gap.
@@ -1124,6 +1127,18 @@ impl CrashRecoveryOutcome {
             Self::ManualActionRequired { reason } | Self::Aborted { reason } => {
                 report.block(CRASH_RECOVERY, reason.clone());
             }
+            Self::Deferred { reason } => {
+                tracing::warn!(
+                    target: "nrr::recovery",
+                    msg_key = "svc-boot-crash-recovery-deferred",
+                    reason = %reason,
+                    "crash recovery postponed to the next start",
+                );
+                report.warn(
+                    CRASH_RECOVERY,
+                    format!("crash recovery postponed: {reason}"),
+                );
+            }
             Self::RecoveredMarkerStale { detail } => {
                 tracing::warn!(
                     target: "nrr::recovery",
@@ -1149,8 +1164,10 @@ fn outcome_of(result: RecoveryExecutionResult) -> CrashRecoveryOutcome {
         },
         RecoveryExecutionResult::RolledBack { revision_active } => {
             CrashRecoveryOutcome::Recovered {
+                // Only the marker is cleared here; the reconcile that follows
+                // converges enforcement to the target revision.
                 detail: format!(
-                    "rolled back; active revision = {}",
+                    "interrupted apply marker cleared; target revision = {}",
                     revision_active.unwrap_or_else(|| "none".into()),
                 ),
             }
@@ -1158,7 +1175,7 @@ fn outcome_of(result: RecoveryExecutionResult) -> CrashRecoveryOutcome {
         RecoveryExecutionResult::ManualActionRequired { reason } => {
             CrashRecoveryOutcome::ManualActionRequired { reason }
         }
-        RecoveryExecutionResult::AuditWriteFailed { detail } => CrashRecoveryOutcome::Aborted {
+        RecoveryExecutionResult::AuditWriteFailed { detail } => CrashRecoveryOutcome::Deferred {
             reason: format!("audit write failed: {detail}"),
         },
         RecoveryExecutionResult::MarkerClearFailed { detail } => CrashRecoveryOutcome::Aborted {
@@ -1802,6 +1819,21 @@ mod tests {
             crate::state::ServiceHealthSeverity::Warning
         );
         assert_eq!(report.phases.len(), 1);
+    }
+
+    #[test]
+    fn an_audit_failure_postpones_recovery_without_holding_the_start() {
+        let outcome = outcome_of(RecoveryExecutionResult::AuditWriteFailed {
+            detail: "disk full".into(),
+        });
+        assert!(matches!(outcome, CrashRecoveryOutcome::Deferred { .. }));
+        let mut report = crate::managers::BootstrapReport::default();
+        outcome.record_in(&mut report);
+        assert!(!report.blocking);
+        assert_eq!(
+            report.worst_severity,
+            crate::state::ServiceHealthSeverity::Warning
+        );
     }
 
     #[test]

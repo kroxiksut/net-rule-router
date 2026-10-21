@@ -7,9 +7,6 @@ pub(super) fn base_for_class(class: PrecedenceClass) -> Option<u64> {
         PrecedenceClass::RouteRule(RouteRole::Primary) => Some(BASE_PRIMARY),
         PrecedenceClass::RouteRule(RouteRole::Secondary) => Some(BASE_SECONDARY),
         PrecedenceClass::HardBlock => Some(BASE_BLOCK),
-        // The StrictSecondaryFailClosed default catch-all block sits at
-        // the lowest band so any rule-driven `Permit` still wins over it.
-        PrecedenceClass::DefaultCatchAll => Some(DEFAULT_BLOCK_WEIGHT),
         _ => None,
     }
 }
@@ -25,67 +22,74 @@ pub(super) fn lower_flow(flow: &FlowRule) -> Vec<WfpFilterSpec> {
     let user_sid = user_sid_of(&flow.principal);
     let weight = base + u64::from(flow.precedence.ordinal);
 
-    // The fail-closed default block (`StrictSecondaryFailClosed`): a
-    // user-scoped ALE `Block` with NO remote condition at the lowest band of
-    // its family's layer. Matches `wfp_codegen::default_block_spec`: `Any` is
-    // the v4 half, the planner's `::/0` twin the v6 one.
-    if flow.precedence.class == PrecedenceClass::DefaultCatchAll && action == WfpAction::Block {
-        let layer = match flow.flow.dst {
-            DstMatch::Any => Some(WfpLayerKey::AleAuthConnectV4),
-            DstMatch::SubnetV6 { prefix: 0, .. } => Some(WfpLayerKey::AleAuthConnectV6),
-            _ => None,
-        };
-        if let Some(layer) = layer {
-            return vec![WfpFilterSpec {
-                layer,
-                action: WfpAction::Block,
-                remote_ip: None,
-                remote_ip_set: Vec::new(),
-                remote_ip_set_v6: Vec::new(),
-                remote_port: None,
-                weight,
-                id: derive_catch_all_id(
-                    user_sid.as_deref(),
-                    layer,
-                    WfpAction::Block,
-                    weight,
-                    // The real catch-all: no conditions, so nothing else to name.
-                    "",
-                ),
-                user_sid,
-                app_pattern: None,
-                local_interface_luid: None,
-                remote_subnet: None,
-                remote_subnet_v6: None,
-                ip_protocol: None,
-            }];
-        }
-    }
-
     // An `Application` flow lowers to per-exe `ALE_APP_ID` filters (no remote IP,
     // no packet mirror — the packet layer has no app context). The planner puts
     // one path per flow, but iterate defensively.
     if let AppScope::Program { exe_paths, .. } = &flow.app {
         if matches!(flow.flow.dst, DstMatch::Any) {
-            return exe_paths
-                .iter()
-                .map(|path| WfpFilterSpec {
-                    layer: WfpLayerKey::AleAuthConnectV4,
+            let denies =
+                flow.precedence.class == PrecedenceClass::HardBlock && action == WfpAction::Block;
+            let slots = nrr_platform_api::enforcement::SLOTS_PER_RULE;
+            let loopback_weight = base
+                + u64::from(flow.precedence.ordinal) / slots * slots
+                + nrr_platform_api::enforcement::DENY_LOOPBACK_SLOT;
+            let mut out = Vec::new();
+            for path in exe_paths {
+                let path = path.to_string_lossy();
+                let spec = |layer, action, tag: &str, weight, v4, v6| WfpFilterSpec {
+                    layer,
                     action,
                     remote_ip: None,
                     remote_ip_set: Vec::new(),
                     remote_ip_set_v6: Vec::new(),
                     remote_port: None,
                     weight,
-                    id: derive_app_id(user_sid.as_deref(), action, &path.to_string_lossy(), weight),
+                    id: derive_app_id(user_sid.as_deref(), action, &format!("{path}{tag}"), weight),
                     user_sid: user_sid.clone(),
-                    app_pattern: Some(path.to_string_lossy().into_owned()),
+                    app_pattern: Some(path.to_string()),
                     local_interface_luid: None,
-                    remote_subnet: None,
-                    remote_subnet_v6: None,
+                    remote_subnet: v4,
+                    remote_subnet_v6: v6,
                     ip_protocol: None,
-                })
-                .collect();
+                    remote_subnet_set: Vec::new(),
+                };
+                out.push(spec(
+                    WfpLayerKey::AleAuthConnectV4,
+                    action,
+                    "",
+                    weight,
+                    None,
+                    None,
+                ));
+                // A program deny also closes IPv6 and leaves loopback open.
+                if denies {
+                    out.push(spec(
+                        WfpLayerKey::AleAuthConnectV6,
+                        action,
+                        "|v6",
+                        weight,
+                        None,
+                        None,
+                    ));
+                    out.push(spec(
+                        WfpLayerKey::AleAuthConnectV4,
+                        WfpAction::Permit,
+                        "|lo4",
+                        loopback_weight,
+                        Some((Ipv4Addr::new(127, 0, 0, 0), 8)),
+                        None,
+                    ));
+                    out.push(spec(
+                        WfpLayerKey::AleAuthConnectV6,
+                        WfpAction::Permit,
+                        "|lo6",
+                        loopback_weight,
+                        None,
+                        Some((Ipv6Addr::LOCALHOST, 128)),
+                    ));
+                }
+            }
+            return out;
         }
     }
 

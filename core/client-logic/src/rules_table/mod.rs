@@ -22,7 +22,7 @@ use crate::Route;
 pub use file_text::{
     build_rules_file_text, RulesFileOptions, PRESET_FORMAT_VERSION, RULES_FILE_HINT_KEYS,
 };
-pub use main_route::{main_route_check_hosts, main_route_rank};
+pub use main_route::{main_route_check_hosts, main_route_rank, CHECK_MAX_POLLS, CHECK_POLL_SECS};
 pub use overrides::{override_remaining, rule_override_key};
 pub use search::{normalize_host_input, row_matches_search, search_box_text};
 pub use wire::{
@@ -182,6 +182,15 @@ impl RuleType {
     }
 }
 
+/// An IPv6 literal (`valueIsIpv6Literal`).
+pub fn value_is_ipv6_literal(rule_type: &RuleType, value: &str) -> bool {
+    match rule_type {
+        RuleType::ExactIpv6 => true,
+        RuleType::ExactIp => value.contains(':'),
+        _ => false,
+    }
+}
+
 /// `x.*` (`valueIsAnyZone`): a site in every zone names no single host, so
 /// "check where it works" has nothing to check.
 pub fn value_is_any_zone(value: &str) -> bool {
@@ -225,8 +234,8 @@ impl RuleRow {
     }
 
     /// The `?` this row actually carries (`rowIsVerify`): a route rule of a
-    /// type that takes it. A block, another type or a site in every zone
-    /// drops it.
+    /// type that takes it. A block, another type, a site in every zone or an
+    /// IPv6 literal drops it.
     pub fn is_verify(&self) -> bool {
         self.verify
             && matches!(
@@ -235,6 +244,13 @@ impl RuleRow {
             )
             && self.rule_type.allows_verify()
             && !value_is_any_zone(&self.match_value)
+            && !self.is_ipv6_literal()
+    }
+
+    /// An IPv6 literal (`valueIsIpv6Literal`): the probe leaves from an IPv4
+    /// source, so the service turns a `?` there into a plain route.
+    pub fn is_ipv6_literal(&self) -> bool {
+        value_is_ipv6_literal(&self.rule_type, &self.match_value)
     }
 
     /// The per-rule wire action.

@@ -1,0 +1,93 @@
+{
+  "description": "pure.js dnsUpstreamForeignNoticeStep: raise once when the state appears, clear when it goes",
+  "cases": [
+    {
+      "name": "appears",
+      "input": {
+        "wasRaised": false,
+        "foreignOnly": true
+      },
+      "expected": {
+        "raise": true,
+        "raised": true
+      }
+    },
+    {
+      "name": "still there",
+      "input": {
+        "wasRaised": true,
+        "foreignOnly": true
+      },
+      "expected": {
+        "raise": false,
+        "raised": true
+      }
+    },
+    {
+      "name": "clears",
+      "input": {
+        "wasRaised": true,
+        "foreignOnly": false
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "absent",
+      "input": {
+        "wasRaised": false,
+        "foreignOnly": false
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "back after clearing",
+      "input": {
+        "wasRaised": false,
+        "foreignOnly": true
+      },
+      "expected": {
+        "raise": true,
+        "raised": true
+      }
+    },
+    {
+      "name": "non-true reading",
+      "input": {
+        "wasRaised": false,
+        "foreignOnly": "yes"
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    },
+    {
+      "name": "dismissed notice stays down",
+      "input": {
+        "wasRaised": true,
+        "foreignOnly": true
+      },
+      "expected": {
+        "raise": false,
+        "raised": true
+      }
+    },
+    {
+      "name": "non-true reading clears",
+      "input": {
+        "wasRaised": true,
+        "foreignOnly": 1
+      },
+      "expected": {
+        "raise": false,
+        "raised": false
+      }
+    }
+  ]
+}

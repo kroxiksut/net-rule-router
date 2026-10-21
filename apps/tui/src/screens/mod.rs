@@ -1,6 +1,7 @@
 //! The screens, in the order of the design's table. The map follows the GUI's
 //! sections, so one piece of advice from the documentation works in both.
 
+pub mod app_groups;
 pub(crate) mod binding;
 mod choice;
 pub mod inspect;
@@ -17,9 +18,9 @@ use crate::keys;
 use crate::state::AppState;
 use crate::view::ScreenView;
 
-pub use status::connection_lines;
 #[cfg(test)]
 pub use status::state_word_keys;
+pub use status::{connection_lines, recovery_hints};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScreenId {
@@ -27,6 +28,8 @@ pub enum ScreenId {
     Wizard,
     Interfaces,
     Rules,
+    /// Programs and virtual machines put on a route; opens from the rules.
+    AppGroups,
     Overlaps,
     Suggestions,
     Trace,
@@ -40,11 +43,12 @@ pub enum ScreenId {
 
 impl ScreenId {
     /// Navigation order: the menu's, each sub-screen right after its parent.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Status,
         Self::Wizard,
         Self::Interfaces,
         Self::Rules,
+        Self::AppGroups,
         Self::Overlaps,
         Self::Suggestions,
         Self::Trace,
@@ -74,6 +78,7 @@ impl ScreenId {
             Self::Wizard => keys::SCREEN_WIZARD,
             Self::Interfaces => keys::SCREEN_INTERFACES,
             Self::Rules => keys::SCREEN_RULES,
+            Self::AppGroups => keys::SCREEN_APP_GROUPS,
             Self::Overlaps => keys::SCREEN_OVERLAPS,
             Self::Suggestions => keys::SCREEN_SUGGESTIONS,
             Self::Trace => keys::SCREEN_TRACE,
@@ -190,6 +195,11 @@ pub trait Screen {
         false
     }
 
+    /// Whether a text field has the focus, so a paste can go into it.
+    fn text_target(&self, _app: &AppState) -> crate::paste::TextTarget {
+        crate::paste::TextTarget::None
+    }
+
     /// A key for the screen; `true` when it was used.
     fn on_key(&self, _app: &mut AppState, _key: crossterm::event::KeyEvent) -> bool {
         false
@@ -248,6 +258,7 @@ pub fn screen(id: ScreenId) -> &'static dyn Screen {
         ScreenId::Wizard => &wizard::WizardScreen,
         ScreenId::Interfaces => &interfaces::InterfacesScreen,
         ScreenId::Rules => &rules::RulesScreen,
+        ScreenId::AppGroups => &app_groups::AppGroupsScreen,
         ScreenId::Overlaps => &overlaps::OverlapsScreen,
         ScreenId::Suggestions => &suggestions::SuggestionsScreen,
         ScreenId::Trace => &inspect::trace::TraceScreen,
@@ -303,6 +314,7 @@ mod tests {
             }
         }
         assert_eq!(ScreenId::OutageBlocks.hotkey(), None);
+        assert_eq!(ScreenId::AppGroups.hotkey(), None);
         let walk: Vec<MenuItem> = MenuItem::walk().collect();
         let trace = walk
             .iter()

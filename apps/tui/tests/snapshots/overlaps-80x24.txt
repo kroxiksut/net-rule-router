@@ -9,7 +9,7 @@ Service: OK
 │  7 Connection trace      ││you want it to: confirm it, or send it over the   │
 │  8 Cache                 ││other route. Changes go to your rules list, where │
 │  9 Diagnostics and logs  ││you review and apply them.                        │
-│  0 Settings              ││4 overlap(s) not confirmed                        │
+│  0 Settings              ││4 overlaps not confirmed                          │
 │                          ││Show resolved: No                                 │
 │                          ││                                                  │
 │                          │╰──────────────────────────────────────────────────╯

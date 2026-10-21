@@ -1,0 +1,105 @@
+{
+  "description": "pure.js vpnPickerResultApps: the link provider set a confirmed picker writes",
+  "cases": [
+    { "name": "nothing ticked, nothing stored", "input": { "rows": [], "selected": [], "stored": [] }, "expected": [] },
+    {
+      "name": "two ticked programs are both written",
+      "input": {
+        "rows": [
+          { "displayName": "example-gui.exe", "exePath": "C:\\Example\\example-gui.exe", "source": "running-process" },
+          { "displayName": "Corp Client", "exePath": "C:\\Corp\\corp-client.exe", "source": "installed-program" }
+        ],
+        "selected": [ "C:\\Corp\\corp-client.exe", "C:\\Example\\example-gui.exe" ],
+        "stored": []
+      },
+      "expected": [
+        { "exe-path": "C:\\Example\\example-gui.exe", "display-name": "example-gui.exe" },
+        { "exe-path": "C:\\Corp\\corp-client.exe", "display-name": "Corp Client" }
+      ]
+    },
+    {
+      "name": "unticking a stored program removes it",
+      "input": {
+        "rows": [
+          { "displayName": "A", "exePath": "C:\\A\\a.exe", "source": "confirmed" },
+          { "displayName": "B", "exePath": "C:\\B\\b.exe", "source": "running-process" }
+        ],
+        "selected": [ "C:\\B\\b.exe" ],
+        "stored": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" }, { "exe-path": "C:\\B\\b.exe", "display-name": "B" } ]
+      },
+      "expected": [ { "exe-path": "C:\\B\\b.exe", "display-name": "B" } ]
+    },
+    {
+      "name": "a stored program the list did not show is kept",
+      "input": {
+        "rows": [ { "displayName": "B", "exePath": "C:\\B\\b.exe", "source": "running-process" } ],
+        "selected": [ "C:\\B\\b.exe" ],
+        "stored": [ { "exe-path": "C:\\Added\\elsewhere.exe", "display-name": "Elsewhere" } ]
+      },
+      "expected": [
+        { "exe-path": "C:\\B\\b.exe", "display-name": "B" },
+        { "exe-path": "C:\\Added\\elsewhere.exe", "display-name": "Elsewhere" }
+      ]
+    },
+    {
+      "name": "a stored name outlives the row's",
+      "input": {
+        "rows": [ { "displayName": "b.exe", "exePath": "C:\\B\\b.exe", "source": "running-process" } ],
+        "selected": [ "c:\\b\\B.EXE" ],
+        "stored": [ { "exe-path": "C:\\B\\b.exe", "display-name": "My client" } ]
+      },
+      "expected": [ { "exe-path": "C:\\B\\b.exe", "display-name": "My client" } ]
+    },
+    {
+      "name": "a nameless row is named by its file",
+      "input": {
+        "rows": [ { "displayName": "  ", "exePath": "/opt/example/bin/example-vpn", "source": "installed-program" } ],
+        "selected": [ "/opt/example/bin/example-vpn" ],
+        "stored": []
+      },
+      "expected": [ { "exe-path": "/opt/example/bin/example-vpn", "display-name": "example-vpn" } ]
+    },
+    {
+      "name": "pathless rows and kernel tunnels never reach the set",
+      "input": {
+        "rows": [
+          { "displayName": "Corp Client", "exePath": "", "source": "installed-program" },
+          { "displayName": "wg-example", "exePath": "/usr/bin/wg", "source": "kernel-tunnel", "interfaceName": "wg-example" }
+        ],
+        "selected": [ "", "/usr/bin/wg" ],
+        "stored": []
+      },
+      "expected": []
+    },
+    {
+      "name": "unticking everything shown clears the set",
+      "input": {
+        "rows": [ { "displayName": "A", "exePath": "C:\\A\\a.exe", "source": "confirmed" } ],
+        "selected": [],
+        "stored": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" } ]
+      },
+      "expected": []
+    },
+    {
+      "name": "two rows of one path write it once",
+      "input": {
+        "rows": [
+          { "displayName": "A", "exePath": "C:\\A\\a.exe", "source": "running-process" },
+          { "displayName": "A again", "exePath": "c:\\a\\a.exe", "source": "installed-program" }
+        ],
+        "selected": [ "C:\\A\\a.exe" ],
+        "stored": []
+      },
+      "expected": [ { "exe-path": "C:\\A\\a.exe", "display-name": "A" } ]
+    },
+    {
+      "name": "a tick for a path no row shows writes nothing new",
+      "input": {
+        "rows": [ { "displayName": "A", "exePath": "C:\\A\\a.exe", "source": "running-process" } ],
+        "selected": [ "C:\\Z\\z.exe" ],
+        "stored": []
+      },
+      "expected": []
+    }
+  ]
+}

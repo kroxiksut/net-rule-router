@@ -7,7 +7,7 @@
     { "name": "snapshot mode wins over fallback", "input": { "snapshot": { "mode": "prefer-primary" }, "modeFallback": "prefer-secondary" } },
     { "name": "empty mode takes the fallback", "input": { "snapshot": { "mode": "" }, "modeFallback": "prefer-secondary" } },
     { "name": "false mode takes the fallback", "input": { "snapshot": { "mode": false }, "modeFallback": "prefer-secondary" } },
-    { "name": "unknown field rides back", "input": { "snapshot": { "future-field": { "nested": [1, 2] }, "kill-switch-enabled": true }, "modeFallback": "prefer-primary" } },
+    { "name": "unknown field rides back", "input": { "snapshot": { "future-field": { "nested": [1, 2] }, "leak-protection": "everything" }, "modeFallback": "prefer-primary" } },
     { "name": "snapshot-only key dropped", "input": { "snapshot": { "secondary-link-provider-apps": ["client.exe"], "mode": "prefer-primary" } } },
     { "name": "nulls dropped and defaulted", "input": { "snapshot": { "include-subdomains": null, "future-null": null } } },
     { "name": "binding-source restamped", "input": { "snapshot": { "binding-source": "recovery" } } },
@@ -17,19 +17,39 @@
       }, "modeFallback": "prefer-primary" } },
     { "name": "loose values normalised", "input": { "snapshot": {
         "kill-switch-protocols": 200, "allow-dns-over-primary": "false", "primary-probe-timeout-ms": "900",
-        "short-name-suffix": 7, "kill-switch-fail-closed": 0, "app-rules-take-all-addresses": "true"
+        "short-name-suffix": 7, "leak-protection": "Everything", "app-rules-take-all-addresses": "true"
       } } },
     { "name": "full snapshot", "input": { "snapshot": {
-        "mode": "prefer-secondary", "block-secondary-when-unavailable": true, "kill-switch-fail-closed": false,
-        "kill-switch-protocols": 5, "kill-switch-block-all": true, "kill-switch-enabled": true,
+        "mode": "prefer-secondary-when-available", "leak-protection": "everything",
+        "kill-switch-protocols": 5,
         "allow-dns-over-primary": false, "include-subdomains": false, "shared-ip-policy": "any-ip",
-        "mode-a-coverage-strategy": "per-host", "resolve-hosts-bypass": false, "doh-lockdown-enabled": true,
+        "resolve-hosts-bypass": false, "doh-lockdown-enabled": true,
         "doh-lockdown-scope": "always", "browser-history-auto-seed": true, "kill-switch-strict-shared-ips": true,
         "auto-rules-mode": "off", "auto-rules-eager-delivery-names": true, "primary-probe-auto": true,
         "primary-probe-timeout-ms": 2000, "primary-probe-max-targets": 4, "primary-probe-repeat-secs": 60,
         "local-networks-auto-accept": true, "zone-priority-over-ip": true, "short-name-completion": true,
         "short-name-suffix": "corp.example", "app-rules-take-all-addresses": true,
-        "binding-source": "user-assigned"
-      }, "modeFallback": "prefer-primary" } }
+        "external-address-auto-check": true, "binding-source": "user-assigned"
+      }, "modeFallback": "prefer-primary" } },
+    { "name": "routed sites under the additional connection settle on everything", "input": { "snapshot": {
+        "mode": "prefer-secondary-when-available", "leak-protection": "sites"
+      } }, "expected": {
+        "mode": "prefer-secondary-when-available", "leak-protection": "everything",
+        "kill-switch-protocols": 127, "allow-dns-over-primary": true, "include-subdomains": true,
+        "shared-ip-policy": "majority-of-ip", "resolve-hosts-bypass": true, "doh-lockdown-enabled": false,
+        "doh-lockdown-scope": "leak-protection-only", "doh-lockdown-auto": true,
+        "browser-history-auto-seed": false, "kill-switch-strict-shared-ips": false,
+        "auto-rules-mode": "suggest", "auto-rules-eager-delivery-names": false,
+        "primary-probe-auto": false, "primary-probe-timeout-ms": 1500, "primary-probe-max-targets": 8,
+        "primary-probe-repeat-secs": 300, "local-networks-auto-accept": false, "zone-priority-over-ip": false,
+        "short-name-completion": false, "short-name-suffix": "", "app-rules-take-all-addresses": false,
+        "forwarded-outage": "", "external-address-auto-check": false, "binding-source": "user-assigned"
+      } },
+    { "name": "routed sites under the main connection kept", "input": { "snapshot": {
+        "mode": "prefer-primary", "leak-protection": "sites"
+      } } },
+    { "name": "routed sites under the fallback route settle too", "input": { "snapshot": {
+        "leak-protection": "sites"
+      }, "modeFallback": "prefer-secondary-when-available" } }
   ]
 }

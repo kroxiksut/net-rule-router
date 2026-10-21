@@ -1,0 +1,121 @@
+{
+  "description": "pure.js leakProtectionConfirmSlug: what a change of leak protection must be confirmed for. `secondary` patches the adapters base row; null means nothing is bound",
+  "cases": [
+    {
+      "name": "the same level asks nothing",
+      "input": {
+        "current": "everything",
+        "next": "everything",
+        "secondary": null
+      },
+      "expected": ""
+    },
+    {
+      "name": "turning it off asks nothing",
+      "input": {
+        "current": "everything",
+        "next": "off",
+        "secondary": null
+      },
+      "expected": ""
+    },
+    {
+      "name": "everything with nothing bound holds the internet now",
+      "input": {
+        "current": "off",
+        "next": "everything",
+        "secondary": null
+      },
+      "expected": "holds-now"
+    },
+    {
+      "name": "everything while the additional connection is down",
+      "input": {
+        "current": "off",
+        "next": "everything",
+        "secondary": {
+          "availability": "unavailable"
+        }
+      },
+      "expected": "holds-now"
+    },
+    {
+      "name": "everything from routed sites while it is down",
+      "input": {
+        "current": "sites",
+        "next": "everything",
+        "secondary": {
+          "availability": "unavailable"
+        }
+      },
+      "expected": "holds-now"
+    },
+    {
+      "name": "an adapter not yet checked counts as not available",
+      "input": {
+        "current": "off",
+        "next": "everything",
+        "secondary": {
+          "availability": "requires-check"
+        }
+      },
+      "expected": "holds-now"
+    },
+    {
+      "name": "everything while it is up asks nothing",
+      "input": {
+        "current": "off",
+        "next": "everything",
+        "secondary": {}
+      },
+      "expected": ""
+    },
+    {
+      "name": "routed sites while it is down asks nothing",
+      "input": {
+        "current": "off",
+        "next": "sites",
+        "secondary": {
+          "availability": "unavailable"
+        }
+      },
+      "expected": ""
+    },
+    {
+      "name": "routed sites over an adapter with no way out",
+      "input": {
+        "current": "off",
+        "next": "sites",
+        "secondary": {
+          "gateway": "",
+          "has-forwarding-path": false
+        }
+      },
+      "expected": "unroutable"
+    },
+    {
+      "name": "everything over an adapter with no way out, up",
+      "input": {
+        "current": "off",
+        "next": "everything",
+        "secondary": {
+          "gateway": "",
+          "has-forwarding-path": false
+        }
+      },
+      "expected": "unroutable"
+    },
+    {
+      "name": "moving up from routed sites over a dead end asks nothing more",
+      "input": {
+        "current": "sites",
+        "next": "everything",
+        "secondary": {
+          "gateway": "",
+          "has-forwarding-path": false
+        }
+      },
+      "expected": ""
+    }
+  ]
+}

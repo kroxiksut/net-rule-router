@@ -11,9 +11,9 @@ use rusqlite::Connection;
 use crate::error::{SidecarError, SidecarResult};
 use crate::schema::{SIDECAR_DB_V1_DDL, SIDECAR_DB_V2_DDL, SIDECAR_DB_V3_DDL};
 
-/// Latest schema version this binary knows how to produce or open: the last
-/// entry of [`MIGRATIONS`].
-pub const LATEST_SCHEMA_VERSION: u32 = 3;
+/// Latest schema version this binary knows how to produce or open, read off
+/// the last entry of [`MIGRATIONS`] so the two cannot disagree.
+pub const LATEST_SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 
 /// Append only; never edit an entry that has shipped.
 const MIGRATIONS: &[Migration] = &[
@@ -251,14 +251,6 @@ mod tests {
         )?;
         assert_eq!(v, 1);
         Ok(())
-    }
-
-    #[test]
-    fn the_latest_version_is_the_last_migration() {
-        assert_eq!(
-            MIGRATIONS.last().map(|m| m.version),
-            Some(LATEST_SCHEMA_VERSION)
-        );
     }
 
     /// Existing sidecars store these; a changed value is a database that no

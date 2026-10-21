@@ -56,7 +56,7 @@ fn named_candidates_are_respected() {
 }
 
 #[test]
-fn strict_secondary_mode_marks_an_unavailable_secondary_as_a_conflict() {
+fn an_unavailable_secondary_reads_unavailable_under_either_default_route() {
     let mut rows = fallback_rows();
     let wifi = rows
         .iter_mut()
@@ -64,16 +64,22 @@ fn strict_secondary_mode_marks_an_unavailable_secondary_as_a_conflict() {
         .expect("wifi row");
     wifi.availability_status = super::BasicAvailabilityStatus::Unavailable;
     wifi.observed_facts.connectivity_state = ConnectivityState::Unavailable;
-    let request = RouteSelectionRequest {
-        behavior_mode: RouteBehaviorMode::StrictSecondaryFailClosed,
-        ..confirmed((None, Some("Ethernet")), (None, Some("Wi-Fi")))
-    };
+    for behavior_mode in [
+        RouteBehaviorMode::PreferPrimary,
+        RouteBehaviorMode::PreferSecondaryWhenAvailable,
+    ] {
+        let request = RouteSelectionRequest {
+            behavior_mode,
+            ..confirmed((None, Some("Ethernet")), (None, Some("Wi-Fi")))
+        };
 
-    let snapshot = decorate_interface_rows(rows, &request, InterfacesDataSource::FallbackMock);
+        let snapshot =
+            decorate_interface_rows(rows.clone(), &request, InterfacesDataSource::FallbackMock);
 
-    let wifi = find_row(&snapshot.rows, "Wi-Fi");
-    assert_eq!(wifi.selected_role, Some(RouteRole::Secondary));
-    assert_eq!(wifi.route_state, RouteSelectionState::FailClosedConflict);
+        let wifi = find_row(&snapshot.rows, "Wi-Fi");
+        assert_eq!(wifi.selected_role, Some(RouteRole::Secondary));
+        assert_eq!(wifi.route_state, RouteSelectionState::Unavailable);
+    }
 }
 
 #[test]
@@ -83,7 +89,7 @@ fn the_snapshot_carries_the_supplier_provenance_and_the_modes() {
     assert_eq!(snapshot.rows.len(), fallback_rows().len());
     assert!(snapshot
         .supported_behavior_modes
-        .contains(&RouteBehaviorMode::StrictSecondaryFailClosed));
+        .contains(&RouteBehaviorMode::PreferSecondaryWhenAvailable));
 }
 
 #[test]

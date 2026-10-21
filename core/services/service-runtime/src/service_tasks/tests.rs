@@ -1,6 +1,6 @@
 use super::*;
 // Private to the cadence module; the tests for it live here.
-use super::auto_rules::{auto_probe_is_due, auto_probe_should_run};
+use super::auto_rules::{auto_probe_cadence, auto_probe_is_due, auto_probe_should_run};
 use crate::ipc_handlers::operation_status_store::OperationStatusStore;
 use crate::managers::{AcceptError, AcceptErrorCategory};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,6 +31,20 @@ fn the_automatic_pass_runs_on_the_users_window_and_not_at_all_without_consent() 
         Some(now),
         now + Duration::from_secs(300)
     ));
+}
+
+/// A stored window outside the probe's range cannot turn the courtesy check
+/// into a pass on every tick, nor into one that never comes back.
+#[test]
+fn a_stored_repeat_window_is_held_to_the_probe_range() {
+    let (min, max) = crate::path_probe::ProbeLimits::REPEAT_AFTER_RANGE;
+    assert_eq!(auto_probe_cadence(true, 0).repeat, min);
+    assert_eq!(auto_probe_cadence(true, u32::MAX).repeat, max);
+    assert_eq!(
+        auto_probe_cadence(true, 300).repeat,
+        Duration::from_secs(300)
+    );
+    assert!(!auto_probe_cadence(false, 300).enabled);
 }
 
 /// A host that has never been measured overrides the window. Until it is
@@ -194,7 +208,9 @@ fn the_housekeeping_tick_collects_expired_confirmation_tokens() {
             issuer_sid: "S-1-A".into(),
             caller_is_elevated: false,
         },
-        Instant::now() - std::time::Duration::from_secs(1),
+        crate::boot_clock::BootInstant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("the clock reads past its start"),
     );
     assert_eq!(tokens.len(), 1);
 
@@ -780,4 +796,66 @@ fn an_observed_resolution_is_applied_for_every_present_principal() {
         *applied.lock().unwrap_or_else(|p| p.into_inner()),
         vec!["unix:uid:1000".to_owned(), "unix:uid:1001".to_owned()],
     );
+}
+
+/// A new address of a program no rule names is stored but moves nothing a plan
+/// reads, so the tick does not ask for a pass; one of a program a plan has read
+/// does.
+#[test]
+fn only_a_program_a_plan_reads_re_drives_policy() {
+    use crate::app_observation_lookup::{AppObservationLookup, AppObservationStore};
+    use nrr_platform_api::conn_observe::{
+        ConnectionObservation, ConnectionProgress, ConnectionVerdict,
+        MockConnectionObservationSource, TransportProtocol,
+    };
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let source = Arc::new(MockConnectionObservationSource::new());
+    let observed = |path: &str, last: u8| ConnectionObservation {
+        pid: 42,
+        process_path: Some(path.to_owned()),
+        user_sid: Some("unix:uid:1000".to_owned()),
+        protocol: TransportProtocol::Tcp,
+        local: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 40000),
+        remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, last)), 443),
+        verdict: ConnectionVerdict::Unknown,
+        drop_filter_id: None,
+        blocked_by_nrr: None,
+        nrr_drop_spec_id: None,
+        observed_unix_ms: None,
+        progress: ConnectionProgress::Attempt,
+    };
+    let store = Arc::new(AppObservationStore::new());
+    let wiring = AppObservationWiring {
+        source: source.clone(),
+        store: Arc::clone(&store),
+        trace: None,
+        consumer: None,
+        scripts: None,
+    };
+    // A plan reads the messenger and nothing else.
+    let _ = store.ips_for_app("messenger");
+
+    let tick = |path: &str, last: u8| {
+        source.push(observed(path, last));
+        let before = store.generation();
+        let fold = fold_batch(&wiring);
+        assert_eq!(
+            fold.destinations, 1,
+            "{path} is new to the store either way"
+        );
+        fold.redrives_policy(store.generation() != before)
+    };
+    assert!(!tick("/usr/bin/browser", 10));
+    assert!(tick("/usr/bin/messenger", 11));
+}
+
+#[test]
+fn a_withdrawal_or_a_learnt_vpn_client_always_re_drives_policy() {
+    let other = Fold {
+        destinations: 0,
+        other: 1,
+    };
+    assert!(other.redrives_policy(false));
+    assert!(!Fold::default().redrives_policy(true));
 }

@@ -18,7 +18,7 @@
 //!
 //! Per connection: identify the caller via
 //! `named_pipe_identity::classify_pipe_client`; reject → audit log + close;
-//! otherwise loop `read_frame` → `IpcRouter::dispatch` → `write_frame` until
+//! otherwise loop `read_request` → `IpcRouter::dispatch` → `write_frame` until
 //! EOF, a transport error, or the worker-shutdown signal.
 //!
 //! ## Pipe instance lifecycle
@@ -72,17 +72,21 @@ use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 use nrr_service_runtime::connection_slot::{PerPrincipalSlots, MAX_CONNECTIONS_PER_PRINCIPAL};
 use nrr_service_runtime::ipc_push::{
-    adopt_subscription, flush_push_frames, SubscriptionChange, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
+    adopt_subscription, flush_push_frames, SubscriptionChange, PUSH_BATCH_SIZE,
+    PUSH_SAFETY_INTERVAL,
 };
 use nrr_service_runtime::{
     AcceptError, AcceptErrorCategory, AcceptOutcome, ActiveSidRegistry, EventBus, IpcAcceptor,
     IpcAuditEmitter, IpcBindError, IpcError, IpcErrorCode, IpcRequestContext, IpcRequestEnvelope,
-    IpcResponseEnvelope, IpcRouter, IpcServer,
+    IpcResponseEnvelope, IpcRouter, IpcServer, PushWaker,
 };
 
 use crate::named_pipe_acl::PipeSecurityAttributes;
 use crate::named_pipe_identity::{classify_pipe_client, ClientRejectReason};
-use nrr_shared::ipc_wire::{read_frame, write_frame, WireError};
+use nrr_service_runtime::ipc_inbound::{
+    read_request_within, write_response, InboundFrame, FRAME_READ_DEADLINE,
+};
+use nrr_shared::ipc_wire::{write_frame, WireError};
 
 /// Canonical pipe path. Derived from the cross-OS endpoint SSOT in
 /// `nrr-shared::ipc_transport` so the server and the client
@@ -603,8 +607,16 @@ fn handle_connection(
     // Register this connection with the per-SID registry. RAII guard
     // pattern so on_disconnect always runs, including on early `break`
     // from the dispatch loop.
+    let registry_profile = if identity.profile == nrr_shared::ipc::IpcClientProfile::TrayLightweight
+        && crate::named_pipe_identity::in_service_session(identity.process_id)
+    {
+        // Known to the registry, but not a routing signal.
+        nrr_shared::ipc::IpcClientProfile::GuiInteractive
+    } else {
+        identity.profile
+    };
     let _registry_guard = active_sids.as_ref().map(|reg| {
-        ActiveSidConnectionGuard::new(Arc::clone(reg), &identity.caller_sid, identity.profile)
+        ActiveSidConnectionGuard::new(Arc::clone(reg), &identity.caller_sid, registry_profile)
     });
 
     // Reader sub-thread: the main loop needs to interleave request reads
@@ -615,6 +627,7 @@ fn handle_connection(
     // flushing push frames.
     let reader_pipe = SendableHandle(pipe);
     let (reader_tx, reader_rx) = std::sync::mpsc::sync_channel::<ReaderMsg>(8);
+    let wake_tx = reader_tx.clone();
     // Helper fn boundary defeats Rust 2021 disjoint capture, which would
     // otherwise capture only the inner `HANDLE` field of `SendableHandle`
     // and bypass the `unsafe impl Send` on the wrapper.
@@ -644,7 +657,7 @@ fn handle_connection(
 
     // Step 2: serve frames until error or shutdown.
     while !shutdown.load(Ordering::SeqCst) {
-        match reader_rx.recv_timeout(PUSH_POLL_INTERVAL) {
+        match reader_rx.recv_timeout(PUSH_SAFETY_INTERVAL) {
             Ok(ReaderMsg::Request(request)) => {
                 tracing::trace!(
                     target: "nrr::ipc",
@@ -676,7 +689,9 @@ fn handle_connection(
                 // the handler returns its id in the payload.
                 match adopt_subscription(&mut subscription_id, &response, event_bus.as_deref()) {
                     SubscriptionChange::Unchanged => {}
-                    SubscriptionChange::Opened(sub_id) => tracing::info!(
+                    SubscriptionChange::Opened(sub_id) => {
+                        attach_waker(event_bus.as_deref(), &sub_id, &wake_tx);
+                        tracing::info!(
                         target: "nrr::ipc-push",
                         msg_key = "push-subscription-opened",
                         subscription_id = %sub_id,
@@ -684,17 +699,27 @@ fn handle_connection(
                         subscribers = event_bus.as_ref().map(|b| b.subscriber_count()).unwrap_or(0),
                         bus_wired = event_bus.is_some(),
                         "push subscription opened"
-                    ),
-                    SubscriptionChange::Replaced { previous, current } => tracing::debug!(
-                        target: "nrr::ipc-push",
-                        previous = %previous,
-                        subscription_id = %current,
-                        profile = ?identity.profile,
-                        "push subscription replaced by a re-subscribe on the same connection"
-                    ),
+                        );
+                    }
+                    SubscriptionChange::Replaced { previous, current } => {
+                        attach_waker(event_bus.as_deref(), &current, &wake_tx);
+                        tracing::debug!(
+                            target: "nrr::ipc-push",
+                            previous = %previous,
+                            subscription_id = %current,
+                            profile = ?identity.profile,
+                            "push subscription replaced by a re-subscribe on the same connection"
+                        );
+                    }
                 }
 
-                if let Err(e) = write_frame(&mut writer, &response) {
+                if let Err(e) = write_response(&mut writer, &response) {
+                    tracing::warn!(target: "nrr::ipc", msg_key = "svc-ipc-response-write-failed", error = %e, "response write failed, closing connection");
+                    break;
+                }
+            }
+            Ok(ReaderMsg::Unsupported(answer)) => {
+                if let Err(e) = write_frame(&mut writer, answer.as_ref()) {
                     tracing::warn!(target: "nrr::ipc", msg_key = "svc-ipc-response-write-failed", error = %e, "response write failed, closing connection");
                     break;
                 }
@@ -721,9 +746,9 @@ fn handle_connection(
                 break;
             }
             Ok(ReaderMsg::Closed) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Push pump tick. Only flushes when this connection
-                // has subscribed AND the bus is wired.
+            Ok(ReaderMsg::PushWake) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // A publish woke us, or the safety tick fired. Only flushes
+                // when this connection has subscribed AND the bus is wired.
                 if let (Some(sub_id), Some(bus)) = (subscription_id.as_ref(), event_bus.as_ref()) {
                     let failed = flush_push_frames(bus, sub_id, PUSH_BATCH_SIZE, |env| {
                         write_frame(&mut writer, env).map_err(|e| e.to_string())
@@ -785,8 +810,29 @@ fn handle_connection(
 /// dispatcher.
 enum ReaderMsg {
     Request(IpcRequestEnvelope),
+    /// An operation this service does not know: answered, connection kept.
+    Unsupported(Box<IpcResponseEnvelope>),
     Malformed,
     Closed,
+    /// The bus published something this connection's subscriber is owed.
+    PushWake,
+}
+
+/// Have a publish for this subscriber wake the connection thread. A full queue
+/// already holds a message that will, so a refused send is not a loss.
+fn attach_waker(
+    bus: Option<&EventBus>,
+    subscription_id: &str,
+    wake_tx: &std::sync::mpsc::SyncSender<ReaderMsg>,
+) {
+    let Some(bus) = bus else { return };
+    let tx = wake_tx.clone();
+    bus.set_waker(
+        subscription_id,
+        PushWaker::new(move || {
+            let _ = tx.try_send(ReaderMsg::PushWake);
+        }),
+    );
 }
 
 /// Body of the per-connection reader thread. Lives behind a fn boundary
@@ -806,12 +852,15 @@ fn run_reader_loop(pipe: SendableHandle, reader_tx: std::sync::mpsc::SyncSender<
     // the service unreachable without a single malformed byte. After the first
     // frame the window comes off: a subscriber legitimately sits quiet for hours
     // waiting to be pushed to, and cutting it would break the very thing the
-    // connection is for.
-    io.set_timeout(Some(FIRST_FRAME_IDLE_TIMEOUT));
+    // connection is for. Every frame, once begun, has FRAME_READ_DEADLINE to end.
     let mut first = true;
     loop {
-        let msg = match read_frame::<_, IpcRequestEnvelope>(&mut io) {
-            Ok(req) => ReaderMsg::Request(req),
+        let idle = first.then_some(FIRST_FRAME_IDLE_TIMEOUT);
+        let msg = match read_request_within(&mut io, idle, FRAME_READ_DEADLINE, |io, t| {
+            io.set_timeout(t)
+        }) {
+            Ok(InboundFrame::Request(req)) => ReaderMsg::Request(req),
+            Ok(InboundFrame::UnsupportedOperation(answer)) => ReaderMsg::Unsupported(answer),
             Err(e) if e.is_transport_dead() => ReaderMsg::Closed,
             // Nothing arrived in the window — a read that timed out reaches us
             // as a broken frame. Treat it as a client that never introduced
@@ -821,9 +870,8 @@ fn run_reader_loop(pipe: SendableHandle, reader_tx: std::sync::mpsc::SyncSender<
         };
         if first {
             first = false;
-            io.set_timeout(None);
         }
-        let terminal = !matches!(msg, ReaderMsg::Request(_));
+        let terminal = !matches!(msg, ReaderMsg::Request(_) | ReaderMsg::Unsupported(_));
         if reader_tx.send(msg).is_err() || terminal {
             break;
         }
@@ -1064,6 +1112,7 @@ impl Write for PipeIo {
 mod tests {
     use super::*;
     use nrr_service_runtime::{IpcHandlerRegistry, NoopIpcAuditEmitter};
+    use nrr_shared::ipc_wire::read_frame;
 
     #[test]
     fn pipe_name_is_versioned() {

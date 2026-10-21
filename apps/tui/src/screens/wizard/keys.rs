@@ -12,6 +12,20 @@ pub const LANGUAGE_NOTE: Key = key(
     "tui.wizard.language-note",
     "The language of this terminal session. To start in it every time, run the program with --lang.",
 );
+pub const LICENCE_TITLE: Key = key("dialog.eula.title", "License agreement");
+pub const LICENCE_ACCEPT: Key = key("dialog.eula.accept", "Accept and continue");
+pub const LICENCE_DECLINE: Key = key("dialog.eula.decline", "Decline and exit");
+pub const LICENCE_PAGE: Key = key("tui.wizard.licence-page", "Part {number} of {total}");
+pub const LICENCE_NEXT: Key = key("tui.wizard.licence-next", "Read on");
+pub const LICENCE_PREVIOUS: Key = key("tui.wizard.licence-previous", "Previous part");
+pub const LICENCE_NOT_SAVED: Key = key(
+    "tui.wizard.licence-not-saved",
+    "The acceptance could not be saved, so you will be asked again next time.",
+);
+pub const SHEET_NOTE: Key = key(
+    "tui.wizard.sheet-note",
+    "Answers supplied before the first start are already chosen below; change any of them.",
+);
 pub const CURRENT: Key = key("tui.wizard.current", "{name} (current)");
 
 pub const PRIMARY_DESCRIPTION: Key = key(
@@ -57,13 +71,76 @@ pub const PROTECTION_DESCRIPTION: Key = key(
     "dialog.first-run-wizard.protection-description",
     "Recommended for everyone. Each of these can be changed later in Settings.",
 );
-pub const KILL_SWITCH: Key = key(
-    "dialog.first-run-wizard.protection-kill-switch",
-    "Block routed traffic when the additional route is down",
+pub const LEAK_PROTECTION: Key = key("settings.routing.kill-switch.title", "Leak protection");
+pub const LEAK_OFF: Key = key("settings.routing.leak-protection.option-off", "Off");
+pub const LEAK_SITES: Key = key(
+    "settings.routing.leak-protection.option-sites",
+    "Routed sites",
+);
+pub const LEAK_EVERYTHING: Key = key(
+    "settings.routing.leak-protection.option-everything",
+    "Everything",
+);
+pub const LEAK_OFF_NOTE: Key = key(
+    "settings.routing.leak-protection.note-off",
+    "If the additional connection drops, traffic continues over your main connection.",
+);
+pub const LEAK_SITES_NOTE: Key = key(
+    "settings.routing.leak-protection.note-sites",
+    "What your rules send through the additional connection never goes out the main one. Everything else keeps working.",
+);
+pub const LEAK_EVERYTHING_NOTE: Key = key(
+    "settings.routing.leak-protection.note-everything",
+    "Nothing leaves except through the additional connection, your local network and what your rules send over the main connection. If the additional connection drops, the internet waits until it returns.",
+);
+// The window's confirmation text, shown here as a note under the choice.
+pub const LEAK_HOLDS_NOW: Key = key(
+    "dialog.leak-holds-now.body",
+    "With leak protection set to Everything, traffic is held right away: the internet stops until the additional connection returns.",
 );
 pub const DOH_LOCKDOWN: Key = key(
     "dialog.first-run-wizard.protection-doh-lockdown",
     "Keep browsers from resolving routed sites past NetRuleRouter",
+);
+pub const FAKE_IP: Key = key(
+    "dialog.first-run-wizard.protection-fake-ip",
+    "Route sites by name, so an address shared with another site is not dragged along",
+);
+pub const DIAGNOSTIC_LOGS: Key = key(
+    "dialog.first-run-wizard.protection-diagnostic-logs",
+    "Write detailed diagnostic logs (only needed to report a problem)",
+);
+pub const LOGS_ONE_HOUR: Key = key(
+    "settings.diagnostics.service-stability.verbose.option-one-hour",
+    "Verbose for 1 hour",
+);
+pub const LOGS_FOUR_HOURS: Key = key(
+    "settings.diagnostics.service-stability.verbose.option-four-hours",
+    "Verbose for 4 hours",
+);
+pub const LOGS_UNTIL_RESTART: Key = key(
+    "settings.diagnostics.service-stability.verbose.option-until-restart",
+    "Verbose until the service restarts",
+);
+pub const NEEDS_ADMIN_TITLE: Key = key(
+    "notifications.first-run-needs-admin.title",
+    "A setup answer needs an administrator",
+);
+pub const NEEDS_ADMIN_BODY: Key = key(
+    "notifications.first-run-needs-admin.body",
+    "“{setting}” applies to the whole computer, so only an administrator can turn it on. It stays off for now; an administrator can switch it on in the routing settings.",
+);
+pub const FAKE_IP_SETTING: Key = key(
+    "settings.routing.fake-ip.label",
+    "Route sites over virtual addresses (fake-IP)",
+);
+pub const STABILITY_FAILED_TITLE: Key = key(
+    "tui.wizard.stability-failed-title",
+    "A setup answer was not saved",
+);
+pub const STABILITY_FAILED: Key = key(
+    "status.system-routing-failed",
+    "Could not update the setting: ",
 );
 pub const SETTING: Key = key("tui.wizard.setting", "{name}: {value}");
 pub const YES: Key = key("label.yes", "Yes");
@@ -183,6 +260,14 @@ pub const ALL: &[Key] = &[
     ANSWERS_TITLE,
     LANGUAGE_TITLE,
     LANGUAGE_NOTE,
+    LICENCE_TITLE,
+    LICENCE_ACCEPT,
+    LICENCE_DECLINE,
+    LICENCE_PAGE,
+    LICENCE_NEXT,
+    LICENCE_PREVIOUS,
+    LICENCE_NOT_SAVED,
+    SHEET_NOTE,
     CURRENT,
     PRIMARY_DESCRIPTION,
     PRIMARY_ASSIGNED,
@@ -196,8 +281,25 @@ pub const ALL: &[Key] = &[
     REFRESH,
     PROTECTION_TITLE,
     PROTECTION_DESCRIPTION,
-    KILL_SWITCH,
+    LEAK_PROTECTION,
+    LEAK_OFF,
+    LEAK_SITES,
+    LEAK_EVERYTHING,
+    LEAK_OFF_NOTE,
+    LEAK_SITES_NOTE,
+    LEAK_EVERYTHING_NOTE,
+    LEAK_HOLDS_NOW,
     DOH_LOCKDOWN,
+    FAKE_IP,
+    DIAGNOSTIC_LOGS,
+    LOGS_ONE_HOUR,
+    LOGS_FOUR_HOURS,
+    LOGS_UNTIL_RESTART,
+    NEEDS_ADMIN_TITLE,
+    NEEDS_ADMIN_BODY,
+    FAKE_IP_SETTING,
+    STABILITY_FAILED_TITLE,
+    STABILITY_FAILED,
     SETTING,
     YES,
     NO,

@@ -10,7 +10,10 @@
 #   Register    files in place: register the service from this folder and start it
 #   Unregister  removal: stop and unregister the service, restore the network,
 #               and remove the service copy a portable install left under
-#               Program Files once nothing is registered; -RemoveData also erases the service's data and that of the
+#               Program Files once nothing is registered; start again a service
+#               another copy registered, which the MSI stopped by name; drop
+#               the tray's launch at sign-in and the PATH entry that name this
+#               folder; -RemoveData also erases the service's data and that of the
 #               account running this (other accounts' data is listed, not
 #               deleted), -RemoveAudit the audit trail as well
 #   RemoveUserData  the running account's own data alone, without elevation:
@@ -149,6 +152,17 @@ function Restore-Network {
     return $code
 }
 
+# The network back after a removal. A service that would not stop still loses
+# its DNS redirect: the files and the process go with the package, and a
+# redirect left in the registry would outlive every reboot with nobody to lift
+# it. Returns the exit code to report.
+function Restore-NetworkAfterRemoval {
+    if (Test-NrrServiceStopped) { return (Restore-Network) }
+    Write-Host '    the service is still running; only the DNS redirect is swept'
+    $null = Remove-NrrDnsRedirect
+    return 1
+}
+
 # 'gone' once no registration is left, 'foreign' when another copy owns it,
 # 'stuck' when ours is still registered (marked for deletion until a reboot).
 function Remove-OwnService {
@@ -188,6 +202,85 @@ function Remove-ServiceCopy {
     return (-not $failed)
 }
 
+# The MSI stops the service by name before Unregister runs, even one another
+# copy registered. That copy is started again when it starts with Windows.
+function Resume-ForeignService {
+    $service = Get-Service -Name $NrrServiceName -ErrorAction SilentlyContinue
+    if (-not $service -or $service.Status -ne 'Stopped' -or "$($service.StartType)" -ne 'Automatic') { return }
+    Write-Host "==> starting $NrrServiceName again from '$(Get-ServiceImagePath)'"
+    $null = Invoke-NativeCommand -FilePath (Get-SystemTool 'sc.exe') -ArgumentList @('start', $NrrServiceName)
+    if (-not (Wait-ServiceStatus -Name $NrrServiceName -Status Running -Seconds 30)) {
+        Write-Host "    $NrrServiceName did not start again"
+    }
+}
+
+# A PATH entry as the console's PATH action compares it: quotes, spaces and
+# trailing separators dropped, slashes and case folded.
+function Get-PathEntryKey {
+    param([string] $Entry)
+    $key = $Entry.Trim().Trim('"').Trim().TrimEnd('\', '/').Replace('/', '\')
+    return $key.ToLowerInvariant()
+}
+
+# Per-user entries naming this folder: the tray's launch at sign-in and the
+# console on PATH. Only hives loaded now are reachable, which covers the account
+# running the removal and every signed-in one; a signed-out account keeps
+# entries that now point at nothing, and is named in the log.
+function Remove-UserEntries {
+    $tray = [IO.Path]::GetFullPath((Join-Path $installDir $NrrTrayExeName))
+    $folderKey = Get-PathEntryKey $installDir
+    $runSubkey = 'Software\Microsoft\Windows\CurrentVersion\Run'
+    $loaded = @()
+    foreach ($sid in [Microsoft.Win32.Registry]::Users.GetSubKeyNames()) {
+        # Real accounts only; `<sid>_Classes` is the same account's other hive.
+        if ($sid -notmatch '^S-1-(5-21|12-1)-[\d-]+$') { continue }
+        $loaded += $sid
+        $run = $null
+        try {
+            $run = [Microsoft.Win32.Registry]::Users.OpenSubKey("$sid\$runSubkey", $true)
+            $command = if ($run) { $run.GetValue($NrrAutostartValueName) } else { $null }
+            if ($command) {
+                $exe = "$command".Trim()
+                if ($exe.StartsWith('"')) {
+                    $end = $exe.IndexOf('"', 1)
+                    $exe = if ($end -gt 1) { $exe.Substring(1, $end - 1) } else { $exe.Trim('"') }
+                }
+                elseif ($exe -match '^(?<exe>.+?\.exe)(?=\s|$)') { $exe = $Matches['exe'] }
+                $same = $false
+                try { $same = [IO.Path]::GetFullPath($exe).Equals($tray, [StringComparison]::OrdinalIgnoreCase) } catch { }
+                if ($same) {
+                    $run.DeleteValue($NrrAutostartValueName, $false)
+                    Write-Host "    removed the tray's launch at sign-in for $sid"
+                }
+            }
+        }
+        catch { Write-Host "    launch at sign-in for $sid was not checked: $($_.Exception.Message)" }
+        finally { if ($run) { $run.Dispose() } }
+
+        $environment = $null
+        try {
+            $environment = [Microsoft.Win32.Registry]::Users.OpenSubKey("$sid\Environment", $true)
+            if (-not $environment -or -not ($environment.GetValueNames() -contains 'Path')) { continue }
+            # Raw and with its type: `%USERPROFILE%\bin` must stay written so.
+            $list = [string] $environment.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $entries = $list -split ';'
+            $kept = @($entries | Where-Object { (Get-PathEntryKey $_) -ne $folderKey })
+            if ($kept.Count -eq $entries.Count) { continue }
+            $environment.SetValue('Path', ($kept -join ';'), $environment.GetValueKind('Path'))
+            Write-Host "    removed $installDir from the PATH of $sid"
+        }
+        catch { Write-Host "    PATH of $sid was not checked: $($_.Exception.Message)" }
+        finally { if ($environment) { $environment.Dispose() } }
+    }
+    $list = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    foreach ($entry in @(Get-ChildItem -LiteralPath $list -ErrorAction SilentlyContinue)) {
+        $sid = $entry.PSChildName
+        if ($sid -match '^S-1-(5-21|12-1)-' -and $sid -notin $loaded) {
+            Write-Host "    $sid is signed out; its launch at sign-in and PATH entry, if any, stay"
+        }
+    }
+}
+
 $exitCode = 0
 $leftForOthers = $false
 switch ($Action) {
@@ -217,10 +310,11 @@ switch ($Action) {
         if ((Test-RegisteredFromHere) -and -not (Stop-NrrService)) { $exitCode = 1 }
         $service = Remove-OwnService
         if ($service -ne 'gone') { $exitCode = 1 }
-        # A service still running would put back what the reset removes; a
-        # registration merely marked for deletion is not one.
-        if ($service -ne 'foreign' -and (Test-NrrServiceStopped) -and (Restore-Network) -ne 0) { $exitCode = 1 }
+        # A registration merely marked for deletion is not a running service.
+        if ($service -ne 'foreign' -and (Restore-NetworkAfterRemoval) -ne 0) { $exitCode = 1 }
         if ($service -eq 'gone' -and -not (Remove-ServiceCopy)) { $exitCode = 1 }
+        if ($service -eq 'foreign') { Resume-ForeignService }
+        Remove-UserEntries
         if ($RemoveData) {
             if ($service -eq 'foreign') {
                 # purge-data.ps1 would remove that other copy's service first.
@@ -268,7 +362,7 @@ switch ($Action) {
         $null = Stop-NrrService
         if (-not $Upgrade) {
             $service = Remove-OwnService
-            if ($service -ne 'foreign' -and (Test-NrrServiceStopped) -and (Restore-Network) -ne 0) { $exitCode = 1 }
+            if ($service -ne 'foreign' -and (Restore-NetworkAfterRemoval) -ne 0) { $exitCode = 1 }
         }
     }
 }

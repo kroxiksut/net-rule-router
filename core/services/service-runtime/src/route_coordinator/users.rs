@@ -7,6 +7,7 @@ use std::net::IpAddr;
 
 use nrr_shared::ipc_payloads::{RoutesHeldDto, TrafficCarriedDto};
 
+use super::liveness::snapshot_or_live;
 use super::merge::{merge_user_routes, MergedRouteView, RouteConflict};
 use super::*;
 
@@ -16,6 +17,8 @@ pub(super) struct UserRoutePlan {
     pub secondary: Option<SecondaryRouteTarget>,
     /// `false` when the plan stopped early: no usable secondary, or no rules.
     pub planned: bool,
+    /// The user's foreign tunnels, when the plan read the machine to name them.
+    pub foreign: Option<Vec<u32>>,
 }
 
 /// Which destinations each later user lost, and to whom — kept so a conflict
@@ -23,14 +26,17 @@ pub(super) struct UserRoutePlan {
 pub(super) type ReportedConflicts = BTreeMap<(String, String), BTreeSet<(IpAddr, u8)>>;
 
 impl SecondaryRouteCoordinator {
-    /// The routes `sid` asks for under `resolution`. `table` is a reading the
-    /// caller already holds; without one it is read here, after the early
-    /// exits, so a user with nothing to route costs no table read.
+    /// The routes `sid` asks for under `resolution`, from the pass's reading
+    /// of the table and the links: the foreign-tunnel view needs both even for
+    /// a user with nothing to route, so the caller reads them once.
     pub(super) fn plan_user_routes(
         &self,
         sid: &str,
         resolution: &RouteResolution,
-        table: Option<&Result<Vec<RouteEntry>, PlatformError>>,
+        policy: Option<&PerSidPolicySnapshot>,
+        table: &Result<Vec<RouteEntry>, PlatformError>,
+        adapters: &[AdapterInfo],
+        cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
     ) -> UserRoutePlan {
         self.remember_resolution(sid, resolution);
         let Some(secondary) = resolution.secondary else {
@@ -39,6 +45,7 @@ impl SecondaryRouteCoordinator {
                 routes: Vec::new(),
                 secondary: None,
                 planned: false,
+                foreign: None,
             };
         };
         let Some(snapshot) = self.rules_provider.active_rules_for(sid) else {
@@ -52,47 +59,42 @@ impl SecondaryRouteCoordinator {
                 routes: Vec::new(),
                 secondary: Some(secondary),
                 planned: false,
+                foreign: None,
             };
         };
-        // The tunnel's own redirect prefixes shape mode A's counter-overlay.
-        // Read here, not cached: a client that reconnects may lay them out
+        // The tunnel's own redirect prefixes shape mode A's counter-overlay,
+        // from this pass's table: a client that reconnects may lay them out
         // differently, and the reconcile that follows must answer that layout.
-        let read;
-        let table = match table {
-            Some(table) => table,
-            None => {
-                read = self
-                    .api
-                    .get_ip_forward_table()
-                    .map(|t| self.stamped_with_ownership(t));
-                &read
-            }
-        };
         let tunnel_catch_alls = table
             .as_ref()
             .map(|t| crate::route_codegen::tunnel_catch_all_prefixes(t, secondary.interface_index))
             .unwrap_or_default();
-        // The rest of the machine reading only when a network rule will use it:
-        // the adapter enumeration is a cost the host-only book never pays.
-        let networks = match table {
-            Ok(t)
-                if crate::route_codegen::network_routes::names_networks(
-                    &snapshot.rule_book,
-                    self.network_support,
-                ) =>
-            {
-                self.network_facts_from(resolution, t, false)
+        // Host routes keep off attached networks and foreign tunnels, so the
+        // links are read with the table, whatever the book holds.
+        let (networks, foreign) = match table {
+            Ok(t) => {
+                let (facts, foreign) =
+                    self.network_facts_from(sid, resolution, policy, t, adapters, false);
+                (facts, Some(foreign))
             }
-            _ => crate::route_codegen::network_routes::NetworkRouteFacts::from_catch_alls(
-                &tunnel_catch_alls,
-            ),
+            _ => {
+                // Unreadable table: nothing is named foreign or local.
+                crate::kept_direct::forget(sid);
+                (
+                    crate::route_codegen::network_routes::NetworkRouteFacts::from_catch_alls(
+                        &tunnel_catch_alls,
+                    ),
+                    None,
+                )
+            }
         };
         let mut out = self.planned_routes(
             sid,
             resolution,
+            policy,
             &secondary,
             &snapshot.rule_book,
-            self.fqdn_cache.as_ref(),
+            cache,
             &tunnel_catch_alls,
             &networks,
         );
@@ -160,6 +162,7 @@ impl SecondaryRouteCoordinator {
             routes: out.routes,
             secondary: Some(secondary),
             planned: true,
+            foreign,
         }
     }
 
@@ -170,14 +173,26 @@ impl SecondaryRouteCoordinator {
         &self,
         served: &[String],
     ) -> Result<RouteReconcileDelta, PlatformError> {
+        let writes = self.reconciler.write_count();
         let table = self
             .api
             .get_ip_forward_table()
             .map(|t| self.stamped_with_ownership(t));
+        // One enumeration for every user's facts and the foreign-tunnel view.
+        let adapters = self.adapters_for_facts();
+        // One cache reading for every user's plan: the book walks run in memory,
+        // not one SQLite query per host.
+        let snapshot = self.fqdn_cache.snapshot_for_compute();
+        let cache = snapshot_or_live(snapshot.as_ref(), self.fqdn_cache.as_ref());
+        crate::kept_direct::retain_only(served);
+        let mut foreign: Vec<Vec<u32>> = Vec::with_capacity(served.len());
+        let mut own_links: Vec<u32> = Vec::new();
         let mut plans: Vec<(String, Vec<RouteEntry>)> = Vec::with_capacity(served.len());
         let mut links: Vec<(String, Option<u32>)> = Vec::with_capacity(served.len());
         let mut interiors: Vec<nrr_domain::ipv4_network::Ipv4Network> = Vec::new();
         for sid in served {
+            // One load of this user's policy serves every question of the pass.
+            let policy = self.route_source.load_for_sid(sid);
             let disposition = self
                 .paused_check
                 .as_ref()
@@ -185,7 +200,27 @@ impl SecondaryRouteCoordinator {
             let routes = match disposition {
                 PausedRouteDisposition::Active => {
                     let resolution = self.resolve(sid);
-                    let plan = self.plan_user_routes(sid, &resolution, Some(&table));
+                    let plan = self.plan_user_routes(
+                        sid,
+                        &resolution,
+                        policy.as_ref(),
+                        &table,
+                        &adapters,
+                        cache,
+                    );
+                    foreign.push(plan.foreign.clone().unwrap_or_else(|| {
+                        self.foreign_tunnel_interfaces(
+                            &resolution,
+                            policy.as_ref(),
+                            table.as_deref().ok(),
+                            Some(&adapters),
+                        )
+                    }));
+                    own_links.extend(Self::additional_links(
+                        policy.as_ref(),
+                        &resolution,
+                        &adapters,
+                    ));
                     if let (Some(secondary), Ok(t)) = (plan.secondary, table.as_ref()) {
                         interiors.extend(
                             primary_local_subnets(t, secondary.interface_index)
@@ -211,6 +246,24 @@ impl SecondaryRouteCoordinator {
                 }
             };
             if disposition != PausedRouteDisposition::Active {
+                // A paused user's links are still theirs; the stored bindings
+                // name them without a resolve.
+                let unresolved = RouteResolution {
+                    mode: RouteBehaviorMode::PreferPrimary,
+                    primary: None,
+                    secondary: None,
+                };
+                foreign.push(self.foreign_tunnel_interfaces(
+                    &unresolved,
+                    policy.as_ref(),
+                    table.as_deref().ok(),
+                    Some(&adapters),
+                ));
+                own_links.extend(Self::additional_links(
+                    policy.as_ref(),
+                    &unresolved,
+                    &adapters,
+                ));
                 tracing::debug!(
                     target: "nrr::route-coordinator",
                     sid = %sid,
@@ -225,13 +278,24 @@ impl SecondaryRouteCoordinator {
         interiors.sort_unstable();
         interiors.dedup();
         crate::secondary_subnets::global_secondary_subnets().publish(interiors);
+        self.publish_foreign_tunnel_networks(
+            table.as_deref().ok(),
+            &adapters,
+            &foreign,
+            &own_links,
+        );
         let mut merged = merge_user_routes(&plans);
         for (sid, link) in &links {
             merged.view.set_link(sid, *link);
         }
         let _ = self.note_conflicts(&merged.conflicts);
         self.note_traffic_carried(&merged.default_carried_by, &links);
-        let delta = self.reconciler.reconcile(&merged.routes)?;
+        // The table this pass began with also checks the routes we keep.
+        let seen = table
+            .as_deref()
+            .ok()
+            .map(|rows| crate::route_reconciler::TableReading { writes, rows });
+        let delta = self.reconciler.reconcile_seen(&merged.routes, seen)?;
         if delta.is_noop() {
             tracing::debug!(
                 target: "nrr::route-coordinator",
@@ -347,7 +411,6 @@ impl SecondaryRouteCoordinator {
                 target: "nrr::route-coordinator",
                 msg_key = "route-users-conflict",
                 sid = %sid,
-                holder = %holder,
                 count = lost.len(),
                 addresses = %sample,
                 "another signed-in user already routes these destinations through a different link; they keep it, and with leak protection on this user's traffic to them is blocked rather than sent the other way",
@@ -359,7 +422,6 @@ impl SecondaryRouteCoordinator {
                     target: "nrr::route-coordinator",
                     msg_key = "route-users-conflict-cleared",
                     sid = %sid,
-                    holder = %holder,
                     "route conflict between signed-in users is over — this user's routes are in the table again",
                 );
             }
@@ -421,7 +483,7 @@ impl SecondaryRouteCoordinator {
         let infos = if carried.is_empty() {
             Vec::new()
         } else {
-            self.api.get_adapter_infos().unwrap_or_default()
+            self.adapters_now().unwrap_or_default()
         };
         let mut now: BTreeMap<&str, String> = BTreeMap::new();
         for (sid, holder) in carried {

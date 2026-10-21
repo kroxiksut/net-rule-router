@@ -68,3 +68,38 @@ fn an_unchanged_state_prints_nothing_new() {
     session.changed(&app, &texts).expect("no change");
     assert_eq!(session.out.len(), before);
 }
+
+#[test]
+fn control_characters_from_the_service_never_reach_the_terminal() {
+    assert_eq!(
+        strip_controls("a\u{1b}[2Jb\u{8}c\rd\te"),
+        "a[2Jbcd e",
+        "escape, backspace and carriage return are dropped, a tab is a space"
+    );
+}
+
+#[test]
+fn an_ended_input_says_that_unapplied_edits_are_gone() {
+    use nrr_client_logic::rules_table::{RuleRow, RuleType, TargetRoute};
+    let texts = texts_en();
+    let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+    let mut session = PlainSession::new(Vec::new());
+    session.input_ended(&app, &texts).expect("clean end");
+    assert!(session.out.is_empty(), "nothing to lose, nothing said");
+
+    app.rules.table.import(
+        vec![RuleRow {
+            id: String::new(),
+            enabled: true,
+            rule_type: RuleType::Domain,
+            match_value: "example.org".into(),
+            target_route: TargetRoute::Secondary,
+            verify: false,
+            comment: String::new(),
+            origin: None,
+        }],
+        true,
+    );
+    session.input_ended(&app, &texts).expect("dirty end");
+    assert!(transcript(session).contains("were not applied"));
+}

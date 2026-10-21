@@ -135,6 +135,10 @@ const DELIBERATE_STOP_FRESHNESS: Duration = Duration::from_secs(120);
 /// account owns: anyone may create folders in ProgramData, and a planted root
 /// or a link in it would steer an elevated write onto another file.
 fn deliberate_stop_marker() -> Option<PathBuf> {
+    marker_in_data_root(DELIBERATE_STOP_MARKER)
+}
+
+fn marker_in_data_root(name: &str) -> Option<PathBuf> {
     let root = service_data_root().ok()?;
     let meta = std::fs::symlink_metadata(&root).ok()?;
     let is_link =
@@ -145,7 +149,7 @@ fn deliberate_stop_marker() -> Option<PathBuf> {
     if !crate::trusted_location::owner_is_trusted(&root).unwrap_or(false) {
         return None;
     }
-    Some(root.join(DELIBERATE_STOP_MARKER))
+    Some(root.join(name))
 }
 
 /// `FILE_ATTRIBUTE_REPARSE_POINT`: a junction or symbolic link.
@@ -195,6 +199,64 @@ pub fn take_deliberate_stop_marker() -> bool {
     fresh
 }
 
+/// Why the service was stopped by something other than its own verbs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnaskedStop {
+    /// The filtering engine went down and took the service with it.
+    EngineDown,
+    Other,
+}
+
+const UNASKED_STOP_ENGINE_MARKER: &str = "unasked-stop-engine";
+const UNASKED_STOP_OTHER_MARKER: &str = "unasked-stop-other";
+
+/// How long such a note stays worth reporting: SCM restarts the service within
+/// a minute, and a note older than a reboot says nothing about this start.
+const UNASKED_STOP_NOTE_FRESHNESS: Duration = Duration::from_secs(900);
+
+/// Leave a note for the next start about a stop nobody asked for, so the
+/// restarted service can say why it was down. Best effort.
+pub fn note_unasked_stop(cause: UnaskedStop) {
+    let name = match cause {
+        UnaskedStop::EngineDown => UNASKED_STOP_ENGINE_MARKER,
+        UnaskedStop::Other => UNASKED_STOP_OTHER_MARKER,
+    };
+    let Some(path) = marker_in_data_root(name) else {
+        return;
+    };
+    let Some(program_data) = crate::system_shell::program_data_directory() else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    let _ = crate::pinned_file::create_new(&program_data, &path);
+}
+
+/// The cause the previous run left with [`note_unasked_stop`], if fresh.
+/// Consumes the notes.
+#[must_use]
+pub fn take_unasked_stop_note() -> Option<UnaskedStop> {
+    let mut found = None;
+    for (name, cause) in [
+        (UNASKED_STOP_ENGINE_MARKER, UnaskedStop::EngineDown),
+        (UNASKED_STOP_OTHER_MARKER, UnaskedStop::Other),
+    ] {
+        let Some(path) = marker_in_data_root(name) else {
+            continue;
+        };
+        let fresh = std::fs::symlink_metadata(&path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age <= UNASKED_STOP_NOTE_FRESHNESS);
+        let _ = std::fs::remove_file(&path);
+        if fresh && found.is_none() {
+            found = Some(cause);
+        }
+    }
+    found
+}
+
 /// The service's recovery actions, switched off until [`RecoveryHold::release`]
 /// or drop. The SCM restarts a process that ends without reporting itself
 /// stopped, so ending a hung service with these on would bring it back in the
@@ -237,7 +299,57 @@ pub fn hold_recovery() -> Result<RecoveryHold, ServiceControlError> {
     })
 }
 
+/// What happens to the recovery actions a stop took off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryAfterStop {
+    /// The service stays down; it puts them back on its next start.
+    LeaveOff,
+    /// The stop did not happen: the running service needs them back now.
+    PutBack,
+}
+
+fn recovery_after_stop(stop_succeeded: bool) -> RecoveryAfterStop {
+    if stop_succeeded {
+        RecoveryAfterStop::LeaveOff
+    } else {
+        RecoveryAfterStop::PutBack
+    }
+}
+
+/// Whether the registered failure actions are the empty set a deliberate stop
+/// (or an interrupted cleanup) leaves behind.
+fn recovery_missing(actions: &windows_service::service::ServiceFailureActions) -> bool {
+    actions.actions.as_ref().is_none_or(Vec::is_empty)
+}
+
+/// At service start: put the recovery actions back if a stop took them off.
+/// Returns whether they had to be restored.
+pub fn restore_recovery_if_missing(binary: &Path) -> Result<bool, ServiceControlError> {
+    let manager = open_manager(ServiceManagerAccess::CONNECT)?;
+    let service = manager
+        .open_service(
+            WINDOWS_SERVICE_NAME,
+            ServiceAccess::QUERY_CONFIG | ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
+        )
+        .map_err(map_service_error)?;
+    let current = service
+        .get_failure_actions()
+        .map_err(|e| ServiceControlError::Mechanism {
+            detail: format!("read failure actions: {}", winapi_detail(&e)),
+        })?;
+    if !recovery_missing(&current) {
+        return Ok(false);
+    }
+    configure_recovery(&service, &RecoveryPolicy::production(), binary)?;
+    Ok(true)
+}
+
 impl RecoveryHold {
+    /// Keep the recovery actions off.
+    fn leave_off(mut self) {
+        self.saved = None;
+    }
+
     /// Put the recovery actions back.
     pub fn release(mut self) -> Result<(), ServiceControlError> {
         self.restore()
@@ -472,22 +584,33 @@ impl ServiceControlPort for WindowsServiceControl {
             )
             .map_err(map_service_error)?;
 
-        // Already running: nothing to do. A start already in flight is NOT
-        // "done" — the poll below waits for it, so a caller that asked for a
-        // running service gets one or an error, never a maybe.
-        let status = service.query_status().map_err(map_service_error)?;
-        if status.current_state == ServiceState::Running {
+        // A start already in flight is NOT "done" — the poll below waits for
+        // it, so a caller that asked for a running service gets one or an
+        // error, never a maybe.
+        let mut status = service.query_status().map_err(map_service_error)?;
+        let step = start_step(status.current_state);
+        if step == StartStep::AlreadyRunning {
             return Ok(());
         }
-
-        service
-            .start::<&str>(&[])
-            .map_err(|e| match map_service_error(e) {
-                ServiceControlError::Mechanism { detail } => ServiceControlError::Mechanism {
-                    detail: format!("start: {detail}"),
-                },
-                other => other,
-            })?;
+        if step == StartStep::LetStopFinish {
+            // A stop in flight (SCM recovery, a peer's restart) rejects a start.
+            wait_for_stopped(&service, timeout)?;
+            status = service.query_status().map_err(map_service_error)?;
+        }
+        if matches!(step, StartStep::Request | StartStep::LetStopFinish) {
+            if let Err(e) = service.start::<&str>(&[]) {
+                if !is_already_running(&e) {
+                    return Err(match map_service_error(e) {
+                        ServiceControlError::Mechanism { detail } => {
+                            ServiceControlError::Mechanism {
+                                detail: format!("start: {detail}"),
+                            }
+                        }
+                        other => other,
+                    });
+                }
+            }
+        }
 
         // Poll so an elevated child can confirm the transition before it exits,
         // which gives whoever polls status afterwards a clean hand-off instead
@@ -531,21 +654,33 @@ impl ServiceControlPort for WindowsServiceControl {
     }
 
     fn stop(&self, timeout: Duration) -> Result<(), ServiceControlError> {
-        let manager = open_manager(ServiceManagerAccess::CONNECT)?;
-        let service = manager
-            .open_service(
-                WINDOWS_SERVICE_NAME,
-                ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
-            )
-            .map_err(map_service_error)?;
+        // Taken first: a service already down may have a restart scheduled by
+        // SCM, and only the actions decide whether it fires.
+        let hold = hold_recovery().ok();
+        let result = (|| {
+            let manager = open_manager(ServiceManagerAccess::CONNECT)?;
+            let service = manager
+                .open_service(
+                    WINDOWS_SERVICE_NAME,
+                    ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
+                )
+                .map_err(map_service_error)?;
 
-        let status = service.query_status().map_err(map_service_error)?;
-        if status.current_state == ServiceState::Stopped {
-            return Ok(());
+            let status = service.query_status().map_err(map_service_error)?;
+            if status.current_state == ServiceState::Stopped {
+                return Ok(());
+            }
+
+            let _ = stop_deliberately(&service);
+            wait_for_stopped(&service, timeout)
+        })();
+        if let Some(hold) = hold {
+            match recovery_after_stop(result.is_ok()) {
+                RecoveryAfterStop::LeaveOff => hold.leave_off(),
+                RecoveryAfterStop::PutBack => drop(hold),
+            }
         }
-
-        let _ = stop_deliberately(&service);
-        wait_for_stopped(&service, timeout)
+        result
     }
 
     fn kill(&self) -> Result<(), ServiceControlError> {
@@ -975,6 +1110,37 @@ fn winapi_detail(err: &windows_service::Error) -> String {
     }
 }
 
+/// The SCM failure actions for `policy`, in failure order. The SCM repeats the
+/// last one for every failure after it: a run command mid-list fires once, and
+/// the restart after it carries the service through any later failure.
+fn failure_action_plan(policy: &RecoveryPolicy) -> Vec<(ServiceActionType, Duration)> {
+    let mut plan: Vec<(ServiceActionType, Duration)> = (0..policy.max_auto_restarts)
+        .map(|i| {
+            let ms = match i {
+                0 => policy.first_restart_delay_ms,
+                1 => policy.second_restart_delay_ms,
+                _ => policy.later_restart_delay_ms,
+            };
+            (
+                ServiceActionType::Restart,
+                Duration::from_millis(u64::from(ms)),
+            )
+        })
+        .collect();
+    if policy.release_network_when_exhausted {
+        plan.push((ServiceActionType::RunCommand, Duration::from_secs(1)));
+    }
+    plan.push(if policy.exhausted_restart_delay_ms > 0 {
+        (
+            ServiceActionType::Restart,
+            Duration::from_millis(u64::from(policy.exhausted_restart_delay_ms)),
+        )
+    } else {
+        (ServiceActionType::None, Duration::ZERO)
+    });
+    plan
+}
+
 /// Configure SCM failure actions for an already-registered service.
 fn configure_recovery(
     service: &Service,
@@ -983,31 +1149,14 @@ fn configure_recovery(
 ) -> Result<(), ServiceControlError> {
     use windows_service::service::{ServiceFailureActions, ServiceFailureResetPeriod};
 
-    let mut actions: Vec<ServiceAction> = (0..policy.max_auto_restarts)
-        .map(|i| ServiceAction {
-            action_type: ServiceActionType::Restart,
-            delay: Duration::from_millis(u64::from(match i {
-                0 => policy.first_restart_delay_ms,
-                1 => policy.second_restart_delay_ms,
-                _ => policy.later_restart_delay_ms,
-            })),
-        })
+    let actions = failure_action_plan(policy);
+    let command = policy
+        .release_network_when_exhausted
+        .then(|| OsString::from(format!("\"{}\" after-crash", binary.display())));
+    let actions: Vec<ServiceAction> = actions
+        .into_iter()
+        .map(|(action_type, delay)| ServiceAction { action_type, delay })
         .collect();
-    // The SCM repeats the last action for every failure after it, so a run
-    // command here fires on each crash past the restarts, never a restart.
-    let command = policy.release_network_when_exhausted.then(|| {
-        actions.push(ServiceAction {
-            action_type: ServiceActionType::RunCommand,
-            delay: Duration::from_secs(1),
-        });
-        OsString::from(format!("\"{}\" after-crash", binary.display()))
-    });
-    if command.is_none() {
-        actions.push(ServiceAction {
-            action_type: ServiceActionType::None,
-            delay: Duration::ZERO,
-        });
-    }
 
     service
         .update_failure_actions(ServiceFailureActions {
@@ -1116,6 +1265,31 @@ fn adoption_verdict(
     Ok(())
 }
 
+/// What `start` does for the state the service was found in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartStep {
+    AlreadyRunning,
+    /// Starting already: only wait.
+    Wait,
+    /// Stopping: wait for the stop, then ask for the start.
+    LetStopFinish,
+    Request,
+}
+
+fn start_step(state: ServiceState) -> StartStep {
+    match state {
+        ServiceState::Running => StartStep::AlreadyRunning,
+        ServiceState::StartPending => StartStep::Wait,
+        ServiceState::StopPending => StartStep::LetStopFinish,
+        _ => StartStep::Request,
+    }
+}
+
+/// `ERROR_SERVICE_ALREADY_RUNNING`: a start that raced another one.
+fn is_already_running(err: &windows_service::Error) -> bool {
+    matches!(err, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(1056))
+}
+
 /// A start wait ends only past both the caller's `deadline` and what the
 /// pending service promised: its wait hint, counted from its last checkpoint move.
 fn start_wait_over(
@@ -1172,17 +1346,15 @@ where
     rx.recv_timeout(budget).ok()
 }
 
-/// Remove the two things this product leaves on the machine that can lock a
-/// user out: WFP filters under our provider, and the Mode-B NRPT redirect
-/// pointing all name resolution at a loopback listener that is about to stop
-/// existing. Both sweeps are scoped to our own marker/provider, so an admin's
-/// or another product's objects are never touched.
+/// Remove what this product leaves on the machine that can lock a user out or
+/// keep steering traffic: WFP filters under our provider, the Mode-B NRPT
+/// redirect pointing all name resolution at a loopback listener that is about
+/// to stop existing, and our routes (a stop that kept the rule routes, or a
+/// killed instance, leaves them until reboot). Each sweep is scoped to our own
+/// marker, provider or route signature, so an admin's or another product's
+/// objects are never touched.
 ///
-/// Routes are deliberately not swept here: ours are non-persistent and clear on
-/// the next reboot, and adopting them needs the reconciler from the service
-/// layer, which this crate must not depend on.
-///
-/// Returns `false` if either sweep could not run — the caller reports it rather
+/// Returns `false` if any sweep could not run — the caller reports it rather
 /// than failing the removal, because a registered service is the worse outcome.
 fn sweep_enforcement_state() -> bool {
     let api: std::sync::Arc<dyn nrr_platform_api::windows_api::WindowsApiPort> =
@@ -1239,12 +1411,142 @@ fn sweep_enforcement_state() -> bool {
         &crate::dns_redirect::WindowsSearchList,
     )
     .is_clean();
-    filters_swept && dns_swept
+    let routes_swept = sweep_routes(std::sync::Arc::new(
+        crate::windows_api::ProductionWindowsApi,
+    ));
+    filters_swept && dns_swept && routes_swept
+}
+
+/// Our routes, by the signature the service writes them with; one the sweep
+/// cannot remove is left to the reboot that clears it.
+fn sweep_routes(api: std::sync::Arc<dyn nrr_platform_api::route_table::RouteTablePort>) -> bool {
+    match nrr_platform_api::route_signature::sweep_owned_routes(api) {
+        Ok(removed) => {
+            if removed > 0 {
+                tracing::info!(
+                    target: "nrr::routes",
+                    removed,
+                    "removed the routes the service left behind",
+                );
+            }
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "nrr::routes",
+                error = %e,
+                "could not remove every route the service left; a reboot clears them",
+            );
+            false
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The uninstall takes our host routes, overlays and network pieces, and
+    /// leaves a VPN's own routes, the OS default and the user's static route.
+    #[test]
+    fn the_uninstall_route_sweep_takes_ours_and_nothing_else() {
+        use nrr_platform_api::route_signature::{NETWORK_ROUTE_METRIC, SECONDARY_ROUTE_METRIC};
+        use nrr_platform_api::route_table::RouteTablePort;
+        use nrr_platform_api::{MockWindowsApi, RouteEntry, RouteTableRef};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let row = |dest: [u8; 4], prefix: u8, ifindex: u32, metric: u32| RouteEntry {
+            destination: IpAddr::V4(Ipv4Addr::from(dest)),
+            prefix_length: prefix,
+            next_hop: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            interface_index: ifindex,
+            metric,
+            is_ours: false,
+            table: RouteTableRef::Main,
+        };
+        let ours = [
+            row([198, 51, 100, 4], 32, 7, SECONDARY_ROUTE_METRIC),
+            row([64, 0, 0, 0], 2, 3, SECONDARY_ROUTE_METRIC),
+            row([10, 20, 0, 0], 16, 7, NETWORK_ROUTE_METRIC),
+        ];
+        let foreign = [
+            row([0, 0, 0, 0], 1, 7, 1),
+            row([128, 0, 0, 0], 1, 7, 1),
+            row([203, 0, 113, 7], 32, 3, 0),
+            row([10, 7, 0, 0], 24, 9, 256),
+            row([0, 0, 0, 0], 0, 3, 25),
+            row([192, 168, 50, 0], 24, 3, 10),
+        ];
+        let api = std::sync::Arc::new(MockWindowsApi::new());
+        api.set_route_table(ours.iter().chain(&foreign).cloned().collect());
+
+        assert!(sweep_routes(
+            std::sync::Arc::clone(&api) as std::sync::Arc<dyn RouteTablePort>
+        ));
+        assert_eq!(
+            RouteTablePort::get_ip_forward_table(api.as_ref()).expect("table"),
+            foreign
+        );
+    }
+
+    /// An unreadable table is reported, never taken for a clean one.
+    #[test]
+    fn an_unreadable_table_is_not_a_swept_one() {
+        use nrr_platform_api::route_table::RouteTablePort;
+        let api = std::sync::Arc::new(nrr_platform_api::MockWindowsApi::new());
+        api.set_route_table_read_error(Some("busy"));
+        assert!(!sweep_routes(api as std::sync::Arc<dyn RouteTablePort>));
+    }
+
+    #[test]
+    fn a_confirmed_stop_leaves_the_actions_off_and_a_failed_one_puts_them_back() {
+        assert_eq!(recovery_after_stop(true), RecoveryAfterStop::LeaveOff);
+        assert_eq!(recovery_after_stop(false), RecoveryAfterStop::PutBack);
+    }
+
+    #[test]
+    fn only_an_empty_action_list_counts_as_missing() {
+        use windows_service::service::{ServiceFailureActions, ServiceFailureResetPeriod};
+        let with = |actions| ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::ZERO),
+            reboot_msg: None,
+            command: None,
+            actions,
+        };
+        assert!(recovery_missing(&with(None)));
+        assert!(recovery_missing(&with(Some(Vec::new()))));
+        assert!(!recovery_missing(&with(Some(vec![ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: Duration::from_secs(5),
+        }]))));
+    }
+
+    #[test]
+    fn repeated_failures_keep_restarting_after_the_network_is_released() {
+        let plan = failure_action_plan(&RecoveryPolicy::production());
+        let kinds: Vec<_> = plan.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            [
+                ServiceActionType::Restart,
+                ServiceActionType::Restart,
+                ServiceActionType::Restart,
+                ServiceActionType::RunCommand,
+                ServiceActionType::Restart,
+            ]
+        );
+        let (last, delay) = plan[plan.len() - 1];
+        assert_eq!(last, ServiceActionType::Restart);
+        assert!(delay >= Duration::from_secs(60), "the tail is a backoff");
+    }
+
+    #[test]
+    fn a_zero_tail_delay_leaves_the_service_stopped() {
+        let mut policy = RecoveryPolicy::production();
+        policy.exhausted_restart_delay_ms = 0;
+        let plan = failure_action_plan(&policy);
+        assert_eq!(plan[plan.len() - 1].0, ServiceActionType::None);
+    }
 
     #[test]
     fn the_scripts_write_the_same_deliberate_stop_marker() {
@@ -1253,6 +1555,17 @@ mod tests {
             lib.contains(&format!("'{DELIBERATE_STOP_MARKER}'")),
             "service-paths.ps1 must name the marker file {DELIBERATE_STOP_MARKER}"
         );
+    }
+
+    #[test]
+    fn a_start_does_not_request_what_is_already_starting_or_running() {
+        assert_eq!(start_step(ServiceState::Running), StartStep::AlreadyRunning);
+        assert_eq!(start_step(ServiceState::StartPending), StartStep::Wait);
+        assert_eq!(
+            start_step(ServiceState::StopPending),
+            StartStep::LetStopFinish
+        );
+        assert_eq!(start_step(ServiceState::Stopped), StartStep::Request);
     }
 
     #[test]

@@ -13,8 +13,8 @@
 use crate::ipc_handlers::mutation_token_store::StoredMutation;
 use crate::ipc_handlers::operation_status_store::OperationError;
 use crate::ipc_handlers::payloads::{
-    AdapterEntry, ApplyFailurePolicyDto, AutostartDto, LinkProviderAppDto, LogRetentionConfigDto,
-    LogRetentionConfigSetRequest, MigrationStatusGetResponse, MutationKind,
+    AdapterEntry, ApplyFailurePolicyDto, AutostartDto, FirstPolicyDto, LinkProviderAppDto,
+    LogRetentionConfigDto, LogRetentionConfigSetRequest, MigrationStatusGetResponse, MutationKind,
     PrincipalDataPurgeResponse, RetentionSettingsDto, RetentionSettingsSetRequest, ReviewRiskLevel,
     ReviewSummaryResponse, RoutePolicyDto, RoutePolicyUpdateRequest, RoutingPauseDto,
     RulesListResponse, RulesRecentChangesResponse, RulesRouteFilter, SecondaryRouteStateDto,
@@ -49,10 +49,8 @@ pub trait AdaptersSnapshotProvider: Send + Sync {
 /// Per-SID Fail-Closed state probe.
 ///
 /// The adapter snapshot itself is service-global, but the Fail-Closed
-/// banner depends on (a) which adapter the caller picked as secondary
-/// (per-SID `route_bindings`), and (b) whether the caller enabled the
-/// "block secondary traffic when unavailable" policy or chose the
-/// `StrictSecondaryFailClosed` behavior mode. Computing this inside
+/// banner depends on which adapter the caller picked as secondary and on
+/// the caller's leak protection. Computing this inside
 /// `AdaptersSnapshotProvider` would require leaking caller identity
 /// into the trait — instead the handler composes: it gets the global
 /// adapter list, then asks this probe to compute the per-SID flag.
@@ -204,6 +202,12 @@ pub fn review_risk_level(summary: &ReviewSummaryResponse) -> ReviewRiskLevel {
 /// drive migration first" signal.
 pub trait RoutePolicyProvider: Send + Sync {
     fn get_for_sid(&self, sid: &str) -> Option<RoutePolicyDto>;
+
+    /// What a first save starts from, for a caller with no policy; `None`
+    /// when it cannot be read.
+    fn first_policy(&self) -> Option<FirstPolicyDto> {
+        None
+    }
 }
 
 /// Wire-format application of a per-SID `RoutePolicyUpdate`. Production
@@ -294,9 +298,10 @@ pub enum RoutePolicyWriteError {
     /// Primary and secondary point at the same `stable_id`. Handler
     /// maps to `IpcErrorCode::PreconditionFailed`.
     PrimaryEqualsSecondary,
-    /// `mode = strict-secondary-fail-closed` but `secondary` is
-    /// `None`. Handler maps to `IpcErrorCode::PreconditionFailed`.
-    StrictModeRequiresSecondary,
+    /// Leak protection `sites` with the additional connection as the default
+    /// route, where it would mean `everything`. Handler maps to
+    /// `IpcErrorCode::PreconditionFailed`.
+    SitesNeedsMainRoute,
     /// The short-name domain is not a usable DNS domain. Handler maps to
     /// `IpcErrorCode::PreconditionFailed`.
     InvalidNetworkDomain,
@@ -307,6 +312,9 @@ pub enum RoutePolicyWriteError {
     /// `IpcErrorCode::Internal`.
     Storage(String),
 }
+
+/// Opens the refusal's message, as the client error code it is catalogued under.
+pub const SITES_NEEDS_MAIN_ROUTE_CODE: &str = "route-policy-sites-needs-main-route";
 
 impl std::fmt::Display for RoutePolicyWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -323,9 +331,10 @@ impl std::fmt::Display for RoutePolicyWriteError {
             Self::PrimaryEqualsSecondary => {
                 write!(f, "primary and secondary cannot reference the same adapter")
             }
-            Self::StrictModeRequiresSecondary => write!(
+            Self::SitesNeedsMainRoute => write!(
                 f,
-                "strict-secondary-fail-closed mode requires a bound secondary"
+                "{SITES_NEEDS_MAIN_ROUTE_CODE}: leak protection `sites` needs the main \
+                 connection as the default route"
             ),
             Self::InvalidNetworkDomain => {
                 write!(f, "the short-name domain is not a valid DNS domain")
@@ -538,6 +547,18 @@ pub trait RefusingAnchorsWriter: Send + Sync {
 /// Source of the caller's per-SID `routing_pause_state` row.
 pub trait RoutingPauseProvider: Send + Sync {
     fn get(&self, sid: &str) -> RoutingPauseDto;
+
+    /// When the caller's pause ends by itself; none for one without a term.
+    fn term(&self, _sid: &str) -> PauseTermView {
+        PauseTermView::default()
+    }
+}
+
+/// When a pause ends by itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PauseTermView {
+    pub resumes_at_ms: Option<i64>,
+    pub until_restart: bool,
 }
 
 /// Writer for the caller's per-SID `routing_pause_state` row.
@@ -559,14 +580,6 @@ pub trait RoutingPauseWriter: Send + Sync {
 /// reaches the service.
 pub trait AutostartProvider: Send + Sync {
     fn get(&self) -> AutostartDto;
-}
-
-/// Writer for the autostart configuration. Production impl wraps
-/// `nrr_platform_api::autostart::AutostartHelper::set_enabled` /
-/// `clear` and persists the result via `AutostartStateRepository::set`.
-/// `sid` is the caller: the change is announced to them and nobody else.
-pub trait AutostartWriter: Send + Sync {
-    fn toggle(&self, sid: &str, enabled: bool) -> Result<AutostartDto, SettingsWriteError>;
 }
 
 // ── Service stability config ────────────────────────────────────────────────

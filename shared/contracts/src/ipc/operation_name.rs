@@ -87,14 +87,10 @@ pub enum IpcOperationName {
     /// Read the caller's autostart configuration alongside
     /// the most recent registry observation (`HKCU\…\Run`).
     AutostartGet,
-    /// Enable or disable the caller's autostart entry.
-    /// User-scoped — writes to the per-user `HKCU\…\Run` hive only.
-    AutostartToggle,
-    /// Explain query — render the decision-engine outcome
-    /// for either a historical `DecisionId` or a synthetic input
-    /// sample, with optional redaction level. Read-only, no mutation
-    /// queue. Pure function of (rules-snapshot, fqdn cache, input)
-    /// plus an audit-log lookup to populate `diagnostic_ids`.
+    /// Explain query — which rule wins for a synthetic input sample, with
+    /// optional redaction level. Read-only, no mutation queue. A historical
+    /// `DecisionId` answers "not found": enforcement is generated from the
+    /// rule book, so no per-decision record exists to replay.
     ExplainGet,
     /// Build a zip archive of operational diagnostics
     /// (manifest, health snapshot, logs window, audit summary, optional
@@ -393,6 +389,12 @@ pub enum IpcOperationName {
     /// [`crate::ipc_payloads::RuleOverrideRevokeRequest`] →
     /// [`crate::ipc_payloads::RuleOverrideRevokeResponse`].
     RulesOverrideRevoke,
+    /// Replace the caller's confirmed VPN gateways: the addresses another VPN
+    /// may reach on its handshake ports while leak protection blocks the main
+    /// link. User-scoped, not elevated.
+    /// [`crate::ipc_payloads::RouteVpnGatewaysSetRequest`] →
+    /// [`crate::ipc_payloads::RouteVpnGatewaysSetResponse`].
+    RouteVpnGatewaysSet,
 }
 
 impl IpcOperationName {
@@ -430,7 +432,6 @@ impl IpcOperationName {
         Self::RoutingPauseGet,
         Self::RoutingPauseToggle,
         Self::AutostartGet,
-        Self::AutostartToggle,
         Self::ExplainGet,
         Self::DiagnosticsExportArchive,
         Self::ServiceStabilityConfigGet,
@@ -483,6 +484,7 @@ impl IpcOperationName {
         Self::RulesOverridePreview,
         Self::RulesOverrideGrant,
         Self::RulesOverrideRevoke,
+        Self::RouteVpnGatewaysSet,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -520,7 +522,6 @@ impl IpcOperationName {
             Self::RoutingPauseGet => "routing.pause.get",
             Self::RoutingPauseToggle => "routing.pause.toggle",
             Self::AutostartGet => "autostart.get",
-            Self::AutostartToggle => "autostart.toggle",
             Self::ExplainGet => "diagnostics.explain.get",
             Self::DiagnosticsExportArchive => "diagnostics.export-archive",
             Self::ServiceStabilityConfigGet => "settings.service-stability.get",
@@ -573,6 +574,7 @@ impl IpcOperationName {
             Self::RulesOverridePreview => "rules.override.preview",
             Self::RulesOverrideGrant => "rules.override.grant",
             Self::RulesOverrideRevoke => "rules.override.revoke",
+            Self::RouteVpnGatewaysSet => "route.vpn-gateways.set",
         }
     }
 

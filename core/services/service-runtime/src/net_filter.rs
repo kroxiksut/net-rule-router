@@ -1,4 +1,4 @@
-//! Non-routable IPv4 filtering shared across the route/cache pipeline.
+//! Non-routable address filtering shared across the route/cache pipeline.
 //!
 //! An ad-blocking OS `hosts` file commonly pins ad/tracker domains to the
 //! loopback address (`app.example 127.0.0.1`) or the unspecified address
@@ -17,10 +17,9 @@
 //! a hostname's "real" resolution, fanning it out into a `/32` route, or
 //! counting it in the shared-IP census corrupts the model of the real network.
 //!
-//! Free is IPv4-only — both [`nrr_storage::dto::ResolutionEntry::resolved_ips`]
-//! and [`nrr_platform_api::dns_observe::DnsObservation::ipv4s`] carry
-//! `Vec<Ipv4Addr>` — so a single IPv4 predicate covers every ingestion and
-//! codegen site.
+//! The cache and the observers carry both families: [`is_non_routable`] is the
+//! screen for an address of either, [`is_non_routable_v4`] its IPv4 half for
+//! the paths keyed by IPv4 alone (the shared-IP census, collateral).
 
 use std::net::{IpAddr, Ipv4Addr};
 

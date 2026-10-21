@@ -1,4 +1,4 @@
-//! Install/update/uninstall configuration types.
+//! Install/uninstall configuration types.
 //!
 //! The service runs as `NT AUTHORITY\LocalSystem`: route-table changes
 //! (`CreateIpForwardEntry2`) and WFP filter management (`FwpmEngineOpen0` /
@@ -8,8 +8,8 @@
 //!
 //! ## Configuration types
 //!
-//! [`InstallConfig`], [`UpdateConfig`], and [`UninstallConfig`] carry the
-//! parameters for the three lifecycle flows. The OS mechanism they drive lives
+//! [`InstallConfig`] and [`UninstallConfig`] carry the
+//! parameters for the two lifecycle flows. The OS mechanism they drive lives
 //! behind `nrr_platform_api::service_control::ServiceControlPort`; this module
 //! is pure Rust and fully unit-testable without admin or a real service
 //! manager.
@@ -18,44 +18,13 @@
 //! port's own vocabulary and are defined there — re-exported here under their
 //! established names so callers keep one spelling. What stays local is the part
 //! the port deliberately does not own: an uninstall *flow* additionally decides
-//! whether to export diagnostics first, and an update flow decides whether to
-//! back up the state database.
-
-use std::path::PathBuf;
+//! whether to export diagnostics first.
 
 use nrr_platform_api::service_control::ServiceUninstallSpec;
 pub use nrr_platform_api::service_control::{
     RecoveryPolicy, ServiceInstallReport as InstallOutcome, ServiceInstallSpec as InstallConfig,
     ServiceStartMode,
 };
-
-// ── Update configuration ──────────────────────────────────────────────────────
-
-/// Parameters for the update (in-place upgrade) flow.
-#[derive(Clone, Debug)]
-pub struct UpdateConfig {
-    /// Path to the new binary that should replace the registered one.
-    pub new_binary_path: PathBuf,
-    /// Seconds to wait for the service to drain in-flight requests before
-    /// forcing a stop.
-    pub drain_timeout_secs: u64,
-    /// Whether to create a `.bak` copy of `nrr_service_state.db` before
-    /// applying migrations.
-    pub backup_state_db: bool,
-    /// Whether to restart the service automatically after binary replacement.
-    pub restart_after_update: bool,
-}
-
-impl UpdateConfig {
-    pub fn default_for(new_binary_path: PathBuf) -> Self {
-        Self {
-            new_binary_path,
-            drain_timeout_secs: 30,
-            backup_state_db: true,
-            restart_after_update: true,
-        }
-    }
-}
 
 // ── Uninstall configuration ───────────────────────────────────────────────────
 
@@ -119,15 +88,6 @@ impl UninstallConfig {
 
 // ── Outcomes ──────────────────────────────────────────────────────────────────
 
-/// Result of a completed update flow.
-#[derive(Clone, Debug)]
-pub struct UpdateOutcome {
-    /// Path of the state DB backup, if one was created.
-    pub state_db_backup: Option<PathBuf>,
-    /// Whether the service was restarted after the update.
-    pub service_restarted: bool,
-}
-
 /// Result of a completed uninstall flow.
 #[derive(Clone, Debug)]
 pub struct UninstallOutcome {
@@ -175,13 +135,5 @@ mod tests {
                 .port_spec()
                 .remove_service_owned_data
         );
-    }
-
-    #[test]
-    fn update_config_defaults_backup_and_restart() {
-        let cfg = UpdateConfig::default_for(PathBuf::from("v2.exe"));
-        assert!(cfg.backup_state_db);
-        assert!(cfg.restart_after_update);
-        assert!(cfg.drain_timeout_secs > 0);
     }
 }

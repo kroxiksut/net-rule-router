@@ -64,16 +64,20 @@ use std::time::Duration;
 use nrr_platform_linux::daemon_lock::DaemonLock;
 use nrr_platform_linux::peer_cred::classify_unix_client;
 use nrr_service_runtime::connection_slot::PerPrincipalSlots;
+use nrr_service_runtime::ipc_inbound::{
+    read_request_within, write_response, InboundFrame, FRAME_READ_DEADLINE,
+};
 use nrr_service_runtime::ipc_push::{
-    adopt_subscription, flush_push_frames, SubscriptionChange, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
+    adopt_subscription, flush_push_frames, SubscriptionChange, PUSH_BATCH_SIZE,
+    PUSH_SAFETY_INTERVAL,
 };
 use nrr_service_runtime::{
     AcceptError, AcceptErrorCategory, AcceptOutcome, CallerProcess, EventBus, IpcAcceptor,
     IpcBindError, IpcError, IpcErrorCode, IpcRequestContext, IpcRequestEnvelope,
-    IpcResponseEnvelope, IpcRouter, IpcServer, UserPrincipal,
+    IpcResponseEnvelope, IpcRouter, IpcServer, PushWaker, UserPrincipal,
 };
 use nrr_shared::ipc::IpcClientProfile;
-use nrr_shared::ipc_wire::{read_frame, write_frame};
+use nrr_shared::ipc_wire::write_frame;
 
 /// Canonical socket path — the cross-OS endpoint SSOT resolves to the Unix
 /// socket form here (`/run/netrulerouter/service-v1.sock`), so server and client
@@ -371,7 +375,8 @@ impl UnixDomainSocketAcceptor {
             tracing::warn!(
                 target: "nrr::ipc",
                 msg_key = "svc-ipc-principal-connection-cap",
-                uid = identity.uid,
+                // `sid` is what scopes the line to its owner in the log reader.
+                sid = %format!("unix:uid:{}", identity.uid),
                 cap = nrr_service_runtime::connection_slot::MAX_CONNECTIONS_PER_PRINCIPAL,
                 "refused a connection: this account already holds its share of the service's connection slots"
             );
@@ -432,8 +437,12 @@ impl Drop for UnixDomainSocketAcceptor {
 /// Frames the reader sub-thread hands to the dispatch loop.
 enum ReaderMsg {
     Request(IpcRequestEnvelope),
+    /// An operation this service does not know: answered, connection kept.
+    Unsupported(Box<IpcResponseEnvelope>),
     Malformed,
     Closed,
+    /// The bus published something this connection's subscriber is owed.
+    PushWake,
 }
 
 /// Per-connection worker: classify the caller once, then serve framed
@@ -468,6 +477,7 @@ fn handle_connection(
         }
     };
     let (reader_tx, reader_rx) = std::sync::mpsc::sync_channel::<ReaderMsg>(8);
+    let wake_tx = reader_tx.clone();
     // Past the window the write fails, the loop below breaks, and teardown
     // drops the subscription and frees the slot.
     let _ = stream.set_write_timeout(Some(PUSH_WRITE_TIMEOUT));
@@ -476,28 +486,34 @@ fn handle_connection(
     // make the service unreachable without a single malformed byte. After the
     // first frame the timeout comes off: a subscriber legitimately sits quiet
     // for hours waiting to be pushed to, and cutting it would break the very
-    // thing the connection is for.
-    let _ = reader.set_read_timeout(Some(FIRST_FRAME_IDLE_TIMEOUT));
+    // thing the connection is for. Every frame, once begun, has
+    // FRAME_READ_DEADLINE to end.
     let reader_thread = thread::Builder::new()
         .name("nrr-ipc-reader".into())
         .spawn(move || {
             let mut first = true;
             loop {
-                let msg = match read_frame::<_, IpcRequestEnvelope>(&mut reader) {
-                    Ok(req) => ReaderMsg::Request(req),
-                    // EOF, and the first-frame timeout: a client that never
-                    // introduced itself gives its slot back without an answer.
-                    Err(e) if e.is_transport_dead() => ReaderMsg::Closed,
-                    // Garbage is answered even on the first frame, so a client
-                    // speaking the wrong protocol hears why instead of a bare
-                    // EOF it would retry forever.
-                    Err(_) => ReaderMsg::Malformed,
-                };
+                let idle = first.then_some(FIRST_FRAME_IDLE_TIMEOUT);
+                let msg =
+                    match read_request_within(&mut reader, idle, FRAME_READ_DEADLINE, |s, t| {
+                        let _ = s.set_read_timeout(t);
+                    }) {
+                        Ok(InboundFrame::Request(req)) => ReaderMsg::Request(req),
+                        Ok(InboundFrame::UnsupportedOperation(answer)) => {
+                            ReaderMsg::Unsupported(answer)
+                        }
+                        // EOF, and the first-frame timeout: a client that never
+                        // introduced itself gives its slot back without an answer.
+                        Err(e) if e.is_transport_dead() => ReaderMsg::Closed,
+                        // Garbage is answered even on the first frame, so a client
+                        // speaking the wrong protocol hears why instead of a bare
+                        // EOF it would retry forever.
+                        Err(_) => ReaderMsg::Malformed,
+                    };
                 if first {
                     first = false;
-                    let _ = reader.set_read_timeout(None);
                 }
-                let terminal = !matches!(msg, ReaderMsg::Request(_));
+                let terminal = !matches!(msg, ReaderMsg::Request(_) | ReaderMsg::Unsupported(_));
                 if reader_tx.send(msg).is_err() || terminal {
                     break;
                 }
@@ -511,7 +527,7 @@ fn handle_connection(
     // for the whole supervisor budget. `recv_timeout` bounds the wait for the
     // flag, and the shutdown below hands the client its EOF.
     while !shutdown.load(Ordering::SeqCst) {
-        match reader_rx.recv_timeout(PUSH_POLL_INTERVAL) {
+        match reader_rx.recv_timeout(PUSH_SAFETY_INTERVAL) {
             Ok(ReaderMsg::Request(request)) => {
                 profile = narrow_profile_from_handshake(profile, &request);
                 let ctx = IpcRequestContext {
@@ -530,21 +546,32 @@ fn handle_connection(
                 let response = router.dispatch(request, ctx);
                 match adopt_subscription(&mut subscription_id, &response, event_bus.as_deref()) {
                     SubscriptionChange::Unchanged => {}
-                    SubscriptionChange::Opened(sub_id) => tracing::info!(
+                    SubscriptionChange::Opened(sub_id) => {
+                        attach_waker(event_bus.as_deref(), &sub_id, &wake_tx);
+                        tracing::info!(
                         target: "nrr::ipc-push",
                         msg_key = "push-subscription-opened",
                         subscription_id = %sub_id,
                         bus_wired = event_bus.is_some(),
                         "push subscription opened"
-                    ),
-                    SubscriptionChange::Replaced { previous, current } => tracing::debug!(
-                        target: "nrr::ipc-push",
-                        previous = %previous,
-                        subscription_id = %current,
-                        "push subscription replaced by a re-subscribe on the same connection"
-                    ),
+                        );
+                    }
+                    SubscriptionChange::Replaced { previous, current } => {
+                        attach_waker(event_bus.as_deref(), &current, &wake_tx);
+                        tracing::debug!(
+                            target: "nrr::ipc-push",
+                            previous = %previous,
+                            subscription_id = %current,
+                            "push subscription replaced by a re-subscribe on the same connection"
+                        );
+                    }
                 }
-                if write_frame(&mut stream, &response).is_err() {
+                if write_response(&mut stream, &response).is_err() {
+                    break;
+                }
+            }
+            Ok(ReaderMsg::Unsupported(answer)) => {
+                if write_frame(&mut stream, answer.as_ref()).is_err() {
                     break;
                 }
             }
@@ -556,7 +583,7 @@ fn handle_connection(
                 break;
             }
             Ok(ReaderMsg::Closed) => break, // EOF / client closed.
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Ok(ReaderMsg::PushWake) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if let (Some(sub_id), Some(bus)) = (subscription_id.as_ref(), event_bus.as_ref()) {
                     let failed = flush_push_frames(bus, sub_id, PUSH_BATCH_SIZE, |env| {
                         write_frame(&mut stream, env).map_err(|e| e.to_string())
@@ -591,6 +618,23 @@ fn handle_connection(
     if let Some(handle) = reader_thread {
         let _ = handle.join();
     }
+}
+
+/// Have a publish for this subscriber wake the connection thread. A full queue
+/// already holds a message that will, so a refused send is not a loss.
+fn attach_waker(
+    bus: Option<&EventBus>,
+    subscription_id: &str,
+    wake_tx: &std::sync::mpsc::SyncSender<ReaderMsg>,
+) {
+    let Some(bus) = bus else { return };
+    let tx = wake_tx.clone();
+    bus.set_waker(
+        subscription_id,
+        PushWaker::new(move || {
+            let _ = tx.try_send(ReaderMsg::PushWake);
+        }),
+    );
 }
 
 /// Apply a `contract.negotiate` handshake's declared client kind to the
@@ -653,6 +697,7 @@ mod tests {
     use super::*;
     use nrr_service_runtime::ipc_push::extract_subscription_id;
     use nrr_service_runtime::{IpcAuditEmitter, IpcHandlerRegistry, NoopIpcAuditEmitter};
+    use nrr_shared::ipc_wire::read_frame;
     use std::sync::atomic::AtomicU32;
     use std::time::{Duration, Instant};
 
@@ -691,6 +736,7 @@ mod tests {
                 client_version: nrr_shared::ipc::IPC_PROTOCOL_VERSION,
                 client_kind: kind,
                 supported_features: Vec::new(),
+                contract_revision: nrr_shared::ipc::IPC_CONTRACT_REVISION,
             })
             .expect("handshake payload"),
             ..request_for(IpcOperationName::ContractNegotiate)
@@ -864,6 +910,41 @@ mod tests {
             0,
             "the worker must release its slot once the peer goes away",
         );
+    }
+
+    /// A client newer than the daemon asks for an operation it does not know:
+    /// it is told so, and the same connection serves its next request.
+    #[test]
+    fn an_unknown_operation_is_answered_and_the_connection_stays_open() {
+        let dir = temp_dir();
+        let sock = dir.0.join("service.sock");
+        let server = UnixDomainSocketServer::new_at(empty_router(), &sock);
+        let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
+        let acc = Arc::clone(&acceptor);
+        let ticker = thread::spawn(move || acc.accept_one());
+
+        let mut client = connect(&sock);
+        let mut unknown = serde_json::to_value(sample_request()).expect("envelope");
+        unknown["operation"] = serde_json::json!("rules.from-the-future");
+        write_frame(&mut client, &unknown).expect("client writes request");
+        let response: IpcResponseEnvelope = read_frame(&mut client).expect("an answer, not EOF");
+        assert_eq!(
+            response.error.map(|e| e.code),
+            Some(IpcErrorCode::UnsupportedOperation)
+        );
+        assert_eq!(response.request_id, "req-1");
+
+        write_frame(&mut client, &sample_request()).expect("client writes request");
+        let next: IpcResponseEnvelope = read_frame(&mut client).expect("the connection lives on");
+        // The router answered it (the empty registry has no handler), not the
+        // frame decoder.
+        let message = next.error.map(|e| e.message).unwrap_or_default();
+        assert!(message.contains("has no handler"), "{message}");
+
+        drop(client);
+        let _ = ticker.join();
+        acceptor.request_shutdown();
+        acceptor.join_workers();
     }
 
     /// A client speaking the wrong protocol hears why, not a bare EOF.
@@ -1065,6 +1146,7 @@ mod tests {
             "client-version": 1,
             "client-kind": "gui",
             "supported-features": [],
+            "contract-revision": nrr_shared::ipc::IPC_CONTRACT_REVISION,
         });
         write_frame(&mut client, &request).expect("client writes request");
         let response: IpcResponseEnvelope = read_frame(&mut client).expect("client reads response");
@@ -1248,7 +1330,7 @@ mod tests {
         ));
 
         // Positive control: an idle client keeps its worker alive on its own.
-        thread::sleep(PUSH_POLL_INTERVAL * 3);
+        thread::sleep(Duration::from_millis(500));
         assert_eq!(acceptor.active_connections(), 1);
 
         let started = Instant::now();

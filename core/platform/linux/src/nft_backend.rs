@@ -150,6 +150,7 @@ mod tests {
             },
             egress: EgressConstraint::OnlyVia(EgressRef::Secondary),
             coverage: Coverage::ConnectOnly,
+            observed_by_program: false,
         }
     }
 

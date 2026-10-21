@@ -119,10 +119,30 @@ fn upstream_dns_pool(
 ) -> Arc<UpstreamDnsPool> {
     static POOL: std::sync::OnceLock<Arc<UpstreamDnsPool>> = std::sync::OnceLock::new();
     Arc::clone(POOL.get_or_init(|| {
-        Arc::new(UpstreamDnsPool::new(
-            servers,
-            Arc::new(UdpUpstreamProbe::default()),
-        ))
+        let pool = UpstreamDnsPool::new(servers, Arc::new(UdpUpstreamProbe::default()));
+        // A corporate tunnel's resolver answers for its own names only. The
+        // routing pass publishes the tunnels and their networks.
+        pool.follow_foreign_tunnels(nrr_service_runtime::foreign_tunnels::global_foreign_tunnels());
+        Arc::new(pool)
+    }))
+}
+
+/// Run after every routing pass: re-selects the upstream, off the pass's
+/// thread, when the pass moved the foreign tunnels. Nothing per query.
+pub(crate) fn upstream_follower(
+    capture: &DnsCapture,
+    controller: Arc<DnsResolverController>,
+) -> Option<Arc<dyn Fn() + Send + Sync>> {
+    let DnsCapture::Via(mechanism) = capture else {
+        return None;
+    };
+    let pool = upstream_dns_pool(Arc::clone(&mechanism.servers) as _);
+    Some(Arc::new(move || {
+        let controller = Arc::clone(&controller);
+        pool.note_excluded_change_in_background(move |upstream| {
+            controller.note_upstream_present(upstream.is_some());
+            controller.tick();
+        });
     }))
 }
 
@@ -182,6 +202,14 @@ impl SystemDnsServersPort for FollowingServers {
 
     fn upstream_candidates_v6(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
         self.current().upstream_candidates_v6()
+    }
+
+    fn upstream_candidates_v4_per_link(&self) -> Vec<UpstreamDnsCandidate> {
+        self.current().upstream_candidates_v4_per_link()
+    }
+
+    fn upstream_candidates_v6_per_link(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        self.current().upstream_candidates_v6_per_link()
     }
 
     fn report_all_unreachable(&self, servers: &[UpstreamDnsCandidate]) {
@@ -330,9 +358,19 @@ fn armed_through(
         claimed_namespaces: Arc::new(move || {
             use nrr_platform_api::route_table::RouteTablePort;
             let api = nrr_platform_linux::LinuxApi;
-            let adapters = api.get_adapter_infos().unwrap_or_default();
-            let routes = api.get_ip_forward_table().unwrap_or_default();
-            nrr_platform_api::dns_scope::classify_claims(scopes.dns_scopes(), &adapters, &routes)
+            // No route table, no uplink to tell apart: nothing reads as foreign.
+            let (adapters, routes) = match api.get_ip_forward_table() {
+                Ok(routes) => (api.get_adapter_infos().unwrap_or_default(), routes),
+                Err(_) => (Vec::new(), Vec::new()),
+            };
+            // Our own links as the route coordinator last named them.
+            let ours = nrr_service_runtime::foreign_tunnels::global_foreign_tunnels().own_links();
+            nrr_platform_api::dns_scope::classify_claims(
+                scopes.dns_scopes(),
+                &adapters,
+                &routes,
+                &ours,
+            )
         }),
         network_changes: Arc::new(nrr_platform_linux::network_change::LinuxNetworkChangeObserver),
         // A VPN's domain reaches the DNS manager after its link is up.
@@ -399,7 +437,7 @@ pub(crate) fn rule_host_resolver(
     let upstream: Arc<dyn Fn() -> Option<SocketAddr> + Send + Sync> = match capture {
         DnsCapture::Via(mechanism) => {
             let pool = upstream_dns_pool(Arc::clone(&mechanism.servers) as _);
-            Arc::new(move || pool.current().or_else(|| pool.note_network_change()))
+            Arc::new(move || pool.current_or_select())
         }
         DnsCapture::Unavailable => Arc::new(|| None),
     };

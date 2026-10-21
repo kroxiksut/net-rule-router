@@ -1,5 +1,7 @@
 # Diagnostic archive: what it contains
 
+**English** · [Русский](../ru/diagnostic-archive.md)
+
 When you run into a problem, NetRuleRouter can build a **diagnostic archive** — a single `.zip` file you can attach to a bug report. This page explains exactly what goes into it, so you can see that it collects only what is needed to diagnose an issue and nothing extra or personal.
 
 The archive is built **only when you ask for it** — there is an "Export diagnostic archive" button in both the **Diagnostics** section and **Settings → Diagnostics and logs**. Nothing is ever sent anywhere automatically — the file is written to your own disk, and you decide whether to share it.

@@ -162,9 +162,19 @@ fn strip_orphaned_block_filters_blocking() {
 /// non-elevated caller ([`ErrorClass::PrivilegeRequired`]), turned into a
 /// "re-run elevated" message.
 pub(crate) fn run_offline_reset() -> std::process::ExitCode {
-    // A live service would put every piece straight back, and its blocks are a
-    // protection the user asked for: that is the stopping variant's call.
-    if let Some(state) = live_service_state() {
+    unless_service_live(live_service_state(), || {
+        with_overrides_revoked(finish_offline_reset())
+    })
+}
+
+/// A live service would put every piece straight back, and its blocks are a
+/// protection the user asked for: that is the stopping variant's call, so
+/// `reset` runs only when the service is stopped or absent.
+fn unless_service_live(
+    live: Option<nrr_platform_api::service_control::ServiceRunState>,
+    reset: impl FnOnce() -> std::process::ExitCode,
+) -> std::process::ExitCode {
+    if let Some(state) = live {
         eprintln!(
             "cleanup: the service is {}; it keeps this state in place and would put back \
              anything removed now.",
@@ -178,7 +188,7 @@ pub(crate) fn run_offline_reset() -> std::process::ExitCode {
             nrr_platform_api::service_control::EXIT_SERVICE_RUNNING,
         );
     }
-    with_overrides_revoked(finish_offline_reset())
+    reset()
 }
 
 /// The user's emergency reset also takes back every confirmed override of the
@@ -304,12 +314,25 @@ fn finish_offline_reset() -> std::process::ExitCode {
 /// settings; filters and routes go too unless someone's leak protection asked
 /// for blocking over leaking.
 pub(crate) fn run_after_crash() -> std::process::ExitCode {
+    use nrr_service_runtime::lifecycle_journal::{after_crash_record, AfterCrashResult};
     let plan = after_crash_plan(LifecycleInputs {
         leak_guard_armed: leak_guard_armed_anywhere(),
         keep_rule_routes_on_stop: false,
     });
+    // This process has no log of ours: the operator's event log is the only
+    // trace that the service gave up.
+    let record = |result| {
+        use nrr_platform_api::system_event_log::SystemEventLogPort;
+        nrr_platform_windows::event_log::WindowsEventLog::new().write(&after_crash_record(result));
+    };
     if plan.filters == FilterTeardown::RemoveAll {
-        return finish_offline_reset();
+        let done = matches!(sweep_orphaned_machine_state(), SweepOutcome::Done);
+        record(if done {
+            AfterCrashResult::NetworkRestored
+        } else {
+            AfterCrashResult::Incomplete
+        });
+        return std::process::ExitCode::from(if done { 0 } else { 1 });
     }
     let dns_sweep = nrr_platform_windows::dns_redirect::sweep_orphan_dns_state(
         &nrr_platform_windows::dns_redirect::TransactedNrptStore,
@@ -318,12 +341,14 @@ pub(crate) fn run_after_crash() -> std::process::ExitCode {
     println!("NetRuleRouter: the service stopped for good; name resolution handed back.");
     println!("  Leak protection is on, so its blocks stay until the service runs again.");
     if dns_sweep.is_clean() {
+        record(AfterCrashResult::DnsHandedBack);
         std::process::ExitCode::SUCCESS
     } else {
         eprintln!(
             "after-crash: the DNS redirect could not be removed; run \
              `nrr-cli reset-network --confirm`."
         );
+        record(AfterCrashResult::Incomplete);
         std::process::ExitCode::from(1)
     }
 }
@@ -495,6 +520,7 @@ mod tests {
             remote_subnet: None,
             remote_subnet_v6: None,
             ip_protocol: None,
+            remote_subnet_set: Vec::new(),
         }
     }
 
@@ -566,6 +592,32 @@ mod tests {
 
         assert_eq!(outcome, OrphanStrip::RuntimeOwnsFilters);
         assert_eq!(installed_ids(&api), vec![1, 10]);
+    }
+
+    #[test]
+    fn restore_network_refuses_a_live_service_and_removes_nothing() {
+        use nrr_platform_api::service_control::{ServiceRunState, EXIT_SERVICE_RUNNING};
+        for live in [
+            ServiceRunState::Running,
+            ServiceRunState::StartPending,
+            ServiceRunState::StopPending,
+            ServiceRunState::Other,
+        ] {
+            let mut reset_ran = false;
+            let code = unless_service_live(Some(live), || {
+                reset_ran = true;
+                std::process::ExitCode::SUCCESS
+            });
+            assert!(!reset_ran, "{live:?}: the sweep ran under a live service");
+            assert_eq!(code, std::process::ExitCode::from(EXIT_SERVICE_RUNNING));
+        }
+        let mut reset_ran = false;
+        let code = unless_service_live(None, || {
+            reset_ran = true;
+            std::process::ExitCode::SUCCESS
+        });
+        assert!(reset_ran, "a stopped service is swept");
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
     }
 
     #[test]

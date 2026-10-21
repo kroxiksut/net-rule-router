@@ -153,8 +153,14 @@ ColumnLayout {
             result: String(w.result || ""),
             reasonCode: String(w.reason_code || ""),
             revisionId: w.revision_id ? String(w.revision_id) : "",
-            hasPayloadSummary: !!w.has_payload_summary
+            hasPayloadSummary: !!w.has_payload_summary,
+            cause: w.cause ? String(w.cause) : ""
         }
+    }
+    // A cause is a service slug: shown only through its translation.
+    function auditCauseText(cause) {
+        var slug = String(cause || "")
+        return slug === "" ? "" : root.tr("audit.cause." + slug, slug)
     }
     function _seedFromSnapshot() {
         _logEntries = (logsCtx.entries || []).slice()
@@ -737,7 +743,7 @@ ColumnLayout {
         spacing: root.uiTheme.spacingXxs
         model: section._logEntriesView
         header: Item {
-            visible: section._logEntries.length === 0
+            visible: section._logEntries.length === 0 && section._logsError === ""
             width: ListView.view ? ListView.view.width : 0
             height: visible ? emptyOp.implicitHeight + root.uiTheme.spacingMd : 0
             Label {
@@ -939,7 +945,7 @@ ColumnLayout {
         spacing: root.uiTheme.spacingXxs
         model: section._auditEntriesView
         header: Item {
-            visible: section._auditEntries.length === 0
+            visible: section._auditEntries.length === 0 && section._auditError === ""
             width: ListView.view ? ListView.view.width : 0
             height: visible ? emptyAu.implicitHeight + root.uiTheme.spacingMd : 0
             Label {
@@ -961,6 +967,7 @@ ColumnLayout {
                     + "\t" + String(modelData.result || "")
                     + "\t" + String(modelData.reasonCode || "")
                     + "\t" + (modelData.revisionId ? String(modelData.revisionId) : "")
+                    + (modelData.cause ? "\tcause=" + String(modelData.cause) : "")
             MouseArea {
                 anchors.fill: parent
                 acceptedButtons: Qt.RightButton
@@ -1009,14 +1016,26 @@ ColumnLayout {
                     color: modelData.result === "failure" || modelData.result === "blocked"
                         ? root.uiTheme.colorAccent : root.textColor
                 }
-                TextEdit {
+                ColumnLayout {
                     Layout.preferredWidth: 220
-                    text: String(modelData.reasonCode || "")
-                    color: root.mutedTextColor
-                    wrapMode: TextEdit.NoWrap
-                    readOnly: true
-                    selectByMouse: true
-                    selectByKeyboard: true
+                    Layout.maximumWidth: 220
+                    spacing: 0
+                    TextEdit {
+                        Layout.fillWidth: true
+                        text: String(modelData.reasonCode || "")
+                        color: root.mutedTextColor
+                        wrapMode: TextEdit.NoWrap
+                        readOnly: true
+                        selectByMouse: true
+                        selectByKeyboard: true
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        visible: text !== ""
+                        text: section.auditCauseText(modelData.cause)
+                        color: root.textColor
+                        wrapMode: Text.WordWrap
+                    }
                 }
                 TextEdit {
                     Layout.fillWidth: true

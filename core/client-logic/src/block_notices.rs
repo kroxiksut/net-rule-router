@@ -1,7 +1,19 @@
 //! The one summary of blocks the service kept while no NetRuleRouter surface
-//! was open (`blockNoticeBacklog` in `pure.js`).
+//! was open (`blockNoticeBacklog` in `pure.js`), and whether a block notice
+//! offers "To additional route" (`blockNoticeOffersRoute`).
 
 use nrr_shared::ipc_payloads::BlockNoticeJournalEntryDto;
+
+/// Whether a rule routing the destination can answer a block of this reason.
+/// A downed route already has a rule pointing at it, and a switch governs the
+/// closed IPv6 family and the encrypted-DNS lockdown: a rule written for
+/// those would answer nothing.
+pub fn offers_route(reason: &str) -> bool {
+    !matches!(
+        reason,
+        "route-unavailable" | "ipv6-blocked" | "dns-lockdown"
+    )
+}
 
 /// How many destinations the summary names before "and N more".
 pub const SHOWN: usize = 5;

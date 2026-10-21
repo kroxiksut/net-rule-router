@@ -181,8 +181,21 @@ pub fn merge_write(
     out
 }
 
+/// Whether a write of `partial` would leave the live row as it is
+/// (`stabilityPatchChangesNothing`): every key is a scalar field and already
+/// holds the patched value. A Set that changes nothing still asks for an
+/// administrator, and a refusal would then report a change that never was.
+/// An empty patch and a one-shot request (`verbose-logging-change`, …) are
+/// never "nothing".
+pub fn patch_changes_nothing(live: &Map<String, Value>, partial: &Map<String, Value>) -> bool {
+    !partial.is_empty()
+        && partial.iter().all(|(key, value)| {
+            field_default(key).is_some() && effective(live, key) == Some(coerce(key, value))
+        })
+}
+
 /// An absent capability map, or an absent flag, reads as supported.
-fn profile_supports(supports: Option<&Map<String, Value>>, feature: &str) -> bool {
+pub(crate) fn profile_supports(supports: Option<&Map<String, Value>>, feature: &str) -> bool {
     supports.is_none_or(|map| map.get(feature) != Some(&Value::Bool(false)))
 }
 

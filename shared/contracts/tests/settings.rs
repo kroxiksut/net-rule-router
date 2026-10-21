@@ -104,10 +104,23 @@ fn each_mode_states_where_unmatched_traffic_goes() {
         RouteBehaviorMode::PreferSecondaryWhenAvailable.default_route_role(),
         RouteRole::Secondary
     );
-    assert_eq!(
-        RouteBehaviorMode::StrictSecondaryFailClosed.default_route_role(),
-        RouteRole::Secondary
-    );
+}
+
+#[test]
+fn only_the_two_default_routes_parse() {
+    for mode in [
+        RouteBehaviorMode::PreferPrimary,
+        RouteBehaviorMode::PreferSecondaryWhenAvailable,
+    ] {
+        assert_eq!(mode.slug().parse::<RouteBehaviorMode>(), Ok(mode));
+    }
+    for removed in [
+        "strict-secondary-fail-closed",
+        "strict-secondary",
+        "fail-closed",
+    ] {
+        assert!(removed.parse::<RouteBehaviorMode>().is_err(), "{removed}");
+    }
 }
 
 #[test]
@@ -118,8 +131,8 @@ fn theme_and_language_parsing_are_stable() {
         Ok(ThemeMode::HighContrast)
     );
     assert_eq!(
-        "strict-secondary-fail-closed".parse::<RouteBehaviorMode>(),
-        Ok(RouteBehaviorMode::StrictSecondaryFailClosed)
+        "prefer-secondary-when-available".parse::<RouteBehaviorMode>(),
+        Ok(RouteBehaviorMode::PreferSecondaryWhenAvailable)
     );
     // legacy slug "exact-fqdn" is a migration alias for Domain
     assert_eq!(

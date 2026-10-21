@@ -3,6 +3,7 @@
 //! Adoption is signature-based, so it works with no per-principal state at
 //! all — which is what makes a crash recoverable on the next start.
 
+use super::liveness::snapshot_or_live;
 use super::*;
 
 impl SecondaryRouteCoordinator {
@@ -22,15 +23,60 @@ impl SecondaryRouteCoordinator {
         sid: &str,
         resolution: &RouteResolution,
     ) -> Result<RouteReconcileDelta, PlatformError> {
-        let plan = self.plan_user_routes(sid, resolution, None);
+        self.drop_machine_memo();
+        let result = self.recompute_for_with(sid, resolution, None);
+        self.drop_machine_memo();
+        result
+    }
+
+    /// [`Self::recompute_for`] over `adapters` the caller has just read.
+    pub(super) fn recompute_for_with(
+        &self,
+        sid: &str,
+        resolution: &RouteResolution,
+        adapters: Option<Vec<AdapterInfo>>,
+    ) -> Result<RouteReconcileDelta, PlatformError> {
+        // One reading for the plan, the foreign-tunnel view and the
+        // reconciler's check of the routes it keeps: the view is needed even
+        // when there is nothing to route.
+        let writes = self.reconciler.write_count();
+        let table = self
+            .api
+            .get_ip_forward_table()
+            .map(|t| self.stamped_with_ownership(t));
+        let adapters = adapters.unwrap_or_else(|| self.adapters_for_facts());
+        let snapshot = self.fqdn_cache.snapshot_for_compute();
+        let cache = snapshot_or_live(snapshot.as_ref(), self.fqdn_cache.as_ref());
+        let policy = self.route_source.load_for_sid(sid);
+        let plan =
+            self.plan_user_routes(sid, resolution, policy.as_ref(), &table, &adapters, cache);
         match resolution.secondary {
             // The tunnel's own interior, refreshed while we already hold the
             // enumeration: the fake-IP answerer must never substitute an
             // address inside it.
-            Some(_) => self.publish_secondary_subnets(sid),
+            Some(link) => match table.as_ref() {
+                Ok(rows) => crate::secondary_subnets::global_secondary_subnets().publish(
+                    primary_local_subnets(rows, link.interface_index)
+                        .into_iter()
+                        .filter_map(|(net, prefix)| Ipv4Network::new(net, prefix))
+                        .collect(),
+                ),
+                // Names the failure itself.
+                Err(_) => self.publish_secondary_subnets(sid),
+            },
             // The tunnel is gone, so its interior is nobody's subnet any more.
             None => crate::secondary_subnets::global_secondary_subnets().publish(Vec::new()),
         }
+        let foreign = plan.foreign.clone().unwrap_or_else(|| {
+            self.foreign_tunnel_interfaces(
+                resolution,
+                policy.as_ref(),
+                table.as_deref().ok(),
+                Some(&adapters),
+            )
+        });
+        let own = Self::additional_links(policy.as_ref(), resolution, &adapters);
+        self.publish_foreign_tunnel_networks(table.as_deref().ok(), &adapters, &[foreign], &own);
         self.publish_served_alone(sid, &plan);
         let (Some(secondary), true) = (plan.secondary, plan.planned) else {
             return self.reconciler.clear();
@@ -60,7 +106,11 @@ impl SecondaryRouteCoordinator {
             .filter(|r| r.metric == crate::route_codegen::NETWORK_ROUTE_METRIC)
             .count();
         let primary_present = resolution.primary.is_some();
-        let delta = self.reconciler.reconcile(&out_routes)?;
+        let seen = table
+            .as_deref()
+            .ok()
+            .map(|rows| crate::route_reconciler::TableReading { writes, rows });
+        let delta = self.reconciler.reconcile_seen(&out_routes, seen)?;
         // ADD-ONLY, settled on hardware: we never remove the VPN's own
         // routes. Stripping its redirect `/1` pair made the client treat the
         // removal as a fault and reconnect, and in mode A it dropped
@@ -110,7 +160,7 @@ impl SecondaryRouteCoordinator {
                     .filter(|r| overlay_shapes.contains(&(r.destination, r.prefix_length)))
                 {
                     any = true;
-                    tracing::info!(
+                    tracing::debug!(
                         target: "nrr::route-coordinator",
                         msg_key = "route-counter-overlay-live",
                         sid = %sid,
@@ -137,6 +187,7 @@ impl SecondaryRouteCoordinator {
 
     /// Tear down every owned route — no active user, or service stopping.
     pub fn clear(&self) -> Result<RouteReconcileDelta, PlatformError> {
+        self.drop_machine_memo();
         self.reconciler.clear()
     }
 
@@ -178,17 +229,18 @@ impl SecondaryRouteCoordinator {
                 return;
             }
         };
-        let orphans: Vec<RouteEntry> = table
-            .into_iter()
-            // Signature asked of the codegen, never restated here: a mode that
-            // grows a shape a local copy does not know leaves those routes
-            // unadopted after a crash, pointing traffic at a dead tunnel.
-            .filter(crate::route_codegen::is_owned_route)
-            .map(|mut r| {
-                r.is_ours = true;
-                r
-            })
-            .collect();
+        let known_secondaries = self.stored_secondary_ifindexes();
+        let orphans: Vec<RouteEntry> =
+            crate::route_codegen::adoptable_orphans(table, &known_secondaries)
+                // Signature asked of the codegen, never restated here: a mode that
+                // grows a shape a local copy does not know leaves those routes
+                // unadopted after a crash, pointing traffic at a dead tunnel.
+                .into_iter()
+                .map(|mut r| {
+                    r.is_ours = true;
+                    r
+                })
+                .collect();
         if !orphans.is_empty() {
             tracing::info!(
                 target: "nrr::route-coordinator",
@@ -198,6 +250,20 @@ impl SecondaryRouteCoordinator {
             );
         }
         self.reconciler.adopt_owned(orphans);
+    }
+
+    /// The additional links the signed-in users' stored bindings resolve to now,
+    /// which vouch for a network rule's routes left by a crash.
+    fn stored_secondary_ifindexes(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .api
+            .interactive_user_sign_ins()
+            .into_iter()
+            .filter_map(|(sid, _)| self.resolve(&sid).secondary.map(|t| t.interface_index))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Number of routes currently owned (for diagnostics/tests).

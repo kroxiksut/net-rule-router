@@ -138,7 +138,6 @@ fn an_address_the_main_link_names_is_never_taken_over_by_an_app_rule() {
         let filters = generate_filters(CodegenInput {
             sid: "S-1-5-21-TEST",
             rule_book: &rule_book,
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
             fqdn_cache: &cache,
             app_observations: &observations,
             app_resolver: &resolver,
@@ -204,7 +203,6 @@ fn every_protected_destination_is_one_the_routes_actually_steer() {
     let filters = generate_filters(CodegenInput {
         sid: "S-1-5-21-TEST",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &observations,
         app_resolver: &resolver,
@@ -297,7 +295,6 @@ fn an_address_rule_wins_over_an_app_rule_on_either_link() {
     let filters = generate_filters(CodegenInput {
         sid: "S-1-5-21-TEST",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &observations,
         app_resolver: &resolver,
@@ -338,7 +335,6 @@ fn a_destination_another_process_uses_is_pinned_by_neither_mechanism() {
     let filters = generate_filters(CodegenInput {
         sid: "S-1-5-21-TEST",
         rule_book: &rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache,
         app_observations: &observations,
         app_resolver: &resolver,
@@ -395,7 +391,6 @@ fn the_neutral_planner_reads_the_same_arbiter() {
     let flows = plan_route_rules(
         &rule_book,
         "S-1-5-21-TEST",
-        RouteBehaviorMode::PreferPrimary,
         &PlannerInput {
             ipv6: nrr_service_runtime::enforcement_planner::Ipv6Guard::Off,
             fqdn_cache: &cache,
@@ -544,7 +539,6 @@ fn codegen(rule_book: &CanonicalRuleBook, cache: &MockFqdnCacheLookup) -> Vec<Sp
     generate_filters(CodegenInput {
         sid: "S-1-5-21-TEST",
         rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &MockAppPathResolver::new(),
@@ -571,7 +565,6 @@ fn blocked_by_planner(
     plan_route_rules(
         rule_book,
         "S-1-5-21-TEST",
-        RouteBehaviorMode::PreferPrimary,
         &PlannerInput {
             ipv6: nrr_service_runtime::enforcement_planner::Ipv6Guard::Off,
             fqdn_cache: cache,
@@ -732,7 +725,6 @@ fn codegen_output(
     generate_filters(CodegenInput {
         sid: "S-1-5-21-TEST",
         rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: cache,
         app_observations: &MockAppObservationLookup::new(),
         app_resolver: &MockAppPathResolver::new(),
@@ -968,7 +960,6 @@ fn an_app_scoped_block_is_skipped_by_both_mechanisms_and_reported() {
     let (_, report) = plan_route_rules(
         &rule_book,
         "S-1-5-21-TEST",
-        RouteBehaviorMode::PreferPrimary,
         &PlannerInput {
             ipv6: nrr_service_runtime::enforcement_planner::Ipv6Guard::Off,
             fqdn_cache: &cache,
@@ -1091,7 +1082,6 @@ fn the_planner_reports_the_conflicts_the_codegen_reports() {
         let (_, report) = plan_route_rules(
             &rule_book,
             "S-1-5-21-TEST",
-            RouteBehaviorMode::PreferPrimary,
             &PlannerInput {
                 ipv6: nrr_service_runtime::enforcement_planner::Ipv6Guard::Off,
                 fqdn_cache: &cache,
@@ -1533,7 +1523,6 @@ fn every_mechanism_gives_a_network_rule_the_engines_answer() {
             CodegenInput {
                 sid: "S-1-5-21-TEST",
                 rule_book: &case.rule_book,
-                behavior_mode: RouteBehaviorMode::PreferPrimary,
                 fqdn_cache: &case.cache,
                 app_observations: &MockAppObservationLookup::new(),
                 app_resolver: &MockAppPathResolver::new(),
@@ -1549,7 +1538,6 @@ fn every_mechanism_gives_a_network_rule_the_engines_answer() {
         let flows = plan_route_rules_with_shapes(
             &case.rule_book,
             PLAN_SID,
-            RouteBehaviorMode::PreferPrimary,
             &PlannerInput {
                 ipv6: nrr_service_runtime::enforcement_planner::Ipv6Guard::FiltersAndRoutes,
                 fqdn_cache: &case.cache,
@@ -1607,6 +1595,7 @@ fn the_network_sweep_notices_a_network_that_swallows_a_narrower_host() {
         local_interface_luid: None,
         remote_subnet: Some((Ipv4Addr::new(10, 0, 0, 0), 8)),
         remote_subnet_v6: None,
+        remote_subnet_set: Vec::new(),
         ip_protocol: None,
     };
     let host = Spec {
@@ -1647,7 +1636,6 @@ fn takeover_filters(
     generate_filters(CodegenInput {
         sid: "S-1-5-21-TEST",
         rule_book,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
         fqdn_cache: &cache(),
         app_observations: observations,
         app_resolver: &resolver(),
@@ -1667,7 +1655,6 @@ fn takeover_flows(
     plan_route_rules(
         rule_book,
         "S-1-5-21-TEST",
-        RouteBehaviorMode::PreferPrimary,
         &PlannerInput {
             ipv6: nrr_service_runtime::enforcement_planner::Ipv6Guard::Off,
             fqdn_cache: &cache(),

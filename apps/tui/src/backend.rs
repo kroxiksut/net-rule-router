@@ -91,6 +91,11 @@ impl Outbox {
     pub fn take_delayed(&mut self) -> Vec<(Duration, Job)> {
         std::mem::take(&mut self.later)
     }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.now.len() + self.later.len()
+    }
 }
 
 impl std::fmt::Debug for Outbox {
@@ -145,10 +150,12 @@ impl Backend {
             .name("nrr-tui-jobs".into())
             .spawn(move || {
                 while let Ok(job) = queue.recv() {
-                    if job_events
-                        .send(BackendEvent::Reply(job(&job_client)))
-                        .is_err()
-                    {
+                    // A panic in one job costs that job, not every later one.
+                    let run = std::panic::AssertUnwindSafe(|| job(&job_client));
+                    let Ok(reply) = std::panic::catch_unwind(run) else {
+                        continue;
+                    };
+                    if job_events.send(BackendEvent::Reply(reply)).is_err() {
                         return;
                     }
                 }
@@ -211,6 +218,7 @@ fn run(
     let started = Instant::now();
     let mut last: Option<Link> = None;
     let mut subscribed = false;
+    let mut told_skew = None;
     loop {
         let status = client.connection_status();
         let starting = started.elapsed() < STARTUP_GRACE;
@@ -230,12 +238,29 @@ fn run(
             last = Some(link.clone());
         }
         if became_connected {
+            let skew = client
+                .negotiate_info()
+                .and_then(|info| info.contract_skew());
+            if skew != told_skew {
+                told_skew = skew;
+                let told = BackendEvent::Reply(Reply::new(move |app| app.contract_skew = skew));
+                if events.send(told).is_err() {
+                    return;
+                }
+            }
             // The client replays an accepted subscription on every reconnect,
             // so one success lasts the whole session.
             if !subscribed {
                 subscribed = subscribe(client, events);
             }
             fetch_snapshot(&**client, events);
+        } else if link.is_connected() && !subscribed {
+            // A refused subscription is asked again while the link lives:
+            // without it the screen would stop following the service.
+            subscribed = subscribe(client, events);
+            if subscribed {
+                fetch_snapshot(&**client, events);
+            }
         }
 
         let tick = if starting || matches!(link, Link::Connecting) {
@@ -319,15 +344,19 @@ fn subscribe(client: &Arc<dyn IpcClient>, events: &Sender<BackendEvent>) -> bool
 }
 
 /// One push frame: `{ "event-id", "event": { "type", … } }`, or the client's
-/// own gap marker. A type this build does not know is dropped.
+/// gap marker, which the service also sends to a subscriber that fell behind
+/// its event ring. An event this build cannot read (a newer service's kind or
+/// value) still says something changed, so it reads as a gap: what the screen
+/// derived from pushes is read again instead of silently falling behind.
 pub fn parse_push(frame: &Value) -> Option<PushEvent> {
     let event = frame.get("event")?;
     if event.get("type").and_then(Value::as_str) == Some("push-gap") {
         return Some(PushEvent::Gap);
     }
-    serde_json::from_value::<StatusUpdateEvent>(event.clone())
-        .ok()
-        .map(|e| PushEvent::Status(Box::new(e)))
+    Some(
+        serde_json::from_value::<StatusUpdateEvent>(event.clone())
+            .map_or(PushEvent::Gap, |e| PushEvent::Status(Box::new(e))),
+    )
 }
 
 #[cfg(test)]
@@ -388,6 +417,25 @@ mod tests {
         drop(backend);
     }
 
+    #[test]
+    fn a_job_that_panics_does_not_end_the_jobs_after_it() {
+        let fake = Arc::new(FakeService::new(ConnectionStatus::Connected));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let client: Arc<dyn IpcClient> = fake.clone();
+        let backend = Backend::spawn(client, no_probe, tx).unwrap_or_else(|e| panic!("{e}"));
+        backend.run_job(Box::new(|_| panic!("a job that goes wrong")));
+        let (done_tx, done) = std::sync::mpsc::channel();
+        backend.run_job(Box::new(move |_| {
+            let _ = done_tx.send(());
+            Reply::new(|_| {})
+        }));
+        assert!(
+            done.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the next job still runs"
+        );
+        drop((backend, rx));
+    }
+
     /// The service went into "additional connection down" before this
     /// interface started; the snapshot carries it, and the screen says so.
     #[test]
@@ -429,9 +477,35 @@ mod tests {
             parse_push(&serde_json::json!({ "event": { "type": "push-gap" } })),
             Some(PushEvent::Gap)
         ));
-        assert!(
-            parse_push(&serde_json::json!({ "event": { "type": "from-the-future" } })).is_none()
-        );
+        // The service's own marker carries an event id besides.
+        assert!(matches!(
+            parse_push(&serde_json::json!({ "event-id": 42, "event": { "type": "push-gap" } })),
+            Some(PushEvent::Gap)
+        ));
         assert!(parse_push(&serde_json::json!({})).is_none());
+    }
+
+    /// A newer service's event, or a known one carrying a value this build
+    /// cannot read, is not dropped silently: the screen reads the state again.
+    #[test]
+    fn an_event_this_build_cannot_read_asks_for_a_fresh_read() {
+        for event in [
+            serde_json::json!({ "type": "from-the-future", "sid": "S-1" }),
+            serde_json::json!({ "type": "routing-pause-state-changed", "sid": "S-1", "paused": "soon" }),
+        ] {
+            assert!(
+                matches!(
+                    parse_push(&serde_json::json!({ "event-id": 7, "event": event })),
+                    Some(PushEvent::Gap)
+                ),
+                "{event}"
+            );
+        }
+        assert!(matches!(
+            parse_push(&serde_json::json!({ "event": {
+                "type": "routing-pause-state-changed", "sid": "S-1", "paused": true
+            } })),
+            Some(PushEvent::Status(_))
+        ));
     }
 }

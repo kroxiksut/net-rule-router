@@ -3,7 +3,7 @@ Service: OK
 │  1 Status                ││Changes: Same as in the service                   │
 │  2 First run             ││Route: All routes                                 │
 │  3 Interfaces and routes │╰──────────────────────────────────────────────────╯
-│> 4 Rules                 │╭Rules─────────────────────────────────────────────╮
+│> 4 Rules                 │╭Rules — +8 more rows──────────────────────────────╮
 │  5 Overlaps              ││Rules 1 to 7 of 7; 7 in all.                      │
 │  6 Suggested addresses   ││> 1. [on] R-0001  Domain  silent.example —        │
 │  7 Connection trace      ││Additional · Main route: does not reach           │

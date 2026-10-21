@@ -51,7 +51,9 @@ impl ConnectionObservationConsumer {
         // Owner-scoped, each connection is resolved against its own user's
         // links below instead.
         let (active_primary, active_secondary) = match active_sid_now.as_deref() {
-            Some(sid) if !self.owner_scoped => (self.egress_of)(sid),
+            Some(sid) if !self.owner_scoped || self.machine_accounts_follow_active => {
+                (self.egress_of)(sid)
+            }
             _ => (None, None),
         };
         let mut owner_links: std::collections::HashMap<String, (Option<u32>, Option<u32>)> =
@@ -66,19 +68,6 @@ impl ConnectionObservationConsumer {
         ) {
             ring.outage_blocks().outage_ended(sid, now_ms);
         }
-        // The "no rule covers this host" catch-all's id is deterministic
-        // (same hash the codegen used to mint it) — computed once per batch,
-        // only when a notice or the trace will read it, so an idle observer
-        // never pays for it. A wired classifier replaces it.
-        let default_block_ids: Option<[u64; 2]> = (self.not_covered_drop_check.is_none()
-            && (self.block_notice_sink.is_some() || self.trace_ring.is_some()))
-        .then(|| {
-            active_sid_now
-                .as_deref()
-                .map(crate::wfp_codegen::default_block_ids)
-        })
-        .flatten();
-
         // Per-batch dedup for the FCrDNS learner.
         let mut reverse_learned_this_batch: std::collections::HashSet<std::net::Ipv4Addr> =
             std::collections::HashSet::new();
@@ -113,7 +102,11 @@ impl ConnectionObservationConsumer {
                 obs.observed_unix_ms.unwrap_or(now_ms),
                 obs.user_sid.as_deref(),
             );
-            let (primary_ifindex, secondary_ifindex) = if self.owner_scoped {
+            let on_active_links = self.machine_accounts_follow_active
+                && obs.user_sid.as_deref().is_none_or(|o| {
+                    o.is_empty() || nrr_platform_api::types::is_service_account_sid(o)
+                });
+            let (primary_ifindex, secondary_ifindex) = if self.owner_scoped && !on_active_links {
                 self.owner_links(&mut owner_links, obs.user_sid.as_deref(), now_ms)
             } else {
                 (active_primary, active_secondary)
@@ -175,14 +168,9 @@ impl ConnectionObservationConsumer {
                     .nrr_drop_spec_id
                     .zip(self.service_account_drop_check.as_ref())
                     .is_some_and(|(spec_id, check)| check(spec_id));
-            // Whichever family's default block this drop hit, if either.
-            let default_block_id = default_block_ids
-                .zip(rec.nrr_drop_spec_id)
-                .filter(|(ids, id)| ids.contains(id))
-                .map(|(_, id)| id);
             let mut drop_reason = None;
             if rec.blocked_by_nrr == Some(true) {
-                let reason = self.reason_for_drop(&rec, killswitch_verified, default_block_id);
+                let reason = self.reason_for_drop(&rec, killswitch_verified);
                 rec.nrr_block_reason = Some(reason.slug());
                 drop_reason = Some(reason);
             }
@@ -210,7 +198,7 @@ impl ConnectionObservationConsumer {
                     && !pinned_while_secondary_live
                     && !service_account_drop
                 {
-                    self.note_block_attempt(&rec, killswitch_verified, default_block_id);
+                    self.note_block_attempt(&rec, killswitch_verified);
                     outage_drop = drop_reason
                         == Some(nrr_domain::block_notice::BlockReason::RouteUnavailable)
                         && !nrr_domain::address_class::is_local_housekeeping_endpoint(
@@ -285,13 +273,33 @@ impl ConnectionObservationConsumer {
                     }
                 }
             }
-            // FCrDNS reverse-learning: OUR block
-            // of a routable V4 that no rule permitted (the browser-cache/DoH blind
-            // spot under block-all) is handed to the learner, which names the IP
-            // (PTR + forward-confirm) and caches it iff it matches a rule. NOT
-            // gated on the process name and safe even if `blocked_by_nrr` over-
-            // attributes (it grants no exemption — only the rule-gated cache; a
-            // user's own Block rule still blocks). De-duped per batch.
+            // Another VPN's handshake the guard dropped, from nothing the
+            // client learner above can name: a question for its owner.
+            if let (Some(sink), Some(owner)) = (
+                self.vpn_gateway_drop.as_ref(),
+                rec.user_sid.as_deref().filter(|s| !s.is_empty()),
+            ) {
+                if rec.verdict == ConnectionVerdict::Block
+                    && rec.blocked_by_nrr == Some(true)
+                    && killswitch_verified
+                    && !service_account_drop
+                    && !process_name_matches_vpn(rec.process_path.as_deref())
+                    && crate::vpn_gateway_confirm::handshake_shaped(rec.protocol, rec.remote.port())
+                {
+                    let program = crate::vpn_gateway_confirm::handshake_program(
+                        rec.protocol,
+                        rec.local.port(),
+                        rec.remote.port(),
+                        rec.process_path.as_deref(),
+                    );
+                    sink(owner, rec.remote.ip(), program);
+                }
+            }
+            // FCrDNS reverse-learning: our block of a routable V4 no rule
+            // permitted (the browser-cache/DoH blind spot under block-all) is
+            // named by the learner; a match caches it for the rule, a confirmed
+            // name no rule matches becomes known-direct for its confirmed
+            // addresses only. A user's own Block rule still blocks. De-duped per batch.
             if let Some(learner) = self.reverse_dns_learner.as_ref() {
                 if rec.verdict == ConnectionVerdict::Block
                     && rec.blocked_by_nrr == Some(true)
@@ -305,6 +313,9 @@ impl ConnectionObservationConsumer {
                     // host, and the exemption compiled for one outranks the
                     // lockdown block — the leak guard would undo itself.
                     && !self.is_dns_lockdown_drop(&rec)
+                    // A deny names its destination already: asking the user's
+                    // resolver about it again only sends the denied site out.
+                    && !self.is_rule_block_drop(&rec)
                 {
                     if let IpAddr::V4(rip) = rec.remote.ip() {
                         if is_learnable_endpoint(rip) && reverse_learned_this_batch.insert(rip) {
@@ -317,6 +328,7 @@ impl ConnectionObservationConsumer {
                                 rip,
                                 !(killswitch_verified && killswitch_app_scoped),
                                 crate::conn_observation_consumer::ReverseLearnOrigin::EnforcementDrop,
+                                rec.user_sid.as_deref(),
                             );
                         }
                     }
@@ -395,6 +407,10 @@ impl ConnectionObservationConsumer {
                     // process before the rule set is compiled against it, or a
                     // destination could be pinned in the same tick that proved
                     // somebody else was already using it.
+                    // Learnt whatever link the flow left on: "other" is also an
+                    // unresolved main link or a second uplink. What a corporate
+                    // tunnel owns, and private space, the store refuses by
+                    // address.
                     store.note_process_destination_running(path, obs.pid, &script_rules, rip);
                     if store.record(path, rip) {
                         summary.app_ips_added += 1;
@@ -426,6 +442,7 @@ impl ConnectionObservationConsumer {
             // instant. A backend that stamps nothing degrades to exactly that,
             // which is why the fallback is last, not first.
             self.note_navigation_attempt(
+                rec.user_sid.as_deref(),
                 rec.process_path.as_deref(),
                 rec.remote.ip(),
                 rec.observed_unix_ms.unwrap_or_else(now_unix_ms),
@@ -508,12 +525,30 @@ impl ConnectionObservationConsumer {
             .filter(|_| !stale_flow_victims.is_empty())
         {
             let addresses: Vec<std::net::IpAddr> = stale_flow_victims.keys().copied().collect();
-            let flows = drop_reporter::stale_flows_behind_drops(
+            let shared_direct = self
+                .flow_reset_census
+                .as_ref()
+                .map(|census| census.shared_direct_ips())
+                .unwrap_or_default();
+            let flows = drop_reporter::pin_drop_resets(
                 reset.established_flows_to(&addresses),
                 &stale_flow_victims,
+                &shared_direct,
+                |owner| {
+                    let (primary, secondary) = (self.egress_of)(owner);
+                    nrr_platform_api::fake_ip::stale_flows::FlowLinks::new(
+                        unicast.clone(),
+                        primary,
+                        secondary,
+                    )
+                },
             );
             let torn_down = reset.reset_established(&flows);
-            for ip in addresses {
+            for ip in flows
+                .iter()
+                .map(|flow| flow.remote.ip())
+                .collect::<std::collections::BTreeSet<_>>()
+            {
                 self.note_torn_down(ip);
             }
             if torn_down > 0 {

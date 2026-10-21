@@ -13,7 +13,7 @@ import QtQuick 2.15
 // Liveness comes from the `at` timestamp inside the payload, not from the file
 // existing: a window that was killed cannot clean up after itself, and a stale
 // timestamp is exactly the signal "no window is running". The file is
-// deliberately NOT removed on exit — the paths in it stay valid and let the
+// deliberately NOT removed on exit (it is marked `gone` instead) — the paths in it stay valid and let the
 // tray keep working after the window is closed, which is the whole point.
 //
 // The rules paths are the window's own answer, not a second resolution of the
@@ -77,6 +77,27 @@ QtObject {
         nrrNativeBridge.writeTextFile(path, JSON.stringify(payload))
     }
 
+    /// Mark the window gone, keeping the paths: the tray must not wait out the
+    /// freshness window on a process that has already exited.
+    function publishGone() {
+        if (!publishing) return
+        if (typeof snapshotProvider !== "function") return
+        var path = _resolvePath()
+        if (path === "" || typeof nrrNativeBridge.writeTextFile !== "function") return
+        var snap = {}
+        try { snap = snapshotProvider() || {} } catch (e) { snap = {} }
+        nrrNativeBridge.writeTextFile(path, JSON.stringify({
+            "at": Date.now(),
+            "gone": true,
+            "active": false,
+            "visible": false,
+            "rules-path-primary": String(snap.rulesPathPrimary || ""),
+            "rules-path-secondary": String(snap.rulesPathSecondary || ""),
+            "rules-folder": String(snap.rulesFolder || ""),
+            "include-comments": snap.includeComments !== false
+        }))
+    }
+
     /// Read the published snapshot.
     /// Returns `{ known, windowRunning, windowVisible, windowActive,
     /// rulesPathPrimary, rulesPathSecondary, rulesFolder, includeComments }`.
@@ -107,7 +128,7 @@ QtObject {
         }
         if (!parsed || typeof parsed !== "object") return blank
         var age = Date.now() - (Number(parsed.at) || 0)
-        var running = age >= 0 && age < freshnessMs
+        var running = parsed.gone !== true && age >= 0 && age < freshnessMs
         return {
             known: true,
             windowRunning: running,
@@ -126,6 +147,13 @@ QtObject {
             includeComments: parsed["include-comments"] !== false
         }
     }
+
+    // Every exit path ends in a quit or in destroying the window's objects.
+    property Connections _quitWatch: Connections {
+        target: Qt.application
+        function onAboutToQuit() { presence.publishGone() }
+    }
+    Component.onDestruction: publishGone()
 
     property Timer _heartbeatTimer: Timer {
         interval: presence.heartbeatMs

@@ -113,18 +113,22 @@ fn carries_traffic(row: &InterfaceRouteRow) -> bool {
 /// The one row that is this machine's way out, judged by structure alone: the
 /// sole holder of a default route, else the sole row that forwards at all. It
 /// is the uplink whatever its kind says (a PPPoE link, a bridge carrying the
-/// host's address), so its kind neither bars nor penalises it.
+/// host's address), so its kind neither bars nor penalises it. Our fake-IP
+/// adapter never counts, as in [`crate::uplink::sole_default_route_holder`];
+/// the user's additional route cannot be left out here, because the rows are
+/// scored before any binding is known.
 fn sole_uplink_index(rows: &[InterfaceRouteRow]) -> Option<usize> {
+    let counts = |row: &InterfaceRouteRow| !crate::uplink::is_own_fake_ip_name(&row.name);
     let only = |holds: fn(&InterfaceRouteRow) -> bool| {
         let mut holders = rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| holds(row))
+            .filter(|(_, row)| counts(row) && holds(row))
             .map(|(index, _)| index);
         let first = holders.next()?;
         holders.next().is_none().then_some(first)
     };
-    if rows.iter().any(|row| row.has_default_route) {
+    if rows.iter().any(|row| counts(row) && row.has_default_route) {
         only(|row| row.has_default_route)
     } else {
         only(carries_traffic)

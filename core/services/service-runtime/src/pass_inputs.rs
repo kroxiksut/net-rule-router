@@ -45,7 +45,7 @@ impl FullPassRequest {
         self.0.store(true, Ordering::Release);
     }
 
-    fn take(&self) -> bool {
+    pub(crate) fn take(&self) -> bool {
         self.0.swap(false, Ordering::AcqRel)
     }
 }
@@ -75,6 +75,8 @@ pub struct PassInputs {
     /// writes). Re-read at [`Self::settle`] so the pass's own apply does not
     /// come back as a change and cost an identical second pass.
     own_writes: Vec<bool>,
+    /// Per source: a reading that bypasses its cache, for [`Self::settle`].
+    fresh: Vec<Option<InputGeneration>>,
     full_every: Duration,
     full_request: FullPassRequest,
     readings: Mutex<Readings>,
@@ -86,6 +88,7 @@ impl PassInputs {
         Self {
             sources: Vec::new(),
             own_writes: Vec::new(),
+            fresh: Vec::new(),
             full_every: FULL_PASS_EVERY,
             full_request: FullPassRequest::default(),
             readings: Mutex::new(Readings::default()),
@@ -104,6 +107,7 @@ impl PassInputs {
     pub fn with_source(mut self, name: &'static str, source: InputGeneration) -> Self {
         self.sources.push((name, source));
         self.own_writes.push(false);
+        self.fresh.push(None);
         self
     }
 
@@ -114,6 +118,23 @@ impl PassInputs {
     pub fn with_own_writes_source(mut self, name: &'static str, source: InputGeneration) -> Self {
         self.sources.push((name, source));
         self.own_writes.push(true);
+        self.fresh.push(None);
+        self
+    }
+
+    /// [`Self::with_own_writes_source`] for a cached source: `fresh` reads the
+    /// OS past the cache, because the notice for the pass's own write has not
+    /// necessarily arrived when the pass settles.
+    #[must_use]
+    pub fn with_cached_own_writes_source(
+        mut self,
+        name: &'static str,
+        source: InputGeneration,
+        fresh: InputGeneration,
+    ) -> Self {
+        self.sources.push((name, source));
+        self.own_writes.push(true);
+        self.fresh.push(Some(fresh));
         self
     }
 
@@ -159,9 +180,10 @@ impl PassInputs {
             .sources
             .iter()
             .zip(&self.own_writes)
+            .zip(&self.fresh)
             .enumerate()
-            .filter(|(_, (_, own))| **own)
-            .map(|(i, ((_, read), _))| (i, read()))
+            .filter(|(_, ((_, own), _))| **own)
+            .map(|(i, (((_, read), _), fresh))| (i, fresh.as_ref().unwrap_or(read)()))
             .collect();
         let mut readings = self.lock();
         let mut values = readings.seen.clone();
@@ -193,14 +215,11 @@ impl PassInputs {
     /// Why the last fingerprint did not match the applied one: the names of
     /// the sources that moved, `extra` for the pass's own part, `due` when only
     /// the periodic full pass came round, `first` before anything was applied,
-    /// `forced` when a caller asked for the pass.
+    /// `forced` (first in the list) when a caller asked for the pass.
     pub fn moved(&self) -> String {
         let readings = self.lock();
-        if readings.forced {
-            return "forced".to_string();
-        }
         let Some(settled) = readings.settled.as_ref() else {
-            return "first".to_string();
+            return if readings.forced { "forced" } else { "first" }.to_string();
         };
         let mut names: Vec<&str> = self
             .sources
@@ -211,6 +230,11 @@ impl PassInputs {
             .collect();
         if readings.seen_extra != settled.extra {
             names.push("extra");
+        }
+        // A forced pass still says what else moved: the caller's own request
+        // must not hide a network change from whoever reads the reason.
+        if readings.forced {
+            names.insert(0, "forced");
         }
         if names.is_empty() {
             "due".to_string()
@@ -236,6 +260,17 @@ impl Default for PassInputs {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether a pass reason from [`PassInputs::moved`] means the machine's links
+/// may have changed: an adapter moved, nothing was applied yet, or the periodic
+/// full pass came due. Work that only a new network needs runs on these and not
+/// on a pass that a cache or an observation asked for.
+#[must_use]
+pub fn network_may_have_changed(moved: &str) -> bool {
+    moved
+        .split([',', ':'])
+        .any(|reason| matches!(reason, "adapters" | "first" | "due"))
 }
 
 /// State tables no enforcement pass reads: journals, suggestions, tokens and
@@ -325,6 +360,29 @@ pub fn hashed<T: Hash, E>(
     })
 }
 
+/// [`hashed`] over a reading taken again only after an OS change notice (or the
+/// safety interval). Returns the cached source and one that reads past the
+/// cache, for [`PassInputs::with_cached_own_writes_source`].
+pub fn change_hashed<T: Hash, E>(
+    generation: nrr_platform_api::net_change::NetChangeGeneration,
+    read: impl Fn() -> Result<T, E> + Send + Sync + 'static,
+) -> (InputGeneration, InputGeneration) {
+    let cache = Arc::new(nrr_platform_api::net_change::ChangeCached::new(
+        generation,
+        move || {
+            let value = read().ok()?;
+            let mut hasher = DefaultHasher::new();
+            value.hash(&mut hasher);
+            Some(hasher.finish())
+        },
+    ));
+    let cached = Arc::clone(&cache);
+    (
+        Arc::new(move || cached.get()),
+        Arc::new(move || cache.refresh()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +413,46 @@ mod tests {
             "who is present is part of the input"
         );
         assert_eq!(inputs.moved(), "cache,extra");
+    }
+
+    #[test]
+    fn only_a_network_reason_counts_as_a_network_change() {
+        for network in [
+            "adapters",
+            "first",
+            "due",
+            "cache,adapters",
+            "forced,adapters",
+        ] {
+            assert!(network_may_have_changed(network), "{network}");
+        }
+        for other in [
+            "cache",
+            "apps,cache",
+            "forced",
+            "state:apps+1",
+            "extra",
+            "routes",
+        ] {
+            assert!(!network_may_have_changed(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_forced_pass_still_names_what_moved() {
+        let (value, source) = counter();
+        let request = FullPassRequest::default();
+        let inputs = PassInputs::new()
+            .with_source("adapters", source)
+            .with_full_pass_request(request.clone());
+        let fp = inputs.fingerprint(&()).expect("fingerprint");
+        inputs.settle(fp);
+        value.store(1, Ordering::Relaxed);
+        request.request();
+        let fp = inputs.fingerprint(&()).expect("fingerprint");
+        assert!(!inputs.is_settled(fp));
+        assert_eq!(inputs.moved(), "forced,adapters");
+        assert!(network_may_have_changed(&inputs.moved()));
     }
 
     #[test]
@@ -434,6 +532,56 @@ mod tests {
             "a change that landed mid-pass was settled unplanned",
         );
         assert_eq!(inputs.moved(), "cache");
+    }
+
+    #[test]
+    fn a_change_hashed_source_reads_the_os_only_after_a_notice() {
+        use nrr_platform_api::net_change::NetChangeGeneration;
+        let generation = NetChangeGeneration::new();
+        let _feed = generation.follow(&AlwaysUp).expect("subscribed");
+        let reads = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&reads);
+        let (cached, _fresh) = change_hashed(generation.clone(), move || {
+            Ok::<_, ()>(counter.fetch_add(1, Ordering::SeqCst))
+        });
+        let first = cached();
+        assert_eq!(cached(), first);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        generation.bump();
+        assert_ne!(cached(), first, "a notice must show the new reading");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    struct AlwaysUp;
+    impl nrr_platform_api::network_change::NetworkChangeObserver for AlwaysUp {
+        fn subscribe(
+            &self,
+            _on_change: nrr_platform_api::network_change::NetworkChangeCallback,
+        ) -> Result<
+            nrr_platform_api::network_change::NetworkChangeSubscription,
+            nrr_platform_api::error::PlatformError,
+        > {
+            Ok(nrr_platform_api::network_change::NetworkChangeSubscription::inert())
+        }
+    }
+
+    #[test]
+    fn a_cached_own_write_is_settled_from_a_fresh_read() {
+        let (routes, routes_fresh) = counter();
+        let stale = Arc::new(AtomicU64::new(0));
+        let cached_view = Arc::clone(&stale);
+        let inputs = PassInputs::new().with_cached_own_writes_source(
+            "routes",
+            Arc::new(move || Some(cached_view.load(Ordering::Relaxed))),
+            routes_fresh,
+        );
+        let fp = inputs.fingerprint(&()).expect("fingerprint");
+        routes.store(1, Ordering::Relaxed); // the apply wrote the table
+        inputs.settle(fp);
+        // The notice for that write lands and the cache catches up.
+        stale.store(1, Ordering::Relaxed);
+        let after = inputs.fingerprint(&()).expect("fingerprint");
+        assert!(inputs.is_settled(after), "the pass's own write came back");
     }
 
     #[test]

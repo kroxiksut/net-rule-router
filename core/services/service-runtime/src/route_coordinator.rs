@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nrr_domain::ipv4_network::Ipv4Network;
 use nrr_domain::RouteBehaviorMode;
@@ -30,7 +30,8 @@ use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::killswitch_codegen::{FailClosedExemptions, KillSwitchResolution};
 use crate::machine_reading::MachineReading;
 use crate::per_sid_orchestrator::{
-    behavior_mode_for_codegen, PerSidBinding, RoutePolicySource, RulesProvider,
+    behavior_mode_for_codegen, PerSidBinding, PerSidPolicySnapshot, RoutePolicySource,
+    RulesProvider,
 };
 use crate::route_codegen::SecondaryRouteTarget;
 use crate::route_reconciler::{
@@ -47,15 +48,15 @@ mod notice_latches;
 // `adapter_entry_binding_matches` are called from `production_handlers_misc`
 // as `route_coordinator::…`, and moving a file should not move a caller.
 use binding_resolver::{
-    adapter_answers_to_saved_name, binding_matches_live, derive_secondary_next_hop,
-    derive_secondary_next_hop_v6, diagnostic_tally, has_own_way_out, mac_anchor_id,
-    preferred_display_name, replacement_candidates,
+    adapter_answers_to_saved_name, adapter_carries_only_the_saved_brand, binding_matches_live,
+    derive_secondary_next_hop, derive_secondary_next_hop_v6, diagnostic_tally, has_own_way_out,
+    mac_anchor_id, preferred_display_name, replacement_candidates,
 };
 pub use binding_resolver::{adapter_binding_matches, adapter_entry_binding_matches};
 // The main-link derivation, for a platform that resolves egress without this
 // coordinator; one definition either way.
 pub(crate) use binding_resolver::derive_primary_target;
-pub(crate) use exemptions::foreign_tunnel_indexes;
+pub(crate) use exemptions::{foreign_tunnel_indexes, own_link_indexes};
 // Read only by this module's tests, which sit in a sibling file and reach it
 // through `super::`.
 #[cfg(test)]
@@ -368,6 +369,13 @@ pub struct SecondaryRouteCoordinator {
     /// The rule shapes the routes are planned under — this build's answer,
     /// overridable in tests so network routing is exercised before it ships.
     network_support: nrr_domain::rule_shape::RuleShapeSupport,
+    /// The adapter list, re-read only after the OS says the network moved.
+    /// Set once by the wiring; unset, every read goes to the OS.
+    /// The orchestrator's readings of the machine after a pass, shared between
+    /// its calls (see [`resolve::MachineMemo`]).
+    machine_memo: Mutex<resolve::MachineMemo>,
+    adapter_cache:
+        std::sync::OnceLock<Arc<nrr_platform_api::net_change::ChangeCached<Vec<AdapterInfo>>>>,
 }
 
 mod apply;

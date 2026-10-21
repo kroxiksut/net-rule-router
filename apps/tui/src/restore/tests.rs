@@ -134,15 +134,15 @@ fn lost_protection_is_switched_back_on_at_once_and_said() {
     let dir = Scratch::new("restore-protection");
     let fake = wiped_service();
     let intent = json!({ "route-policy": {
-        "kill-switch-enabled": true,
+        "leak-protection": "sites",
         "include-subdomains": false
     } });
     let app = connected(Some(settings_file(&dir)), intent, &fake);
 
     let sent = fake.sent(IpcOperationName::RoutePolicyUpdate);
     assert_eq!(sent.len(), 1, "{sent:?}");
-    assert_eq!(sent[0]["apply-only"], json!(["kill-switch-enabled"]));
-    assert_eq!(sent[0]["kill-switch-enabled"], json!(true));
+    assert_eq!(sent[0]["apply-only"], json!(["leak-protection"]));
+    assert_eq!(sent[0]["leak-protection"], json!("sites"));
     assert_eq!(
         app.restore.offer,
         Some(Offer {
@@ -158,18 +158,55 @@ fn lost_protection_is_switched_back_on_at_once_and_said() {
     );
 }
 
-/// A record that holds protection OFF never switches it off unasked.
+/// A record that holds protection weaker than the service never lowers it
+/// unasked.
 #[test]
-fn a_record_of_protection_off_is_only_offered() {
+fn a_record_of_weaker_protection_is_only_offered() {
     let dir = Scratch::new("restore-protection-off");
-    let fake = wiped_service();
-    let intent = json!({ "route-policy": { "kill-switch-fail-closed": false } });
+    let fake = FakeService::new(ConnectionStatus::Connected);
+    let mut snapshot = snapshot_json(&Fixture::healthy());
+    snapshot["route-policy"]["leak-protection"] = json!("everything");
+    fake.answer(IpcOperationName::SnapshotInitialGet, snapshot);
+    fake.answer(
+        IpcOperationName::BlockNoticeMutesList,
+        json!({ "mutes": [] }),
+    );
+    let intent = json!({ "route-policy": { "leak-protection": "sites" } });
     let app = connected(Some(settings_file(&dir)), intent, &fake);
 
     assert!(fake.sent(IpcOperationName::RoutePolicyUpdate).is_empty());
     assert_eq!(
         app.restore.offer.as_ref().map(|o| o.keys.clone()),
-        Some(vec!["kill-switch-fail-closed".to_string()])
+        Some(vec!["leak-protection".to_string()])
+    );
+}
+
+/// A record written before leak protection was one choice still protects
+/// after the service lost its data: the strict mode comes back as everything
+/// at once, and its additional default route is offered.
+#[test]
+fn a_record_of_retired_settings_restores_what_it_protected() {
+    let dir = Scratch::new("restore-retired");
+    let fake = wiped_service();
+    let intent = json!({ "route-policy": {
+        "mode": "strict-secondary-fail-closed",
+        "kill-switch-enabled": true,
+        "kill-switch-fail-closed": true,
+        "kill-switch-block-all": true
+    } });
+    let app = connected(Some(settings_file(&dir)), intent, &fake);
+
+    let sent = fake.sent(IpcOperationName::RoutePolicyUpdate);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["apply-only"], json!(["leak-protection"]));
+    assert_eq!(sent[0]["leak-protection"], json!("everything"));
+    assert!(sent[0].get("kill-switch-enabled").is_none());
+    assert_eq!(
+        app.restore.offer,
+        Some(Offer {
+            keys: vec!["mode".into()],
+            mutes: 0
+        })
     );
 }
 
@@ -227,9 +264,10 @@ fn under_sudo_nothing_is_compared_or_recorded() {
     let fake = wiped_service();
     let mut app = connected(None, json!({}), &fake);
     assert_eq!(app.restore.offer, None);
-    assert!(
-        fake.sent(IpcOperationName::BlockNoticeMutesList).is_empty(),
-        "no comparison without a settings file of the user's own"
+    assert_eq!(
+        fake.sent(IpcOperationName::BlockNoticeMutesList).len(),
+        1,
+        "only the feed's own read: no comparison without a settings file of the user's own"
     );
     let named = json!({ "mode": "x", "apply-only": ["mode"] });
     record_route_policy(&app, named.as_object().expect("object"));
@@ -243,13 +281,13 @@ fn a_confirmed_write_records_only_the_keys_it_named() {
     app.rules.settings_file = Some(settings_file(&dir));
     let request = json!({
         "mode": "prefer-primary",
-        "kill-switch-enabled": true,
-        "apply-only": ["kill-switch-enabled"]
+        "leak-protection": "everything",
+        "apply-only": ["leak-protection"]
     });
     record_route_policy(&app, request.as_object().expect("object"));
     assert_eq!(
         recorded(&settings_file(&dir)),
-        json!({ "route-policy": { "kill-switch-enabled": true } })
+        json!({ "route-policy": { "leak-protection": "everything" } })
     );
 
     let mutes = vec![BlockNoticeMuteDto {

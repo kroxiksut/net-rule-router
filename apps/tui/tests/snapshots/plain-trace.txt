@@ -23,7 +23,9 @@ Notifications:
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the listed programs as your VPN, so leak protection keeps them working
+  a: allow the listed VPNs to reach their servers, so leak protection lets them connect
   p: confirm the suggested main connection; another one is chosen under Interfaces and routes
+  v: send the blocked site named under the state over the additional route; you are asked first
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -45,6 +47,7 @@ Commands on this screen:
   o: what was blocked while the additional route was down
   h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
   g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3
+  i and a row number: a rule for that connection's address, for example i 3; a and a row number: a rule for its program
 Type a screen number, h for help or q to quit, then press Enter.
 Connection trace: Shown: 12 of 14.
 Connections: > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
@@ -103,6 +106,7 @@ Commands on this screen:
   o: what was blocked while the additional route was down
   h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
   g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3
+  i and a row number: a rule for that connection's address, for example i 3; a and a row number: a rule for its program
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -134,6 +138,7 @@ Commands on this screen:
   o: what was blocked while the additional route was down
   h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
   g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3
+  i and a row number: a rule for that connection's address, for example i 3; a and a row number: a rule for its program
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -173,6 +178,7 @@ Commands on this screen:
   o: what was blocked while the additional route was down
   h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
   g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3
+  i and a row number: a rule for that connection's address, for example i 3; a and a row number: a rule for its program
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -212,6 +218,7 @@ Commands on this screen:
   o: what was blocked while the additional route was down
   h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
   g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3
+  i and a row number: a rule for that connection's address, for example i 3; a and a row number: a rule for its program
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Diagnostics and logs
@@ -219,7 +226,7 @@ Service: OK
 Service:
   Service unavailable
   Loading...
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
 Audit trail:
   No data from the service yet
   No data from the service yet
@@ -234,7 +241,7 @@ Diagnostic archive export:
   Ready
   x: Diagnostic archive export
 Commands on this screen:
-  l: switch between diagnostics and the log
+  l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
   c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route

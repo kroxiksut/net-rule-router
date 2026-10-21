@@ -401,7 +401,7 @@ fn automatic_mode_asks_first_and_cancel_changes_nothing() {
     assert!(render(&app, 160, 60).contains("Nothing was changed."));
 
     press(&mut app, KeyCode::Char('m'));
-    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('y'));
     drain(&mut app, &fake);
     let ops = fake.operations()[before..].to_vec();
     assert_eq!(
@@ -417,8 +417,82 @@ fn automatic_mode_asks_first_and_cancel_changes_nothing() {
     assert!(wide.contains("Mode: Apply automatically"), "{wide}");
 }
 
+/// Rules taken by "always" reach the bound files as rules taken one by one
+/// do: both re-read the rules, which then writes the files.
+#[test]
+fn an_always_answer_rewrites_the_bound_files_like_an_accept() {
+    let answers: [&[KeyCode]; 2] = [
+        &[KeyCode::Char('a')],
+        &[KeyCode::Char('m'), KeyCode::Char('y')],
+    ];
+    for keys in answers {
+        let fake = service();
+        let mut app = on_screen(&fake);
+        press(&mut app, KeyCode::Enter);
+        let before = fake.operations().len();
+        for key in keys {
+            press(&mut app, *key);
+        }
+        drain(&mut app, &fake);
+        let ops = fake.operations()[before..].to_vec();
+        assert!(
+            ops.contains(&IpcOperationName::AutoRuleCandidatesAccept),
+            "{ops:?}"
+        );
+        assert!(
+            ops.contains(&IpcOperationName::RulesList),
+            "{keys:?}: the rules are read back so the files follow: {ops:?}"
+        );
+    }
+}
+
 #[test]
 fn a_push_rereads_and_points_to_the_screen_when_more_wait() {
+    let fake = service();
+    let mut app = on_screen(&fake);
+    let texts = texts_en();
+    let push = |count: u64, announces: bool| {
+        BackendEvent::Push(PushEvent::Status(Box::new(
+            nrr_shared::ipc_payloads::StatusUpdateEvent::AutoRuleCandidatesChanged {
+                sid: "S".into(),
+                pending_count: count,
+                top_anchor: "news.example".into(),
+                announces,
+            },
+        )))
+    };
+    app.apply(push(5, true), &texts, Instant::now());
+    assert_eq!(app.outbox.take().len(), 1, "the list is read again");
+    let notice = app.notices.last().expect("more offers wait");
+    assert!(notice.body.contains("news.example"), "{}", notice.body);
+    assert!(notice.body.contains("screen 6"), "{}", notice.body);
+    let before = app.notices.len();
+    app.apply(push(2, false), &texts, Instant::now());
+    assert_eq!(
+        app.notices.len(),
+        before,
+        "a count that only moved is not news"
+    );
+    assert_eq!(app.suggestions.pending_count, 2, "yet the count follows it");
+    app.apply(push(6, false), &texts, Instant::now());
+    assert_eq!(
+        app.notices.len(),
+        before,
+        "nor is one that grew without news"
+    );
+    app.apply(push(0, true), &texts, Instant::now());
+    assert_eq!(
+        app.notices.len(),
+        before,
+        "nothing waiting is never announced"
+    );
+    assert_eq!(app.suggestions.pending_count, 0);
+}
+
+/// The list title carries the service's count, the number the tray menu and
+/// the window's sidebar show; a push that only moves it is followed at once.
+#[test]
+fn the_list_title_counts_what_the_service_counts() {
     let fake = service();
     let mut app = on_screen(&fake);
     let texts = texts_en();
@@ -427,18 +501,59 @@ fn a_push_rereads_and_points_to_the_screen_when_more_wait() {
             nrr_shared::ipc_payloads::StatusUpdateEvent::AutoRuleCandidatesChanged {
                 sid: "S".into(),
                 pending_count: count,
-                top_anchor: "news.example".into(),
+                top_anchor: String::new(),
+                announces: false,
             },
         )))
     };
-    app.apply(push(5), &texts, Instant::now());
-    assert_eq!(app.outbox.take().len(), 1, "the list is read again");
-    let notice = app.notices.last().expect("more offers wait");
-    assert!(notice.body.contains("news.example"), "{}", notice.body);
-    assert!(notice.body.contains("screen 6"), "{}", notice.body);
-    let before = app.notices.len();
-    app.apply(push(2), &texts, Instant::now());
-    assert_eq!(app.notices.len(), before, "fewer waiting is not news");
+    let title = |app: &AppState| SuggestionsScreen.view(app, &texts).panels[1].title.clone();
+    app.apply(push(6), &texts, Instant::now());
+    assert_eq!(title(&app), "Suggested addresses (6)");
+    app.apply(push(0), &texts, Instant::now());
+    assert_eq!(title(&app), "Suggested addresses");
+}
+
+/// A program out of reach of site rules is not announced as a site missing
+/// addresses: the notice says what the offer is about.
+#[test]
+fn a_push_about_a_program_resolving_names_itself_says_so() {
+    let fake = service();
+    let mut app = on_screen(&fake);
+    let texts = texts_en();
+    let offer: AutoRuleCandidateDto = serde_json::from_value(json!({
+        "id": "own-1",
+        "anchor": "fetcher.exe",
+        "proposed-match": "fetcher.exe",
+        "match-kind": "application",
+        "route": "secondary",
+        "affinity": 0.0,
+        "first-seen-unix-ms": 1000,
+        "last-seen-unix-ms": 1000,
+        "signal": "app-own-resolver"
+    }))
+    .expect("offer row");
+    app.suggestions.candidates = vec![offer];
+    app.suggestions.pending_count = 0;
+    app.apply(
+        BackendEvent::Push(PushEvent::Status(Box::new(
+            nrr_shared::ipc_payloads::StatusUpdateEvent::AutoRuleCandidatesChanged {
+                sid: "S".into(),
+                pending_count: 1,
+                top_anchor: "fetcher.exe".into(),
+                announces: true,
+            },
+        ))),
+        &texts,
+        Instant::now(),
+    );
+    let notice = app.notices.last().expect("a new offer waits");
+    assert_eq!(notice.title, "Programs your site rules do not reach");
+    assert!(notice.body.contains("fetcher.exe"), "{}", notice.body);
+    assert!(
+        !notice.body.contains("will not work fully"),
+        "{}",
+        notice.body
+    );
 }
 
 #[test]

@@ -170,6 +170,8 @@ fn matches(m: &NftMatch, p: &Packet) -> bool {
         NftMatch::Mark(_) => false,
         // Nor a conntrack direction: they all open a flow.
         NftMatch::CtReply => false,
+        // Nor an IPsec policy.
+        NftMatch::RouteIpsec => false,
     }
 }
 

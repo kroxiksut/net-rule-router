@@ -522,14 +522,12 @@ QtObject {
         return null
     }
 
-    /// The bound secondary row when it cannot carry traffic out (host-only
-    /// virtual adapter, or no gateway and no default route), else null. Read by
-    /// the leak-protection toggle before it arms.
-    function unroutableBoundSecondaryRow() {
+    /// The additional adapter's row, null when none is bound or it is gone.
+    /// Read by the leak-protection choice before it is sent.
+    function boundSecondaryRow() {
         var rows = root.interfacesRowsAll || []
         for (var i = 0; i < rows.length; i += 1) {
-            if (String(rows[i].selectedRole || "") !== "secondary") continue
-            return Pure.interfaceCannotCarryTrafficOut(rows[i]) ? rows[i] : null
+            if (String(rows[i].selectedRole || "") === "secondary") return rows[i]
         }
         return null
     }

@@ -9,7 +9,7 @@
 //!    surfaces with `running = true` and its real exe path.
 //! 2. **Installed programs** — the `Uninstall` registry keys (HKLM + the
 //!    32-bit `WOW6432Node` view + HKCU), matched on `DisplayName`, with a
-//!    best-effort exe path from `DisplayIcon` / `InstallLocation`.
+//!    best-effort exe path from `DisplayIcon`.
 //!
 //! Neither source needs elevation, so this runs in the (non-elevated) GUI /
 //! launcher during onboarding, before the background service is even
@@ -78,7 +78,7 @@ fn discover_from_installed_programs() -> Vec<VpnCandidate> {
         }
         out.push(VpnCandidate {
             display_name,
-            exe_path: program.exe_path(),
+            exe_path: program_file(program.exe_path()),
             running: false,
             source: VpnCandidateSource::InstalledProgram,
             interface: None,
@@ -87,9 +87,24 @@ fn discover_from_installed_programs() -> Vec<VpnCandidate> {
     out
 }
 
+/// The install folder is no program: confirmed as one it would exempt
+/// nothing, so a row without an `.exe` asks the user for the file instead.
+fn program_file(path: Option<String>) -> Option<String> {
+    path.filter(|p| p.trim().to_ascii_lowercase().ends_with(".exe"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_executable_is_offered_as_the_program() {
+        let exe = Some(r"C:\Corp\corp-client.exe".to_owned());
+        assert_eq!(program_file(exe.clone()), exe);
+        assert_eq!(program_file(Some(r"C:\Corp\Client\".to_owned())), None);
+        assert_eq!(program_file(Some(r"C:\Corp\Client".to_owned())), None);
+        assert_eq!(program_file(None), None);
+    }
 
     #[test]
     fn discovery_is_constructible_and_runs_without_panicking() {

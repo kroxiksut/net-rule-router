@@ -98,6 +98,24 @@ fn cleanup_expired_removes_expired_resolutions() {
             rusqlite::params![system_time_to_ms(far_past)],
         )
         .expect("resolution");
+        // The backstop only applies while the cache is being written at all:
+        // one live row proves the old one is abandoned, not a stepped clock.
+        let now_ms = system_time_to_ms(SystemTime::now());
+        conn.execute(
+                "INSERT INTO hostnames (canonical_host, first_seen_at, last_seen_at) VALUES ('live.example', 0, 0)",
+                [],
+            ).expect("hostname");
+        conn.execute(
+                "INSERT INTO ip_addresses (address_family, canonical_ip, ipv4_packed, first_seen_at, last_seen_at) VALUES ('ipv4', '198.51.100.10', 3325256714, 0, 0)",
+                [],
+            ).expect("ip");
+        conn.execute(
+            "INSERT INTO hostname_ip_resolutions
+                 (hostname_id, ip_id, source, ttl_seconds, resolved_at, expires_at, freshness_state)
+                 VALUES (2, 2, 'dns', 60, ?1, ?2, 'fresh')",
+            rusqlite::params![now_ms, now_ms + 3_600_000],
+        )
+        .expect("live resolution");
     }
 
     let policy = crate::dto::CleanupPolicy {
@@ -109,13 +127,21 @@ fn cleanup_expired_removes_expired_resolutions() {
         .expect("cleanup");
     assert_eq!(summary.expired_resolutions_removed, 1);
 
-    // Hostname and IP rows should also be gone (orphan cleanup).
+    // The old hostname and IP rows are gone (orphan cleanup); the live ones stay.
     let conn = store.into_connection();
     let h_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM hostnames", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM hostnames WHERE canonical_host = 'old.example'",
+            [],
+            |r| r.get(0),
+        )
         .expect("h");
     let ip_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM ip_addresses", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM ip_addresses WHERE canonical_ip = '198.51.100.9'",
+            [],
+            |r| r.get(0),
+        )
         .expect("ip");
     assert_eq!(h_count, 0);
     assert_eq!(ip_count, 0);

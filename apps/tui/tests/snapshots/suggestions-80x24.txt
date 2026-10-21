@@ -12,7 +12,7 @@ Service: OK
 │  0 Settings              ││                                                  │
 │                          ││                                                  │
 │                          │╰──────────────────────────────────────────────────╯
-│                          │╭Suggested addresses───────────────────────────────╮
+│                          │╭Suggested addresses (3)───────────────────────────╮
 │                          ││1. example.org — Pending (1)                      │
 │                          ││   Needed by: news.example, shop.example          │
 │                          ││   *.video.example.org — Pending; connections to  │

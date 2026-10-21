@@ -112,7 +112,6 @@ Dialog {
                 "dialog.drift.body",
                 "The rules stored in your file, shown in the app, and applied by the service no longer agree. Pick how to resolve.")
             wrapMode: Text.Wrap
-            font.pixelSize: 13
             color: dialog.ownerRoot ? dialog.ownerRoot.textColor : palette.text
             Accessible.role: Accessible.StaticText
             Accessible.name: text
@@ -158,19 +157,16 @@ Dialog {
                     : dialog.tr("dialog.drift.no-file", "(no file)")
                 color: dialog.ownerRoot ? dialog.ownerRoot.textColor : palette.text
                 font.family: "Consolas, Courier New, monospace"
-                font.pixelSize: 12
             }
             Label {
                 text: dialog._shortHash(dialog.primaryDetails.gui)
                 color: dialog.ownerRoot ? dialog.ownerRoot.textColor : palette.text
                 font.family: "Consolas, Courier New, monospace"
-                font.pixelSize: 12
             }
             Label {
                 text: dialog._shortHash(dialog.primaryDetails.service)
                 color: dialog.ownerRoot ? dialog.ownerRoot.textColor : palette.text
                 font.family: "Consolas, Courier New, monospace"
-                font.pixelSize: 12
             }
 
             // Secondary row
@@ -184,19 +180,16 @@ Dialog {
                     : dialog.tr("dialog.drift.no-file", "(no file)")
                 color: dialog.ownerRoot ? dialog.ownerRoot.textColor : palette.text
                 font.family: "Consolas, Courier New, monospace"
-                font.pixelSize: 12
             }
             Label {
                 text: dialog._shortHash(dialog.secondaryDetails.gui)
                 color: dialog.ownerRoot ? dialog.ownerRoot.textColor : palette.text
                 font.family: "Consolas, Courier New, monospace"
-                font.pixelSize: 12
             }
             Label {
                 text: dialog._shortHash(dialog.secondaryDetails.service)
                 color: dialog.ownerRoot ? dialog.ownerRoot.textColor : palette.text
                 font.family: "Consolas, Courier New, monospace"
-                font.pixelSize: 12
             }
         }
 
@@ -213,8 +206,7 @@ Dialog {
                     .replace("{kind}",
                         dialog._mismatchLabel(dialog.primaryDetails.mismatch))
                 wrapMode: Text.Wrap
-                font.pixelSize: 12
-                color: "#a04400"
+                color: dialog.ownerRoot ? dialog.ownerRoot.uiTheme.colorWarning : "#d97706"
             }
             Label {
                 Layout.fillWidth: true
@@ -224,8 +216,7 @@ Dialog {
                     .replace("{kind}",
                         dialog._mismatchLabel(dialog.secondaryDetails.mismatch))
                 wrapMode: Text.Wrap
-                font.pixelSize: 12
-                color: "#a04400"
+                color: dialog.ownerRoot ? dialog.ownerRoot.uiTheme.colorWarning : "#d97706"
             }
         }
 

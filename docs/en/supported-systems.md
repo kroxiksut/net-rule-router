@@ -1,5 +1,7 @@
 # Supported systems
 
+**English** · [Русский](../ru/supported-systems.md)
+
 What the first alpha runs on, how it is delivered there, and which systems it
 has actually been run on. "Checked" means installed, used with real rules and
 removed again on that system; the rest should work for the reasons given, but

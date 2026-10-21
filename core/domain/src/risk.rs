@@ -14,7 +14,7 @@
 //!
 //! | Signal                   | Condition                                                       | Level    |
 //! |--------------------------|-----------------------------------------------------------------|----------|
-//! | `BroadSuffixScope`       | SuffixDomain on TLD or ccTLD (`*.com`, `*.ru`)                  | High     |
+//! | `BroadSuffixScope`       | SuffixDomain or Zone on TLD or ccTLD (`*.com`, `.ru`)           | High     |
 //! | `ModerateSuffixScope`    | SuffixDomain on 2nd-level (`*.example.com`)                     | Medium   |
 //! | `DefaultBehaviorChanged` | `behavior_mode` changed between revisions                       | Medium   |
 //! | `MassChangeCount`        | ≥ 20 rule changes across both sets                              | High     |
@@ -25,7 +25,6 @@
 //! | `RuleSetEmptied`         | Prev had rules, next has zero                                   | High     |
 //! | `HighRemovalRatio`       | ≥ 50 % of prev rules removed in this revision                   | High     |
 //! | `OverlappingRules`       | ExactFqdn `host.apex` + SuffixDomain `apex` in same set          | Medium   |
-//! | `FailClosedActivation`   | `behavior_mode` newly set to `StrictSecondaryFailClosed`        | High     |
 //!
 //! # Threshold rationale
 //!
@@ -38,10 +37,7 @@
 //! - **`UnstableInterfaceBinding`**: Adapter identity changes can silently
 //!   redirect all traffic. The user must confirm the new binding is intentional.
 //! - **`RuleSetEmptied`**: Going from non-empty rules → empty in one step
-//!   removes all per-rule routing decisions. Under `PreferPrimary` mode the
-//!   user just falls back to the OS default route (recoverable); under
-//!   `StrictSecondaryFailClosed` it disables all traffic until the user
-//!   restores rules.
+//!   removes all per-rule routing decisions at once.
 //! - **`HighRemovalRatio` ≥ 50 %**: Distinct from `RuleSetEmptied` —
 //!   removing half-or-more of an active rule set is rarely intentional in
 //!   the Free edition (typical edit is "add one rule" or "modify one
@@ -52,16 +48,12 @@
 //!   but the user may not realise they've created a redundant entry — or
 //!   worse, the two rules sit in DIFFERENT route sets (primary vs secondary)
 //!   and produce surprising routing.
-//! - **`FailClosedActivation`**: Turning on `StrictSecondaryFailClosed`
-//!   changes the default behaviour from "permit unmatched" to "block
-//!   unmatched". Important enough to flag even when the rules diff is
-//!   trivial.
 
 use crate::{
     canonical::CanonicalAddressMatch,
     review::{RuleChange, StructuralDiff},
     revision::{RevisionSource, RiskLevel},
-    RouteBehaviorMode, RouteRole,
+    RouteRole,
 };
 
 /// Minimum number of rule changes that triggers [`RiskSignal::MassChangeCount`].
@@ -163,24 +155,13 @@ pub enum RiskSignal {
     /// Level: **Medium**. `apex` is the suffix label without the `*.`
     /// prefix (e.g. `"example.com"`).
     OverlappingRules { apex: String },
-
-    /// Fires when `behavior_mode` is being set to
-    /// `StrictSecondaryFailClosed` in this revision and was not in the
-    /// previous one (or there was no previous revision). The mode
-    /// change flips the default behaviour from "permit unmatched" to
-    /// "block unmatched"; even a trivial-looking rules diff deserves
-    /// review when fail-closed is activated.
-    ///
-    /// Level: **High**.
-    FailClosedActivation,
 }
 
 // Cross-crate projection: domain `RiskSignal` → wire
 // `nrr_shared::ipc_payloads::RiskSignalDto`. Lives in domain because
 // the dep direction is `domain → shared`; service-runtime calls
 // `Into::into` on each signal when assembling
-// `ReviewSummaryResponse.risk_signals`. The mapping is 1:1 today —
-// all 12 wire variants have domain counterparts.
+// `ReviewSummaryResponse.risk_signals`. Every domain variant has a wire twin.
 impl From<&RiskSignal> for nrr_shared::ipc_payloads::RiskSignalDto {
     fn from(s: &RiskSignal) -> Self {
         use nrr_shared::ipc_payloads::RiskSignalDto as W;
@@ -206,7 +187,6 @@ impl From<&RiskSignal> for nrr_shared::ipc_payloads::RiskSignalDto {
                 removed_pct: *removed_pct,
             },
             RiskSignal::OverlappingRules { apex } => W::OverlappingRules { apex: apex.clone() },
-            RiskSignal::FailClosedActivation => W::FailClosedActivation,
         }
     }
 }
@@ -220,8 +200,7 @@ impl RiskSignal {
             | Self::UnstableInterfaceBinding
             | Self::LinkedSuspiciousDelta
             | Self::RuleSetEmptied { .. }
-            | Self::HighRemovalRatio { .. }
-            | Self::FailClosedActivation => RiskLevel::High,
+            | Self::HighRemovalRatio { .. } => RiskLevel::High,
 
             Self::ModerateSuffixScope { .. }
             | Self::DefaultBehaviorChanged
@@ -302,25 +281,9 @@ pub fn score_candidate(diff: &StructuralDiff, source: &RevisionSource) -> RiskAs
     RiskAssessment { level, signals }
 }
 
-/// Detects `FailClosedActivation`, `RuleSetEmptied`, `HighRemovalRatio`,
-/// and `OverlappingRules`.
-///
-/// All four signals rely on fields on [`StructuralDiff`]
-/// (`prev_total_rules`, `next_total_rules`,
-/// `overlapping_apexes`, `prev_behavior_mode`, `next_behavior_mode`).
-/// They are emitted in this order: `FailClosedActivation`,
-/// `RuleSetEmptied`, `HighRemovalRatio`, `OverlappingRules` — matching
-/// severity-then-specificity for the review UI's rendering.
+/// Detects `RuleSetEmptied`, `HighRemovalRatio` and `OverlappingRules`, in
+/// that order — severity, then specificity, as the review UI renders them.
 fn collect_structural_severity_signals(diff: &StructuralDiff, signals: &mut Vec<RiskSignal>) {
-    // Fail-closed activation: next mode is StrictSecondaryFailClosed
-    // AND prev mode wasn't (or there was no prev — first revision
-    // activating fail-closed is still High risk).
-    if diff.next_behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed
-        && diff.prev_behavior_mode != Some(RouteBehaviorMode::StrictSecondaryFailClosed)
-    {
-        signals.push(RiskSignal::FailClosedActivation);
-    }
-
     // Rule-set emptied: prev had rules, next has zero.
     if diff.prev_total_rules > 0 && diff.next_total_rules == 0 {
         signals.push(RiskSignal::RuleSetEmptied {
@@ -382,7 +345,10 @@ fn collect_content_signals(diff: &StructuralDiff, signals: &mut Vec<RiskSignal>)
                 if *route == RouteRole::Secondary {
                     secondary_reroute_count += 1;
                 }
-                if let Some(CanonicalAddressMatch::SuffixDomain(label)) = &rule.address_match {
+                if let Some(
+                    CanonicalAddressMatch::SuffixDomain(label) | CanonicalAddressMatch::Zone(label),
+                ) = &rule.address_match
+                {
                     classify_suffix(label, signals);
                 }
             }
@@ -484,7 +450,7 @@ mod tests {
                 },
                 source: BindingSource::UserAssigned,
             }),
-            behavior_mode: crate::RouteBehaviorMode::StrictSecondaryFailClosed,
+            behavior_mode: crate::RouteBehaviorMode::PreferSecondaryWhenAvailable,
             rule_book: CanonicalRuleBook {
                 primary: CanonicalRuleSet::from_rules(primary_rules),
                 secondary: CanonicalRuleSet::from_rules(secondary_rules),
@@ -527,6 +493,21 @@ mod tests {
             .signals
             .iter()
             .any(|s| matches!(s, RiskSignal::BroadSuffixScope { .. })));
+    }
+
+    #[test]
+    fn high_risk_for_a_whole_top_level_zone() {
+        let prev = make_profile(vec![], vec![]);
+        let mut zone = suffix_rule("r-1", "ru");
+        zone.address_match = Some(CanonicalAddressMatch::Zone("ru".to_string()));
+        let next = make_profile(vec![zone], vec![]);
+        let diff = compute_diff(Some(&prev), &next);
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
+        assert_eq!(assessment.level, RiskLevel::High);
+        assert!(assessment
+            .signals
+            .iter()
+            .any(|s| matches!(s, RiskSignal::BroadSuffixScope { label } if label == "ru")));
     }
 
     #[test]
@@ -706,7 +687,6 @@ mod tests {
             .level(),
             RiskLevel::Medium
         );
-        assert_eq!(RiskSignal::FailClosedActivation.level(), RiskLevel::High);
     }
 
     // ── New signal detection tests ────────────────────────────────────────────
@@ -894,48 +874,15 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_activation_fires_when_mode_transitions_to_strict() {
+    fn moving_the_default_route_to_the_additional_connection_is_a_medium_change() {
+        // Blocking is leak protection's business now, so the default route
+        // alone never escalates a revision to mandatory review.
         let mut prev = make_profile(vec![], vec![]);
         prev.behavior_mode = crate::RouteBehaviorMode::PreferPrimary;
-        let mut next = make_profile(vec![], vec![]);
-        next.behavior_mode = crate::RouteBehaviorMode::StrictSecondaryFailClosed;
-        let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
-        assert!(assessment
-            .signals
-            .iter()
-            .any(|s| matches!(s, RiskSignal::FailClosedActivation)));
-        assert_eq!(assessment.level, RiskLevel::High);
-    }
-
-    #[test]
-    fn fail_closed_activation_does_not_fire_when_already_strict() {
-        // Both prev and next are StrictSecondaryFailClosed → no new
-        // activation signal (the mode was already strict).
-        let mut prev = make_profile(vec![], vec![]);
-        prev.behavior_mode = crate::RouteBehaviorMode::StrictSecondaryFailClosed;
-        let mut next = make_profile(vec![], vec![]);
-        next.behavior_mode = crate::RouteBehaviorMode::StrictSecondaryFailClosed;
-        let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
-        assert!(!assessment
-            .signals
-            .iter()
-            .any(|s| matches!(s, RiskSignal::FailClosedActivation)));
-    }
-
-    #[test]
-    fn fail_closed_activation_fires_on_first_revision_if_strict() {
-        // No prev revision; first activation is StrictSecondaryFailClosed.
         let next = make_profile(vec![], vec![]);
-        // `make_profile` default is `StrictSecondaryFailClosed`; the
-        // helper test path already covers this. Confirm the signal
-        // fires when prev is None.
-        let diff = compute_diff(None, &next);
+        let diff = compute_diff(Some(&prev), &next);
         let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
-        assert!(assessment
-            .signals
-            .iter()
-            .any(|s| matches!(s, RiskSignal::FailClosedActivation)));
+        assert_eq!(assessment.signals, vec![RiskSignal::DefaultBehaviorChanged]);
+        assert_eq!(assessment.level, RiskLevel::Medium);
     }
 }

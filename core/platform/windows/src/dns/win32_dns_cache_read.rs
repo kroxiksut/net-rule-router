@@ -18,9 +18,9 @@
 //!    `Get-DnsClientCache`) writes the head of a singly-linked list of
 //!    [`DnsCacheEntry`] — each node carries the wide hostname and the record
 //!    `wType`. It does NOT carry the record data, so we read only names+types
-//!    here and skip non-`A` types.
-//! 2. For every `A`-type name we issue a **cache-only** [`DnsQuery_W`] with
-//!    `DNS_QUERY_NO_WIRE_QUERY` (`0x10`): it returns the cached `A` records
+//!    here and skip types other than `A` and `AAAA`.
+//! 2. For every such name we issue a **cache-only** [`DnsQuery_W`] per type
+//!    with `DNS_QUERY_NO_WIRE_QUERY` (`0x10`): it returns the cached records
 //!    without touching the network, so this whole port never blocks on DNS.
 //!
 //! ## Memory ownership
@@ -37,8 +37,9 @@
 
 #![allow(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nrr_platform_api::dns::{
     canonicalize_hostname, DnsCacheReadError, DnsCacheReadPort, OsCachedResolution,
@@ -46,7 +47,7 @@ use nrr_platform_api::dns::{
 use windows::core::PCWSTR;
 use windows::Win32::NetworkManagement::Dns::{
     DnsFree, DnsFreeFlat, DnsFreeRecordList, DnsQuery_W, DNS_QUERY_OPTIONS, DNS_RECORDA, DNS_TYPE,
-    DNS_TYPE_A,
+    DNS_TYPE_A, DNS_TYPE_AAAA,
 };
 
 /// `DNS_QUERY_NO_WIRE_QUERY` — answer only from the local resolver cache; never
@@ -54,8 +55,10 @@ use windows::Win32::NetworkManagement::Dns::{
 /// so we spell the documented bit directly.
 const DNS_QUERY_NO_WIRE_QUERY: u32 = 0x0000_0010;
 
-/// `A` record type as it appears in a [`DnsCacheEntry::w_type`] field.
+/// `A` and `AAAA` record types as they appear in a [`DnsCacheEntry::w_type`]
+/// field.
 const DNS_TYPE_A_U16: u16 = 1;
+const DNS_TYPE_AAAA_U16: u16 = 28;
 
 /// Defensive bound on the cache-list walk. The Windows resolver cache holds at
 /// most a few thousand entries in practice; this is far above that and only
@@ -101,6 +104,13 @@ impl WindowsDnsCacheRead {
 
 impl DnsCacheReadPort for WindowsDnsCacheRead {
     fn read_resolver_cache(&self) -> Result<Vec<OsCachedResolution>, DnsCacheReadError> {
+        self.read_resolver_cache_matching(&|_| true)
+    }
+
+    fn read_resolver_cache_matching(
+        &self,
+        keep: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<OsCachedResolution>, DnsCacheReadError> {
         let mut head: *mut DnsCacheEntry = std::ptr::null_mut();
         // SAFETY: `head` is a valid out-slot; the export writes a freshly
         // allocated list head (or leaves it null) and returns non-zero on
@@ -114,9 +124,10 @@ impl DnsCacheReadPort for WindowsDnsCacheRead {
             return Ok(Vec::new());
         }
 
-        // First pass: collect the canonical `A`-record names. We read every
-        // node before freeing anything so the free pass is a simple walk.
-        let mut names: Vec<String> = Vec::new();
+        // First pass: collect the canonical names and which of the two
+        // address types each has cached. We read every node before freeing
+        // anything so the free pass is a simple walk.
+        let mut names: BTreeMap<String, CachedTypes> = BTreeMap::new();
         let mut current = head;
         let mut visited = 0usize;
         while !current.is_null() && visited < MAX_CACHE_ENTRIES {
@@ -124,13 +135,19 @@ impl DnsCacheReadPort for WindowsDnsCacheRead {
             // POD fields only and never dereference `psz_name` past its
             // NUL terminator (see `wide_to_string`).
             let node = unsafe { &*current };
-            if node.w_type == DNS_TYPE_A_U16 && !node.psz_name.is_null() {
+            let is_a = node.w_type == DNS_TYPE_A_U16;
+            if (is_a || node.w_type == DNS_TYPE_AAAA_U16) && !node.psz_name.is_null() {
                 // SAFETY: `psz_name` is a NUL-terminated wide string owned by
                 // the DNS API heap, valid until we free the list below.
                 if let Some(name) = unsafe { wide_to_string(node.psz_name) } {
                     let canonical = canonicalize_hostname(&name);
-                    if !canonical.is_empty() {
-                        names.push(canonical);
+                    if !canonical.is_empty() && keep(&canonical) {
+                        let types = names.entry(canonical).or_default();
+                        if is_a {
+                            types.a = true;
+                        } else {
+                            types.aaaa = true;
+                        }
                     }
                 }
             }
@@ -145,10 +162,16 @@ impl DnsCacheReadPort for WindowsDnsCacheRead {
         // touch a node after freeing it.
         unsafe { free_cache_table(head) };
 
-        // Second pass: cache-only A-record lookups. No network I/O.
+        // Second pass: cache-only lookups. No network I/O.
         let mut out = Vec::with_capacity(names.len());
-        for name in names {
-            let addresses = cache_only_a_lookup(&name);
+        for (name, types) in names {
+            let mut addresses: Vec<IpAddr> = Vec::new();
+            if types.a {
+                addresses.extend(cache_only_lookup(&name, DNS_TYPE_A));
+            }
+            if types.aaaa {
+                addresses.extend(cache_only_lookup(&name, DNS_TYPE_AAAA));
+            }
             if !addresses.is_empty() {
                 out.push(OsCachedResolution {
                     canonical_hostname: name,
@@ -160,9 +183,17 @@ impl DnsCacheReadPort for WindowsDnsCacheRead {
     }
 }
 
-/// Cache-only `A` lookup for `canonical` (already lower-cased, no trailing dot).
-/// Returns the cached IPv4 addresses, or empty on any error / cache miss.
-fn cache_only_a_lookup(canonical: &str) -> Vec<Ipv4Addr> {
+/// Which address types the OS cache lists for one name.
+#[derive(Default)]
+struct CachedTypes {
+    a: bool,
+    aaaa: bool,
+}
+
+/// Cache-only `want` (`A` or `AAAA`) lookup for `canonical` (already
+/// lower-cased, no trailing dot). Returns the cached addresses, or empty on
+/// any error / cache miss.
+fn cache_only_lookup(canonical: &str, want: DNS_TYPE) -> Vec<IpAddr> {
     if canonical.is_empty() || canonical.contains('\0') {
         return Vec::new();
     }
@@ -174,7 +205,7 @@ fn cache_only_a_lookup(canonical: &str) -> Vec<Ipv4Addr> {
     let win_err = unsafe {
         DnsQuery_W(
             PCWSTR(wide.as_ptr()),
-            DNS_TYPE_A,
+            want,
             DNS_QUERY_OPTIONS(DNS_QUERY_NO_WIRE_QUERY),
             None,
             &mut records,
@@ -183,9 +214,9 @@ fn cache_only_a_lookup(canonical: &str) -> Vec<Ipv4Addr> {
     };
     let mut addresses = Vec::new();
     if win_err.0 == 0 && !records.is_null() {
-        // SAFETY: non-null Win32-allocated `DNS_RECORDA` chain; we read the
-        // union `A` arm only after checking `wType == DNS_TYPE_A`.
-        addresses = unsafe { collect_a_addresses(records) };
+        // SAFETY: non-null Win32-allocated `DNS_RECORDA` chain; each union
+        // arm is read only after its `wType` check.
+        addresses = unsafe { collect_addresses(records, want) };
     }
     // SAFETY: release any allocated chain (no-op on null), matching the proven
     // resolver's ownership handling.
@@ -196,25 +227,32 @@ fn cache_only_a_lookup(canonical: &str) -> Vec<Ipv4Addr> {
     addresses
 }
 
-/// Walk a `DNS_RECORDA` chain and collect every IPv4 (`A`) address.
+/// Walk a `DNS_RECORDA` chain and collect every address of type `want`; an
+/// IPv4-mapped `AAAA` is its IPv4 address.
 ///
 /// # Safety
 ///
 /// `head` must be a non-null Win32-allocated DNS record list, not yet freed.
-unsafe fn collect_a_addresses(head: *mut DNS_RECORDA) -> Vec<Ipv4Addr> {
+unsafe fn collect_addresses(head: *mut DNS_RECORDA, want: DNS_TYPE) -> Vec<IpAddr> {
     let mut addresses = Vec::new();
     let mut current = head;
-    // A cached A answer is tiny; bound the walk against a corrupt chain.
+    // A cached answer is tiny; bound the walk against a corrupt chain.
     const MAX_CHAIN_LEN: usize = 256;
     let mut visited = 0usize;
     while !current.is_null() && visited < MAX_CHAIN_LEN {
         // SAFETY: `current` is a valid `DNS_RECORDA`; POD field reads.
         let record = unsafe { &*current };
-        if DNS_TYPE(record.wType) == DNS_TYPE_A {
+        let wtype = DNS_TYPE(record.wType);
+        if wtype == want && wtype == DNS_TYPE_A {
             // SAFETY: the `A: DNS_A_DATA` union arm is selected by the type
             // check; `IpAddress` is a network-order u32 per the Win32 contract.
             let net_order = unsafe { record.Data.A.IpAddress };
-            addresses.push(Ipv4Addr::from(u32::from_be(net_order)));
+            addresses.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(net_order))));
+        } else if wtype == want && wtype == DNS_TYPE_AAAA {
+            // SAFETY: the `AAAA: DNS_AAAA_DATA` union arm is selected by the
+            // type check; `IP6Byte` is the address in network order.
+            let octets = unsafe { record.Data.AAAA.Ip6Address.IP6Byte };
+            addresses.push(IpAddr::V6(Ipv6Addr::from(octets)).to_canonical());
         }
         current = record.pNext;
         visited += 1;
@@ -300,7 +338,9 @@ mod tests {
 
     #[test]
     fn cache_only_lookup_rejects_empty_and_nul() {
-        assert!(cache_only_a_lookup("").is_empty());
-        assert!(cache_only_a_lookup("bad\0name").is_empty());
+        for want in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+            assert!(cache_only_lookup("", want).is_empty());
+            assert!(cache_only_lookup("bad\0name", want).is_empty());
+        }
     }
 }

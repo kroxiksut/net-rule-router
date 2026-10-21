@@ -186,9 +186,16 @@ fn ps_single_quote(s: &str) -> String {
 
 /// Creates the file the elevated relay reports into: new, and in the directory
 /// the path names rather than wherever a link swapped in by the user points.
-pub fn create_relay_report(path: &Path) -> std::io::Result<std::fs::File> {
-    let root = crate::pinned_file::user_temp_root()?;
+/// `user_sid` is the account that asked: when the elevated copy runs as another
+/// administrator, the report belongs in the asker's folder, not that admin's.
+pub fn create_relay_report(path: &Path, user_sid: Option<&str>) -> std::io::Result<std::fs::File> {
+    let root = crate::pinned_file::temp_root_of_user(user_sid)?;
     crate::pinned_file::create_new(&root, path)
+}
+
+/// The account this process runs as, to hand to the elevated copy it starts.
+pub fn current_user_sid() -> Option<String> {
+    crate::pinned_file::current_user_sid()
 }
 
 /// Where the unelevated side must put the report path it hands to the elevated

@@ -1,0 +1,102 @@
+{
+  "description": "pure.js rollbackDryRunVerdict: what a safe-rollback dry run answered",
+  "cases": [
+    {
+      "name": "ready",
+      "input": {
+        "ok": true,
+        "answer": {
+          "confirmation-token": "tok-1",
+          "target": {
+            "revision-id": "rev-7",
+            "activated-at": 1767225600,
+            "rule-count": 12
+          }
+        }
+      }
+    },
+    {
+      "name": "ready with a superseded time",
+      "input": {
+        "ok": true,
+        "answer": {
+          "confirmation-token": "tok-2",
+          "target": {
+            "revision-id": "rev-7",
+            "activated-at": 1767225600,
+            "rule-count": 12,
+            "superseded-at": 1767229200
+          }
+        }
+      }
+    },
+    {
+      "name": "nothing to roll back to",
+      "input": {
+        "ok": true,
+        "answer": {}
+      }
+    },
+    {
+      "name": "answer missing entirely",
+      "input": {
+        "ok": true
+      }
+    },
+    {
+      "name": "service error code",
+      "input": {
+        "ok": true,
+        "answer": {
+          "error": {
+            "code": "precondition-failed"
+          }
+        }
+      }
+    },
+    {
+      "name": "service error without a code",
+      "input": {
+        "ok": true,
+        "answer": {
+          "error": {}
+        }
+      }
+    },
+    {
+      "name": "call failed with a code",
+      "input": {
+        "ok": false,
+        "code": "forbidden"
+      }
+    },
+    {
+      "name": "call failed without a code",
+      "input": {
+        "ok": false
+      }
+    },
+    {
+      "name": "token without target",
+      "input": {
+        "ok": true,
+        "answer": {
+          "confirmation-token": "tok-3"
+        }
+      }
+    },
+    {
+      "name": "target without token",
+      "input": {
+        "ok": true,
+        "answer": {
+          "target": {
+            "revision-id": "rev-7",
+            "activated-at": 1767225600,
+            "rule-count": 12
+          }
+        }
+      }
+    }
+  ]
+}

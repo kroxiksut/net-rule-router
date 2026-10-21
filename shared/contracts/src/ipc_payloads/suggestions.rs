@@ -200,6 +200,11 @@ pub const AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED: &str = "main-link-blocked";
 /// The offer is about the program itself.
 pub const AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED: &str = "app-main-link-blocked";
 
+/// [`AutoRuleCandidateDto::signal`]: a program that looks names up on its own,
+/// past the system resolver, so rules by name never see where it goes. The
+/// offer is about the program itself and says nothing about the main link.
+pub const AUTO_RULE_SIGNAL_APP_OWN_RESOLVER: &str = "app-own-resolver";
+
 /// The signals where the host makes the offer about ITSELF: `anchor` is the
 /// host, there is no companion arithmetic, and the question is only whether the
 /// main link carries it. The GUI reads this to know it must not say "a site
@@ -209,6 +214,7 @@ pub const AUTO_RULE_SELF_SIGNED_SIGNALS: &[&str] = &[
     AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER,
     AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED,
     AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED,
+    AUTO_RULE_SIGNAL_APP_OWN_RESOLVER,
 ];
 
 /// `true` when `signal` is one of [`AUTO_RULE_SELF_SIGNED_SIGNALS`].

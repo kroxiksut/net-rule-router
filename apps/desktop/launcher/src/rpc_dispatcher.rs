@@ -238,18 +238,35 @@ fn dispatcher_answer_bound(op: IpcOperationName) -> Duration {
 /// dispatcher is still allowed to produce.
 pub fn host_answer_deadlines() -> HostAnswerDeadlines {
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let mut operations_ms: std::collections::BTreeMap<String, u64> = IpcOperationName::ALL
+        .into_iter()
+        .map(|op| {
+            (
+                op.slug().to_string(),
+                ms(dispatcher_answer_bound(op) + HOST_ANSWER_MARGIN),
+            )
+        })
+        .collect();
+    // A service action outlives any other local operation (a prompt, a slow
+    // restart); one deadline here, not the generic local one.
+    operations_ms.insert(
+        SERVICE_CONTROL_OP.to_string(),
+        ms(service_control_answer_bound() + HOST_ANSWER_MARGIN),
+    );
     HostAnswerDeadlines {
         default_ms: ms(LOCAL_ANSWER_DEADLINE),
-        operations_ms: IpcOperationName::ALL
-            .into_iter()
-            .map(|op| {
-                (
-                    op.slug().to_string(),
-                    ms(dispatcher_answer_bound(op) + HOST_ANSWER_MARGIN),
-                )
-            })
-            .collect(),
+        operations_ms,
     }
+}
+
+/// Longest `local.service-control` takes to answer: the broker's liveness
+/// probe plus the action under the one shared budget.
+fn service_control_answer_bound() -> Duration {
+    use nrr_broker::protocol::{
+        client_answer_timeout, BROKER_PING, BROKER_SERVICE_CONTROL, SERVICE_CONTROL_BUDGET,
+    };
+    client_answer_timeout(BROKER_PING, Duration::ZERO)
+        + client_answer_timeout(BROKER_SERVICE_CONTROL, SERVICE_CONTROL_BUDGET)
 }
 
 /// Block until `client` reports `Connected`, a state that cannot progress
@@ -366,7 +383,7 @@ pub fn dispatch_request(
         let response = match broker.call(
             nrr_broker::protocol::BROKER_SERVICE_CONTROL,
             &parsed.payload,
-            Duration::from_secs(60),
+            nrr_broker::protocol::SERVICE_CONTROL_BUDGET,
         ) {
             Ok(value) => LauncherRpcResponse::ok(parsed.correlation_id.clone(), value),
             Err(nrr_broker::BrokerCallError::Declined) => LauncherRpcResponse::err(
@@ -873,7 +890,7 @@ fn broker_may_retry(
             .is_none_or(|spec| spec.allowed_clients.contains(&profile))
 }
 
-fn write_response(stdin: &SharedStdin, resp: &LauncherRpcResponse) {
+pub(crate) fn write_response(stdin: &SharedStdin, resp: &LauncherRpcResponse) {
     let line = match encode_response_line(resp) {
         Ok(s) => s,
         Err(e) => {
@@ -1498,8 +1515,13 @@ mod tests {
         }
         assert_eq!(
             deadlines.operations_ms.len(),
-            IpcOperationName::ALL.len(),
-            "one entry per operation, nothing else"
+            IpcOperationName::ALL.len() + 1,
+            "one entry per service operation, plus the service-control action"
+        );
+        let control = deadlines.operations_ms[SERVICE_CONTROL_OP];
+        assert!(
+            u128::from(control) > service_control_answer_bound().as_millis(),
+            "the host outlasts the longest service action"
         );
     }
 

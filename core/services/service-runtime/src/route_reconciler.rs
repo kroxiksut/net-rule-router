@@ -23,11 +23,21 @@
 //! in-memory. Routes a crash orphaned are adopted by their signature
 //! ([`crate::route_codegen::is_owned_route`]) before the first reconcile, so
 //! that reconcile takes back the ones no longer wanted.
+//!
+//! Memory is not the table: a route deleted from outside, or taken by the OS
+//! with a link that dropped and came back, is still remembered. So a pass that
+//! keeps routes checks them against the live table first and puts back what
+//! is gone, touching nothing that is still there.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use nrr_platform_api::route_signature::signed_routes;
+pub use nrr_platform_api::route_signature::{
+    sweep_owned_routes, sweep_owned_routes_with, RouteSweepError,
+};
 use nrr_platform_api::route_table::RouteTablePort;
 use nrr_platform_api::routing::RoutingTransaction;
 use nrr_platform_api::{PlatformError, RouteEntry, RoutingAction};
@@ -49,6 +59,29 @@ fn route_key(r: &RouteEntry) -> RouteKey {
         r.interface_index,
         r.table.clone(),
     )
+}
+
+/// Whether a remembered route is still in the live table: the identity the OS
+/// reports back as asked. The next hop is left out, as in
+/// [`SecondaryRouteReconciler::owns`]: a hop reported in another spelling would
+/// read as gone, and its re-add would conflict and lose the claim on it.
+type PresenceKey = (IpAddr, u8, u32, nrr_platform_api::RouteTableRef);
+
+fn presence_key(r: &RouteEntry) -> PresenceKey {
+    (
+        r.destination,
+        r.prefix_length,
+        r.interface_index,
+        r.table.clone(),
+    )
+}
+
+/// A reading of the live table a caller already holds, taken after
+/// [`SecondaryRouteReconciler::write_count`] returned `writes`.
+#[derive(Clone, Copy, Debug)]
+pub struct TableReading<'a> {
+    pub writes: u64,
+    pub rows: &'a [RouteEntry],
 }
 
 /// What a route currently in the system table represents, from the
@@ -379,6 +412,9 @@ pub struct SecondaryRouteReconciler {
     /// Routes this reconciler currently owns (last successfully applied
     /// desired set).
     owned: Mutex<Vec<RouteEntry>>,
+    /// Bumped after every write of ours to the table: a reading taken before
+    /// it may miss a route we own, and is read again.
+    writes: AtomicU64,
     /// "Has the stop teardown begun?" A route added behind it stays in the OS
     /// table with no service left to reap it. Injected rather than read from
     /// the static directly so a test can flip it for itself alone.
@@ -392,6 +428,7 @@ impl SecondaryRouteReconciler {
         Self {
             api,
             owned: Mutex::new(Vec::new()),
+            writes: AtomicU64::new(0),
             teardown_gate: Arc::new(crate::teardown_in_progress),
         }
     }
@@ -461,13 +498,75 @@ impl SecondaryRouteReconciler {
         self.owned.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
+    /// How many writes of ours the table has seen; pairs with
+    /// [`Self::reconcile_seen`].
+    pub fn write_count(&self) -> u64 {
+        self.writes.load(Ordering::SeqCst)
+    }
+
     /// Diff `desired` against the owned set and apply the difference. On
     /// success the owned set becomes exactly `desired`. On any platform
     /// error the partial changes are rolled back and the owned set follows
     /// what the rollback actually restored.
     pub fn reconcile(&self, desired: &[RouteEntry]) -> Result<RouteReconcileDelta, PlatformError> {
+        self.reconcile_seen(desired, None)
+    }
+
+    /// [`Self::reconcile`] checking the kept routes against `seen`, the table
+    /// the caller read for this pass, instead of reading it again. Stale once
+    /// a write of ours followed it, and then read afresh.
+    pub fn reconcile_seen(
+        &self,
+        desired: &[RouteEntry],
+        seen: Option<TableReading<'_>>,
+    ) -> Result<RouteReconcileDelta, PlatformError> {
         let owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
-        self.reconcile_owned(desired, owned)
+        self.reconcile_owned(desired, owned, seen)
+    }
+
+    /// Forget the kept routes the live table no longer holds, so the diff puts
+    /// them back. Only routes kept across the pass are checked: one being
+    /// dropped is deleted anyway, and deleting what is gone is success. A fresh
+    /// read happens under the owned-set lock, so no write of ours lands
+    /// between it and the diff.
+    fn forget_vanished(
+        &self,
+        owned: &mut Vec<RouteEntry>,
+        desired: &HashSet<RouteKey>,
+        seen: Option<TableReading<'_>>,
+    ) {
+        if !owned.iter().any(|o| desired.contains(&route_key(o))) {
+            return;
+        }
+        let fresh: Vec<RouteEntry>;
+        let rows = match seen {
+            Some(reading) if reading.writes == self.write_count() => reading.rows,
+            _ => match self.api.get_ip_forward_table() {
+                Ok(rows) => {
+                    fresh = rows;
+                    fresh.as_slice()
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "nrr::route-reconciler",
+                        error = %e,
+                        "route table unreadable: the kept routes are taken as still in place",
+                    );
+                    return;
+                }
+            },
+        };
+        let present: HashSet<PresenceKey> = rows.iter().map(presence_key).collect();
+        let before = owned.len();
+        owned.retain(|o| !desired.contains(&route_key(o)) || present.contains(&presence_key(o)));
+        let vanished = before - owned.len();
+        if vanished > 0 {
+            tracing::info!(
+                target: "nrr::route-reconciler",
+                vanished = vanished as u64,
+                "routes of ours were removed from outside; putting them back",
+            );
+        }
     }
 
     /// The body of [`Self::reconcile`], entered with the owned-set lock ALREADY
@@ -479,8 +578,10 @@ impl SecondaryRouteReconciler {
         &self,
         desired: &[RouteEntry],
         mut owned: std::sync::MutexGuard<'_, Vec<RouteEntry>>,
+        seen: Option<TableReading<'_>>,
     ) -> Result<RouteReconcileDelta, PlatformError> {
         let desired_keys: HashSet<RouteKey> = desired.iter().map(route_key).collect();
+        self.forget_vanished(&mut owned, &desired_keys, seen);
         let owned_keys: HashSet<RouteKey> = owned.iter().map(route_key).collect();
 
         let mut actions: Vec<RoutingAction> = Vec::new();
@@ -523,7 +624,9 @@ impl SecondaryRouteReconciler {
         }
 
         let mut tx = RoutingTransaction::new(Arc::clone(&self.api));
-        match tx.execute(&actions) {
+        let executed = tx.execute(&actions);
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        match executed {
             Ok(()) => {
                 // Claim what we ACTUALLY added, plus what we already owned and
                 // still want. A conflicting add reports success without adding
@@ -531,13 +634,13 @@ impl SecondaryRouteReconciler {
                 // redirect VPN's own overlay - and claiming the whole desired
                 // set would adopt it and delete it on a later pass, which is
                 // exactly what destabilises the VPN client.
-                let landed = tx.added_routes();
+                let landed: HashSet<RouteKey> = tx.added_routes().iter().map(route_key).collect();
                 tx.finalize();
                 *owned = desired
                     .iter()
                     .filter(|d| {
-                        landed.iter().any(|l| route_key(l) == route_key(d))
-                            || owned.iter().any(|o| route_key(o) == route_key(d))
+                        let key = route_key(d);
+                        landed.contains(&key) || owned_keys.contains(&key)
                     })
                     .cloned()
                     .collect();
@@ -590,7 +693,9 @@ impl SecondaryRouteReconciler {
             return Ok(0);
         }
         let mut tx = RoutingTransaction::new(Arc::clone(&self.api));
-        if let Err(e) = tx.execute(&actions) {
+        let executed = tx.execute(&actions);
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        if let Err(e) = executed {
             owned.extend(tx.rollback_with_residue().still_added);
             return Err(e);
         }
@@ -617,68 +722,8 @@ impl SecondaryRouteReconciler {
             .filter(|r| !crate::route_codegen::is_overlay_route(r))
             .cloned()
             .collect();
-        self.reconcile_owned(&keep, owned)
+        self.reconcile_owned(&keep, owned, None)
     }
-}
-
-/// Why an offline route sweep stopped.
-#[derive(Debug)]
-pub enum RouteSweepError {
-    /// The table could not be read, so nothing was touched.
-    Enumerate(PlatformError),
-    /// Removing what was found failed part-way.
-    Delete(PlatformError),
-}
-
-impl std::fmt::Display for RouteSweepError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Enumerate(e) => write!(f, "could not read the route table: {e}"),
-            Self::Delete(e) => write!(f, "could not remove the routes found: {e}"),
-        }
-    }
-}
-
-/// The rows of the live table carrying our signature
-/// ([`crate::route_codegen::is_owned_route`]) or claimed by `also_ours`,
-/// stamped as ours.
-fn signed_routes(
-    api: &dyn RouteTablePort,
-    also_ours: &dyn Fn(&RouteEntry) -> bool,
-) -> Result<Vec<RouteEntry>, PlatformError> {
-    Ok(api
-        .get_ip_forward_table()?
-        .into_iter()
-        .filter(|r| crate::route_codegen::is_owned_route(r) || also_ours(r))
-        .map(|mut r| {
-            r.is_ours = true;
-            r
-        })
-        .collect())
-}
-
-/// Remove every route in the table that carries our signature, with no service
-/// running to say which it installed. Returns how many went. Recognition is
-/// [`crate::route_codegen::is_owned_route`] alone, so this needs no stored state.
-pub fn sweep_owned_routes(api: Arc<dyn RouteTablePort>) -> Result<usize, RouteSweepError> {
-    sweep_owned_routes_with(api, &|_: &RouteEntry| false)
-}
-
-/// [`sweep_owned_routes`], also removing the rows `also_ours` claims.
-pub fn sweep_owned_routes_with(
-    api: Arc<dyn RouteTablePort>,
-    also_ours: &dyn Fn(&RouteEntry) -> bool,
-) -> Result<usize, RouteSweepError> {
-    let orphans = signed_routes(api.as_ref(), also_ours).map_err(RouteSweepError::Enumerate)?;
-    if orphans.is_empty() {
-        return Ok(0);
-    }
-    let reconciler = SecondaryRouteReconciler::new(api);
-    reconciler.adopt_owned(orphans);
-    reconciler
-        .clear()
-        .map(|delta| delta.removed)
-        .map_err(RouteSweepError::Delete)
 }
 
 #[cfg(test)]
@@ -1106,36 +1151,102 @@ mod tests {
         );
     }
 
+    // ── routes removed from outside ──
+
+    /// A kept route deleted from outside, in either family, is put back on the
+    /// next pass; the one still in place is neither removed nor re-added.
     #[test]
-    fn offline_sweep_removes_our_signature_and_nothing_else() {
+    fn a_kept_route_removed_from_outside_is_put_back_and_nothing_else_moves() {
         let api = Arc::new(MockWindowsApi::new());
-        let ours = route([192, 0, 2, 1], [10, 0, 0, 1], 7);
-        let foreign_metric = RouteEntry {
-            metric: 100,
-            ..route([192, 0, 2, 2], [10, 0, 0, 1], 7)
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        let a = route([198, 51, 100, 1], [10, 0, 0, 1], 7);
+        let b = route([198, 51, 100, 2], [10, 0, 0, 1], 7);
+        let v6 = RouteEntry {
+            destination: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            prefix_length: 128,
+            next_hop: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            ..a.clone()
         };
-        let foreign_table = RouteEntry {
-            table: nrr_platform_api::RouteTableRef::Tagged(51820),
-            ..route([192, 0, 2, 3], [10, 0, 0, 1], 7)
-        };
-        api.set_route_table(vec![ours, foreign_metric, foreign_table]);
+        let desired = [a, b.clone(), v6.clone()];
+        rec.reconcile(&desired).unwrap();
 
-        let removed = sweep_owned_routes(Arc::clone(&api) as Arc<dyn RouteTablePort>).unwrap();
+        api.delete_ip_forward_entry(&b).unwrap();
+        api.delete_ip_forward_entry(&v6).unwrap();
+        let delta = rec.reconcile(&desired).unwrap();
 
-        assert_eq!(removed, 1);
         assert_eq!(
-            table_dests(&api),
-            HashSet::from([Ipv4Addr::new(192, 0, 2, 2), Ipv4Addr::new(192, 0, 2, 3)])
+            delta,
+            RouteReconcileDelta {
+                added: 2,
+                removed: 0
+            }
         );
+        assert_eq!(rec.owned_count(), 3);
+        assert_eq!(api.get_ip_forward_table().unwrap().len(), 3, "each once");
+        assert!(rec.reconcile(&desired).unwrap().is_noop());
     }
 
+    /// The OS may report a route of ours with another next-hop spelling or
+    /// metric. It is still in place: re-adding it would conflict and lose the
+    /// claim on it.
     #[test]
-    fn offline_sweep_of_a_clean_table_removes_nothing() {
+    fn a_route_reported_in_another_spelling_is_still_in_place() {
         let api = Arc::new(MockWindowsApi::new());
-        assert_eq!(
-            sweep_owned_routes(Arc::clone(&api) as Arc<dyn RouteTablePort>).unwrap(),
-            0
-        );
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        let a = route([198, 51, 100, 1], [10, 0, 0, 1], 7);
+        rec.reconcile(std::slice::from_ref(&a)).unwrap();
+        api.set_route_table(vec![RouteEntry {
+            next_hop: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            metric: 261,
+            is_ours: false,
+            ..a.clone()
+        }]);
+
+        assert!(rec.reconcile(&[a]).unwrap().is_noop());
+        assert_eq!(rec.owned_count(), 1);
+    }
+
+    /// An unreadable table proves nothing gone: memory stands, nothing moves.
+    #[test]
+    fn an_unreadable_table_keeps_what_is_remembered() {
+        let api = Arc::new(MockWindowsApi::new());
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        let a = route([198, 51, 100, 1], [10, 0, 0, 1], 7);
+        rec.reconcile(std::slice::from_ref(&a)).unwrap();
+        api.set_route_table_read_error(Some("busy"));
+
+        assert!(rec.reconcile(&[a]).unwrap().is_noop());
+        assert_eq!(rec.owned_count(), 1);
+    }
+
+    /// The pass hands over the table it began with, trusted only while no
+    /// write of ours has followed it: a route added since would read as gone,
+    /// and its re-add would conflict.
+    #[test]
+    fn a_handed_reading_is_trusted_until_a_write_of_ours_follows_it() {
+        let api = Arc::new(MockWindowsApi::new());
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        let a = route([198, 51, 100, 1], [10, 0, 0, 1], 7);
+        let c = route([198, 51, 100, 3], [10, 0, 0, 1], 7);
+        rec.reconcile(std::slice::from_ref(&a)).unwrap();
+
+        let writes = rec.write_count();
+        let rows = api.get_ip_forward_table().unwrap();
+        rec.install_additional(std::slice::from_ref(&c)).unwrap();
+        let both = [a, c];
+        let stale = TableReading {
+            writes,
+            rows: &rows,
+        };
+        let delta = rec.reconcile_seen(&both, Some(stale)).unwrap();
+        assert!(delta.is_noop(), "read again, and both are there: {delta:?}");
+
+        // A current reading is taken at its word.
+        let current = TableReading {
+            writes: rec.write_count(),
+            rows: &[],
+        };
+        assert_eq!(rec.reconcile_seen(&both, Some(current)).unwrap().added, 2);
     }
 
     // ── route ownership classification ──

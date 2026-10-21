@@ -10,7 +10,7 @@
 use nrr_domain::canonical::{CanonicalRuleBook, CanonicalRuleSet};
 use nrr_domain::rules_file::HostPlatform;
 use nrr_domain::rules_revision::RulesRevisionContent;
-use nrr_domain::RouteRole;
+use nrr_domain::{LeakProtection, RouteRole};
 use nrr_storage::install_policy::SecondaryUnset;
 use nrr_storage::route_bindings::BehaviorMode;
 
@@ -103,6 +103,8 @@ impl std::fmt::Display for ProvisionRefusal {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SettingsFacts {
     pub route_mode: Option<BehaviorMode>,
+    /// The floor of each new user's first leak protection.
+    pub leak_protection: Option<LeakProtection>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -293,12 +295,14 @@ fn bounded_text(bytes: &[u8], limit: usize) -> Result<&str, ReadError> {
 const MAX_DEPTH: usize = 8;
 
 /// The settings export as `production_settings_exporter` writes it: the
-/// `nrr_settings_export:` root, `version: 1`, and `behavior.route_mode`.
+/// `nrr_settings_export:` root, `version: 1`, `behavior.route_mode` and
+/// `behavior.leak_protection`.
 pub fn read_settings_export(bytes: &[u8]) -> Result<SettingsFacts, ReadError> {
     let text = bounded_text(bytes, SETTINGS_MAX_BYTES)?;
     let mut seen_root = false;
     let mut version: Option<String> = None;
     let mut route_mode: Option<String> = None;
+    let mut leak_protection: Option<String> = None;
     // Open sections, outermost first, each with the indent of its key.
     let mut open: Vec<(usize, &str)> = Vec::new();
     for (number, raw) in text.lines().enumerate() {
@@ -345,6 +349,7 @@ pub fn read_settings_export(bytes: &[u8]) -> Result<SettingsFacts, ReadError> {
         match (path.as_slice(), key) {
             ([], "version") => version = Some(value),
             (["behavior"], "route_mode") => route_mode = Some(value),
+            (["behavior"], "leak_protection") => leak_protection = Some(value),
             _ => {}
         }
     }
@@ -361,14 +366,32 @@ pub fn read_settings_export(bytes: &[u8]) -> Result<SettingsFacts, ReadError> {
         }
         None => return Err(("missing-version", "no `version:` line".to_owned())),
     }
+    let mut leak_protection = match leak_protection.as_deref() {
+        None | Some("") => None,
+        Some(slug) => Some(slug.parse::<LeakProtection>().map_err(|_| {
+            (
+                "unknown-leak-protection",
+                format!("leak_protection {slug:?}"),
+            )
+        })?),
+    };
     let route_mode = match route_mode.as_deref() {
         None | Some("") => None,
+        // An export written before the mode was retired: the additional route,
+        // and its promise of no leaks.
+        Some("strict-secondary-fail-closed") => {
+            leak_protection = Some(LeakProtection::Everything);
+            Some(BehaviorMode::PreferSecondaryWhenAvailable)
+        }
         Some(slug) => Some(
             BehaviorMode::from_slug(slug)
                 .ok_or(("unknown-route-mode", format!("route_mode {slug:?}")))?,
         ),
     };
-    Ok(SettingsFacts { route_mode })
+    Ok(SettingsFacts {
+        route_mode,
+        leak_protection,
+    })
 }
 
 /// A YAML scalar as the exporter writes it: double-quoted with `\\`, `\"`,

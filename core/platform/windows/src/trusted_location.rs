@@ -16,8 +16,8 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, BOOL, ERROR_SUCCESS, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, ProgressInvokeNever, TreeResetNamedSecurityInfoW, SDDL_REVISION_1,
-    SE_FILE_OBJECT,
+    GetNamedSecurityInfoW, ProgressInvokeNever, SetNamedSecurityInfoW, TreeResetNamedSecurityInfoW,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     GetAce, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, ACCESS_ALLOWED_ACE, ACL,
@@ -188,15 +188,31 @@ fn lock_down_tree(root: &Path, sddl: &str) -> Result<(), LockdownError> {
     let descriptor = SecurityDescriptor::from_sddl(sddl).map_err(LockdownError::Failed)?;
     let (owner, dacl) = descriptor.owner_and_dacl().map_err(LockdownError::Failed)?;
     let wide = wide(root.as_os_str());
+    // The root first, on its own: from then on nobody else can plant an entry
+    // directly under it, which narrows the window the recursive reset below
+    // leaves between the link scan and the reset.
     // SAFETY: `wide` is a NUL-terminated path borrowed for the call; `owner`
-    // and `dacl` point into `descriptor`, which outlives it. No progress callback.
+    // and `dacl` point into `descriptor`, which outlives it.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            LOCKED_DOWN_INFO,
+            owner,
+            PSID::default(),
+            Some(dacl),
+            None,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(failed_reset(root, status.0));
+    }
+    // SAFETY: as above; no progress callback.
     let status = unsafe {
         TreeResetNamedSecurityInfoW(
             PCWSTR(wide.as_ptr()),
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
+            LOCKED_DOWN_INFO,
             owner,
             PSID::default(),
             Some(dacl),
@@ -208,13 +224,28 @@ fn lock_down_tree(root: &Path, sddl: &str) -> Result<(), LockdownError> {
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(LockdownError::Failed(format!(
-            "reset permissions on {}: Win32 error {}",
-            root.display(),
-            status.0
-        )));
+        return Err(failed_reset(root, status.0));
+    }
+    // A link that appeared during the reset is reported, so the caller does
+    // not take the tree for clean.
+    if let Some(link) = first_reparse_point(root).map_err(LockdownError::Failed)? {
+        return Err(LockdownError::Link(link));
     }
     Ok(())
+}
+
+const LOCKED_DOWN_INFO: windows::Win32::Security::OBJECT_SECURITY_INFORMATION =
+    windows::Win32::Security::OBJECT_SECURITY_INFORMATION(
+        OWNER_SECURITY_INFORMATION.0
+            | DACL_SECURITY_INFORMATION.0
+            | PROTECTED_DACL_SECURITY_INFORMATION.0,
+    );
+
+fn failed_reset(root: &Path, status: u32) -> LockdownError {
+    LockdownError::Failed(format!(
+        "reset permissions on {}: Win32 error {status}",
+        root.display()
+    ))
 }
 
 /// Whether `path` is owned by SYSTEM, Administrators or TrustedInstaller.

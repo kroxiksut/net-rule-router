@@ -1,5 +1,4 @@
-//! The route half of the plan: host routes, overlays, default-block exemptions
-//! and the fake-IP pool.
+//! The route half of the plan: host routes, overlays and the fake-IP pool.
 
 use super::*;
 use crate::route_codegen::network_routes::{
@@ -19,7 +18,7 @@ use crate::route_codegen::NETWORK_ROUTE_METRIC;
 ///   so non-rule traffic rides the primary. Shaped by the same
 ///   [`counter_overlay_for`] as the codegen: a fixed `/2` set loses to a tunnel
 ///   that redirects with narrower prefixes.
-/// - **`PreferSecondaryWhenAvailable` / `StrictSecondaryFailClosed`** (mode B): the
+/// - **`PreferSecondaryWhenAvailable`** (mode B): the
 ///   `/1` split-default overlay ([`OVERLAY_LOW`] + [`OVERLAY_HIGH`]) via the
 ///   secondary, plus (with a primary target) the primary-bound rules pulled back
 ///   as `/32` exceptions via the primary.
@@ -116,8 +115,7 @@ pub fn plan_routes_with(
                 }
             }
         }
-        RouteBehaviorMode::PreferSecondaryWhenAvailable
-        | RouteBehaviorMode::StrictSecondaryFailClosed => {
+        RouteBehaviorMode::PreferSecondaryWhenAvailable => {
             // Own the split-default overlay → all traffic to the tunnel.
             routes.push(overlay_intent(
                 OVERLAY_LOW.0,
@@ -364,79 +362,6 @@ fn overlay_intent(net: Ipv4Addr, prefix: u8, egress: EgressRef) -> RouteIntent {
     }
 }
 
-/// The floor a blanket block may never cut, as neutral flows.
-///
-/// The strict mode's default catch-all blocks everything no rule permitted —
-/// including loopback, DHCP, the link's own control traffic and the tunnel's
-/// handshake. Those are not traffic anyone routes; cutting them takes the
-/// machine off its own network. On Windows this floor was carried by a branch
-/// in the orchestrator, so the neutral plan — the one Linux enforces — had a
-/// block with nothing underneath it.
-///
-/// Order mirrors the shipped `killswitch_codegen::default_block_exemptions`:
-/// loopback, link-local, broadcast, the local network control block, then the
-/// tunnel servers and the attached subnets. `server_ips` / `local_subnets` may
-/// be empty (a machine whose route table has not been read yet); the
-/// machine-independent part of the floor is planned regardless.
-///
-/// The block is family-less on a backend that judges both families in one
-/// chain, so the floor carries the IPv6 exemptions the blanket postures carry
-/// (`v6`): without them the block cuts `::1`, the link scope and the tunnel's
-/// own v6 endpoint.
-pub fn plan_default_block_exemptions(
-    sid: &str,
-    server_ips: &[Ipv4Addr],
-    local_subnets: &[(Ipv4Addr, u8)],
-    v6: Ipv6Exemptions<'_>,
-) -> Vec<FlowRule> {
-    let principal = principal_scope(sid);
-    let mut dsts: Vec<DstMatch> = vec![
-        DstMatch::SubnetV4 {
-            net: Ipv4Addr::new(127, 0, 0, 0),
-            prefix: 8,
-        },
-        DstMatch::SubnetV4 {
-            net: Ipv4Addr::new(169, 254, 0, 0),
-            prefix: 16,
-        },
-        DstMatch::HostV4(Ipv4Addr::BROADCAST),
-        DstMatch::SubnetV4 {
-            net: Ipv4Addr::new(224, 0, 0, 0),
-            prefix: 24,
-        },
-    ];
-    dsts.extend(server_ips.iter().map(|ip| DstMatch::HostV4(*ip)));
-    dsts.extend(
-        local_subnets
-            .iter()
-            .map(|(net, prefix)| DstMatch::SubnetV4 {
-                net: *net,
-                prefix: *prefix,
-            }),
-    );
-    dsts.extend(super::kill_switch::ipv6_exempt_matches(v6));
-
-    dsts.into_iter()
-        .enumerate()
-        .map(|(ordinal, dst)| FlowRule {
-            verdict: Verdict::Permit,
-            precedence: Precedence {
-                class: PrecedenceClass::CatchAllExempt,
-                ordinal: ordinal as u32,
-            },
-            flow: FlowMatch {
-                dst,
-                dst_port: None,
-                protocol: None,
-            },
-            principal: principal.clone(),
-            app: AppScope::Any,
-            egress: EgressConstraint::Any,
-            coverage: Coverage::ConnectOnly,
-        })
-        .collect()
-}
-
 /// The fake-IP relay's pool, as neutral flows.
 ///
 /// Two things have to be true at once for a fake-routed host to work: an
@@ -473,6 +398,7 @@ pub fn plan_fake_ip_pool(
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
+            observed_by_program: false,
         })
     };
 

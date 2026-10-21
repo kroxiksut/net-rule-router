@@ -224,10 +224,18 @@ pub fn handle_a_query(
         reconciler.request_reconcile();
         ReconcileOutcome::Deferred
     } else if futile_wait {
-        reconciler.request_reconcile();
+        // Only an address the policy lacks needs a pass that cannot be judged
+        // unchanged; an enforced one converges through the cache it moved.
+        if all_enforced {
+            reconciler.request_reconcile();
+        } else {
+            reconciler.request_reconcile_forced();
+        }
         ReconcileOutcome::AheadOfEnforcement
-    } else {
+    } else if all_enforced {
         reconciler.reconcile_now(hold_deadline)
+    } else {
+        reconciler.reconcile_forced(hold_deadline)
     };
     let enforced = all_enforced || matches!(reconcile, ReconcileOutcome::Installed);
     // Fail-open on latency is right while the additional link is UP: the worst
@@ -362,10 +370,10 @@ pub fn handle_aaaa_query(
             .typical_run()
             .is_some_and(|typical| typical > hold_deadline)
     {
-        reconciler.request_reconcile();
+        reconciler.request_reconcile_forced();
         ReconcileOutcome::AheadOfEnforcement
     } else {
-        reconciler.reconcile_now(hold_deadline)
+        reconciler.reconcile_forced(hold_deadline)
     };
     // No installed-address view for IPv6, so a skipped wait counts as a miss
     // under the guard, as on the A path.

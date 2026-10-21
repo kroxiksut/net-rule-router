@@ -46,6 +46,11 @@ fn set_dns_settings_fn() -> Option<SetDnsSettingsFn> {
     })
 }
 
+/// This Windows has `SetDnsSettings`, so a list write needs no child process.
+pub fn can_set_dns_settings() -> bool {
+    set_dns_settings_fn().is_some()
+}
+
 /// Makes `comma_separated` the global suffix search list; empty clears it.
 ///
 /// `None` when this Windows has no `SetDnsSettings`, so the caller can take

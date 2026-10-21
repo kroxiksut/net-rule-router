@@ -540,6 +540,77 @@ function stabilityAnyKeyApplies(supports) {
     return false
 }
 
+// Whether a write of `partial` would leave the `live` row as it is: every key
+// is a scalar field already holding the patched value. A Set that changes
+// nothing still asks for an administrator. An empty patch and a one-shot
+// request are never "nothing". Twin of `stability::patch_changes_nothing`.
+function stabilityPatchChangesNothing(live, partial) {
+    var keys = Object.keys(partial || {})
+    if (keys.length === 0) return false
+    for (var i = 0; i < keys.length; i += 1) {
+        var key = keys[i]
+        if (STABILITY_FIELD_DEFAULTS[key] === undefined) return false
+        if (stabilityEffective(live, key) !== stabilityCoerce(key, partial[key])) return false
+    }
+    return true
+}
+
+// Rust's `char::is_whitespace` over one UTF-16 unit (every such character
+// lies in the BMP): the trim the rules-file reader applies.
+function _rustIsSpaceUnit(u) {
+    return (u >= 0x09 && u <= 0x0D) || u === 0x20 || u === 0x85 || u === 0xA0 || u === 0x1680
+        || (u >= 0x2000 && u <= 0x200A) || u === 0x2028 || u === 0x2029 || u === 0x202F
+        || u === 0x205F || u === 0x3000
+}
+
+// `raw` as the rule it names: a program value in one outer pair of double
+// quotes loses them, as a rules-file line does. Every other value and rule
+// type comes back as given. Twin of `rule_form::form_rule_value`.
+function formRuleValue(ruleType, raw) {
+    var v = String(raw)
+    if (String(ruleType) !== "application" || v.length < 2
+            || v.charAt(0) !== "\"" || v.charAt(v.length - 1) !== "\"") return v
+    var a = 1
+    var b = v.length - 1
+    while (a < b && _rustIsSpaceUnit(v.charCodeAt(a))) a += 1
+    while (b > a && _rustIsSpaceUnit(v.charCodeAt(b - 1))) b -= 1
+    return a === b ? v : v.substring(a, b)
+}
+
+// The routing settings a window offers, in display order: each row exactly
+// where the service acts on it. Leak-protection refinements follow the level;
+// routing refinements do not. `leakProtection` is the level settled against
+// the default route, `enforcementMode` and `fakeIpEnabled` the effective
+// values. Twin of `routing_settings::offered`.
+function offeredRoutingSettings(supports, enforcementMode, leakProtection, secondaryBound, fakeIpEnabled) {
+    var guards = _profileSupports(supports, "killSwitch")
+    var stability = _profileSupports(supports, "serviceStabilityConfig")
+    var fakeIp = _profileSupports(supports, "fakeIp")
+    var level = String(leakProtection)
+    var everything = level === "everything"
+    var leakOn = everything || level === "sites"
+    var resolver = String(enforcementMode) === "resolver"
+    var bound = secondaryBound === true
+    var fakeIpOn = fakeIpEnabled === true
+    var rows = [
+        ["kill-switch-protocols", guards && leakOn],
+        ["allow-dns-over-primary", guards && everything],
+        ["enforcement-mode", stability],
+        ["dns-via-secondary", stability && bound],
+        ["dns-fast-answers", stability && resolver],
+        ["fake-ip-enabled", stability && resolver && fakeIp],
+        ["fake-ip-unavailable", stability && resolver && !fakeIp],
+        ["fake-ip-udp-relay", stability && resolver && fakeIp && fakeIpOn],
+        ["fake-ip-instant-rst", stability && resolver && fakeIp && fakeIpOn],
+        ["shared-ip-policy", true],
+        ["kill-switch-strict-shared-ips", guards && leakOn],
+        ["secondary-liveness-window-secs", stability && bound],
+        ["service-stability-unavailable", !stability],
+        ["local-networks", _profileSupports(supports, "localNetworkExceptions")]
+    ]
+    return rows.filter(function (row) { return row[1] }).map(function (row) { return row[0] })
+}
+
 // Whole hours and minutes left until `untilMs`, rounded up to the minute so
 // the last minute never reads as zero.
 function remainingHoursMinutes(untilMs, nowMs) {
@@ -1073,6 +1144,15 @@ function formatLastKnownTimestamp(observedAtMs, nowMs) {
     return dd + "." + mo + " " + timePart
 }
 
+// An enforcement status that says the additional link is not up: whatever
+// exit address was shown for it no longer describes anything.
+var SECONDARY_LINK_ENDED_STATUSES = ["secondary-down", "adapter-gone", "adapter-failed"]
+
+function secondaryLinkEnded(status, role) {
+    return String(role || "") === "secondary"
+        && SECONDARY_LINK_ENDED_STATUSES.indexOf(String(status || "")) >= 0
+}
+
 // ---- live adapter list ----
 
 // The enumerations that are this machine's. Any other spelling, an unknown one
@@ -1586,6 +1666,110 @@ function systemDnsNoticeStep(wasRaised, notRestored) {
     return { raise: now && wasRaised !== true, raised: now }
 }
 
+// What the `adapters` health message opens with when a full-tunnel VPN lets
+// only its own resolver answer (`DNS_ONLY_FOREIGN_RESOLVER` in nrr-shared).
+var DNS_ONLY_FOREIGN_RESOLVER = "only another VPN's DNS server answers"
+
+// Twin of `nrr_client_logic::system_dns::upstream_foreign_only`.
+function dnsUpstreamForeignOnly(health) {
+    var components = (health && health.components) || []
+    if (!Array.isArray(components)) return false
+    return components.some(function(c) {
+        return !!c && c.component === "adapters"
+            && !!c.message && String(c.message).indexOf(DNS_ONLY_FOREIGN_RESOLVER) === 0
+    })
+}
+
+// Twin of `nrr_client_logic::system_dns::foreign_only_notice_step`.
+function dnsUpstreamForeignNoticeStep(wasRaised, foreignOnly) {
+    return systemDnsNoticeStep(wasRaised, foreignOnly)
+}
+
+// What the `policy` health message opens with while a stored rule book cannot
+// be read (`RULES_BOOK_UNREADABLE` in nrr-shared).
+var RULES_BOOK_UNREADABLE = "a stored rule book could not be read"
+
+// Whether a health answer says the last applied rules are held because a
+// stored book could not be read. Twin of
+// `nrr_client_logic::diagnostics::rules_book_unreadable`.
+function rulesBookUnreadable(health) {
+    var components = (health && health.components) || []
+    if (!Array.isArray(components)) return false
+    return components.some(function(c) {
+        return !!c && c.component === "policy"
+            && !!c.message && String(c.message).indexOf(RULES_BOOK_UNREADABLE) === 0
+    })
+}
+
+// One reading of whether the user's own saved rules cannot be read, from its
+// push or the snapshot: raise the notice when that appears, keep a dismissed
+// one down while it lasts. Twin of
+// `nrr_client_logic::diagnostics::rules_book_notice_step`.
+function rulesBookNoticeStep(wasRaised, unreadable) {
+    return systemDnsNoticeStep(wasRaised, unreadable)
+}
+
+// One reading of the service manager's state for a client that watched the
+// service run: a stop nobody asked for raises the notice once and offers the
+// recoveries; a stop the user made stays silent. Twin of
+// `nrr_client_logic::service_loss::step`.
+function serviceLossStep(wasRaised, status, wasRunning, stopExpected, canRestore) {
+    var lost = status === "stopped" && wasRunning === true && stopExpected !== true
+    var actions = []
+    if (lost) {
+        actions.push("start-service")
+        if (canRestore === true) actions.push("restore-network")
+    }
+    return { raise: lost && wasRaised !== true, raised: lost, actions: actions }
+}
+
+// The banner kind for a failed health read. Only an unexplained drop is
+// sharpened by the service manager's slug (`_serviceStatusSlug`): the client
+// alone cannot tell "stopped" or "not installed" from "no answer". Same
+// decision as the terminal UI's `Link::from_status`.
+function offlineBackendKind(kind, serviceManagerSlug) {
+    if (kind !== "disconnected") return kind
+    if (serviceManagerSlug === "not-installed") return "service-not-installed"
+    if (serviceManagerSlug === "stopped") return "service-stopped"
+    return kind
+}
+
+// Whether a move between two banner kinds is news for the progress log: the
+// offline kinds differ only in what the service manager said about the same
+// outage.
+function backendOutageContinues(prevKind, kind) {
+    var offline = ["disconnected", "service-stopped", "service-not-installed"]
+    return offline.indexOf(prevKind) >= 0 && offline.indexOf(kind) >= 0
+}
+
+// The wait before sending a write again after it failed with `code`, or -1 to
+// give up. Only "no answer in time" is worth repeating: the service was busy.
+// Callers repeat only a write that names its own keys (`apply-only`), so a
+// repeat of one that did land changes nothing.
+var BUSY_RETRY_DELAYS_MS = [2000, 5000]
+function busyRetryDelayMs(code, attemptsMade) {
+    var c = String(code || "")
+    if (c !== "timeout" && c !== "rpc-timed-out") return -1
+    var n = Number(attemptsMade)
+    return n >= 0 && n < BUSY_RETRY_DELAYS_MS.length ? BUSY_RETRY_DELAYS_MS[n] : -1
+}
+
+// The shipped binaries the service reports as not installed
+// (`third-party.components.list` rows), as `{ key, name, feature }`. A file
+// that is there but does not match is a different message, and an asset has
+// nothing on disk to miss.
+function missingShippedComponents(rows) {
+    var out = []
+    var list = Array.isArray(rows) ? rows : []
+    for (var i = 0; i < list.length; i += 1) {
+        var r = list[i] || {}
+        if (r.kind !== "binary" || r.verdict !== "missing") continue
+        out.push({ key: String(r.key || ""), name: String(r.displayName || r.key || ""),
+                   feature: String(r.requiredFor || "") })
+    }
+    return out
+}
+
 // A network this computer forwards for: WSL's adapter (`vEthernet (WSL)`, or
 // `vEthernet (WSL (Hyper-V firewall))` on newer builds) or a Linux container or
 // VM bridge. Twin of `nrr_client_logic::forwarded::is_forwarding_adapter_name`.
@@ -1641,6 +1825,14 @@ function blockNoticeBacklog(entries) {
         shown: shown,
         more: destinations.length - shown.length
     }
+}
+
+// Whether a block notice of this reason offers "To additional route": a
+// downed route already has a rule, and a switch governs IPv6 and the
+// encrypted-DNS lockdown. Twin of `block_notices::offers_route`.
+function blockNoticeOffersRoute(reason) {
+    var r = String(reason || "")
+    return r !== "route-unavailable" && r !== "ipv6-blocked" && r !== "dns-lockdown"
 }
 
 // Warnings ahead of everything else, each group in the order given: what
@@ -1820,6 +2012,14 @@ function diagnosticsSnapshotMerged(current, status) {
     next.overallHealthy = status.overall_healthy === true
     next.stale = false
     next.origin = String(status.origin || "service")
+    next.missingCapabilities = Array.isArray(status.missing_capabilities)
+        ? status.missing_capabilities.map(String)
+        : []
+    var tamper = status.dns_tamper || {}
+    next.dnsTamper = {
+        affectedHosts: Number(tamper.affected_hosts || 0),
+        examples: Array.isArray(tamper.examples) ? tamper.examples.map(String) : []
+    }
     next.serviceHealth = {
         state: String(health.state || ""),
         activeRevisionId: _nullIfAbsent(health.active_revision_id),
@@ -1956,17 +2156,15 @@ function parsePendingSummaryCounts(summaryJsonText) {
 // Main-link probing keys are listed here for the same reason as every other
 // field: a request that omits a key sends its default, so a panel writing ANY
 // key would otherwise reset the ones it does not mention.
+// `mode` and `leak-protection` have no wire default; theirs is the fallback for
+// a snapshot that lacks them, and protection never reads as on by guess.
 var ROUTE_POLICY_FIELD_DEFAULTS = {
     "mode": "prefer-primary",
-    "block-secondary-when-unavailable": false,
-    "kill-switch-fail-closed": true,
+    "leak-protection": "off",
     "kill-switch-protocols": 127,
-    "kill-switch-block-all": false,
-    "kill-switch-enabled": false,
     "allow-dns-over-primary": true,
     "include-subdomains": true,
     "shared-ip-policy": "majority-of-ip",
-    "mode-a-coverage-strategy": "per-ip",
     "resolve-hosts-bypass": true,
     "doh-lockdown-enabled": false,
     "doh-lockdown-scope": "leak-protection-only",
@@ -1984,7 +2182,8 @@ var ROUTE_POLICY_FIELD_DEFAULTS = {
     "short-name-completion": false,
     "short-name-suffix": "",
     "app-rules-take-all-addresses": false,
-    "forwarded-outage": ""
+    "forwarded-outage": "",
+    "external-address-auto-check": false
 }
 
 // Keys the policy SNAPSHOT carries but the update REQUEST must not: they are
@@ -1998,14 +2197,10 @@ var ROUTE_POLICY_SNAPSHOT_ONLY_KEYS = ["secondary-link-provider-apps", "doh-lock
 // OFF, and every later visit to the panel re-sent the stale value.
 var ROUTE_POLICY_PREF_MIRRORS = {
     "mode": "routeBehaviorMode",
-    "kill-switch-enabled": "routeKillSwitchEnabled",
-    "kill-switch-fail-closed": "routeKillSwitchFailClosed",
-    "kill-switch-block-all": "routeKillSwitchBlockAll",
     "kill-switch-protocols": "routeKillSwitchProtocols",
     "allow-dns-over-primary": "routeAllowDnsOverPrimary",
     "include-subdomains": "routeIncludeSubdomains",
     "shared-ip-policy": "routeSharedIpPolicy",
-    "mode-a-coverage-strategy": "routeModeACoverageStrategy",
     "resolve-hosts-bypass": "routeResolveHostsBypass"
 }
 
@@ -2035,6 +2230,17 @@ var ROUTE_POLICY_FIELD_MASKS = {
     "kill-switch-protocols": { all: 0x7F, enforced: KILL_SWITCH_PROTOCOLS_ENFORCED }
 }
 
+// Every default route the service accepts.
+var DEFAULT_ROUTES = ["prefer-primary", "prefer-secondary-when-available"]
+
+// Every leak-protection level, weakest first.
+var LEAK_PROTECTION_LEVELS = ["off", "sites", "everything"]
+
+// Legal values of the slug fields; anything else reads as the default.
+var ROUTE_POLICY_FIELD_CHOICES = {
+    "leak-protection": ["off", "sites", "everything"]
+}
+
 // Normalise ONE route-policy value to the shape the wire expects, using the
 // declared default to pick the coercion. Absent / null / empty reads as the
 // default, so a snapshot value, a parked offline intent and a QML literal all
@@ -2050,7 +2256,92 @@ function routePolicyCoerce(key, raw) {
         if (mask === undefined) return n
         return ((n & mask.enforced) === 0 || (n & ~mask.all) !== 0) ? def : n
     }
-    return String(raw)
+    var text = String(raw)
+    var choices = ROUTE_POLICY_FIELD_CHOICES[key]
+    if (choices && choices.indexOf(text) < 0) return def
+    return text
+}
+
+// Whether `defaultRoute` keeps unmatched traffic on the main connection; an
+// unset one is the default, which does.
+function _isMainRoute(defaultRoute) {
+    var route = (defaultRoute === undefined || defaultRoute === null) ? "" : String(defaultRoute)
+    return route === "" || route === "prefer-primary"
+}
+
+// The leak-protection levels offered under `defaultRoute`, weakest first.
+// "Routed sites" only means something while unmatched traffic stays on the
+// main connection; under the additional one it would be "Everything".
+function leakProtectionChoices(defaultRoute) {
+    var main = _isMainRoute(defaultRoute)
+    return LEAK_PROTECTION_LEVELS.filter(function (level) { return level !== "sites" || main })
+}
+
+// `current` as a level `defaultRoute` offers: "Routed sites" under the
+// additional connection becomes "Everything", never weaker; an unknown value
+// reads as off. Twin of `route_policy::coerce_leak_protection`.
+function coerceLeakProtection(defaultRoute, current) {
+    if (current === "sites") return _isMainRoute(defaultRoute) ? "sites" : "everything"
+    if (current === "everything") return "everything"
+    return "off"
+}
+
+// The levels a first save offers under `defaultRoute` when the administrator
+// set `floor` at install time: none weaker than it. Twin of
+// `route_policy::leak_protection_choices_at_least`.
+function leakProtectionChoicesAtLeast(defaultRoute, floor) {
+    var least = LEAK_PROTECTION_LEVELS.indexOf(coerceLeakProtection(defaultRoute, floor))
+    return leakProtectionChoices(defaultRoute).filter(function (level) {
+        return LEAK_PROTECTION_LEVELS.indexOf(level) >= least
+    })
+}
+
+// `level` raised to `floor`, both as `defaultRoute` offers them. Twin of
+// `route_policy::raise_leak_protection`.
+function raiseLeakProtection(defaultRoute, level, floor) {
+    var held = coerceLeakProtection(defaultRoute, level)
+    var least = coerceLeakProtection(defaultRoute, floor)
+    return LEAK_PROTECTION_LEVELS.indexOf(least) > LEAK_PROTECTION_LEVELS.indexOf(held)
+        ? least : held
+}
+
+// What moving leak protection from `current` to `next` (both settled against
+// the default route) must be confirmed for: "holds-now" (Everything while the
+// additional connection is not available), "unroutable" (switched on over an
+// additional adapter with no way out) or "". `secondaryRow` is the bound
+// additional adapter's mapped row, null when none. Twin of
+// `route_policy::leak_protection_confirm`.
+function leakProtectionConfirmSlug(current, next, secondaryRow) {
+    if (next === current || next === "off") return ""
+    var up = !!secondaryRow && String(secondaryRow.availability || "") === "available"
+    if (next === "everything" && !up) return "holds-now"
+    if (current === "off" && !!secondaryRow
+            && unroutableInterfaceReasonSlug(secondaryRow) !== "") return "unroutable"
+    return ""
+}
+
+// What moving the default route to `nextRoute` must be confirmed for while
+// `level` is in force: the write raises "Routed sites" to "Everything" under
+// the additional connection. Twin of `route_policy::default_route_change_confirm`.
+function defaultRouteChangeConfirmSlug(level, nextRoute, secondaryRow) {
+    return leakProtectionConfirmSlug(level, coerceLeakProtection(nextRoute, level), secondaryRow)
+}
+
+// Whether `level` holds the internet the moment it applies: "Everything"
+// while the additional connection is not available. Twin of
+// `route_policy::leak_protection_holds_now`.
+function leakProtectionHoldsNow(level, secondaryRow) {
+    return leakProtectionConfirmSlug("off", level, secondaryRow) === "holds-now"
+}
+
+// Brings `req`'s leak protection in line with its own default route, so a
+// write that changes either never carries a pair the service refuses.
+// Returns `req`.
+function settleLeakProtection(req) {
+    req["leak-protection"] = coerceLeakProtection(
+        routePolicyCoerce("mode", req["mode"]),
+        routePolicyCoerce("leak-protection", req["leak-protection"]))
+    return req
 }
 
 // Whether the protocol box `bit` must stay ticked: it is the last one that
@@ -2100,6 +2391,7 @@ function buildFullRoutePolicyReq(cur, modeFallback) {
     }
     if (!req["mode"]) req["mode"] = String(modeFallback || "")
     for (key in ROUTE_POLICY_FIELD_DEFAULTS) req[key] = routePolicyCoerce(key, req[key])
+    settleLeakProtection(req)
     // The writer always claims the binding as user-assigned; `recovery` /
     // `migrated-from-preferences` are service- and migration-owned values that
     // must never be echoed back from a snapshot.
@@ -2139,13 +2431,53 @@ function isUserWriteOrigin(origin) {
 // The two adapter-binding slots of the route policy.
 var ROUTE_BINDING_KEYS = ["primary", "secondary"]
 
+// The leak-protection settings of an earlier build, folded into one choice.
+var _RETIRED_GUARD_KEYS = ["kill-switch-enabled", "kill-switch-fail-closed",
+    "kill-switch-block-all", "mode-a-coverage-strategy"]
+
+// What the retired settings of `intent` meant, mapped as the service's own
+// migration maps its rows; "" when the record holds none of them.
+function _retiredLevel(mine) {
+    if (mine["mode"] === "strict-secondary-fail-closed") return "everything"
+    var any = false
+    for (var i = 0; i < _RETIRED_GUARD_KEYS.length; i += 1) {
+        if (mine.hasOwnProperty(_RETIRED_GUARD_KEYS[i])) any = true
+    }
+    if (!any) return ""
+    if (mine["kill-switch-enabled"] !== true || mine["kill-switch-fail-closed"] === false) return "off"
+    var mode = (typeof mine["mode"] === "string" && mine["mode"] !== "")
+        ? mine["mode"] : "prefer-primary"
+    if (mine["kill-switch-block-all"] === true
+            || mine["mode-a-coverage-strategy"] === "fail-closed-unknown"
+            || mode !== "prefer-primary") return "everything"
+    return "sites"
+}
+
+// `intent` in this build's keys. A record kept before leak protection was one
+// choice still restores what it protected: the strict mode becomes the
+// additional default route with everything, the old guard its level. A level
+// the record holds was written by this build, after them, and stands. Twin of
+// `restore::upgrade_record`.
+function routePolicyIntentUpgrade(intent) {
+    var mine = intent || {}
+    var level = _retiredLevel(mine)
+    var next = {}
+    for (var key in mine) {
+        if (_RETIRED_GUARD_KEYS.indexOf(key) >= 0 || key === "block-secondary-when-unavailable")
+            continue
+        next[key] = mine[key]
+    }
+    if (next["mode"] === "strict-secondary-fail-closed")
+        next["mode"] = "prefer-secondary-when-available"
+    if (level !== "" && !next.hasOwnProperty("leak-protection")) next["leak-protection"] = level
+    return next
+}
+
 // The route-policy record after a write the service confirmed: every key the
 // write named takes the request's value; a key the request leaves out or sets
 // to null (an unbinding) is dropped.
 function routePolicyIntentAfterWrite(intent, req, keys) {
-    var next = {}
-    var key
-    for (key in (intent || {})) next[key] = intent[key]
+    var next = routePolicyIntentUpgrade(intent)
     var list = keys || []
     for (var i = 0; i < list.length; i += 1) {
         var k = String(list[i])
@@ -2179,6 +2511,7 @@ function _bindingHolds(slot, id) {
 // compare as the wire reads them; a binding compares by adapter id; a key this
 // build has no field for is not compared.
 function routePolicyIntentDivergence(intent, service) {
+    intent = routePolicyIntentUpgrade(intent)
     var out = []
     var cur = service || {}
     for (var key in (intent || {})) {
@@ -2189,44 +2522,76 @@ function routePolicyIntentDivergence(intent, service) {
             continue
         }
         if (ROUTE_POLICY_FIELD_DEFAULTS[key] === undefined) continue
-        if (routePolicyCoerce(key, mine) !== routePolicyEffective(cur, key)) out.push(key)
+        // A default route the service no longer accepts is not a setting to restore.
+        if (key === "mode" && DEFAULT_ROUTES.indexOf(routePolicyCoerce(key, mine)) < 0) continue
+        if (_asServiceReads(key, mine, cur) !== routePolicyEffective(cur, key)) out.push(key)
     }
     out.sort()
     return out
 }
 
+// The recorded value as the service's default route offers it: "Routed sites"
+// under the additional connection is "Everything" there.
+function _asServiceReads(key, mine, service) {
+    var value = routePolicyCoerce(key, mine)
+    if (key !== "leak-protection") return value
+    return coerceLeakProtection(routePolicyEffective(service, "mode"), value)
+}
+
 // The protective settings. After the service lost them they come back without
-// asking, and only ever switched ON that way: a damaged or stale record can
-// never be what turns protection off. Twin of `restore::PROTECTIVE_KEYS`.
+// asking, and only ever made stronger that way: a damaged or stale record can
+// never be what weakens protection. Twin of `restore::PROTECTIVE_KEYS`.
 var ROUTE_POLICY_PROTECTIVE_KEYS = [
     "doh-lockdown-enabled",
-    "kill-switch-block-all",
-    "kill-switch-enabled",
-    "kill-switch-fail-closed",
-    "kill-switch-strict-shared-ips"
+    "kill-switch-strict-shared-ips",
+    "leak-protection"
 ]
 
-// The protective keys the record holds on and the service holds off, sorted.
-function routePolicyProtectionToRestore(intent, service) {
-    var mine = intent || {}
+// The value that brings `key` back to what the record holds, when that is
+// stronger than what the service holds; undefined otherwise. Leak protection
+// is read under the service's default route, which the restore does not change.
+function _protectionStrengthened(key, mine, service) {
+    if (key !== "leak-protection") {
+        return (routePolicyCoerce(key, mine) === true
+                && routePolicyEffective(service, key) === false) ? true : undefined
+    }
+    var mode = routePolicyEffective(service, "mode")
+    var wanted = coerceLeakProtection(mode, routePolicyCoerce(key, mine))
+    var held = coerceLeakProtection(mode, routePolicyEffective(service, key))
+    return LEAK_PROTECTION_LEVELS.indexOf(wanted) > LEAK_PROTECTION_LEVELS.indexOf(held)
+        ? wanted : undefined
+}
+
+// `[key, value]` for each protective key the record holds stronger.
+function _protectionValues(intent, service) {
+    var mine = routePolicyIntentUpgrade(intent)
     var out = []
     for (var i = 0; i < ROUTE_POLICY_PROTECTIVE_KEYS.length; i += 1) {
         var key = ROUTE_POLICY_PROTECTIVE_KEYS[i]
         if (mine[key] === undefined) continue
-        if (routePolicyCoerce(key, mine[key]) === true
-                && routePolicyEffective(service || {}, key) === false) out.push(key)
+        var value = _protectionStrengthened(key, mine[key], service || {})
+        if (value !== undefined) out.push([key, value])
     }
     return out
 }
 
-// The one apply-only write that switches them back on, over the service's
-// row; null when nothing the record holds on is off.
+// The protective keys the record holds stronger than the service, sorted.
+function routePolicyProtectionToRestore(intent, service) {
+    return _protectionValues(intent, service).map(function (pair) { return pair[0] })
+}
+
+// The one apply-only write that brings them back, over the service's row;
+// null when the service holds nothing weaker than the record.
 function routePolicyProtectionRestore(intent, service) {
-    var keys = routePolicyProtectionToRestore(intent, service)
-    if (keys.length === 0) return null
+    var values = _protectionValues(intent, service)
+    if (values.length === 0) return null
     var request = buildFullRoutePolicyReq(service || {}, "")
-    for (var i = 0; i < keys.length; i += 1) request[keys[i]] = true
-    request["apply-only"] = keys.slice()
+    var keys = []
+    for (var i = 0; i < values.length; i += 1) {
+        request[values[i][0]] = values[i][1]
+        keys.push(values[i][0])
+    }
+    request["apply-only"] = keys
     return request
 }
 
@@ -2237,6 +2602,7 @@ function routePolicyProtectionRestore(intent, service) {
 // `missing` as `{ role, name }` and left out. `request` is null when nothing
 // can be restored.
 function routePolicyRestorePlan(intent, service, presentIds) {
+    intent = routePolicyIntentUpgrade(intent)
     var request = buildFullRoutePolicyReq(service || {}, "")
     var plan = { request: null, keys: [], missing: [] }
     var present = presentIds || []
@@ -2265,6 +2631,14 @@ function routePolicyRestorePlan(intent, service, presentIds) {
         plan.keys.push(key)
     }
     if (plan.keys.length > 0) {
+        // A restored default route may not offer the level the row holds; the
+        // level it moves to is then part of the write.
+        var held = request["leak-protection"]
+        settleLeakProtection(request)
+        if (request["leak-protection"] !== held && plan.keys.indexOf("leak-protection") < 0) {
+            plan.keys.push("leak-protection")
+            plan.keys.sort()
+        }
         request["apply-only"] = plan.keys.slice()
         plan.request = request
     }
@@ -2572,6 +2946,64 @@ function autoRuleShownByDefault(row) {
 /// The wire rows a window may offer unasked: what the tray popup chooses from.
 function autoRuleRowsShownByDefault(rows) {
     return (rows || []).filter(function(row) { return !!row && autoRuleShownByDefault(row) })
+}
+
+/// The wire contract this window's code speaks; `IPC_CONTRACT_REVISION` in Rust.
+var WIRE_CONTRACT_REVISION = 2
+
+/// The contract-skew slug from `local.service-info`, `""` when there is none.
+/// Twin of `nrr_client_logic::contract::skew`.
+function contractSkew(info, own) {
+    var i = info || {}
+    if (Number(i["service-protocol"] || 0) <= 0) return ""
+    if (Number(i["gui-contract"] || 0) !== own) return "client-older"
+    var service = Number(i["service-contract"] || 0)
+    if (service < own) return "service-older"
+    if (service > own) return "client-older"
+    return ""
+}
+
+/// Does an `auto-rule-candidates-changed` push raise a notice? Only one that
+/// announces offers (a service without the flag sent nothing else), and never
+/// over an empty inbox: a push that only moves the count updates the badges.
+function autoRuleNoticeDue(event) {
+    if (!event) return false
+    if (event["announces"] === false) return false
+    var count = Number(event["pending-count"] || 0)
+    return count > 0
+}
+
+/// `AUTO_RULE_SELF_SIGNED_SIGNALS`: offers a host or program made about itself.
+var AUTO_RULE_SELF_SIGNED_SIGNALS = [
+    "placeholder-answer", "main-link-blocked", "app-main-link-blocked", "app-own-resolver"
+]
+
+/// Is this wire row an offer the host or program made about itself? A slug
+/// this build does not know still reads as one when the row is its own anchor.
+function autoRuleIsSelfSigned(row) {
+    var r = row || {}
+    if (AUTO_RULE_SELF_SIGNED_SIGNALS.indexOf(String(r.signal || "")) >= 0) return true
+    var anchor = String(r.anchor || "")
+    return anchor !== "" && anchor === String(r["proposed-match"] || "")
+}
+
+/// What one notice over these wire rows is about, which picks its heading: a
+/// claim true of every row, or "assorted" when the rows disagree.
+function autoRuleNoticeKind(rows) {
+    var list = (rows || []).filter(function(r) { return !!r })
+    if (list.length === 0) return "companions"
+    var own = 0
+    var blocked = 0
+    var selfSigned = 0
+    for (var i = 0; i < list.length; i += 1) {
+        var signal = String(list[i].signal || "")
+        if (signal === "app-own-resolver") own += 1
+        if (signal === "app-main-link-blocked") blocked += 1
+        if (autoRuleIsSelfSigned(list[i])) selfSigned += 1
+    }
+    if (own > 0) return own === list.length ? "programs-own-resolver" : "assorted"
+    if (blocked > 0) return blocked === list.length ? "programs-blocked" : "mixed-blocked"
+    return selfSigned === list.length ? "sites-blocked" : "companions"
 }
 
 /// Pending hosts a group card lists after the list's filters: its caption.
@@ -2943,5 +3375,351 @@ function vpnClientTrustConfirmedApps(existing, offer, withBundle) {
         var bundle = o.bundledExePaths || []
         for (var b = 0; b < bundle.length; b += 1) push(bundle[b], "")
     }
+    return out
+}
+
+// The link provider set after the user removes `exePath`: every other entry,
+// unchanged and in order.
+function vpnClientTrustRemovedApps(existing, exePath) {
+    var path = String(exePath || "").trim()
+    var out = []
+    for (var i = 0; i < (existing || []).length; i += 1) {
+        var app = existing[i] || {}
+        if (!_vpnTrustSamePath(String(app["exe-path"] || "").trim(), path)) out.push(app)
+    }
+    return out
+}
+
+// The "Your VPN client" picker: rows are what discovery found plus every
+// stored program it did not find; it opens with the stored ones ticked, and a
+// confirm keeps any stored program the list did not show. Rows are
+// `{ displayName, exePath, running, source, interfaceName }`.
+// What each confirmed program is called: its name, else its file name.
+function vpnProviderNames(apps) {
+    var out = []
+    for (var i = 0; i < (apps || []).length; i += 1) {
+        var app = apps[i] || {}
+        var name = String(app["display-name"] || "").trim()
+        out.push(name !== "" ? name : _vpnTrustFileName(app["exe-path"]))
+    }
+    return out
+}
+
+function vpnPickerTickable(row) {
+    var r = row || {}
+    return String(r.source || "") !== "kernel-tunnel" && String(r.exePath || "").trim() !== ""
+}
+
+function _vpnPickerStoredName(stored, path) {
+    for (var i = 0; i < (stored || []).length; i += 1) {
+        var app = stored[i] || {}
+        if (_vpnTrustSamePath(String(app["exe-path"] || "").trim(), path)) {
+            var name = String(app["display-name"] || "").trim()
+            return name
+        }
+    }
+    return ""
+}
+
+function _vpnPickerShows(rows, path) {
+    for (var i = 0; i < rows.length; i += 1) {
+        if (vpnPickerTickable(rows[i]) && _vpnTrustSamePath(String(rows[i].exePath || "").trim(), path))
+            return true
+    }
+    return false
+}
+
+function vpnPickerRows(found, stored) {
+    var rows = []
+    for (var i = 0; i < (found || []).length; i += 1) {
+        var f = found[i] || {}
+        rows.push({
+            displayName: String(f.displayName || ""),
+            exePath: String(f.exePath || "").trim(),
+            running: f.running === true,
+            source: String(f.source || ""),
+            interfaceName: String(f.interfaceName || "")
+        })
+    }
+    for (var j = 0; j < (stored || []).length; j += 1) {
+        var app = stored[j] || {}
+        var path = String(app["exe-path"] || "").trim()
+        if (path === "" || _vpnPickerShows(rows, path)) continue
+        var name = String(app["display-name"] || "").trim()
+        rows.push({
+            displayName: name !== "" ? name : _vpnTrustFileName(path),
+            exePath: path,
+            running: false,
+            source: "confirmed",
+            interfaceName: ""
+        })
+    }
+    return rows
+}
+
+function vpnPickerPreselected(rows, stored) {
+    var out = []
+    for (var i = 0; i < (rows || []).length; i += 1) {
+        if (!vpnPickerTickable(rows[i])) continue
+        var path = String(rows[i].exePath || "").trim()
+        var isStored = false
+        for (var j = 0; j < (stored || []).length; j += 1) {
+            if (_vpnTrustSamePath(String((stored[j] || {})["exe-path"] || "").trim(), path)) isStored = true
+        }
+        var repeat = false
+        for (var k = 0; k < out.length; k += 1) {
+            if (_vpnTrustSamePath(out[k], path)) repeat = true
+        }
+        if (isStored && !repeat) out.push(path)
+    }
+    return out
+}
+
+function vpnPickerResultApps(rows, selected, stored) {
+    var list = rows || []
+    var out = []
+    var push = function (path, name) {
+        for (var k = 0; k < out.length; k += 1) {
+            if (_vpnTrustSamePath(out[k]["exe-path"], path)) return
+        }
+        out.push({ "exe-path": path, "display-name": name !== "" ? name : _vpnTrustFileName(path) })
+    }
+    for (var i = 0; i < list.length; i += 1) {
+        if (!vpnPickerTickable(list[i])) continue
+        var path = String(list[i].exePath || "").trim()
+        var ticked = false
+        for (var s = 0; s < (selected || []).length; s += 1) {
+            if (_vpnTrustSamePath(String(selected[s] || "").trim(), path)) ticked = true
+        }
+        if (!ticked) continue
+        var name = _vpnPickerStoredName(stored, path)
+        push(path, name !== "" ? name : String(list[i].displayName || "").trim())
+    }
+    for (var j = 0; j < (stored || []).length; j += 1) {
+        var app = stored[j] || {}
+        var kept = String(app["exe-path"] || "").trim()
+        if (kept === "" || _vpnPickerShows(list, kept)) continue
+        push(kept, String(app["display-name"] || "").trim())
+    }
+    return out
+}
+
+// `nrr_client_logic::vpn_gateway_trust`: the question asked when leak
+// protection stopped another VPN reaching its gateway, and the list an answer
+// writes (`route.vpn-gateways.set` replaces it whole).
+function _vpnGatewaySame(a, b) {
+    return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase()
+}
+
+function vpnGatewayOffers(pending) {
+    var offers = []
+    for (var i = 0; i < (pending || []).length; i += 1) {
+        var entry = pending[i] || {}
+        var address = String(entry["address"] || "").trim()
+        if (address === "") continue
+        var repeat = false
+        for (var j = 0; j < offers.length; j += 1) {
+            if (_vpnGatewaySame(offers[j].address, address)) repeat = true
+        }
+        if (repeat) continue
+        var program = String(entry["program"] || "").trim()
+        offers.push({ address: address, program: program, name: _vpnTrustFileName(program) })
+    }
+    return offers
+}
+
+function vpnGatewaysConfirmed(existing, offer) {
+    var out = []
+    var push = function (address, program) {
+        var a = String(address || "").trim()
+        if (a === "") return
+        for (var k = 0; k < out.length; k += 1) {
+            if (_vpnGatewaySame(out[k]["address"], a)) return
+        }
+        out.push({ "address": a, "program": String(program || "").trim() })
+    }
+    for (var i = 0; i < (existing || []).length; i += 1) {
+        var g = existing[i] || {}
+        push(g["address"], g["program"])
+    }
+    var o = offer || {}
+    push(o.address, o.program)
+    return out
+}
+
+function vpnGatewaysRemoved(existing, address) {
+    var out = []
+    for (var i = 0; i < (existing || []).length; i += 1) {
+        var g = existing[i] || {}
+        if (!_vpnGatewaySame(g["address"], address)) out.push(g)
+    }
+    return out
+}
+
+// `nrr_shared::glob::glob_match`: `*` is the only wildcard, `?` is literal.
+// Characters compare per code point under Unicode lowercasing (final sigma
+// folds to sigma); both sides implement it identically, and the vectors in
+// `core/client-logic/tests/vectors/glob_match.json` hold them together.
+function _globFold(cp) {
+    if (cp < 128) return (cp >= 65 && cp <= 90) ? String.fromCharCode(cp + 32) : String.fromCharCode(cp)
+    return String.fromCodePoint(cp).toLowerCase().replace(/\u03c2/g, "\u03c3")
+}
+function _globEq(a, b) {
+    return a === b || _globFold(a) === _globFold(b)
+}
+function _globWidth(cp) {
+    return cp > 0xffff ? 2 : 1
+}
+function globMatch(pattern, text) {
+    var pat = String(pattern), txt = String(text)
+    var p = 0, t = 0
+    var starP = -1, starT = 0
+    for (;;) {
+        if (p < pat.length && pat.charCodeAt(p) === 42) {
+            while (p < pat.length && pat.charCodeAt(p) === 42) p += 1
+            if (p === pat.length) return true
+            starP = p
+            starT = t
+            continue
+        }
+        if (p < pat.length && t < txt.length) {
+            var pc = pat.codePointAt(p), tc = txt.codePointAt(t)
+            if (_globEq(pc, tc)) {
+                p += _globWidth(pc)
+                t += _globWidth(tc)
+                continue
+            }
+        }
+        if (p === pat.length && t === txt.length) return true
+        if (starP >= 0 && starT < txt.length) {
+            starT += _globWidth(txt.codePointAt(starT))
+            p = starP
+            t = starT
+        } else {
+            return false
+        }
+    }
+}
+
+function _globFoldStr(text) {
+    var out = ""
+    for (var i = 0; i < text.length;) {
+        var cp = text.codePointAt(i)
+        out += _globFold(cp)
+        i += _globWidth(cp)
+    }
+    return out
+}
+
+// `nrr_client_logic::app_routes::plan_app_route_assignments`: which application
+// rules an app-group / virtual-machine route assignment removes, retargets
+// (to secondary, enabled) or adds. Indexes point into `rules`
+// ({value, route, enabled}); `assignments` are {value, route}.
+function planAppRouteAssignments(rules, assignments) {
+    var list = rules || [], todo = assignments || []
+    var removed = []
+    var plan = { remove: [], retarget: [], add: [] }
+    var i, k
+    for (i = 0; i < list.length; i += 1) removed.push(false)
+    for (k = 0; k < todo.length; k += 1) {
+        var pv = String(todo[k].value || "")
+        if (String(todo[k].route || "") !== "primary" || pv === "") continue
+        for (i = 0; i < list.length; i += 1) {
+            if (!removed[i] && globMatch(String(list[i].value || ""), pv)) removed[i] = true
+        }
+    }
+    var entries = []
+    for (i = 0; i < list.length; i += 1) {
+        if (removed[i]) { plan.remove.push(i); continue }
+        entries.push({
+            index: i,
+            value: String(list[i].value || ""),
+            ready: String(list[i].route || "") === "secondary" && list[i].enabled !== false
+        })
+    }
+    for (k = 0; k < todo.length; k += 1) {
+        var sv = String(todo[k].value || "")
+        if (String(todo[k].route || "") !== "secondary" || sv === "") continue
+        var wanted = _globFoldStr(sv), found = -1
+        for (i = 0; i < entries.length; i += 1) {
+            if (_globFoldStr(entries[i].value) === wanted) { found = i; break }
+            if (found < 0 && globMatch(entries[i].value, sv)) found = i
+        }
+        if (found >= 0) {
+            if (!entries[found].ready) {
+                entries[found].ready = true
+                if (entries[found].index >= 0) plan.retarget.push(entries[found].index)
+            }
+        } else {
+            plan.add.push(sv)
+            entries.push({ index: -1, value: sv, ready: true })
+        }
+    }
+    return plan
+}
+
+// `nrr_client_logic::app_routes::app_route_of`: the route the enabled
+// application rules ({value, route, enabled}) give `program`; the first rule
+// that covers it decides, "primary" when none does.
+function appRouteOf(rules, program) {
+    var list = rules || []
+    for (var i = 0; i < list.length; i += 1) {
+        if (list[i].enabled !== false && globMatch(String(list[i].value || ""), String(program || ""))) {
+            return String(list[i].route || "primary")
+        }
+    }
+    return "primary"
+}
+
+// `nrr_client_logic::app_routes::group_route`: the route all of `programs`
+// share, "mixed" when they differ, "primary" for a group with none.
+function groupRouteOf(rules, programs) {
+    var names = programs || []
+    if (names.length === 0) return "primary"
+    var first = appRouteOf(rules, names[0])
+    for (var i = 1; i < names.length; i += 1) {
+        if (appRouteOf(rules, names[i]) !== first) return "mixed"
+    }
+    return first
+}
+
+// The order of a full reset. The service is stopped last: every earlier step
+// needs it answering.
+var FULL_RESET_ORDER = ["clear-logs", "reset-sidecar", "purge-principal-data",
+    "apply-empty-rules", "stop-service"]
+
+// What a full reset does after the steps done so far. `done` is a list of
+// { step, result } in the order run, result "ok" | "failed" | "forbidden" |
+// "skipped". A failed step does not abort the next ones, except a refused
+// purge or rules step when the client cannot elevate by itself: the flow
+// stops ("needs-elevation") instead of stopping a service whose rules are
+// still in place. Otherwise { action: "run", step } or, after the last step,
+// { action: "finish", cleared } (purge, rules and stop all "ok").
+function fullResetNext(canElevate, done) {
+    var list = done || []
+    var out = { action: "", step: "", cleared: false, why: "" }
+    if (list.length > 0) {
+        var last = list[list.length - 1]
+        if (last.result === "forbidden" && canElevate !== true
+                && (last.step === "purge-principal-data" || last.step === "apply-empty-rules")) {
+            out.action = "stop"
+            out.step = last.step
+            out.why = "needs-elevation"
+            return out
+        }
+    }
+    if (list.length < FULL_RESET_ORDER.length) {
+        out.action = "run"
+        out.step = FULL_RESET_ORDER[list.length]
+        return out
+    }
+    var ok = function(step) {
+        for (var i = 0; i < list.length; i += 1) {
+            if (list[i].step === step && list[i].result === "ok") return true
+        }
+        return false
+    }
+    out.action = "finish"
+    out.cleared = ok("purge-principal-data") && ok("apply-empty-rules") && ok("stop-service")
     return out
 }

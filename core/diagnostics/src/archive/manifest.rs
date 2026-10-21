@@ -103,8 +103,12 @@ impl DiagnosticArchiveManifest {
 pub struct RedactionReport {
     /// Redaction mode applied.
     pub redaction_mode: String,
-    /// Number of hostname fields that were redacted to eTLD+1.
+    /// Number of hostnames hidden behind the host marker. A hostname shortened
+    /// to eTLD+1 leaves no marker and is not counted.
     pub hostnames_redacted: u32,
+    /// Number of values of any kind hidden behind the generic marker.
+    #[serde(default)]
+    pub values_redacted: u32,
     /// Number of IP addresses hidden behind markers.
     pub ips_redacted: u32,
     /// Number of process paths reduced to filename only.
@@ -239,6 +243,7 @@ mod tests {
         let r = RedactionReport {
             redaction_mode: "default".into(),
             hostnames_redacted: 10,
+            values_redacted: 7,
             ips_redacted: 5,
             paths_redacted: 3,
             excluded_sections: vec!["explain_samples.json".into()],

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use nrr_shared::ipc::IpcOperationName;
 
+use crate::boot_clock::BootInstant;
 use crate::ipc::{
     canonical_operation_class, CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode,
     IpcRequestContext, IpcRequestEnvelope, Prechecked,
@@ -202,7 +203,7 @@ impl RollbackHandler {
                 let token = self.token_store.issue(
                     IpcOperationName::RollbackRequest,
                     stored,
-                    Instant::now() + self.token_ttl,
+                    BootInstant::now() + self.token_ttl,
                 );
                 RollbackDryRunResponse {
                     confirmation_token: Some(token),
@@ -248,7 +249,7 @@ impl RollbackHandler {
                 IpcOperationName::RollbackRequest,
                 ctx.caller_stored(),
                 elevated_confirm,
-                Instant::now(),
+                BootInstant::now(),
             )
             .map_err(IpcError::from)?;
         let reviewed_target = stored

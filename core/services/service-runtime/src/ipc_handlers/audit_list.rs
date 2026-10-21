@@ -67,6 +67,7 @@ mod tests {
             reason_code: "review.approved".into(),
             revision_id: Some("rev-1".into()),
             has_payload_summary: false,
+            cause: None,
         }
     }
 

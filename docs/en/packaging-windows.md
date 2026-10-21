@@ -1,5 +1,7 @@
 # Packaging NetRuleRouter for Windows
 
+**English** · [Русский](../ru/packaging-windows.md)
+
 `scripts/package-windows.ps1` turns a checkout into a folder that runs on a
 clean Windows machine: no Qt, no Rust toolchain, no repository, no installer.
 Copy the folder to the target machine and start `NetRuleRouter.exe`.
@@ -47,6 +49,7 @@ NetRuleRouter\
   qml\                  Qt's own modules
   apps\desktop\qml\     the application's QML
   locales\  presets\  configs\  assets\  scripts\
+  licenses\            licence texts: this product, Wintun, and (full package) Qt
 ```
 
 Two details of that layout are load bearing rather than cosmetic:

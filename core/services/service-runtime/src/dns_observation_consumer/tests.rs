@@ -97,6 +97,7 @@ fn obs(host: &str, ip: [u8; 4]) -> DnsObservation {
     DnsObservation {
         hostname: host.into(),
         ipv4s: vec![Ipv4Addr::from(ip)],
+        ipv6s: Vec::new(),
         owner: None,
     }
 }
@@ -374,18 +375,18 @@ fn seed_from_os_cache_caches_rule_matches_skips_others_and_loopback() {
         // Matches the `.example` zone rule → seeded.
         OsCachedResolution {
             canonical_hostname: "shop.example".into(),
-            addresses: vec![Ipv4Addr::new(100, 64, 1, 4)],
+            addresses: vec![IpAddr::V4(Ipv4Addr::new(100, 64, 1, 4))],
         },
         // No rule → ignored.
         OsCachedResolution {
             canonical_hostname: "other.test".into(),
-            addresses: vec![Ipv4Addr::new(100, 64, 8, 8)],
+            addresses: vec![IpAddr::V4(Ipv4Addr::new(100, 64, 8, 8))],
         },
         // Matches the zone name but is an ad-block loopback pin → dropped
         // before it can become a /32 (mirrors the observe path).
         OsCachedResolution {
             canonical_hostname: "ads.example".into(),
-            addresses: vec![Ipv4Addr::new(127, 0, 0, 1)],
+            addresses: vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
         },
     ]);
     let c = consumer(
@@ -401,7 +402,10 @@ fn seed_from_os_cache_caches_rule_matches_skips_others_and_loopback() {
         sum.matched, 1,
         "only shop.example is a rule match with a routable IP"
     );
-    assert_eq!(sum.ignored, 1, "other.test matched no rule");
+    assert_eq!(
+        sum.ignored, 0,
+        "names outside the rules are dropped by the reader filter, before any per-name OS lookup"
+    );
     assert_eq!(
         lookup.ips_for_hostname("shop.example"),
         vec![Ipv4Addr::new(100, 64, 1, 4)]
@@ -487,6 +491,125 @@ fn re_observing_an_unchanged_host_is_refresh_not_progress() {
     assert!(third.made_progress());
 }
 
+/// An IPv6 address of a rule host is cached like its IPv4 one, and a new one
+/// is progress even when the IPv4 set is unchanged: the codegen pins and
+/// routes both families, so a v4-only comparison would leave it unenforced
+/// until something else recomputed.
+#[test]
+fn a_new_ipv6_address_of_a_rule_host_is_cached_and_is_progress() {
+    let (cache, lookup) = in_memory_cache();
+    let c = consumer(
+        vec![exact_fqdn_rule("r1", "dual.example")],
+        Arc::clone(&cache),
+        Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+        active_sid("S-A"),
+    );
+    let v4 = IpAddr::V4(Ipv4Addr::new(100, 64, 7, 7));
+    let v6: IpAddr = "2001:db8::7".parse().expect("v6");
+
+    let mut first = ConsumeSummary::default();
+    c.upsert_counted(
+        "dual.example",
+        [v4],
+        SystemTime::now(),
+        StorageResolutionSource::Dns,
+        &mut first,
+    );
+    assert_eq!(first.matched, 1);
+
+    let mut second = ConsumeSummary::default();
+    c.upsert_counted(
+        "dual.example",
+        [v4, v6],
+        SystemTime::now(),
+        StorageResolutionSource::Dns,
+        &mut second,
+    );
+    assert_eq!(second.matched, 1, "a new IPv6 address changes the plan");
+    let cached = lookup.ips_for_hostname("dual.example");
+    assert!(cached.contains(&v4) && cached.contains(&v6), "{cached:?}");
+
+    let mut third = ConsumeSummary::default();
+    c.upsert_counted(
+        "dual.example",
+        [v4, v6],
+        SystemTime::now(),
+        StorageResolutionSource::Dns,
+        &mut third,
+    );
+    assert_eq!((third.matched, third.refreshed), (0, 1));
+}
+
+/// An observed AAAA answer of a rule host reaches the cache, alone or beside
+/// its A answer; an address nothing can be reached at does not.
+#[test]
+fn an_observed_ipv6_answer_of_a_rule_host_is_cached() {
+    let (cache, lookup) = in_memory_cache();
+    let c = consumer(
+        vec![suffix_rule("r1", "example.com")],
+        Arc::clone(&cache),
+        Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+        active_sid("S-A"),
+    );
+    let v6 = |s: &str| s.parse::<std::net::Ipv6Addr>().expect("v6");
+    let answer = |host: &str, ipv4s: Vec<Ipv4Addr>, ipv6s| DnsObservation {
+        hostname: host.into(),
+        ipv4s,
+        ipv6s,
+        owner: None,
+    };
+
+    let sum = c.consume(
+        &[
+            answer(
+                "v6only.example.com",
+                vec![],
+                vec![v6("2001:db8::10"), v6("fe80::1")],
+            ),
+            answer(
+                "dual.example.com",
+                vec![Ipv4Addr::new(198, 51, 100, 10)],
+                vec![v6("2001:db8::11")],
+            ),
+            answer("elsewhere.test", vec![], vec![v6("2001:db8::12")]),
+        ],
+        SystemTime::now(),
+    );
+
+    assert_eq!(sum.matched, 2);
+    assert_eq!(
+        lookup.ips_for_hostname("v6only.example.com"),
+        vec![IpAddr::V6(v6("2001:db8::10"))],
+        "link-local is never cached",
+    );
+    let dual = lookup.ips_for_hostname("dual.example.com");
+    assert!(dual.contains(&IpAddr::V6(v6("2001:db8::11"))), "{dual:?}");
+    assert!(dual.contains(&IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))));
+    assert!(lookup.ips_for_hostname("elsewhere.test").is_empty());
+}
+
+#[test]
+fn an_os_cached_ipv6_address_of_a_rule_host_is_seeded() {
+    use nrr_platform_api::dns::{MockDnsCacheRead, OsCachedResolution};
+    let (cache, lookup) = in_memory_cache();
+    let reader = Arc::new(MockDnsCacheRead::new());
+    let v6: IpAddr = "2001:db8::20".parse().expect("v6");
+    reader.set_entries(vec![OsCachedResolution {
+        canonical_hostname: "shop.example".into(),
+        addresses: vec![v6, "::1".parse().expect("loopback")],
+    }]);
+    let c = consumer(
+        vec![zone_rule("r1", "example")],
+        Arc::clone(&cache),
+        Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+        active_sid("S-A"),
+    )
+    .with_dns_cache_read(reader);
+
+    assert_eq!(c.seed_from_os_cache(SystemTime::now()).matched, 1);
+    assert_eq!(lookup.ips_for_hostname("shop.example"), vec![v6]);
+}
+
 #[test]
 fn re_seeding_unchanged_os_cache_entries_is_not_progress() {
     use nrr_platform_api::dns::{MockDnsCacheRead, OsCachedResolution};
@@ -494,7 +617,7 @@ fn re_seeding_unchanged_os_cache_entries_is_not_progress() {
     let reader = Arc::new(MockDnsCacheRead::new());
     reader.set_entries(vec![OsCachedResolution {
         canonical_hostname: "shop.example".into(),
-        addresses: vec![Ipv4Addr::new(100, 64, 1, 4)],
+        addresses: vec![IpAddr::V4(Ipv4Addr::new(100, 64, 1, 4))],
     }]);
     let c = consumer(
         vec![zone_rule("r1", "example")],
@@ -910,6 +1033,7 @@ fn loopback_and_unspecified_observations_are_not_cached_or_collateral() {
         &[DnsObservation {
             hostname: "mix.example.com".into(),
             ipv4s: vec![Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(198, 51, 100, 4)],
+            ipv6s: Vec::new(),
             owner: None,
         }],
         SystemTime::now(),

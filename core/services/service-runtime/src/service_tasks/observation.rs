@@ -10,20 +10,68 @@ use crate::conn_observation_consumer::ConnectionTraceRing;
 /// A tick that unwinds clears it — the supervisor restarts the task only after
 /// a backoff, and the panel must not claim to watch meanwhile; a tick that
 /// returns sets it again.
-struct ObserverLiveness<'a>(Option<&'a ConnectionTraceRing>);
+/// Health voice of the DNS feed, apart from the task-liveness one.
+const HEALTH_SOURCE_DNS_FEED: &str = "dns-observer-feed";
+
+/// Health voice of the connection feed, apart from the task-liveness one.
+const HEALTH_SOURCE_CONN_FEED: &str = "conn-observer-feed";
+
+struct ObserverLiveness<'a> {
+    ring: Option<&'a ConnectionTraceRing>,
+    /// The source's feeding thread is alive; a dead pump drains empty forever.
+    feeding: bool,
+    /// Where a source that stopped feeding is reported, beside the panel flag.
+    health: Option<&'a HealthAggregator>,
+}
 
 impl Drop for ObserverLiveness<'_> {
     fn drop(&mut self) {
-        let Some(ring) = self.0 else { return };
+        let Some(ring) = self.ring else { return };
         if std::thread::panicking() {
             ring.mark_observer_down();
-        } else {
+        } else if self.feeding {
+            if let Some(health) = self.health {
+                health.clear_as(HEALTH_SOURCE_CONN_FEED, HealthComponent::BackgroundTasks);
+            }
             ring.mark_observer_active();
+        } else {
+            if let Some(health) = self.health {
+                health.record_as(
+                    HEALTH_SOURCE_CONN_FEED,
+                    HealthComponent::BackgroundTasks,
+                    ServiceHealthSeverity::Degraded,
+                    "connection observation stopped feeding: the trace and application-rule learning are blind",
+                );
+            }
+            if ring.observer_active() {
+                tracing::warn!(
+                    target: "nrr::conn-trace",
+                    "connection observation source stopped feeding; the trace is not watching",
+                );
+            }
+            ring.mark_observer_down();
         }
     }
 }
 
 // ── DNS observation ──────────────────────────────────────────────────────────
+
+/// A dead DNS feed drains empty forever, which looks like a quiet network while
+/// domain rules stop learning; say so on the health surface, and clear it when
+/// the feed is back.
+fn report_dns_feed(health: Option<&HealthAggregator>, feeding: bool) {
+    let Some(health) = health else { return };
+    if feeding {
+        health.clear_as(HEALTH_SOURCE_DNS_FEED, HealthComponent::BackgroundTasks);
+    } else {
+        health.record_as(
+            HEALTH_SOURCE_DNS_FEED,
+            HealthComponent::BackgroundTasks,
+            ServiceHealthSeverity::Degraded,
+            "DNS observation stopped feeding: domain rules stop learning new addresses",
+        );
+    }
+}
 
 /// How often observed resolutions are folded into the rule-driven cache.
 ///
@@ -143,12 +191,17 @@ pub fn build_app_observation_task(
         APP_OBSERVATION_INTERVAL,
         RECOVERABLE_DEFAULT_MAX_RESTARTS,
         move |_stop| {
-            let _liveness = ObserverLiveness(ring.as_deref());
-            let learnt = fold_observations(&wiring);
-            if learnt > 0 {
+            let _liveness = ObserverLiveness {
+                ring: ring.as_deref(),
+                feeding: wiring.source.is_feeding(),
+                health: None,
+            };
+            let before = wiring.store.generation();
+            let fold = fold_batch(&wiring);
+            if fold.redrives_policy(wiring.store.generation() != before) {
                 tracing::debug!(
                     target: "nrr::app-routing",
-                    learnt,
+                    learnt = fold.destinations + fold.other,
                     "new application destinations observed; re-driving policy",
                 );
                 if let Some(hook) = on_new_destination.as_ref() {
@@ -160,17 +213,44 @@ pub fn build_app_observation_task(
     )
 }
 
+/// What one drain of the source changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fold {
+    /// Destinations that were new to the store, for any program.
+    pub destinations: usize,
+    /// Withdrawn destinations and newly-learnt VPN clients: each changes the
+    /// next pass whatever program it came from.
+    pub other: usize,
+}
+
+impl Fold {
+    /// Whether the next pass plans something different. A new address of a
+    /// program no rule names does not (`store_moved` false): the store moves
+    /// its generation only for programs a plan has read, so a browser tab
+    /// opening a connection costs no pass.
+    #[must_use]
+    pub fn redrives_policy(&self, store_moved: bool) -> bool {
+        self.other > 0 || (self.destinations > 0 && store_moved)
+    }
+}
+
 /// Drain the source into the store; returns how many destinations were NEW.
 ///
 /// Separate from the task so the decision is testable without a supervisor: the
 /// count is what decides whether policy is re-driven, and a count that can only
 /// be read from a log is a decision nothing checks.
 pub fn fold_observations(wiring: &AppObservationWiring) -> usize {
+    let fold = fold_batch(wiring);
+    fold.destinations + fold.other
+}
+
+/// [`fold_observations`], with the new destinations told apart from the rest.
+pub fn fold_batch(wiring: &AppObservationWiring) -> Fold {
     let mut learnt = 0usize;
     let mut batch = wiring.source.drain();
     if let Some(consumer) = wiring.consumer.as_ref() {
         if batch.is_empty() {
-            return 0;
+            return Fold::default();
         }
         // A socket table has no clock of its own: the drain time stands in.
         let now = SystemTime::now();
@@ -180,8 +260,10 @@ pub fn fold_observations(wiring: &AppObservationWiring) -> usize {
         }
         let summary = consumer.consume(&batch, now);
         // Each of these changes what the next pass plans.
-        return (summary.app_ips_added + summary.app_ips_retracted + summary.vpn_client_apps_learned)
-            as usize;
+        return Fold {
+            destinations: summary.app_ips_added as usize,
+            other: (summary.app_ips_retracted + summary.vpn_client_apps_learned) as usize,
+        };
     }
     if let Some(trace) = wiring.trace.as_ref() {
         trace.record(&batch, crate::conn_observation_consumer::now_unix_ms());
@@ -212,7 +294,10 @@ pub fn fold_observations(wiring: &AppObservationWiring) -> usize {
             }
         }
     }
-    learnt
+    Fold {
+        destinations: learnt,
+        other: 0,
+    }
 }
 
 // ── Live-connection refresh ──────────────────────────────────────────────────
@@ -278,6 +363,7 @@ pub fn build_dns_observe_task(
     source: Arc<dyn nrr_platform_api::dns_observe::DnsObservationSource>,
     consumer: Arc<crate::dns_observation_consumer::DnsObservationConsumer>,
     on_progress: Option<crate::supervised_runtime::RouteRecomputeHook>,
+    health: Option<Arc<HealthAggregator>>,
 ) -> ServiceTask {
     // Seed the FQDN cache from the OS resolver cache on a SLOW cadence (every
     // SEED_EVERY_TICKS observe ticks ≈ 30 s at the 1 s observe interval) in
@@ -294,6 +380,7 @@ pub fn build_dns_observe_task(
         DNS_OBSERVE_INTERVAL,
         0,
         move |_stop| {
+            report_dns_feed(health.as_deref(), source.is_feeding());
             let batch = source.drain();
             if !batch.is_empty() {
                 let summary = consumer.consume(&batch, SystemTime::now());
@@ -335,6 +422,17 @@ pub fn build_conn_observe_task(
     consumer: Arc<crate::conn_observation_consumer::ConnectionObservationConsumer>,
     on_progress: Option<crate::supervised_runtime::RouteRecomputeHook>,
 ) -> ServiceTask {
+    build_conn_observe_task_reporting(source, consumer, on_progress, None)
+}
+
+/// [`build_conn_observe_task`] that also reports a source which stopped
+/// feeding to `health`, so it does not die quietly.
+pub fn build_conn_observe_task_reporting(
+    source: Arc<dyn nrr_platform_api::conn_observe::ConnectionObservationSource>,
+    consumer: Arc<crate::conn_observation_consumer::ConnectionObservationConsumer>,
+    on_progress: Option<crate::supervised_runtime::RouteRecomputeHook>,
+    health: Option<Arc<HealthAggregator>>,
+) -> ServiceTask {
     let ring = consumer.trace_ring().cloned();
     ServiceTask::periodic(
         TASK_ID_CONN_OBSERVE,
@@ -342,10 +440,16 @@ pub fn build_conn_observe_task(
         CONN_OBSERVE_INTERVAL,
         0,
         move |_stop| {
-            let _liveness = ObserverLiveness(ring.as_deref());
+            let _liveness = ObserverLiveness {
+                ring: ring.as_deref(),
+                feeding: source.is_feeding(),
+                health: health.as_deref(),
+            };
             let batch = source.drain();
             if !batch.is_empty() {
+                let app_generation = consumer.app_generation();
                 let summary = consumer.consume(&batch, SystemTime::now());
+                let app_store_moved = consumer.app_generation() != app_generation;
                 if summary.made_progress() {
                     tracing::info!(
                         target: "nrr::conn-trace",
@@ -378,7 +482,9 @@ pub fn build_conn_observe_task(
                 // of waiting for the next apply. A newly-learned VPN client
                 // app must likewise arm its app-scoped exemption before the
                 // client's next check, not at the 30 s safety tick.
-                if summary.app_ips_added > 0
+                // A new address of a program no rule names moves nothing: the
+                // store counts only the ones a plan has read.
+                if (summary.app_ips_added > 0 && app_store_moved)
                     // A withdrawal has to reach the route table as promptly as
                     // an addition: until the recompute runs, the `/32` is still
                     // moving the process the withdrawal was for.
@@ -400,12 +506,34 @@ mod liveness_tests {
     use super::*;
 
     #[test]
+    fn a_dead_dns_feed_reaches_health_and_a_revived_one_clears_it() {
+        let health = HealthAggregator::new();
+        let degraded = |h: &HealthAggregator| {
+            h.snapshot().components.iter().any(|c| {
+                c.component == HealthComponent::BackgroundTasks
+                    && c.severity == ServiceHealthSeverity::Degraded
+            })
+        };
+        report_dns_feed(Some(&health), true);
+        assert!(!degraded(&health));
+        report_dns_feed(Some(&health), false);
+        assert!(degraded(&health), "a dead feed must reach health");
+        report_dns_feed(Some(&health), true);
+        assert!(!degraded(&health), "a feed that is back clears the report");
+    }
+
+    #[test]
     fn an_unwinding_tick_clears_the_watching_flag_and_a_clean_tick_restores_it() {
         let ring = ConnectionTraceRing::new(4);
+        let health = HealthAggregator::new();
         ring.mark_observer_active();
 
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _liveness = ObserverLiveness(Some(&ring));
+            let _liveness = ObserverLiveness {
+                ring: Some(&ring),
+                feeding: true,
+                health: None,
+            };
             panic!("observer tick blew up");
         }));
         assert!(unwound.is_err());
@@ -415,11 +543,36 @@ mod liveness_tests {
         );
 
         {
-            let _liveness = ObserverLiveness(Some(&ring));
+            let _liveness = ObserverLiveness {
+                ring: Some(&ring),
+                feeding: true,
+                health: None,
+            };
         }
         assert!(
             ring.observer_active(),
             "a completed tick means watching again"
+        );
+
+        {
+            let _liveness = ObserverLiveness {
+                ring: Some(&ring),
+                feeding: false,
+                health: Some(&health),
+            };
+        }
+        assert!(
+            !ring.observer_active(),
+            "a source whose pump died must not be reported as watching"
+        );
+        assert!(
+            health
+                .snapshot()
+                .components
+                .iter()
+                .any(|c| c.component == HealthComponent::BackgroundTasks
+                    && c.severity == ServiceHealthSeverity::Degraded),
+            "a dead feed must reach health"
         );
     }
 }

@@ -56,6 +56,9 @@ fn error_slug(error: &IpcClientError) -> String {
         IpcClientError::BadResponse { .. } => "bad-response".to_owned(),
         IpcClientError::SerializationFailed(_) => "serialization-failed".to_owned(),
         IpcClientError::ClientShutdown => "client-shutdown".to_owned(),
+        IpcClientError::ContractMismatch { .. } => {
+            nrr_shared::client_error_codes::SERVICE_CONTRACT_MISMATCH.to_owned()
+        }
     }
 }
 

@@ -114,15 +114,13 @@ fn probe_verbose_until_reflects_persisted_value() {
 }
 
 #[test]
-fn fake_ip_enabled_defaults_false_and_roundtrips() {
-    // Machine-wide fake-IP toggle: off for the implicit
-    // default record and for a pre-v34 row; an explicit `true` persists.
+fn fake_ip_enabled_is_on_for_a_fresh_install_and_a_stored_off_is_kept() {
     let dir = tempfile::tempdir().expect("temp dir");
     let conn = open_state_db(&dir);
     let repo = ServiceStabilityConfigRepository::new(&conn);
     assert!(
-        !repo.get_or_default().expect("get").fake_ip_enabled,
-        "implicit default must be off (opt-in feature)"
+        repo.get_or_default().expect("get").fake_ip_enabled,
+        "a never-written config has fake-IP on"
     );
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
@@ -134,7 +132,7 @@ fn fake_ip_enabled_defaults_false_and_roundtrips() {
         300,
         EnforcementMode::Resolver,
         0,
-        true,
+        false,
         false,
         true,
         false,
@@ -145,9 +143,33 @@ fn fake_ip_enabled_defaults_false_and_roundtrips() {
     )
     .expect("set");
     let r = repo.get_or_default().expect("get");
-    assert!(r.fake_ip_enabled, "fake_ip_enabled=true must persist");
+    assert!(
+        !r.fake_ip_enabled,
+        "a stored off is not replaced by the default"
+    );
     // Unrelated flags untouched.
     assert!(r.verbose_until_ms.is_none() && r.conn_trace_ndjson_until_ms.is_none());
+}
+
+/// An install that saved its settings before the default changed keeps them:
+/// the column default, which a row written before the field existed takes,
+/// stays off.
+#[test]
+fn a_row_written_before_fake_ip_existed_reads_it_as_off() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    conn.execute(
+        "INSERT INTO service_stability_config
+             (id, ipc_accept_kind, ipc_max_restarts, ipc_backoff_base_ms,
+              ipc_backoff_cap_ms, updated_at)
+         VALUES (1, 'critical', NULL, NULL, NULL, 7)",
+        [],
+    )
+    .expect("insert a row that names no fake-IP field");
+    let r = ServiceStabilityConfigRepository::new(&conn)
+        .get_or_default()
+        .expect("get");
+    assert!(!r.fake_ip_enabled);
 }
 
 #[test]

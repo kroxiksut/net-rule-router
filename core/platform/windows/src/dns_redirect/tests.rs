@@ -66,6 +66,11 @@ impl NrptRuleStore for FakeStore {
                 scan.ours_intact = expected.iter().all(|e| has(values, e));
             } else if !values.iter().any(|v| v.name == "Version") {
                 scan.damaged += 1;
+            } else if let (Some(n), Some(c)) = (
+                expected.iter().find(|v| v.name == "Name"),
+                expected.iter().find(|v| v.name == "Comment"),
+            ) {
+                scan.foreign_catch_all |= has(values, n) && !has(values, c);
             }
         }
         Ok(scan)
@@ -224,6 +229,59 @@ fn candidates_keep_order_and_drop_repeats() {
             UpstreamDnsCandidate::new(Some(48), "198.51.100.1".parse().unwrap()),
         ],
         "the caller probes down the list, so a repeat would cost a second probe"
+    );
+}
+
+/// The corporate tunnel, listed first, offers the home router's server too:
+/// per interface that server stays the home adapter's as well, so barring the
+/// tunnel's interface cannot hide it. The plain list is unchanged.
+#[test]
+fn a_server_a_tunnel_and_our_adapter_both_offer_is_listed_for_each_interface() {
+    let runner = FakeRunner::new(ok(concat!(
+        "24\t192.168.0.1\tCorporate VPN Adapter\tCorp VPN\n",
+        "24\t10.20.0.53\tCorporate VPN Adapter\tCorp VPN\n",
+        "16\t192.168.0.1\tEthernet Connection (2)\tEthernet\n",
+        "16\t192.168.0.1\tEthernet Connection (2)\tEthernet\n",
+    )));
+    let home: Ipv4Addr = "192.168.0.1".parse().unwrap();
+    let corporate: Ipv4Addr = "10.20.0.53".parse().unwrap();
+    assert_eq!(
+        capture_upstream_dns_candidates_v4_per_link(&runner),
+        vec![
+            UpstreamDnsCandidate::new(Some(24), home),
+            UpstreamDnsCandidate::new(Some(24), corporate),
+            UpstreamDnsCandidate::new(Some(16), home),
+        ],
+        "each (interface, server) pair once, the default-route repeat dropped"
+    );
+    assert_eq!(
+        capture_upstream_dns_candidates_v4(&runner),
+        vec![
+            UpstreamDnsCandidate::new(Some(24), home),
+            UpstreamDnsCandidate::new(Some(24), corporate),
+        ]
+    );
+}
+
+#[test]
+fn an_ipv6_server_two_interfaces_offer_is_listed_for_each() {
+    let runner = FakeRunner::new(ok(concat!(
+        "24\t2001:db8::53\tCorporate VPN Adapter\tCorp VPN\n",
+        "16\t2001:db8::53\tEthernet Connection (2)\tEthernet\n",
+    )));
+    let server = IpAddr::V6("2001:db8::53".parse().unwrap());
+    let indexes = |list: Vec<nrr_platform_api::dns::UpstreamDnsServer>| {
+        list.into_iter()
+            .map(|c| (c.interface_index, c.server))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        indexes(capture_upstream_dns_candidates_v6_per_link(&runner)),
+        vec![(Some(24), server), (Some(16), server)]
+    );
+    assert_eq!(
+        indexes(capture_upstream_dns_candidates_v6(&runner)),
+        vec![(Some(24), server)]
     );
 }
 
@@ -440,6 +498,45 @@ fn restore_takes_back_the_search_list_the_redirect_wrote() {
         ["branch.corp.example".to_string()]
     );
     redirect.restore(&handle()).expect("restore");
+    assert!(list.read().expect("read").global.is_empty());
+    assert!(list.noted().is_empty());
+}
+
+/// Where a list write needs a child process, the restore does not wait for it:
+/// the catch-all is gone on return, the list is cleared behind it, and the next
+/// sync waits for that clearing instead of racing it.
+#[test]
+fn a_slow_list_write_never_holds_up_the_restore() {
+    let (open, gate) = std::sync::mpsc::channel();
+    let list = Arc::new(search_list::FakeList::behind_a_process(gate));
+    let store = FakeStore::with(&[(NRPT_RULE_KEY, ours("127.0.0.1"))]);
+    let redirect =
+        NrptDnsRedirect::new(FakeRunner::new(ok("")), store).with_search_list(list.clone());
+    open.send(()).expect("open for the arm");
+    redirect
+        .keep_short_names(
+            &[exemption("branch.corp.example", &["192.168.0.53"])],
+            &Vec::new,
+        )
+        .expect("keep");
+    assert_eq!(list.writes(), 1);
+
+    redirect.restore(&handle()).expect("restore");
+    assert!(
+        redirect.store.keys().is_empty(),
+        "the catch-all goes before the list is touched"
+    );
+    assert_eq!(
+        list.writes(),
+        1,
+        "the restore returned while the write waits"
+    );
+
+    open.send(()).expect("let the clearing through");
+    redirect
+        .keep_short_names(&[], &Vec::new)
+        .expect("a sync after the restore");
+    assert_eq!(list.writes(), 2, "the sync waited for the clearing");
     assert!(list.read().expect("read").global.is_empty());
     assert!(list.noted().is_empty());
 }
@@ -846,4 +943,126 @@ fn the_script_sweep_mirrors_the_markers_and_the_rule_key() {
         assert!(script.contains("Remove-NrrDnsRedirect"));
         assert!(!script.contains("Get-DnsClientNrptRule"));
     }
+}
+
+#[test]
+fn a_foreign_catch_all_is_told_apart_from_our_own_and_from_suffix_rules() {
+    fn scan(store: &FakeStore) -> NrptTableScan {
+        store
+            .scan(NRPT_RULE_KEY, &nrpt_rule_values("127.0.0.1", NRPT_MARKER))
+            .expect("scan")
+    }
+    let foreign = vec![
+        sz("Comment", "OtherAgent"),
+        multi_sz("Name", "."),
+        sz("GenericDNSServers", "203.0.113.9"),
+        dword("ConfigOptions", 8),
+        dword("Version", 2),
+    ];
+    assert!(scan(&FakeStore::with(&[("{OTHER}", foreign)])).foreign_catch_all);
+    assert!(
+        !scan(&FakeStore::with(&[
+            (NRPT_RULE_KEY, ours("127.0.0.1")),
+            ("{VPN}", theirs()),
+        ]))
+        .foreign_catch_all,
+        "a suffix rule and our own catch-all are not a rival"
+    );
+    // A stale copy of ours under another key is ours, swept at the next redirect.
+    assert!(!scan(&FakeStore::with(&[("{OLD}", ours("127.0.0.1"))])).foreign_catch_all);
+}
+
+#[test]
+fn a_foreign_catch_all_reaches_the_status_card_while_it_competes_with_ours() {
+    static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let foreign = vec![
+        sz("Comment", "OtherAgent"),
+        multi_sz("Name", "."),
+        sz("GenericDNSServers", "203.0.113.9"),
+        dword("ConfigOptions", 8),
+        dword("Version", 2),
+    ];
+    let redirect = NrptDnsRedirect::new(
+        accepting_runner(),
+        FakeStore::with(&[("{OTHER}", foreign.clone())]),
+    )
+    .with_notice_flag(&FLAG);
+    assert!(slugs_from(&FLAG).is_empty());
+
+    let handle = redirect.redirect_to(listener()).expect("redirect");
+    assert_eq!(slugs_from(&FLAG), [FOREIGN_CATCH_ALL_SLUG]);
+
+    // The other program withdraws its rule: the guard's next look drops the notice.
+    redirect
+        .store
+        .rules
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove("{OTHER}");
+    redirect.inspect(&handle).expect("inspect");
+    assert!(slugs_from(&FLAG).is_empty());
+
+    // It comes back, then our redirect is lifted: nothing is left to compete with.
+    redirect
+        .store
+        .rules
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert("{OTHER}".to_string(), foreign);
+    redirect.inspect(&handle).expect("inspect");
+    assert_eq!(slugs_from(&FLAG), [FOREIGN_CATCH_ALL_SLUG]);
+    redirect.restore(&handle).expect("restore");
+    assert!(slugs_from(&FLAG).is_empty());
+}
+
+#[test]
+fn the_foreign_catch_all_notice_has_its_texts_in_every_bundled_language() {
+    for (language, text) in [
+        ("en", include_str!("../../../../../locales/en.json")),
+        ("ru", include_str!("../../../../../locales/ru.json")),
+    ] {
+        let catalog: serde_json::Value = serde_json::from_str(text).expect("locale file");
+        let notice = &catalog["platform"]["missing"][FOREIGN_CATCH_ALL_SLUG];
+        for field in ["title", "effect"] {
+            assert!(
+                notice[field].as_str().is_some_and(|s| !s.is_empty()),
+                "{language}: platform.missing.{FOREIGN_CATCH_ALL_SLUG}.{field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_changed_exemption_set_rewrites_only_what_differs() {
+    let redirect = NrptDnsRedirect::new(
+        FakeRunner::new(ok("")),
+        FakeStore::with(&[(NRPT_RULE_KEY, ours("127.0.0.1"))]),
+    );
+    let a = exemption("corp.a.example", &["10.0.0.1"]);
+    let b = exemption("corp.b.example", &["10.0.0.2"]);
+    redirect
+        .exempt_namespaces(&[a.clone(), b.clone()])
+        .expect("exempt");
+    let before = redirect.store.writes().len();
+
+    // Unchanged set: nothing is written, nothing is erased.
+    assert_eq!(
+        redirect
+            .exempt_namespaces(&[a.clone(), b.clone()])
+            .expect("exempt"),
+        2
+    );
+    assert_eq!(redirect.store.writes().len(), before);
+
+    // One server list changes: only that rule is written, the other stays put.
+    let b2 = exemption("corp.b.example", &["10.0.0.9"]);
+    assert_eq!(redirect.exempt_namespaces(&[a, b2]).expect("exempt"), 2);
+    assert_eq!(
+        redirect.store.writes(),
+        [
+            redirect.store.writes()[..before].to_vec(),
+            vec![nrpt_exemption_key("corp.b.example")]
+        ]
+        .concat()
+    );
 }

@@ -71,6 +71,7 @@ pub mod auto_rules;
 pub mod block_notice_center;
 pub mod block_notice_journal_store;
 pub mod block_notice_mute_store;
+pub mod boot_clock;
 pub mod boot_integrity;
 pub mod boot_settings;
 pub mod bootstrap;
@@ -94,6 +95,7 @@ pub mod dns_resolver;
 pub mod dns_resolver_ports;
 pub mod dns_resolver_service;
 pub mod dns_stack;
+pub mod dns_tamper_summary;
 pub mod dns_upstream;
 pub mod dns_wire;
 pub mod doh_lockdown_policy;
@@ -103,14 +105,18 @@ pub mod enforcement_planner;
 pub mod fake_ip;
 pub mod fcrdns_learner;
 pub mod flow_reset_log;
+pub mod foreign_tunnels;
 pub mod fqdn_cache_lookup;
 pub mod health;
+pub mod hosts_bypass;
 pub mod integrity_review;
 pub mod ipc;
 pub mod ipc_handlers;
+pub mod ipc_inbound;
 pub mod ipc_push;
 pub mod ipv6_disposition;
 pub mod ipv6_route_log;
+pub mod kept_direct;
 pub mod killswitch_codegen;
 pub mod killswitch_drop_registry;
 pub mod known_direct;
@@ -120,6 +126,7 @@ pub mod lifecycle_matrix;
 pub mod local_dns_namespaces;
 pub mod local_dns_suffixes;
 pub mod local_namespace_fallback;
+pub mod local_network_source;
 pub mod logon_rearm;
 pub mod machine_reading;
 pub mod machine_scoped;
@@ -133,6 +140,7 @@ pub mod observed_host_names;
 pub mod outage_blocks;
 pub mod override_grants;
 pub mod override_recheck;
+pub mod own_resolver_watch;
 pub mod pass_inputs;
 pub mod path_probe;
 pub mod per_sid_orchestrator;
@@ -140,10 +148,12 @@ pub mod persistent_app_resolver;
 pub mod phase_timings;
 pub mod placeholder_waitlist;
 pub mod plan_flow_reset;
+pub mod platform_notices;
 pub mod policy_loader;
 pub mod power_resume;
 pub mod primary_stall_registry;
 pub mod principal_enforcement;
+pub mod principal_reset;
 pub mod production_auto_rule_probe;
 pub mod production_coordinator;
 pub mod production_diagnostics;
@@ -167,6 +177,7 @@ pub mod provisioning;
 pub mod recent_rule_addresses;
 pub mod recent_rule_changes;
 pub mod recompute_coalescer;
+pub mod recompute_window;
 pub mod recovery_audit;
 pub mod revision_signing;
 pub mod revision_watch;
@@ -181,6 +192,7 @@ pub mod routing_setup;
 pub mod rule_book_facts;
 pub mod rule_conflicts;
 pub mod rule_hostname_seeder;
+pub mod rules_book_notice;
 pub mod runtime_loop;
 pub mod script_launches;
 pub mod secondary_address_owners;
@@ -208,6 +220,7 @@ pub mod verbosity_control;
 mod verify_overlay;
 pub mod vpn_client_registry;
 pub mod vpn_client_trust;
+pub mod vpn_gateway_confirm;
 mod wfp_bands;
 pub mod wfp_codegen;
 pub mod wfp_filter_ledger;
@@ -263,27 +276,27 @@ pub use ipc_handlers::{
     register_production_handlers, service_binary_version, set_service_binary_version,
     AdaptersSnapshotProvider, ApplyFailurePolicyGetHandler, ApplyFailurePolicyProvider,
     ApplyFailurePolicySetHandler, ApplyFailurePolicyWriter, AuditListHandler, AutostartGetHandler,
-    AutostartProvider, AutostartToggleHandler, AutostartWriter, ConsumeError,
-    ContractNegotiateHandler, DiagnosticsExportArchiveHandler, EventBus, EventEntry,
-    ExplainGetHandler, InterfacesRefreshHandler, IpcHandlerDeps, LogRetentionConfigGetHandler,
-    LogRetentionConfigProvider, LogRetentionConfigSetHandler, LogRetentionConfigWriter,
-    LogsListHandler, MigrationCompletionRecord, MigrationCompletionWriter,
-    MigrationMarkCompleteHandler, MigrationStatusGetHandler, MigrationStatusProvider,
-    MutationExecutor, MutationOutcome, MutationSubmitHandler, MutationTokenStore, OperationError,
-    OperationRecord, OperationState, OperationStatusHandler, OperationStatusStore,
-    ProductImpactDisableTemporaryHandler, RetentionSettingsGetHandler, RetentionSettingsProvider,
-    RetentionSettingsSetHandler, RetentionSettingsWriter, RollbackHandler, RoutePolicyProvider,
-    RoutePolicyUpdateHandler, RoutePolicyWriteError, RoutePolicyWriter, RoutingPauseGetHandler,
-    RoutingPauseProvider, RoutingPauseToggleHandler, RoutingPauseWriter, RulesListHandler,
-    RulesSnapshotProvider, SecurityAlertsHandler, ServiceHealthHandler,
-    ServiceStabilityConfigGetHandler, ServiceStabilityConfigProvider,
-    ServiceStabilityConfigSetHandler, ServiceStabilityConfigWriter, SettingsWriteError,
-    SnapshotDiagnosticsHandler, SnapshotInitialHandler, SnapshotInterfacesHandler,
-    StatusUpdatesPollHandler, StatusUpdatesSubscribeHandler, StorageUsageGetHandler,
-    StorageUsageProvider, StoredMutation, SubscribeOutcome, SubscriberState,
-    TrafficStatsGetHandler, TrafficStatsProvider, TrafficStatsSetHandler, TrafficStatsWriter,
-    UnimplementedHandler, DEFAULT_MUTATION_TOKEN_TTL, DEFAULT_OPERATION_RETENTION,
-    EVENT_BUFFER_CAPACITY, MIN_SUPPORTED_CLIENT_VERSION, STATUS_UPDATES_POLL_DEPRECATION_MESSAGE,
+    AutostartProvider, ConsumeError, ContractNegotiateHandler, DiagnosticsExportArchiveHandler,
+    EventBus, EventEntry, ExplainGetHandler, InterfacesRefreshHandler, IpcHandlerDeps,
+    LogRetentionConfigGetHandler, LogRetentionConfigProvider, LogRetentionConfigSetHandler,
+    LogRetentionConfigWriter, LogsListHandler, MigrationCompletionRecord,
+    MigrationCompletionWriter, MigrationMarkCompleteHandler, MigrationStatusGetHandler,
+    MigrationStatusProvider, MutationExecutor, MutationOutcome, MutationSubmitHandler,
+    MutationTokenStore, OperationError, OperationRecord, OperationState, OperationStatusHandler,
+    OperationStatusStore, ProductImpactDisableTemporaryHandler, PushWaker,
+    RetentionSettingsGetHandler, RetentionSettingsProvider, RetentionSettingsSetHandler,
+    RetentionSettingsWriter, RollbackHandler, RoutePolicyProvider, RoutePolicyUpdateHandler,
+    RoutePolicyWriteError, RoutePolicyWriter, RoutingPauseGetHandler, RoutingPauseProvider,
+    RoutingPauseToggleHandler, RoutingPauseWriter, RulesListHandler, RulesSnapshotProvider,
+    SecurityAlertsHandler, ServiceHealthHandler, ServiceStabilityConfigGetHandler,
+    ServiceStabilityConfigProvider, ServiceStabilityConfigSetHandler, ServiceStabilityConfigWriter,
+    SettingsWriteError, SnapshotDiagnosticsHandler, SnapshotInitialHandler,
+    SnapshotInterfacesHandler, StatusUpdatesPollHandler, StatusUpdatesSubscribeHandler,
+    StorageUsageGetHandler, StorageUsageProvider, StoredMutation, SubscribeOutcome,
+    SubscriberState, TrafficStatsGetHandler, TrafficStatsProvider, TrafficStatsSetHandler,
+    TrafficStatsWriter, UnimplementedHandler, DEFAULT_MUTATION_TOKEN_TTL,
+    DEFAULT_OPERATION_RETENTION, EVENT_BUFFER_CAPACITY, MIN_SUPPORTED_CLIENT_VERSION,
+    STATUS_UPDATES_POLL_DEPRECATION_MESSAGE,
 };
 // Re-export IPC contract types from nrr-shared that acceptance tests need.
 pub use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
@@ -354,7 +367,7 @@ pub use managers::{
 };
 pub use service_lifecycle::{
     InstallConfig, InstallOutcome, RecoveryPolicy, ServiceStartMode, UninstallConfig,
-    UninstallOutcome, UpdateConfig, UpdateOutcome,
+    UninstallOutcome,
 };
 // Re-export the neutral cross-OS principal type so the transport
 // (nrr-windows-service) and integration tests can name the `IpcRequestContext`
@@ -387,7 +400,7 @@ pub struct ServiceRuntimeOrchestrationSnapshot {
 /// Maturity of each runtime dimension, as the `status` verb reports it.
 ///
 /// The two `partial` entries name what is missing rather than rounding up:
-/// health is read on request but never pushed (`health-changed` is not sent), and
+/// health is read on request but never pushed, and
 /// the update hook stops after draining and backing up the state database —
 /// replacing the binary is the installer's half.
 pub const fn service_runtime_orchestration_snapshot() -> ServiceRuntimeOrchestrationSnapshot {

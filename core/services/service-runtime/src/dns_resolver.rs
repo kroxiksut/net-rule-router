@@ -207,6 +207,9 @@ pub struct ScopedFakeIpAnswerer {
     /// The additional route's own subnets, read live. See
     /// [`FakeIpAnswerer::may_substitute`].
     secondary_subnets: Option<SecondarySubnetsFn>,
+    /// Names and networks of the corporate tunnels beside ours; none of them
+    /// ever gets a virtual address.
+    foreign_tunnels: Arc<crate::foreign_tunnels::ForeignTunnelCell>,
 }
 
 /// Reads the subnets that belong to the additional route itself. A closure over
@@ -224,7 +227,18 @@ impl ScopedFakeIpAnswerer {
             runtime_exclusions: Arc::new(crate::fake_ip::RuntimeHostExclusions::new()),
             health: Arc::new(crate::fake_ip::FakeIpHealth::new()),
             secondary_subnets: None,
+            foreign_tunnels: Arc::new(crate::foreign_tunnels::ForeignTunnelCell::new()),
         }
+    }
+
+    /// Keep names and addresses a foreign tunnel owns on their real answers.
+    #[must_use]
+    pub fn with_foreign_tunnels(
+        mut self,
+        cell: Arc<crate::foreign_tunnels::ForeignTunnelCell>,
+    ) -> Self {
+        self.foreign_tunnels = cell;
+        self
     }
 
     /// Share a runtime exclusion set (VPN self-heal) — a host it names keeps its
@@ -271,6 +285,11 @@ impl FakeIpAnswerer for ScopedFakeIpAnswerer {
     /// it either: reaching the interior requires being inside the tunnel, which
     /// is what the caller was already doing.
     fn may_substitute(&self, real: &[Ipv4Addr]) -> bool {
+        // A corporate address answered with ours is a flow our relay cannot
+        // carry: it reaches the tunnel only through the tunnel's own routes.
+        if self.foreign_tunnels.carries_any(real) {
+            return false;
+        }
         let Some(read) = self.secondary_subnets.as_ref() else {
             return true;
         };
@@ -283,10 +302,14 @@ impl FakeIpAnswerer for ScopedFakeIpAnswerer {
     fn carries_on_v4(&self, hostname: &str) -> bool {
         self.scope.decide(hostname, None).is_fake_ip()
             && !self.runtime_exclusions.contains(hostname)
+            && !self.foreign_tunnels.claims_name(hostname)
     }
 
     fn fake_answer(&self, hostname: &str) -> Option<Vec<Ipv4Addr>> {
         if !self.scope.decide(hostname, None).is_fake_ip() {
+            return None;
+        }
+        if self.foreign_tunnels.claims_name(hostname) {
             return None;
         }
         // A runtime exclusion (a host the VPN self-heal moved back to its real
@@ -565,6 +588,17 @@ pub trait SyncReconciler: Send + Sync {
     /// registers the request and returns immediately.
     fn request_reconcile(&self) {
         let _ = self.reconcile_now(Duration::ZERO);
+    }
+
+    /// [`Self::reconcile_now`] for a fact no pass input can see: the run is
+    /// not judged unchanged and skipped. Default: the plain request.
+    fn reconcile_forced(&self, deadline: Duration) -> ReconcileOutcome {
+        self.reconcile_now(deadline)
+    }
+
+    /// [`Self::request_reconcile`] with the forced run.
+    fn request_reconcile_forced(&self) {
+        self.request_reconcile();
     }
 
     /// How long a reconcile run has been taking lately, when the implementation

@@ -39,9 +39,10 @@ use nrr_service_runtime::boot_integrity::AuditTrail;
 use nrr_service_runtime::browser_history_seeder::BrowserHistorySeeder;
 use nrr_service_runtime::ipc_handlers::event_bus::EventBus;
 use nrr_service_runtime::ipc_handlers::IpcHandlerDeps;
-use nrr_service_runtime::principal_enforcement::{CycleOutcome, PrincipalEnforcementCycle};
+use nrr_service_runtime::principal_enforcement::PrincipalEnforcementCycle;
 use nrr_service_runtime::production_coordinator::{
     ProductionActivationAuditEmitter, ProductionApplyMarkerStore, ProductionIdGenerator,
+    ProductionRecoveryAuditSink,
 };
 use nrr_service_runtime::production_diagnostics::ProductionDiagnosticsFacade;
 use nrr_service_runtime::production_handlers_misc::{
@@ -198,18 +199,7 @@ impl CycleApplyDispatcher {
 /// policy is in force that is not.
 fn pass_now(cycle: &PrincipalEnforcementCycle, trigger: &'static str) -> Result<(), String> {
     cycle.request_retry();
-    match cycle.tick_logged(trigger) {
-        CycleOutcome::Applied { .. } | CycleOutcome::Unchanged => Ok(()),
-        CycleOutcome::EnforcementFailed { reason, .. } | CycleOutcome::RefusalStands { reason } => {
-            Err(reason)
-        }
-        CycleOutcome::AuthorityUnavailable { reason } => {
-            Err(format!("could not determine who is logged in: {reason}"))
-        }
-        CycleOutcome::Stopped => {
-            Err("the service is stopping; the change was saved but not applied".to_owned())
-        }
-    }
+    cycle.tick_logged(trigger).landed()
 }
 
 /// Routing pause on this platform: the pass is the whole mechanism.
@@ -293,6 +283,7 @@ pub(crate) fn build_ipc_surface(
     conn_trace_ring: Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>,
     app_enforcement: nrr_service_runtime::app_enforcement_status::AppEnforcementStatus,
     shared_ip_exemptions: nrr_service_runtime::app_enforcement_status::SharedIpExemptionStatus,
+    local_networks: Arc<dyn nrr_service_runtime::local_network_source::LocalNetworkSource>,
     conn_trace_log: nrr_service_runtime::boot_settings::ConnTraceLogSwitch,
     verbosity: Option<nrr_service_runtime::TracingVerbosityHandle>,
     key_store: Arc<dyn KeyStore>,
@@ -313,6 +304,7 @@ pub(crate) fn build_ipc_surface(
     // Held back from the deps builder below, which consumes the connection.
     let stats_state_conn = Arc::clone(&state_conn);
     let ids = Arc::new(ProductionIdGenerator::new());
+    let recovery_ids = Arc::clone(&ids);
     // Bound here rather than inline at the call below, so the caller can hand it
     // to the housekeeping tick — the same wiring the Windows surface has.
     let mutation_tokens: Arc<MutationTokenStore> = Arc::default();
@@ -416,9 +408,9 @@ pub(crate) fn build_ipc_surface(
                 // is refused while its tunnel is down.
                 nrr_service_runtime::network_rule_screen::facts_with_remembered_servers(
                     screen_route_table,
-                    nrr_service_runtime::tunnel_server_memory::persisted_servers(Arc::clone(
-                        &state_conn,
-                    )),
+                    nrr_service_runtime::tunnel_server_memory::persisted_servers_by_principal(
+                        Arc::clone(&state_conn),
+                    ),
                 ),
                 None,
             ),
@@ -434,7 +426,14 @@ pub(crate) fn build_ipc_surface(
     // An alert acknowledgement the trail cannot point at would be recorded
     // as having happened nowhere; the chain restart needs the trail too.
     if let Some(writer) = audit_writer.as_ref() {
-        mutation_executor = mutation_executor.with_audit_writer(Arc::clone(writer));
+        mutation_executor = mutation_executor
+            .with_audit_writer(Arc::clone(writer))
+            // Safe-disable records itself before it pauses the caller; without
+            // a sink it is refused rather than reported as done.
+            .with_recovery_audit_sink(Arc::new(ProductionRecoveryAuditSink::new(
+                Arc::clone(writer),
+                recovery_ids,
+            )));
     }
     // Shared with the rule author, so a rule the service changes on its own
     // passes the same gates as one the user saves.
@@ -538,12 +537,8 @@ pub(crate) fn build_ipc_surface(
         Arc::new(ProductionAutostart::new(
             Arc::clone(&state_conn),
             Arc::clone(&autostart_helper),
-            gui_binary.clone(),
+            gui_binary,
         )),
-        Arc::new(
-            ProductionAutostart::new(state_conn, autostart_helper, gui_binary)
-                .with_event_bus(event_bus),
-        ),
     );
     // Each caller's own book judges the rows of the cache and connection
     // views, and decides which cached names a non-administrator may see.
@@ -695,6 +690,14 @@ pub(crate) fn build_ipc_surface(
     spawn_boot_auto_seed(Arc::clone(&seeder), Arc::clone(&stats_state_conn));
     let deps = deps
         .with_browser_history_seeder(seeder)
+        // The networks kept reachable under the guard, listed from the same
+        // route table the planner's exemptions come from.
+        .with_local_networks(Arc::new(
+            nrr_service_runtime::production_local_networks::ProductionLocalNetworks::new(
+                local_networks,
+                Arc::clone(&stats_state_conn),
+            ),
+        ))
         // "This site refuses main-link addresses": a fact only the user knows.
         .with_refusing_anchors(Arc::new(
             nrr_service_runtime::production_local_networks::ProductionRefusingAnchors::new(

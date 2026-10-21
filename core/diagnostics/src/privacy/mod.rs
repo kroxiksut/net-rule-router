@@ -22,6 +22,6 @@ pub mod redact;
 pub use mode::RedactionMode;
 pub use redact::{
     redact_adapter_id, redact_hostname, redact_ipv4, redact_ipv4_str, redact_process_path,
-    redact_resolver_source, Redacted, MARKER_MASKED_IPV4, MARKER_MASKED_PATH, MARKER_PRIVATE_IPV4,
-    MARKER_PUBLIC_IPV4, MARKER_REDACTED,
+    redact_resolver_source, Redacted, MARKER_MASKED_HOST, MARKER_MASKED_IPV4, MARKER_MASKED_PATH,
+    MARKER_PRIVATE_IPV4, MARKER_PUBLIC_IPV4, MARKER_REDACTED,
 };

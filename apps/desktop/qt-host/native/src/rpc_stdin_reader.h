@@ -72,9 +72,12 @@ public:
                 ::CloseHandle(threadHandle);
             }
         }
-        ::_close(0);
+        // `_close` closes the OS handle behind the fd as well; the standard
+        // handle is closed separately only when it is a different one.
         HANDLE h = ::GetStdHandle(STD_INPUT_HANDLE);
-        if (h != nullptr && h != INVALID_HANDLE_VALUE) {
+        const HANDLE fdHandle = reinterpret_cast<HANDLE>(::_get_osfhandle(0));
+        ::_close(0);
+        if (h != nullptr && h != INVALID_HANDLE_VALUE && h != fdHandle) {
             ::CloseHandle(h);
         }
 #else

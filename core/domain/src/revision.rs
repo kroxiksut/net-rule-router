@@ -191,14 +191,11 @@ pub enum RiskLevel {
     /// Default route changes, mass changes, interface binding changes,
     /// or rerouting known destinations to secondary.
     High,
-    /// Catastrophic configurations: the candidate
-    /// would lock the user out of the network (e.g. primary↔secondary
-    /// swap under `StrictSecondaryFailClosed` with no fallback). Today
-    /// no signal in `score_candidate` is severe enough to map here —
-    /// the level is wire-stable so future binding-aware detection can
-    /// emit it without changing the IPC contract. `PartialOrd` puts
-    /// `Critical` above `High`, so `signals.iter().map(level).max()`
-    /// naturally returns it once present.
+    /// Catastrophic configurations: the candidate would lock the user out
+    /// of the network. No signal in `score_candidate` maps here yet; the
+    /// level is wire-stable so a future detection can emit it without
+    /// changing the IPC contract. `PartialOrd` puts `Critical` above
+    /// `High`, so `signals.iter().map(level).max()` returns it once present.
     Critical,
 }
 

@@ -37,6 +37,8 @@ fn sample_health() -> DiagnosticsStatusDto {
         },
         stale: false,
         origin: DiagnosticsDataOrigin::Service,
+        missing_capabilities: Vec::new(),
+        dns_tamper: Default::default(),
     }
 }
 
@@ -65,6 +67,7 @@ fn sample_input(request: DiagnosticArchiveRequest) -> ArchiveInput {
             reason_code: "review.approved".into(),
             revision_id: Some("rev-001".into()),
             has_payload_summary: false,
+            cause: None,
         }],
         audit_chain_lines: Vec::new(),
         raw_log_files: Vec::new(),
@@ -1066,4 +1069,20 @@ fn a_default_export_caps_the_listing_placeholders_too() {
 
     let body = export_listing_with_args(DiagnosticArchiveRequest::diagnostics_export("0.1.0"));
     assert!(body.contains("private-host.example"), "{body}");
+}
+
+#[test]
+fn the_redaction_report_counts_hosts_only_under_the_host_marker() {
+    let dir = std::env::temp_dir().join(format!("nrr-markers-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join("a.json"),
+        r#"{"h":"<masked-host>","x":"<redacted>","y":"<redacted>","p":"<masked-path>"}"#,
+    )
+    .expect("write");
+    let counts = count_markers(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(counts.hostnames, 1);
+    assert_eq!(counts.values, 2);
+    assert_eq!(counts.paths, 1);
 }

@@ -241,7 +241,7 @@ fn a_destination_routed_for_another_user_stays_out_of_the_share() {
 }
 
 #[test]
-fn a_down_tunnel_blocks_the_service_accounts_only_when_the_owner_fails_closed() {
+fn a_down_tunnel_blocks_the_service_accounts_only_while_the_owner_is_protected() {
     let owner = owner_is(Some("S-1-5-21-A"));
     let (api, orch, src, rules) = fixture_with_service_accounts(None, &owner, Vec::new());
     rules.set(rules_with_secondary_ip(RULE_HOST));
@@ -260,11 +260,20 @@ fn a_down_tunnel_blocks_the_service_accounts_only_when_the_owner_fails_closed() 
 
     let (api, orch, src, rules) = fixture_with_service_accounts(None, &owner, Vec::new());
     rules.set(rules_with_secondary_ip(RULE_HOST));
-    let mut fail_open = snap_block("Wi-Fi", "TAP");
-    fail_open.kill_switch_fail_closed = false;
-    src.set("S-1-5-21-A", fail_open);
+    src.set(
+        "S-1-5-21-A",
+        snap_with(
+            "Wi-Fi",
+            "TAP",
+            PerSidBehaviorMode::PreferPrimary,
+            nrr_domain::LeakProtection::Off,
+        ),
+    );
     orch.install_for_sid("S-1-5-21-A").unwrap();
-    assert!(service_filters(&api).is_empty(), "fail-open guards nobody");
+    assert!(
+        service_filters(&api).is_empty(),
+        "protection off guards nobody"
+    );
 }
 
 #[test]
@@ -422,5 +431,73 @@ fn system_traffic_to_a_pinned_host_leaves_only_through_the_tunnel() {
         verdict_for(&filters, &connect(&["S-1-5-21-A"], None, MAIN_LUID)),
         WfpAction::Block,
         "the owner's own pin still holds"
+    );
+}
+
+/// The user refused the WSL network, the tunnel is down and protection covers
+/// everything: the forwarded blanket still lets replies out into the guest,
+/// keyed on its adapter and on the forwarding path alone.
+#[test]
+fn the_forwarded_blanket_lets_replies_into_a_guest_whose_network_was_refused() {
+    const GUEST_LUID: u64 = 0x0006_0000_0000_001F;
+    let owner = owner_is(Some("S-1-5-21-A"));
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let src = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
+    let audit = Arc::new(CollectAudit::default());
+    let owners = Arc::clone(&owner);
+    let tunnel_down: Option<KillSwitchResolution> = None;
+    let primary_dns: Vec<IpAddr> = Vec::new();
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&src) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        cache,
+        Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_kill_switch_resolver(Arc::new(move |_, _| tunnel_down.clone()))
+    .with_fail_closed_exemptions_resolver(Arc::new(|_, _| FailClosedExemptions {
+        bootstrap_server_ips: vec![Ipv4Addr::new(203, 0, 113, 7)],
+        guest_network_luids: vec![GUEST_LUID],
+        ..FailClosedExemptions::default()
+    }))
+    .with_service_accounts(ServiceAccountWiring {
+        routing_owners: Arc::new(move || owners.lock().unwrap().clone()),
+        routed_elsewhere: Arc::new(|_, _| false),
+        own_executable: Some(OWN_EXE.to_string()),
+        primary_dns: Arc::new(move || primary_dns.clone()),
+    });
+    rules.set(rules_with_secondary_ip(RULE_HOST));
+    src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
+
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    let filters = api.wfp_filters.lock().unwrap().clone();
+    let blanket = filters
+        .iter()
+        .find(|f| {
+            f.layer == WfpLayerKey::IpForwardV4
+                && f.action == WfpAction::Block
+                && f.remote_ip.is_none()
+                && f.remote_ip_set.is_empty()
+                && f.remote_subnet.is_none()
+        })
+        .expect("the forwarded blanket is armed");
+    let guest: Vec<_> = filters
+        .iter()
+        .filter(|f| f.local_interface_luid == Some(GUEST_LUID))
+        .collect();
+    assert!(
+        guest.iter().any(|f| f.layer == WfpLayerKey::IpForwardV4
+            && f.action == WfpAction::Permit
+            && f.weight > blanket.weight),
+        "{guest:?}"
+    );
+    assert!(
+        guest
+            .iter()
+            .all(|f| f.layer.is_forwarding() && f.action == WfpAction::Permit),
+        "nothing keyed on the guest reaches the machine's own traffic: {guest:?}"
     );
 }

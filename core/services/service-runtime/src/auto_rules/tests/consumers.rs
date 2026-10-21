@@ -239,6 +239,31 @@ fn subscribed_bus() -> Arc<EventBus> {
     bus
 }
 
+/// `(pending_count, announces)` of every suggestions push `subscription` holds.
+fn suggestion_pushes(bus: &EventBus, subscription: &str) -> Vec<(u64, bool)> {
+    bus.peek_pending_for(subscription, 64)
+        .into_iter()
+        .filter_map(|e| match e.event {
+            StatusUpdateEvent::AutoRuleCandidatesChanged {
+                pending_count,
+                announces,
+                ..
+            } => Some((pending_count, announces)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The counts of the pushes that announce news — the ones a surface may
+/// raise a notice for.
+fn announcements(bus: &EventBus, subscription: &str) -> Vec<u64> {
+    suggestion_pushes(bus, subscription)
+        .into_iter()
+        .filter(|(_, announces)| *announces)
+        .map(|(count, _)| count)
+        .collect()
+}
+
 /// The service and the tray start together and the service usually wins. An
 /// offer announced into that gap reached nobody, yet counted as announced —
 /// and the tray, whose subscription begins at the CURRENT head, never learned
@@ -438,17 +463,11 @@ fn a_settled_offer_stays_listed_but_only_an_unsettled_one_is_counted_and_pops() 
         "the list reply and the tick count through one definition"
     );
 
-    let published = bus.peek_pending_for(&sub.subscription_id, 10);
-    assert_eq!(published.len(), 1, "exactly one event went out so far");
-    match &published[0].event {
-        StatusUpdateEvent::AutoRuleCandidatesChanged { pending_count, .. } => {
-            assert_eq!(
-                *pending_count, 1,
-                "the tray's number is what the list shows by default"
-            );
-        }
-        other => panic!("unexpected event: {other:?}"),
-    }
+    assert_eq!(
+        suggestion_pushes(&bus, &sub.subscription_id),
+        vec![(1, true)],
+        "one announcement, and the tray's number is what the list shows by default"
+    );
 
     // The remaining companion settles too, well outside the quiet gap — nothing
     // is left worth a popup, so this tick must stay silent on its own terms.
@@ -461,8 +480,11 @@ fn a_settled_offer_stays_listed_but_only_an_unsettled_one_is_counted_and_pops() 
         "everything answers on primary, so no popup"
     );
 
-    let after = bus.peek_pending_for(&sub.subscription_id, 10);
-    assert_eq!(after.len(), 1, "no second event was published");
+    assert_eq!(
+        suggestion_pushes(&bus, &sub.subscription_id),
+        vec![(1, true), (0, false)],
+        "no second announcement, yet every badge is told the count fell to zero"
+    );
 }
 
 /// A batch the inbox would only list behind its toggle is not news: no push
@@ -490,7 +512,7 @@ fn a_batch_of_only_hidden_offers_raises_no_popup() {
     assert_eq!(listed.len(), 1, "listed behind the toggle");
     assert!(listed[0].served_by_main_link);
     assert!(!hidden.published, "a hidden-only batch must not announce");
-    assert!(bus.peek_pending_for(&sub.subscription_id, 10).is_empty());
+    assert!(announcements(&bus, &sub.subscription_id).is_empty());
 
     // Positive control: a row the list shows does announce, and the push counts
     // only it.
@@ -508,14 +530,11 @@ fn a_batch_of_only_hidden_offers_raises_no_popup() {
     }
     let shown = engine.tick(SID, SystemTime::UNIX_EPOCH + Duration::from_millis(169_000));
     assert!(shown.published, "an offer the list shows is announced");
-    let events = bus.peek_pending_for(&sub.subscription_id, 10);
-    assert_eq!(events.len(), 1);
-    match &events[0].event {
-        StatusUpdateEvent::AutoRuleCandidatesChanged { pending_count, .. } => {
-            assert_eq!(*pending_count, 1, "the hidden row is not counted");
-        }
-        other => panic!("unexpected event: {other:?}"),
-    }
+    assert_eq!(
+        announcements(&bus, &sub.subscription_id),
+        vec![1],
+        "the hidden row is not counted"
+    );
 }
 
 /// An answer's reply carries the same count, so the tray menu and the sidebar
@@ -549,6 +568,96 @@ fn an_answer_reports_only_what_the_list_still_shows_by_default() {
     );
 }
 
+/// An answer given on one surface reaches the badges of the others, with the
+/// number the list then shows; a count that did not move is not pushed again.
+#[test]
+fn an_answer_on_one_surface_moves_every_badge_to_the_lists_count() {
+    let f = fixture(AutoRulesMode::Suggest);
+    let bus = subscribed_bus();
+    let engine = AutoRulesEngine::new(
+        Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
+        mode_fn(AutoRulesMode::Suggest),
+        Arc::clone(&f.dismissals) as Arc<dyn DismissalStore>,
+        Arc::new(InMemoryPendingStore::new()),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_event_bus(Arc::clone(&bus));
+    let sub = bus.subscribe_as("client".into(), Some(SID.to_string()), None);
+
+    two_visits(&engine, &["cdn.example", "assets.example"]);
+    let first = engine.tick(SID, later());
+    assert_eq!(first.pending, 2);
+    assert_eq!(
+        suggestion_pushes(&bus, &sub.subscription_id),
+        vec![(2, true)]
+    );
+
+    let one: Vec<String> = engine
+        .candidates(SID)
+        .into_iter()
+        .map(|c| c.id)
+        .take(1)
+        .collect();
+    let answer = engine.dismiss(SID, &one, later());
+    assert_eq!(answer.pending, 1);
+    assert_eq!(
+        suggestion_pushes(&bus, &sub.subscription_id),
+        vec![(2, true), (1, false)],
+        "the other surfaces hear the new count, and no notice rides on it"
+    );
+    assert_eq!(
+        shown_by_default_count(&engine.candidates(SID)),
+        1,
+        "the pushed count is what the list shows"
+    );
+
+    engine.tick(SID, SystemTime::UNIX_EPOCH + Duration::from_millis(400_000));
+    engine.tick(SID, SystemTime::UNIX_EPOCH + Duration::from_millis(410_000));
+    assert_eq!(
+        suggestion_pushes(&bus, &sub.subscription_id).len(),
+        2,
+        "an unchanged count is not pushed again"
+    );
+}
+
+/// Turning suggestions off empties the inbox, and the badges are told so.
+#[test]
+fn turning_suggestions_off_tells_the_badges_zero() {
+    let f = fixture(AutoRulesMode::Suggest);
+    let bus = subscribed_bus();
+    let mode = Arc::new(AtomicBool::new(true));
+    let read_mode: AutoRulesModeFn = {
+        let mode = Arc::clone(&mode);
+        Arc::new(move |_sid: &str| {
+            if mode.load(Ordering::Relaxed) {
+                AutoRulesMode::Suggest
+            } else {
+                AutoRulesMode::Off
+            }
+        })
+    };
+    let engine = AutoRulesEngine::new(
+        Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
+        read_mode,
+        Arc::clone(&f.dismissals) as Arc<dyn DismissalStore>,
+        Arc::new(InMemoryPendingStore::new()),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_event_bus(Arc::clone(&bus));
+    let sub = bus.subscribe_as("client".into(), Some(SID.to_string()), None);
+
+    two_visits(&engine, &["cdn.example"]);
+    engine.tick(SID, later());
+    mode.store(false, Ordering::Relaxed);
+    engine.expire_settings_memo();
+    engine.tick(SID, SystemTime::UNIX_EPOCH + Duration::from_millis(400_000));
+    assert_eq!(
+        suggestion_pushes(&bus, &sub.subscription_id),
+        vec![(1, true), (0, false)]
+    );
+    assert!(engine.candidates(SID).is_empty());
+}
+
 /// A site the user marked as refusing main-link addresses is the one case where
 /// "it answers on the main route" proves nothing — answering with a refusal is
 /// still answering. Its companions keep being offered.
@@ -577,7 +686,7 @@ fn a_site_marked_as_refusing_keeps_its_companions_on_offer() {
         summary.published,
         "the anchor refuses main-link addresses, so its companions are still worth asking about"
     );
-    assert_eq!(bus.peek_pending_for(&sub.subscription_id, 10).len(), 1);
+    assert_eq!(announcements(&bus, &sub.subscription_id), vec![1]);
     // The popup, the count and the inbox agree: a row that popped and is
     // counted must not hide behind the "main route handles it" toggle.
     let listed = engine.candidates(SID);
@@ -615,7 +724,11 @@ fn suggestions_wait_for_the_additional_route_and_arrive_when_it_returns() {
         !while_down.published,
         "nothing pops while the route is down"
     );
-    assert!(bus.peek_pending_for(&sub.subscription_id, 10).is_empty());
+    assert_eq!(
+        suggestion_pushes(&bus, &sub.subscription_id),
+        vec![(1, false)],
+        "the badges count it, but nothing announces it"
+    );
 
     up.store(true, Ordering::Relaxed);
     let when_back = engine.tick(SID, SystemTime::UNIX_EPOCH + Duration::from_millis(400_000));
@@ -623,7 +736,7 @@ fn suggestions_wait_for_the_additional_route_and_arrive_when_it_returns() {
         when_back.published,
         "what was learned while the route was down is offered once it is up"
     );
-    assert_eq!(bus.peek_pending_for(&sub.subscription_id, 10).len(), 1);
+    assert_eq!(announcements(&bus, &sub.subscription_id), vec![1]);
 }
 
 /// "It answers on the main route" settles a third-party neighbour, never an
@@ -654,7 +767,7 @@ fn an_address_of_the_site_itself_still_pops_even_when_the_main_route_answers() {
         summary.published,
         "an address belonging to the routed site is not settled by a completed connection"
     );
-    assert_eq!(bus.peek_pending_for(&sub.subscription_id, 10).len(), 1);
+    assert_eq!(announcements(&bus, &sub.subscription_id), vec![1]);
 }
 
 // ── Eager delivery-name suggestions (per-SID opt-in) ─────────────────────────
@@ -802,5 +915,51 @@ fn a_host_named_only_by_reverse_lookup_lands_inside_the_open_window() {
     assert_eq!(
         summary.parked, 1,
         "a reverse-confirmed name must reach the offer from one visit"
+    );
+}
+
+/// A tunnel zone with a direct sub-host: the sub-host's own rule wins for it, so
+/// it anchors the main route, not the tunnel.
+#[test]
+fn an_anchor_takes_the_route_of_the_rule_that_wins_for_it() {
+    use crate::dns_observation_consumer::rule_set_match_origin;
+    let user_rule = |id: &str, m: CanonicalAddressMatch| CanonicalRule {
+        id: RuleId(id.into()),
+        enabled: true,
+        address_match: Some(m),
+        app_match: None,
+        comment: String::new(),
+        action: RuleAction::Route,
+        origin: None,
+    };
+    let book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![user_rule(
+            "r-0000",
+            CanonicalAddressMatch::ExactFqdn("online.bank.ru".into()),
+        )]),
+        secondary: CanonicalRuleSet::from_rules(vec![user_rule(
+            "r-0000",
+            CanonicalAddressMatch::Zone("ru".into()),
+        )]),
+    };
+    let kind = |host: &str| {
+        AutoRulesEngine::classify_in_book(
+            host,
+            &book,
+            rule_set_match_origin(host, &book.primary),
+            rule_set_match_origin(host, &book.secondary),
+        )
+    };
+    assert_eq!(
+        kind("online.bank.ru"),
+        CoActivityKind::Anchor {
+            route: RouteRole::Primary
+        }
+    );
+    assert_eq!(
+        kind("other.ru"),
+        CoActivityKind::Anchor {
+            route: RouteRole::Secondary
+        }
     );
 }

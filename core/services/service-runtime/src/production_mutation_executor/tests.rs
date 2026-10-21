@@ -1441,27 +1441,25 @@ fn preview_preset_import_single_route_succeeds_with_empty_db() {
     assert!(!review.diff_summary.starts_with("malformed payload"));
 }
 
-/// A first revision activated while the user sits in the strict fail-closed
-/// mode is exactly what `FailClosedActivation` exists to flag, and it could
-/// never fire: the scorer compared two synthetic profiles that both said
-/// `PreferPrimary`.
+/// Editing rules changes neither the default route nor the bindings, so a
+/// stored additional default route with its bound adapter must not read as a
+/// change of either.
 #[test]
-fn the_strict_mode_of_the_caller_reaches_the_risk_scorer() {
+fn the_stored_policy_reaches_the_risk_scorer_unchanged() {
     let (exec, conn) = build_test_executor();
     let sid = nrr_storage::BASELINE_PRINCIPAL;
     {
         let guard = conn.lock().expect("lock");
         let repo = nrr_storage::route_bindings::RouteBindingsRepository::new(&guard);
         let mut policy = repo.load_for_sid(sid).expect("load");
-        // Strict mode is only storable with a bound secondary — the same
-        // precondition the GUI enforces.
         policy.secondary = Some(nrr_storage::RouteBindingRecord {
             stable_id: "win-adapter:vpn".into(),
             display_name: "vpn".into(),
             user_confirmed: true,
             known_stable_ids: Vec::new(),
         });
-        policy.mode = nrr_storage::route_bindings::BehaviorMode::StrictSecondaryFailClosed;
+        policy.mode = nrr_storage::route_bindings::BehaviorMode::PreferSecondaryWhenAvailable;
+        policy.leak_protection = nrr_domain::LeakProtection::Everything;
         repo.update_for_sid(sid, &policy, 0).expect("store");
     }
 
@@ -1469,11 +1467,11 @@ fn the_strict_mode_of_the_caller_reaches_the_risk_scorer() {
         .score_candidate_for_payload(r#"{"schema-version":1,"primary":[],"secondary":[]}"#, sid)
         .expect("scored");
     assert!(
-        scored
-            .signals
-            .iter()
-            .any(|s| matches!(s, RiskSignalDto::FailClosedActivation)),
-        "expected the fail-closed signal, got {:?}",
+        !scored.signals.iter().any(|s| matches!(
+            s,
+            RiskSignalDto::DefaultBehaviorChanged | RiskSignalDto::UnstableInterfaceBinding
+        )),
+        "a rules edit changed no policy, got {:?}",
         scored.signals
     );
 }

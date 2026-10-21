@@ -20,8 +20,8 @@ use super::*;
 ///
 /// # `include_child_processes`
 ///
-/// This is a global GUI setting, not a per-rule file attribute. The caller
-/// passes the current value; it is applied uniformly to all application rules.
+/// The global GUI setting, applied to every application rule; a rule's own
+/// `+children` flag turns it on for that rule alone.
 pub fn rules_file_to_route_rule_set(
     parsed: &RulesFileParsed,
     platform: HostPlatform,
@@ -77,7 +77,8 @@ pub fn rules_file_to_route_rule_set(
                         None,
                         Some(AppMatch {
                             pattern,
-                            include_child_processes,
+                            include_child_processes: include_child_processes
+                                || entry.children_requested,
                             override_requested: entry.override_requested,
                             windows_service_name: None,
                         }),
@@ -224,6 +225,7 @@ pub fn canonical_rule_set_to_rules_file_parsed(
                 blocked,
                 verify_primary,
                 override_requested: false,
+                children_requested: false,
                 origin: if app_authored {
                     rule.origin.clone()
                 } else {
@@ -242,6 +244,7 @@ pub fn canonical_rule_set_to_rules_file_parsed(
                 blocked,
                 verify_primary: false,
                 override_requested: app.override_requested,
+                children_requested: app.include_child_processes,
                 origin: rule.origin.clone(),
             });
         }

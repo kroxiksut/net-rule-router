@@ -128,6 +128,7 @@ fn write_disabled_entry_with_inline_comment() {
                 verify_primary: false,
                 origin: None,
                 override_requested: false,
+                children_requested: false,
             }],
         }],
     };
@@ -424,4 +425,126 @@ fn a_line_break_in_any_field_never_becomes_a_rule_or_section() {
             .any(|l| l.trim() == "192.0.2.9" || l.trim() == "--- IP"),
         "written text:\n{text}"
     );
+}
+
+#[test]
+fn children_flag_survives_a_write_and_read_in_a_program_section_only() {
+    let parsed = RulesFileParsed {
+        sections: vec![
+            SectionContent {
+                section: RulesFileSection::Windows,
+                entries: vec![RulesFileEntry {
+                    children_requested: true,
+                    ..RulesFileEntry::enabled("codex.exe")
+                }],
+            },
+            SectionContent {
+                section: RulesFileSection::Domains,
+                entries: vec![RulesFileEntry {
+                    children_requested: true,
+                    ..RulesFileEntry::enabled("example.com")
+                }],
+            },
+        ],
+    };
+    let text = write_rules_file(&parsed, &[], None);
+    assert!(text.contains("codex.exe +children\n"), "{text}");
+    assert!(!text.contains("example.com +children"), "{text}");
+    let again = parse_rules_file(&text).parsed;
+    let flags: Vec<bool> = again
+        .sections
+        .iter()
+        .flat_map(|s| &s.entries)
+        .map(|e| e.children_requested)
+        .collect();
+    // Sections are written in canonical order, Domains before Windows.
+    assert_eq!(flags, [false, true]);
+}
+
+/// A disabled program the parser would take for a note goes in quotes and
+/// reads back as the same rule, in every program section.
+#[test]
+fn a_disabled_spaced_program_is_written_in_quotes_and_read_back() {
+    for section in [
+        RulesFileSection::Windows,
+        RulesFileSection::Linux,
+        RulesFileSection::MacOS,
+    ] {
+        let parsed = RulesFileParsed {
+            sections: vec![SectionContent {
+                section,
+                entries: vec![
+                    RulesFileEntry {
+                        children_requested: true,
+                        inline_comment: Some("note".to_string()),
+                        ..RulesFileEntry::disabled("Web Content")
+                    },
+                    RulesFileEntry::disabled("/opt/My Apps/tool"),
+                    RulesFileEntry {
+                        blocked: true,
+                        ..RulesFileEntry::disabled("Denied App")
+                    },
+                    RulesFileEntry::disabled("My \"Big\" App"),
+                    RulesFileEntry::enabled("\"Quoted\""),
+                ],
+            }],
+        };
+        let text = write_rules_file(&parsed, &[], None);
+        for line in [
+            "\n# \"Web Content\" +children  # note\n",
+            "\n# \"/opt/My Apps/tool\"\n",
+            "\n# !\"Denied App\"\n",
+            "\n# \"My \"Big\" App\"\n",
+            "\n\"\"Quoted\"\"\n",
+        ] {
+            assert!(text.contains(line), "{section}: {line:?} in\n{text}");
+        }
+        assert_eq!(parse_rules_file(&text).parsed, parsed, "{text}");
+    }
+}
+
+/// Quotes are read on an enabled line too, so taking `# ` off by hand turns
+/// the rule on; the next write needs no quotes for it.
+#[test]
+fn an_enabled_quoted_program_reads_without_its_quotes() {
+    let parsed = parse_rules_file("--- Linux\n\"Web Content\" +children  # note\n").parsed;
+    let apps = parsed.entries_for(RulesFileSection::Linux);
+    assert_eq!(apps.len(), 1, "{apps:?}");
+    assert_eq!(apps[0].match_value, "Web Content");
+    assert!(apps[0].enabled && apps[0].children_requested);
+    assert_eq!(
+        write_rules_file(&parsed, &[], None),
+        "--- Linux\nWeb Content +children  # note\n"
+    );
+}
+
+/// A file every line of which read back bare before keeps its bytes.
+#[test]
+fn program_lines_that_read_back_bare_keep_their_bytes() {
+    let input = "\
+--- Windows
+# Adobe Reader.exe
+# C:\\Program Files\\Example App\\*
+Web Content.exe +children
+chrome.exe
+
+--- Linux
+# firefox
+# /opt/Example App/
+Web Content  # on
+";
+    let parsed = parse_rules_file(input).parsed;
+    assert_eq!(write_rules_file(&parsed, &[], None), input);
+}
+
+/// Quotes mean nothing outside a program section: the value keeps them.
+#[test]
+fn quotes_outside_a_program_section_stay_in_the_value() {
+    let input = "--- Domains\n\"example.com\"\n";
+    let parsed = parse_rules_file(input).parsed;
+    assert_eq!(
+        parsed.entries_for(RulesFileSection::Domains)[0].match_value,
+        "\"example.com\""
+    );
+    assert_eq!(write_rules_file(&parsed, &[], None), input);
 }

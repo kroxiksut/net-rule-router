@@ -597,6 +597,7 @@ fn write_redaction_report(
     let report = RedactionReport {
         redaction_mode: redaction_mode_slug(input.request.redaction_mode),
         hostnames_redacted: counts.hostnames,
+        values_redacted: counts.values,
         ips_redacted: counts.ips,
         paths_redacted: counts.paths,
         excluded_sections: excluded,
@@ -611,14 +612,15 @@ fn write_redaction_report(
 #[derive(Default)]
 struct MarkerCounts {
     hostnames: u32,
+    values: u32,
     ips: u32,
     paths: u32,
 }
 
 fn count_markers(dir: &Path) -> MarkerCounts {
     use crate::privacy::redact::{
-        MARKER_MASKED_IPV4, MARKER_MASKED_PATH, MARKER_PRIVATE_IPV4, MARKER_PUBLIC_IPV4,
-        MARKER_REDACTED,
+        MARKER_MASKED_HOST, MARKER_MASKED_IPV4, MARKER_MASKED_PATH, MARKER_PRIVATE_IPV4,
+        MARKER_PUBLIC_IPV4, MARKER_REDACTED,
     };
 
     let mut counts = MarkerCounts::default();
@@ -629,7 +631,8 @@ fn count_markers(dir: &Path) -> MarkerCounts {
         let Ok(text) = std::fs::read_to_string(dir.join(name)) else {
             continue;
         };
-        counts.hostnames += text.matches(MARKER_REDACTED).count() as u32;
+        counts.hostnames += text.matches(MARKER_MASKED_HOST).count() as u32;
+        counts.values += text.matches(MARKER_REDACTED).count() as u32;
         counts.ips += (text.matches(MARKER_MASKED_IPV4).count()
             + text.matches(MARKER_PRIVATE_IPV4).count()
             + text.matches(MARKER_PUBLIC_IPV4).count()) as u32;

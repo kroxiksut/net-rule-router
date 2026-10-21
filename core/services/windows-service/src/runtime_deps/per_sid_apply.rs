@@ -22,7 +22,12 @@ pub(super) struct PerSidApplyInputs<'a> {
     pub event_bus: Arc<EventBus>,
     pub fake_ip_controller: Arc<nrr_service_runtime::fake_ip::FakeIpController>,
     pub health_agg: Arc<HealthAggregator>,
+    /// Raised when a route failure needs the next tick to retry in full.
+    pub full_pass: nrr_service_runtime::pass_inputs::FullPassRequest,
     pub id_generator: Arc<ProductionIdGenerator>,
+    /// A full pass, forced and on a thread of its own: a block-all edge of one
+    /// user changes the plan of every other user holding one.
+    pub peer_replan: Arc<dyn Fn() + Send + Sync>,
     pub liveness_tracker: Arc<nrr_service_runtime::secondary_liveness::SecondaryLivenessTracker>,
     pub reachability_probe: Arc<dyn nrr_platform_windows::reachability::ReachabilityProbe>,
     pub rebind_requests: Arc<nrr_service_runtime::power_resume::RebindRequests>,
@@ -102,6 +107,35 @@ fn first_pass_after_late_engine(orch: &PerSidApplyOrchestrator, health: &HealthA
     }
 }
 
+/// A dead instance's blocks once the engine answered at start: held for the
+/// first pass to adopt while anyone has leak protection on, lifted now when
+/// nobody does. Runs before any pass is wired, so every block it finds is an
+/// orphan.
+fn settle_inherited_blocks(orch: &PerSidApplyOrchestrator, startup: OrphanedBlocks) {
+    if startup == OrphanedBlocks::AdoptOnFirstPass {
+        return;
+    }
+    // By id first (robust when enumerate under-reports), then every block the
+    // enumerate finds.
+    orch.strip_inherited_now();
+    match orch.cleanup_wfp_blocks_only() {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            target: "nrr::runtime",
+            msg_key = "svc-persid-startup-blocks-stripped",
+            stripped_blocks = n as u64,
+            "startup reconciliation: stripped orphaned block/kill-switch \
+             WFP filter(s) left by a prior instance",
+        ),
+        Err(e) => tracing::warn!(
+            target: "nrr::runtime",
+            msg_key = "svc-persid-startup-block-strip-failed",
+            error = %e,
+            "startup block-filter reconciliation failed",
+        ),
+    }
+}
+
 pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
     // Destructured rather than read through `inputs.x`, so the body below is
     // the same text it was inline and the diff shows a move, not a rewrite.
@@ -113,7 +147,9 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
         event_bus,
         fake_ip_controller,
         health_agg,
+        full_pass,
         id_generator,
+        peer_replan,
         liveness_tracker,
         reachability_probe,
         rebind_requests,
@@ -272,6 +308,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
             let production_rules = ProductionRulesProvider::new(Arc::clone(state_conn));
             // A book that stops reading is a health verdict, not a log line.
             production_rules.set_health(Arc::clone(&health_agg));
+            // The user whose book stops reading is told at once, alone.
+            nrr_service_runtime::rules_book_notice::attach_events(Arc::clone(&event_bus));
             let rules_provider: Arc<dyn RulesProvider> = Arc::new(production_rules);
             // Swap Noop → Production audit
             // sink when the audit writer is available. Without
@@ -366,51 +404,12 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             }
                         })
                     };
-            // The user's own answers about local networks: which segments
-            // stay reachable while the kill-switch blocks everything else.
-            // Read per resolve so a change in Settings lands on the next
-            // reconcile; unreadable rows degrade to "no stored decisions",
-            // never to a wider exemption.
-            let local_network_policy: nrr_service_runtime::route_coordinator::LocalNetworkPolicyFn = {
-                let conn = Arc::clone(state_conn);
-                Arc::new(move |sid: &str| {
-                    use nrr_domain::ipv4_network::Ipv4Network;
-                    let mut policy =
-                        nrr_service_runtime::route_coordinator::LocalNetworkPolicy::default();
-                    let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                    let repo =
-                        nrr_storage::local_network_rules::LocalNetworkRulesRepository::new(&guard);
-                    let Ok(rules) = repo.list_for_sid(sid) else {
-                        return policy;
-                    };
-                    for rule in rules {
-                        // The adapter half is what survives a
-                        // hypervisor switch renumbering its segment;
-                        // the coordinator resolves it against the
-                        // adapters that exist at reconcile time.
-                        if !rule.adapter.is_empty() {
-                            policy
-                                .adapter_answers
-                                .push((rule.adapter.clone(), rule.allow));
-                        }
-                        let Some(network) = Ipv4Network::parse(&rule.cidr) else {
-                            // A public IPv6 prefix, answered by itself.
-                            if let Some(block) = nrr_shared::ip_block::IpBlock::parse(&rule.cidr)
-                                .filter(|b| !b.is_ipv4())
-                            {
-                                policy.answers_v6.push((block, rule.allow));
-                            }
-                            continue;
-                        };
-                        if rule.allow {
-                            policy.allowed.push(network);
-                        } else {
-                            policy.refused.push(network);
-                        }
-                    }
-                    policy
-                })
-            };
+            // The user's own answers about local networks, read per resolve so
+            // a change in Settings lands on the next reconcile.
+            let local_network_policy: nrr_service_runtime::route_coordinator::LocalNetworkPolicyFn =
+                nrr_service_runtime::production_local_networks::stored_local_network_policy(
+                    Arc::clone(state_conn),
+                );
             // Safe-disable (ROUTE-half) — the route coordinator gates
             // EVERY recompute on the persistent pause flag, so a paused
             // user's routes are never (re)installed by any re-drive path
@@ -458,8 +457,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 persistence_over(Arc::clone(state_conn))
             };
             // Alongside the per-SID WFP orchestrator, the
-            // `SecondaryRouteCoordinator` drives the system route table for the
-            // active console user (real interface routing of IP/FQDN/
+            // `SecondaryRouteCoordinator` drives the system route table for
+            // every served user (real interface routing of IP/FQDN/
             // domain-suffix/zone rules out the secondary adapter); it shares the
             // orchestrator's providers, cloned before the orchestrator consumes
             // them.
@@ -515,7 +514,11 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 nrr_service_runtime::rule_hostname_seeder::RuleHostnameSeeder::new(
                     build_hosts_bypass_resolver(
                         Some(Arc::clone(state_conn)),
-                        Some(Arc::clone(&seeder_active_sid)),
+                        Some({
+                            let reg = Arc::clone(&sid_registry);
+                            let coord = Arc::clone(&route_coord);
+                            Arc::new(move || coord.served_sids(&reg.active_sids()))
+                        }),
                         Some(build_dns_egress_policy(
                             &route_coord,
                             Arc::clone(&seeder_active_sid),
@@ -816,9 +819,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
             // kill-switch pins its egress condition to the live
             // interface and never traps the tunnel / LAN / DHCP. Read
             // fresh on every apply (a secondary reconnect changes the LUID /
-            // server IP). Returns `None` → kill-switch off (fail-open);
-            // it only activates when the user also enables
-            // `block_secondary_when_unavailable`.
+            // server IP). Returns `None` → kill-switch off (fail-open).
             let kill_switch_resolver: nrr_service_runtime::per_sid_orchestrator::KillSwitchResolver = {
                         let coord = Arc::clone(&route_coord);
                         Arc::new(move |sid: &str, machine: &nrr_service_runtime::machine_reading::MachineReading| {
@@ -834,6 +835,9 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             coord.ipv6_guard(sid, machine)
                         })
             };
+            // This orchestrator publishes each SID's disposition, so the DNS
+            // path can tell "first plan pending" from "nothing carries IPv6".
+            nrr_service_runtime::ipv6_disposition::global_ipv6_dispositions().expect_plans();
             // Fail-closed exemptions: resolved even
             // when the secondary is gone, so a fail-closed block-all
             // (mode B) keeps LAN / manageability and lets the tunnel
@@ -1022,15 +1026,23 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         .with_route_sync({
                             let coord = Arc::clone(&route_coord);
                             let registry = Arc::clone(&sid_registry);
-                            Arc::new(move || {
-                                if let Err(e) = coord.recompute_active(&registry.active_sids()) {
-                                    tracing::warn!(
-                                        target: "nrr::route-coordinator",
-                                        msg_key = "svc-persid-route-sync-before-pin-failed",
-                                        error = %e,
-                                        "route sync before installing new destination pins failed",
-                                    );
-                                }
+                            nrr_service_runtime::apply_health::route_sync_hook(
+                                move || {
+                                    coord
+                                        .recompute_active(&registry.active_sids())
+                                        .map(drop)
+                                        .map_err(|e| e.to_string())
+                                },
+                                Arc::clone(&health_agg),
+                                full_pass.clone(),
+                            )
+                        })
+                        // A few freshly pinned hosts route their own addresses;
+                        // anything else (or a decline) takes the full pass above.
+                        .with_scoped_route_sync({
+                            let coord = Arc::clone(&route_coord);
+                            Arc::new(move |sid: &str, hosts: &[std::net::IpAddr]| {
+                                coord.route_first_contact(sid, hosts) > 0
                             })
                         })
                         // Break the connections a newly enforced destination
@@ -1072,6 +1084,18 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                                 ),
                             },
                         )
+                        // IKEv2 and L2TP/IPsec key exchange comes from the IKEEXT
+                        // service in svchost: its handshake passes the service
+                        // accounts' share of a guard, and nothing else of theirs.
+                        .with_peer_replan(Arc::clone(&peer_replan))
+                        .with_ike_service_images(vec![std::path::Path::new(
+                            &std::env::var("SystemRoot")
+                                .unwrap_or_else(|_| r"C:\Windows".to_string()),
+                        )
+                        .join("System32")
+                        .join("svchost.exe")
+                        .to_string_lossy()
+                        .into_owned()])
                         // A rule can name a host nothing has resolved yet — the
                         // browser tab that prompted it is sitting on an
                         // established socket and will never ask DNS again. Ask
@@ -1096,10 +1120,20 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                                 {
                                     return;
                                 }
-                                let busy_done = Arc::clone(&busy);
+                                // Clears the flag however the worker ends: a panic
+                                // inside the resolver would otherwise stop every
+                                // later resolve for good.
+                                struct BusyDone(Arc<std::sync::atomic::AtomicBool>);
+                                impl Drop for BusyDone {
+                                    fn drop(&mut self) {
+                                        self.0.store(false, std::sync::atomic::Ordering::Release);
+                                    }
+                                }
+                                let busy_done = BusyDone(Arc::clone(&busy));
                                 let spawned = std::thread::Builder::new()
                                     .name("nrr-rule-host-resolve".to_string())
                                     .spawn(move || {
+                                        let _busy_done = busy_done;
                                         let summary = refresher
                                             .resolve_now(&hosts, std::time::SystemTime::now());
                                         tracing::info!(
@@ -1109,12 +1143,9 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                                             succeeded = summary.succeeded,
                                             "resolved rule hosts that had no confirmed address — enforcement picks them up on the next reconcile",
                                         );
-                                        busy_done
-                                            .store(false, std::sync::atomic::Ordering::Release);
                                     });
-                                if spawned.is_err() {
-                                    busy.store(false, std::sync::atomic::Ordering::Release);
-                                }
+                                // A failed spawn drops the closure, and the guard with it.
+                                drop(spawned);
                             })
                         })
                         // Fake-IP: the WFP additions (pool permit +
@@ -1187,43 +1218,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
             };
             if open_wfp_session_or_keep_trying(Arc::clone(&session), on_late) {
                 health_agg.clear_as(WFP_ENGINE_HEALTH_SOURCE, HealthComponent::Apply);
-                if startup_orphans == OrphanedBlocks::StripNow {
-                    // By id first (robust when enumerate under-reports), then
-                    // every block the enumerate finds.
-                    orch.strip_inherited_now();
-                    match orch.cleanup_wfp_blocks_only() {
-                        Ok(0) => {}
-                        Ok(n) => tracing::warn!(
-                            target: "nrr::runtime",
-                            msg_key = "svc-persid-startup-blocks-stripped",
-                            stripped_blocks = n as u64,
-                            "startup reconciliation: stripped orphaned block/kill-switch \
-                             WFP filter(s) left by a prior instance",
-                        ),
-                        Err(e) => tracing::warn!(
-                            target: "nrr::runtime",
-                            msg_key = "svc-persid-startup-block-strip-failed",
-                            error = %e,
-                            "startup block-filter reconciliation failed",
-                        ),
-                    }
-                }
-            }
-            // Recompute the route table on every active-user transition
-            // (login/logout/switch). Every served user's routes share the
-            // table; nobody served tears it down (no user → no routes).
-            {
-                let coord = Arc::clone(&route_coord);
-                sid_registry.add_listener(Arc::new(move |snapshot: &[String]| {
-                    if let Err(e) = coord.recompute_active(snapshot) {
-                        tracing::error!(
-                            target: "nrr::route-coordinator",
-                            msg_key = "svc-persid-route-recompute-failed",
-                            error = %e,
-                            "route recompute on active-user change failed",
-                        );
-                    }
-                }));
+                settle_inherited_blocks(&orch, startup_orphans);
             }
             (
                 Some(orch),
@@ -1276,20 +1271,17 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
     // decider (served minus paused, read under its membership lock), the same
     // call the pass and the pause dispatcher make — so an exit during a pass
     // can no longer be overtaken by the pass's older view. A decider that
-    // cannot answer (pause-flag read error) touches nothing.
-    if let Some(orch) = per_sid_orchestrator.as_ref() {
-        let orch = Arc::clone(orch);
-        sid_registry.add_listener(Arc::new(move |_snapshot: &[String]| {
-            if let Err(e) = orch.settle() {
-                tracing::error!(
-                    target: "nrr::per_sid_orchestrator",
-                    msg_key = "svc-persid-pause-aware-reconcile-failed",
-                    error = %e,
-                    "membership settle on active-user change failed",
-                );
-            }
-        }));
-    }
+    // cannot answer (pause-flag read error) touches nothing. The route table,
+    // which every served user's routes share, moves after it.
+    listen_filters_then_routes(
+        &sid_registry,
+        per_sid_orchestrator
+            .as_ref()
+            .map(|orch| (orch, settle_membership)),
+        route_coordinator
+            .as_ref()
+            .map(|coord| (coord, recompute_routes)),
+    );
 
     // Recompile the held filter sets right after a fake-IP stack transition.
     // The per-SID codegen reads the fake-IP context LIVE (see
@@ -1340,5 +1332,189 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
             auto_rules_engine,
             app_destination_memory,
         ),
+    }
+}
+
+/// Membership transitions settle the filters first and move the routes second:
+/// listeners run in registration order, so a transition never moves traffic
+/// before the guard over it has settled. Held weakly, as both reach the
+/// registry back through their own deciders.
+fn listen_filters_then_routes<F, R, S, U>(
+    registry: &ActiveSidRegistry,
+    filters: Option<(&Arc<F>, S)>,
+    routes: Option<(&Arc<R>, U)>,
+) where
+    F: Send + Sync + 'static,
+    R: Send + Sync + 'static,
+    S: Fn(&F) + Send + Sync + 'static,
+    U: Fn(&R, &[String]) + Send + Sync + 'static,
+{
+    if let Some((filters, settle)) = filters {
+        let filters = Arc::downgrade(filters);
+        registry.add_listener(Arc::new(move |_snapshot: &[String]| {
+            if let Some(filters) = filters.upgrade() {
+                settle(&filters);
+            }
+        }));
+    }
+    if let Some((routes, recompute)) = routes {
+        let routes = Arc::downgrade(routes);
+        registry.add_listener(Arc::new(move |snapshot: &[String]| {
+            if let Some(routes) = routes.upgrade() {
+                recompute(&routes, snapshot);
+            }
+        }));
+    }
+}
+
+fn settle_membership(orch: &PerSidApplyOrchestrator) {
+    if let Err(e) = orch.settle() {
+        tracing::error!(
+            target: "nrr::per_sid_orchestrator",
+            msg_key = "svc-persid-pause-aware-reconcile-failed",
+            error = %e,
+            "membership settle on active-user change failed",
+        );
+    }
+}
+
+fn recompute_routes(
+    coord: &nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator,
+    snapshot: &[String],
+) {
+    if let Err(e) = coord.recompute_active(snapshot) {
+        tracing::error!(
+            target: "nrr::route-coordinator",
+            msg_key = "svc-persid-route-recompute-failed",
+            error = %e,
+            "route recompute on active-user change failed",
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use nrr_platform_windows::{
+        MockWindowsApi, WfpAction, WfpFilterAction, WfpFilterId, WfpFilterSpec, WfpLayerKey,
+    };
+    use nrr_service_runtime::fqdn_cache_lookup::MockFqdnCacheLookup;
+    use nrr_service_runtime::per_sid_orchestrator::{NoopRulesProvider, PerSidPolicySnapshot};
+
+    struct NoPolicy;
+    impl RoutePolicySource for NoPolicy {
+        fn load_for_sid(&self, _sid: &str) -> Option<PerSidPolicySnapshot> {
+            None
+        }
+    }
+
+    fn filter(raw: u64, action: WfpAction) -> WfpFilterSpec {
+        WfpFilterSpec {
+            layer: WfpLayerKey::AleAuthConnectV4,
+            action,
+            remote_ip: Some(std::net::Ipv4Addr::new(192, 0, 2, raw as u8)),
+            remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
+            remote_port: None,
+            weight: 0x10_0000 + raw,
+            id: WfpFilterId::from_raw(raw),
+            user_sid: None,
+            app_pattern: None,
+            local_interface_luid: None,
+            remote_subnet: None,
+            remote_subnet_v6: None,
+            ip_protocol: None,
+            remote_subnet_set: Vec::new(),
+        }
+    }
+
+    /// The engine as a crashed instance left it (two blocks, one permit), and
+    /// the next start's orchestrator over it, orphans deferred as at boot.
+    fn start_after_crash(api: &Arc<MockWindowsApi>) -> PerSidApplyOrchestrator {
+        let crashed = WfpSession::open(Arc::clone(api) as Arc<dyn WindowsApiPort>).unwrap();
+        crashed
+            .execute_wfp_plan(&[
+                WfpFilterAction::AddFilter(filter(1, WfpAction::Block)),
+                WfpFilterAction::AddFilter(filter(2, WfpAction::Permit)),
+                WfpFilterAction::AddFilter(filter(3, WfpAction::Block)),
+            ])
+            .unwrap();
+        let session =
+            Arc::new(WfpSession::open(Arc::clone(api) as Arc<dyn WindowsApiPort>).unwrap());
+        let orch = PerSidApplyOrchestrator::new(
+            session,
+            Arc::new(NoPolicy),
+            Arc::new(NoopRulesProvider),
+            Arc::new(MockFqdnCacheLookup::new()),
+            Arc::new(NoopPerSidApplyAudit),
+        );
+        orch.defer_orphans_to_first_pass();
+        orch
+    }
+
+    fn installed(api: &MockWindowsApi, action: WfpAction) -> Vec<u64> {
+        let mut ids: Vec<u64> = api
+            .wfp_filters
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f.action == action)
+            .map(|f| f.id.raw)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A membership change settles the filters before it moves the routes,
+    /// and the registry keeps neither side alive.
+    #[test]
+    fn a_transition_settles_the_filters_before_it_moves_the_routes() {
+        use nrr_shared::ipc::IpcClientProfile;
+        use std::sync::Mutex;
+
+        struct Side(&'static str, Arc<Mutex<Vec<&'static str>>>);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let filters = Arc::new(Side("filters", Arc::clone(&seen)));
+        let routes = Arc::new(Side("routes", Arc::clone(&seen)));
+        let registry = ActiveSidRegistry::new();
+        listen_filters_then_routes(
+            &registry,
+            Some((&filters, |side: &Side| side.1.lock().unwrap().push(side.0))),
+            Some((&routes, |side: &Side, _: &[String]| {
+                side.1.lock().unwrap().push(side.0)
+            })),
+        );
+
+        registry.on_connect("S-1-5-21-1-1-1-1001", IpcClientProfile::TrayLightweight);
+
+        assert_eq!(*seen.lock().unwrap(), vec!["filters", "routes"]);
+        assert_eq!(Arc::strong_count(&filters), 1);
+        assert_eq!(Arc::strong_count(&routes), 1);
+    }
+
+    #[test]
+    fn a_start_after_a_crash_keeps_the_blocks_while_someone_has_leak_protection() {
+        let api = Arc::new(MockWindowsApi::new());
+        let orch = start_after_crash(&api);
+
+        settle_inherited_blocks(&orch, orphaned_blocks_at_start(true));
+
+        assert_eq!(
+            installed(&api, WfpAction::Block),
+            vec![1, 3],
+            "the blocks hold until the first pass adopts them"
+        );
+    }
+
+    #[test]
+    fn a_start_after_a_crash_lifts_the_blocks_when_nobody_has_leak_protection() {
+        let api = Arc::new(MockWindowsApi::new());
+        let orch = start_after_crash(&api);
+
+        settle_inherited_blocks(&orch, orphaned_blocks_at_start(false));
+
+        assert!(installed(&api, WfpAction::Block).is_empty());
+        assert_eq!(installed(&api, WfpAction::Permit), vec![2]);
     }
 }

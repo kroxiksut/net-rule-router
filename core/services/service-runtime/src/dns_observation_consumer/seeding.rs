@@ -15,8 +15,8 @@ impl DnsObservationConsumer {
     /// uncompiled and the host blocked under a catch-all.
     ///
     /// Same keep-logic as [`consume`](Self::consume): active-SID gate,
-    /// active-rules match (primary OR secondary), and the `is_non_routable_v4`
-    /// filter (an ad-blocked `127.0.0.1` pin in the OS cache must never become a
+    /// active-rules match (primary OR secondary), and the non-routable filter
+    /// (an ad-blocked `127.0.0.1` pin in the OS cache must never become a
     /// `/32`). Collateral detection is intentionally NOT run here — that is a
     /// property of live observation, not of a cache snapshot. Best-effort: a
     /// read error is logged at debug and yields an empty summary.
@@ -26,7 +26,13 @@ impl DnsObservationConsumer {
         if books.is_empty() {
             return summary;
         }
-        let entries = match self.dns_cache_read.read_resolver_cache() {
+        // Filter before the per-name OS lookup: most cache names match no rule.
+        let in_rules = |name: &str| {
+            books
+                .iter()
+                .any(|b| rule_set_matches(name, &b.primary) || rule_set_matches(name, &b.secondary))
+        };
+        let entries = match self.dns_cache_read.read_resolver_cache_matching(&in_rules) {
             Ok(e) => e,
             Err(e) => {
                 tracing::debug!(
@@ -37,14 +43,9 @@ impl DnsObservationConsumer {
                 return summary;
             }
         };
-        for entry in entries {
-            let routable: Vec<Ipv4Addr> = entry
-                .addresses
-                .iter()
-                .copied()
-                .filter(|ip| !is_non_routable_v4(ip))
-                .collect();
-            if routable.is_empty() {
+        for mut entry in entries {
+            entry.addresses.retain(|ip| !is_non_routable(ip));
+            if entry.addresses.is_empty() {
                 continue;
             }
             let matches = books.iter().any(|book| {
@@ -57,7 +58,7 @@ impl DnsObservationConsumer {
             }
             self.upsert_counted(
                 &entry.canonical_hostname,
-                &routable,
+                entry.addresses,
                 now,
                 StorageResolutionSource::OsCacheSeed,
                 &mut summary,
@@ -137,7 +138,7 @@ impl DnsObservationConsumer {
         }
         let kept = self.upsert(
             hostname,
-            &novel,
+            novel.iter().copied().map(IpAddr::V4),
             now,
             StorageResolutionSource::ReverseConfirmed,
         );

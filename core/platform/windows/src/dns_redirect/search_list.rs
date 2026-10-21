@@ -31,6 +31,9 @@ pub trait SearchListStore: Send + Sync {
     fn read(&self) -> Result<SearchListView, PlatformError>;
     /// Make `suffixes` the global list in force; empty clears it.
     fn write(&self, suffixes: &[String]) -> Result<(), PlatformError>;
+    /// `write` lands without a child process. When it does not, the DNS
+    /// restore leaves the clearing to a thread of its own rather than wait.
+    fn writes_in_place(&self) -> bool;
     /// Every suffix a list we wrote may hold. Empty when we hold none.
     fn noted(&self) -> Vec<String>;
     fn note(&self, suffixes: &[String]) -> Result<(), PlatformError>;
@@ -229,6 +232,10 @@ mod live {
             }
         }
 
+        fn writes_in_place(&self) -> bool {
+            crate::win32_ffi::dns_settings::can_set_dns_settings()
+        }
+
         fn noted(&self) -> Vec<String> {
             note_path()
                 .and_then(|path| std::fs::read_to_string(path).ok())
@@ -276,6 +283,9 @@ pub(crate) struct FakeList {
     noted: std::sync::Mutex<Vec<String>>,
     writes: std::sync::Mutex<Vec<Vec<String>>>,
     fail_write: bool,
+    /// Set for a store whose writes go through a child process: each write
+    /// waits for one message on it.
+    gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 #[cfg(test)]
@@ -283,6 +293,12 @@ impl FakeList {
     fn with(view: SearchListView) -> Self {
         Self {
             view: std::sync::Mutex::new(view),
+            ..Self::default()
+        }
+    }
+    pub(crate) fn behind_a_process(gate: std::sync::mpsc::Receiver<()>) -> Self {
+        Self {
+            gate: std::sync::Mutex::new(Some(gate)),
             ..Self::default()
         }
     }
@@ -296,7 +312,7 @@ impl FakeList {
     fn noted_now(&self) -> Vec<String> {
         self.noted.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
-    fn writes(&self) -> usize {
+    pub(crate) fn writes(&self) -> usize {
         self.writes.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
@@ -313,12 +329,21 @@ impl SearchListStore for FakeList {
                 detail: "refused".into(),
             });
         }
+        if let Some(gate) = self.gate.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            let _ = gate.recv();
+        }
         self.writes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(suffixes.to_vec());
         self.view.lock().unwrap_or_else(|p| p.into_inner()).global = suffixes.to_vec();
         Ok(())
+    }
+    fn writes_in_place(&self) -> bool {
+        self.gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
     }
     fn noted(&self) -> Vec<String> {
         self.noted_now()

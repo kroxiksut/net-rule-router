@@ -107,6 +107,7 @@ impl PerSidApplyOrchestrator {
             // driving the route pass). Production wires the route coordinator
             // via `with_route_sync`.
             route_sync: None,
+            scoped_route_sync: None,
             // Default: nobody listens, so a persisting fail-closed posture only
             // announces itself. Production wires the watchdog's queue via
             // `with_rebind_requests`.
@@ -116,7 +117,18 @@ impl PerSidApplyOrchestrator {
             service_accounts: None,
             service_account_owner: Mutex::new(Vec::new()),
             service_account_dns_log: crate::enforcement_planner::ServiceAccountDnsLog::default(),
+            foreign_cut_seen: Mutex::new(std::collections::HashMap::new()),
+            ike_service_images: Vec::new(),
+            peer_replan: None,
         }
+    }
+
+    /// Wire the full-pass request a block-all transition makes: another user's
+    /// plan reads who else holds a block-all, and nothing else of theirs moved.
+    #[must_use]
+    pub fn with_peer_replan(mut self, request: PeerReplanRequest) -> Self {
+        self.peer_replan = Some(request);
+        self
     }
 
     /// Wire the one decider of who holds a filter set (see
@@ -134,6 +146,14 @@ impl PerSidApplyOrchestrator {
     #[must_use]
     pub fn with_service_accounts(mut self, wiring: ServiceAccountWiring) -> Self {
         self.service_accounts = Some(wiring);
+        self
+    }
+
+    /// Name the images that host the OS IKE service, so its handshake passes
+    /// the service accounts' share of a guard.
+    #[must_use]
+    pub fn with_ike_service_images(mut self, images: Vec<String>) -> Self {
+        self.ike_service_images = images;
         self
     }
 
@@ -284,12 +304,18 @@ impl PerSidApplyOrchestrator {
             .flat_map(|v| v.service_accounts.iter())
             .copied()
             .collect();
+        let rule_blocks: HashSet<u64> = by_sid
+            .values()
+            .flat_map(|v| v.rule_blocks.iter())
+            .copied()
+            .collect();
         registry.publish_scoped(crate::killswitch_drop_registry::ScopedBlockIds {
             all,
             app_scoped,
             ipv6_cut,
             dns_lockdown,
             service_accounts,
+            rule_blocks,
         });
     }
 
@@ -323,6 +349,17 @@ impl PerSidApplyOrchestrator {
             .unwrap_or_else(|p| p.into_inner())
             .values()
             .any(|armed| *armed)
+    }
+
+    /// Whether a principal other than `sid` holds a block-all: the IPv6 packet
+    /// layer cannot be scoped to one user, so a second blocker means the
+    /// machine-wide block would cut somebody else's IPv6.
+    pub(super) fn other_principals_hold_block_all(&self, sid: &str) -> bool {
+        self.block_all_flush_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|(other, armed)| *armed && other.as_str() != sid)
     }
 
     /// Whether ANY tracked SID currently has the guard blocking because its
@@ -457,8 +494,7 @@ impl PerSidApplyOrchestrator {
     /// Without this the kill-switch is inert (the default resolver always
     /// returns `None`). Production passes a closure that resolves the
     /// active user's secondary binding + exemptions through the route
-    /// coordinator; the kill-switch then activates only when the user has
-    /// also turned on `block_secondary_when_unavailable`.
+    /// coordinator.
     /// Plug the one machine reading each compute hands its resolvers.
     #[must_use]
     pub fn with_machine_reader(mut self, reader: MachineReader) -> Self {
@@ -487,7 +523,7 @@ impl PerSidApplyOrchestrator {
 
     /// wire the fail-closed exemptions resolver. Only
     /// consulted on the fail-closed path when the secondary is unresolvable
-    /// (mode B block-all). Without it, block-all still exempts loopback /
+    /// (the block-all). Without it, block-all still exempts loopback /
     /// link-local / broadcast but not LAN — production should wire this so a
     /// fail-closed user keeps local manageability and tunnel reconnection.
     pub fn with_fail_closed_exemptions_resolver(

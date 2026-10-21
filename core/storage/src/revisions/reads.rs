@@ -146,22 +146,47 @@ impl<'c> RevisionsRepository<'c> {
         self.last_known_good_for(BASELINE_PRINCIPAL)
     }
 
-    /// The most recent superseded revision for one
-    /// `principal` — that user's canonical rollback target.
+    /// The revision the active one replaced: that user's rollback target.
+    /// Found by `superseded_by`, so two switches in one second or a clock step
+    /// back cannot pick an older row; without an active row the newest
+    /// superseded one (insertion order breaks ties) is used.
     pub fn last_known_good_for(&self, principal: &str) -> StorageResult<Option<RevisionRecord>> {
-        self.conn
-            .query_row(
-                "SELECT revision_id, content_hash, rules_json, status, source,
+        const COLUMNS: &str = "revision_id, content_hash, rules_json, status, source,
                         correlation_id, created_at, activated_at, superseded_at,
-                        superseded_by, rejected_reason, review_summary_json, risk_level
-                 FROM revisions
-                 WHERE principal = ?1 AND status = 'superseded'
-                 ORDER BY superseded_at DESC LIMIT 1",
+                        superseded_by, rejected_reason, review_summary_json, risk_level";
+        let map =
+            |e: rusqlite::Error| StorageError::Internal(format!("revisions last_known_good: {e}"));
+        let by_active = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {COLUMNS} FROM revisions
+                     WHERE principal = ?1 AND status = 'superseded'
+                       AND superseded_by IN
+                           (SELECT revision_id FROM revisions
+                            WHERE principal = ?1 AND status = 'active')
+                     ORDER BY superseded_at DESC, rowid DESC LIMIT 1"
+                ),
                 params![principal],
                 row_to_record,
             )
             .optional()
-            .map_err(|e| StorageError::Internal(format!("revisions last_known_good: {e}")))
+            .map_err(map)?;
+        if by_active.is_some() {
+            return Ok(by_active);
+        }
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {COLUMNS} FROM revisions
+                     WHERE principal = ?1 AND status = 'superseded'
+                     ORDER BY superseded_at DESC, rowid DESC LIMIT 1"
+                ),
+                params![principal],
+                row_to_record,
+            )
+            .optional()
+            .map_err(map)
     }
 
     /// `principal`'s revisions that have ever enforced policy, most-

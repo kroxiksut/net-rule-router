@@ -110,7 +110,6 @@ fn narrowing_keeps_only_what_both_profiles_may_invoke() {
 fn the_terminal_has_every_window_operation_but_the_desktop_session_ones() {
     let desktop_only = [
         IpcOperationName::AutostartGet,
-        IpcOperationName::AutostartToggle,
         IpcOperationName::MigrationStatusGet,
         IpcOperationName::MigrationMarkComplete,
     ];
@@ -368,4 +367,14 @@ fn version_compatibility_matrix_defines_client_behavior_per_case() {
         rule.case == VersionCompatibilityCase::IncompatibleContract
             && rule.behavior == CompatibilityClientBehavior::HardFailAndPromptUpgrade
     }));
+}
+
+/// The launcher answers autostart in the user's own session; a service that
+/// accepted it would write the SYSTEM or root profile.
+#[test]
+fn the_service_has_no_autostart_toggle() {
+    assert_eq!(IpcOperationName::from_slug("autostart.toggle"), None);
+    assert!(ipc_operation_catalog()
+        .iter()
+        .all(|item| item.name.slug() != "autostart.toggle"));
 }

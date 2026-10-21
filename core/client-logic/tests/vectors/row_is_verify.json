@@ -3,7 +3,9 @@
   "cases": [
     { "name": "domain on primary", "input": { "row": { "ruleType": "domain", "targetRoute": "primary", "verify": true } }, "expected": true },
     { "name": "suffix on secondary", "input": { "row": { "ruleType": "suffix-domain", "targetRoute": "secondary", "verify": true } }, "expected": true },
-    { "name": "address v6", "input": { "row": { "ruleType": "exact-ipv6", "targetRoute": "secondary", "verify": true } }, "expected": true },
+    { "name": "address v6 type", "input": { "row": { "ruleType": "exact-ipv6", "targetRoute": "secondary", "verify": true } }, "expected": false },
+    { "name": "address v4 under exact-ip", "input": { "row": { "ruleType": "exact-ip", "targetRoute": "secondary", "verify": true, "matchValue": "203.0.113.7" } }, "expected": true },
+    { "name": "ipv6 literal under exact-ip", "input": { "row": { "ruleType": "exact-ip", "targetRoute": "primary", "verify": true, "matchValue": "2001:db8::1" } }, "expected": false },
     { "name": "flag off", "input": { "row": { "ruleType": "domain", "targetRoute": "primary", "verify": false } }, "expected": false },
     { "name": "flag absent", "input": { "row": { "ruleType": "domain", "targetRoute": "primary" } }, "expected": false },
     { "name": "block", "input": { "row": { "ruleType": "domain", "targetRoute": "block", "verify": true } }, "expected": false },

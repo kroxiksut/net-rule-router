@@ -20,7 +20,7 @@
       "name": "other recorded keys stay",
       "input": {
         "intent": {
-          "kill-switch-enabled": true
+          "leak-protection": "sites"
         },
         "request": {
           "mode": "prefer-primary"
@@ -30,7 +30,7 @@
         ]
       },
       "expected": {
-        "kill-switch-enabled": true,
+        "leak-protection": "sites",
         "mode": "prefer-primary"
       }
     },
@@ -41,14 +41,14 @@
           "mode": "prefer-primary"
         },
         "request": {
-          "mode": "strict-secondary-fail-closed"
+          "mode": "prefer-secondary-when-available"
         },
         "keys": [
           "mode"
         ]
       },
       "expected": {
-        "mode": "strict-secondary-fail-closed"
+        "mode": "prefer-secondary-when-available"
       }
     },
     {
@@ -116,15 +116,15 @@
       "name": "no named keys change nothing",
       "input": {
         "intent": {
-          "kill-switch-enabled": false
+          "leak-protection": "off"
         },
         "request": {
-          "kill-switch-enabled": true
+          "leak-protection": "sites"
         },
         "keys": []
       },
       "expected": {
-        "kill-switch-enabled": false
+        "leak-protection": "off"
       }
     },
     {
@@ -144,15 +144,15 @@
         "intent": {},
         "request": {
           "mode": "prefer-primary",
-          "kill-switch-enabled": true,
+          "leak-protection": "sites",
           "include-subdomains": true
         },
         "keys": [
-          "kill-switch-enabled"
+          "leak-protection"
         ]
       },
       "expected": {
-        "kill-switch-enabled": true
+        "leak-protection": "sites"
       }
     }
   ]
