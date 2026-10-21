@@ -269,8 +269,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends minisign
           umask 077
           key="$RUNNER_TEMP/minisign.key"
-          printf '%s
-' "$MINISIGN_KEY" > "$key"
+          printf '%s\n' "$MINISIGN_KEY" > "$key"
           minisign -S -s "$key" -m SHA256SUMS
           rm -f "$key"
 
