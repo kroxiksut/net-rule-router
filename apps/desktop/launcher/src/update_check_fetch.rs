@@ -302,24 +302,27 @@ const MAX_RELEASE_BODY_BYTES: u64 = 256 * 1024;
 /// parse failure returns `None`. No redirects are followed: the only answer
 /// trusted is the one the named host gives itself.
 fn fetch_latest_release() -> Option<(String, String)> {
-    use std::io::Read;
     let api_url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/latest");
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout(std::time::Duration::from_secs(5))
-        .build();
-    let response = agent
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .max_redirects(0)
+        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .build()
+        .into();
+    let mut response = agent
         .get(&api_url)
         // GitHub requires a UA; name the product honestly.
-        .set("User-Agent", "NetRuleRouter-update-check")
-        .set("Accept", "application/vnd.github+json")
+        .header("User-Agent", "NetRuleRouter-update-check")
+        .header("Accept", "application/vnd.github+json")
         .call()
         .ok()?;
-    let mut text = String::new();
-    response
-        .into_reader()
-        .take(MAX_RELEASE_BODY_BYTES)
-        .read_to_string(&mut text)
+    if !response.status().is_success() {
+        return None;
+    }
+    let text = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_RELEASE_BODY_BYTES)
+        .read_to_string()
         .ok()?;
     let body: serde_json::Value = serde_json::from_str(&text).ok()?;
     let tag = body.get("tag_name")?.as_str()?.trim().to_string();
