@@ -1,0 +1,14 @@
+{
+  "description": "pure.js enforcementRestoreIsNews: the rules applying again is news after an outage, not after the first setup",
+  "cases": [
+    { "name": "the tunnel came back", "input": { "previous": "secondary-down" }, "expected": true },
+    { "name": "a replaced adapter was matched", "input": { "previous": "adapter-gone" }, "expected": true },
+    { "name": "the main connection came back", "input": { "previous": "no-primary-route" }, "expected": true },
+    { "name": "the first main connection was confirmed", "input": { "previous": "no-policy" }, "expected": false },
+    { "name": "an unknown previous status still counts", "input": { "previous": "" }, "expected": true },
+    { "name": "a driver that would not start was fixed", "input": { "previous": "adapter-failed" }, "expected": true },
+    { "name": "an ambiguous adapter name was settled", "input": { "previous": "adapter-choice-needed" }, "expected": true },
+    { "name": "the main link found its way out again", "input": { "previous": "primary-no-way-out" }, "expected": true },
+    { "name": "a spelling the service never sends is not the first setup", "input": { "previous": "No-Policy" }, "expected": true }
+  ]
+}

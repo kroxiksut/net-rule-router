@@ -37,6 +37,7 @@ const PUBLIC: &[&str] = &[
     "app_ips_retracted",
     "app_scoped",
     "applied",
+    "at_start",
     "attempt",
     "attempted",
     "attempts",

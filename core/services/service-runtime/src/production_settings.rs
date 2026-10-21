@@ -475,6 +475,11 @@ impl ProductionRoutingPause {
             paused_at: rec.paused_at.map(|v| v as u64),
             pause_reason: rec.pause_reason,
             updated_at: rec.updated_at as u64,
+            resumes_at_ms: match rec.end {
+                nrr_storage::pause_state::PauseEnd::At(ms) if rec.paused => Some(ms),
+                _ => None,
+            },
+            until_restart: rec.paused && rec.end == nrr_storage::pause_state::PauseEnd::Restart,
         }
     }
 
@@ -486,6 +491,8 @@ impl ProductionRoutingPause {
             paused_at: None,
             pause_reason: None,
             updated_at: now as u64,
+            resumes_at_ms: None,
+            until_restart: false,
         };
         let conn = match self.conn.lock() {
             Ok(c) => c,
@@ -503,6 +510,17 @@ impl RoutingPauseProvider for ProductionRoutingPause {
     fn get(&self, sid: &str) -> RoutingPauseDto {
         self.read_for_sid(sid)
     }
+
+    fn term(&self, sid: &str) -> crate::ipc_handlers::providers::PauseTermView {
+        use nrr_storage::pause_state::PauseEnd;
+        let mut view = crate::ipc_handlers::providers::PauseTermView::default();
+        match self.coordinator.term(sid) {
+            PauseEnd::At(ms) => view.resumes_at_ms = Some(ms),
+            PauseEnd::Restart => view.until_restart = true,
+            PauseEnd::Never => {}
+        }
+        view
+    }
 }
 
 impl RoutingPauseWriter for ProductionRoutingPause {
@@ -512,13 +530,30 @@ impl RoutingPauseWriter for ProductionRoutingPause {
         paused: bool,
         reason: Option<&str>,
     ) -> Result<RoutingPauseDto, SettingsWriteError> {
+        self.toggle_for(sid, paused, reason, None)
+    }
+
+    fn toggle_for(
+        &self,
+        sid: &str,
+        paused: bool,
+        reason: Option<&str>,
+        term: Option<nrr_shared::ipc_payloads::SafeDisableTerm>,
+    ) -> Result<RoutingPauseDto, SettingsWriteError> {
         if sid.is_empty() {
             return Err(SettingsWriteError::AccessDenied(
                 "caller SID required".into(),
             ));
         }
+        let end = match term {
+            Some(term) if paused => crate::routing_pause::pause_end_for(
+                term,
+                i64::try_from(crate::conn_observation_consumer::now_unix_ms()).unwrap_or(i64::MAX),
+            ),
+            _ => nrr_storage::pause_state::PauseEnd::Never,
+        };
         let outcome = if paused {
-            self.coordinator.pause(sid, reason)
+            self.coordinator.pause_until(sid, reason, end)
         } else {
             self.coordinator.resume(sid)
         };
@@ -529,8 +564,11 @@ impl RoutingPauseWriter for ProductionRoutingPause {
                 StatusUpdateEvent::RoutingPauseStateChanged {
                     sid: sid.to_string(),
                     paused,
-                    resumes_at_ms: None,
-                    until_restart: false,
+                    resumes_at_ms: match end {
+                        nrr_storage::pause_state::PauseEnd::At(at) => Some(at),
+                        _ => None,
+                    },
+                    until_restart: end == nrr_storage::pause_state::PauseEnd::Restart,
                 },
             );
         }

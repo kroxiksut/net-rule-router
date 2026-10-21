@@ -484,8 +484,8 @@ Item {
     SafeDisableConfirmDialog {
         id: safeDisableConfirmDialog
         ownerRoot: dialogHost.ownerRoot
-        onConfirmed: function(reason) {
-            ownerRoot._handleSafeDisableConfirmed(reason)
+        onConfirmed: function(reason, term) {
+            ownerRoot._handleSafeDisableConfirmed(reason, term)
         }
         onCancelled: {
             ownerRoot.statusLine = ownerRoot.tr("status.safe-disable.cancelled",

@@ -186,6 +186,9 @@ pub fn connection_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         first.push(Segment::plain(format!(" — {}", texts.get(banner))));
     }
     let mut lines = vec![ViewLine::new(first)];
+    if app.link.is_connected() && app.rules_need_a_sign_in {
+        lines.push(ViewLine::text(texts.get(keys::SSH_ONLY_SESSION)));
+    }
     if let (Link::Connected, Some(skew)) = (&app.link, app.contract_skew) {
         let text = match skew {
             ContractSkew::ServiceOlder => keys::CONTRACT_SERVICE_OLDER,
@@ -254,8 +257,21 @@ fn fix_line(texts: &Texts, key: Key, verb: &str) -> ViewLine {
     ])
 }
 
+/// "12 min left" / "until restart" for a timed pause; `None` for one that
+/// lasts until the user resumes.
+fn pause_left(app: &AppState, texts: &Texts) -> Option<String> {
+    let snapshot = app.snapshot.as_ref()?;
+    if snapshot.routing_pause_until_restart {
+        return Some(texts.dynamic("routing.pause.until-restart", "until restart"));
+    }
+    snapshot
+        .routing_pause_resumes_at_ms
+        .map(|at| crate::screens::rules::overrides::left_text(Some(at), texts))
+}
+
 fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
-    let (word, tone, detail) = match app.routing_state() {
+    let state = app.routing_state();
+    let (word, tone, detail) = match state {
         RoutingState::Active => (
             keys::ROUTING_ACTIVE,
             StateTone::Good,
@@ -273,7 +289,13 @@ fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         ),
         RoutingState::Disconnected => (keys::ROUTING_DISCONNECTED, StateTone::Bad, None),
     };
-    let mut lines = vec![ViewLine::new(vec![Segment::state(texts.get(word), tone)])];
+    let mut first = vec![Segment::state(texts.get(word), tone)];
+    if state == RoutingState::Paused {
+        if let Some(left) = pause_left(app, texts) {
+            first.push(Segment::plain(format!(" · {left}")));
+        }
+    }
+    let mut lines = vec![ViewLine::new(first)];
     match detail {
         Some(detail) => lines.push(ViewLine::text(texts.get(detail))),
         // Without the service the screen shows what it last knew and says so.
@@ -568,6 +590,32 @@ mod tests {
     use crate::testing::{app_at, texts_en, Fixture};
 
     #[test]
+    fn a_timed_pause_says_how_long_it_lasts() {
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        let first_line = |app: &AppState| routing_lines(app, &texts_en())[0].plain_text();
+        let snapshot = app.snapshot.as_mut().expect("snapshot");
+        snapshot.routing_paused = true;
+        snapshot.routing_pause_until_restart = true;
+        assert!(
+            first_line(&app).ends_with("until restart"),
+            "{}",
+            first_line(&app)
+        );
+
+        let snapshot = app.snapshot.as_mut().expect("snapshot");
+        snapshot.routing_pause_until_restart = false;
+        snapshot.routing_pause_resumes_at_ms = Some(i64::MAX);
+        assert!(first_line(&app).contains("left"), "{}", first_line(&app));
+
+        let snapshot = app.snapshot.as_mut().expect("snapshot");
+        snapshot.routing_pause_resumes_at_ms = None;
+        assert!(
+            !first_line(&app).contains(" · "),
+            "an untimed pause names no term"
+        );
+    }
+
+    #[test]
     fn a_contract_skew_is_said_under_the_connection_line() {
         let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
         let lines = |app: &AppState| -> Vec<String> {
@@ -576,14 +624,36 @@ mod tests {
                 .map(ViewLine::plain_text)
                 .collect()
         };
-        assert_eq!(lines(&app).len(), 1);
+        let before = lines(&app).len();
         app.contract_skew = Some(ContractSkew::ServiceOlder);
         let shown = lines(&app);
-        assert!(shown[1].contains("older than this window"), "{shown:?}");
+        assert_eq!(shown.len(), before + 1, "{shown:?}");
+        assert!(
+            shown.iter().any(|l| l.contains("older than this window")),
+            "{shown:?}"
+        );
         app.link = Link::Offline;
         assert!(!lines(&app)
             .iter()
             .any(|l| l.contains("older than this window")));
+    }
+
+    /// The SSH notice follows the flag read at start, not the environment the
+    /// tests run in: a gate run over SSH used to redraw every snapshot.
+    #[test]
+    fn a_session_without_a_windows_sign_in_is_told_so_while_connected() {
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        let said = |app: &AppState| {
+            connection_lines(app, &texts_en())
+                .iter()
+                .map(ViewLine::plain_text)
+                .any(|l| l.contains("Signed in over SSH"))
+        };
+        assert!(!said(&app));
+        app.rules_need_a_sign_in = true;
+        assert!(said(&app));
+        app.link = Link::Offline;
+        assert!(!said(&app));
     }
 
     fn shown(app: &AppState) -> Vec<String> {

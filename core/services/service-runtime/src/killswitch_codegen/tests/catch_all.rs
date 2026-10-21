@@ -56,7 +56,7 @@ fn a_named_foreign_tunnel_is_no_exit_from_either_blanket_posture() {
             WfpLayerKey::AleAuthConnectV4,
             WfpLayerKey::OutboundTransportV4,
             WfpLayerKey::AleAuthConnectV6,
-            WfpLayerKey::OutboundIpPacketV6,
+            WfpLayerKey::OutboundTransportV6,
         ] {
             let permit = permits
                 .iter()
@@ -429,6 +429,7 @@ fn catch_all_user_sid_stamped_on_ale_filters_only() {
             WfpLayerKey::OutboundIpPacketV4
             | WfpLayerKey::OutboundIpPacketV6
             | WfpLayerKey::OutboundTransportV4
+            | WfpLayerKey::OutboundTransportV6
             | WfpLayerKey::IpForwardV4
             | WfpLayerKey::IpForwardV6 => {
                 assert_eq!(f.user_sid, None, "no ALE_USER_ID below the ALE layers")
@@ -677,7 +678,14 @@ fn the_user_less_layers_keep_the_networks_and_the_interface() {
     const FOREIGN: u64 = 0x00AB_CDEF_0000_0003;
     let sid = "S-1-5-21-F";
     let mut blocking = pins_for(sid);
-    blocking.extend(catch_all_v6_filters(sid, LUID, &[], &[], false));
+    blocking.extend(catch_all_v6_filters(
+        sid,
+        LUID,
+        &[],
+        &[],
+        KillSwitchProtocols::ALL,
+        false,
+    ));
     let networks = [
         foreign_net(FOREIGN, "10.77.0.0/16"),
         foreign_net(FOREIGN, "10.78.0.0/16"),
@@ -691,7 +699,7 @@ fn the_user_less_layers_keep_the_networks_and_the_interface() {
             f.action == WfpAction::Permit
                 && matches!(
                     f.layer,
-                    WfpLayerKey::OutboundTransportV4 | WfpLayerKey::OutboundIpPacketV6
+                    WfpLayerKey::OutboundTransportV4 | WfpLayerKey::OutboundTransportV6
                 )
         })
         .collect();
@@ -701,7 +709,7 @@ fn the_user_less_layers_keep_the_networks_and_the_interface() {
             .any(|f| f.layer == WfpLayerKey::OutboundTransportV4)
             && below_ale
                 .iter()
-                .any(|f| f.layer == WfpLayerKey::OutboundIpPacketV6),
+                .any(|f| f.layer == WfpLayerKey::OutboundTransportV6),
         "both user-less layers carry a permit: {below_ale:?}",
     );
     for f in below_ale {

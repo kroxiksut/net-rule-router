@@ -41,10 +41,11 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Install cargo-deny
+      # Prebuilt binaries. check.sh runs the tests through nextest when present.
+      - name: Install cargo-deny and cargo-nextest
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
-          tool: cargo-deny
+          tool: cargo-deny,cargo-nextest
 
       # qmllint for the QML gate, nothing else: the Qt host stays skipped.
       # Version and action as in release.yml, so the QML is checked against

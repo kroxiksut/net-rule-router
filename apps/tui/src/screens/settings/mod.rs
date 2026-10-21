@@ -331,6 +331,10 @@ pub struct SettingsState {
     pub export_path: String,
     /// Why protection is being switched off, kept in the audit trail.
     pub safe_disable_reason: String,
+    /// The term picked for the next safe disable.
+    pub safe_disable_term: &'static str,
+    /// How long the next pause from the rules toggle lasts.
+    pub pause_term: &'static str,
     pub rollback: RollbackOffer,
     pub prefs: TuiPrefs,
     /// Where the terminal's settings are saved; `None` cannot save.
@@ -355,6 +359,8 @@ impl Default for SettingsState {
             local_network_new: String::new(),
             export_path: String::new(),
             safe_disable_reason: String::new(),
+            safe_disable_term: "until-restart",
+            pause_term: "until-resumed",
             rollback: RollbackOffer::default(),
             prefs: TuiPrefs::default(),
             prefs_path: None,
@@ -1090,6 +1096,8 @@ fn needs_service(id: ItemId) -> bool {
             | ItemId::Reset(reset::ResetRow::Scope)
             | ItemId::ExportPath
             | ItemId::SafeDisableReason
+            | ItemId::SafeDisableTerm
+            | ItemId::RulesPauseTerm
             | ItemId::Pref(_)
             | ItemId::ServiceStart
             | ItemId::ServiceStop
@@ -1246,9 +1254,19 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
             jobs::ServiceOp::Restart,
             app.settings.service_probe,
         )),
-        (ItemId::RulesPause, Input::Toggle) => Some(jobs::set_rules_paused(!toggled)),
+        (ItemId::RulesPause, Input::Toggle) => {
+            Some(jobs::set_rules_paused(!toggled, app.settings.pause_term))
+        }
+        (ItemId::RulesPauseTerm, Input::Pick(slug)) => {
+            app.settings.pause_term = slug;
+            None
+        }
         (ItemId::SafeDisableReason, Input::Text(reason)) => {
             app.settings.safe_disable_reason = reason;
+            None
+        }
+        (ItemId::SafeDisableTerm, Input::Pick(slug)) => {
+            app.settings.safe_disable_term = slug;
             None
         }
         (ItemId::SafeDisableRun, Input::Run) => {
@@ -1258,7 +1276,7 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
                     .refuse(Words::Key(text::SAFE_DISABLE_NEED_REASON));
                 return;
             }
-            Some(jobs::safe_disable(reason))
+            Some(jobs::safe_disable(reason, app.settings.safe_disable_term))
         }
         (ItemId::RollbackLookup, Input::Run) => {
             app.settings.rollback = RollbackOffer::Unasked;

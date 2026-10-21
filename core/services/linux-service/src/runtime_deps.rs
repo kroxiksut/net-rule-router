@@ -461,6 +461,7 @@ pub(crate) fn build_runtime_deps(
         // tick and anything reading suggestions see one state rather than two.
         auto_rules_engine: auto_rules,
         auto_rule_probe: ipc.auto_probe,
+        routing_pause_terms: ipc.routing_pause_terms,
         // The connect-time address notice, for the users who opted in.
         secondary_external_address: match (state_conn.as_ref(), served_principals.clone()) {
             (Some(conn), Some(served)) => Some(secondary_external_address(
@@ -567,6 +568,8 @@ pub(crate) struct IpcServerParts {
     pub revision_watch: Option<nrr_service_runtime::revision_watch::RevisionWatch>,
     /// The automatic main-link pass; `None` on the handshake-only fallback.
     pub auto_probe: Option<nrr_service_runtime::service_tasks::AutoProbeWiring>,
+    /// Ends timed pauses; `None` on the handshake-only fallback.
+    pub routing_pause_terms: Option<Arc<nrr_service_runtime::routing_pause::RoutingPauseTerms>>,
 }
 
 pub(crate) fn build_ipc_server(
@@ -577,99 +580,109 @@ pub(crate) fn build_ipc_server(
     instance: nrr_platform_linux::daemon_lock::DaemonLock,
     verbosity: Option<nrr_service_runtime::TracingVerbosityHandle>,
 ) -> IpcServerParts {
-    let (registry, audit, mutation_tokens, activation_coordinator, revision_watch, auto_probe) =
-        match stack {
-            Some(stack) => {
-                let surface = crate::ipc_deps::build_ipc_surface(
-                    Arc::clone(&stack.state_conn),
-                    open_state_connection(&artifacts.topology.cache_db_path),
-                    artifacts.topology.data_dir.clone(),
-                    artifacts.topology.logs_dir.clone(),
-                    artifacts.topology.data_dir.join("audit"),
-                    artifacts.topology.state_db_path.clone(),
-                    artifacts.topology.cache_db_path.clone(),
-                    artifacts.audit_writer.clone(),
-                    artifacts.log_writer.clone(),
-                    Arc::new(nrr_platform_linux::LinuxApi),
-                    Arc::clone(&stack.cycle),
-                    Arc::clone(&health),
-                    Arc::clone(&event_bus),
-                    gui_binary_path(),
-                    Some(Arc::clone(&stack.auto_rules)),
-                    stack.traffic_sampler.clone(),
-                    Arc::clone(&stack.cache_store),
-                    stack.conn_trace.ring(),
-                    stack.app_enforcement.clone(),
-                    stack.shared_ip_exemptions.clone(),
-                    Arc::clone(&stack.local_networks)
-                        as Arc<dyn nrr_service_runtime::local_network_source::LocalNetworkSource>,
-                    stack.conn_trace_log.clone(),
-                    verbosity,
-                    // Beside the state database it signs, under the same `0700`.
-                    Arc::new(nrr_platform_linux::key_store::FileKeyStore::in_state_dir(
-                        &artifacts.topology.data_dir,
-                    )),
-                    Arc::clone(&stack.service_resolver),
-                    Arc::clone(&stack.block_notice_center),
-                    Arc::clone(&stack.block_notice_journal),
-                );
-                // The daemon's confirmations; an enforcement pass before this
-                // saw none, so the protection held.
-                nrr_service_runtime::crash_series::withdraw_on_crash_loop(
+    let (
+        registry,
+        audit,
+        mutation_tokens,
+        activation_coordinator,
+        revision_watch,
+        auto_probe,
+        routing_pause_terms,
+    ) = match stack {
+        Some(stack) => {
+            let surface = crate::ipc_deps::build_ipc_surface(
+                Arc::clone(&stack.state_conn),
+                open_state_connection(&artifacts.topology.cache_db_path),
+                artifacts.topology.data_dir.clone(),
+                artifacts.topology.logs_dir.clone(),
+                artifacts.topology.data_dir.join("audit"),
+                artifacts.topology.state_db_path.clone(),
+                artifacts.topology.cache_db_path.clone(),
+                artifacts.audit_writer.clone(),
+                artifacts.log_writer.clone(),
+                Arc::new(nrr_platform_linux::LinuxApi),
+                Arc::clone(&stack.cycle),
+                Arc::clone(&health),
+                Arc::clone(&event_bus),
+                gui_binary_path(),
+                Some(Arc::clone(&stack.auto_rules)),
+                stack.traffic_sampler.clone(),
+                Arc::clone(&stack.cache_store),
+                stack.conn_trace.ring(),
+                stack.app_enforcement.clone(),
+                stack.shared_ip_exemptions.clone(),
+                Arc::clone(&stack.local_networks)
+                    as Arc<dyn nrr_service_runtime::local_network_source::LocalNetworkSource>,
+                stack.conn_trace_log.clone(),
+                verbosity,
+                // Beside the state database it signs, under the same `0700`.
+                Arc::new(nrr_platform_linux::key_store::FileKeyStore::in_state_dir(
                     &artifacts.topology.data_dir,
-                    &surface.override_grants,
-                    nrr_service_runtime::timed_window::now_ms(),
+                )),
+                Arc::clone(&stack.service_resolver),
+                Arc::clone(&stack.block_notice_center),
+                Arc::clone(&stack.block_notice_journal),
+            );
+            // The daemon's confirmations; an enforcement pass before this
+            // saw none, so the protection held.
+            nrr_service_runtime::crash_series::withdraw_on_crash_loop(
+                &artifacts.topology.data_dir,
+                &surface.override_grants,
+                nrr_service_runtime::timed_window::now_ms(),
+            );
+            nrr_service_runtime::override_grants::install(Arc::clone(&surface.override_grants));
+            // The gateways of other VPNs each user let through, and the
+            // question that asks for them.
+            nrr_service_runtime::vpn_gateway_confirm::wire_production(
+                Arc::clone(&stack.state_conn),
+                Arc::clone(&event_bus),
+            );
+            // The service accounts a confirmation covers are read again when
+            // the set of units changes, never on an enforcement pass.
+            if let Some(rule_override) = surface.deps.rule_override.as_ref() {
+                nrr_service_runtime::override_recheck::start_for_service(
+                    Arc::clone(rule_override),
+                    &nrr_platform_linux::service_set_change::LinuxServiceSetChangeObserver::default(
+                    ),
                 );
-                nrr_service_runtime::override_grants::install(Arc::clone(&surface.override_grants));
-                // The gateways of other VPNs each user let through, and the
-                // question that asks for them.
-                nrr_service_runtime::vpn_gateway_confirm::wire_production(
-                    Arc::clone(&stack.state_conn),
-                    Arc::clone(&event_bus),
-                );
-                // The service accounts a confirmation covers are read again when
-                // the set of units changes, never on an enforcement pass.
-                if let Some(rule_override) = surface.deps.rule_override.as_ref() {
-                    nrr_service_runtime::override_recheck::start_for_service(
-                        Arc::clone(rule_override),
-                        &nrr_platform_linux::service_set_change::LinuxServiceSetChangeObserver::default(),
-                    );
-                }
-                let mut registry = nrr_service_runtime::IpcHandlerRegistry::new();
-                nrr_service_runtime::ipc_handlers::register_production_handlers(
-                    &mut registry,
-                    surface.deps,
-                );
-                (
-                    registry,
-                    surface.audit,
-                    Some(surface.mutation_tokens),
-                    Some(surface.coordinator),
-                    surface.revision_watch,
-                    surface.auto_probe,
-                )
             }
-            None => {
-                tracing::error!(
-                    target: "nrr::ipc",
-                    msg_key = "linux-svc-no-state-database",
-                    "no state database: only the handshake, subscription and health operations \
-                     are served — the GUI will show the service as needing recovery",
-                );
-                // Handshake trio only: nothing here mints a dry-run token, and the
-                // privileged mutations whose refusal the audit safeguard protects are
-                // not served at all.
-                (
-                    crate::run::serving_registry_with(health, Arc::clone(&event_bus)),
-                    Arc::new(nrr_service_runtime::NoopIpcAuditEmitter)
-                        as Arc<dyn nrr_service_runtime::IpcAuditEmitter>,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            }
-        };
+            let mut registry = nrr_service_runtime::IpcHandlerRegistry::new();
+            nrr_service_runtime::ipc_handlers::register_production_handlers(
+                &mut registry,
+                surface.deps,
+            );
+            (
+                registry,
+                surface.audit,
+                Some(surface.mutation_tokens),
+                Some(surface.coordinator),
+                surface.revision_watch,
+                surface.auto_probe,
+                Some(surface.routing_pause_terms),
+            )
+        }
+        None => {
+            tracing::error!(
+                target: "nrr::ipc",
+                msg_key = "linux-svc-no-state-database",
+                "no state database: only the handshake, subscription and health operations \
+                 are served — the GUI will show the service as needing recovery",
+            );
+            // Handshake trio only: nothing here mints a dry-run token, and the
+            // privileged mutations whose refusal the audit safeguard protects are
+            // not served at all.
+            (
+                crate::run::serving_registry_with(health, Arc::clone(&event_bus)),
+                Arc::new(nrr_service_runtime::NoopIpcAuditEmitter)
+                    as Arc<dyn nrr_service_runtime::IpcAuditEmitter>,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+    };
     // polkit answers "may this user do this" for callers who cannot elevate
     // themselves — which on this platform is everyone but root. Without it a
     // privileged operation from a normal desktop session has no path at all.
@@ -691,6 +704,7 @@ pub(crate) fn build_ipc_server(
         activation_coordinator,
         revision_watch,
         auto_probe,
+        routing_pause_terms,
     }
 }
 

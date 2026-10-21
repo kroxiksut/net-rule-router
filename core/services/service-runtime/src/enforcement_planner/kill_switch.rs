@@ -232,8 +232,8 @@ pub(super) fn selected_packet_protocols(p: KillSwitchProtocols) -> Vec<L4Proto> 
 ///   lone permit per UN-selected protocol; otherwise one block per selected named
 ///   protocol.
 /// - **IPv6 cut** (always) — loopback `::1/128` + link-local `fe80::/10`
-///   exemptions over an `::/0` block-all, at BOTH V6 layers (Free's only IPv6
-///   handling; independent of the V4 protocol mask).
+///   exemptions over an `::/0` connect block-all, plus a per-protocol block
+///   (ICMPv6, GRE, ESP) for each selected one, like the V4 packet blocks.
 ///
 /// Returns empty when there is no server exemption (arming the blanket block
 /// without one would trap the tunnel's own reconnect) or no protocol is selected
@@ -362,7 +362,12 @@ pub fn plan_catch_all_kill_switch(
 
     // IPv6 leaving through the tunnel survives the cut below. Named per family:
     // the Windows lowering reads `Any` as IPv4.
-    for coverage in [Coverage::ConnectOnly, Coverage::AllPackets] {
+    let v6_coverages: &[Coverage] = if selected_packet_protocols_v6(protocols).is_empty() {
+        &[Coverage::ConnectOnly]
+    } else {
+        &[Coverage::ConnectOnly, Coverage::AllPackets]
+    };
+    for &coverage in v6_coverages {
         flows.push(catch_all_flow(
             &principal,
             Verdict::Permit,
@@ -378,8 +383,8 @@ pub fn plan_catch_all_kill_switch(
         ));
     }
     // ── IPv6 cut (always): loopback + link-local + link-local-multicast
-    //    exemptions over an ::/0 block-all, at BOTH V6 layers (ALE + packet). ──
-    push_ipv6_cut(&principal, &mut flows, v6);
+    //    exemptions over the ::/0 connect block and the per-protocol ones. ──
+    push_ipv6_cut(&principal, &mut flows, v6, protocols);
 
     flows
 }
@@ -603,14 +608,22 @@ pub struct Ipv6Exemptions<'a> {
 }
 
 /// Append the IPv6 half of a blanket block — the link-scope exemptions, the
-/// tunnel's endpoints and the local prefixes, over an `::/0` block-all, at BOTH
-/// V6 layers. Shared by the catch-all and fail-closed block-all planners
+/// tunnel's endpoints and the local prefixes, over the principal's `::/0`
+/// block-all on connect and, below it, a block per selected non-TCP/UDP
+/// protocol (ICMPv6, GRE, ESP), the shape of the v4 half. Shared by the
+/// catch-all and fail-closed block-all planners
 /// (`killswitch_codegen::catch_all_v6_filters`).
+///
+/// No protocol-less block below connect: Windows cannot scope that layer to a
+/// user, so it would cut the system's IKE to an IPv6 VPN server, and its drop
+/// would name nobody to ask about the gateway.
 pub(super) fn push_ipv6_cut(
     principal: &PrincipalScope,
     flows: &mut Vec<FlowRule>,
     v6: Ipv6Exemptions<'_>,
+    protocols: KillSwitchProtocols,
 ) {
+    let below_connect = selected_packet_protocols_v6(protocols);
     for (e, dst) in ipv6_exempt_matches(v6).into_iter().enumerate() {
         flows.push(catch_all_flow(
             principal,
@@ -622,16 +635,18 @@ pub(super) fn push_ipv6_cut(
             Coverage::ConnectOnly,
             e as u32,
         ));
-        flows.push(catch_all_flow(
-            principal,
-            Verdict::Permit,
-            PrecedenceClass::CatchAllExempt,
-            dst,
-            EgressConstraint::Any,
-            None,
-            Coverage::AllPackets,
-            e as u32,
-        ));
+        if !below_connect.is_empty() {
+            flows.push(catch_all_flow(
+                principal,
+                Verdict::Permit,
+                PrecedenceClass::CatchAllExempt,
+                dst,
+                EgressConstraint::Any,
+                None,
+                Coverage::AllPackets,
+                e as u32,
+            ));
+        }
     }
     let v6_all = DstMatch::SubnetV6 {
         net: Ipv6Addr::UNSPECIFIED,
@@ -647,16 +662,31 @@ pub(super) fn push_ipv6_cut(
         Coverage::ConnectOnly,
         0,
     ));
-    flows.push(catch_all_flow(
-        principal,
-        Verdict::Block,
-        PrecedenceClass::CatchAllBlock,
-        v6_all,
-        EgressConstraint::Any,
-        None,
-        Coverage::AllPackets,
-        0,
-    ));
+    for (k, proto) in below_connect.into_iter().enumerate() {
+        flows.push(catch_all_flow(
+            principal,
+            Verdict::Block,
+            PrecedenceClass::CatchAllBlock,
+            v6_all,
+            EgressConstraint::Any,
+            Some(proto),
+            Coverage::AllPackets,
+            k as u32,
+        ));
+    }
+}
+
+/// [`selected_packet_protocols`] for IPv6: ICMP is ICMPv6, and IGMP has no v6
+/// twin (its job is MLD, ICMPv6 to link scope).
+pub(super) fn selected_packet_protocols_v6(p: KillSwitchProtocols) -> Vec<L4Proto> {
+    selected_packet_protocols(p)
+        .into_iter()
+        .filter_map(|proto| match proto {
+            L4Proto::Icmp => Some(L4Proto::IcmpV6),
+            L4Proto::Igmp => None,
+            other => Some(other),
+        })
+        .collect()
 }
 
 /// What any block over `::/0` must leave open, in order: the link-scope

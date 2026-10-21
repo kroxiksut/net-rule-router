@@ -484,9 +484,14 @@ pub fn set_log_retention(request: LogRetentionConfigSetRequest) -> Job {
 
 /// The GUI's "Apply rules" switch: the service keeps the state per user and
 /// announces it, so the screen follows the answer, not the click.
-pub fn set_rules_paused(paused: bool) -> Job {
+pub fn set_rules_paused(paused: bool, term: &'static str) -> Job {
     job(move |client| {
-        let result = call(client, Op::RoutingPauseToggle, json!({ "paused": paused }));
+        let request = if paused {
+            json!({ "paused": true, "term": term })
+        } else {
+            json!({ "paused": false })
+        };
+        let result = call(client, Op::RoutingPauseToggle, request);
         Reply::new(move |app| match result {
             Ok(_) => {
                 if let Some(snapshot) = app.snapshot.as_mut() {
@@ -501,12 +506,12 @@ pub fn set_rules_paused(paused: bool) -> Job {
 
 /// The GUI's two-phase safe disable: a dry run mints the token, the confirm
 /// spends it with the same reason. The row's confirmation is the review.
-pub fn safe_disable(reason: String) -> Job {
+pub fn safe_disable(reason: String, term: &'static str) -> Job {
     job(move |client| {
         let result = read::<ProductImpactDisableDryRunResponse>(
             client,
             Op::ProductImpactDisableTemporary,
-            json!({ "reason": reason, "dry-run": true }),
+            json!({ "reason": reason, "dry-run": true, "term": term }),
         )
         .and_then(|dry| {
             call(
@@ -515,6 +520,7 @@ pub fn safe_disable(reason: String) -> Job {
                 json!({
                     "reason": reason,
                     "dry-run": false,
+                    "term": term,
                     // The client lifts this to the envelope.
                     "_envelope_confirmation_token": dry.confirmation_token,
                 }),

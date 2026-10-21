@@ -2387,6 +2387,8 @@ ApplicationWindow {
         routingPaused: false,
         routingPausedAt: "",
         routingPauseReason: "",
+        routingPauseResumesAtMs: -1,
+        routingPauseUntilRestart: false,
         autostartEnabled: false,
         autostartLastKnownState: "absent",
         autostartBinaryMatches: true,
@@ -2533,6 +2535,7 @@ ApplicationWindow {
             _applyStandingRoutesHeld(p["routes-held-by-another-user"])
             _applyStandingTrafficCarried(p["traffic-carried-by-another-user"])
             _onRulesBookReading(p["rules-book-unreadable"] === true)
+            _applyPushedSettingsFromSnapshot(p)
             if (typeof onSnapshot === "function") onSnapshot(p)
         })
     }
@@ -3763,7 +3766,7 @@ ApplicationWindow {
             boundFilesController.handleRulesChangedInService()
         else if (typeof driftController._driftRefreshServiceBaselineFromService === "function")
             driftController._driftRefreshServiceBaselineFromService()
-        refreshUnenforcedAppRules(_applyPushedSettingsFromSnapshot)
+        refreshUnenforcedAppRules()
         refreshDiagnosticsSnapshot()
         refreshPendingLocalNetworks()
         autoRuleSuggestionsController.refreshAutoRuleCandidates()
@@ -3771,9 +3774,11 @@ ApplicationWindow {
         verifyVerdicts.refresh()
         notificationsController.onNoticeMutesChanged()
         driftController._driftRecheck(true)
+        pushGapReread()
     }
 
-    /// The settings this window otherwise learns only from their pushes.
+    /// The settings whose pushes fire on change only: a window that started or
+    /// lost pushes after the change learns them from every snapshot.
     function _applyPushedSettingsFromSnapshot(p) {
         var patch = {}
         var paused = p["routing-paused"] === true
@@ -3782,6 +3787,10 @@ ApplicationWindow {
             patch.routingPausedAt = paused ? new Date().toISOString() : ""
             patch.routingPauseReason = ""
         }
+        patch.routingPauseResumesAtMs = paused && p["routing-pause-resumes-at-ms"] !== undefined
+            && p["routing-pause-resumes-at-ms"] !== null
+            ? Number(p["routing-pause-resumes-at-ms"]) : -1
+        patch.routingPauseUntilRestart = paused && p["routing-pause-until-restart"] === true
         var failurePolicy = p["apply-failure-policy"]
         if (failurePolicy && failurePolicy.policy)
             patch.applyFailurePolicy = String(failurePolicy.policy)
@@ -3906,7 +3915,10 @@ ApplicationWindow {
                     routingPaused: !!event.paused,
                     routingPausedAt: event.paused ? new Date().toISOString()
                                                   : "",
-                    routingPauseReason: ""
+                    routingPauseReason: "",
+                    routingPauseResumesAtMs: event.paused && event["resumes-at-ms"] !== undefined
+                        && event["resumes-at-ms"] !== null ? Number(event["resumes-at-ms"]) : -1,
+                    routingPauseUntilRestart: !!event.paused && event["until-restart"] === true
                 })
                 break
             case "apply-failure-policy-changed":
@@ -4459,6 +4471,7 @@ ApplicationWindow {
         var status = String(event.status || "")
         var noticeId = "enforcement-status:" + role
         var quiet = event.quiet === true && status !== "" && status !== "ok"
+        var previous = String(enforcementStatusByRole[role] || "")
         _setEnforcementStatus(role, status)
         notificationsController._dropPushNotice(noticeId)
         _enforcementQuietRoles = _enforcementQuietRoles.filter(
@@ -4480,7 +4493,7 @@ ApplicationWindow {
             if (wasDown) {
                 _enforcementDownRoles = _enforcementDownRoles.filter(
                     function(r) { return r !== role })
-                _noteEnforcementRestored()
+                if (Pure.enforcementRestoreIsNews(previous)) _noteEnforcementRestored()
             }
             return
         }
@@ -4824,7 +4837,9 @@ ApplicationWindow {
         updateRoutingState({
             routingPaused: !!paused,
             routingPausedAt: paused ? new Date().toISOString() : "",
-            routingPauseReason: paused ? (reason || "") : ""
+            routingPauseReason: paused ? (reason || "") : "",
+            routingPauseResumesAtMs: -1,
+            routingPauseUntilRestart: false
         })
         if (!bridgeAvailable) return
         var corr = nrrNativeBridge.rpcRoutingPauseToggle(!!paused, reason || "")
@@ -4832,6 +4847,23 @@ ApplicationWindow {
             if (!ok) console.log("routing-pause-toggle failed:", code, msg)
             // On success the server returns authoritative paused_at;
             // A later change will replace the synthetic timestamp.
+        })
+    }
+    /// Pauses the rules for `term` (`fifteen-minutes` … `until-resumed`).
+    function pauseRoutingFor(term, reason) {
+        var slug = String(term || "until-resumed")
+        updateRoutingState({
+            routingPaused: true,
+            routingPausedAt: new Date().toISOString(),
+            routingPauseReason: reason || ""
+        })
+        if (!bridgeAvailable || typeof nrrNativeBridge.rpcRoutingPauseFor !== "function") return
+        var corr = nrrNativeBridge.rpcRoutingPauseFor(slug, reason || "")
+        rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
+            if (!ok) {
+                console.log("routing-pause-for failed:", code, msg)
+                updateRoutingState({ routingPaused: false, routingPausedAt: "" })
+            }
         })
     }
     function setAutostartEnabled(enabled) {
@@ -5623,6 +5655,9 @@ ApplicationWindow {
     /// needed pushing) so the settings panels re-read a service that now
     /// agrees with the user.
     signal serviceIntentReplayed()
+    /// Emitted after a hole in the push stream (a quick service restart the
+    /// health poll never saw): the panels re-read what the pushes would have told.
+    signal pushGapReread()
 
     /// The declared default of one `route.policy.update` wire field. The single
     /// declaration lives in `lib/pure.js` (shared with the tray process and
@@ -6076,7 +6111,8 @@ ApplicationWindow {
     // on failure, green on success). The synthetic correlation id
     // ties the visible toast to the RPC chain so we can settle it
     // from either phase's callback.
-    function _handleSafeDisableConfirmed(reason) {
+    function _handleSafeDisableConfirmed(reason, term) {
+        var termSlug = String(term || "until-restart")
         statusLine = tr("status.safe-disable.requested",
             "Safe disable requested")
         var corr = "safe-disable-" + Date.now()
@@ -6099,7 +6135,7 @@ ApplicationWindow {
         }
         // dry-run.
         var dryRunCorr = nrrNativeBridge.rpcProductImpactDisable(
-            reason, true /* dryRun */, "" /* token */)
+            reason, true /* dryRun */, "" /* token */, termSlug)
         rpcTransport.registerRpcCallback(dryRunCorr, function(ok, p, code, msg) {
             if (!ok) {
                 if (operationToastStack && operationToastStack.model) {
@@ -6121,7 +6157,7 @@ ApplicationWindow {
             // Reason MUST match the dry-run reason
             // (server cross-checks; mismatch returns PreconditionFailed).
             var confirmCorr = nrrNativeBridge.rpcProductImpactDisable(
-                reason, false /* dryRun */, token)
+                reason, false /* dryRun */, token, termSlug)
             rpcTransport.registerRpcCallback(confirmCorr, function(ok2, p2, code2, msg2) {
                 if (!ok2) {
                     if (operationToastStack && operationToastStack.model) {

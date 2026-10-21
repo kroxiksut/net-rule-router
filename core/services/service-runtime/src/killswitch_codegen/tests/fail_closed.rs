@@ -159,8 +159,7 @@ fn fail_closed_allow_dns_over_primary_permits_port_53_to_the_system_resolvers_on
 }
 
 /// On a network whose only resolvers are IPv6 the port-53 permit must name
-/// them at the v6 ALE layer, and at the v6 packet layer too: that layer has no
-/// port condition and blocks every packet it does not exempt.
+/// them at the v6 ALE layer; nothing below it cuts UDP or TCP.
 #[test]
 fn an_ipv6_only_network_keeps_its_resolver_reachable_under_the_block_all() {
     let resolver: Ipv6Addr = "2001:db8:53::1".parse().unwrap();
@@ -187,10 +186,9 @@ fn an_ipv6_only_network_keeps_its_resolver_reachable_under_the_block_all() {
     assert!(ale.iter().any(|f| f.ip_protocol == Some(6)));
     assert!(
         out.iter()
-            .any(|f| f.layer == WfpLayerKey::OutboundIpPacketV6
-                && f.action == WfpAction::Permit
-                && f.remote_subnet_v6 == Some((resolver, 128))),
-        "the v6 packet block would still eat the query"
+            .filter(|f| f.action == WfpAction::Block && f.layer == WfpLayerKey::OutboundTransportV6)
+            .all(|f| !matches!(f.ip_protocol, Some(6) | Some(17))),
+        "a block below ALE would still eat the query"
     );
     // Only the resolver: no v6 permit for any host on port 53, and nothing v4.
     assert!(out
@@ -244,10 +242,10 @@ fn a_dual_stack_network_permits_both_families_and_never_a_link_local_resolver() 
     assert_eq!(ids.len(), out.len(), "every filter has its own id");
 }
 
-/// With another principal on the machine the v6 packet block is gone, so the
-/// resolver's packet permit has nothing to answer.
+/// With another principal on the machine nothing v6 is emitted below ALE, and
+/// the resolver keeps its ALE permits.
 #[test]
-fn the_v6_resolver_packet_permit_follows_the_packet_block() {
+fn with_other_principals_the_v6_resolver_keeps_its_ale_permits() {
     let resolver: Ipv6Addr = "2001:db8:53::1".parse().unwrap();
     let ex = FailClosedExemptions {
         allow_dns_over_primary: true,
@@ -257,7 +255,7 @@ fn the_v6_resolver_packet_permit_follows_the_packet_block() {
     let out = fail_closed_block_all_filters_for("S", &ex, KillSwitchProtocols::ALL, true);
     assert!(out
         .iter()
-        .all(|f| f.layer != WfpLayerKey::OutboundIpPacketV6));
+        .all(|f| f.layer != WfpLayerKey::OutboundTransportV6));
     assert_eq!(
         out.iter()
             .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV6 && f.remote_port == Some(53))
@@ -452,8 +450,8 @@ fn fail_closed_mode_b_blocks_all_except_exemptions() {
     //   subnet + block-all = 7. Packet: same 6 exemptions + 4 named
     //   protocol blocks = 10 (ICMP/IGMP/GRE/ESP, no agnostic block-all).
     // IPv6: V6 ALE (loopback+link-local+link-local-multicast+block = 4)
-    // + V6 packet (4) = 8. Total 25.
-    assert_eq!(out.len(), 25);
+    // + V6 transport (3 exemptions + ICMPv6/GRE/ESP = 6) = 10. Total 27.
+    assert_eq!(out.len(), 27);
     let ale_block = out
         .iter()
         .find(|f| f.action == WfpAction::Block && f.layer == WfpLayerKey::AleAuthConnectV4)
@@ -568,13 +566,13 @@ fn fail_closed_mode_b_arms_without_server_ips() {
     );
     // ALE: loopback+link-local+broadcast+local-network-control + block = 5.
     // Packet: same 4 exemptions + 4 named protocol blocks = 8. IPv6: V6 ALE
-    // (loopback+link-local+link-local-multicast+block = 4) + V6 packet (4)
-    // = 8. Total 21.
-    assert_eq!(out.len(), 21);
+    // (loopback+link-local+link-local-multicast+block = 4) + V6 transport
+    // (3 exemptions + 3 protocol blocks = 6) = 10. Total 23.
+    assert_eq!(out.len(), 23);
     assert_eq!(
         out.iter().filter(|f| f.action == WfpAction::Block).count(),
-        7,
-        "V4 ALE + 4 named V4 packet + V6 ALE + V6 packet block-all"
+        9,
+        "V4 ALE + 4 named V4 packet + V6 ALE + 3 named V6 transport"
     );
 }
 

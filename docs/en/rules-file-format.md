@@ -334,6 +334,12 @@ down. The switch is off by default.
 
 ### 1.6 Child process tracking (`+children`)
 
+> **Not in effect yet.** This version accepts the flag and keeps it in your
+> rules, but the rule covers only the named program; the programs it starts
+> follow their own rules. The window and the terminal interface mark such a
+> rule with a warning. Following the programs a program starts is on the
+> [roadmap](../../ROADMAP.md).
+
 By default an application rule matches only the named process. Appending the
 flag **`+children`** after the process name extends the rule to the matched
 process's **entire descendant subtree** — every child, grandchild, and so on.

@@ -92,8 +92,12 @@ pub fn live_users() -> Result<Vec<LiveUser>, LogindError> {
         Err(e) => e,
     };
     // The older spelling. Its own failure is not the one worth reporting: the
-    // machine is far likelier to be current, so the first error is kept.
-    live_users_via(LIST_USERS_SPELLINGS[1]).map_err(|_| first)
+    // machine is far likelier to be current, so the first error is kept —
+    // unless it says logind is not here at all, which outranks a flag.
+    live_users_via(LIST_USERS_SPELLINGS[1]).map_err(|e| match e {
+        LogindError::Unavailable(_) => e,
+        _ => first,
+    })
 }
 
 fn live_users_via(args: &[&str]) -> Result<Vec<LiveUser>, LogindError> {
@@ -106,12 +110,24 @@ fn live_users_via(args: &[&str]) -> Result<Vec<LiveUser>, LogindError> {
     )
     .map_err(|e| LogindError::Unavailable(e.to_string()))?;
     if !out.status.success() {
-        return Err(LogindError::Failed {
-            status: out.status.to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        });
+        return Err(failure(
+            out.status.to_string(),
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
     }
     parse_live_users(&String::from_utf8_lossy(&out.stdout), user_states)
+}
+
+/// A failed `loginctl`, told apart: with no systemd as init or no system bus
+/// (a container, a WSL image without systemd) logind is absent, which is not
+/// a failure of logind.
+fn failure(status: String, stderr: String) -> LogindError {
+    const ABSENT: [&str; 2] = ["not been booted with systemd", "Failed to connect to bus"];
+    if ABSENT.iter().any(|sign| stderr.contains(sign)) {
+        LogindError::Unavailable(stderr)
+    } else {
+        LogindError::Failed { status, stderr }
+    }
 }
 
 /// The states of users a `list-users` named without one, in one call: this runs
@@ -588,6 +604,20 @@ mod tests {
         assert_eq!(users.len(), 2, "the closing one is dropped");
         assert_eq!(users[0].uid, 1000);
         assert_eq!(users[1].uid, 1001);
+    }
+
+    #[test]
+    fn a_machine_without_systemd_has_no_logind_rather_than_a_broken_one() {
+        let absent = failure(
+            "exit status: 1".into(),
+            "System has not been booted with systemd as init system (PID 1). Can't operate.\nFailed to connect to bus: Host is down".into(),
+        );
+        assert!(matches!(absent, LogindError::Unavailable(_)));
+        let broken = failure(
+            "exit status: 1".into(),
+            "/usr/bin/loginctl: unrecognized option '--json=short'".into(),
+        );
+        assert!(matches!(broken, LogindError::Failed { .. }));
     }
 
     /// The flag IS the bug, and a parser test cannot see it: each spelling is

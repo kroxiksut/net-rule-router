@@ -2098,13 +2098,22 @@ fn a_forwarded_reply_with_a_compressed_or_unlearnable_question_is_still_checked(
 }
 
 /// A UDP socket and a TCP listener on one loopback port, as the resolver binds
-/// them. A free UDP port can sit in a range Windows reserves for TCP, so a
-/// few ports are tried.
+/// them. Hyper-V reserves 100-port windows per protocol, and the OS hands out
+/// ephemeral ports in sequence, so asking it again lands in the same window.
+/// Explicit ports below the ephemeral range, spread by a large stride, do not.
 fn udp_and_tcp_on_one_port() -> (UdpSocket, TcpListener) {
-    for _ in 0..32 {
-        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("udp");
-        let addr = udp.local_addr().expect("udp addr");
-        if let Ok(tcp) = TcpListener::bind(addr) {
+    const LOW: u32 = 20_000;
+    const SPAN: u32 = 28_000;
+    let seed = std::process::id()
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+    for n in 0..256u32 {
+        let port = (LOW + (seed.wrapping_add(n.wrapping_mul(7_919)) % SPAN)) as u16;
+        let Ok(tcp) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) else {
+            continue;
+        };
+        if let Ok(udp) = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
             return (udp, tcp);
         }
     }

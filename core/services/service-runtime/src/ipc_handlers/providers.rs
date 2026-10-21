@@ -183,7 +183,12 @@ pub trait MutationExecutor: Send + Sync {
     /// leak guard come down and their pause is persisted, which their own
     /// `routing.pause.toggle` lifts. Everyone else on the machine keeps theirs.
     /// The `reason` is captured in audit.
-    fn safe_disable(&self, principal: &str, reason: &str) -> MutationOutcome;
+    fn safe_disable(
+        &self,
+        principal: &str,
+        reason: &str,
+        term: nrr_shared::ipc_payloads::SafeDisableTerm,
+    ) -> MutationOutcome;
 }
 
 /// Convenience: classify a `ReviewSummary` by its risk level field.
@@ -572,6 +577,18 @@ pub trait RoutingPauseWriter: Send + Sync {
         paused: bool,
         reason: Option<&str>,
     ) -> Result<RoutingPauseDto, SettingsWriteError>;
+
+    /// [`Self::toggle`] with how long a pause lasts; a writer without terms
+    /// pauses until the user resumes.
+    fn toggle_for(
+        &self,
+        sid: &str,
+        paused: bool,
+        reason: Option<&str>,
+        _term: Option<nrr_shared::ipc_payloads::SafeDisableTerm>,
+    ) -> Result<RoutingPauseDto, SettingsWriteError> {
+        self.toggle(sid, paused, reason)
+    }
 }
 
 /// Source of the singleton `autostart_state` row combined with a live probe of

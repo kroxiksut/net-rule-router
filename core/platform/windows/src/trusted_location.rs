@@ -520,7 +520,9 @@ mod tests {
     #[test]
     fn a_binary_in_a_user_created_directory_is_reported() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let binary = dir.path().join("service.exe");
+        // Not `.exe`: the check reads rights, not the name, and an executable
+        // dropped in a temp folder makes some antivirus hold the whole process.
+        let binary = dir.path().join("service.bin");
         std::fs::write(&binary, b"placeholder").expect("write");
         let found = untrusted_writer(&binary).expect("readable");
         assert!(
@@ -590,7 +592,7 @@ mod tests {
     #[test]
     fn a_program_tree_lets_users_read_but_change_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("service.exe");
+        let file = dir.path().join("service.bin");
         std::fs::write(&file, b"image").expect("write");
         if lock_down_program_tree(dir.path()).is_err() {
             return; // handing ownership to Administrators needs an elevated run

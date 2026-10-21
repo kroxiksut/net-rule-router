@@ -595,19 +595,6 @@ pub struct ReviewSummaryResponse {
     pub rules_modified: Vec<RuleSummaryEntryDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules_retargeted: Vec<RuleSummaryEntryDto>,
-    /// unsupported sections preserved verbatim from the
-    /// imported preset file. Each entry names a section (e.g. `CIDR`,
-    /// `Ports`) that the Free edition parses but does not apply, plus
-    /// the number of entries it carries. The GUI renders them in the
-    /// review diff with a "not applied" badge so the user knows the file
-    /// contains unsupported rules being preserved unchanged.
-    ///
-    /// Currently always empty — the active revision storage drops
-    /// unknown sections. The wire field is plumbed now so a future
-    /// schema-bump that adds `unknown_sections_json` to the `revisions`
-    /// table requires only server-side population — the GUI is ready.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extended_sections: Vec<ExtendedSectionSummaryDto>,
     /// Rules the candidate names in BOTH route sets with both copies enabled.
     ///
     /// Not an error and not resolved server-side: both copies claim the same
@@ -631,19 +618,6 @@ pub struct CrossSetDuplicateDto {
     /// What both copies match, as the user wrote it — what a person recognises
     /// on screen, unlike the two ids.
     pub match_summary: String,
-}
-
-/// One unsupported section preserved from the imported
-/// preset file. See [`ReviewSummaryResponse::extended_sections`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct ExtendedSectionSummaryDto {
-    /// Raw section name as it appeared in the file, e.g. `"CIDR"`,
-    /// `"Ports"`. Not localized — readers display it verbatim.
-    pub name: String,
-    /// Number of rule entries (active + disabled) in this section.
-    /// Displayed as "<name>: N rules preserved as-is (unsupported feature)".
-    pub preserved_count: u32,
 }
 
 /// Wire-form of `nrr_domain::review::RuleSummaryEntry`.

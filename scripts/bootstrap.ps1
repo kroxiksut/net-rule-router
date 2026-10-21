@@ -39,6 +39,16 @@ if ($installedTargets -notcontains $target) {
     }
 }
 
+# The gate's test runner (scripts\check.ps1 falls back to cargo test without it).
+& cargo nextest --version *> $null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host '[bootstrap] installing cargo-nextest'
+    & cargo install cargo-nextest --locked
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Failed to install cargo-nextest'
+    }
+}
+
 $envFile = Join-Path $repoRoot '.env'
 if (-not (Test-Path $envFile)) {
     Copy-Item (Join-Path $repoRoot '.env.example') $envFile

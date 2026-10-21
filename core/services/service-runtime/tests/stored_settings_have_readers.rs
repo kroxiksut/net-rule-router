@@ -177,6 +177,7 @@ fn stored_fields() -> Vec<(&'static str, Vec<&'static str>)> {
                 paused_at,
                 pause_reason,
                 updated_at,
+                end,
             }),
         ),
     ]
@@ -906,6 +907,31 @@ fn settings() -> Vec<Setting> {
                 (
                     "core/services/service-runtime/src/principal_enforcement.rs",
                     "with_paused_principals",
+                ),
+            ]),
+        },
+        // A timed pause is lifted by the term tick both platforms spawn.
+        Setting {
+            store: "RoutingPauseRecord",
+            field: "end",
+            windows: Read(vec![
+                (
+                    "core/services/service-runtime/src/routing_pause.rs",
+                    "list_ended(now_ms, at_start)",
+                ),
+                (
+                    "core/services/windows-service/src/runtime_deps/build.rs",
+                    "RoutingPauseTerms::new",
+                ),
+            ]),
+            linux: Read(vec![
+                (
+                    "core/services/service-runtime/src/routing_pause.rs",
+                    "list_ended(now_ms, at_start)",
+                ),
+                (
+                    "core/services/linux-service/src/ipc_deps.rs",
+                    "RoutingPauseTerms::new",
                 ),
             ]),
         },

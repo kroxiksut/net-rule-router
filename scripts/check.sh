@@ -411,12 +411,20 @@ cargo-fmt --all -- --check
 cyan "[check] clippy: cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings
 
-cyan "[check] tests: cargo test --workspace"
 # Tests get a temp directory of their own, removed however the run ends, so
 # nothing a test fails to clean up stays in /tmp.
 test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/nrr-gate.XXXXXX")"
 trap 'rm -rf "$test_tmp"' EXIT
-TMPDIR="$test_tmp" cargo test --workspace
+# nextest runs the suite about twice as fast and ends a hung test
+# (.config/nextest.toml); it skips doctests, which run after it.
+if cargo nextest --version >/dev/null 2>&1; then
+  cyan "[check] tests: cargo nextest run --workspace, then cargo test --workspace --doc"
+  TMPDIR="$test_tmp" cargo nextest run --workspace
+  TMPDIR="$test_tmp" cargo test --workspace --doc
+else
+  cyan "[check] tests: cargo test --workspace (cargo-nextest not installed; scripts/bootstrap.sh installs it)"
+  TMPDIR="$test_tmp" cargo test --workspace
+fi
 
 if [ "$include_privileged" -eq 1 ]; then
   cyan "[check] privileged tests: cargo test -p nrr-platform-linux -p nrr-service-runtime -- --ignored"

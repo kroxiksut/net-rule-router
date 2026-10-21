@@ -11,10 +11,10 @@
 #[test]
 fn the_v6_cut_still_lets_the_tunnel_itself_out() {
     const LUID: u64 = 0x1234_5678;
-    let out = catch_all_v6_filters("S", LUID, &[], &[], false);
+    let out = catch_all_v6_filters("S", LUID, &[], &[], KillSwitchProtocols::ALL, false);
     for layer in [
         WfpLayerKey::AleAuthConnectV6,
-        WfpLayerKey::OutboundIpPacketV6,
+        WfpLayerKey::OutboundTransportV6,
     ] {
         assert!(
             out.iter().any(|f| f.layer == layer
@@ -25,7 +25,7 @@ fn the_v6_cut_still_lets_the_tunnel_itself_out() {
     }
     // An unresolved tunnel has no egress to permit - and must not turn the
     // cut into a permit-everything by accident.
-    let unresolved = catch_all_v6_filters("S", 0, &[], &[], false);
+    let unresolved = catch_all_v6_filters("S", 0, &[], &[], KillSwitchProtocols::ALL, false);
     assert!(unresolved.iter().all(|f| f.local_interface_luid.is_none()));
     assert!(unresolved.iter().any(|f| f.action == WfpAction::Block));
 }

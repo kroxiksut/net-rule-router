@@ -274,14 +274,20 @@ impl ConnectionObservationConsumer {
                 }
             }
             // Another VPN's handshake the guard dropped, from nothing the
-            // client learner above can name: a question for its owner.
+            // client learner above can name: a question for its owner. The
+            // IPv6 cut counts here: it proves nothing about our tunnel, but a
+            // handshake it stopped is the same question about a gateway.
+            let ipv6_cut_drop = rec
+                .nrr_drop_spec_id
+                .zip(self.ipv6_cut_drop_check.as_ref())
+                .is_some_and(|(spec_id, check)| check(spec_id));
             if let (Some(sink), Some(owner)) = (
                 self.vpn_gateway_drop.as_ref(),
                 rec.user_sid.as_deref().filter(|s| !s.is_empty()),
             ) {
                 if rec.verdict == ConnectionVerdict::Block
                     && rec.blocked_by_nrr == Some(true)
-                    && killswitch_verified
+                    && (killswitch_verified || ipv6_cut_drop)
                     && !service_account_drop
                     && !process_name_matches_vpn(rec.process_path.as_deref())
                     && crate::vpn_gateway_confirm::handshake_shaped(rec.protocol, rec.remote.port())

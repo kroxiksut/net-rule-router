@@ -33,6 +33,7 @@
 //!   by program or folder.
 //! - [`diagnostics`] — security alert lists, whether an acknowledgement took,
 //!   and when to say the user's saved rules cannot be read.
+//! - [`enforcement_notice`] — when the rules applying again is worth a line.
 //! - [`forwarded`] — whether WSL runs, and asking what it gets when the
 //!   tunnel is down.
 //! - [`notice_mutes`] — hiding whole notice kinds for a while.
@@ -59,6 +60,7 @@ pub mod bulk_rules;
 pub mod conn_trace;
 pub mod contract;
 pub mod diagnostics;
+pub mod enforcement_notice;
 pub mod forwarded;
 pub mod full_reset;
 mod js;

@@ -1,6 +1,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import QtQuick.Dialogs
 import "../lib/pure.js" as Pure
 import "../lib/rules.js" as Rules
 
@@ -25,13 +26,37 @@ ColumnLayout {
     property var _detected: []
     property bool _detecting: false
     property int _added: 0
+    /// The program the gateways are looked up for, as a file name.
+    property string _program: ""
+    // Found programs, the chosen one even when it was not found, then the two
+    // actions. Sentinels cannot clash with a file name: no file is named so.
+    readonly property var _programChoices: {
+        var list = helper._detected.slice()
+        if (helper._program !== "" && list.indexOf(helper._program) < 0) list.push(helper._program)
+        return list.concat([":pick", ":refresh"])
+    }
+    Component.onCompleted: helper.detect()
+
+    function _chooseProgram(raw) {
+        var file = Rules.vpnProgramFileName(raw)
+        if (file === "" || file === helper._program) return
+        helper._program = file
+        helper._reset()
+    }
+    function _programLabel(item) {
+        if (item === ":pick")
+            return root.tr("settings.routing.vpn-gateway.pick-file", "Choose the program file…")
+        if (item === ":refresh")
+            return root.tr("settings.routing.vpn-gateway.refresh", "Refresh the list")
+        return Pure.displayText(item)
+    }
 
     readonly property string _route: routeCombo.currentIndex === 0 ? "primary" : "secondary"
     readonly property string _commentTemplate: root.uiRevision >= 0
         ? root.tr("settings.routing.vpn-gateway.rule-comment", "VPN gateway: {program}") : ""
 
     function _draftFor(value) {
-        return Rules.vpnGatewayRuleDraft(value, programField.text, helper._route,
+        return Rules.vpnGatewayRuleDraft(value, helper._program, helper._route,
             helper._commentTemplate)
     }
     function _isSelected(value) { return helper._selected[value] === true }
@@ -73,7 +98,7 @@ ColumnLayout {
     }
 
     function find() {
-        var program = Rules.vpnProgramFileName(programField.text)
+        var program = helper._program
         if (program === "" || helper._loading) return
         if (!root.rpc || typeof root.rpc.rpcVpnGatewayCandidatesList !== "function") return
         helper._reset()
@@ -119,7 +144,6 @@ ColumnLayout {
                 if (name !== "" && names.indexOf(name) < 0) names.push(name)
             }
             helper._detected = names
-            detectedCombo.currentIndex = -1
         })
     }
 
@@ -171,39 +195,39 @@ ColumnLayout {
             text: root.uiRevision >= 0
                 ? root.tr("settings.routing.vpn-gateway.program", "VPN program") : ""
         }
-        ThemedTextField {
-            id: programField
+        ThemedComboBox {
+            id: programCombo
             theme: root.uiTheme
             Layout.fillWidth: true
-            Layout.maximumWidth: 320
-            placeholderText: root.uiRevision >= 0
-                ? root.tr("settings.routing.vpn-gateway.program-placeholder",
-                    "Program file name, for example corpvpn.exe") : ""
+            Layout.maximumWidth: 460
+            model: helper._programChoices
+            currentIndex: helper._programChoices.indexOf(helper._program)
+            labelResolver: function(item) { return helper._programLabel(String(item)) }
+            displayText: root.uiRevision < 0 ? ""
+                : helper._program !== "" ? Pure.displayText(helper._program)
+                : helper._detecting
+                    ? root.tr("settings.routing.vpn-gateway.searching", "Looking for VPN programs…")
+                    : root.tr("settings.routing.vpn-gateway.detected", "Pick a VPN program")
             Accessible.name: root.uiRevision >= 0
                 ? root.tr("settings.routing.vpn-gateway.program", "VPN program") : ""
-            onTextChanged: helper._reset()
-            onAccepted: helper.find()
-        }
-        ThemedButton {
-            theme: root.uiTheme
-            enabled: !helper._detecting
-            text: root.uiRevision >= 0 ? root.tr("vpn-onboarding.scan", "Scan for VPN apps") : ""
-            onClicked: helper.detect()
+            onActivated: function(index) {
+                var item = String(helper._programChoices[index] || "")
+                if (item === ":pick") programFileDialog.open()
+                else if (item === ":refresh") helper.detect()
+                else helper._chooseProgram(item)
+                currentIndex = helper._programChoices.indexOf(helper._program)
+            }
         }
     }
-    ThemedComboBox {
-        id: detectedCombo
-        theme: root.uiTheme
-        visible: helper._detected.length > 0
-        Layout.fillWidth: true
-        Layout.maximumWidth: 460
-        model: helper._detected
-        currentIndex: -1
-        labelResolver: function(item) { return Pure.displayText(item) }
-        displayText: root.uiRevision >= 0 && currentIndex >= 0
-            ? Pure.displayText(helper._detected[currentIndex])
-            : root.tr("settings.routing.vpn-gateway.detected", "Pick a found program")
-        onActivated: function(index) { programField.text = String(helper._detected[index] || "") }
+    FileDialog {
+        id: programFileDialog
+        fileMode: FileDialog.OpenFile
+        title: root.tr("settings.routing.vpn-gateway.pick-file-title", "Choose the VPN program")
+        nameFilters: (root.platformProfile && root.platformProfile.os === "windows")
+            ? [root.tr("settings.routing.vpn-gateway.program-filter", "Programs (*.exe)"),
+               root.tr("rules.dialog.all-filter", "All files (*)")]
+            : [root.tr("rules.dialog.all-filter", "All files (*)")]
+        onAccepted: helper._chooseProgram(Pure.localPathFromFileUrl(selectedFile))
     }
 
     RowLayout {
@@ -231,7 +255,7 @@ ColumnLayout {
         }
         ThemedButton {
             theme: root.uiTheme
-            enabled: !helper._loading && Rules.vpnProgramFileName(programField.text) !== ""
+            enabled: !helper._loading && helper._program !== ""
             text: root.uiRevision >= 0
                 ? root.tr("settings.routing.vpn-gateway.find", "Find gateway addresses") : ""
             onClicked: helper.find()
@@ -259,7 +283,7 @@ ColumnLayout {
             if (helper._candidates.length === 0)
                 return root.tr("settings.routing.vpn-gateway.empty",
                     "{program} has not connected anywhere on the internet recently. Start the VPN and let it try to connect, then search again.")
-                    .replace("{program}", Pure.displayText(Rules.vpnProgramFileName(programField.text)))
+                    .replace("{program}", Pure.displayText(helper._program))
             return ""
         }
     }
@@ -346,7 +370,7 @@ ColumnLayout {
         Layout.fillWidth: true
         Layout.preferredWidth: 0
         visible: manualField.text.trim() !== ""
-            && Rules.vpnProgramFileName(programField.text) !== ""
+            && helper._program !== ""
             && helper._draftFor(manualField.text) === null
         color: root.uiTheme.colorDanger
         wrapMode: Text.WordWrap

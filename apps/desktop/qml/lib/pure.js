@@ -1709,6 +1709,13 @@ function rulesBookNoticeStep(wasRaised, unreadable) {
     return systemDnsNoticeStep(wasRaised, unreadable)
 }
 
+// Whether the rules applying again after `previous` is worth the "routing works
+// again" line: finishing the first setup (`no-policy`) is not a recovery. Twin
+// of `nrr_client_logic::enforcement_notice::restore_is_news`.
+function enforcementRestoreIsNews(previous) {
+    return String(previous || "") !== "no-policy"
+}
+
 // One reading of the service manager's state for a client that watched the
 // service run: a stop nobody asked for raises the notice once and offers the
 // recoveries; a stop the user made stays silent. Twin of

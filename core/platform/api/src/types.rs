@@ -190,6 +190,13 @@ pub enum WfpLayerKey {
     /// stack), and like the packet layer it has NO `ALE_USER_ID` / `ALE_APP_ID`
     /// — `user_sid` and `app_pattern` MUST be `None` here.
     OutboundTransportV4,
+    /// `FWPM_LAYER_OUTBOUND_TRANSPORT_V6` — the IPv6 twin of
+    /// [`OutboundTransportV4`], where the blanket posture cuts ICMPv6, GRE and
+    /// ESP by protocol. A protocol-less block at the packet layer would cut the
+    /// system's IKE as well, which no user condition there can spare.
+    ///
+    /// [`OutboundTransportV4`]: WfpLayerKey::OutboundTransportV4
+    OutboundTransportV6,
     /// `FWPM_LAYER_IPFORWARD_V4` — IPv4 packets the machine forwards for
     /// others (WSL, Docker Desktop, connection sharing). Locally originated
     /// traffic never reaches it, and nothing above it does either: no user,
@@ -227,6 +234,7 @@ impl WfpLayerKey {
             self,
             WfpLayerKey::AleAuthConnectV6
                 | WfpLayerKey::OutboundIpPacketV6
+                | WfpLayerKey::OutboundTransportV6
                 | WfpLayerKey::IpForwardV6
         )
     }

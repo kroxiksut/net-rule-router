@@ -89,6 +89,10 @@ pub const BANNER_REFUSED: Key = key(
     "connection.banner.refused",
     "The background service refused this connection",
 );
+pub const SSH_ONLY_SESSION: Key = key(
+    "tui.connection.ssh-only-session",
+    "Signed in over SSH: your rules are saved but apply only while you are also signed in to Windows.",
+);
 pub const CONTRACT_SERVICE_OLDER: Key = key(
     "status.contract-skew.service-older",
     "The background service is older than this window. Changes are off until both match: update or restart the service.",
@@ -595,6 +599,7 @@ pub const ALL: &[Key] = &[
     BANNER_REFUSED,
     CONTRACT_SERVICE_OLDER,
     CONTRACT_CLIENT_OLDER,
+    SSH_ONLY_SESSION,
     FIX_INSTALL,
     FIX_START,
     FIX_RESTORE_NETWORK,

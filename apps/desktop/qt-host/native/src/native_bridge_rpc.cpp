@@ -280,6 +280,16 @@ QString NrrNativeBridge::rpcRoutingPauseToggle(bool paused, const QString &reaso
     return emitRpcRequest(QStringLiteral("routing.pause.toggle"), obj);
 }
 
+QString NrrNativeBridge::rpcRoutingPauseFor(const QString &term, const QString &reason) {
+    QJsonObject obj;
+    obj.insert(QStringLiteral("paused"), true);
+    obj.insert(QStringLiteral("term"), term);
+    if (!reason.isEmpty()) {
+        obj.insert(QStringLiteral("reason"), reason);
+    }
+    return emitRpcRequest(QStringLiteral("routing.pause.toggle"), obj);
+}
+
 QString NrrNativeBridge::rpcAutostartToggle(bool enabled) {
     QJsonObject obj;
     obj.insert(QStringLiteral("enabled"), enabled);
@@ -340,10 +350,14 @@ QString NrrNativeBridge::rpcRollbackRequest(const QString &targetRevisionId,
 
 QString NrrNativeBridge::rpcProductImpactDisable(const QString &reason,
                                                 bool dryRun,
-                                                const QString &confirmationToken) {
+                                                const QString &confirmationToken,
+                                                const QString &term) {
     QJsonObject obj;
     obj.insert(QStringLiteral("reason"), reason);
     obj.insert(QStringLiteral("dry-run"), dryRun);
+    if (!term.isEmpty()) {
+        obj.insert(QStringLiteral("term"), term);
+    }
     if (!confirmationToken.isEmpty()) {
         obj.insert(QStringLiteral("_envelope_confirmation_token"),
                    confirmationToken);

@@ -556,7 +556,20 @@ New-Item -ItemType Directory -Path $testTemp | Out-Null
 $previousTmp, $previousTemp = $env:TMP, $env:TEMP
 $env:TMP, $env:TEMP = $testTemp, $testTemp
 try {
-    Invoke-CargoStep 'tests' @('test', '--workspace')
+    # nextest runs the suite about twice as fast and ends a hung test
+    # (.config/nextest.toml); it skips doctests, which run after it.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & cargo nextest --version *> $null
+    $hasNextest = $LASTEXITCODE -eq 0
+    $ErrorActionPreference = $previous
+    if ($hasNextest) {
+        Invoke-CargoStep 'tests' @('nextest', 'run', '--workspace')
+        Invoke-CargoStep 'doctests' @('test', '--workspace', '--doc')
+    } else {
+        Write-Host '[check] cargo-nextest not installed; scripts\bootstrap.ps1 installs it' -ForegroundColor Yellow
+        Invoke-CargoStep 'tests' @('test', '--workspace')
+    }
     if ($IncludePrivileged) {
         $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
         if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {

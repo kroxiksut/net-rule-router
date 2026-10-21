@@ -257,6 +257,7 @@ fn deps(
         app_destination_memory: None,
         conn_history: None,
         secondary_external_address: None,
+        routing_pause_terms: None,
         health: Arc::new(HealthAggregator::new()),
         liveness: None,
         ipc_server: Arc::new(InertServer),

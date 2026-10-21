@@ -40,7 +40,12 @@ Dialog {
     /// supply context-aware defaults).
     property string reasonText: ""
 
-    signal confirmed(string reason)
+    /// When the rules come back on their own: the service's closed list.
+    readonly property var termSlugs: ["fifteen-minutes", "one-hour", "four-hours",
+        "until-restart", "until-resumed"]
+    property string termSlug: "until-restart"
+
+    signal confirmed(string reason, string term)
     signal cancelled()
 
     function tr(key, fallback) {
@@ -55,6 +60,11 @@ Dialog {
     // change signal or superclass signal").
     function resetForOpen(prefilledReason) {
         reasonText = String(prefilledReason || "")
+        termSlug = "until-restart"
+        termCombo.currentIndex = termSlugs.indexOf(termSlug)
+    }
+    function termLabel(slug) {
+        return tr("dialog.safe-disable.term." + slug, slug)
     }
 
     onRejected: { cancelled() }
@@ -124,6 +134,28 @@ Dialog {
             }
         }
 
+        ColumnLayout {
+            Layout.fillWidth: true
+            spacing: 4
+            Label {
+                Layout.fillWidth: true
+                text: dialog.tr("dialog.safe-disable.term-label", "Turn rules back on")
+                font.pixelSize: 12
+                color: dialog.ownerRoot ? dialog.ownerRoot.mutedTextColor : palette.text
+            }
+            ThemedComboBox {
+                id: termCombo
+                theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
+                Layout.fillWidth: true
+                model: dialog.termSlugs
+                currentIndex: dialog.termSlugs.indexOf(dialog.termSlug)
+                labelResolver: function(item) { return dialog.termLabel(String(item)) }
+                displayText: dialog.termLabel(dialog.termSlug)
+                onActivated: dialog.termSlug = dialog.termSlugs[currentIndex]
+                Accessible.name: dialog.tr("dialog.safe-disable.term-label", "Turn rules back on")
+            }
+        }
+
         RowLayout {
             Layout.fillWidth: true
             Layout.topMargin: 6
@@ -152,7 +184,7 @@ Dialog {
                 onClicked: {
                     var reason = dialog.reasonText.trim()
                     dialog.close()
-                    dialog.confirmed(reason)
+                    dialog.confirmed(reason, dialog.termSlug)
                 }
             }
         }

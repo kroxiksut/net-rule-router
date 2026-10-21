@@ -34,19 +34,35 @@ use crate::schema::FreshnessStateDb;
 
 // ── SqliteCacheStore ──────────────────────────────────────────────────────────
 
-/// SQLite-backed implementation of [`CacheRepository`].
-///
-/// Owns one connection to `nrr_fqdn_ip_cache.db`.  The connection was opened
-/// and migrated by [`SqliteMigrationRunner`][crate::migration::SqliteMigrationRunner]
-/// before this struct was constructed.
-/// Backstop age (seconds) after which even a held DNS-sourced last-known-good
-/// resolution is dropped by cleanup. A rule host that could not be
-/// re-resolved for this long is treated as dead so the cache cannot grow
-/// unbounded; anything refreshed within the window is retained.
 /// Bound parameters per query when the refresh asks for a list of named hosts.
 const NAMED_CHUNK: usize = 200;
 
+/// Age after which cleanup drops even a held last-known-good DNS resolution:
+/// a rule host unresolvable this long is dead, and the cache stays bounded.
 const HELD_RESOLUTION_BACKSTOP_SECS: i64 = 30 * 86_400;
+
+/// One refresh batch out of two lanes. Rule-named hosts carry enforcement
+/// and lose a pure hot-first race to browsing every tick, so they hold half
+/// the batch; a lane's unused share goes to the other. Both lanes arrive in
+/// their own priority order.
+fn merge_refresh_lanes(
+    mut named: Vec<ExpiredHostname>,
+    used: Vec<ExpiredHostname>,
+    limit: usize,
+) -> Vec<ExpiredHostname> {
+    let rest = named.split_off(limit.div_ceil(2).min(named.len()));
+    let mut out = Vec::with_capacity(limit);
+    let mut seen = std::collections::HashSet::new();
+    for host in named.into_iter().chain(used).chain(rest) {
+        if out.len() >= limit {
+            break;
+        }
+        if seen.insert(host.canonical_hostname.clone()) {
+            out.push(host);
+        }
+    }
+    out
+}
 
 /// A restamp of an address last confirmed longer ago than this counts as news:
 /// it may have aged out of what enforcement reads, and bringing it back changes
@@ -56,6 +72,11 @@ const HELD_RESOLUTION_BACKSTOP_SECS: i64 = 30 * 86_400;
 /// under one zone within the hour than the cap, and waits for the full pass.
 const RESTAMP_IS_NEWS_AFTER_MS: i64 = 60 * 60 * 1_000;
 
+/// SQLite-backed implementation of [`CacheRepository`].
+///
+/// Owns one connection to `nrr_fqdn_ip_cache.db`.  The connection was opened
+/// and migrated by [`SqliteMigrationRunner`][crate::migration::SqliteMigrationRunner]
+/// before this struct was constructed.
 pub struct SqliteCacheStore {
     conn: RefCell<Connection>,
     thresholds: FreshnessThresholds,
@@ -760,7 +781,7 @@ impl CacheRepository for SqliteCacheStore {
                 last_seen_at: last_seen_ms.map(ms_to_system_time),
             })
         };
-        let mut out: Vec<ExpiredHostname> = Vec::new();
+        let mut used: Vec<ExpiredHostname> = Vec::new();
         {
             let sql = format!("{HEAD} AND h.last_seen_at >= ?3{TAIL}");
             let mut stmt = conn.prepare_cached(&sql).map_err(db_err)?;
@@ -768,20 +789,30 @@ impl CacheRepository for SqliteCacheStore {
                 .query_map(params![now_ms, limit as i64, used_ms], read)
                 .map_err(db_err)?;
             for row in rows {
-                out.push(row.map_err(db_err)?);
+                used.push(row.map_err(db_err)?);
             }
         }
-        // Hosts a rule names are refreshed whatever their last use; the rest of
-        // the named set is read in bounded chunks of bound parameters.
-        let mut seen: std::collections::HashSet<String> =
-            out.iter().map(|h| h.canonical_hostname.clone()).collect();
+        // Hosts a rule names are refreshed whatever their last use, the one
+        // confirmed longest ago first: it is the next to age out of what
+        // enforcement trusts. Read in bounded chunks of bound parameters.
+        const NAMED_TAIL: &str = " GROUP BY h.canonical_host
+             ORDER BY MAX(r.resolved_at) ASC, h.canonical_host ASC
+             LIMIT ?2";
+        let mut named_rows: Vec<(i64, ExpiredHostname)> = Vec::new();
         for chunk in named.chunks(NAMED_CHUNK) {
             // Numbered: a bare `?` would take the index ?2 already holds.
             let marks = (3..3 + chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            let sql = format!("{HEAD} AND h.canonical_host IN ({marks}){TAIL}");
+            let sql = format!(
+                "SELECT h.canonical_host, MAX(h.last_seen_at), MAX(r.resolved_at)
+                 FROM hostname_ip_resolutions r
+                 JOIN hostnames h ON h.id = r.hostname_id
+                 WHERE (r.expires_at <= ?1 OR r.resolved_at > ?1)
+                   AND r.source IN ('dns', 'manual_refresh')
+                   AND h.canonical_host IN ({marks}){NAMED_TAIL}"
+            );
             let mut stmt = conn.prepare(&sql).map_err(db_err)?;
             let mut args: Vec<rusqlite::types::Value> = vec![
                 rusqlite::types::Value::Integer(now_ms),
@@ -793,15 +824,23 @@ impl CacheRepository for SqliteCacheStore {
                     .map(|h| rusqlite::types::Value::Text(h.clone())),
             );
             let rows = stmt
-                .query_map(rusqlite::params_from_iter(args), read)
+                .query_map(rusqlite::params_from_iter(args), |r| {
+                    Ok((r.get::<_, Option<i64>>(2)?.unwrap_or(0), read(r)?))
+                })
                 .map_err(db_err)?;
             for row in rows {
-                let row = row.map_err(db_err)?;
-                if seen.insert(row.canonical_hostname.clone()) {
-                    out.push(row);
-                }
+                named_rows.push(row.map_err(db_err)?);
             }
         }
+        named_rows.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.canonical_hostname.cmp(&b.1.canonical_hostname))
+        });
+        let mut out = merge_refresh_lanes(
+            named_rows.into_iter().map(|(_, h)| h).collect(),
+            used,
+            limit,
+        );
         out.sort_by(|a, b| {
             b.last_seen_at
                 .cmp(&a.last_seen_at)

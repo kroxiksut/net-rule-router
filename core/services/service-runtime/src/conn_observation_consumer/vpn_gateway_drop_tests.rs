@@ -131,3 +131,26 @@ fn esp_is_noted_without_naming_the_program_it_carried() {
         vec![(OWNER.to_string(), IpAddr::V4(GATEWAY), None)]
     );
 }
+
+/// The IPv6 cut proves nothing about our tunnel, yet a handshake it stopped is
+/// the same question: without it a VPN whose server is IPv6 could never be
+/// allowed, since nobody was asked.
+#[test]
+fn a_handshake_the_ipv6_cut_dropped_is_noted_for_its_owner() {
+    const CUT: u64 = 0x44;
+    let gateway: std::net::Ipv6Addr = "2001:db8::20".parse().expect("ip");
+    let (consumer, seen) = consumer();
+    let consumer = consumer.with_ipv6_cut_drop_check(Arc::new(|id: u64| id == CUT));
+    let mut rec = drop_of(CUT, TransportProtocol::Udp, 500, r"C:\Corp\agent.exe");
+    rec.local = "[2001:db8::5]:51000".parse().expect("addr");
+    rec.remote = SocketAddr::new(IpAddr::V6(gateway), 500);
+    consumer.consume(&[rec], SystemTime::now());
+    assert_eq!(
+        noted(&seen),
+        vec![(
+            OWNER.to_string(),
+            IpAddr::V6(gateway),
+            Some(r"C:\Corp\agent.exe".to_string())
+        )]
+    );
+}

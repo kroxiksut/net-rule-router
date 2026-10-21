@@ -1389,9 +1389,12 @@ mod tests {
         let inside =
             reset.established_flows_matching(&FlowTargets::new(Vec::new(), vec![loopback]));
         assert!(inside.iter().any(|f| f.local == local));
+        // Not "empty": a parallel test's connection to the documentation range
+        // can be accepted by a local proxy (WSL's DNS tunnelling takes any :53).
         assert!(reset
             .established_flows_matching(&FlowTargets::new(Vec::new(), vec![outside]))
-            .is_empty());
+            .iter()
+            .all(|f| f.local != local));
     }
 
     /// The assertion the port exists for: a listed connection is closed and

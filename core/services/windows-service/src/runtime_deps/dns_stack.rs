@@ -266,7 +266,7 @@ pub(super) fn build_fake_ip_stack_factory(
                 msg_key = "svc-dns-fakeip-wintun-unavailable",
                 "fake-IP requested but the Wintun driver is unavailable; feature stays off (fail-open)",
             );
-            return None;
+            return Err(nrr_service_runtime::fake_ip::FakeIpBuildFailure::Unavailable);
         }
         // The config is derived from the SAME pool the assembly uses
         // (`TunAdapterConfig::for_pool`), so the adapter's address range can
@@ -279,9 +279,9 @@ pub(super) fn build_fake_ip_stack_factory(
                     target: "nrr::fake-ip",
                     msg_key = "svc-dns-fakeip-tun-open-failed",
                     error = %e,
-                    "fake-IP: TUN adapter open failed; feature stays off (fail-open)",
+                    "fake-IP: TUN adapter open failed; asked again shortly (fail-open meanwhile)",
                 );
-                return None;
+                return Err(nrr_service_runtime::fake_ip::FakeIpBuildFailure::Transient);
             }
         };
         // Upstream = the direct-host session map layered over the FQDN
@@ -422,23 +422,21 @@ pub(super) fn build_fake_ip_stack_factory(
             Arc::clone(&served_principals),
             Arc::clone(&active_sid),
         ));
-        Some(
-            assembly
-                .build_stack(device, dialer, upstream, routes, StackWaker::new())
-                .with_dial_time_resolution(true)
-                // Two things care about a relayed flow: self-heal (is this a
-                // VPN client reaching its own server?) and companion discovery
-                // (the user is ON this site right now — a fact DNS cannot
-                // deliver when the browser answers from its own cache).
-                .with_flow_observer(flow_observer)
-                .with_flow_owners(flow_owners)
-                // Fake-IP instant reset — the same process-wide flag
-                // `ProductionServiceStability::set` flips live, so a rebuilt
-                // stack (watchdog rebuild, restart after a toggle) always
-                // starts on the CURRENT persisted value instead of the
-                // constructor default.
-                .with_instant_rst(nrr_service_runtime::fake_ip::global_instant_rst_enabled()),
-        )
+        Ok(assembly
+            .build_stack(device, dialer, upstream, routes, StackWaker::new())
+            .with_dial_time_resolution(true)
+            // Two things care about a relayed flow: self-heal (is this a
+            // VPN client reaching its own server?) and companion discovery
+            // (the user is ON this site right now — a fact DNS cannot
+            // deliver when the browser answers from its own cache).
+            .with_flow_observer(flow_observer)
+            .with_flow_owners(flow_owners)
+            // Fake-IP instant reset — the same process-wide flag
+            // `ProductionServiceStability::set` flips live, so a rebuilt
+            // stack (watchdog rebuild, restart after a toggle) always
+            // starts on the CURRENT persisted value instead of the
+            // constructor default.
+            .with_instant_rst(nrr_service_runtime::fake_ip::global_instant_rst_enabled()))
     });
     Some(factory)
 }

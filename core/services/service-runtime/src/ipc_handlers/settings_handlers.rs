@@ -785,10 +785,12 @@ impl CheckedIpcHandler for RoutingPauseToggleHandler {
         _request: &IpcRequestEnvelope,
         ctx: &IpcRequestContext,
     ) -> HandlerOutcome {
-        match self
-            .writer
-            .toggle(ctx.caller_stored(), req.paused, req.reason.as_deref())
-        {
+        match self.writer.toggle_for(
+            ctx.caller_stored(),
+            req.paused,
+            req.reason.as_deref(),
+            req.term,
+        ) {
             Ok(dto) => serialise("routing.pause.toggle", dto),
             Err(e) => Err(map_settings_write_error(e)),
         }
@@ -1302,6 +1304,8 @@ mod tests {
                 paused_at: None,
                 pause_reason: None,
                 updated_at: 0,
+                resumes_at_ms: None,
+                until_restart: false,
             }
         }
     }
@@ -1335,6 +1339,8 @@ mod tests {
                 paused_at: if paused { Some(42) } else { None },
                 pause_reason: reason.map(str::to_string),
                 updated_at: 42,
+                resumes_at_ms: None,
+                until_restart: false,
             })
         }
     }

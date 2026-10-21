@@ -112,7 +112,6 @@ impl MutationExecutor for FakeExecutor {
             rules_removed: Vec::new(),
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
-            extended_sections: Vec::new(),
             cross_set_duplicates: Vec::new(),
         }
     }
@@ -134,7 +133,12 @@ impl MutationExecutor for FakeExecutor {
             rule_count: 1,
         }))
     }
-    fn safe_disable(&self, _principal: &str, reason: &str) -> MutationOutcome {
+    fn safe_disable(
+        &self,
+        _principal: &str,
+        reason: &str,
+        _term: nrr_shared::ipc_payloads::SafeDisableTerm,
+    ) -> MutationOutcome {
         MutationOutcome::Completed(serde_json::json!({
             "safe-disabled": true,
             "reason": reason,
@@ -177,8 +181,13 @@ impl MutationExecutor for RollbackRecorder {
     ) -> Result<Option<RollbackTargetDto>, OperationError> {
         FakeExecutor.rollback_target(principal, target)
     }
-    fn safe_disable(&self, principal: &str, reason: &str) -> MutationOutcome {
-        FakeExecutor.safe_disable(principal, reason)
+    fn safe_disable(
+        &self,
+        principal: &str,
+        reason: &str,
+        term: nrr_shared::ipc_payloads::SafeDisableTerm,
+    ) -> MutationOutcome {
+        FakeExecutor.safe_disable(principal, reason, term)
     }
 }
 
@@ -202,7 +211,6 @@ impl MutationExecutor for FailingExecutor {
             rules_removed: Vec::new(),
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
-            extended_sections: Vec::new(),
             cross_set_duplicates: Vec::new(),
         }
     }
@@ -227,7 +235,12 @@ impl MutationExecutor for FailingExecutor {
     ) -> Result<Option<RollbackTargetDto>, OperationError> {
         FakeExecutor.rollback_target(principal, target)
     }
-    fn safe_disable(&self, _principal: &str, _reason: &str) -> MutationOutcome {
+    fn safe_disable(
+        &self,
+        _principal: &str,
+        _reason: &str,
+        _term: nrr_shared::ipc_payloads::SafeDisableTerm,
+    ) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
             args: Default::default(),
             code: "safe-disable.rejected.test".into(),
@@ -569,6 +582,8 @@ impl nrr_service_runtime::RoutingPauseProvider for EmptyRoutingPause {
             paused_at: None,
             pause_reason: None,
             updated_at: 0,
+            resumes_at_ms: None,
+            until_restart: false,
         }
     }
 }
@@ -591,6 +606,8 @@ impl nrr_service_runtime::RoutingPauseWriter for EmptyRoutingPauseWriter {
                 paused_at: if paused { Some(0) } else { None },
                 pause_reason: reason.map(str::to_string),
                 updated_at: 0,
+                resumes_at_ms: None,
+                until_restart: false,
             },
         )
     }

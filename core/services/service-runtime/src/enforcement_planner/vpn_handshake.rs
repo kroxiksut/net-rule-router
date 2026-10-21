@@ -6,8 +6,9 @@
 //! key exchange comes from the OS IKE service and its ESP from the kernel.
 //! Cut either and that VPN never connects while protection is on. So:
 //!
-//! - ESP to any address, for the user, under a blanket block. ESP carries no
-//!   ports, and its payload is the other VPN's own encryption.
+//! - ESP to any address of either family, for the user, under a blanket
+//!   block. ESP carries no ports, and its payload is the other VPN's own
+//!   encryption.
 //! - IKE (UDP 500 and 4500) from the OS IKE service only, for the service
 //!   accounts it runs as. Never from a user's program: that could be anything
 //!   dressed as IKE.
@@ -116,6 +117,19 @@ pub fn plan_vpn_handshake_permits(
         Coverage::AllPackets,
         VPN_HANDSHAKE_ORDINAL_BASE,
     )];
+    // Named per family: the Windows lowering reads `Any` as IPv4.
+    out.push(handshake_permit(
+        &principal,
+        DstMatch::SubnetV6 {
+            net: Ipv6Addr::UNSPECIFIED,
+            prefix: 0,
+        },
+        None,
+        L4Proto::Esp,
+        AppScope::Any,
+        Coverage::AllPackets,
+        VPN_HANDSHAKE_ORDINAL_BASE,
+    ));
     let mut ordinal = VPN_HANDSHAKE_ORDINAL_BASE + 1;
     let mut seen = std::collections::HashSet::new();
     for ip in gateways

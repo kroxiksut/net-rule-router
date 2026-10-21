@@ -1129,8 +1129,13 @@ mod tests {
         > {
             self.0.rollback_target(principal, target)
         }
-        fn safe_disable(&self, principal: &str, reason: &str) -> MutationOutcome {
-            self.0.safe_disable(principal, reason)
+        fn safe_disable(
+            &self,
+            principal: &str,
+            reason: &str,
+            term: nrr_shared::ipc_payloads::SafeDisableTerm,
+        ) -> MutationOutcome {
+            self.0.safe_disable(principal, reason, term)
         }
     }
 

@@ -1413,21 +1413,22 @@ fn slice4c_catch_all_kill_switch_matches_current_codegen() {
 
     // ALL: ALE 8 (egress+loopback+link-local+broadcast+local-network-
     // control+server+subnet+block) + packet 11 (7 mirror exempts + 4 named
-    // blocks — no agnostic block-all) + IPv6 10 (egress through the tunnel and
-    // 4 more, at each layer) = 29.
-    check(KillSwitchProtocols::ALL, 29);
+    // blocks — no agnostic block-all) + IPv6 12 (ALE: egress, 3 exemptions,
+    // the block-all; transport: egress, 3 exemptions, ICMPv6/GRE/ESP) = 31.
+    check(KillSwitchProtocols::ALL, 31);
 
-    // TCP/UDP only: no V4 packet layer at all → ALE 8 + IPv6 10 = 18.
-    check(KillSwitchProtocols::from_bits(0x03), 18);
+    // TCP/UDP only: nothing below ALE in either family → ALE 8 + IPv6 5 = 13.
+    check(KillSwitchProtocols::from_bits(0x03), 13);
 
     // All-except-ICMP: ALE 8 + packet 10 (7 mirror exempts + IGMP/GRE/ESP
-    // named blocks; unchecked ICMP simply gets no filter) + IPv6 10 = 28.
+    // named blocks; unchecked ICMP simply gets no filter) + IPv6 11 (no
+    // ICMPv6 block) = 29.
     check(
         KillSwitchProtocols {
             icmp: false,
             ..KillSwitchProtocols::ALL
         },
-        28,
+        29,
     );
 }
 
@@ -1695,7 +1696,7 @@ fn foreign_tunnels_and_vpn_handshakes_match_current_codegen() {
         WfpLayerKey::AleAuthConnectV4,
         WfpLayerKey::OutboundTransportV4,
         WfpLayerKey::AleAuthConnectV6,
-        WfpLayerKey::OutboundIpPacketV6,
+        WfpLayerKey::OutboundTransportV6,
     ] {
         assert!(
             current

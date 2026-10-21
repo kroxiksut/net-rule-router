@@ -158,7 +158,7 @@ struct Flow<'a> {
 fn proto_of(layer: WfpLayerKey) -> u8 {
     match layer {
         WfpLayerKey::OutboundTransportV4 | WfpLayerKey::OutboundIpPacketV4 => 1,
-        WfpLayerKey::OutboundIpPacketV6 => 58,
+        WfpLayerKey::OutboundIpPacketV6 | WfpLayerKey::OutboundTransportV6 => 58,
         _ => 6,
     }
 }
@@ -227,6 +227,7 @@ fn posture_blocks(filters: &[WfpFilterRecord], layer: WfpLayerKey) -> bool {
             crate::wfp_bands::CATCHALL_EXEMPT_BASE
         }
         WfpLayerKey::OutboundTransportV4 => crate::wfp_bands::PACKET_EXEMPT_BASE,
+        WfpLayerKey::OutboundTransportV6 => crate::wfp_bands::PACKET_V6_EXEMPT_BASE,
         _ => crate::wfp_bands::BASE_BLOCK,
     };
     filters
@@ -238,14 +239,14 @@ const LAYERS: [WfpLayerKey; 4] = [
     WfpLayerKey::AleAuthConnectV4,
     WfpLayerKey::OutboundTransportV4,
     WfpLayerKey::AleAuthConnectV6,
-    WfpLayerKey::OutboundIpPacketV6,
+    WfpLayerKey::OutboundTransportV6,
 ];
 
 fn corp_host_of(layer: WfpLayerKey) -> IpAddr {
     match layer {
-        WfpLayerKey::AleAuthConnectV6 | WfpLayerKey::OutboundIpPacketV6 => {
-            IpAddr::V6(CORP_OTHER_V6)
-        }
+        WfpLayerKey::AleAuthConnectV6
+        | WfpLayerKey::OutboundIpPacketV6
+        | WfpLayerKey::OutboundTransportV6 => IpAddr::V6(CORP_OTHER_V6),
         _ => IpAddr::V4(CORP_OTHER),
     }
 }

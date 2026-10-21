@@ -312,7 +312,8 @@ pub(crate) fn band_of_filter(spec: &nrr_platform_api::types::WfpFilterSpec) -> &
     match spec.layer {
         WfpLayerKey::OutboundIpPacketV4
         | WfpLayerKey::OutboundIpPacketV6
-        | WfpLayerKey::OutboundTransportV4 => band_of(PACKET_BANDS, spec.weight),
+        | WfpLayerKey::OutboundTransportV4
+        | WfpLayerKey::OutboundTransportV6 => band_of(PACKET_BANDS, spec.weight),
         _ => band_of(ALE_BANDS, spec.weight),
     }
 }

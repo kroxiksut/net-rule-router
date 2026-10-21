@@ -75,6 +75,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
 
 It wraps `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`,
 `cargo test --workspace` and `cargo deny check`. All four have to be green.
+When [cargo-nextest](https://nexte.st) is installed (`scripts/bootstrap.ps1`
+installs it), the tests run through it — about twice as fast, and a hung test
+is ended instead of stalling the gate — with the doctests run by `cargo test`.
 It also runs `qmllint` over every QML file and fails on a syntax error, since a
 file with one does not load; without Qt installed that step is skipped with a
 warning, and CI requires it.

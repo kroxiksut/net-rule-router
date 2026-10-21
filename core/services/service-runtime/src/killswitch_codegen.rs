@@ -142,6 +142,7 @@ const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const PROTO_GRE: u8 = 47;
 const PROTO_ESP: u8 = 50;
+const PROTO_ICMPV6: u8 = 58;
 
 /// Decoded protocol selection for the emergency block (the v16
 /// `kill_switch_protocols` bitmask: TCP=1, UDP=2, ICMP=4, IGMP=8, GRE=16,
@@ -230,6 +231,22 @@ impl KillSwitchProtocols {
         }
         if self.igmp {
             v.push(PROTO_IGMP);
+        }
+        if self.gre {
+            v.push(PROTO_GRE);
+        }
+        if self.esp {
+            v.push(PROTO_ESP);
+        }
+        v
+    }
+
+    /// [`Self::packet_named`] in IPv6 numbers: ICMP is ICMPv6, and IGMP has
+    /// no v6 twin (its job is MLD, which is ICMPv6 to link scope).
+    pub(crate) fn packet_named_v6(self) -> Vec<u8> {
+        let mut v = Vec::new();
+        if self.icmp {
+            v.push(PROTO_ICMPV6);
         }
         if self.gre {
             v.push(PROTO_GRE);
@@ -928,6 +945,7 @@ pub fn catch_all_kill_switch_filters_for(
         resolution.secondary_luid,
         &exemptions.bootstrap_server_ips_v6,
         &exemptions.local_subnets_v6,
+        protocols,
         machine_has_other_principals,
     ));
 

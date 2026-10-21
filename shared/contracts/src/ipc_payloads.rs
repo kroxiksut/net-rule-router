@@ -560,15 +560,18 @@ pub enum SafeDisableTerm {
     /// Until the service next starts, a reboot included.
     #[default]
     UntilRestart,
+    /// Until the user turns the rules back on.
+    UntilResumed,
 }
 
 impl SafeDisableTerm {
     /// Every term, in the order the confirmation offers them.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::FifteenMinutes,
         Self::OneHour,
         Self::FourHours,
         Self::UntilRestart,
+        Self::UntilResumed,
     ];
 
     #[must_use]
@@ -578,6 +581,7 @@ impl SafeDisableTerm {
             Self::OneHour => "one-hour",
             Self::FourHours => "four-hours",
             Self::UntilRestart => "until-restart",
+            Self::UntilResumed => "until-resumed",
         }
     }
 
@@ -589,7 +593,7 @@ impl SafeDisableTerm {
             Self::FifteenMinutes => Some(15 * MINUTE_MS),
             Self::OneHour => Some(60 * MINUTE_MS),
             Self::FourHours => Some(4 * 60 * MINUTE_MS),
-            Self::UntilRestart => None,
+            Self::UntilRestart | Self::UntilResumed => None,
         }
     }
 }

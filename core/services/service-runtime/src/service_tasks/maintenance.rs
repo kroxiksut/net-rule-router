@@ -307,6 +307,25 @@ pub fn build_conn_history_flush_task(
     )
 }
 
+/// Ends timed pauses. `Optional`: without it a timed pause lasts until the user
+/// resumes, as an untimed one does.
+pub fn build_routing_pause_terms_task(
+    terms: Arc<crate::routing_pause::RoutingPauseTerms>,
+) -> ServiceTask {
+    ServiceTask::periodic(
+        TASK_ID_ROUTING_PAUSE_TERMS,
+        TaskClass::Optional,
+        ROUTING_PAUSE_TERMS_INTERVAL,
+        0,
+        move |_stop| {
+            let now_ms =
+                i64::try_from(crate::conn_observation_consumer::now_unix_ms()).unwrap_or(i64::MAX);
+            terms.tick(now_ms);
+            TaskOutcome::Continue
+        },
+    )
+}
+
 // ── Operation-results GC ─────────────────────────────────────────────────────
 
 /// Periodic GC for the in-memory operation-results table. Operation

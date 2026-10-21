@@ -201,6 +201,12 @@ QtObject {
             } else {
                 root.openChildWindow(root.firstRunWindow)
             }
+            // The wizard may be closed unanswered, and a new user already
+            // follows the administrator's baseline: the table shows what the
+            // service applies from the start, not "no rules".
+            if (((root.backendStatus || {}).kind) === "connected") {
+                root._coldStartRulesFetch()
+            }
         } else {
             // Auto-open-on-launch. When the user has
             // opted in (Save As → "Open these rules on next launch"

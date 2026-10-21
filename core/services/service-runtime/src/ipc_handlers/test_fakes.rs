@@ -286,6 +286,7 @@ pub struct FakeMutationExecutor {
     pub safe_disable_count: AtomicUsize,
     pub last_rollback_target: Mutex<Option<String>>,
     pub last_safe_disable_reason: Mutex<Option<String>>,
+    pub last_safe_disable_term: Mutex<Option<nrr_shared::ipc_payloads::SafeDisableTerm>>,
     pub last_executed: Mutex<Option<StoredMutation>>,
     /// Principal threaded into the last `execute` /
     /// `rollback` call, so handler tests can assert the per-principal
@@ -307,6 +308,7 @@ impl Default for FakeMutationExecutor {
             safe_disable_count: AtomicUsize::new(0),
             last_rollback_target: Mutex::new(None),
             last_safe_disable_reason: Mutex::new(None),
+            last_safe_disable_term: Mutex::new(None),
             last_executed: Mutex::new(None),
             last_principal: Mutex::new(None),
             fail_with: None,
@@ -363,7 +365,6 @@ impl MutationExecutor for FakeMutationExecutor {
             rules_removed: Vec::new(),
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
-            extended_sections: Vec::new(),
             cross_set_duplicates: Vec::new(),
         }
     }
@@ -406,8 +407,14 @@ impl MutationExecutor for FakeMutationExecutor {
         }))
     }
 
-    fn safe_disable(&self, principal: &str, reason: &str) -> MutationOutcome {
+    fn safe_disable(
+        &self,
+        principal: &str,
+        reason: &str,
+        term: nrr_shared::ipc_payloads::SafeDisableTerm,
+    ) -> MutationOutcome {
         *self.last_principal.lock().unwrap() = Some(principal.to_string());
+        *self.last_safe_disable_term.lock().unwrap() = Some(term);
         self.safe_disable_count.fetch_add(1, Ordering::Relaxed);
         *self.last_safe_disable_reason.lock().unwrap() = Some(reason.to_string());
         if let Some(err) = self.fail_with.clone() {
@@ -789,6 +796,8 @@ impl RoutingPauseProvider for FakeRoutingPause {
             paused_at: None,
             pause_reason: None,
             updated_at: 0,
+            resumes_at_ms: None,
+            until_restart: false,
         }
     }
 }
@@ -807,6 +816,8 @@ impl RoutingPauseWriter for FakeRoutingPauseWriter {
             paused_at: if paused { Some(0) } else { None },
             pause_reason: reason.map(str::to_string),
             updated_at: 0,
+            resumes_at_ms: None,
+            until_restart: false,
         })
     }
 }

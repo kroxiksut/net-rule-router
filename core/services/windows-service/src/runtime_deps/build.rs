@@ -1879,6 +1879,12 @@ pub(crate) fn build_supervised_runtime_deps(
         rebind_requests: Some(rebind_requests),
         secondary_liveness_hook,
         secondary_external_address,
+        routing_pause_terms: pause_coordinator.as_ref().map(|coordinator| {
+            Arc::new(nrr_service_runtime::routing_pause::RoutingPauseTerms::new(
+                Arc::clone(coordinator),
+                Some(Arc::clone(&event_bus)),
+            ))
+        }),
         // Windows learns application destinations and resolutions through the
         // observation CONSUMERS above (WFP net-events and ETW), which do more
         // than fold addresses into a store — attribution, traces, collateral

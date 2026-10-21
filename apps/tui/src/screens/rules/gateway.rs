@@ -29,9 +29,21 @@ const CHANNELS: [Route; 2] = [Route::Primary, Route::Secondary];
 
 #[derive(Debug)]
 pub enum Stage {
-    Program { text: String },
-    Channel { program: String, cursor: usize },
-    Loading { program: String, route: Route },
+    /// `found` is `None` while the scan runs; typing names a program by path
+    /// or file name, the terminal's stand-in for the window's file dialog.
+    Program {
+        text: String,
+        found: Option<Vec<String>>,
+        cursor: usize,
+    },
+    Channel {
+        program: String,
+        cursor: usize,
+    },
+    Loading {
+        program: String,
+        route: Route,
+    },
     Pick(Pick),
 }
 
@@ -60,8 +72,61 @@ pub fn start(app: &mut AppState) -> bool {
     }
     app.rules.mode = Mode::Gateway(Box::new(Stage::Program {
         text: String::new(),
+        found: None,
+        cursor: 0,
     }));
+    scan(app);
     true
+}
+
+/// The VPN programs on this computer, by file name, as the window lists them.
+fn scan(app: &mut AppState) {
+    app.outbox.push(Box::new(|_client: &dyn IpcClient| {
+        let mut names: Vec<String> = Vec::new();
+        for candidate in crate::platform::vpn_discovery().discover_vpn_candidates() {
+            if candidate.source == nrr_platform_api::VpnCandidateSource::KernelTunnel {
+                continue;
+            }
+            let name = program_file_name(candidate.exe_path.as_deref().unwrap_or_default());
+            if !name.is_empty() && !names.iter().any(|n| n == name) {
+                names.push(name.to_owned());
+            }
+        }
+        Reply::new(move |app| {
+            if let Mode::Gateway(stage) = &mut app.rules.mode {
+                if let Stage::Program { found, cursor, .. } = stage.as_mut() {
+                    *cursor = 0;
+                    *found = Some(names);
+                }
+            }
+        })
+    }));
+}
+
+/// The program `typed` names, else the found one under the cursor.
+fn program_of(typed: &str, found: Option<&[String]>, cursor: usize) -> String {
+    let typed = typed.trim();
+    let found = found.unwrap_or_default();
+    if typed.is_empty() {
+        return found.get(cursor).cloned().unwrap_or_default();
+    }
+    match typed.parse::<usize>() {
+        Ok(n) if (1..=found.len()).contains(&n) => found[n - 1].clone(),
+        _ => program_file_name(typed).to_owned(),
+    }
+}
+
+fn program_chosen(app: &mut AppState, text: String, found: Option<Vec<String>>, cursor: usize) {
+    let program = program_of(&text, found.as_deref(), cursor);
+    app.rules.mode = Mode::Gateway(Box::new(if program.is_empty() {
+        Stage::Program {
+            text,
+            found,
+            cursor,
+        }
+    } else {
+        Stage::Channel { program, cursor: 1 }
+    }));
 }
 
 fn channel_label(route: Route) -> Key {
@@ -207,18 +272,44 @@ pub fn on_key(app: &mut AppState, stage: Stage, key: KeyEvent) -> bool {
         return true;
     }
     match stage {
-        Stage::Program { mut text } => match key.code {
-            KeyCode::Enter => {
-                let program = program_file_name(&text).to_owned();
-                if program.is_empty() {
-                    app.rules.mode = Mode::Gateway(Box::new(Stage::Program { text }));
-                } else {
-                    app.rules.mode = Mode::Gateway(Box::new(Stage::Channel { program, cursor: 1 }));
-                }
+        Stage::Program {
+            mut text,
+            found,
+            mut cursor,
+        } => match key.code {
+            KeyCode::Enter => program_chosen(app, text, found, cursor),
+            KeyCode::F(5) => {
+                app.rules.mode = Mode::Gateway(Box::new(Stage::Program {
+                    text,
+                    found: None,
+                    cursor: 0,
+                }));
+                scan(app);
+            }
+            KeyCode::Up if text.is_empty() => {
+                cursor = cursor.saturating_sub(1);
+                app.rules.mode = Mode::Gateway(Box::new(Stage::Program {
+                    text,
+                    found,
+                    cursor,
+                }));
+            }
+            KeyCode::Down if text.is_empty() => {
+                let last = found.as_ref().map_or(0, |f| f.len().saturating_sub(1));
+                cursor = (cursor + 1).min(last);
+                app.rules.mode = Mode::Gateway(Box::new(Stage::Program {
+                    text,
+                    found,
+                    cursor,
+                }));
             }
             _ => {
                 let used = edit_text(&mut text, key);
-                app.rules.mode = Mode::Gateway(Box::new(Stage::Program { text }));
+                app.rules.mode = Mode::Gateway(Box::new(Stage::Program {
+                    text,
+                    found,
+                    cursor,
+                }));
                 return used.unwrap_or(true);
             }
         },
@@ -280,18 +371,17 @@ pub fn on_line(app: &mut AppState, stage: Stage, line: &str) {
         return;
     }
     match stage {
-        Stage::Program { text } => {
+        Stage::Program {
+            text,
+            found,
+            cursor,
+        } => {
             let typed = if line.is_empty() {
                 text
             } else {
                 line.to_owned()
             };
-            let program = program_file_name(&typed).to_owned();
-            app.rules.mode = Mode::Gateway(Box::new(if program.is_empty() {
-                Stage::Program { text: typed }
-            } else {
-                Stage::Channel { program, cursor: 1 }
-            }));
+            program_chosen(app, typed, found, cursor);
         }
         Stage::Channel { program, cursor } => match line.trim() {
             "" => channel_chosen(app, program, cursor),
@@ -360,12 +450,30 @@ fn candidate_text(c: &VpnGatewayCandidateDto, texts: &Texts) -> String {
 pub fn lines(stage: &Stage, texts: &Texts) -> Vec<ViewLine> {
     let mut lines = vec![ViewLine::text(texts.get(text::GATEWAY_NOTE))];
     match stage {
-        Stage::Program { text: typed } => {
+        Stage::Program {
+            text: typed,
+            found,
+            cursor,
+        } => {
             lines.push(ViewLine::new(vec![Segment::strong(
                 texts.get(text::GATEWAY_PROGRAM_QUESTION),
             )]));
+            match found {
+                None => lines.push(ViewLine::text(texts.get(text::GATEWAY_PROGRAM_SCANNING))),
+                Some(found) if found.is_empty() => {
+                    lines.push(ViewLine::text(texts.get(text::GATEWAY_PROGRAM_NONE)));
+                }
+                Some(found) => lines.extend(found.iter().enumerate().map(|(i, name)| {
+                    ViewLine::text(format!(
+                        "{}{}. {}",
+                        marker(typed.is_empty() && i == *cursor),
+                        i + 1,
+                        display_text(name)
+                    ))
+                })),
+            }
             lines.push(ViewLine::text(format!("> {typed}")));
-            lines.push(ViewLine::text(texts.get(text::INPUT_HINT)));
+            lines.push(ViewLine::text(texts.get(text::GATEWAY_PROGRAM_KEYS)));
         }
         Stage::Channel { program, cursor } => {
             lines.push(ViewLine::text(program.clone()));
@@ -434,4 +542,30 @@ fn pick_lines(pick: &Pick, texts: &Texts, lines: &mut Vec<ViewLine>) {
         lines.push(ViewLine::text(texts.get(text::GATEWAY_INVALID)));
     }
     lines.push(ViewLine::text(texts.get(text::GATEWAY_PICK_KEYS)));
+}
+
+#[cfg(test)]
+mod program_tests {
+    use super::program_of;
+
+    #[test]
+    fn the_program_comes_from_the_list_or_from_what_was_typed() {
+        let found = vec!["corpvpn.exe".to_owned(), "other.exe".to_owned()];
+        assert_eq!(program_of("", Some(&found), 1), "other.exe");
+        assert_eq!(program_of("1", Some(&found), 1), "corpvpn.exe");
+        assert_eq!(
+            program_of("C:/Program Files/Corp/client.exe", Some(&found), 0),
+            "client.exe"
+        );
+        assert_eq!(
+            program_of("", None, 0),
+            "",
+            "nothing found and nothing typed"
+        );
+        assert_eq!(
+            program_of("3", Some(&found), 0),
+            "3",
+            "a number past the list is a name"
+        );
+    }
 }

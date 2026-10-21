@@ -837,8 +837,8 @@ fn everything_under_the_additional_route_blocks_all_when_unresolved() {
         .collect();
     assert_eq!(
         blocks.len(),
-        7,
-        "mode-B fail-closed: V4 ALE block-all + 4 named V4 packet blocks + V6 ALE + V6 packet block-all"
+        9,
+        "mode-B fail-closed: V4 ALE block-all + 4 named V4 packet blocks + V6 ALE + 3 named V6 transport"
     );
 }
 
@@ -952,7 +952,7 @@ fn a_second_blocker_arriving_or_leaving_re_plans_the_first_one() {
             .collect();
         api.wfp_filters.lock().unwrap().iter().any(|f| {
             ids.contains(&f.id.raw)
-                && f.layer == WfpLayerKey::OutboundIpPacketV6
+                && f.layer == WfpLayerKey::OutboundTransportV6
                 && f.action == WfpAction::Block
         })
     };

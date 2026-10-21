@@ -174,6 +174,15 @@ a number and press `Enter`; `h` or `?` prints the help, `q` quits.
   service answers. In the meantime it shows only what it already knows and does
   not present it as current.
 
+## Windows over SSH
+
+On Windows, rules apply to a user who is signed in to Windows — at the screen
+or over Remote Desktop. Signed in only over SSH, you can still view and edit
+your rules in `nrr-tui`, and they are saved, but they take effect only while
+the same user is also signed in to Windows. The status line says so in such a
+session. A mode that routes the whole machine by one set of rules is planned
+for a later release.
+
 ## Linux servers
 
 On Linux, rules apply to a user who is logged in. When you manage your rules

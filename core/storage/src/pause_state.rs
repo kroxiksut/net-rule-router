@@ -28,6 +28,20 @@ pub struct RoutingPauseRecord {
     /// IPC handler). May be `None`.
     pub pause_reason: Option<String>,
     pub updated_at: i64,
+    /// When the pause ends on its own.
+    pub end: PauseEnd,
+}
+
+/// When a pause ends without the user lifting it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PauseEnd {
+    /// Lasts until the user resumes.
+    #[default]
+    Never,
+    /// Wall-clock milliseconds since the Unix epoch.
+    At(i64),
+    /// The service's next start.
+    Restart,
 }
 
 // ── Repository ────────────────────────────────────────────────────────────────
@@ -48,17 +62,20 @@ impl<'c> RoutingPauseStateRepository<'c> {
         }
         self.conn
             .query_row(
-                "SELECT sid, paused, paused_at, pause_reason, updated_at
+                "SELECT sid, paused, paused_at, pause_reason, updated_at, resumes_at_ms, until_restart
                  FROM routing_pause_state WHERE sid = ?1",
                 params![sid],
                 |row| {
                     let paused_int: i64 = row.get(1)?;
+                    let resumes_at: Option<i64> = row.get(5)?;
+                    let until_restart: i64 = row.get(6)?;
                     Ok(RoutingPauseRecord {
                         sid: row.get(0)?,
                         paused: paused_int != 0,
                         paused_at: row.get(2)?,
                         pause_reason: row.get(3)?,
                         updated_at: row.get(4)?,
+                        end: end_of(resumes_at, until_restart != 0),
                     })
                 },
             )
@@ -81,22 +98,51 @@ impl<'c> RoutingPauseStateRepository<'c> {
         reason: Option<&str>,
         now: i64,
     ) -> StorageResult<()> {
+        self.set_paused_until(sid, paused, reason, now, PauseEnd::Never)
+    }
+
+    /// [`Self::set_paused`] with when the pause ends on its own; a resume
+    /// clears the term whatever `end` says.
+    pub fn set_paused_until(
+        &self,
+        sid: &str,
+        paused: bool,
+        reason: Option<&str>,
+        now: i64,
+        end: PauseEnd,
+    ) -> StorageResult<()> {
         if sid.is_empty() {
             return Err(StorageError::Internal("set_paused: empty sid".into()));
         }
         let paused_at = if paused { Some(now) } else { None };
         let reason = if paused { reason } else { None };
+        let end = if paused { end } else { PauseEnd::Never };
+        let resumes_at = match end {
+            PauseEnd::At(ms) => Some(ms),
+            PauseEnd::Never | PauseEnd::Restart => None,
+        };
+        let until_restart = i64::from(end == PauseEnd::Restart);
         self.conn
             .execute(
                 "INSERT INTO routing_pause_state
-                 (sid, paused, paused_at, pause_reason, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 (sid, paused, paused_at, pause_reason, updated_at, resumes_at_ms, until_restart)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(sid) DO UPDATE SET
                      paused = excluded.paused,
                      paused_at = excluded.paused_at,
                      pause_reason = excluded.pause_reason,
-                     updated_at = excluded.updated_at",
-                params![sid, paused as i64, paused_at, reason, now],
+                     updated_at = excluded.updated_at,
+                     resumes_at_ms = excluded.resumes_at_ms,
+                     until_restart = excluded.until_restart",
+                params![
+                    sid,
+                    paused as i64,
+                    paused_at,
+                    reason,
+                    now,
+                    resumes_at,
+                    until_restart
+                ],
             )
             .map_err(|e| StorageError::Internal(format!("routing_pause_state set: {e}")))?;
         Ok(())
@@ -119,6 +165,31 @@ impl<'c> RoutingPauseStateRepository<'c> {
         Ok(out)
     }
 
+    /// Paused users whose pause has ended by `now_ms`: a term that has run out,
+    /// and, with `at_start`, every pause that was to last until a restart.
+    pub fn list_ended(&self, now_ms: i64, at_start: bool) -> StorageResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT sid FROM routing_pause_state
+                 WHERE paused = 1
+                   AND ((resumes_at_ms IS NOT NULL AND resumes_at_ms <= ?1)
+                        OR (?2 = 1 AND until_restart = 1))
+                 ORDER BY sid",
+            )
+            .map_err(|e| StorageError::Internal(format!("routing_pause_state ended prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![now_ms, i64::from(at_start)], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| StorageError::Internal(format!("routing_pause_state ended: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| StorageError::Internal(format!("row: {e}")))?);
+        }
+        Ok(out)
+    }
+
     /// Removes the row for `sid`. Idempotent — absent rows succeed
     /// silently. The repository keeps history rows when toggling
     /// pause off (`set_paused(false)`); use this only for explicit
@@ -134,6 +205,14 @@ impl<'c> RoutingPauseStateRepository<'c> {
             )
             .map_err(|e| StorageError::Internal(format!("routing_pause_state forget: {e}")))?;
         Ok(())
+    }
+}
+
+fn end_of(resumes_at_ms: Option<i64>, until_restart: bool) -> PauseEnd {
+    match (resumes_at_ms, until_restart) {
+        (Some(ms), _) => PauseEnd::At(ms),
+        (None, true) => PauseEnd::Restart,
+        (None, false) => PauseEnd::Never,
     }
 }
 
@@ -212,6 +291,50 @@ mod tests {
         repo.set_paused("S-M", false, None, 0).expect("m");
         let list = repo.list_paused().expect("list");
         assert_eq!(list, vec!["S-A".to_string(), "S-Z".to_string()]);
+    }
+
+    #[test]
+    fn a_term_is_kept_with_the_pause_and_cleared_by_a_resume() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_state_db(&dir);
+        let repo = RoutingPauseStateRepository::new(&conn);
+        repo.set_paused_until("S-A", true, None, 10, PauseEnd::At(5_000))
+            .expect("timed");
+        repo.set_paused_until("S-B", true, None, 10, PauseEnd::Restart)
+            .expect("restart");
+        assert_eq!(
+            repo.get("S-A").expect("a").expect("row").end,
+            PauseEnd::At(5_000)
+        );
+        assert_eq!(
+            repo.get("S-B").expect("b").expect("row").end,
+            PauseEnd::Restart
+        );
+        repo.set_paused_until("S-A", false, None, 20, PauseEnd::At(9_000))
+            .expect("resume");
+        assert_eq!(
+            repo.get("S-A").expect("a").expect("row").end,
+            PauseEnd::Never
+        );
+    }
+
+    #[test]
+    fn ended_pauses_are_the_run_out_terms_and_at_start_the_restart_ones() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_state_db(&dir);
+        let repo = RoutingPauseStateRepository::new(&conn);
+        repo.set_paused_until("S-due", true, None, 0, PauseEnd::At(1_000))
+            .expect("due");
+        repo.set_paused_until("S-later", true, None, 0, PauseEnd::At(9_000))
+            .expect("later");
+        repo.set_paused_until("S-restart", true, None, 0, PauseEnd::Restart)
+            .expect("restart");
+        repo.set_paused("S-open", true, None, 0).expect("open");
+        assert_eq!(repo.list_ended(1_000, false).expect("tick"), vec!["S-due"]);
+        assert_eq!(
+            repo.list_ended(1_000, true).expect("start"),
+            vec!["S-due", "S-restart"]
+        );
     }
 
     #[test]

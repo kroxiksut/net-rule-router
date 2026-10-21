@@ -136,7 +136,9 @@ pub trait CacheRepository {
 
     /// [`Self::list_expired_resolutions`] limited to what is worth re-resolving:
     /// a host in `named` (a rule names it) always, any other host only when it
-    /// was last used at or after `used_since`. Same order, at most `limit` rows.
+    /// was last used at or after `used_since`. Named hosts hold half of the
+    /// `limit` rows, longest-unconfirmed first, so browsing cannot starve them
+    /// out of enforcement; the result is returned in the same order.
     fn list_expired_for_refresh(
         &self,
         now: SystemTime,

@@ -312,6 +312,9 @@ pub struct SupervisedRuntimeDeps {
     /// available; the tick is then not spawned.
     pub secondary_external_address:
         Option<crate::secondary_external_address::ExternalAddressWiring>,
+    /// Ends timed pauses. `None` without a pause coordinator; the tick is then
+    /// not spawned.
+    pub routing_pause_terms: Option<Arc<crate::routing_pause::RoutingPauseTerms>>,
     /// The runtime controller that starts/stops the local DNS resolver on
     /// demand (live re-arm). `run_supervised_runtime`
     /// applies `dns_resolver_mode` to it once tasks are up (arming the
@@ -1609,6 +1612,20 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
                 msg_key = "supervised-spawn-secondary-external-address-tick-failed",
                 error = %e,
                 "spawn secondary-external-address-tick failed",
+            );
+        }
+    }
+
+    // 11. routing-pause-term-tick. Ends the pauses whose term ran out.
+    if let Some(terms) = deps.routing_pause_terms.clone() {
+        if let Err(e) =
+            supervisor.spawn(crate::service_tasks::build_routing_pause_terms_task(terms))
+        {
+            tracing::warn!(
+                target: "nrr::supervisor",
+                msg_key = "supervised-spawn-routing-pause-term-tick-failed",
+                error = %e,
+                "spawn routing-pause-term-tick failed",
             );
         }
     }

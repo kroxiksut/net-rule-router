@@ -63,6 +63,9 @@ GroupBox {
         && draftPinLkg === defaults.pinLkg
 
     Component.onCompleted: reloadFromCurrent()
+    // The service's values arrive after the section exists (snapshot, push from
+    // another client); an untouched draft follows them.
+    onCurrentChanged: if (!draftDirty) reloadFromCurrent()
 
     function markDirty() { draftDirty = true; justSaved = false }
 

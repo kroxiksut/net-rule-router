@@ -463,11 +463,11 @@ fn install_for_sid_with_policy_pushes_filters_to_wfp() {
     assert_eq!(count, 2 + EXEMPT);
     let filters = api.wfp_filters.lock().unwrap();
     assert_eq!(filters.len(), 2 + EXEMPT);
-    // The v6 packet layer has no ALE_USER_ID, so those filters are
+    // The v6 transport layer has no ALE_USER_ID, so those filters are
     // machine-wide by construction; everything else is this SID's.
     assert!(filters
         .iter()
-        .filter(|f| f.layer != nrr_platform_api::types::WfpLayerKey::OutboundIpPacketV6)
+        .filter(|f| f.layer != nrr_platform_api::types::WfpLayerKey::OutboundTransportV6)
         .all(|f| f.user_sid.as_deref() == Some("S-1-5-21-A")));
 }
 

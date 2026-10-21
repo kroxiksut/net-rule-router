@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::Connection;
 
 use nrr_platform_api::active_principals::ActivePrincipalSource;
-use nrr_storage::pause_state::{RoutingPauseRecord, RoutingPauseStateRepository};
+use nrr_storage::pause_state::{PauseEnd, RoutingPauseRecord, RoutingPauseStateRepository};
 
 use crate::activation_coordinator::Clock;
 use crate::active_sid_registry::{ActiveSidRegistry, ActiveSidsListener};
@@ -153,6 +153,56 @@ pub struct RoutingPauseCoordinator {
     presence: Option<Arc<dyn ActivePrincipalSource>>,
 }
 
+/// When a pause asked for with `term` at `now_ms` ends.
+pub fn pause_end_for(term: nrr_shared::ipc_payloads::SafeDisableTerm, now_ms: i64) -> PauseEnd {
+    use nrr_shared::ipc_payloads::SafeDisableTerm;
+    match term {
+        SafeDisableTerm::UntilRestart => PauseEnd::Restart,
+        SafeDisableTerm::UntilResumed => PauseEnd::Never,
+        timed => timed.window_ms().map_or(PauseEnd::Never, |window| {
+            PauseEnd::At(now_ms.saturating_add(window))
+        }),
+    }
+}
+
+/// Ends the pauses whose term ran out and tells their users. The first tick of
+/// a run also ends the pauses that were to last until the service restarted.
+pub struct RoutingPauseTerms {
+    coordinator: Arc<RoutingPauseCoordinator>,
+    events: Option<Arc<crate::ipc_handlers::event_bus::EventBus>>,
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl RoutingPauseTerms {
+    pub fn new(
+        coordinator: Arc<RoutingPauseCoordinator>,
+        events: Option<Arc<crate::ipc_handlers::event_bus::EventBus>>,
+    ) -> Self {
+        Self {
+            coordinator,
+            events,
+            started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn tick(&self, now_ms: i64) {
+        let at_start = !self.started.swap(true, std::sync::atomic::Ordering::SeqCst);
+        for sid in self.coordinator.lift_ended(now_ms, at_start) {
+            if let Some(bus) = self.events.as_ref() {
+                bus.publish_for(
+                    &sid,
+                    nrr_shared::ipc_payloads::StatusUpdateEvent::RoutingPauseStateChanged {
+                        sid: sid.clone(),
+                        paused: false,
+                        resumes_at_ms: None,
+                        until_restart: false,
+                    },
+                );
+            }
+        }
+    }
+}
+
 // State is `Mutex`-guarded; `lock().expect(...)` propagates poisoning (a prior
 // panic) as a panic — deliberate, not a recoverable error path.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -215,7 +265,9 @@ impl RoutingPauseCoordinator {
         let conn = self.conn.lock().expect("restore connection mutex poisoned");
         let repo = RoutingPauseStateRepository::new(&conn);
         let result = match previous {
-            Some(rec) => repo.set_paused(sid, rec.paused, rec.pause_reason.as_deref(), now),
+            Some(rec) => {
+                repo.set_paused_until(sid, rec.paused, rec.pause_reason.as_deref(), now, rec.end)
+            }
             None => repo.forget(sid),
         };
         if let Err(e) = result {
@@ -339,6 +391,17 @@ impl RoutingPauseCoordinator {
     /// removes the SID's filters via the dispatcher. Idempotent — a
     /// pause-while-paused succeeds and updates `pause_reason`.
     pub fn pause(&self, sid: &str, reason: Option<&str>) -> Result<(), PauseError> {
+        self.pause_until(sid, reason, PauseEnd::Never)
+    }
+
+    /// [`Self::pause`] that ends on its own at `end`; [`Self::lift_ended`]
+    /// lifts it.
+    pub fn pause_until(
+        &self,
+        sid: &str,
+        reason: Option<&str>,
+        end: PauseEnd,
+    ) -> Result<(), PauseError> {
         if sid.is_empty() {
             return Err(PauseError::EmptySid);
         }
@@ -349,7 +412,7 @@ impl RoutingPauseCoordinator {
         {
             let conn = self.conn.lock().expect("pause connection mutex poisoned");
             RoutingPauseStateRepository::new(&conn)
-                .set_paused(sid, true, reason, now)
+                .set_paused_until(sid, true, reason, now, end)
                 .map_err(|e| PauseError::Storage {
                     operation: "set_paused(true)",
                     message: e.to_string(),
@@ -477,6 +540,63 @@ impl RoutingPauseCoordinator {
             Some(e) => Err(e),
             None => Ok(paused),
         }
+    }
+
+    /// Resumes every user whose pause has ended by `now_ms`, and with
+    /// `at_start` every pause that was to last until the service restarted.
+    /// Returns who was resumed; a user the platform refused stays paused and
+    /// is tried again on the next call.
+    pub fn lift_ended(&self, now_ms: i64, at_start: bool) -> Vec<String> {
+        let ended = {
+            let conn = self
+                .conn
+                .lock()
+                .expect("lift_ended connection mutex poisoned");
+            RoutingPauseStateRepository::new(&conn).list_ended(now_ms, at_start)
+        };
+        let ended = match ended {
+            Ok(sids) => sids,
+            Err(e) => {
+                tracing::warn!(
+                    target: "nrr::routing-pause",
+                    msg_key = "routingpause-term-read-failed",
+                    error = %e,
+                    "the ended pauses could not be read; they are tried again",
+                );
+                return Vec::new();
+            }
+        };
+        let mut lifted = Vec::new();
+        for sid in ended {
+            match self.resume(&sid) {
+                Ok(()) => {
+                    tracing::info!(
+                        target: "nrr::routing-pause",
+                        msg_key = "routingpause-term-ended",
+                        sid = %sid,
+                        at_start,
+                        "a pause reached its end and routing resumed",
+                    );
+                    lifted.push(sid);
+                }
+                Err(e) => tracing::warn!(
+                    target: "nrr::routing-pause",
+                    msg_key = "routingpause-term-resume-failed",
+                    sid = %sid,
+                    error = %e,
+                    "a pause reached its end but routing did not resume; it is tried again",
+                ),
+            }
+        }
+        lifted
+    }
+
+    /// When `sid`'s pause ends on its own; `Never` for one without a term or
+    /// no pause at all.
+    pub fn term(&self, sid: &str) -> PauseEnd {
+        self.record(sid)
+            .filter(|rec| rec.paused)
+            .map_or(PauseEnd::Never, |rec| rec.end)
     }
 
     /// Reads the persistent pause flag. Defaults to `false` for unknown
@@ -787,6 +907,72 @@ mod tests {
         fx.coord.resume("S-A").expect("resume");
         assert!(!fx.coord.is_paused("S-A").expect("is_paused"));
         assert_eq!(fx.dispatcher.install_log(), vec!["S-A".to_string()]);
+    }
+
+    #[test]
+    fn a_timed_pause_is_lifted_once_its_term_runs_out() {
+        let fx = build_fx();
+        fx.registry
+            .on_connect("S-A", IpcClientProfile::TrayLightweight);
+        fx.coord
+            .pause_until("S-A", Some("safe-disable"), PauseEnd::At(5_000))
+            .expect("pause");
+        assert_eq!(fx.coord.term("S-A"), PauseEnd::At(5_000));
+        assert!(fx.coord.lift_ended(4_999, false).is_empty());
+        assert_eq!(fx.coord.lift_ended(5_000, false), vec!["S-A".to_string()]);
+        assert!(!fx.coord.is_paused("S-A").expect("is_paused"));
+        assert_eq!(fx.dispatcher.install_log(), vec!["S-A".to_string()]);
+        assert_eq!(fx.coord.term("S-A"), PauseEnd::Never);
+    }
+
+    #[test]
+    fn a_pause_until_restart_ends_only_with_the_first_tick_of_a_run() {
+        let fx = build_fx();
+        fx.coord
+            .pause_until("S-A", None, PauseEnd::Restart)
+            .expect("pause");
+        let terms = RoutingPauseTerms::new(Arc::clone(&fx.coord), None);
+        terms.tick(i64::MAX);
+        assert!(!fx.coord.is_paused("S-A").expect("first tick lifts it"));
+
+        fx.coord
+            .pause_until("S-A", None, PauseEnd::Restart)
+            .expect("pause again");
+        terms.tick(i64::MAX);
+        assert!(
+            fx.coord.is_paused("S-A").expect("later ticks keep it"),
+            "within one run the pause lasts"
+        );
+    }
+
+    #[test]
+    fn every_term_maps_to_its_end() {
+        use nrr_shared::ipc_payloads::SafeDisableTerm;
+        assert_eq!(
+            pause_end_for(SafeDisableTerm::FifteenMinutes, 1_000),
+            PauseEnd::At(1_000 + 15 * 60_000)
+        );
+        assert_eq!(
+            pause_end_for(SafeDisableTerm::FourHours, 0),
+            PauseEnd::At(4 * 3_600_000)
+        );
+        assert_eq!(
+            pause_end_for(SafeDisableTerm::UntilRestart, 0),
+            PauseEnd::Restart
+        );
+        assert_eq!(
+            pause_end_for(SafeDisableTerm::UntilResumed, 0),
+            PauseEnd::Never
+        );
+    }
+
+    #[test]
+    fn a_plain_pause_has_no_term_and_is_never_lifted_by_the_clock() {
+        let fx = build_fx();
+        fx.coord.pause("S-A", None).expect("pause");
+        assert_eq!(fx.coord.term("S-A"), PauseEnd::Never);
+        assert!(fx.coord.lift_ended(i64::MAX, true).is_empty());
+        assert!(fx.coord.is_paused("S-A").expect("is_paused"));
     }
 
     #[test]

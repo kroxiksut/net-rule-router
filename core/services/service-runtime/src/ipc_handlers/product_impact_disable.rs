@@ -40,6 +40,8 @@ use crate::ipc_handlers::providers::{MutationExecutor, MutationOutcome};
 /// Where the reviewed `reason` waits for the confirm, which refuses a
 /// different one.
 const SAFE_DISABLE_REASON_KEY: &str = "_nrr_safe_disable_reason";
+/// The reviewed term, kept beside the reason for the same check.
+const SAFE_DISABLE_TERM_KEY: &str = "_nrr_safe_disable_term";
 
 pub struct ProductImpactDisableTemporaryHandler {
     executor: Arc<dyn MutationExecutor>,
@@ -71,6 +73,7 @@ pub enum CheckedSafeDisable {
     Confirm {
         reason: String,
         principal: String,
+        term: nrr_shared::ipc_payloads::SafeDisableTerm,
     },
 }
 
@@ -114,9 +117,11 @@ impl CheckedIpcHandler for ProductImpactDisableTemporaryHandler {
     ) -> HandlerOutcome {
         match checked.into_inner() {
             CheckedSafeDisable::DryRun(body) => self.handle_dry_run(body, ctx),
-            CheckedSafeDisable::Confirm { reason, principal } => {
-                self.handle_confirm(&reason, &principal, ctx)
-            }
+            CheckedSafeDisable::Confirm {
+                reason,
+                principal,
+                term,
+            } => self.handle_confirm(&reason, &principal, term, ctx),
         }
     }
 }
@@ -140,12 +145,14 @@ impl ProductImpactDisableTemporaryHandler {
             rules_removed: Vec::new(),
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
-            extended_sections: Vec::new(),
             cross_set_duplicates: Vec::new(),
         };
 
         let stored = StoredMutation::confirmation_of(
-            serde_json::json!({ SAFE_DISABLE_REASON_KEY: body.reason }),
+            serde_json::json!({
+                SAFE_DISABLE_REASON_KEY: body.reason,
+                SAFE_DISABLE_TERM_KEY: body.term.slug(),
+            }),
             ctx.caller_stored(),
             ctx.caller_is_elevated,
         );
@@ -244,9 +251,24 @@ impl ProductImpactDisableTemporaryHandler {
                 diagnostics_id: None,
             });
         }
+        // The same for the term: a pause longer than the one reviewed is never
+        // taken on the confirm's word.
+        let stored_term = stored
+            .payload
+            .get(SAFE_DISABLE_TERM_KEY)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if body.term.slug() != stored_term {
+            return Err(IpcError {
+                code: IpcErrorCode::PreconditionFailed,
+                message: "confirm term does not match dry-run term".into(),
+                diagnostics_id: None,
+            });
+        }
         Ok(CheckedSafeDisable::Confirm {
             reason: stored_reason,
             principal,
+            term: body.term,
         })
     }
 
@@ -254,12 +276,13 @@ impl ProductImpactDisableTemporaryHandler {
         &self,
         stored_reason: &str,
         principal: &str,
+        term: nrr_shared::ipc_payloads::SafeDisableTerm,
         ctx: &IpcRequestContext,
     ) -> HandlerOutcome {
         let op_id = self
             .operation_store
             .enqueue_for(crate::ipc_handlers::operation_status_store::owner_of(ctx));
-        let outcome = self.executor.safe_disable(principal, stored_reason);
+        let outcome = self.executor.safe_disable(principal, stored_reason, term);
         match outcome {
             MutationOutcome::Completed(result) => {
                 self.operation_store
@@ -405,6 +428,70 @@ mod tests {
             exec.last_principal.lock().unwrap().as_deref(),
             Some(ctx().caller_stored())
         );
+    }
+
+    fn dry_run_token(h: &ProductImpactDisableTemporaryHandler, term: &str) -> String {
+        let dry: ProductImpactDisableDryRunResponse = serde_json::from_value(
+            h.handle(
+                &dry_run_envelope(serde_json::json!({
+                    "reason": "r", "dry-run": true, "term": term,
+                })),
+                &ctx(),
+            )
+            .expect("dry-run"),
+        )
+        .expect("parse");
+        dry.confirmation_token
+    }
+
+    #[test]
+    fn the_reviewed_term_reaches_the_executor() {
+        let (h, _tokens, _ops, exec) = make_handler();
+        let token = dry_run_token(&h, "one-hour");
+        h.handle(
+            &confirm_envelope(
+                serde_json::json!({ "reason": "r", "dry-run": false, "term": "one-hour" }),
+                &token,
+            ),
+            &ctx(),
+        )
+        .expect("confirm");
+        assert_eq!(
+            *exec.last_safe_disable_term.lock().unwrap(),
+            Some(nrr_shared::ipc_payloads::SafeDisableTerm::OneHour)
+        );
+    }
+
+    #[test]
+    fn a_confirm_naming_another_term_than_the_reviewed_one_is_refused() {
+        let (h, _tokens, _ops, exec) = make_handler();
+        let token = dry_run_token(&h, "fifteen-minutes");
+        let refused = h
+            .handle(
+                &confirm_envelope(
+                    serde_json::json!({ "reason": "r", "dry-run": false, "term": "until-restart" }),
+                    &token,
+                ),
+                &ctx(),
+            )
+            .expect_err("a longer pause than reviewed");
+        assert_eq!(refused.code, IpcErrorCode::PreconditionFailed);
+        assert_eq!(exec.safe_disable_count(), 0);
+    }
+
+    #[test]
+    fn an_unknown_term_mints_no_token() {
+        let (h, tokens, _ops, _exec) = make_handler();
+        let refused = h
+            .handle(
+                &dry_run_envelope(serde_json::json!({
+                    "reason": "r", "dry-run": true, "term": "forever",
+                })),
+                &ctx(),
+            )
+            .expect_err("no such term");
+        assert_eq!(refused.code, IpcErrorCode::MalformedRequest);
+        assert_eq!(tokens.len(), 0);
     }
 
     /// A standard account runs the dry-run; the confirm arrives elevated under

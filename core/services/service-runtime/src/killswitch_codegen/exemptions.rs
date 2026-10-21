@@ -11,10 +11,10 @@ use nrr_platform_api::types::{WfpAction, WfpFilterSpec, WfpLayerKey};
 
 use super::*;
 use crate::wfp_bands::{
-    BASE_BLOCK, DOH_BLOCK_BASE, DOH_FOREIGN_VETO_BASE, DOH_FOREIGN_VETO_MAX,
-    FOREIGN_TUNNEL_MAX_NETWORKS, FOREIGN_TUNNEL_MAX_TUNNELS, FOREIGN_TUNNEL_PERMIT_BASE,
-    FOREIGN_TUNNEL_PIN_VETO_BASE, FOREIGN_TUNNEL_PIN_VETO_MAX, KILLSWITCH_BLOCK_BASE,
-    PACKET_FOREIGN_TUNNEL_PERMIT_BASE, PACKET_FOREIGN_TUNNEL_PIN_VETO_BASE, PACKET_V6_EXEMPT_BASE,
+    DOH_BLOCK_BASE, DOH_FOREIGN_VETO_BASE, DOH_FOREIGN_VETO_MAX, FOREIGN_TUNNEL_MAX_NETWORKS,
+    FOREIGN_TUNNEL_MAX_TUNNELS, FOREIGN_TUNNEL_PERMIT_BASE, FOREIGN_TUNNEL_PIN_VETO_BASE,
+    FOREIGN_TUNNEL_PIN_VETO_MAX, KILLSWITCH_BLOCK_BASE, PACKET_FOREIGN_TUNNEL_PERMIT_BASE,
+    PACKET_FOREIGN_TUNNEL_PIN_VETO_BASE, PACKET_V6_EXEMPT_BASE,
 };
 
 /// The floor a block with no destination condition needs: loopback, the link's
@@ -205,7 +205,7 @@ pub fn foreign_tunnel_permits_counted(
         WfpLayerKey::AleAuthConnectV4,
         WfpLayerKey::OutboundTransportV4,
         WfpLayerKey::AleAuthConnectV6,
-        WfpLayerKey::OutboundIpPacketV6,
+        WfpLayerKey::OutboundTransportV6,
     ] {
         if !emitted
             .iter()
@@ -251,7 +251,7 @@ pub fn foreign_tunnel_permits_counted(
             ));
             permitted.extend(nets);
         }
-        // The ALE layers see each family once; the packet layers repeat it.
+        // The ALE layers see each family once; the transport layers repeat it.
         match layer {
             WfpLayerKey::AleAuthConnectV4 => cut.0 = cut_here,
             WfpLayerKey::AleAuthConnectV6 => cut.1 = cut_here,
@@ -468,8 +468,8 @@ pub fn has_posture_block(emitted: &[WfpFilterSpec]) -> bool {
 }
 
 /// A block the guard placed, as opposed to one the user wrote. The
-/// user's sit at [`BASE_BLOCK`] and above, on ALE and as their packet mirrors
-/// alike; on the v4 packet layer nothing else lives.
+/// user's sit at [`crate::wfp_bands::BASE_BLOCK`] and above on ALE, and their packet mirrors
+/// on the packet layers, where the guard places nothing.
 fn is_posture_block(f: &WfpFilterSpec) -> bool {
     f.action == WfpAction::Block
         && match f.layer {
@@ -477,7 +477,7 @@ fn is_posture_block(f: &WfpFilterSpec) -> bool {
                 f.weight < CATCHALL_EXEMPT_BASE
             }
             WfpLayerKey::OutboundTransportV4 => f.weight < PACKET_EXEMPT_BASE,
-            WfpLayerKey::OutboundIpPacketV6 => f.weight < BASE_BLOCK,
+            WfpLayerKey::OutboundTransportV6 => f.weight < PACKET_V6_EXEMPT_BASE,
             _ => false,
         }
 }
@@ -745,16 +745,10 @@ pub const MAX_DNS_SERVER_PERMITS: usize = 8;
 /// Opt-in only (see [`FailClosedExemptions::allow_dns_over_primary`]) and
 /// pinned to the machine's own resolvers: port 53 to any host is a tunnel for
 /// every program that runs its own DNS. No servers, no permits.
-///
-/// An IPv6 resolver also needs a host permit at the v6 packet layer, which has
-/// no port or protocol condition and blocks everything it does not exempt;
-/// `v6_packet_block` says that block is present. The ALE port-53 permit stays
-/// the only thing that lets a program reach the resolver on any other port.
 pub(super) fn exempt_dns_over_primary(
     sid: &str,
     servers: &[IpAddr],
     base_weight: u64,
-    v6_packet_block: bool,
 ) -> Vec<WfpFilterSpec> {
     const IP_PROTO_UDP: u8 = 17;
     const IP_PROTO_TCP: u8 = 6;
@@ -764,7 +758,7 @@ pub(super) fn exempt_dns_over_primary(
         .filter(|ip| !is_exempt_from_blocking(*ip))
         .take(MAX_DNS_SERVER_PERMITS)
         .collect();
-    let mut out: Vec<WfpFilterSpec> = capped
+    capped
         .iter()
         .flat_map(|ip| {
             [(IP_PROTO_UDP, "udp53"), (IP_PROTO_TCP, "tcp53")]
@@ -800,40 +794,5 @@ pub(super) fn exempt_dns_over_primary(
                 remote_subnet_set: Vec::new(),
             }
         })
-        .collect();
-    if v6_packet_block {
-        for (i, ip) in capped
-            .iter()
-            .filter_map(|ip| match ip {
-                IpAddr::V6(v6) => Some(*v6),
-                IpAddr::V4(_) => None,
-            })
-            .enumerate()
-        {
-            out.push(WfpFilterSpec {
-                layer: WfpLayerKey::OutboundIpPacketV6,
-                action: WfpAction::Permit,
-                remote_ip: None,
-                remote_ip_set: Vec::new(),
-                remote_ip_set_v6: Vec::new(),
-                remote_port: None,
-                weight: PACKET_V6_EXEMPT_BASE + 3 + i as u64,
-                id: filter_id_for(
-                    sid,
-                    KILLSWITCH_ROLE,
-                    &ip.to_string(),
-                    "ks-ca-dns-v6-pkt",
-                    "host",
-                ),
-                user_sid: None,
-                app_pattern: None,
-                local_interface_luid: None,
-                remote_subnet: None,
-                remote_subnet_v6: Some((ip, 128)),
-                ip_protocol: None,
-                remote_subnet_set: Vec::new(),
-            });
-        }
-    }
-    out
+        .collect()
 }

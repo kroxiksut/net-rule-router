@@ -201,6 +201,12 @@ pub struct RoutingPauseDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_reason: Option<String>,
     pub updated_at: u64,
+    /// When a timed pause ends, epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumes_at_ms: Option<i64>,
+    /// The pause ends when the service next starts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub until_restart: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -217,6 +223,9 @@ pub struct RoutingPauseToggleRequest {
     /// quotes it verbatim. `None` clears the previous reason on resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// How long a pause lasts; none is until the user resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term: Option<crate::ipc_payloads::SafeDisableTerm>,
 }
 
 pub type RoutingPauseToggleResponse = RoutingPauseDto;

@@ -46,7 +46,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    GetNamedPipeServerProcessId, WaitNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
+    GetNamedPipeServerProcessId, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
@@ -201,13 +201,14 @@ pub fn create_owner_restricted_pipe(
     };
     // SAFETY: name_wide is null-terminated UTF-16; attrs points at a valid
     // SECURITY_ATTRIBUTES whose descriptor stays alive until after this call
-    // (freed by _sd_guard at end of scope). Buffer sizes are the same as the
-    // service pipe.
+    // (freed by _sd_guard at end of scope). Buffer sizes and the byte read
+    // mode are the service pipe's: frames carry their length, and a message
+    // read shorter than the message fails with ERROR_MORE_DATA.
     let pipe = unsafe {
         CreateNamedPipeW(
             PCWSTR(name_wide.as_ptr()),
             open_mode,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
             PIPE_BUFFER_SIZE,
             PIPE_BUFFER_SIZE,

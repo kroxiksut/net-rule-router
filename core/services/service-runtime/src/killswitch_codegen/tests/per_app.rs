@@ -262,6 +262,7 @@ fn ale_filters_carry_sid_packet_filters_do_not() {
             WfpLayerKey::OutboundIpPacketV4
             | WfpLayerKey::OutboundIpPacketV6
             | WfpLayerKey::OutboundTransportV4
+            | WfpLayerKey::OutboundTransportV6
             | WfpLayerKey::IpForwardV4
             | WfpLayerKey::IpForwardV6 => {
                 assert_eq!(f.user_sid, None, "no ALE_USER_ID below the ALE layers")

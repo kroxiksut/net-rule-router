@@ -64,7 +64,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, NAMED_PIPE_MODE, PIPE_READMODE_BYTE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -102,6 +102,13 @@ pub const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 /// Pipe in/out buffer size (bytes). Smaller than max message because
 /// `PIPE_TYPE_MESSAGE` will fragment on the wire as needed.
 const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
+
+/// Read as a byte stream: frames carry their own length. In message read mode
+/// a read shorter than the message ends in `ERROR_MORE_DATA`, which read as a
+/// dead pipe, so every request past 64 KiB (a large rule set) dropped the
+/// connection before the service saw it.
+const PIPE_MODE: NAMED_PIPE_MODE =
+    NAMED_PIPE_MODE(PIPE_TYPE_MESSAGE.0 | PIPE_READMODE_BYTE.0 | PIPE_WAIT.0);
 
 /// How long a freshly connected client may stay silent before the slot is
 /// taken back. Generous — a GUI starting on a cold machine is slower than one
@@ -309,7 +316,7 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
             CreateNamedPipeW(
                 PCWSTR(self.pipe_name.as_ptr()),
                 open_mode,
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_MODE | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES,
                 PIPE_BUFFER_SIZE,
                 PIPE_BUFFER_SIZE,
@@ -1252,7 +1259,7 @@ mod tests {
             CreateNamedPipeW(
                 PCWSTR(wide.as_ptr()),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                PIPE_MODE,
                 1,
                 PIPE_BUFFER_SIZE,
                 PIPE_BUFFER_SIZE,
@@ -1275,6 +1282,30 @@ mod tests {
         }
         .expect("test client connects");
         (server, client)
+    }
+
+    /// A request longer than the pipe buffer arrives whole: a rule set of a few
+    /// hundred entries is one, and it used to drop the connection.
+    #[test]
+    fn a_frame_longer_than_the_pipe_buffer_is_read_whole() {
+        let (server, client) = overlapped_pipe_pair("big-frame");
+        let body = "x".repeat(3 * PIPE_BUFFER_SIZE as usize);
+        let sent = serde_json::json!({ "rules-json": body });
+        let raw = client.0 as isize;
+        let frame = sent.clone();
+        let writer = thread::spawn(move || {
+            let mut io = PipeIo::new(HANDLE(raw as *mut _)).expect("client io");
+            nrr_shared::ipc_wire::write_frame(&mut io, &frame).expect("write");
+        });
+        let mut io = PipeIo::new(server).expect("server io");
+        let got: serde_json::Value = read_frame(&mut io).expect("the whole frame");
+        writer.join().expect("writer");
+        assert_eq!(got, sent);
+        // SAFETY: both handles belong to this test and are not used again.
+        unsafe {
+            let _ = CloseHandle(client);
+            let _ = CloseHandle(server);
+        }
     }
 
     /// The deadline exists so a peer that stops talking cannot park a worker

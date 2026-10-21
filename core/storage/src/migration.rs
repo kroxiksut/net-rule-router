@@ -35,6 +35,7 @@ use crate::schema::STATE_DB_V79_DDL;
 use crate::schema::STATE_DB_V80_DDL;
 use crate::schema::STATE_DB_V81_DDL;
 use crate::schema::STATE_DB_V82_DDL;
+use crate::schema::STATE_DB_V83_DDL;
 use crate::schema::{
     CACHE_DB_V1_DDL, CACHE_DB_V2_DDL, CACHE_DB_V3_DDL, CACHE_DB_V4_DDL, STATE_DB_V10_DDL,
     STATE_DB_V11_DDL, STATE_DB_V12_DDL, STATE_DB_V13_DDL, STATE_DB_V14_DDL, STATE_DB_V15_DDL,
@@ -690,6 +691,11 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         version: 82,
         name: "add_vpn_gateway_confirmations",
         stmts: STATE_DB_V82_DDL,
+    },
+    MigrationDef {
+        version: 83,
+        name: "add_routing_pause_term",
+        stmts: STATE_DB_V83_DDL,
     },
 ];
 

@@ -1567,6 +1567,85 @@ fn the_explain_answer_names_the_network_that_matched() {
     assert!(explain("198.51.101.77").match_section.is_none());
 }
 
+/// With the caller's rules paused, nothing routes by them: the check answers
+/// the default route and says why.
+#[test]
+fn the_routing_check_answers_the_default_route_while_rules_are_paused() {
+    use nrr_shared::rules_json::{
+        to_canonical_string, AddressMatchDto, CanonicalRulesJsonV1, RuleDto,
+        RULES_JSON_SCHEMA_VERSION,
+    };
+    use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+    use nrr_storage::repository::MigrationRunner;
+
+    const SID: &str = "S-1-5-21-1";
+    let dir = TempDir::new().expect("tmp");
+    let conn = open_connection(&dir.path().join("state.db")).expect("open");
+    let runner = SqliteMigrationRunner::for_state_db(conn);
+    runner.run_pending_migrations().expect("migrate");
+    let conn = Arc::new(std::sync::Mutex::new(runner.into_connection()));
+    let rules_json = to_canonical_string(&CanonicalRulesJsonV1 {
+        schema_version: RULES_JSON_SCHEMA_VERSION,
+        primary: vec![],
+        secondary: vec![RuleDto {
+            id: "N-0001".into(),
+            enabled: true,
+            address_match: Some(AddressMatchDto::Subnet {
+                network: "198.51.100.0/24".into(),
+            }),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_shared::rules_json::RuleAction::Route,
+            origin: None,
+        }],
+    })
+    .expect("serialise");
+    conn.lock()
+        .expect("lock")
+        .execute(
+            "INSERT INTO revisions (
+                principal, revision_id, content_hash, rules_json, status, source,
+                correlation_id, created_at, activated_at
+             ) VALUES (?1, 'rev-1', 'h', ?2, 'active', 'gui-rules-edit', 'c', 1, 1)",
+            rusqlite::params![nrr_storage::BASELINE_PRINCIPAL, rules_json],
+        )
+        .expect("seed active revision");
+    let alerts: Arc<dyn SecurityAlertsRepository> =
+        Arc::new(InMemorySecurityAlertsRepository::new());
+    let facade = ProductionDiagnosticsFacade::new(
+        dir.path(),
+        dir.path(),
+        None,
+        alerts,
+        Some(Arc::clone(&conn)),
+    );
+    let explain = || {
+        let q = ExplainQuery::Synthetic {
+            input_sample: nrr_diagnostics::explain::RuntimeInputSample::new()
+                .with_ip("198.51.100.77"),
+        };
+        facade
+            .get_explain(&q, ExplainDetailLevel::Diagnostics, SID)
+            .expect("explain")
+    };
+
+    assert!(
+        explain().match_section.is_some(),
+        "the rule routes it while active"
+    );
+    nrr_storage::pause_state::RoutingPauseStateRepository::new(&conn.lock().expect("lock"))
+        .set_paused(SID, true, None, 1)
+        .expect("pause");
+    let paused = explain();
+    assert!(
+        paused.match_section.is_none(),
+        "no rule decides while paused"
+    );
+    let action = paused.final_action_section.expect("an answer");
+    assert_eq!(action.reason_key, "diag.explain.reason.rules-paused");
+    assert_eq!(action.route_role.as_deref(), Some("primary"));
+}
+
 /// Every reason the explain probe can name is translated: a missing key shows
 /// the user a raw `diag.explain.reason.*` id. Keys built with `format!` are
 /// invisible to the workspace-wide `tr()` scan, so they are listed here.

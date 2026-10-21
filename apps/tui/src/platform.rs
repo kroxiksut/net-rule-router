@@ -123,6 +123,19 @@ pub fn app_group_discovery() -> Box<dyn nrr_platform_api::AppGroupDiscoveryPort>
     Box::new(nrr_platform_api::NoopAppGroupDiscovery)
 }
 
+/// Windows routes only users signed in to Windows; a shell reached over SSH
+/// alone is not one of them.
+#[cfg(windows)]
+pub fn rules_need_a_windows_sign_in() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+}
+
+/// Every signed-in user is routed, over SSH too.
+#[cfg(not(windows))]
+pub fn rules_need_a_windows_sign_in() -> bool {
+    false
+}
+
 /// What the "Your VPN client" rows scan for: likely VPN programs on this
 /// machine, run as the user who reads them.
 #[cfg(windows)]

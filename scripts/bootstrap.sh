@@ -49,6 +49,12 @@ if ! rustup target list --installed | grep -qx "$target"; then
   rustup target add "$target"
 fi
 
+# The gate's test runner (scripts/check.sh falls back to cargo test without it).
+if ! cargo nextest --version >/dev/null 2>&1; then
+  cyan "[bootstrap] installing cargo-nextest"
+  cargo install cargo-nextest --locked
+fi
+
 if [ ! -f "$repo_root/.env" ]; then
   cp "$repo_root/.env.example" "$repo_root/.env"
   cyan "[bootstrap] created .env from .env.example"

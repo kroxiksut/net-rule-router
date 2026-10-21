@@ -203,8 +203,8 @@ pub fn augment_codegen_for_fake_ip(
 }
 
 /// The pool's permits below ALE, where the blanket postures also block: ICMP
-/// at the transport layer (our stack answers a ping to a virtual address) and
-/// every IPv6 packet into the v6 pool. Their own source, our range only: the
+/// at the transport layer (our stack answers a ping to a virtual address), in
+/// both families. Their own source, our range only: the
 /// pool is routed to nothing but our adapter, and no rule network may overlap
 /// it. Those layers carry no user, so neither do these.
 #[must_use]
@@ -245,9 +245,9 @@ pub fn fake_ip_pool_packet_permits(sid: &str, pool: &FakeIpPoolConfig) -> Vec<Wf
         out.push(WfpFilterSpec {
             remote_subnet_v6: Some((v6_base, pool.v6_prefix_len)),
             ..permit(
-                WfpLayerKey::OutboundIpPacketV6,
+                WfpLayerKey::OutboundTransportV6,
                 crate::wfp_bands::FAKEIP_POOL_PERMIT_BASE,
-                "v6",
+                "v6-tr",
             )
         });
     }
@@ -651,7 +651,7 @@ mod tests {
             (WfpLayerKey::AleAuthConnectV4, fake_v4, 6),
             (WfpLayerKey::OutboundTransportV4, fake_v4, 1),
             (WfpLayerKey::AleAuthConnectV6, fake_v6, 6),
-            (WfpLayerKey::OutboundIpPacketV6, fake_v6, 6),
+            (WfpLayerKey::OutboundTransportV6, fake_v6, 58),
         ] {
             assert_eq!(
                 verdict(&filters, layer, dst, proto, TUN),

@@ -151,7 +151,11 @@ fn safe_disable_with_recording_sink_completes_and_audits() {
         .with_recovery_audit_sink(Arc::clone(&sink) as Arc<dyn RecoveryAuditSink>)
         .with_pause_coordinator(pause);
 
-    let outcome = exec.safe_disable(ALICE, "operator triggered safe-disable");
+    let outcome = exec.safe_disable(
+        ALICE,
+        "operator triggered safe-disable",
+        nrr_shared::ipc_payloads::SafeDisableTerm::UntilRestart,
+    );
     match outcome {
         MutationOutcome::Completed(payload) => {
             assert_eq!(payload["outcome"], "safe-disabled");
@@ -188,7 +192,11 @@ fn safe_disable_pauses_only_the_caller_on_a_two_user_machine() {
         )
         .with_pause_coordinator(Arc::clone(&pause));
 
-    match exec.safe_disable(ALICE, "checking something") {
+    match exec.safe_disable(
+        ALICE,
+        "checking something",
+        nrr_shared::ipc_payloads::SafeDisableTerm::UntilRestart,
+    ) {
         MutationOutcome::Completed(payload) => assert_eq!(payload["suspended-sids"], 1),
         other => panic!("expected Completed, got {other:?}"),
     }
@@ -206,7 +214,11 @@ fn safe_disable_pauses_only_the_caller_on_a_two_user_machine() {
 fn safe_disable_without_sink_returns_audit_unavailable() {
     let fx = build_coordinator();
     let exec = ProductionMutationExecutor::new(Arc::clone(&fx.coordinator));
-    match exec.safe_disable(ALICE, "test") {
+    match exec.safe_disable(
+        ALICE,
+        "test",
+        nrr_shared::ipc_payloads::SafeDisableTerm::UntilRestart,
+    ) {
         MutationOutcome::Failed(err) => {
             assert_eq!(err.code, "audit-unavailable");
         }
@@ -225,7 +237,11 @@ fn safe_disable_when_audit_sink_fails_returns_audit_write_failed() {
     let exec = ProductionMutationExecutor::new(Arc::clone(&fx.coordinator))
         .with_recovery_audit_sink(Arc::new(FailingRecoveryAuditSink) as Arc<dyn RecoveryAuditSink>)
         .with_pause_coordinator(pause);
-    match exec.safe_disable(ALICE, "test") {
+    match exec.safe_disable(
+        ALICE,
+        "test",
+        nrr_shared::ipc_payloads::SafeDisableTerm::UntilRestart,
+    ) {
         MutationOutcome::Failed(err) => {
             assert_eq!(err.code, "audit-write-failed");
             assert!(err.message.contains("simulated"));

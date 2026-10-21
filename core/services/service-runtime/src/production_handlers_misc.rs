@@ -1317,7 +1317,6 @@ impl MutationExecutor for NoopMutationExecutor {
             rules_removed: Vec::new(),
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
-            extended_sections: Vec::new(),
             cross_set_duplicates: Vec::new(),
         }
     }
@@ -1350,7 +1349,12 @@ impl MutationExecutor for NoopMutationExecutor {
         })
     }
 
-    fn safe_disable(&self, _principal: &str, _reason: &str) -> MutationOutcome {
+    fn safe_disable(
+        &self,
+        _principal: &str,
+        _reason: &str,
+        _term: nrr_shared::ipc_payloads::SafeDisableTerm,
+    ) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
             args: Default::default(),
             code: "not-implemented".into(),

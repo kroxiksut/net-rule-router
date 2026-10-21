@@ -6,6 +6,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "../lib/pure.js" as Pure
 import "../lib/plurals.js" as Plurals
 
 Dialog {
@@ -122,41 +123,27 @@ Dialog {
         return tr("risk.level." + riskLevelSlug(), riskLevelSlug())
     }
 
-    /// Render one `RiskSignalDto` entry as a localised string,
-    /// substituting payload fields into the placeholder pattern via
-    /// `.replace("{name}", value)`. Mirrors the wire serde tagged
-    /// enum field names (kebab-case at JSON layer).
+    /// One `RiskSignalDto` entry as a localised string. A placeholder may
+    /// occur more than once ("*.{apex} covers {apex} itself"); an unknown one
+    /// stays in the string rather than silently dropping the value.
     function renderSignal(signal) {
         if (!signal || !signal.kind) return ""
         var kind = String(signal.kind)
-        var text = tr("risk.signal." + kind, kind)
-        // Substitute known payload fields. Unknown placeholders
-        // remain in the string — better than silently dropping the
-        // value.
-        if (signal.label !== undefined) text = text.replace("{label}", String(signal.label))
-        if (signal.count !== undefined) text = text.replace("{count}", String(signal.count))
-        if (signal["rule-count"] !== undefined) {
-            text = text.replace("{rule-count}", String(signal["rule-count"]))
+        var values = {}
+        var scalars = ["label", "count", "rule-count", "prev-total", "removed-pct", "apex"]
+        for (var s = 0; s < scalars.length; s += 1) {
+            if (signal[scalars[s]] !== undefined) values[scalars[s]] = signal[scalars[s]]
         }
-        if (signal["prev-total"] !== undefined) {
-            text = text.replace("{prev-total}", String(signal["prev-total"]))
+        // QVariantList from the bridge: no `join`, index it.
+        var lists = ["executables", "rules"]
+        for (var l = 0; l < lists.length; l += 1) {
+            var list = signal[lists[l]]
+            if (list === undefined) continue
+            var items = []
+            for (var i = 0; i < list.length; i += 1) items.push(String(list[i]))
+            values[lists[l]] = items.join(", ")
         }
-        if (signal["removed-pct"] !== undefined) {
-            text = text.replace("{removed-pct}", String(signal["removed-pct"]))
-        }
-        if (signal.apex !== undefined) text = text.replace("{apex}", String(signal.apex))
-        if (signal.executables !== undefined) {
-            // QVariantList from the bridge: no `join`, index it.
-            var names = []
-            for (var i = 0; i < signal.executables.length; i += 1) names.push(String(signal.executables[i]))
-            text = text.replace("{executables}", names.join(", "))
-        }
-        if (signal.rules !== undefined) {
-            var values = []
-            for (var j = 0; j < signal.rules.length; j += 1) values.push(String(signal.rules[j]))
-            text = text.replace("{rules}", values.join(", "))
-        }
-        return text
+        return Pure.fillPlaceholders(tr("risk.signal." + kind, kind), values)
     }
 
     /// Rules this candidate writes into BOTH route sets with both copies
@@ -473,63 +460,6 @@ Dialog {
                     return out
                 }
                 emptyText: root.tr("dialog.review-diff.column-empty", "(none)")
-            }
-        }
-
-        // ── unsupported-section badging ──────────────────
-        // When the imported preset carries `--- CIDR` / `--- Ports`
-        // or any other unknown section, the wire field
-        // `extended-sections` lists them. The server currently always
-        // returns empty (active revision doesn't persist unknown
-        // sections), so this block stays hidden until a future
-        // schema-bump adds an `unknown_sections_json` column.
-        ColumnLayout {
-            Layout.fillWidth: true
-            spacing: 4
-            visible: {
-                var ps = root.summary && root.summary["extended-sections"]
-                // Coerce to a real bool — when `summary` is `{}` the
-                // first `&&` yields `undefined`, which Qt rejects as a
-                // `bool` binding ("Unable to assign [undefined] to bool").
-                // Count by `.length` (not `Array.isArray`): bridge-delivered
-                // QVariantList is not a JS Array but has a numeric `.length`.
-                return !!(ps && typeof ps.length === "number" && ps.length > 0)
-            }
-            Label {
-                Layout.fillWidth: true
-                text: root.tr(
-                    "dialog.review-diff.extended-sections-title",
-                    "Extended sections preserved as-is")
-                font.bold: true
-                color: root.ownerRoot ? root.ownerRoot.textColor : "white"
-            }
-            Repeater {
-                model: (root.summary && root.summary["extended-sections"]) || []
-                delegate: RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 6
-                    Image {
-                        Layout.preferredWidth: 16
-                        Layout.preferredHeight: 16
-                        source: root.ownerRoot
-                            ? root.ownerRoot.uiIconSource("about")
-                            : ""
-                        fillMode: Image.PreserveAspectFit
-                        sourceSize.width: 16
-                        sourceSize.height: 16
-                        asynchronous: true
-                    }
-                    Label {
-                        Layout.fillWidth: true
-                        text: root.tr(
-                            "dialog.review-diff.extended-section-line",
-                            "{name}: {count} rules preserved (not applied)")
-                            .replace("{name}", String(modelData.name || "?"))
-                            .replace("{count}", String(modelData["preserved-count"] || 0))
-                        color: root.ownerRoot ? root.ownerRoot.textColor : "white"
-                        elide: Text.ElideRight
-                    }
-                }
             }
         }
 

@@ -305,7 +305,22 @@ impl FakeIpBindingView {
 /// could not be brought up (driver missing, adapter create failed) — the
 /// controller then stays off, leaving routing untouched (fail-open on the
 /// feature, exactly like the Mode-B resolver factory).
-pub type FakeIpStackFactory = Arc<dyn Fn() -> Option<FakeIpStack> + Send + Sync>;
+pub type FakeIpStackFactory =
+    Arc<dyn Fn() -> Result<FakeIpStack, FakeIpBuildFailure> + Send + Sync>;
+
+/// Why the factory built no stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeIpBuildFailure {
+    /// Nothing to build with (no TUN driver): asking again cannot help.
+    Unavailable,
+    /// The adapter refused this time, as one left behind by a killed process
+    /// does until Windows lets it go: the watchdog asks again.
+    Transient,
+}
+
+/// How long the watchdog waits before asking the factory again after a
+/// [`FakeIpBuildFailure::Transient`].
+pub const BUILD_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// See [`FakeIpController::datapath_status`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,6 +364,9 @@ struct ControllerInner {
     /// it succeeds. Gated so a factory that cannot build (driver missing) is
     /// not hammered every tick for a stack that never lived.
     restart_pending: bool,
+    /// Not before this moment does the watchdog ask the factory again after a
+    /// transient refusal.
+    retry_build_at: Option<crate::boot_clock::BootInstant>,
     /// The datapath went DOWN outside a clean user toggle. The next watchdog
     /// tick reports a bring-up-style `true` even when no fresh stack could
     /// start, so the caller replans enforcement and flushes the OS DNS cache —
@@ -484,16 +502,26 @@ impl FakeIpController {
             );
             return;
         };
-        let Some(mut stack) = factory() else {
-            // The factory logs WHY it could not build (driver missing, adapter
-            // open failed); this line records that a start was attempted.
-            tracing::warn!(
-                target: "nrr::fake-ip",
-                msg_key = "fakeip-start-build-failed",
-                "fake-IP start requested but the stack could not be built; feature stays off (fail-open)",
-            );
-            return;
+        let mut stack = match factory() {
+            Ok(stack) => stack,
+            Err(failure) => {
+                // The factory logs WHY it could not build; this line records
+                // that a start was attempted and whether it is tried again.
+                let retry = failure == FakeIpBuildFailure::Transient;
+                tracing::warn!(
+                    target: "nrr::fake-ip",
+                    msg_key = "fakeip-start-build-failed",
+                    retry,
+                    "fake-IP start requested but the stack could not be built; feature stays off (fail-open)",
+                );
+                if retry {
+                    inner.restart_pending = true;
+                    inner.retry_build_at = Some(crate::boot_clock::BootInstant::now());
+                }
+                return;
+            }
         };
+        inner.retry_build_at = None;
         let stop = Arc::new(AtomicBool::new(false));
         let control = stack.control();
         let thread_stop = Arc::clone(&stop);
@@ -760,7 +788,10 @@ impl FakeIpController {
                 // real addresses instead of dialling a dead TUN for the whole
                 // outage.
                 let down_flush = std::mem::take(&mut inner.down_flush_pending);
-                if inner.desired && !inner.disarmed && inner.restart_pending {
+                let build_due = inner
+                    .retry_build_at
+                    .is_none_or(|at| at.elapsed() >= BUILD_RETRY_AFTER);
+                if inner.desired && !inner.disarmed && inner.restart_pending && build_due {
                     Self::start_locked(&mut inner);
                     if inner.running.is_some() {
                         inner.restart_pending = false;
@@ -982,8 +1013,10 @@ mod tests {
                 FakeIpPoolConfig::default(),
             );
             let (adapter, _state) = MockTunAdapter::new();
-            let device = adapter.open(&TunAdapterConfig::default()).ok()?;
-            Some(assembly.build_stack(
+            let device = adapter
+                .open(&TunAdapterConfig::default())
+                .map_err(|_| FakeIpBuildFailure::Transient)?;
+            Ok(assembly.build_stack(
                 device,
                 Arc::new(MockRelayDialer::new()),
                 Arc::new(StaticUpstreamResolver::new()),
@@ -1072,6 +1105,48 @@ mod tests {
     }
 
     #[test]
+    fn a_transient_build_failure_is_retried_after_the_pause_and_a_missing_driver_is_not() {
+        use std::sync::atomic::AtomicUsize;
+        let builds = Arc::new(AtomicUsize::new(0));
+        let controller = FakeIpController::new();
+        let factory: FakeIpStackFactory = {
+            let builds = Arc::clone(&builds);
+            let inner = stack_factory();
+            Arc::new(move || {
+                if builds.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(FakeIpBuildFailure::Transient)
+                } else {
+                    inner()
+                }
+            })
+        };
+        controller.set_factory(factory);
+        controller.apply(true);
+        assert!(!controller.is_running());
+
+        controller.watchdog_tick();
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "not before the pause");
+        controller.lock().retry_build_at = None;
+        controller.watchdog_tick();
+        assert!(
+            controller.is_running(),
+            "asked again once the pause is over"
+        );
+        controller.apply(false);
+
+        let missing = FakeIpController::new();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        missing.set_factory(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err(FakeIpBuildFailure::Unavailable)
+        }));
+        missing.apply(true);
+        missing.watchdog_tick();
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "no driver, no second try");
+    }
+
+    #[test]
     fn watchdog_retries_a_pending_restart_only_while_desired() {
         // A stack that went down without a user toggle (detached
         // stop / self-exited thread) must be brought back by the periodic
@@ -1145,7 +1220,7 @@ mod tests {
         let controller = FakeIpController::new();
         let health = Arc::new(crate::fake_ip::FakeIpHealth::new());
         controller.set_health(Arc::clone(&health));
-        controller.set_factory(Arc::new(|| None));
+        controller.set_factory(Arc::new(|| Err(FakeIpBuildFailure::Unavailable)));
         {
             let mut inner = controller.lock();
             inner.desired = true;
@@ -1221,7 +1296,7 @@ mod tests {
     #[test]
     fn a_none_build_leaves_the_feature_off() {
         let controller = FakeIpController::new();
-        controller.set_factory(Arc::new(|| None));
+        controller.set_factory(Arc::new(|| Err(FakeIpBuildFailure::Unavailable)));
         controller.apply(true);
         assert!(!controller.is_running());
     }

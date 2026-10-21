@@ -50,7 +50,6 @@ impl ProductionMutationExecutor {
             rules_removed: Vec::new(),
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
-            extended_sections: Vec::new(),
             cross_set_duplicates: Vec::new(),
         }
     }

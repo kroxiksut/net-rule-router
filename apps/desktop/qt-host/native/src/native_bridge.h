@@ -421,6 +421,8 @@ public:
 
     Q_INVOKABLE QString rpcRoutingPauseGet();
     Q_INVOKABLE QString rpcRoutingPauseToggle(bool paused, const QString &reason);
+    /// Pauses the caller's rules for `term` (a `SafeDisableTerm` slug).
+    Q_INVOKABLE QString rpcRoutingPauseFor(const QString &term, const QString &reason);
 
     Q_INVOKABLE QString rpcAutostartToggle(bool enabled);
 
@@ -479,7 +481,8 @@ public:
     /// `call_with_token` overload on the `IpcClient` trait.
     Q_INVOKABLE QString rpcProductImpactDisable(const QString &reason,
                                                 bool dryRun,
-                                                const QString &confirmationToken);
+                                                const QString &confirmationToken,
+                                                const QString &term);
 
     /// Read-only full settings export. Calls
     /// `settings.export.full` and returns the correlation id. The

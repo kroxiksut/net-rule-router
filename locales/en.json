@@ -568,8 +568,7 @@
         "title": "Other VPNs (corporate)",
         "note": "For a VPN that connects only from one network, such as a work VPN allowed only from abroad: its gateway gets a rule for the channel you choose, so it always connects through that channel. If that channel is down, the VPN does not connect over the other one.",
         "program": "VPN program",
-        "program-placeholder": "Program file name, for example corpvpn.exe",
-        "detected": "Pick a found program",
+        "detected": "Pick a VPN program",
         "channel": "Connect it through",
         "find": "Find gateway addresses",
         "finding": "Looking at recent connections...",
@@ -583,7 +582,12 @@
         "manual-invalid": "This is neither an address nor a host name.",
         "add": "Add rules",
         "rule-comment": "VPN gateway: {program}",
-        "apply-hint": "The rules are in your list now. Apply the changes to put them into effect."
+        "apply-hint": "The rules are in your list now. Apply the changes to put them into effect.",
+        "pick-file": "Choose the program file…",
+        "refresh": "Refresh the list",
+        "searching": "Looking for VPN programs…",
+        "pick-file-title": "Choose the VPN program",
+        "program-filter": "Programs (*.exe)"
       },
       "shared-addresses": {
         "title": "Shared addresses (one IP serving several sites)",
@@ -914,7 +918,7 @@
         },
         "verbose": {
           "label": "Verbose service logging",
-          "tooltip": "Adds debug events to the service log. Switches itself off when the chosen time runs out or the service restarts. Applies immediately.",
+          "tooltip": "Adds debug events to the service log. Switches itself off when the chosen time runs out, even across a service restart; the \"until the service restarts\" choice ends at the next restart. Applies immediately.",
           "help": "Useful for diagnosing rare problems. The log grows substantially while it is on, which is why it switches itself off.",
           "option-off": "Normal",
           "option-one-hour": "Verbose for 1 hour",
@@ -929,7 +933,7 @@
         "intro-no-log": "Shows outgoing connections of all apps and the interface each left through (direct vs the additional adapter). Sees the real socket, so it works even when the browser uses DoH. Observation itself is always on — this switch decides whether it is shown. On this platform the trace is never written to disk.",
         "ndjson": {
           "label": "Write connection trace to service log",
-          "tooltip": "Each observed connection is written to the service log: process, remote IP:port and egress interface (primary or additional adapter). Switches itself off when the chosen time runs out or the service restarts. Applies immediately.",
+          "tooltip": "Each observed connection is written to the service log: process, remote IP:port and egress interface (primary or additional adapter). Switches itself off when the chosen time runs out, even across a service restart; the \"until the service restarts\" choice ends at the next restart. Applies immediately.",
           "option-off": "Off",
           "option-one-hour": "Write for 1 hour",
           "option-four-hours": "Write for 4 hours",
@@ -1125,6 +1129,9 @@
       "detail-no-rules": "Add rules in the Rules section, then click Save and review.",
       "detail-disconnected": "Showing preview data. Install and start the NetRuleRouter service to apply rules.",
       "tray-tooltip-paused": "Rules disabled — click to enable"
+    },
+    "pause": {
+      "until-restart": "until restart"
     }
   },
   "theme": {
@@ -1365,8 +1372,6 @@
       "column-removed": "Removed",
       "column-modified": "Modified or retargeted",
       "column-empty": "(none)",
-      "extended-sections-title": "Extended sections preserved as-is",
-      "extended-section-line": "{name}: {count} rules preserved (not applied)",
       "risk-heading": "Risk assessment",
       "signals-heading": "Detected signals",
       "approve": "Approve and activate",
@@ -1794,15 +1799,23 @@
       "cancel-description": "Dismiss the dialog without retrying the review"
     },
     "safe-disable": {
-      "title": "Safe disable",
-      "body": "Temporarily disable your routing and leak protection: the routes and filters NetRuleRouter keeps for you are removed. Other users of this computer keep theirs. The service stays running; you can re-enable at any time. This action is audited.",
+      "title": "Turn off rules for a while",
+      "body": "Your routing and leak protection stop for the time you choose: the routes and filters NetRuleRouter keeps for you are removed, and they come back on their own when it is up. Other users of this computer keep theirs. The service stays running; you can turn the rules back on earlier. This action is audited.",
       "reason-label": "Reason (required)",
       "reason-placeholder": "Why are you disabling protection?",
       "reason-required": "Please describe the reason — it is recorded in the audit trail.",
       "confirm": "Disable now",
       "confirm-description": "Temporarily disable enforcement with the provided reason",
       "cancel-description": "Dismiss the dialog and leave enforcement active",
-      "unavailable": "Safe disable requires the NetRuleRouter service to be running. Start the service and try again."
+      "unavailable": "Safe disable requires the NetRuleRouter service to be running. Start the service and try again.",
+      "term-label": "Turn rules back on",
+      "term": {
+        "fifteen-minutes": "In 15 minutes",
+        "one-hour": "In 1 hour",
+        "four-hours": "In 4 hours",
+        "until-restart": "After the computer or the service restarts",
+        "until-resumed": "When I turn them back on"
+      }
     },
     "network-recovery": {
       "title": "Restore network?",
@@ -2655,7 +2668,8 @@
         "network-wide-public": "Routed, but not blocked when the additional connection drops: leak protection holds networks up to /{prefix}. This is a large public network — make sure you meant it.",
         "subnet-host-bits": "Saved as the network {network}.",
         "protected-file-in-system-folder": "A program from a system folder: other parts of the system may rely on it reaching the network.",
-        "override-requested": "Not applied: the protection of system programs holds this rule until you confirm it (+override)."
+        "override-requested": "Not applied: the protection of system programs holds this rule until you confirm it (+override).",
+        "children-not-in-effect": "The +children flag is kept but not in effect yet: the rule covers only this program, not the ones it starts"
       }
     },
     "file-sync": {
@@ -3042,9 +3056,9 @@
       "add-rule": "Add rule…",
       "suggestions": "Suggested addresses",
       "suggestions-count": "Suggested addresses ({count})",
-      "safe-disable": "Disable temporarily…",
       "start-service": "Start service",
-      "stop-service": "Stop service"
+      "stop-service": "Stop service",
+      "pause-rules": "Turn off rules…"
     },
     "add-rule": {
       "title": "Add rule",
@@ -3266,7 +3280,11 @@
     "settings-lost": {
       "body": "This happens after the service was reinstalled or its data was reset. Settings missing: {count}."
     },
-    "settings-restore-failed": "Your settings could not be restored. Open the app to try again."
+    "settings-restore-failed": "Your settings could not be restored. Open the app to try again.",
+    "pause": {
+      "title": "Turn off rules",
+      "body": "Your routing and leak protection stop for the time you choose and come back on their own."
+    }
   },
   "diag": {
     "dns-tamper": {
@@ -3669,7 +3687,8 @@
         "rule-shape-not-enforced": "Matched a rule that limits an address to one application. Such rules cannot be carried out yet: the result shown is what the rule asks for, but it is not enforced",
         "blocked-by-ip-rule": "Denied by an address rule: this name resolves to a denied address",
         "blocked-by-network-rule": "Denied by a subnet or range rule: this address lies inside a denied network",
-        "no-rule-match": "No rule matched — default route applies"
+        "no-rule-match": "No rule matched — default route applies",
+        "rules-paused": "Rules are paused: traffic takes the default route, as if there were no rules"
       },
       "final-action": {
         "route-primary": "Route via primary",
@@ -4467,7 +4486,11 @@
       "linux-flow-reset-dump-capped": "The connection table holds more {family} sockets than one listing reads ({cap}); connections past that are not reset.",
       "svc-boot-restarted-after-unasked-stop": "The service started again after a stop nobody asked for; protection was off in between.",
       "svc-scm-stop-unasked": "Stopped by something other than NetRuleRouter's own commands; the service will be started again. To keep it stopped, use \"nrr-cli stop\".",
-      "svc-scm-stop-with-filtering-engine": "Stopping because the Windows Base Filtering Engine is going down; the service will be started again once the engine is back."
+      "svc-scm-stop-with-filtering-engine": "Stopping because the Windows Base Filtering Engine is going down; the service will be started again once the engine is back.",
+      "routingpause-term-read-failed": "The ended pauses could not be read; they are tried again: {error}",
+      "routingpause-term-ended": "A pause reached its end and routing resumed",
+      "routingpause-term-resume-failed": "A pause reached its end but routing did not resume; it is tried again: {error}",
+      "supervised-spawn-routing-pause-term-tick-failed": "The task that ends timed pauses did not start: {error}"
     },
     "conn-history": {
       "subtitle": "Connections your programs made over the chosen period, kept by the service on this computer: one line per program and destination, with how many times it connected. Only you can see your history, and it is never part of the diagnostic archive. Switch it off or clear it in Settings → Diagnostics and logs.",
@@ -5194,7 +5217,8 @@
       "fix-stop-and-restore-network": "To stop the service and restore the network, run: {command} (leak protection stays off until the service is started again)",
       "versions": "The service speaks protocol version {server}, this program version {client}. Update NetRuleRouter so both match.",
       "refused-reason": "The service said: {reason}",
-      "retrying": "Checking again every 2 seconds."
+      "retrying": "Checking again every 2 seconds.",
+      "ssh-only-session": "Signed in over SSH: your rules are saved but apply only while you are also signed in to Windows."
     },
     "status": {
       "fetch-failed": "Could not read the state from the service: {error}",
@@ -5367,11 +5391,13 @@
       "plain-review-prompt": "Type y and press Enter to apply these changes, or n to go back to editing; > and < scroll the list.",
       "plain-review-critical-prompt": "The risk is critical. Type c and press Enter to tick the box above, then y to apply; n goes back to editing.",
       "gateway": {
-        "program-question": "Which VPN program? Type its file name, for example corpvpn.exe.",
+        "program-question": "Which VPN program? Pick a found one, or type the path to its file.",
         "channel-question": "Through which channel should it connect?",
         "pick": "Type a number to add that address, or type the gateway address or name.",
         "pick-keys": "Up and Down choose, Enter adds the chosen address; typing an address or name adds that instead. Esc cancels.",
-        "none-found": "No addresses found. Type the gateway address or name."
+        "none-found": "No addresses found. Type the gateway address or name.",
+        "program-none": "No VPN programs found. Type the path to the program file.",
+        "program-keys": "Up and Down choose, Enter takes the chosen program; typing a path or a number takes that instead. F5 looks again, Esc cancels."
       },
       "help": {
         "focus": "Tab or Enter in the menu: move into the rule list; Esc: back to the menu",

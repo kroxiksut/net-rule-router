@@ -644,7 +644,7 @@ pub fn plan_fail_closed_block_all_with_dns(
     }
 
     // ── IPv6 cut (always). ──
-    push_ipv6_cut(&principal, &mut flows, v6);
+    push_ipv6_cut(&principal, &mut flows, v6, protocols);
 
     flows
 }

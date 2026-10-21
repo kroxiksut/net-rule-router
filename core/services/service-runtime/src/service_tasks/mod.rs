@@ -206,6 +206,13 @@ pub const TASK_ID_APP_DESTINATION_FLUSH: &str = "app-destination-flush-tick";
 /// learned destinations, slow enough to be invisible.
 pub const APP_DESTINATION_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Timed pauses — task id.
+pub const TASK_ID_ROUTING_PAUSE_TERMS: &str = "routing-pause-term-tick";
+
+/// How often a timed pause is checked for its end. A pause outlives its term by
+/// at most this much; the check is one indexed read.
+pub const ROUTING_PAUSE_TERMS_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Connection-history write-back — task id.
 pub const TASK_ID_CONN_HISTORY_FLUSH: &str = "conn-history-flush-tick";
 

@@ -124,6 +124,9 @@ pub struct AppState {
     pub contract_skew: Option<nrr_shared::ipc::ContractSkew>,
     /// The user's settings file could not be read: this run is on defaults.
     pub settings_unreadable: bool,
+    /// This session alone does not get the rules applied (SSH without a
+    /// Windows sign-in). Read once at start, never from tests' environment.
+    pub rules_need_a_sign_in: bool,
     /// Parts of the package this copy lacks (`presets`, `locales`).
     pub delivery_gaps: Vec<&'static str>,
     /// The newest notices, at most [`FEED_CAPACITY`].
@@ -196,6 +199,7 @@ impl AppState {
             notices: Vec::new(),
             notice_count: 0,
             settings_unreadable: false,
+            rules_need_a_sign_in: false,
             delivery_gaps: Vec::new(),
             last_notice_at: None,
             screen,
@@ -398,9 +402,16 @@ impl AppState {
                 }
                 effects
             }
-            StatusUpdateEvent::RoutingPauseStateChanged { paused, .. } => {
+            StatusUpdateEvent::RoutingPauseStateChanged {
+                paused,
+                resumes_at_ms,
+                until_restart,
+                ..
+            } => {
                 if let Some(snapshot) = self.snapshot.as_mut() {
                     snapshot.routing_paused = paused;
+                    snapshot.routing_pause_resumes_at_ms = resumes_at_ms;
+                    snapshot.routing_pause_until_restart = until_restart;
                 }
                 Vec::new()
             }
@@ -883,11 +894,9 @@ impl AppState {
         now: Instant,
     ) -> Vec<Effect> {
         if status.is_empty() || status == "ok" {
-            if self
-                .enforcement_down
-                .remove(&role)
-                .is_some_and(|down| !down.quiet)
-                && !crate::notice_mutes::muted(self, "enforcement-restored")
+            if self.enforcement_down.remove(&role).is_some_and(|down| {
+                !down.quiet && nrr_client_logic::enforcement_notice::restore_is_news(&down.status)
+            }) && !crate::notice_mutes::muted(self, "enforcement-restored")
             {
                 let mut body = texts.get(keys::ENF_RESTORED_BODY);
                 // What leak protection held back meanwhile has a list of its own.
@@ -1134,6 +1143,27 @@ mod tests {
                 quiet: false,
             },
         )))
+    }
+
+    /// Confirming the first main connection applies the rules for the first
+    /// time: "routing works again" there would report an outage that never was.
+    #[test]
+    fn finishing_the_first_setup_is_not_announced_as_a_recovery() {
+        let t = texts();
+        let mut app = connected(&Fixture::healthy());
+        app.apply(enforcement("no-policy", "primary"), &t, Instant::now());
+        let before = app.notices.len();
+        app.apply(enforcement("ok", "primary"), &t, Instant::now());
+        assert_eq!(app.notices.len(), before, "{:?}", app.notices.last());
+
+        app.apply(
+            enforcement("no-primary-route", "primary"),
+            &t,
+            Instant::now(),
+        );
+        let before = app.notices.len();
+        app.apply(enforcement("ok", "primary"), &t, Instant::now());
+        assert_eq!(app.notices.len(), before + 1, "a real outage ended");
     }
 
     #[test]

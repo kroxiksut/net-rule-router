@@ -729,3 +729,52 @@ fn refresh_candidates_are_named_or_recently_used() {
         .expect("list");
     assert!(still.iter().all(|h| h.canonical_hostname != "idle.example"));
 }
+
+/// Browsing keeps more hosts expired than one batch holds. Ranked by last use
+/// alone, a rule's host never got a turn, aged out of enforcement and came
+/// back only when the seeder learned it again: a churn every six hours.
+#[test]
+fn browsing_cannot_starve_a_named_host_out_of_the_refresh() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store_short_ttl(&dir);
+    let now = SystemTime::now();
+    for i in 0..20u8 {
+        store
+            .upsert_resolution(resolution_at(
+                &format!("busy{i}.example"),
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, i)),
+                now - hours(1),
+            ))
+            .expect("seed");
+    }
+    for (host, age) in [("new.rule", 3), ("old.rule", 5), ("mid.rule", 4)] {
+        store
+            .upsert_resolution(resolution_at(
+                host,
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, age as u8)),
+                now - hours(age),
+            ))
+            .expect("seed");
+    }
+    let named: Vec<String> = ["new.rule", "old.rule", "mid.rule"]
+        .map(String::from)
+        .to_vec();
+    let later = now + hours(1);
+
+    let got = store
+        .list_expired_for_refresh(later, 4, now - hours(24 * 7), &named)
+        .expect("list");
+    let hosts: Vec<&str> = got.iter().map(|h| h.canonical_hostname.as_str()).collect();
+    assert_eq!(hosts.len(), 4);
+    assert!(hosts.contains(&"old.rule") && hosts.contains(&"mid.rule"));
+    assert!(
+        !hosts.contains(&"new.rule"),
+        "half the batch, the oldest first"
+    );
+
+    // With nothing recently used, the named lane takes the whole batch.
+    let idle = store
+        .list_expired_for_refresh(later, 4, later, &named)
+        .expect("list");
+    assert_eq!(idle.len(), 3);
+}

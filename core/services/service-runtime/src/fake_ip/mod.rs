@@ -60,7 +60,8 @@ pub use enforcement::{
 pub use flow::{parse_packet, FlowKey, FlowProtocol, ParsedPacket};
 pub use health::FakeIpHealth;
 pub use lifecycle::{
-    FakeIpAssembly, FakeIpBindingView, FakeIpController, FakeIpDatapathStatus, FakeIpStackFactory,
+    FakeIpAssembly, FakeIpBindingView, FakeIpBuildFailure, FakeIpController, FakeIpDatapathStatus,
+    FakeIpStackFactory,
 };
 pub use production_ports::{
     CacheUpstreamResolver, CompositeFlowObserver, ConfirmedNameResolver, FlowActivityObserver,

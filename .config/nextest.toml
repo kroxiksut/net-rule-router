@@ -1,0 +1,9 @@
+# The gate's test runner (scripts/check.ps1, scripts/check.sh) when
+# cargo-nextest is installed. Each test runs in a process of its own.
+
+[profile.default]
+# A hung test is reported after a minute and ended after five: a frozen
+# process (an antivirus holding a test binary, a deadlock) must not stall
+# the whole gate.
+slow-timeout = { period = "60s", terminate-after = 5 }
+fail-fast = false

@@ -141,7 +141,9 @@ bash scripts/check.sh --require-cargo-deny
 
 Same gates in the same order as on Windows: formatting, clippy with warnings
 denied, the full test suite, then `cargo deny`. Enforcement tests that need root
-(nftables, live routes) skip loudly on their own.
+(nftables, live routes) skip loudly on their own. The suite runs through
+cargo-nextest when it is installed (`scripts/bootstrap.sh` installs it): about
+twice as fast, and a hung test is ended rather than stalling the gate.
 
 If you develop on Windows and build Linux through WSL, run this gate before
 pushing: code that compiles on one platform is not evidence about the other.

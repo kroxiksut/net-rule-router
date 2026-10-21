@@ -70,6 +70,7 @@ pub fn layer_ord(layer: WfpLayerKey) -> u8 {
         WfpLayerKey::OutboundTransportV4 => 4,
         WfpLayerKey::IpForwardV4 => 5,
         WfpLayerKey::IpForwardV6 => 6,
+        WfpLayerKey::OutboundTransportV6 => 7,
     }
 }
 

@@ -3,6 +3,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import "../../components"
 import "../../lib/pure.js" as Pure
+import "../../lib/rules.js" as Rules
 
 // Routing-control panel: pause toggle (persistent per-SID)
 // + the apply-failure-policy radios + retention. Mounted
@@ -1489,6 +1490,9 @@ ColumnLayout {
         function onServiceIntentReplayed() {
             panel._reloadServiceBackedControls()
         }
+        function onPushGapReread() {
+            panel._reloadServiceBackedControls()
+        }
     }
 
     GroupBox {
@@ -1502,6 +1506,25 @@ ColumnLayout {
             ? (root.routingState.trayActive !== false) : true
         readonly property string pausedAt: (root.uiRevision >= 0)
             ? String(root.routingState.routingPausedAt || "") : ""
+        /// When a timed pause ends, as "12 min left" / "until restart"; "" for
+        /// a pause that lasts until the user resumes.
+        property double nowMs: Date.now()
+        readonly property string leftText: {
+            if (root.uiRevision < 0 || !paused) return ""
+            if (root.routingState.routingPauseUntilRestart === true)
+                return root.tr("routing.pause.until-restart", "until restart")
+            var at = Number(root.routingState.routingPauseResumesAtMs)
+            if (!(at >= 0)) return ""
+            var left = Rules.overrideRemaining(at, nowMs)
+            return root.tr("rules.override.left." + left.kind, left.kind)
+                .replace("{count}", String(left.count))
+        }
+        Timer {
+            interval: 30000
+            repeat: true
+            running: pauseGroup.paused
+            onTriggered: pauseGroup.nowMs = Date.now()
+        }
 
         ColumnLayout {
             anchors.left: parent.left
@@ -1525,14 +1548,34 @@ ColumnLayout {
                     color: root.textColor
                     text: pauseGroup.paused
                         ? root.tr("settings.routing.pause.status-paused", "Rules are disabled")
+                            + (pauseGroup.leftText !== "" ? " · " + pauseGroup.leftText : "")
                         : root.tr("settings.routing.pause.status-active", "Rules are active")
+                }
+                ThemedComboBox {
+                    id: pauseTermCombo
+                    theme: root.uiTheme
+                    visible: !pauseGroup.paused
+                    readonly property var terms: ["fifteen-minutes", "one-hour", "four-hours",
+                        "until-restart", "until-resumed"]
+                    model: terms
+                    currentIndex: terms.length - 1
+                    labelResolver: function(item) {
+                        return root.tr("dialog.safe-disable.term." + item, String(item))
+                    }
+                    displayText: root.uiRevision >= 0 && currentIndex >= 0
+                        ? root.tr("dialog.safe-disable.term." + terms[currentIndex], terms[currentIndex])
+                        : ""
+                    Accessible.name: root.uiRevision >= 0
+                        ? root.tr("dialog.safe-disable.term-label", "Turn rules back on") : ""
                 }
                 ThemedButton {
                     theme: root.uiTheme
                     text: pauseGroup.paused
                         ? root.tr("settings.routing.pause.action-enable", "Enable rules")
                         : root.tr("settings.routing.pause.action-disable", "Disable rules")
-                    onClicked: root.setRoutingPauseEnabled(!pauseGroup.paused, "")
+                    onClicked: pauseGroup.paused
+                        ? root.setRoutingPauseEnabled(false, "")
+                        : root.pauseRoutingFor(pauseTermCombo.terms[pauseTermCombo.currentIndex], "")
                 }
             }
 
@@ -1543,7 +1586,7 @@ ColumnLayout {
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.pause.paused-since",
                     "Paused since {timestamp}")
-                    .replace("{timestamp}", pauseGroup.pausedAt)
+                    .replace("{timestamp}", Pure.formatTimestamp(Date.parse(pauseGroup.pausedAt)))
             }
 
             Label {

@@ -52,11 +52,11 @@ fn the_block_all_lets_another_vpns_handshake_through() {
         .all(|f| f.user_sid.as_deref() == Some(sid) && f.ip_protocol == Some(17)));
 }
 
-/// The v6 packet layer names no protocol or port, so the machine-wide IPv6 cut
-/// can spare another VPN only by its server's address: a confirmed v6 gateway
-/// passes it, and nothing wider does.
+/// The IPv6 cut below ALE names a protocol and never UDP, so a confirmed v6
+/// gateway needs only its user's ALE permit on the handshake ports, and the
+/// machine-wide layer opens nothing for it.
 #[test]
-fn a_confirmed_v6_gateway_passes_the_machine_wide_ipv6_cut_and_nothing_else_does() {
+fn a_confirmed_v6_gateway_is_opened_for_its_user_and_nothing_below_ale_cuts_udp() {
     let sid = "S-1-5-21-77-77-77-1006";
     let gateway: std::net::Ipv6Addr = "2001:db8::20".parse().expect("ip");
     crate::vpn_gateway_confirm::global_vpn_gateways()
@@ -78,26 +78,40 @@ fn a_confirmed_v6_gateway_passes_the_machine_wide_ipv6_cut_and_nothing_else_does
 
     orch.install_for_sid(sid).unwrap();
     let filters = api.wfp_filters.lock().unwrap();
-    let packet_v6: Vec<_> = filters
+    let ale: Vec<_> = filters
         .iter()
-        .filter(|f| f.layer == WfpLayerKey::OutboundIpPacketV6)
+        .filter(|f| {
+            f.layer == WfpLayerKey::AleAuthConnectV6
+                && f.action == WfpAction::Permit
+                && f.remote_subnet_v6 == Some((gateway, 128))
+        })
         .collect();
-    let cut = packet_v6
-        .iter()
-        .find(|f| f.action == WfpAction::Block && f.remote_subnet_v6.is_none())
-        .expect("the machine-wide IPv6 cut is armed");
-    let spared = packet_v6
-        .iter()
-        .find(|f| f.action == WfpAction::Permit && f.remote_subnet_v6 == Some((gateway, 128)))
-        .expect("the confirmed gateway passes the packet layer");
-    assert!(spared.weight > cut.weight);
-    assert_eq!(spared.user_sid, None, "the layer carries no user");
     assert!(
-        packet_v6
+        !ale.is_empty(),
+        "the confirmed gateway passes the user's block"
+    );
+    assert!(ale
+        .iter()
+        .all(|f| f.user_sid.as_deref() == Some(sid) && f.ip_protocol == Some(17)));
+    assert!(
+        filters
             .iter()
-            .filter(|f| f.action == WfpAction::Permit)
-            .all(|f| f.remote_subnet_v6.is_some() || f.local_interface_luid.is_some()),
-        "every packet-layer permit names an address or our own link"
+            .filter(|f| f.action == WfpAction::Block
+                && matches!(
+                    f.layer,
+                    WfpLayerKey::OutboundTransportV6 | WfpLayerKey::OutboundIpPacketV6
+                ))
+            .all(|f| f.ip_protocol.is_some_and(|p| p != 17 && p != 6)),
+        "a block below ALE would cut the system's IKE to the gateway"
+    );
+    assert!(
+        filters
+            .iter()
+            .filter(|f| f.action == WfpAction::Permit && f.layer == WfpLayerKey::OutboundTransportV6)
+            .all(|f| f.remote_subnet_v6.is_some()
+                || f.local_interface_luid.is_some()
+                || f.ip_protocol == Some(50)),
+        "every transport-layer permit names an address, our own link or ESP"
     );
 }
 

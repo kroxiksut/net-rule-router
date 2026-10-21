@@ -185,6 +185,7 @@ fn run(
     }
     start_licence_and_sheet(&mut app, texts);
     app.delivery_gaps = delivery_gaps();
+    app.rules_need_a_sign_in = platform::rules_need_a_windows_sign_in();
     let result = if options.plain {
         plain::run(&mut app, texts, &backend, events)
     } else {

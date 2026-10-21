@@ -150,6 +150,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
 
 For the `-RequireCargoDeny` flag you need [cargo-deny](https://github.com/EmbarkStudios/cargo-deny):
 `cargo install cargo-deny`. Without it — the same script without the flag.
+The tests run through [cargo-nextest](https://nexte.st) when it is installed
+(`scripts\bootstrap.ps1` installs it), otherwise through `cargo test`.
 
 The QML check uses `qmllint` from the same Qt the build finds (`CMAKE_PREFIX_PATH`,
 otherwise the newest under `C:\Qt`). Without Qt it is skipped with a warning;

@@ -858,7 +858,19 @@ pub const GATEWAY_ALREADY: Key = key(
 );
 pub const GATEWAY_PROGRAM_QUESTION: Key = key(
     "tui.rules.gateway.program-question",
-    "Which VPN program? Type its file name, for example corpvpn.exe.",
+    "Which VPN program? Pick a found one, or type the path to its file.",
+);
+pub const GATEWAY_PROGRAM_SCANNING: Key = key(
+    "settings.routing.vpn-gateway.searching",
+    "Looking for VPN programs…",
+);
+pub const GATEWAY_PROGRAM_NONE: Key = key(
+    "tui.rules.gateway.program-none",
+    "No VPN programs found. Type the path to the program file.",
+);
+pub const GATEWAY_PROGRAM_KEYS: Key = key(
+    "tui.rules.gateway.program-keys",
+    "Up and Down choose, Enter takes the chosen program; typing a path or a number takes that instead. F5 looks again, Esc cancels.",
 );
 pub const GATEWAY_CHANNEL_QUESTION: Key = key(
     "tui.rules.gateway.channel-question",
@@ -1467,6 +1479,9 @@ pub const ALL: &[Key] = &[
     GATEWAY_APPLY_HINT,
     GATEWAY_ALREADY,
     GATEWAY_PROGRAM_QUESTION,
+    GATEWAY_PROGRAM_SCANNING,
+    GATEWAY_PROGRAM_NONE,
+    GATEWAY_PROGRAM_KEYS,
     GATEWAY_CHANNEL_QUESTION,
     GATEWAY_PICK,
     GATEWAY_PICK_KEYS,

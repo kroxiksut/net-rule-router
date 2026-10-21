@@ -848,7 +848,12 @@ impl MutationExecutor for ProductionMutationExecutor {
         }))
     }
 
-    fn safe_disable(&self, principal: &str, reason: &str) -> MutationOutcome {
+    fn safe_disable(
+        &self,
+        principal: &str,
+        reason: &str,
+        term: nrr_shared::ipc_payloads::SafeDisableTerm,
+    ) -> MutationOutcome {
         if principal.is_empty() {
             return MutationOutcome::Failed(OperationError {
                 args: Default::default(),
@@ -906,7 +911,16 @@ impl MutationExecutor for ProductionMutationExecutor {
                         message: "pause coordinator not wired; cannot suspend enforcement".into(),
                     });
                 };
-                match coordinator.pause(principal, Some(reason)) {
+                let end = crate::routing_pause::pause_end_for(
+                    term,
+                    i64::try_from(crate::conn_observation_consumer::now_unix_ms())
+                        .unwrap_or(i64::MAX),
+                );
+                let resumes_at_ms = match end {
+                    nrr_storage::pause_state::PauseEnd::At(at) => Some(at),
+                    _ => None,
+                };
+                match coordinator.pause_until(principal, Some(reason), end) {
                     Ok(()) => {
                         if let Some(bus) = self.event_bus.as_ref() {
                             bus.publish_for(
@@ -914,8 +928,9 @@ impl MutationExecutor for ProductionMutationExecutor {
                                 StatusUpdateEvent::RoutingPauseStateChanged {
                                     sid: principal.to_string(),
                                     paused: true,
-                                    resumes_at_ms: None,
-                                    until_restart: false,
+                                    resumes_at_ms,
+                                    until_restart: end
+                                        == nrr_storage::pause_state::PauseEnd::Restart,
                                 },
                             );
                         }
@@ -924,6 +939,8 @@ impl MutationExecutor for ProductionMutationExecutor {
                             "disabled-at-secs": disabled_at_epoch_secs,
                             "reason": reason,
                             "suspended-sids": 1,
+                            "term": term.slug(),
+                            "resumes-at-ms": resumes_at_ms,
                         }))
                     }
                     Err(e) => MutationOutcome::Failed(OperationError {
@@ -1000,7 +1017,6 @@ fn reset_review_summary(
         rules_removed: Vec::new(),
         rules_modified: Vec::new(),
         rules_retargeted: Vec::new(),
-        extended_sections: Vec::new(),
         cross_set_duplicates: Vec::new(),
     }
 }
@@ -1049,7 +1065,6 @@ fn malformed_summary(message: &str) -> ReviewSummaryResponse {
         rules_removed: Vec::new(),
         rules_modified: Vec::new(),
         rules_retargeted: Vec::new(),
-        extended_sections: Vec::new(),
         cross_set_duplicates: Vec::new(),
     }
 }
@@ -1332,7 +1347,6 @@ fn not_implemented_summary(reason: &str) -> ReviewSummaryResponse {
         rules_removed: Vec::new(),
         rules_modified: Vec::new(),
         rules_retargeted: Vec::new(),
-        extended_sections: Vec::new(),
         cross_set_duplicates: Vec::new(),
     }
 }
@@ -1523,7 +1537,6 @@ fn dry_run_to_review_summary(
         rules_removed,
         rules_modified,
         rules_retargeted,
-        extended_sections: Vec::new(),
         cross_set_duplicates: Vec::new(),
     }
 }

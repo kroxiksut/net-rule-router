@@ -557,3 +557,22 @@ fn a_rules_file_import_with_only_good_rows_drops_nothing() {
             | ValidationWarning::AppPatternRefusedDropped { .. }
     )));
 }
+
+/// `+children` is accepted and kept, but nothing follows a program's children
+/// yet: the rule says so rather than looking as if it did.
+#[test]
+fn a_children_flag_is_warned_as_not_in_effect() {
+    let judged = nrr_domain::rule_value_validation::validate_rule_value(
+        "application",
+        "codex.exe +children",
+    );
+    assert!(judged.is_warning(), "{judged:?}");
+    assert_eq!(
+        judged.message_key(),
+        "rules.validation.match-value-warning.children-not-in-effect"
+    );
+    assert!(
+        !nrr_domain::rule_value_validation::validate_rule_value("application", "codex.exe")
+            .is_warning()
+    );
+}

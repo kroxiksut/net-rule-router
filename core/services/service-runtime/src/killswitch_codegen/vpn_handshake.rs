@@ -1,16 +1,14 @@
 //! Another VPN's handshake through a blanket block, as WFP filters — the live
 //! twin of `enforcement_planner::vpn_handshake`.
 //!
-//! - ESP on `OUTBOUND_TRANSPORT_V4`, where the posture's ESP block sits. The
-//!   layer has no user condition, so the permit is machine-wide by
-//!   construction; ESP carries no ports and only another VPN's encryption. The
-//!   v6 packet layer has no protocol condition, so v6 ESP is not opened.
+//! - ESP on the transport layers of both families, where the posture's ESP
+//!   blocks sit. They have no user condition, so the permit is machine-wide by
+//!   construction; ESP carries no ports and only another VPN's encryption.
 //! - IKE from the OS IKE service: ALE, UDP 500/4500, the svchost image AND the
 //!   service accounts. A user's own blanket never matches LocalSystem; this is
 //!   for the service accounts' share of the guard.
 //! - Each confirmed gateway: ALE, UDP to that address on the handshake ports,
-//!   for that user; a v6 gateway also gets a host permit on the v6 packet
-//!   layer, which can name nothing narrower.
+//!   for that user.
 
 use nrr_platform_api::types::{WfpFilterId, SERVICE_ACCOUNTS_PRINCIPAL};
 use nrr_shared::ipc_payloads::{VPN_GATEWAYS_MAX, VPN_HANDSHAKE_UDP_PORTS};
@@ -51,14 +49,24 @@ fn permit(layer: WfpLayerKey, weight: u64, id: WfpFilterId) -> WfpFilterSpec {
 /// the per-destination guard nothing but rule hosts is cut.
 #[must_use]
 pub fn vpn_handshake_filters(sid: &str, gateways: &[IpAddr]) -> Vec<WfpFilterSpec> {
-    let mut out = vec![WfpFilterSpec {
-        ip_protocol: Some(PROTO_ESP),
-        ..permit(
-            WfpLayerKey::OutboundTransportV4,
-            PACKET_VPN_HANDSHAKE_PERMIT_BASE,
-            filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-vpn-esp", "any"),
-        )
-    }];
+    let mut out = vec![
+        WfpFilterSpec {
+            ip_protocol: Some(PROTO_ESP),
+            ..permit(
+                WfpLayerKey::OutboundTransportV4,
+                PACKET_VPN_HANDSHAKE_PERMIT_BASE,
+                filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-vpn-esp", "any"),
+            )
+        },
+        WfpFilterSpec {
+            ip_protocol: Some(PROTO_ESP),
+            ..permit(
+                WfpLayerKey::OutboundTransportV6,
+                PACKET_VPN_HANDSHAKE_PERMIT_BASE,
+                filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-vpn-esp-v6", "any"),
+            )
+        },
+    ];
     let mut seen = std::collections::HashSet::new();
     let mut slot = 0u64;
     for ip in gateways
@@ -89,17 +97,6 @@ pub fn vpn_handshake_filters(sid: &str, gateways: &[IpAddr]) -> Vec<WfpFilterSpe
                         "ks-vpn-gw",
                         &port.to_string(),
                     ),
-                )
-            });
-            slot += 1;
-        }
-        if let IpAddr::V6(v6) = ip {
-            out.push(WfpFilterSpec {
-                remote_subnet_v6: Some((v6, 128)),
-                ..permit(
-                    WfpLayerKey::OutboundIpPacketV6,
-                    VPN_HANDSHAKE_PERMIT_BASE + slot,
-                    filter_id_for(sid, KILLSWITCH_ROLE, &target, "ks-vpn-gw-v6-pkt", "host"),
                 )
             });
             slot += 1;
@@ -162,16 +159,24 @@ mod tests {
     const SVCHOST: &str = r"C:\Windows\System32\svchost.exe";
 
     #[test]
-    fn esp_is_permitted_on_the_transport_layer_above_the_posture_block() {
+    fn esp_is_permitted_on_both_transport_layers_above_the_posture_blocks() {
         let filters = vpn_handshake_filters(SID, &[]);
-        assert_eq!(filters.len(), 1);
-        let esp = &filters[0];
-        assert_eq!(esp.layer, WfpLayerKey::OutboundTransportV4);
-        assert_eq!(esp.action, WfpAction::Permit);
-        assert_eq!(esp.ip_protocol, Some(PROTO_ESP));
-        assert_eq!(esp.user_sid, None, "the layer carries no user");
-        assert!(esp.weight > PACKET_BLOCK_BASE && esp.weight < PACKET_EXEMPT_BASE);
-        assert!(esp.remote_port.is_none() && esp.remote_ip.is_none());
+        let layers: Vec<WfpLayerKey> = filters.iter().map(|f| f.layer).collect();
+        assert_eq!(
+            layers,
+            vec![
+                WfpLayerKey::OutboundTransportV4,
+                WfpLayerKey::OutboundTransportV6
+            ]
+        );
+        for esp in &filters {
+            assert_eq!(esp.action, WfpAction::Permit);
+            assert_eq!(esp.ip_protocol, Some(PROTO_ESP));
+            assert_eq!(esp.user_sid, None, "the layer carries no user");
+            assert!(esp.weight > PACKET_BLOCK_BASE && esp.weight < PACKET_EXEMPT_BASE);
+            assert!(esp.remote_port.is_none() && esp.remote_ip.is_none());
+        }
+        assert_ne!(filters[0].id, filters[1].id);
     }
 
     #[test]
@@ -206,8 +211,9 @@ mod tests {
         assert_eq!(ids.len(), filters.len(), "every filter its own id");
     }
 
+    /// Nothing below ALE cuts UDP to a v6 gateway, so ALE is all it needs.
     #[test]
-    fn a_v6_gateway_is_opened_on_both_v6_layers() {
+    fn a_v6_gateway_is_opened_at_the_v6_ale_layer_only() {
         let gateway: IpAddr = "2001:db8::20".parse().expect("ip");
         let filters = vpn_handshake_filters(SID, &[gateway]);
         assert_eq!(
@@ -219,8 +225,7 @@ mod tests {
         );
         assert!(filters
             .iter()
-            .any(|f| f.layer == WfpLayerKey::OutboundIpPacketV6
-                && f.remote_subnet_v6 == Some(("2001:db8::20".parse().expect("ip"), 128))));
+            .all(|f| f.layer == WfpLayerKey::AleAuthConnectV6 || f.ip_protocol == Some(PROTO_ESP)));
     }
 
     #[test]

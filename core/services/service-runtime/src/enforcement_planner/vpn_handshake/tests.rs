@@ -55,9 +55,14 @@ fn site_postures() -> Vec<(&'static str, Vec<FlowRule>)> {
     ]
 }
 
+/// ESP to every address of one family: `Any` is IPv4 to the Windows lowering,
+/// so IPv6 is named by its `/0`.
 fn is_esp_anywhere(f: &FlowRule) -> bool {
     f.flow.protocol == Some(L4Proto::Esp)
-        && f.flow.dst == DstMatch::Any
+        && matches!(
+            f.flow.dst,
+            DstMatch::Any | DstMatch::SubnetV6 { prefix: 0, .. }
+        )
         && f.flow.dst_port.is_none()
 }
 
@@ -65,9 +70,10 @@ fn is_esp_anywhere(f: &FlowRule) -> bool {
 fn every_blanket_lets_esp_through_for_the_user() {
     for (name, flows) in blanket_postures() {
         let permits = plan_vpn_handshake_permits(SID, &flows, &[]);
-        assert_eq!(permits.len(), 1, "{name}: {permits:?}");
-        let esp = &permits[0];
-        assert!(is_esp_anywhere(esp), "{name}");
+        assert_eq!(permits.len(), 2, "{name}: one per family: {permits:?}");
+        assert!(permits.iter().any(|f| f.flow.dst == DstMatch::Any));
+        let esp = &permits[1];
+        assert!(permits.iter().all(is_esp_anywhere), "{name}");
         assert_eq!(esp.verdict, Verdict::Permit);
         assert_eq!(esp.principal, principal_scope(SID));
         assert_eq!(esp.app, AppScope::Any);
@@ -181,7 +187,7 @@ fn a_confirmed_gateway_is_named_on_the_handshake_ports_and_only_while_confirmed(
     assert!(revoked.iter().all(|f| f.flow.dst != host_match(gateway())));
     // The machine's own upkeep is never a gateway.
     let local = plan_vpn_handshake_permits(SID, flows, &[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
-    assert_eq!(local.len(), 1);
+    assert!(local.iter().all(is_esp_anywhere), "{local:?}");
 }
 
 #[test]

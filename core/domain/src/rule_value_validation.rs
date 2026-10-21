@@ -163,7 +163,19 @@ pub fn validate_rule_value(rule_type_slug: &str, match_value: &str) -> RuleValue
             RuleValueValidation::error("rules.validation.match-value-invalid.application")
         }
         // `+children` is the rule's, not the program's: a path ends before it.
-        "application" => validate_application(&extract_rule_flags(trimmed)),
+        // The flag is kept but nothing follows a program's children yet.
+        "application" => match validate_application(&extract_rule_flags(trimmed)) {
+            RuleValueValidation::Valid
+                if nrr_shared::preset_parser::split_rule_flags(trimmed)
+                    .1
+                    .children =>
+            {
+                RuleValueValidation::warning(
+                    "rules.validation.match-value-warning.children-not-in-effect",
+                )
+            }
+            judged => judged,
+        },
         _ => {
             let mut args = BTreeMap::new();
             args.insert("slug".to_string(), rule_type_slug.to_string());
@@ -787,13 +799,17 @@ mod tests {
         }
     }
 
+    /// Accepted: valid, or with `+children` the flag's not-in-effect warning.
     fn ok(rule_type: &str, value: &str) {
         let r = validate_rule_value(rule_type, value);
-        assert_eq!(
-            r,
-            RuleValueValidation::Valid,
-            "expected Valid for {rule_type}/{value:?}, got {r:?}"
-        );
+        let expected = if value.split_whitespace().skip(1).any(|w| w == "+children") {
+            RuleValueValidation::warning(
+                "rules.validation.match-value-warning.children-not-in-effect",
+            )
+        } else {
+            RuleValueValidation::Valid
+        };
+        assert_eq!(r, expected, "for {rule_type}/{value:?}");
     }
 
     fn err(rule_type: &str, value: &str, key_suffix: &str) {

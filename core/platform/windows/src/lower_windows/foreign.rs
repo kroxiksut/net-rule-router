@@ -56,7 +56,8 @@ pub(super) fn is_vpn_handshake(flow: &FlowRule) -> bool {
 }
 
 /// A block the guard placed, as opposed to one the user wrote: what a foreign
-/// tunnel is spared from. The user's own sit at [`BASE_BLOCK`] and up.
+/// tunnel is spared from. The user's own sit at [`BASE_BLOCK`] and up on ALE,
+/// and on the packet layers, where the guard places nothing.
 fn is_posture_block(f: &WfpFilterSpec) -> bool {
     f.action == WfpAction::Block
         && match f.layer {
@@ -64,7 +65,7 @@ fn is_posture_block(f: &WfpFilterSpec) -> bool {
                 f.weight < CATCHALL_EXEMPT_BASE
             }
             WfpLayerKey::OutboundTransportV4 => f.weight < PACKET_EXEMPT_BASE,
-            WfpLayerKey::OutboundIpPacketV6 => f.weight < BASE_BLOCK,
+            WfpLayerKey::OutboundTransportV6 => f.weight < CATCHALL_EXEMPT_BASE,
             _ => false,
         }
 }
@@ -215,7 +216,7 @@ fn foreign_permits_for(
         WfpLayerKey::AleAuthConnectV4,
         WfpLayerKey::OutboundTransportV4,
         WfpLayerKey::AleAuthConnectV6,
-        WfpLayerKey::OutboundIpPacketV6,
+        WfpLayerKey::OutboundTransportV6,
     ] {
         let ale = layer.supports_ale_scoping();
         if (*scope == PrincipalScope::ServiceAccounts && !ale)
@@ -524,10 +525,9 @@ pub fn lower_doh_foreign_vetoes(
 
 /// Lower another VPN's handshake permits, the narrowest each layer can say:
 ///
-/// - ESP on the v4 transport layer, for nobody (the layer has no user). The v6
-///   packet layer has no protocol condition, so v6 ESP is not opened.
-/// - Each confirmed gateway on its handshake ports, for its user, at ALE; a v6
-///   gateway also gets a host permit on the v6 packet layer.
+/// - ESP on the transport layer of its family, for nobody (the layer has no
+///   user).
+/// - Each confirmed gateway on its handshake ports, for its user, at ALE.
 /// - The OS IKE service on UDP 500/4500 at ALE, by image, for the service
 ///   accounts.
 pub fn lower_vpn_handshake(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
@@ -538,7 +538,7 @@ pub fn lower_vpn_handshake(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
         .partition(|f| f.precedence.ordinal >= VPN_HANDSHAKE_IKE_ORDINAL_BASE);
     let mut out = Vec::new();
     let mut slot = 0u64;
-    for (n, flow) in user.iter().enumerate() {
+    for flow in &user {
         let sid = user_sid_of(&flow.principal);
         let seed = sid.clone().unwrap_or_default();
         let proto = flow.flow.protocol.map(l4proto_to_ip_number);
@@ -549,6 +549,16 @@ pub fn lower_vpn_handshake(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
                     WfpAction::Permit,
                     PACKET_VPN_HANDSHAKE_PERMIT_BASE,
                     digest(&format!("vpn-esp|{seed}")),
+                );
+                spec.ip_protocol = Some(PROTO_ESP);
+                out.push(spec);
+            }
+            (Some(PROTO_ESP), DstMatch::SubnetV6 { prefix: 0, .. }, None) => {
+                let mut spec = bare(
+                    WfpLayerKey::OutboundTransportV6,
+                    WfpAction::Permit,
+                    PACKET_VPN_HANDSHAKE_PERMIT_BASE,
+                    digest(&format!("vpn-esp-v6|{seed}")),
                 );
                 spec.ip_protocol = Some(PROTO_ESP);
                 out.push(spec);
@@ -574,20 +584,6 @@ pub fn lower_vpn_handshake(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
                 spec.ip_protocol = Some(PROTO_UDP);
                 spec.user_sid = sid;
                 out.push(spec);
-                // After a v6 gateway's last port: the packet layer can name
-                // the host and nothing narrower.
-                let last_of_gateway = user.get(n + 1).is_none_or(|next| next.flow.dst != dst);
-                if let (DstMatch::HostV6(ip), true) = (dst, last_of_gateway) {
-                    let mut spec = bare(
-                        WfpLayerKey::OutboundIpPacketV6,
-                        WfpAction::Permit,
-                        VPN_HANDSHAKE_PERMIT_BASE + slot,
-                        digest(&format!("vpn-gw-v6-pkt|{seed}|{ip}")),
-                    );
-                    slot += 1;
-                    spec.remote_subnet_v6 = Some((ip, 128));
-                    out.push(spec);
-                }
             }
             _ => {}
         }

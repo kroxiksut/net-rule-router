@@ -545,6 +545,11 @@ GroupBox {
         function onServiceIntentReplayed() {
             if (!group._stabilityDirty) group._fetchStabilityConfig()
         }
+        // A restarted service may hold a different trace or verbose window, or
+        // a forced trace, and its pushes in between were lost.
+        function onPushGapReread() {
+            if (!group._stabilityDirty) group._fetchStabilityConfig()
+        }
     }
 
     onVisibleChanged: if (visible) root.refreshDiagnosticsOnPageOpen()
@@ -1107,7 +1112,7 @@ GroupBox {
                         ToolTip.delay: 400
                         ToolTip.text: group.root.tr(
                             "settings.diagnostics.service-stability.verbose.tooltip",
-                            "Adds debug events to the service log. Switches itself off when the chosen time runs out or the service restarts. Applies immediately.")
+                            "Adds debug events to the service log. Switches itself off when the chosen time runs out, even across a service restart; the \"until the service restarts\" choice ends at the next restart. Applies immediately.")
                     }
                 }
                 Label {

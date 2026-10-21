@@ -5,6 +5,7 @@ import "flows"
 import "theme"
 import "lib/pure.js" as Pure
 import "lib/plurals.js" as Plurals
+import "lib/rules.js" as Rules
 
 SystemTrayIcon {
     id: tray
@@ -61,6 +62,26 @@ SystemTrayIcon {
     // push event flips this property and `iconSource` swaps to the cached
     // grayscale variant prepared by `nrrNativeBridge.prepareTrayGrayscaleIcon`.
     property bool routingPaused: false
+    /// When a timed pause ends (epoch ms, -1 for none) and whether it ends with
+    /// the service's next start.
+    property double _pauseResumesAtMs: -1
+    property bool _pauseUntilRestart: false
+    property double _pauseNowMs: Date.now()
+    /// "12 min left" / "until restart"; "" for a pause without a term.
+    function _pauseLeftText() {
+        if (!routingPaused) return ""
+        if (_pauseUntilRestart) return tr("routing.pause.until-restart", "until restart")
+        if (!(_pauseResumesAtMs >= 0)) return ""
+        var left = Rules.overrideRemaining(_pauseResumesAtMs, _pauseNowMs)
+        return tr("rules.override.left." + left.kind, left.kind)
+            .replace("{count}", String(left.count))
+    }
+    function _takePauseTerm(source) {
+        var at = source ? source["resumes-at-ms"] : undefined
+        _pauseResumesAtMs = routingPaused && at !== undefined && at !== null ? Number(at) : -1
+        _pauseUntilRestart = routingPaused && !!source && source["until-restart"] === true
+        _pauseNowMs = Date.now()
+    }
     property string grayscaleIconUrl: ""
     readonly property bool bridgeAvailable: typeof nrrNativeBridge !== "undefined"
         && nrrNativeBridge !== null
@@ -488,6 +509,7 @@ SystemTrayIcon {
         switch (type) {
             case "routing-pause-state-changed":
                 routingPaused = !!event.paused
+                _takePauseTerm(event)
                 break
             case "auto-rule-candidates-changed":
                 _onAutoRuleCandidatesChanged(event)
@@ -2754,6 +2776,7 @@ SystemTrayIcon {
         rpc.registerRpcCallback(corr, function(ok, p) {
             if (ok && p && typeof p.paused !== "undefined") {
                 tray.routingPaused = !!p.paused
+                tray._takePauseTerm(p)
             }
         })
     }
@@ -2854,11 +2877,12 @@ SystemTrayIcon {
         var wasDown = _enforcementDownRoles.indexOf(role) >= 0
         if (status === "" || status === "ok") {
             _clearEnforcementNotice(role)
+            var previous = String(_enforcementShownByRole[role] || "")
             delete _enforcementShownByRole[role]
             if (wasDown) {
                 _enforcementDownRoles = _enforcementDownRoles.filter(
                     function(r) { return r !== role })
-                _noteEnforcementRestored()
+                if (Pure.enforcementRestoreIsNews(previous)) _noteEnforcementRestored()
             }
             return
         }
@@ -3359,6 +3383,10 @@ SystemTrayIcon {
         }
         if (action.indexOf("suggestions-silence-") === 0) {
             _onSuggestionsSilenceChoice(action)
+            return
+        }
+        if (action.indexOf("pause-term-") === 0) {
+            _onPauseTermChoice(action)
             return
         }
         // Block-notice actions swap the SAME window through a chain of
@@ -4280,6 +4308,58 @@ SystemTrayIcon {
         _presentOrQueue("suggestions-silence", show)
     }
 
+    /// One entry turns the rules off; how long is asked here, the way the
+    /// suggestions pause asks (the tray cannot carry a submenu).
+    function _showPauseChoice() {
+        _presentOrQueue("pause-term", function() {
+            promptWindow.present({
+                titleText: tr("tray.pause.title", "Turn off rules"),
+                bodyText: tr("tray.pause.body",
+                    "Your routing and leak protection stop for the time you choose and come back on their own."),
+                primaryAction: {
+                    label: tr("dialog.safe-disable.term.fifteen-minutes", "In 15 minutes"),
+                    actionId: "pause-term-fifteen-minutes",
+                    accent: false
+                },
+                secondaryAction: {
+                    label: tr("dialog.safe-disable.term.one-hour", "In 1 hour"),
+                    actionId: "pause-term-one-hour"
+                },
+                tertiaryAction: {
+                    label: tr("dialog.safe-disable.term.four-hours", "In 4 hours"),
+                    actionId: "pause-term-four-hours"
+                },
+                extraActions: [{
+                    label: tr("dialog.safe-disable.term.until-restart",
+                        "After the computer or the service restarts"),
+                    actionId: "pause-term-until-restart"
+                }, {
+                    label: tr("dialog.safe-disable.term.until-resumed", "When I turn them back on"),
+                    actionId: "pause-term-until-resumed"
+                }],
+                dismissActionId: "pause-term-cancel",
+                autoRetireMs: _promptAutoRetireMs
+            })
+        })
+    }
+
+    function _onPauseTermChoice(action) {
+        var term = action.substring("pause-term-".length)
+        if (term !== "cancel" && bridgeAvailable
+                && typeof nrrNativeBridge.rpcRoutingPauseFor === "function") {
+            var prev = tray.routingPaused
+            tray.routingPaused = true
+            var corr = nrrNativeBridge.rpcRoutingPauseFor(term, "tray")
+            tray.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
+                if (!ok) {
+                    console.log("tray pause failed:", code, msg)
+                    tray.routingPaused = prev
+                }
+            })
+        }
+        _scheduleDrain()
+    }
+
     function _onSuggestionsSilenceChoice(action) {
         var hours = {
             "suggestions-silence-30m": 0.5,
@@ -4749,7 +4829,7 @@ SystemTrayIcon {
 
     menu: Menu {
         id: trayMenu
-        onAboutToShow: tray._refreshMenuState()
+        onAboutToShow: { tray._pauseNowMs = Date.now(); tray._refreshMenuState() }
 
         MenuItem {
             text: tray._menuHeader[0]
@@ -4845,10 +4925,17 @@ SystemTrayIcon {
         MenuItem {
             text: tray.routingPaused
                 ? tr("action.resume-rules", "Enable rules")
-                : tr("action.pause-rules", "Disable rules")
+                    + (tray._pauseLeftText() !== "" ? " (" + tray._pauseLeftText() + ")" : "")
+                : tr("tray.menu.pause-rules", "Turn off rules…")
             enabled: true
             onTriggered: {
-                var nextPaused = !tray.routingPaused
+                if (!tray.routingPaused) {
+                    tray._showPauseChoice()
+                    return
+                }
+                var nextPaused = false
+                tray._pauseResumesAtMs = -1
+                tray._pauseUntilRestart = false
                 if (tray.bridgeAvailable) {
                     var prev = tray.routingPaused
                     tray.routingPaused = nextPaused
@@ -4893,16 +4980,6 @@ SystemTrayIcon {
             text: tr("tray.suggestions.stop-automatic", "Stop adding automatically")
             visible: tray._autoRulesMode === "auto"
             onTriggered: tray._setAutoRulesMode("suggest", null)
-        }
-        // Safe-disable always reachable from the
-        // tray. The primary GUI's confirm-dialog is the gatekeeper:
-        // a service-unavailable state surfaces there, not via a
-        // greyed-out menu (which would leave the user without a
-        // reason for the disablement).
-        MenuItem {
-            text: tr("tray.menu.safe-disable", "Disable temporarily…")
-            enabled: true
-            onTriggered: triggerAction("temporary-disable-product-impact")
         }
         // Starting and stopping is everyday and stays. Installing, removing and
         // the recovery actions are administration — they belong to the window,

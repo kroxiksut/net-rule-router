@@ -63,7 +63,14 @@ impl ProductionDiagnosticsFacade {
         // the probe must answer "<query> → primary", never "no route". A user
         // never needs to save a rule for traffic to flow via the primary NIC;
         // claiming otherwise was misleading and looked like broken routing.
-        let mut rule_book = self.load_active_rule_book(caller_sid).unwrap_or_default();
+        // Paused rules route nothing: the answer is the default route, said
+        // to be so because of the pause.
+        let paused = self.routing_paused_for(caller_sid);
+        let mut rule_book = if paused {
+            Default::default()
+        } else {
+            self.load_active_rule_book(caller_sid).unwrap_or_default()
+        };
         // The routing-check must model ENFORCEMENT, not the
         // bare stored rules. `ProductionRulesProvider::active_rules_for` applies
         // subdomain coverage before the WFP/route codegen and the DNS seeder ever
@@ -236,6 +243,9 @@ impl ProductionDiagnosticsFacade {
         };
         if shape_not_enforced {
             reason_key = "diag.explain.reason.rule-shape-not-enforced".to_string();
+        }
+        if paused {
+            reason_key = "diag.explain.reason.rules-paused".to_string();
         }
 
         // Compact-view-friendly population. At `CompactUi` we elide
@@ -472,6 +482,21 @@ impl ProductionDiagnosticsFacade {
     /// rather than from the rule book. Falls back to `PreferPrimary` on an
     /// empty SID, missing state DB, lock failure, or read error — the same
     /// safe default the storage layer uses for an unknown SID.
+    fn routing_paused_for(&self, sid: &str) -> bool {
+        if sid.is_empty() {
+            return false;
+        }
+        let Some(conn) = self.state_conn.as_ref() else {
+            return false;
+        };
+        let Ok(conn) = conn.lock() else {
+            return false;
+        };
+        nrr_storage::pause_state::RoutingPauseStateRepository::new(&conn)
+            .is_paused(sid)
+            .unwrap_or(false)
+    }
+
     fn behavior_mode_for_sid(&self, sid: &str) -> nrr_domain::RouteBehaviorMode {
         use std::str::FromStr;
         let fallback = nrr_domain::RouteBehaviorMode::PreferPrimary;

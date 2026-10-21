@@ -105,6 +105,8 @@ pub(crate) struct IpcSurface {
     /// The confirmations this surface's handlers use; the daemon installs
     /// them for the enforcement path.
     pub override_grants: Arc<nrr_service_runtime::override_grants::OverrideGrants>,
+    /// Ends the pauses whose term ran out.
+    pub routing_pause_terms: Arc<nrr_service_runtime::routing_pause::RoutingPauseTerms>,
 }
 
 /// Turns an approved revision into kernel state by running one enforcement pass.
@@ -394,6 +396,10 @@ pub(crate) fn build_ipc_surface(
         )
         .with_presence_source(Arc::new(LogindActivePrincipals)),
     );
+    let routing_pause_terms = Arc::new(nrr_service_runtime::routing_pause::RoutingPauseTerms::new(
+        Arc::clone(&pause_coordinator),
+        Some(Arc::clone(&event_bus)),
+    ));
 
     // Every rule change the GUI makes — preset import, table edits, rollback —
     // lands here; without it a preview came back empty and read as "nothing to
@@ -787,6 +793,7 @@ pub(crate) fn build_ipc_surface(
         revision_watch,
         auto_probe,
         override_grants,
+        routing_pause_terms,
     }
 }
 

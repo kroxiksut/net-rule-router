@@ -25,6 +25,8 @@ fuzzing = []
 # `TempDir` cleans up on drop so we no longer leak `nrr-locale-test-*` dirs
 # into `%TEMP%` after each `cargo test` run.
 tempfile = "3"
+# Parses the CI workflows: a broken one is refused by GitHub only after a push.
+yaml-rust2 = "0.13"
 
 [lints]
 workspace = true

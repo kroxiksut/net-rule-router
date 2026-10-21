@@ -276,7 +276,6 @@ pub fn fail_closed_block_all_filters_for(
             sid,
             &exemptions.dns_servers,
             weight,
-            !machine_has_other_principals,
         ));
     }
     // The catch-all ALE block — TCP/UDP egress this user sends, narrowed to the
@@ -356,6 +355,7 @@ pub fn fail_closed_block_all_filters_for(
         exemptions.secondary_luid,
         &exemptions.bootstrap_server_ips_v6,
         &exemptions.local_subnets_v6,
+        protocols,
         machine_has_other_principals,
     ));
 

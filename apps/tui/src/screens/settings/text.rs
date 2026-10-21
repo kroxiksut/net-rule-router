@@ -631,6 +631,19 @@ pub const SAFE_DISABLE_NOTE: Key = key(
 );
 pub const SAFE_DISABLE_REASON: Key = key("dialog.safe-disable.reason-label", "Reason (required)");
 pub const SAFE_DISABLE_RUN: Key = key("dialog.safe-disable.confirm", "Disable now");
+pub const SAFE_DISABLE_TERM: Key = key("dialog.safe-disable.term-label", "Turn rules back on");
+pub const SAFE_DISABLE_TERM_15M: Key =
+    key("dialog.safe-disable.term.fifteen-minutes", "In 15 minutes");
+pub const SAFE_DISABLE_TERM_1H: Key = key("dialog.safe-disable.term.one-hour", "In 1 hour");
+pub const SAFE_DISABLE_TERM_4H: Key = key("dialog.safe-disable.term.four-hours", "In 4 hours");
+pub const SAFE_DISABLE_TERM_RESUMED: Key = key(
+    "dialog.safe-disable.term.until-resumed",
+    "When I turn them back on",
+);
+pub const SAFE_DISABLE_TERM_RESTART: Key = key(
+    "dialog.safe-disable.term.until-restart",
+    "After the computer or the service restarts",
+);
 pub const SAFE_DISABLE_NEED_REASON: Key = key(
     "dialog.safe-disable.reason-required",
     "Please describe the reason — it is recorded in the audit trail.",
@@ -1187,6 +1200,12 @@ pub fn all() -> Vec<Key> {
         SAFE_DISABLE_NOTE,
         SAFE_DISABLE_REASON,
         SAFE_DISABLE_RUN,
+        SAFE_DISABLE_TERM,
+        SAFE_DISABLE_TERM_15M,
+        SAFE_DISABLE_TERM_1H,
+        SAFE_DISABLE_TERM_4H,
+        SAFE_DISABLE_TERM_RESTART,
+        SAFE_DISABLE_TERM_RESUMED,
         SAFE_DISABLE_NEED_REASON,
         SAFE_DISABLE_DONE,
         SERVICE_FIX_UNINSTALL,

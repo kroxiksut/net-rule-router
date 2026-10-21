@@ -77,15 +77,16 @@ fn mode_b_arms_catch_all_kill_switch() {
     let filters = api.wfp_filters.lock().unwrap();
     // 0704 (P2): the catch-all arms at BOTH the ALE (TCP/UDP) and the
     // packet layers. The packet side is one NAMED block per
-    // ICMP/IGMP/GRE/ESP (4) instead of one agnostic block-all; IPv6 adds a
-    // V6 ALE + V6 packet block-all → 1 + 4 + 2 = 7 block filters.
+    // ICMP/IGMP/GRE/ESP (4) instead of one agnostic block-all; IPv6 adds the
+    // V6 ALE block-all and ICMPv6/GRE/ESP at the V6 transport layer → 1 + 4 +
+    // 1 + 3 = 9 block filters.
     assert_eq!(
         filters
             .iter()
             .filter(|f| f.action == WfpAction::Block)
             .count(),
-        7,
-        "mode B: V4 ALE block + 4 named V4 packet blocks + V6 ALE + V6 packet"
+        9,
+        "mode B: V4 ALE block + 4 named V4 packet blocks + V6 ALE + 3 V6 transport"
     );
     assert_eq!(
         filters
@@ -139,7 +140,11 @@ fn killswitch_registry_publishes_exactly_the_armed_block_ids() {
         .filter(|f| f.action == WfpAction::Block && is_family_cut(f))
         .map(|f| f.id.raw)
         .collect();
-    assert_eq!(v6_block_ids.len(), 2, "one v6 block per v6 layer");
+    assert_eq!(
+        v6_block_ids.len(),
+        4,
+        "the v6 ALE block-all and three v6 protocol blocks"
+    );
     for id in &v6_block_ids {
         assert!(registry.is_ipv6_cut(*id));
         assert!(!registry.contains(*id));
@@ -1104,7 +1109,7 @@ fn kill_switch_fail_closed_blocks_secondary_dest_when_luid_unresolved() {
             !matches!(
                 f.layer,
                 nrr_platform_api::types::WfpLayerKey::AleAuthConnectV6
-                    | nrr_platform_api::types::WfpLayerKey::OutboundIpPacketV6
+                    | nrr_platform_api::types::WfpLayerKey::OutboundTransportV6
             )
         })
         .collect();

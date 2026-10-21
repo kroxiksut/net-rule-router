@@ -190,9 +190,9 @@ pub(super) fn catch_all_layer(is_v6: bool, is_packet: bool) -> WfpLayerKey {
         // `killswitch_codegen::catch_all_kill_switch_filters`.
         (false, true) => WfpLayerKey::OutboundTransportV4,
         (true, false) => WfpLayerKey::AleAuthConnectV6,
-        // The V6 catch-all block is proto-agnostic, so it stays at the packet
-        // layer (which also sees kernel-injected traffic).
-        (true, true) => WfpLayerKey::OutboundIpPacketV6,
+        // The same for V6: a protocol-less block below ALE would cut the
+        // system's IKE, which no user condition there could spare.
+        (true, true) => WfpLayerKey::OutboundTransportV6,
     }
 }
 

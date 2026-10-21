@@ -168,6 +168,7 @@ pub enum ItemId {
     StopPersist,
     /// Applying the rules at all (the GUI's "Apply rules").
     RulesPause,
+    RulesPauseTerm,
     /// A one-shot log-window request (`verbose-logging-change`, …).
     LogWindow(&'static str),
     FailurePolicy,
@@ -177,6 +178,7 @@ pub enum ItemId {
     ExportPath,
     ExportRun,
     SafeDisableReason,
+    SafeDisableTerm,
     SafeDisableRun,
     RollbackLookup,
     RollbackRun,
@@ -755,6 +757,14 @@ fn routing(app: &AppState) -> Vec<Item> {
         toggle(ItemId::RulesPause, t::RULES_PAUSE_TITLE, !paused),
         info(Words::Key(t::RULES_PAUSE_HINT)),
     ];
+    if !paused {
+        v.push(choice(
+            ItemId::RulesPauseTerm,
+            t::SAFE_DISABLE_TERM,
+            safe_disable_term_options(),
+            s.pause_term,
+        ));
+    }
     v.extend(rollback_rows(app));
     let mode = policy_text(policy, "mode");
     v.extend([
@@ -1092,6 +1102,17 @@ pub const PROBE_LIMITS: [(&str, Key, i64, i64); 3] = [
 
 // ── Apply failure policy ─────────────────────────────────────────────────────
 
+/// The service's closed list of terms, in the order the GUI offers them.
+pub fn safe_disable_term_options() -> Vec<Opt> {
+    vec![
+        opt("fifteen-minutes", t::SAFE_DISABLE_TERM_15M),
+        opt("one-hour", t::SAFE_DISABLE_TERM_1H),
+        opt("four-hours", t::SAFE_DISABLE_TERM_4H),
+        opt("until-restart", t::SAFE_DISABLE_TERM_RESTART),
+        opt("until-resumed", t::SAFE_DISABLE_TERM_RESUMED),
+    ]
+}
+
 pub fn failure_policy_options() -> Vec<Opt> {
     vec![
         opt("best-effort", t::POLICY_BEST_EFFORT),
@@ -1206,6 +1227,12 @@ fn service(app: &AppState) -> Vec<Item> {
                     ItemId::SafeDisableReason,
                     Words::Key(t::SAFE_DISABLE_REASON),
                     Kind::Text(app.settings.safe_disable_reason.clone()),
+                ));
+                v.push(choice(
+                    ItemId::SafeDisableTerm,
+                    t::SAFE_DISABLE_TERM,
+                    safe_disable_term_options(),
+                    app.settings.safe_disable_term,
                 ));
                 v.push(action(ItemId::SafeDisableRun, t::SAFE_DISABLE_RUN, true));
             }

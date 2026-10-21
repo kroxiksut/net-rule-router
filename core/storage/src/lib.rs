@@ -113,7 +113,7 @@ pub use migration::{
     read_schema_version, rebuild_conn_history_db, SqliteMigrationRunner, TrafficDbOpen,
 };
 pub use mutation_tokens::{ConsumeOutcome, MutationTokenStoreSqlite, StoredMutationToken};
-pub use pause_state::{RoutingPauseRecord, RoutingPauseStateRepository};
+pub use pause_state::{PauseEnd, RoutingPauseRecord, RoutingPauseStateRepository};
 pub use policy_settings::{
     ApplyFailurePolicyRecord, ApplyFailurePolicySettingsRepository, DEFAULT_POLICY_SLUG,
     VALID_POLICY_SLUGS,

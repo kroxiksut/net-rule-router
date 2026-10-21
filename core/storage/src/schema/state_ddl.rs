@@ -1601,3 +1601,10 @@ pub const STATE_DB_V81_DDL: &[&str] = &["ALTER TABLE secondary_block_policy ADD 
 /// The gateways of another VPN each user let through leak protection, by
 /// address. Per user: one person's answer never opens a hole for another.
 pub const STATE_DB_V82_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS vpn_gateway_confirmations (sid TEXT NOT NULL, address TEXT NOT NULL, program TEXT NOT NULL DEFAULT '', confirmed_at INTEGER NOT NULL, PRIMARY KEY (sid, address))"];
+
+/// A pause can end on its own: at a wall-clock moment, or with the service's
+/// next start. Existing pauses keep lasting until the user lifts them.
+pub const STATE_DB_V83_DDL: &[&str] = &[
+    "ALTER TABLE routing_pause_state ADD COLUMN resumes_at_ms INTEGER",
+    "ALTER TABLE routing_pause_state ADD COLUMN until_restart INTEGER NOT NULL DEFAULT 0 CHECK(until_restart IN (0, 1))",
+];
